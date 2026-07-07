@@ -22,6 +22,12 @@ npx tailii-host setup
 
 表示された QR コードを Tailii アプリで読み取るか、表示されたコードをアプリに入力してペアリングします。
 
+`setup` は、アプリが SSH 経由で実行するランチャー(`~/.local/bin/tailii-host`)を自動生成し、あわせて環境診断(tmux / claude CLI / リモートログイン)を表示します。診断だけを再実行するには:
+
+```sh
+npx tailii-host doctor
+```
+
 ## How it works
 
 Tailii はサーバーレス構成で動作し、リレーサーバーは使いません。Mac への到達性は自宅 LAN や Tailscale など、ユーザー自身のネットワーク環境で確保します。

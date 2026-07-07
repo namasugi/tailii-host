@@ -38,6 +38,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import qrcode from "qrcode-terminal";
 import { runPairingResponder } from "./pairingCode.js";
+import {
+  collectDoctorChecks,
+  defaultShimBinDir,
+  ensureHostShim,
+  formatDoctorChecks,
+  resolveOwnCliPath,
+} from "./doctor.js";
 
 // MARK: - ペアリング payload の byte-exact 符号化
 
@@ -330,6 +337,33 @@ export async function runSetupCommand(argv: string[]): Promise<number> {
   } catch (error) {
     process.stderr.write(`authorized_keys 登録に失敗: ${String(error)}\n`);
     return 1;
+  }
+
+  // --- 2.5) ホストシムを生成 + 環境診断 ---
+  // iPhone は SSH 非対話シェルから ~/.local/bin/tailii-host を exec する。
+  // node が PATH に無い環境でも動くよう、node 絶対パス固定のシムを自動生成する。
+  try {
+    const shim = ensureHostShim(defaultShimBinDir(), process.execPath, resolveOwnCliPath());
+    const shimPath = path.join(defaultShimBinDir(), "tailii-host");
+    if (shim === "skipped-foreign") {
+      process.stderr.write(
+        `注意: ${shimPath} は手動管理のファイルのため上書きしませんでした。\n` +
+          `      アプリはこのパスを実行します。内容が正しいか確認してください。\n`,
+      );
+    } else if (shim !== "unchanged") {
+      process.stdout.write(`ホストシムを${shim === "created" ? "生成" : "更新"}しました: ${shimPath}\n`);
+    }
+  } catch (error) {
+    process.stderr.write(`ホストシムの生成に失敗: ${String(error)}\n`);
+    return 1;
+  }
+  const checks = await collectDoctorChecks();
+  process.stdout.write("環境診断:\n" + formatDoctorChecks(checks) + "\n");
+  const failedRequired = checks.filter((c) => c.required && !c.ok);
+  if (failedRequired.length > 0) {
+    process.stderr.write(
+      `注意: 必須項目 ${failedRequired.length} 件が未充足です(ペアリング自体は続行できます)。\n`,
+    );
   }
 
   // --- 3) ペアリング payload を構築（v1/v2） ---

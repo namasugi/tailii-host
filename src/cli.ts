@@ -20,6 +20,7 @@ import { runHookCommand } from "./hook.js";
 import { runKickCommand } from "./kick.js";
 import { runPushTokenCommand } from "./pushTokenCommand.js";
 import { runSetupCommand } from "./setup.js";
+import { runDoctorCommand } from "./doctor.js";
 import { migrateLegacyHome } from "./legacyHomeMigration.js";
 
 const PORTED: Record<string, (args: string[]) => Promise<number>> = {
@@ -30,6 +31,7 @@ const PORTED: Record<string, (args: string[]) => Promise<number>> = {
   kick: runKickCommand,
   "push-token": runPushTokenCommand,
   setup: runSetupCommand,
+  doctor: runDoctorCommand,
 };
 
 async function main(): Promise<number> {
@@ -37,7 +39,7 @@ async function main(): Promise<number> {
   const [subcommand, ...rest] = process.argv.slice(2);
   if (!subcommand || subcommand === "--help" || subcommand === "-h") {
     process.stderr.write(
-      "usage: tailii <engine|serve|hook|launch|kick|push-token|setup> [options]\n",
+      "usage: tailii <engine|serve|hook|launch|kick|push-token|setup|doctor> [options]\n",
     );
     return 64;
   }
