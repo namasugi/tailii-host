@@ -1,0 +1,50 @@
+{
+  "name": "tailii-host",
+  "version": "0.1.0",
+  "description": "Tailii host — control Claude Code / Codex sessions on your machine from the Tailii mobile app",
+  "author": "Namasugi",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/namasugi/tailii-host.git"
+  },
+  "homepage": "https://github.com/namasugi/tailii-host#readme",
+  "bugs": {
+    "url": "https://github.com/namasugi/tailii-host/issues"
+  },
+  "keywords": [
+    "claude-code",
+    "claude",
+    "codex",
+    "tmux",
+    "iphone",
+    "remote-control",
+    "cli",
+    "tailii"
+  ],
+  "type": "module",
+  "bin": {
+    "tailii-host": "dist/cli.js",
+    "tailii": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build",
+    "test": "vitest run --pool=forks --poolOptions.forks.singleFork=true",
+    "lint": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
+  },
+  "dependencies": {
+    "qrcode-terminal": "^0.12.0"
+  }
+}

@@ -1,0 +1,2 @@
+{"agentType":"general-purpose","depth":1,"label":"Search food mechanics specs","nodeId":"a64248450ea4d7cec","parentNodeId":"root","status":"running","toolUseId":"toolu_011oYuCoC9Uunee5rACf28de","ts":1783016361453,"type":"subagent_node","v":2}
+{"agentType":"general-purpose","depth":1,"label":"Search food mechanics specs","nodeId":"a64248450ea4d7cec","parentNodeId":"root","status":"completed","toolUseId":"toolu_011oYuCoC9Uunee5rACf28de","ts":1783016400000,"type":"subagent_node","v":2}

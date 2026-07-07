@@ -1,0 +1,44 @@
+{"maxVersion":1,"type":"channel_hello","v":1}
+{"cwd":"/Users/alice/project","diff":{"kind":"create","newText":"print(\"hi\")\n","path":"/Users/alice/project/src/new.swift"},"id":"6ba7b810-9dad-11d1-80b4-00c04fd430c8","summary":"/Users/alice/project/src/new.swift","tool":"Write","type":"approval_request","v":1}
+{"cwd":"/Users/alice/project","diff":{"kind":"edit","newString":"let x = 2","oldString":"let x = 1","path":"/Users/alice/project/src/main.swift"},"id":"7c8d9e10-1111-2222-3333-444455556666","summary":"/Users/alice/project/src/main.swift","tool":"Edit","type":"approval_request","v":1}
+{"decision":"allow","id":"6ba7b810-9dad-11d1-80b4-00c04fd430c8","type":"approval_decision","v":1}
+{"id":"aaaa1111-0000-0000-0000-000000000001","type":"session_list_request","v":1}
+{"id":"aaaa1111-0000-0000-0000-000000000001","sessions":[{"alive":true,"cwd":"/Users/alice/project","name":"proj-a"},{"alive":false,"cwd":"/Users/alice/other","name":"proj-b"}],"type":"session_list_response","v":1}
+{"cwd":"/Users/alice/project","id":"bbbb2222-0000-0000-0000-000000000002","name":"proj-a","type":"session_start","v":1}
+{"id":"cccc3333-0000-0000-0000-000000000003","name":"proj-a","type":"session_reattach","v":1}
+{"id":"dddd4444-0000-0000-0000-000000000004","name":"proj-b","type":"session_kill","v":1}
+{"code":"session_not_found","id":"cccc3333-0000-0000-0000-000000000003","message":"no such session: proj-a","type":"error","v":1}
+{"height":1080,"id":"img-1111-0000-0000-0000-000000000001","mime":"image/png","path":"/Users/alice/project/out/chart.png","relatedApprovalId":"6ba7b810-9dad-11d1-80b4-00c04fd430c8","thumbnail":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC","type":"image_available","v":1,"width":1920}
+{"height":480,"id":"img-2222-0000-0000-0000-000000000002","mime":"image/jpeg","path":"/Users/alice/project/out/photo.jpg","thumbnail":"/9j/4AAQSkZJRg==","type":"image_available","v":1,"width":640}
+{"id":"img-1111-0000-0000-0000-000000000001","type":"image_fetch_request","v":1}
+{"data":"AAECAwQF","eof":false,"id":"img-1111-0000-0000-0000-000000000001","mime":"image/png","seq":0,"type":"image_fetch_response","v":1}
+{"data":"Bgc=","eof":true,"id":"img-1111-0000-0000-0000-000000000001","mime":"image/png","seq":1,"type":"image_fetch_response","v":1}
+{"eof":false,"role":"assistant","streamId":"chat-0001-0000-0000-0000-000000000001","text":"Hello, ","type":"chat_output","v":1}
+{"eof":true,"role":"assistant","streamId":"chat-0001-0000-0000-0000-000000000001","text":"world!","type":"chat_output","v":1}
+{"eof":true,"role":"user","streamId":"chat-0002-0000-0000-0000-000000000002","text":"run the build","type":"chat_output","v":1}
+{"eof":true,"role":"system","streamId":"chat-0003-0000-0000-0000-000000000003","text":"session resumed","type":"chat_output","v":1}
+{"baseDir":"/Users/alice/dev","cwd":"myproj","id":"eeee5555-0000-0000-0000-000000000005","name":"myproj","type":"session_start","v":1}
+{"baseDir":"/Users/alice/dev","id":"ffff6666-0000-0000-0000-000000000006","partial":"foo/ba","type":"dir_list_request","v":1}
+{"entries":["bar","baz"],"id":"ffff6666-0000-0000-0000-000000000006","type":"dir_list_response","v":1}
+{"cursor":"eyJuIjoicHJvai1hIiwidSI6MTcyMDEwMDAwMH0","id":"aaaa1111-0000-0000-0000-000000000007","limit":5,"type":"session_list_request","v":1}
+{"id":"aaaa1111-0000-0000-0000-000000000007","nextCursor":"eyJuIjoicHJvai1hIiwidSI6MTcyMDEwMDAwMH0","sessions":[{"alive":true,"cwd":"/Users/alice/project","name":"proj-a","updatedAt":1720100000}],"type":"session_list_response","v":1}
+{"id":"aaaa1111-0000-0000-0000-000000000008","name":"proj-a","type":"session_idle_hint","v":1}
+{"id":"1a2b3c4d-0000-0000-0000-0000000000b1","path":"/Users/alice","type":"browse_request","v":1}
+{"entries":["dev","Documents"],"id":"1a2b3c4d-0000-0000-0000-0000000000b1","path":"/Users/alice","type":"browse_response","v":1}
+{"cwd":"/Users/alice/Documents/ClaudeCode/code0630","id":"aa11bb22-0000-0000-0000-0000000000c1","name":"cs-11111111","resumeSessionId":"11111111-2222-3333-4444-555555555555","type":"session_start","v":1}
+{"id":"cs11aa00-0000-0000-0000-0000000000d1","type":"claude_session_list_request","v":1}
+{"claudeSessions":[{"cwd":"/Users/alice/Documents/ClaudeCode/code0630","sessionId":"11111111-2222-3333-4444-555555555555","title":"最初の会話","updatedAt":1720100000},{"cwd":"/Users/alice/other","sessionId":"22222222-3333-4444-5555-666666666666","title":"3f2a1b0c"}],"id":"cs11aa00-0000-0000-0000-0000000000d1","type":"claude_session_list_response","v":1}
+{"baseDir":"/Users/alice/dev","id":"dc11ee22-0000-0000-0000-0000000000e1","relative":"newfolder","type":"dir_create_request","v":1}
+{"id":"dc11ee22-0000-0000-0000-0000000000e1","ok":true,"path":"/Users/alice/dev/newfolder","type":"dir_create_response","v":1}
+{"id":"ug11aa22-0000-0000-0000-0000000000f1","type":"usage_request","v":1}
+{"cacheCreationTokens":1200,"cacheReadTokens":45000,"fiveHourResetsAt":"2026-07-05T15:00:00+09:00","fiveHourUtilization":23,"id":"ug11aa22-0000-0000-0000-0000000000f1","inputTokens":350,"outputTokens":2800,"sevenDayFableResetsAt":"2026-07-09T00:00:00+09:00","sevenDayFableUtilization":41,"sevenDayResetsAt":"2026-07-09T00:00:00+09:00","sevenDayUtilization":56,"turns":12,"type":"usage_response","v":1}
+{"addedLines":2,"diff":{"newString":"let x = 2\nlet y = 3","newStringTruncated":false,"oldString":"let x = 1","oldStringTruncated":false},"file":"/Users/alice/project/ChatLogModel.swift","id":"toolu-1111-2222-3333-444444444444","label":"編集済み ChatLogModel.swift","name":"Edit","removedLines":1,"type":"tool_activity","v":1}
+{"id":"qu11aa22-0000-0000-0000-000000000101","questions":[{"header":"Choose path","multiSelect":false,"options":[{"description":"Use the default route","label":"Default"},{"description":"Use the advanced route","label":"Advanced"}],"question":"Which path should I take?"},{"header":"Extras","multiSelect":true,"options":[{"description":"Run tests after editing","label":"Run tests"},{"description":"Update docs too","label":"Update docs"}],"question":"Select extra work."}],"type":"question_prompt","v":1}
+{"answers":[{"multiSelect":false,"questionIndex":0,"selectedOptionIndexes":[1]},{"multiSelect":true,"otherText":"Add a migration note","questionIndex":1,"selectedOptionIndexes":[0,2]}],"id":"qu11aa22-0000-0000-0000-000000000101","session":"proj-a","type":"question_answer","v":1}
+{"id":"qu11aa22-0000-0000-0000-000000000101","type":"question_dismiss","v":1}
+{"id":"toolu-5555-6666-7777-888888888888","label":"Todoを更新しました","name":"TodoWrite","todos":[{"content":"実装する","status":"completed"},{"content":"テストする","status":"in_progress"},{"content":"デプロイする","status":"pending"}],"type":"tool_activity","v":1}
+{"id":"md11aa22-0000-0000-0000-000000000201","session":"proj-a","type":"mode_get","v":1}
+{"id":"md11aa22-0000-0000-0000-000000000202","mode":"acceptEdits","session":"proj-a","type":"mode_set","v":1}
+{"id":"md11aa22-0000-0000-0000-000000000202","mode":"acceptEdits","type":"mode_set_response","v":1}
+{"cwd":"/Users/dev/proj-a","id":"sl11aa22-0000-0000-0000-000000000301","type":"slash_list_request","v":1}
+{"commands":[{"name":"/kiro-spec-init","summary":"新しい仕様を初期化する"},{"name":"/code-review","summary":"変更差分をレビューする"}],"id":"sl11aa22-0000-0000-0000-000000000301","type":"slash_list_response","v":1}
