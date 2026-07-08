@@ -72,27 +72,27 @@ export class TmuxSessionManager {
     this.protocolVersion = options.protocolVersion ?? PROTOCOL_V1;
   }
 
-  /** 現存する各セッションを name/cwd/alive で列挙する（name 昇順、メタのみは alive:false）。 */
+  /**
+   * 現存する各セッションを name/cwd/alive で列挙する（name 昇順、メタのみは alive:false）。
+   * updatedAt はここでは付与しない。tmux `#{session_activity}` はセッション作成自体を「活動」
+   * として刻むため、会話ゼロの新規セッションが実会話より上に浮く。整列時刻の権威は
+   * SessionActivityProvider（セッション自身の transcript mtime）に一本化する。
+   */
   async list(): Promise<SessionInfo[]> {
-    const alive = await this.liveSessions();
+    const alive = await this.liveSessionNames();
     const metas = this.store.all();
 
     const cwdByName = new Map<string, string>();
     for (const meta of metas) cwdByName.set(meta.name, meta.cwd);
 
-    const names = new Set<string>(alive.keys());
+    const names = new Set<string>(alive);
     for (const meta of metas) names.add(meta.name);
 
-    const infos: SessionInfo[] = [...names].map((name) => {
-      const base: SessionInfo = {
-        name,
-        cwd: cwdByName.get(name) ?? "",
-        alive: alive.has(name),
-      };
-      // tmux のセッション個別の活動時刻を updatedAt（Unix 秒）の権威にする。
-      const activity = alive.get(name);
-      return activity === undefined || activity === null ? base : { ...base, updatedAt: activity };
-    });
+    const infos: SessionInfo[] = [...names].map((name) => ({
+      name,
+      cwd: cwdByName.get(name) ?? "",
+      alive: alive.has(name),
+    }));
     return infos.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   }
 
@@ -155,37 +155,19 @@ export class TmuxSessionManager {
 
   /** `tmux ls` の生存セッション名集合。サーバ未起動 = 空集合として扱う。 */
   private async liveSessionNames(): Promise<Set<string>> {
-    return new Set((await this.liveSessions()).keys());
-  }
-
-  /**
-   * `tmux ls` の生存セッションと最終活動時刻（Unix 秒）を返す。サーバ未起動 = 空。
-   * `#{session_activity}` はセッション個別の最終活動時刻で、一覧の updatedAt 権威に使う
-   * （同一 cwd でも共有トランスクリプト mtime に潰されず正しく最近使用順で並ぶ）。
-   * 活動時刻を伴わない出力（name のみ）は値 null とし、呼び出し側のフォールバックに委ねる。
-   */
-  private async liveSessions(): Promise<Map<string, number | null>> {
-    const args = ["ls", "-F", "#{session_name} #{session_activity}"];
+    const args = ["ls", "-F", "#{session_name}"];
     const result = await this.runner(args);
     if (result.exitCode !== 0) {
       const combined = (result.stdout + result.stderr).toLowerCase();
       if (combined.includes("no server running") || combined.includes("no sessions")) {
-        return new Map();
+        return new Set();
       }
       throw new TmuxFailedError(args, result.exitCode, result.stderr);
     }
-    const out = new Map<string, number | null>();
+    const out = new Set<string>();
     for (const raw of result.stdout.split("\n")) {
       const line = raw.trim();
-      if (line.length === 0) continue;
-      const sep = line.lastIndexOf(" ");
-      if (sep < 0) {
-        out.set(line, null); // 活動時刻なし（name のみ）
-        continue;
-      }
-      const name = line.slice(0, sep).trim();
-      const secs = Number.parseInt(line.slice(sep + 1).trim(), 10);
-      out.set(name, Number.isFinite(secs) ? secs : null);
+      if (line.length > 0) out.add(line);
     }
     return out;
   }

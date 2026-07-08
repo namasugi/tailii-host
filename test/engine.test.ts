@@ -254,7 +254,7 @@ describe("EngineControl — 横断制御チャネル", () => {
     const store = makeTempStore();
     store.put({ name: "work", cwd: "/tmp/work", createdAt: 1, claudeSessionId: "sid-work" });
     const runner = new MockTmuxRunner((args) => {
-      if (args[0] === "ls") return ok("work 10\n");
+      if (args[0] === "ls") return ok("work\n");
       if (args[0] === "capture-pane") return ok("");
       return ok("");
     });

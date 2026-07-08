@@ -52,11 +52,11 @@ export class SessionListService {
   async page(limit: number | undefined, cursor: string | undefined): Promise<SessionListPage> {
     const raw = await this.sessionManager.list();
 
-    // updatedAt を付与する（未解決は省略 = 比較上 0）。
-    // tmux 由来の per-session 活動時刻（sessionManager.list() が付与）を最優先し、
-    // 無い場合のみ従来の provider（claude transcript mtime）へフォールバックする。
-    // これにより同一 cwd の複数セッションでも共有トランスクリプト mtime に潰されず、
-    // セッション個別の最近使用順で正しく整列する（最新セッションが一覧に埋もれない）。
+    // updatedAt を付与する（未解決は省略 = 比較上 0 で最下位）。
+    // 権威は provider（セッション自身の会話 transcript の mtime = 最終会話時刻）。
+    // tmux の活動時刻や cwd 共有の mtime は使わない: 前者は作成だけで最新になり、
+    // 後者は同一 cwd の別セッションの会話を継承するため、どちらも
+    // 「会話していないセッションが実会話より上に浮く」誤整列を生む。
     const annotated: SessionInfo[] = raw.map((info) => {
       if (info.updatedAt !== undefined) return info;
       const updatedAt = this.activityProvider(info);

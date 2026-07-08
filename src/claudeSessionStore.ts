@@ -16,6 +16,10 @@ const TITLE_MAX_LENGTH = 60;
 const SCAN_LINE_CAP = 400;
 /** jsonl から先頭を読む最大バイト数（1 ファイル数十MBになり得るため全読みを避ける）。 */
 const HEAD_BYTES_CAP = 256 * 1024;
+/** 最終会話時刻の後方スキャンの1回分の読み幅。 */
+const TAIL_CHUNK_BYTES = 16 * 1024;
+/** 最終会話時刻の後方スキャンの上限バイト数（超巨大な無タイムスタンプ行への保険）。 */
+const TAIL_BYTES_CAP = 256 * 1024;
 
 /** slug（`/`→`-` 置換済み）から cwd を復元する（lossy フォールバック）。 */
 export function cwdFromSlug(slug: string): string {
@@ -99,14 +103,68 @@ export class ClaudeSessionStore {
   }
 }
 
-/** 1 つの jsonl から ClaudeSessionInfo を導出する（先頭チャンクのみ読む）。 */
-function deriveInfo(filePath: string, sessionId: string, slug: string): ClaudeSessionInfo {
-  let updatedAt: number | undefined;
+/**
+ * transcript の「最終会話時刻」（Unix 秒）を末尾から後方スキャンで解決する。
+ * 権威はエントリ自身の `timestamp` フィールド（user/assistant/system 行が持つ）。
+ * ファイル mtime は使わない: `claude --resume` は開くだけで `mode`/`last-prompt` 等の
+ * タイムスタンプ無し状態行を追記して mtime を進めるため、mtime を順位に使うと
+ * 「開いただけの会話」が実会話より上に浮く（2026-07-08 ユーザー報告の根治）。
+ * - 全体を読み切って timestamp 行が無い = 状態行のみ（会話なし）→ null（最下位へ）
+ * - 上限まで読んでも見つからない（巨大な無 timestamp 行）→ mtime へ保守的にフォールバック
+ */
+export function lastConversationTimestamp(filePath: string): number | null {
+  let fd: number;
   try {
-    updatedAt = Math.floor(fs.statSync(filePath).mtimeMs / 1000);
+    fd = fs.openSync(filePath, "r");
   } catch {
-    updatedAt = undefined;
+    return null;
   }
+  try {
+    const size = fs.fstatSync(fd).size;
+    const maxSpan = Math.min(size, TAIL_BYTES_CAP);
+    let span = 0;
+    while (span < maxSpan) {
+      span = Math.min(span + TAIL_CHUNK_BYTES, maxSpan);
+      const buf = Buffer.alloc(span);
+      const bytesRead = fs.readSync(fd, buf, 0, span, size - span);
+      const lines = buf.subarray(0, bytesRead).toString("utf8").split("\n");
+      // 途中から読んだ場合、先頭要素は行の途中で切れている可能性があるため捨てる。
+      const first = span < size ? 1 : 0;
+      for (let i = lines.length - 1; i >= first; i--) {
+        const ts = parseEntryTimestamp(lines[i] ?? "");
+        if (ts !== null) return ts;
+      }
+      if (span >= size) return null; // 全読みして無し = 会話エントリなし
+    }
+    // 上限到達: timestamp 不明だが中身はある。mtime で近似する。
+    return Math.floor(fs.fstatSync(fd).mtimeMs / 1000);
+  } catch {
+    return null;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/** jsonl 1 行の トップレベル `timestamp`（ISO 文字列）を Unix 秒に読む。無ければ null。 */
+function parseEntryTimestamp(line: string): number | null {
+  const trimmed = line.trim();
+  if (!trimmed) return null;
+  let obj: unknown;
+  try {
+    obj = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (typeof obj !== "object" || obj === null) return null;
+  const raw = (obj as Record<string, unknown>)["timestamp"];
+  if (typeof raw !== "string") return null;
+  const ms = Date.parse(raw);
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+}
+
+/** 1 つの jsonl から ClaudeSessionInfo を導出する（先頭 + 末尾チャンクのみ読む）。 */
+function deriveInfo(filePath: string, sessionId: string, slug: string): ClaudeSessionInfo {
+  const updatedAt = lastConversationTimestamp(filePath) ?? undefined;
 
   let cwd: string | null = null;
   let title: string | null = null;

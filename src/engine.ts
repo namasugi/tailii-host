@@ -39,7 +39,7 @@ import {
   type SessionInfo,
   type SlashCommandInfo,
 } from "./protocol.js";
-import { claudeTranscriptActivityProvider } from "./sessionActivityProvider.js";
+import { ownTranscriptActivityProvider } from "./sessionActivityProvider.js";
 import { SessionIdleTracker } from "./sessionIdleTracker.js";
 import { SessionListService } from "./sessionListService.js";
 import { searchClaudeSessions } from "./sessionSearch.js";
@@ -144,10 +144,17 @@ export async function runEngineCommand(args: string[]): Promise<number> {
     claudeProjectsDirArg ?? path.join(os.homedir(), ".claude", "projects");
 
   // 一覧整形（session-list-lifecycle）: updatedAt 付与・整列・ページング。
+  // updatedAt の権威はセッション自身の会話 transcript（会話が無ければ最下位）。
   const sessionManager = new TmuxSessionManager({ store });
+  const claudeSessionStore = new ClaudeSessionStore(claudeProjectsRoot);
+  const codexSessionStore = new CodexSessionStore();
   const sessionListService = new SessionListService(
     sessionManager,
-    claudeTranscriptActivityProvider(),
+    ownTranscriptActivityProvider({
+      metadataStore: store,
+      claudeStore: claudeSessionStore,
+      codexStore: codexSessionStore,
+    }),
   );
 
   // アイドルライフサイクル: timeout は host 側設定（既定 30 分）。
@@ -182,8 +189,8 @@ export async function runEngineCommand(args: string[]): Promise<number> {
       idleTracker,
       resumeLauncher,
       codexResumeLauncher,
-      claudeSessionStore: new ClaudeSessionStore(claudeProjectsRoot),
-      codexSessionStore: new CodexSessionStore(),
+      claudeSessionStore,
+      codexSessionStore,
       reaperCheckIntervalSeconds: reaperInterval,
       chatTailProjectsRoot: claudeProjectsRoot,
       agent: agentArg,

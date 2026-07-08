@@ -371,16 +371,55 @@ describe("ClaudeSessionStore", () => {
     fs.mkdirSync(slugDir, { recursive: true });
     const oldFile = path.join(slugDir, "aaaaaaaa-0000-0000-0000-000000000000.jsonl");
     const newFile = path.join(slugDir, "bbbbbbbb-0000-0000-0000-000000000000.jsonl");
-    fs.writeFileSync(oldFile, '{"type":"user","cwd":"/tmp/proj","message":{"content":"古い会話"}}\n');
-    fs.writeFileSync(newFile, '{"type":"user","cwd":"/tmp/proj","message":{"content":"新しい会話"}}\n');
-    const past = new Date(Date.now() - 60_000);
-    fs.utimesSync(oldFile, past, past);
+    // updatedAt の権威はエントリの timestamp。mtime は逆転させて非依存を検証する。
+    fs.writeFileSync(
+      oldFile,
+      '{"type":"user","cwd":"/tmp/proj","timestamp":"2026-01-01T00:00:00Z","message":{"content":"古い会話"}}\n',
+    );
+    fs.writeFileSync(
+      newFile,
+      '{"type":"user","cwd":"/tmp/proj","timestamp":"2026-06-01T00:00:00Z","message":{"content":"新しい会話"}}\n',
+    );
+    const future = new Date(Date.now() + 60_000);
+    fs.utimesSync(oldFile, future, future);
 
     const list = new ClaudeSessionStore(root).list();
     expect(list.map((s) => s.title)).toEqual(["新しい会話", "古い会話"]);
     expect(list[0]?.cwd).toBe("/tmp/proj");
     expect(list[0]?.sessionId).toBe("bbbbbbbb-0000-0000-0000-000000000000");
-    expect(list[0]?.updatedAt).toBeGreaterThan(0);
+    expect(list[0]?.updatedAt).toBe(Math.floor(Date.parse("2026-06-01T00:00:00Z") / 1000));
+  });
+
+  test("resume の状態行追記（timestamp 無し）では updatedAt が動かない", () => {
+    const root = makeTempDir("claude-sessions-reopen");
+    const slugDir = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slugDir, { recursive: true });
+    const file = path.join(slugDir, "aaaaaaaa-4444.jsonl");
+    fs.writeFileSync(
+      file,
+      '{"type":"user","cwd":"/tmp/proj","timestamp":"2026-01-01T00:00:00Z","message":{"content":"会話"}}\n' +
+        // `claude --resume` が開くだけで追記する状態行（mtime が進む実挙動の再現）。
+        '{"type":"last-prompt"}\n{"type":"mode","mode":"normal"}\n{"type":"permission-mode"}\n',
+    );
+    const list = new ClaudeSessionStore(root).list();
+    expect(list[0]?.updatedAt).toBe(Math.floor(Date.parse("2026-01-01T00:00:00Z") / 1000));
+  });
+
+  test("状態行のみ（会話ゼロ）の transcript は updatedAt なしで最下位", () => {
+    const root = makeTempDir("claude-sessions-empty");
+    const slugDir = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slugDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(slugDir, "aaaaaaaa-5555.jsonl"),
+      '{"type":"mode","mode":"normal"}\n{"type":"permission-mode"}\n',
+    );
+    fs.writeFileSync(
+      path.join(slugDir, "bbbbbbbb-5555.jsonl"),
+      '{"type":"user","cwd":"/tmp/proj","timestamp":"2026-01-01T00:00:00Z","message":{"content":"実会話"}}\n',
+    );
+    const list = new ClaudeSessionStore(root).list();
+    expect(list.map((s) => s.sessionId)).toEqual(["bbbbbbbb-5555", "aaaaaaaa-5555"]);
+    expect(list[1]?.updatedAt).toBeUndefined();
   });
 
   test("cwd 行が無ければ slug から復元し、title は sessionId 先頭8字", () => {
@@ -435,21 +474,17 @@ describe("searchClaudeSessions", () => {
     fs.writeFileSync(
       oldFile,
       [
-        JSON.stringify({ type: "user", cwd: "/Users/alice/proj-a", message: { content: "Please inspect Approval flow" } }),
-        JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", input: "Approval hidden" }] } }),
+        JSON.stringify({ type: "user", cwd: "/Users/alice/proj-a", timestamp: "2026-01-01T00:00:00Z", message: { content: "Please inspect Approval flow" } }),
+        JSON.stringify({ type: "assistant", timestamp: "2026-01-01T00:01:00Z", message: { content: [{ type: "tool_use", input: "Approval hidden" }] } }),
       ].join("\n") + "\n",
     );
     fs.writeFileSync(
       newFile,
       [
-        JSON.stringify({ type: "assistant", cwd: "/Users/alice/proj-b", message: { content: [{ type: "text", text: "The approval search path is ready" }] } }),
+        JSON.stringify({ type: "assistant", cwd: "/Users/alice/proj-b", timestamp: "2026-06-01T00:00:00Z", message: { content: [{ type: "text", text: "The approval search path is ready" }] } }),
         JSON.stringify({ type: "tool_result", message: { content: "approval should not count" } }),
       ].join("\n") + "\n",
     );
-    const oldDate = new Date(Date.now() - 120_000);
-    const newDate = new Date(Date.now() - 30_000);
-    fs.utimesSync(oldFile, oldDate, oldDate);
-    fs.utimesSync(newFile, newDate, newDate);
 
     const response = searchClaudeSessions(new ClaudeSessionStore(root), "approval", { limit: 10 });
 
