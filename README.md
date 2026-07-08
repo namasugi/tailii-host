@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/namasugi/tailii-host/main/assets/tailii-logo.png" alt="Tailii" width="440">
+</p>
+
 # tailii-host
 
 Tailii is an iPhone app for controlling Claude Code and Codex sessions running on your own machine.

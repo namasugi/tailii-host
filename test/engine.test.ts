@@ -10,6 +10,7 @@ import { ClaudeSessionStore } from "../src/claudeSessionStore.js";
 import { decodeControlMessage } from "../src/protocol.js";
 import { TranscriptTailer } from "../src/transcriptTailer.js";
 import { TmuxSessionManager } from "../src/tmux.js";
+import { readPackageVersion } from "../src/version.js";
 import {
   MockTmuxRunner,
   makeTempDir,
@@ -32,7 +33,8 @@ describe("EngineControl — 横断制御チャネル", () => {
 
     const hello = await engine.lines.nextOfType("channel_hello");
     expect(hello).toContain('"maxVersion":2');
-    expect(hello).toContain('"serverVersion":"0.1.0"');
+    // serverVersion は package.json の実バージョンを載せる(ハードコードすると bump で壊れる)。
+    expect(hello).toContain(`"serverVersion":"${readPackageVersion()}"`);
     expect(hello).toContain('"v":1');
 
     engine.writeLine('{"maxVersion":1,"type":"channel_hello","v":1}');
