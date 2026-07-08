@@ -207,6 +207,9 @@ export function makeSessionLauncher(options: {
       },
       runner,
       agent,
+      // resume は同一会話 id の jsonl に書き続ける（engine の tail 束縛と同じ前提）ため、
+      // resume 起動でも実効会話 id を権威記録し、以後の reattach で厳密束縛できるようにする。
+      claudeSessionId: agent === "claude" ? (resumeSessionId ?? newSessionId ?? null) : null,
     });
     return { exitCode, errorText };
   };
@@ -231,6 +234,8 @@ export async function launchCore(options: {
   runner?: ProcessRunner;
   /** 起動対象エージェント（既定 claude）。codex は claude 固有の事前信頼/フック注入を行わない。 */
   agent?: LaunchAgent;
+  /** host が `--session-id` で固定した Claude 会話 id。新規 claude 起動だけに記録する。 */
+  claudeSessionId?: string | null;
   /** `~/.claude.json`（事前信頼記録）の場所。テスト注入用。省略時は実ホーム。 */
   claudeJsonPath?: string;
   /** フックのグローバル無効化マーカーの場所。テスト注入用（実マシンのマーカーに左右されない密閉性）。 */
@@ -330,8 +335,16 @@ export async function launchCore(options: {
 
   // --- 4. cwd を権威記録（tmux は起動 cwd を安定に返さないため本ストアを権威とする） ---
   try {
-    // agent は codex のときだけ記録する（claude セッションのメタ形式を従来どおり不変に保つ）。
-    store.put({ name: session, cwd: dir, createdAt: now(), ...(agent === "codex" ? { agent } : {}) });
+    // 任意メタは必要なときだけ記録する（古いメタ形式との後方互換を保つ）。
+    store.put({
+      name: session,
+      cwd: dir,
+      createdAt: now(),
+      ...(agent === "codex" ? { agent } : {}),
+      ...(agent === "claude" && options.claudeSessionId
+        ? { claudeSessionId: options.claudeSessionId }
+        : {}),
+    });
   } catch (error) {
     errorSink(`tailii launch: メタデータ保存失敗: ${String(error)}\n`);
     return 1;

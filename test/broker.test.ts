@@ -150,6 +150,42 @@ describe("Broker — 双方向中継", () => {
     expect(await reader.nextLine()).toBe(helloDown);
   });
 
+  it("serve broker は起動直後の hello に serverVersion を載せられる", async () => {
+    harness = startBroker("serve-hello", {
+      sendHello: true,
+      staleDistGuard: { startupVersion: "0.1.0", currentVersion: () => "0.1.0" },
+    });
+
+    expect(await harness.outputLines.next()).toBe(
+      '{"maxVersion":2,"serverVersion":"0.1.0","type":"channel_hello","v":1}',
+    );
+  });
+
+  it("serve broker は hook 接続時の stale dist を承認中継完了後に終了する", async () => {
+    let currentVersion = "0.1.0";
+    let staleNotified = false;
+    harness = startBroker("serve-stale", {
+      sendHello: true,
+      staleDistGuard: { startupVersion: "0.1.0", currentVersion: () => currentVersion },
+      onStaleDist: () => {
+        staleNotified = true;
+      },
+    });
+    await harness.outputLines.next();
+    currentVersion = "0.2.0";
+
+    const { socket } = await connect(harness);
+    const requestLine =
+      '{"cwd":"/tmp","id":"stale-1","summary":"echo stale","tool":"Bash","type":"approval_request","v":1}';
+    writeLine(socket, requestLine);
+    expect(await harness.outputLines.next()).toBe(requestLine);
+    expect(staleNotified).toBe(true);
+
+    socket.end();
+    await harness.done;
+    expect(fs.existsSync(harness.socketPath)).toBe(false);
+  });
+
   it("SSH 断で N クライアント全てが EOF になり broker が正常終了する (Req 5.6)", async () => {
     harness = startBroker("n-clients");
     const connected = [];

@@ -3,7 +3,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { ImageService } from "../src/imageService.js";
 import type { EngineLauncher } from "../src/launch.js";
 import { ClaudeSessionStore } from "../src/claudeSessionStore.js";
@@ -32,9 +32,38 @@ describe("EngineControl — 横断制御チャネル", () => {
 
     const hello = await engine.lines.nextOfType("channel_hello");
     expect(hello).toContain('"maxVersion":2');
+    expect(hello).toContain('"serverVersion":"0.1.0"');
     expect(hello).toContain('"v":1');
 
     engine.writeLine('{"maxVersion":1,"type":"channel_hello","v":1}');
+    await engine.teardown();
+  });
+
+  test("engine はメッセージ処理後に stale dist を検出し、応答を書き終えてから終了する", async () => {
+    const store = makeTempStore();
+    store.put({ name: "alpha", cwd: "/tmp/alpha", createdAt: 1 });
+    const runner = new MockTmuxRunner((args) => (args[0] === "ls" ? ok("alpha\n") : ok("")));
+    let currentVersion = "0.1.0";
+    let staleNotified = false;
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store),
+      staleDistGuard: { startupVersion: "0.1.0", currentVersion: () => currentVersion },
+      onStaleDist: () => {
+        staleNotified = true;
+      },
+    });
+
+    expect(await engine.lines.nextOfType("channel_hello")).toBe(
+      '{"maxVersion":2,"serverVersion":"0.1.0","type":"channel_hello","v":1}',
+    );
+    currentVersion = "0.2.0";
+    engine.writeLine('{"id":"L-stale","type":"session_list_request","v":1}');
+
+    const resp = await engine.lines.nextOfType("session_list_response");
+    expect(resp).toContain('"id":"L-stale"');
+    expect(resp).toContain('"name":"alpha"');
+    await engine.done;
+    expect(staleNotified).toBe(true);
     await engine.teardown();
   });
 
@@ -217,6 +246,99 @@ describe("EngineControl — 横断制御チャネル", () => {
     expect(resumed[5]).toBeNull();
 
     await engine.teardown();
+  });
+
+  test("session_reattach attached は保存済み claudeSessionId を chat tail の preferred に渡す", async () => {
+    const store = makeTempStore();
+    store.put({ name: "work", cwd: "/tmp/work", createdAt: 1, claudeSessionId: "sid-work" });
+    const runner = new MockTmuxRunner((args) => {
+      if (args[0] === "ls") return ok("work 10\n");
+      if (args[0] === "capture-pane") return ok("");
+      return ok("");
+    });
+    const spy = vi.spyOn(TranscriptTailer, "resolveJsonl").mockReturnValue(null);
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store),
+      metadataStore: store,
+      chatTailProjectsRoot: makeTempDir("reattach-tail-attached"),
+      transcriptTailer: new TranscriptTailer(),
+    });
+
+    try {
+      await engine.lines.nextOfType("channel_hello");
+      engine.writeLine('{"id":"R-tail-1","name":"work","type":"session_reattach","v":1}');
+      await engine.lines.nextOfType("session_list_response");
+
+      expect(spy.mock.calls.some((call) => call[1] === "sid-work")).toBe(true);
+    } finally {
+      spy.mockRestore();
+      await engine.teardown();
+    }
+  });
+
+  test("session_reattach resume は保存済み claudeSessionId を chat tail の preferred に渡す", async () => {
+    const store = makeTempStore();
+    store.put({ name: "resumed", cwd: "/tmp/resumed", createdAt: 1, claudeSessionId: "sid-resumed" });
+    const runner = new MockTmuxRunner((args) => (args[0] === "ls" ? ok("") : ok("")));
+    const resume: EngineLauncher = async () => ({ exitCode: 0, errorText: "" });
+    const spy = vi.spyOn(TranscriptTailer, "resolveJsonl").mockReturnValue(null);
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store),
+      metadataStore: store,
+      resumeLauncher: resume,
+      chatTailProjectsRoot: makeTempDir("reattach-tail-resume"),
+      transcriptTailer: new TranscriptTailer(),
+    });
+
+    try {
+      await engine.lines.nextOfType("channel_hello");
+      engine.writeLine('{"id":"R-tail-2","name":"resumed","type":"session_reattach","v":1}');
+      await engine.lines.nextOfType("session_list_response");
+
+      expect(spy.mock.calls.some((call) => call[1] === "sid-resumed")).toBe(true);
+    } finally {
+      spy.mockRestore();
+      await engine.teardown();
+    }
+  });
+
+  test("session_reattach resume: claudeSessionId 記録済みなら launcher の --resume 経路で厳密再開する", async () => {
+    const store = makeTempStore();
+    store.put({ name: "strict", cwd: "/tmp/strict", createdAt: 1, claudeSessionId: "sid-strict" });
+    const runner = new MockTmuxRunner((args) => (args[0] === "ls" ? ok("") : ok("")));
+    // 通常 launcher（`claude --resume <id>` 相当）と `--continue` 相当の resumeLauncher を
+    // 両方注入し、id 記録済みセッションでは前者が resumeSessionId 付きで選ばれることを確認する。
+    const launcherCalls: Array<string | null> = [];
+    const launcher: EngineLauncher = async (_cwd, _name, _base, resumeSessionId) => {
+      launcherCalls.push(resumeSessionId);
+      return { exitCode: 0, errorText: "" };
+    };
+    let continueResumeCalled = false;
+    const resume: EngineLauncher = async () => {
+      continueResumeCalled = true;
+      return { exitCode: 0, errorText: "" };
+    };
+    const spy = vi.spyOn(TranscriptTailer, "resolveJsonl").mockReturnValue(null);
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store),
+      metadataStore: store,
+      launcher,
+      resumeLauncher: resume,
+      chatTailProjectsRoot: makeTempDir("reattach-strict-resume"),
+      transcriptTailer: new TranscriptTailer(),
+    });
+
+    try {
+      await engine.lines.nextOfType("channel_hello");
+      engine.writeLine('{"id":"R-strict","name":"strict","type":"session_reattach","v":1}');
+      await engine.lines.nextOfType("session_list_response");
+
+      expect(launcherCalls).toEqual(["sid-strict"]);
+      expect(continueResumeCalled).toBe(false);
+    } finally {
+      spy.mockRestore();
+      await engine.teardown();
+    }
   });
 
   test("launcher 失敗（非0 exit）で error(launch_failed) が返る", async () => {
@@ -574,6 +696,36 @@ describe("EngineControl — 横断制御チャネル", () => {
     expect(resp).toContain('"sessionId":"77777777-8888-9999-aaaa-bbbbbbbbbbbb"');
     expect(resp).toContain('"cwd":"/tmp/proj"');
     expect(resp).toContain('"title":"エンジン越し会話"');
+
+    await engine.teardown();
+  });
+
+  // MARK: session_search_request → session_search_response
+
+  test("session_search_request に本文検索結果を返す（store 橋渡し）", async () => {
+    const projects = makeTempDir("tailii-search-engine");
+    const slugDir = path.join(projects, "-tmp-proj");
+    fs.mkdirSync(slugDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(slugDir, "99999999-8888-7777-6666-555555555555.jsonl"),
+      '{"type":"user","cwd":"/tmp/proj","message":{"content":"検索タイトル"}}\n' +
+        '{"type":"assistant","message":{"content":[{"type":"text","text":"本文に Approval keyword が含まれる"}]}}\n',
+    );
+
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({
+      sessionManager: makeManager(runner),
+      claudeSessionStore: new ClaudeSessionStore(projects),
+    });
+
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine('{"id":"SS1","query":"approval","type":"session_search_request","v":2}');
+
+    const resp = await engine.lines.nextOfType("session_search_response");
+    expect(resp).toContain('"id":"SS1"');
+    expect(resp).toContain('"sessionId":"99999999-8888-7777-6666-555555555555"');
+    expect(resp).toContain('"snippet":"本文に Approval keyword が含まれる"');
+    expect(resp).toContain('"title":"検索タイトル"');
 
     await engine.teardown();
   });

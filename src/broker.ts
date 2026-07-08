@@ -18,6 +18,8 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import type { Readable, Writable } from "node:stream";
 import { resolveSocketPath } from "./socketPath.js";
+import { encodeControlMessage, PROTOCOL_MAX_SUPPORTED, PROTOCOL_V1 } from "./protocol.js";
+import { createStaleDistGuard, isStaleDist, readPackageVersion, type StaleDistGuard } from "./version.js";
 
 /** 行分割器: チャンクを積み、完全行（末尾 \n 込み）ごとに onLine を呼ぶ。 */
 function makeLineFeeder(onLine: (line: Buffer) => void): {
@@ -51,6 +53,12 @@ export interface RunBrokerOptions {
   output: Writable;
   /** 診断ログ出力先（省略時は無音。CLI は stderr を渡す）。 */
   log?: (message: string) => void;
+  /** 起動時 package version と現在の package version を比較する stale 判定（テスト注入用）。 */
+  staleDistGuard?: StaleDistGuard | null;
+  /** stale dist 検出時の通知（テスト観測用）。 */
+  onStaleDist?: () => void;
+  /** 起動直後に SSH 側へ channel_hello を送る（CLI の serve 経路で有効）。 */
+  sendHello?: boolean;
 }
 
 /**
@@ -60,12 +68,25 @@ export interface RunBrokerOptions {
 export async function runBroker(options: RunBrokerOptions): Promise<void> {
   const { socketPath, input, output } = options;
   const log = options.log ?? (() => {});
+  const staleDistGuard = options.staleDistGuard ?? createStaleDistGuard();
 
   // 既存 socket ファイルを削除してから listen（Swift 版 unlink→bind と同一）。
   fs.rmSync(socketPath, { force: true });
 
   const clients = new Set<net.Socket>();
   let registryClosed = false;
+  let shutdownRequested = false;
+  let resolveBroker: (() => void) | null = null;
+  let server: net.Server;
+
+  const finishBroker = (): void => {
+    if (registryClosed) return;
+    registryClosed = true;
+    for (const client of clients) client.end();
+    server.close(() => {});
+    fs.rmSync(socketPath, { force: true });
+    resolveBroker?.();
+  };
 
   /** 1 完全行を SSH (output) へ書き込む（失敗は無視 — Swift 版 try? と同一）。 */
   const writeLineToSSH = (line: Buffer): void => {
@@ -87,13 +108,18 @@ export async function runBroker(options: RunBrokerOptions): Promise<void> {
     }
   };
 
-  const server = net.createServer((client) => {
+  server = net.createServer((client) => {
     if (registryClosed) {
       client.destroy();
       return;
     }
     clients.add(client);
     log(`[tailii-host serve] hook クライアント接続\n`);
+    if (isStaleDist(staleDistGuard)) {
+      shutdownRequested = true;
+      log("[tailii-host serve] stale dist を検出、再起動のため終了\n");
+      options.onStaleDist?.();
+    }
 
     const feeder = makeLineFeeder(writeLineToSSH);
     client.on("data", (chunk) => feeder.push(chunk));
@@ -103,6 +129,7 @@ export async function runBroker(options: RunBrokerOptions): Promise<void> {
     client.on("close", () => {
       clients.delete(client);
       log(`[tailii-host serve] hook クライアント切断\n`);
+      if (shutdownRequested && clients.size === 0) finishBroker();
     });
   });
   server.maxConnections = 16;
@@ -115,19 +142,34 @@ export async function runBroker(options: RunBrokerOptions): Promise<void> {
     });
   });
   log(`[tailii-host serve] listening on ${socketPath}\n`);
+  if (options.sendHello === true) {
+    const helloVersion = staleDistGuard?.startupVersion ?? readPackageVersion() ?? undefined;
+    writeLineToSSH(Buffer.from(encodeControlMessage({
+      type: "channel_hello",
+      v: PROTOCOL_V1,
+      maxVersion: PROTOCOL_MAX_SUPPORTED,
+      ...(helloVersion !== undefined ? { serverVersion: helloVersion } : {}),
+    }) + "\n", "utf8"));
+  }
+  if (isStaleDist(staleDistGuard)) {
+    shutdownRequested = true;
+    log("[tailii-host serve] stale dist を検出、再起動のため終了\n");
+    options.onStaleDist?.();
+    finishBroker();
+  }
 
   // SSH リーダ: input → 全クライアントへブロードキャスト。EOF で全体を終了させる。
   await new Promise<void>((resolve) => {
+    resolveBroker = resolve;
+    if (registryClosed) {
+      resolve();
+      return;
+    }
     const feeder = makeLineFeeder(broadcast);
     const finish = (): void => {
       feeder.flush();
-      registryClosed = true;
-      // 全生存クライアントを閉じる（各 hook 側 read は EOF になる, 5.6）。
-      for (const client of clients) client.end();
-      server.close(() => {});
-      fs.rmSync(socketPath, { force: true });
+      finishBroker();
       log(`[tailii-host serve] stdin→broadcast: EOF\n`);
-      resolve();
     };
     input.on("data", (chunk: Buffer) => feeder.push(chunk));
     input.once("end", finish);
@@ -153,6 +195,7 @@ export async function runServeCommand(args: string[]): Promise<number> {
       input: process.stdin,
       output: process.stdout,
       log: (message) => process.stderr.write(message),
+      sendHello: true,
     });
   } catch (error) {
     process.stderr.write(`[tailii-host serve] 異常終了: ${String(error)}\n`);

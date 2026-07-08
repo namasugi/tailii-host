@@ -31,6 +31,25 @@ export class ClaudeSessionStore {
     this.root = root ?? path.join(os.homedir(), ".claude", "projects");
   }
 
+  /** 指定会話 ID の jsonl パスを projects root から探す。見つからない場合は null。 */
+  transcriptPath(sessionId: string): string | null {
+    let slugs: string[];
+    try {
+      slugs = fs.readdirSync(this.root);
+    } catch {
+      return null;
+    }
+    for (const slug of slugs) {
+      const candidate = path.join(this.root, slug, `${sessionId}.jsonl`);
+      try {
+        if (fs.statSync(candidate).isFile()) return candidate;
+      } catch {
+        // 読めない slug は無視する。
+      }
+    }
+    return null;
+  }
+
   /**
    * 会話一覧を updatedAt 降順で返す（nil は末尾、同値は sessionId 昇順で安定化）。
    * `baseDir` 指定時は cwd が baseDir 自身/配下の会話のみに絞る（engine は無指定で呼ぶ）。

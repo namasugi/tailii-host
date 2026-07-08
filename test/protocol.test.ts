@@ -116,6 +116,32 @@ describe("decode 詳細", () => {
     });
   });
 
+  it("v2 session_search_request/response を復元する", () => {
+    const lines = goldenLines("approval-protocol-v2.ndjson");
+    const requestLine = lines.find((line) => line.includes('"type":"session_search_request"'));
+    const responseLine = lines.find((line) => line.includes('"type":"session_search_response"'));
+    expect(requestLine).toBeDefined();
+    expect(responseLine).toBeDefined();
+
+    const request = decodeControlMessage(requestLine!);
+    expect(request).toEqual({
+      type: "session_search_request",
+      v: 2,
+      id: "ss11aa22-0000-0000-0000-000000000401",
+      query: "approval",
+      limit: 2,
+    });
+
+    const response = decodeControlMessage(responseLine!);
+    if (response.type !== "session_search_response") throw new Error("session_search_response を期待");
+    expect(response.results[0]).toMatchObject({
+      sessionId: "11111111-2222-3333-4444-555555555555",
+      cwd: "/Users/alice/project",
+      title: "Search implementation",
+      updatedAt: 1720100000,
+    });
+  });
+
   it("v2 subagent_node を復元する", () => {
     const line = goldenLines("approval-protocol-v2.ndjson").find((entry) =>
       entry.includes('"type":"subagent_node"') && entry.includes('"status":"running"')
@@ -195,5 +221,52 @@ describe("encode 詳細", () => {
     ).toBe(
       '{"agentType":"general-purpose","depth":1,"label":"調査","nodeId":"agent-a","parentNodeId":null,"status":"running","toolUseId":"toolu-a","ts":1000,"type":"subagent_node","v":2}',
     );
+  });
+
+  it("session_search_request/response は v2 と canonical key order でエンコードする", () => {
+    expect(
+      encodeControlMessage({
+        type: "session_search_request",
+        v: 2,
+        id: "ss1",
+        query: "approval",
+        limit: 2,
+      }),
+    ).toBe('{"id":"ss1","limit":2,"query":"approval","type":"session_search_request","v":2}');
+    expect(
+      encodeControlMessage({
+        type: "session_search_response",
+        v: 2,
+        id: "ss1",
+        results: [
+          {
+            sessionId: "s1",
+            title: "Title",
+            cwd: "/tmp/proj",
+            snippet: "...approval...",
+            updatedAt: 10,
+          },
+        ],
+      }),
+    ).toBe(
+      '{"id":"ss1","results":[{"cwd":"/tmp/proj","sessionId":"s1","snippet":"...approval...","title":"Title","updatedAt":10}],"type":"session_search_response","v":2}',
+    );
+  });
+
+  it("channel_hello の serverVersion は optional で canonical key order に従う", () => {
+    expect(
+      encodeControlMessage({
+        type: "channel_hello",
+        v: 2,
+        maxVersion: 2,
+        serverVersion: "0.1.0",
+      }),
+    ).toBe('{"maxVersion":2,"serverVersion":"0.1.0","type":"channel_hello","v":2}');
+    expect(
+      decodeControlMessage('{"maxVersion":2,"serverVersion":"0.1.0","type":"channel_hello","v":2}'),
+    ).toEqual({ type: "channel_hello", v: 2, maxVersion: 2, serverVersion: "0.1.0" });
+    expect(
+      encodeControlMessage({ type: "channel_hello", v: 2, maxVersion: 2 }),
+    ).toBe('{"maxVersion":2,"type":"channel_hello","v":2}');
   });
 });

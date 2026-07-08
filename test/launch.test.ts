@@ -398,6 +398,8 @@ describe("makeSessionLauncher: claude --session-id / --name の合成（lazy-ses
       expect(inner).toContain("claude --resume resume-id");
       expect(inner).not.toContain("--name");
       expect(inner).not.toContain("--session-id");
+      // resume でも実効会話 id を権威記録する（以後の reattach が厳密束縛できる）。
+      expect(store.get("s-3")?.claudeSessionId).toBe("resume-id");
     });
   });
 

@@ -1,2 +1,5 @@
 {"agentType":"general-purpose","depth":1,"label":"Search food mechanics specs","nodeId":"a64248450ea4d7cec","parentNodeId":"root","status":"running","toolUseId":"toolu_011oYuCoC9Uunee5rACf28de","ts":1783016361453,"type":"subagent_node","v":2}
 {"agentType":"general-purpose","depth":1,"label":"Search food mechanics specs","nodeId":"a64248450ea4d7cec","parentNodeId":"root","status":"completed","toolUseId":"toolu_011oYuCoC9Uunee5rACf28de","ts":1783016400000,"type":"subagent_node","v":2}
+{"maxVersion":2,"serverVersion":"0.1.0","type":"channel_hello","v":2}
+{"id":"ss11aa22-0000-0000-0000-000000000401","limit":2,"query":"approval","type":"session_search_request","v":2}
+{"id":"ss11aa22-0000-0000-0000-000000000401","results":[{"cwd":"/Users/alice/project","sessionId":"11111111-2222-3333-4444-555555555555","snippet":"...Please review the approval flow around session search.","title":"Search implementation","updatedAt":1720100000}],"type":"session_search_response","v":2}

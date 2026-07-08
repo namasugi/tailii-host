@@ -92,6 +92,15 @@ export interface ClaudeSessionInfo {
   agent?: "claude" | "codex";
 }
 
+/** session_search_response の 1 検索結果。 */
+export interface SessionSearchResult {
+  sessionId: string;
+  title: string;
+  cwd: string;
+  snippet: string;
+  updatedAt?: number;
+}
+
 /** slash_list_response の 1 コマンド候補。 */
 export interface SlashCommandInfo {
   name: string;
@@ -127,7 +136,7 @@ export type ChatRole = "assistant" | "user" | "system";
 export type Decision = "allow" | "deny";
 
 export type ControlMessage =
-  | { type: "channel_hello"; v: number; maxVersion: number }
+  | { type: "channel_hello"; v: number; maxVersion: number; serverVersion?: string }
   | { type: "approval_request"; v: number; id: string; tool: string; summary: string; cwd: string; diff?: ToolDiff }
   | { type: "approval_decision"; v: number; id: string; decision: Decision; reason?: string }
   | { type: "session_list_request"; v: number; id: string; limit?: number; cursor?: string }
@@ -166,7 +175,9 @@ export type ControlMessage =
   | { type: "claude_session_list_request"; v: number; id: string }
   | { type: "claude_session_list_response"; v: number; id: string; claudeSessions: ClaudeSessionInfo[] }
   | { type: "dir_create_request"; v: number; id: string; baseDir: string; relative: string }
-  | { type: "dir_create_response"; v: number; id: string; path: string; ok: boolean };
+  | { type: "dir_create_response"; v: number; id: string; path: string; ok: boolean }
+  | { type: "session_search_request"; v: number; id: string; query: string; limit?: number }
+  | { type: "session_search_response"; v: number; id: string; results: SessionSearchResult[] };
 
 export type ControlMessageType = ControlMessage["type"];
 
@@ -291,7 +302,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
 
   switch (type) {
     case "channel_hello":
-      return { type, v, maxVersion: requireNumber(raw, "maxVersion") };
+      return compact({ type, v, maxVersion: requireNumber(raw, "maxVersion"), serverVersion: optionalString(raw, "serverVersion") });
 
     case "approval_request":
       return compact({
@@ -567,6 +578,30 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         id: requireString(raw, "id"),
         path: requireString(raw, "path"),
         ok: requireBoolean(raw, "ok"),
+      };
+
+    case "session_search_request":
+      return compact({
+        type, v,
+        id: requireString(raw, "id"),
+        query: requireString(raw, "query"),
+        limit: optionalNumber(raw, "limit"),
+      });
+
+    case "session_search_response":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        results: requireArray(raw, "results").map((element) => {
+          const obj = requireObject(element, "results");
+          return compact<SessionSearchResult>({
+            sessionId: requireString(obj, "sessionId"),
+            title: requireString(obj, "title"),
+            cwd: requireString(obj, "cwd"),
+            snippet: requireString(obj, "snippet"),
+            updatedAt: optionalNumber(obj, "updatedAt"),
+          });
+        }),
       };
 
     default:

@@ -15,6 +15,8 @@ export interface SessionMeta {
   createdAt: number;
   /** そのセッションを駆動するエージェント（claude=既定 / codex）。未記録は claude 相当。 */
   agent?: "claude" | "codex";
+  /** Claude の会話 JSONL 名に対応する session-id。未記録は従来どおり最新 JSONL 解決へ戻す。 */
+  claudeSessionId?: string;
 }
 
 /** session 名が安全でないときに投げる型付きエラー。 */
@@ -54,10 +56,14 @@ export class SessionMetadataStore {
     validateSessionName(meta.name);
     ensureDirectory0700(this.base);
     const payload = JSON.stringify(
-      // sortedKeys 相当。agent は指定時のみ書く（後方互換: 未指定は従来どおりのキー構成）。
-      meta.agent !== undefined
-        ? { agent: meta.agent, createdAt: meta.createdAt, cwd: meta.cwd, name: meta.name }
-        : { createdAt: meta.createdAt, cwd: meta.cwd, name: meta.name },
+      // sortedKeys 相当。任意キーは指定時のみ書く（後方互換: 未指定は従来どおりのキー構成）。
+      {
+        ...(meta.agent !== undefined ? { agent: meta.agent } : {}),
+        ...(meta.claudeSessionId !== undefined ? { claudeSessionId: meta.claudeSessionId } : {}),
+        createdAt: meta.createdAt,
+        cwd: meta.cwd,
+        name: meta.name,
+      },
     );
     const target = this.fileFor(meta.name);
     const tmp = target + ".tmp";
@@ -118,7 +124,13 @@ function decodeMeta(raw: unknown): SessionMeta | null {
     return null;
   }
   const agent = obj["agent"] === "codex" || obj["agent"] === "claude" ? obj["agent"] : undefined;
-  return agent !== undefined
-    ? { name: obj["name"], cwd: obj["cwd"], createdAt: obj["createdAt"], agent }
-    : { name: obj["name"], cwd: obj["cwd"], createdAt: obj["createdAt"] };
+  const claudeSessionId =
+    typeof obj["claudeSessionId"] === "string" ? obj["claudeSessionId"] : undefined;
+  return {
+    name: obj["name"],
+    cwd: obj["cwd"],
+    createdAt: obj["createdAt"],
+    ...(agent !== undefined ? { agent } : {}),
+    ...(claudeSessionId !== undefined ? { claudeSessionId } : {}),
+  };
 }

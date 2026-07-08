@@ -96,7 +96,10 @@ export interface BrokerHarness {
   teardown(): Promise<void>;
 }
 
-export function startBroker(suffix: string): BrokerHarness {
+export function startBroker(
+  suffix: string,
+  options: Pick<Parameters<typeof runBroker>[0], "sendHello" | "staleDistGuard" | "onStaleDist"> = {},
+): BrokerHarness {
   const socketPath = tempSocketPath(suffix);
   const input = new PassThrough();
   const output = new PassThrough();
@@ -104,7 +107,7 @@ export function startBroker(suffix: string): BrokerHarness {
   const rl = readline.createInterface({ input: output, crlfDelay: Number.POSITIVE_INFINITY });
   rl.on("line", (line) => outputLines.push(line));
 
-  const done = runBroker({ socketPath, input, output });
+  const done = runBroker({ socketPath, input, output, ...options });
   done.catch(() => {});
 
   return {

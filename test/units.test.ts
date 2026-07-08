@@ -12,6 +12,7 @@ import { dirChildren, dirCreate, dirList } from "../src/dirLister.js";
 import { parsePermissionMode } from "../src/permissionMode.js";
 import { extractCredential, orderCandidates, parsePlanUsage } from "../src/planUsageFetcher.js";
 import { SessionIdleTracker } from "../src/sessionIdleTracker.js";
+import { searchClaudeSessions } from "../src/sessionSearch.js";
 import {
   SessionListService,
   decodeSessionListCursor,
@@ -277,6 +278,24 @@ describe("SessionMetadataStore", () => {
     store.put({ name: "cla", cwd: "/tmp/l", createdAt: 2 });
     expect(store.get("cla")).toEqual({ name: "cla", cwd: "/tmp/l", createdAt: 2 });
   });
+
+  test("claudeSessionId フィールドの往復と旧形式メタの後方互換", () => {
+    const base = makeTempDir("metastore-claude-session");
+    const store = new SessionMetadataStore(base);
+    store.put({ name: "cla", cwd: "/tmp/l", createdAt: 2, claudeSessionId: "sid-1" });
+    expect(fs.readFileSync(path.join(base, "cla.json"), "utf8")).toBe(
+      '{"claudeSessionId":"sid-1","createdAt":2,"cwd":"/tmp/l","name":"cla"}',
+    );
+    expect(store.get("cla")).toEqual({
+      name: "cla",
+      cwd: "/tmp/l",
+      createdAt: 2,
+      claudeSessionId: "sid-1",
+    });
+
+    fs.writeFileSync(path.join(base, "old.json"), '{"createdAt":3,"cwd":"/tmp/old","name":"old"}');
+    expect(store.get("old")).toEqual({ name: "old", cwd: "/tmp/old", createdAt: 3 });
+  });
 });
 
 // MARK: - SessionIdleTracker
@@ -389,6 +408,84 @@ describe("ClaudeSessionStore", () => {
   test("cwdFromSlug は lossy 復元（空は /）", () => {
     expect(cwdFromSlug("-Users-me-dev")).toBe("/Users/me/dev");
     expect(cwdFromSlug("")).toBe("/");
+  });
+
+  test("transcriptPath は projects root から会話 jsonl を探す", () => {
+    const root = makeTempDir("claude-sessions-path");
+    const slugDir = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slugDir, { recursive: true });
+    const file = path.join(slugDir, "eeeeeeee-3333.jsonl");
+    fs.writeFileSync(file, '{"type":"user","message":{"content":"x"}}\n');
+    expect(new ClaudeSessionStore(root).transcriptPath("eeeeeeee-3333")).toBe(file);
+    expect(new ClaudeSessionStore(root).transcriptPath("missing")).toBeNull();
+  });
+});
+
+// MARK: - session_search
+
+describe("searchClaudeSessions", () => {
+  test("user/assistant 本文を大文字小文字無視で検索し snippet 付きで updatedAt 降順に返す", () => {
+    const root = makeTempDir("session-search");
+    const slugA = path.join(root, "-Users-alice-proj-a");
+    const slugB = path.join(root, "-Users-alice-proj-b");
+    fs.mkdirSync(slugA, { recursive: true });
+    fs.mkdirSync(slugB, { recursive: true });
+    const oldFile = path.join(slugA, "aaaaaaaa-search.jsonl");
+    const newFile = path.join(slugB, "bbbbbbbb-search.jsonl");
+    fs.writeFileSync(
+      oldFile,
+      [
+        JSON.stringify({ type: "user", cwd: "/Users/alice/proj-a", message: { content: "Please inspect Approval flow" } }),
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", input: "Approval hidden" }] } }),
+      ].join("\n") + "\n",
+    );
+    fs.writeFileSync(
+      newFile,
+      [
+        JSON.stringify({ type: "assistant", cwd: "/Users/alice/proj-b", message: { content: [{ type: "text", text: "The approval search path is ready" }] } }),
+        JSON.stringify({ type: "tool_result", message: { content: "approval should not count" } }),
+      ].join("\n") + "\n",
+    );
+    const oldDate = new Date(Date.now() - 120_000);
+    const newDate = new Date(Date.now() - 30_000);
+    fs.utimesSync(oldFile, oldDate, oldDate);
+    fs.utimesSync(newFile, newDate, newDate);
+
+    const response = searchClaudeSessions(new ClaudeSessionStore(root), "approval", { limit: 10 });
+
+    expect(response.results.map((r) => r.sessionId)).toEqual(["bbbbbbbb-search", "aaaaaaaa-search"]);
+    expect(response.results[0]?.snippet).toContain("approval search path");
+    expect(response.results[1]?.title).toBe("Please inspect Approval flow");
+    expect(response.stats.truncated).toBe(false);
+  });
+
+  test("limit・fileCountLimit・timeBudget で打ち切る", () => {
+    const root = makeTempDir("session-search-limits");
+    const slug = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slug, { recursive: true });
+    for (let i = 0; i < 3; i += 1) {
+      fs.writeFileSync(
+        path.join(slug, `s${i}.jsonl`),
+        JSON.stringify({ type: "user", cwd: "/tmp/proj", message: { content: `needle ${i}` } }) + "\n",
+      );
+    }
+
+    const limited = searchClaudeSessions(new ClaudeSessionStore(root), "needle", { limit: 1 });
+    expect(limited.results).toHaveLength(1);
+
+    const fileCapped = searchClaudeSessions(new ClaudeSessionStore(root), "needle", { fileCountLimit: 1 });
+    expect(fileCapped.stats.truncated).toBe(true);
+    expect(fileCapped.stats.scannedFiles).toBe(1);
+
+    let now = 1000;
+    const timed = searchClaudeSessions(new ClaudeSessionStore(root), "needle", {
+      nowMs: () => {
+        now += 1000;
+        return now;
+      },
+      timeBudgetMs: 1,
+    });
+    expect(timed.stats.truncated).toBe(true);
   });
 });
 

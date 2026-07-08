@@ -42,12 +42,14 @@ import {
 import { claudeTranscriptActivityProvider } from "./sessionActivityProvider.js";
 import { SessionIdleTracker } from "./sessionIdleTracker.js";
 import { SessionListService } from "./sessionListService.js";
+import { searchClaudeSessions } from "./sessionSearch.js";
 import { SessionMetadataStore } from "./sessionMetadataStore.js";
 import { sleep } from "./sleep.js";
 import { TranscriptTailer } from "./transcriptTailer.js";
 import { TmuxSessionManager } from "./tmux.js";
 import { aggregateUsage, emptyUsageTotals } from "./usageAggregator.js";
 import { aggregateCodexUsage, type CodexUsage } from "./codexUsage.js";
+import { createStaleDistGuard, isStaleDist, readPackageVersion, type StaleDistGuard } from "./version.js";
 
 // MARK: - エントリポイント（cli から呼ばれる）
 
@@ -235,6 +237,10 @@ export interface RunEngineOptions {
   homeDir?: string;
   /** mode_get/mode_set の待機間隔（テストは短縮値を注入する）。 */
   modeTiming?: Partial<ModeTiming>;
+  /** 起動時 package version と現在の package version を比較する stale 判定（テスト注入用）。 */
+  staleDistGuard?: StaleDistGuard | null;
+  /** stale dist 検出時の通知（CLI では return によりプロセス終了、テストは観測用）。 */
+  onStaleDist?: () => void;
 }
 
 interface ModeTiming {
@@ -282,6 +288,8 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     planUsage = () => fetchPlanUsage(),
     homeDir = os.homedir(),
     modeTiming = {},
+    staleDistGuard = createStaleDistGuard(),
+    onStaleDist = undefined,
   } = options;
   const resolvedModeTiming: ModeTiming = { ...DEFAULT_MODE_TIMING, ...modeTiming };
 
@@ -317,7 +325,13 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
 
   try {
     // ---- 1. channel_hello を送出（確立直後）----
-    writer.write({ type: "channel_hello", v: PROTOCOL_V1, maxVersion });
+    const helloVersion = staleDistGuard?.startupVersion ?? readPackageVersion() ?? undefined;
+    writer.write({
+      type: "channel_hello",
+      v: PROTOCOL_V1,
+      maxVersion,
+      ...(helloVersion !== undefined ? { serverVersion: helloVersion } : {}),
+    });
 
     // ---- 1.5 画像 pending を drain し image_available を送出 ----
     if (imageService !== null) {
@@ -365,7 +379,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     const rl = readline.createInterface({ input: options.input, crlfDelay: Number.POSITIVE_INFINITY });
     try {
       for await (const line of rl) {
-        await handleLine(line, {
+        const didProcessMessage = await handleLine(line, {
           writer,
           state,
           sessionManager,
@@ -385,6 +399,11 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           modeTiming: resolvedModeTiming,
           defaultAgent: agent,
         });
+        if (didProcessMessage && isStaleDist(staleDistGuard)) {
+          process.stderr.write("[tailii-host engine] stale dist を検出、再起動のため終了\n");
+          onStaleDist?.();
+          break;
+        }
       }
     } finally {
       rl.close();
@@ -432,9 +451,9 @@ interface HandlerContext {
 }
 
 /** 1行（改行なし）をデコードし、メッセージ種別ごとに処理する。decode 失敗は破棄。 */
-async function handleLine(rawLine: string, ctx: HandlerContext): Promise<void> {
+async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean> {
   const trimmed = rawLine.replaceAll("\r", "");
-  if (!trimmed) return;
+  if (!trimmed) return false;
 
   let message: ControlMessage;
   try {
@@ -445,7 +464,7 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<void> {
       `engine decode 失敗（行破棄）: ${String(error)} 生=${trimmed.slice(0, 120)}`,
     );
     process.stderr.write(`[tailii-host engine] decode 失敗、行破棄: ${String(error)}\n`);
-    return;
+    return false;
   }
   ChatTailController.diag(`engine 受信 type=${message.type}`);
 
@@ -489,19 +508,36 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<void> {
           const meta = metadataStore?.get(message.name) ?? null;
           const openCwd = meta?.cwd ?? result.info.cwd;
           // セッション記録の agent（codex/claude）で tail mode を選ぶ。
-          chatTailController?.open(openCwd, null, null, meta?.agent ?? ctx.defaultAgent);
+          chatTailController?.open(
+            openCwd,
+            meta?.claudeSessionId ?? null,
+            null,
+            meta?.agent ?? ctx.defaultAgent,
+          );
         } else {
           const meta = metadataStore?.get(message.name) ?? null;
           if (ctx.resumeLauncher !== null && meta !== null) {
             // codex セッションは codex 用 resume launcher で再起動する。
             const reAgent = meta.agent ?? ctx.defaultAgent;
+            // claude で会話 id が記録済みなら通常 launcher の `--resume <id>` で同一会話を
+            // 厳密に再開する（resumeLauncher の `--continue` は cwd の最新会話を拾うため、
+            // 別会話を再開して tail 束縛と食い違い得る）。id 未記録の旧メタは従来経路。
+            const strictClaudeResume =
+              reAgent === "claude" && meta.claudeSessionId != null && ctx.launcher !== null;
             const chosenResume =
-              reAgent === "codex" ? (ctx.codexResumeLauncher ?? ctx.resumeLauncher) : ctx.resumeLauncher;
-            const res = await chosenResume(meta.cwd, message.name, null, null);
+              reAgent === "codex"
+                ? (ctx.codexResumeLauncher ?? ctx.resumeLauncher)
+                : strictClaudeResume
+                  ? ctx.launcher!
+                  : ctx.resumeLauncher;
+            const res = await chosenResume(
+              meta.cwd, message.name, null,
+              strictClaudeResume ? (meta.claudeSessionId ?? null) : null,
+            );
             if (res.exitCode === 0) {
               const info: SessionInfo = { name: message.name, cwd: meta.cwd, alive: true };
               writeSessionListResponse(writer, v, message.id, [info], null);
-              chatTailController?.open(meta.cwd, null, null, reAgent);
+              chatTailController?.open(meta.cwd, meta.claudeSessionId ?? null, null, reAgent);
             } else {
               const m = res.errorText || `resume 失敗 (exit ${res.exitCode})`;
               writeError(writer, v, message.id, "launch_failed", m);
@@ -837,6 +873,26 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<void> {
       break;
     }
 
+    case "session_search_request": {
+      // Claude 会話本文検索。長時間 read loop を塞がないよう検索関数側で件数/時間/読取量を制限する。
+      ChatTailController.diag(`session_search_request id=${message.id} query=${message.query}`);
+      const response =
+        ctx.claudeSessionStore !== null
+          ? searchClaudeSessions(ctx.claudeSessionStore, message.query, { limit: message.limit })
+          : { results: [], stats: { scannedFiles: 0, truncated: false } };
+      ChatTailController.diag(
+        `session_search_response id=${message.id} count=${response.results.length} scanned=${response.stats.scannedFiles} truncated=${response.stats.truncated}`,
+      );
+      try {
+        writer.write({ type: "session_search_response", v, id: message.id, results: response.results });
+      } catch (error) {
+        process.stderr.write(
+          `[tailii-host engine] session_search_response 書込失敗: ${String(error)}\n`,
+        );
+      }
+      break;
+    }
+
     case "dir_create_request": {
       // ディレクトリ作成。base 外/`..` 脱出は ok=false。
       const result = dirCreate(message.baseDir, message.relative);
@@ -856,6 +912,7 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<void> {
       // 承認2型・画像・chat_output などは engine 制御では処理しない（本タスク範囲外）。破棄。
       break;
   }
+  return true;
 }
 
 /**
