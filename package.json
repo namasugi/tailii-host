@@ -1,6 +1,6 @@
 {
   "name": "tailii-host",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Tailii host — control Claude Code / Codex sessions on your machine from the Tailii mobile app",
   "author": "Namasugi",
   "license": "MIT",
