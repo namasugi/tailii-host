@@ -65,12 +65,37 @@ export interface RunBrokerOptions {
  * unix socket と input/output の間を双方向中継する非解釈リレーの本体。
  * input EOF（SSH 断）で全クライアントを閉じ、socket ファイルを削除して resolve する。
  */
+/**
+ * `socketPath` に既に生きた listener がいるかを probe する（reject せず bool で返す）。
+ * 同一 session 名の serve が重複起動されうる（iOS 側の enterChat レース、または同一
+ * session を複数デバイスから同時に開いた場合）。無条件に unlink→listen すると生きている
+ * 側の listen 中ソケットを奪ってしまい、しかも Node の `net.Server.close()` は bind した
+ * パスを close 時に自動 unlink するため、奪われた側が閉じた瞬間に「今生きている方」の
+ * ソケットファイルまで消える（以後の hook connect が全て ECONNREFUSED になり、承認が
+ * 「考え中」のまま永久にハングする不具合の実根因）。奪う前に生存確認する。
+ */
+function isSocketAlive(socketPath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const probe = net.connect(socketPath);
+    probe.once("connect", () => {
+      probe.destroy();
+      resolve(true);
+    });
+    probe.once("error", () => resolve(false));
+  });
+}
+
 export async function runBroker(options: RunBrokerOptions): Promise<void> {
   const { socketPath, input, output } = options;
   const log = options.log ?? (() => {});
   const staleDistGuard = options.staleDistGuard ?? createStaleDistGuard();
 
-  // 既存 socket ファイルを削除してから listen（Swift 版 unlink→bind と同一）。
+  // 既存 socket ファイルが生きていれば奪わず諦める（上記コメント参照）。
+  // 生きていなければ（前回異常終了のスタール残骸）安全に削除して bind し直す
+  // （Swift 版 unlink→bind と同一の後始末）。
+  if (await isSocketAlive(socketPath)) {
+    throw new Error(`socket already in use by a live listener: ${socketPath}`);
+  }
   fs.rmSync(socketPath, { force: true });
 
   const clients = new Set<net.Socket>();
@@ -83,8 +108,10 @@ export async function runBroker(options: RunBrokerOptions): Promise<void> {
     if (registryClosed) return;
     registryClosed = true;
     for (const client of clients) client.end();
+    // `net.Server.close()` は bind したパスの socket ファイルを自前で unlink するため
+    // （Node 内部仕様）、ここで追加の fs.rmSync は不要（かつ、上の isSocketAlive ガードにより
+    // このプロセスは常にこのパスの正当な唯一の所有者として起動しているため安全）。
     server.close(() => {});
-    fs.rmSync(socketPath, { force: true });
     resolveBroker?.();
   };
 

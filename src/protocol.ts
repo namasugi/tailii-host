@@ -80,6 +80,8 @@ export interface SessionInfo {
   cwd: string;
   alive: boolean;
   updatedAt?: number;
+  /** Claude の会話 JSONL 名に対応する session-id。既知の live session 再利用に使う。 */
+  claudeSessionId?: string;
 }
 
 /** マシン内会話 1 件（claude=jsonl / codex=rollout）。 */
@@ -134,11 +136,14 @@ export interface QuestionAnswer {
 
 export type ChatRole = "assistant" | "user" | "system";
 export type Decision = "allow" | "deny";
+export type RemotePendingKind = "approval" | "question";
 
 export type ControlMessage =
   | { type: "channel_hello"; v: number; maxVersion: number; serverVersion?: string }
   | { type: "approval_request"; v: number; id: string; tool: string; summary: string; cwd: string; diff?: ToolDiff }
   | { type: "approval_decision"; v: number; id: string; decision: Decision; reason?: string }
+  | { type: "remote_pending"; v: number; id: string; session: string; kind: RemotePendingKind; tool?: string; summary: string }
+  | { type: "remote_pending_cleared"; v: number; id: string; session: string; kind: RemotePendingKind }
   | { type: "session_list_request"; v: number; id: string; limit?: number; cursor?: string }
   | { type: "session_list_response"; v: number; id: string; sessions: SessionInfo[]; nextCursor?: string }
   | { type: "session_start"; v: number; id: string; cwd: string; name: string; baseDir?: string; resumeSessionId?: string; title?: string; agentType?: "claude" | "codex"; codexModel?: string; codexSandbox?: "read-only" | "workspace-write" | "danger-full-access" }
@@ -327,6 +332,26 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
       });
     }
 
+    case "remote_pending": {
+      const kind = requireRemotePendingKind(raw);
+      return compact({
+        type, v,
+        id: requireString(raw, "id"),
+        session: requireString(raw, "session"),
+        kind,
+        tool: optionalString(raw, "tool"),
+        summary: requireString(raw, "summary"),
+      });
+    }
+
+    case "remote_pending_cleared":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        session: requireString(raw, "session"),
+        kind: requireRemotePendingKind(raw),
+      };
+
     case "session_list_request":
       return compact({
         type, v,
@@ -346,6 +371,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
             cwd: requireString(obj, "cwd"),
             alive: requireBoolean(obj, "alive"),
             updatedAt: optionalNumber(obj, "updatedAt"),
+            claudeSessionId: optionalString(obj, "claudeSessionId"),
           });
         }),
         nextCursor: optionalString(raw, "nextCursor"),
@@ -607,6 +633,14 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
     default:
       throw new ProtocolDecodeError("unknown-type", type);
   }
+}
+
+function requireRemotePendingKind(raw: Raw): RemotePendingKind {
+  const kind = requireString(raw, "kind");
+  if (kind !== "approval" && kind !== "question") {
+    throw new ProtocolDecodeError("missing-field", "kind");
+  }
+  return kind;
 }
 
 function decodeToolDiff(value: unknown): ToolDiff | undefined {

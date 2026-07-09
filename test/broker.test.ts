@@ -10,11 +10,14 @@
 import { afterEach, describe, expect, it } from "vitest";
 import * as fs from "node:fs";
 import type * as net from "node:net";
+import { PassThrough } from "node:stream";
+import { runBroker } from "../src/broker.js";
 import {
   connectUnixClient,
   ensureRegistered,
   SocketLineReader,
   startBroker,
+  tempSocketPath,
   writeLine,
   type BrokerHarness,
 } from "./socketHelpers.js";
@@ -211,5 +214,39 @@ describe("Broker — 双方向中継", () => {
     socket.destroy();
     await harness.done;
     expect(fs.existsSync(harness.socketPath)).toBe(false);
+  });
+
+  it("同一 session 名で serve が重複起動しても、後発は先発の生きたソケットを奪わず失敗する（承認ハング根治）", async () => {
+    // iOS 側の enterChat レース（reconnect と同時進入など）、または同一 session を複数
+    // デバイスから同時に開いた場合、同一 session 名の `serve --session <name>` が 2 プロセス
+    // 起動しうる。以前は後発が無条件に unlink→listen して先発のパスを奪い、しかも Node の
+    // `net.Server.close()` は bind したパスを close 時に自前で unlink するため、奪われた
+    // 先発が閉じた瞬間に「今生きている後発」のソケットファイルまで消えていた
+    // （以後の hook connect が全て ECONNREFUSED になり、承認が「考え中」のまま永久に
+    // ハングする不具合の実根因）。後発は先発が生きている間、奪わず起動失敗しなければならない。
+    const socketPath = tempSocketPath("dup-race");
+    const inputA = new PassThrough();
+    const outputA = new PassThrough();
+    const doneA = runBroker({ socketPath, input: inputA, output: outputA });
+    doneA.catch(() => {});
+    // 先発が listen を終えるまで待つ（接続できることで確認）。
+    (await connectUnixClient(socketPath)).destroy();
+
+    // 後発（reconnect 起点などで割り込んだ 2 本目の serve）は先発が生きているため起動失敗する。
+    const inputB = new PassThrough();
+    const outputB = new PassThrough();
+    await expect(runBroker({ socketPath, input: inputB, output: outputB })).rejects.toThrow(
+      /already in use/,
+    );
+
+    // 先発の socket ファイルは無傷で、新規 connect も引き続き成功しなければならない。
+    expect(fs.existsSync(socketPath)).toBe(true);
+    const stillReachable = await connectUnixClient(socketPath, 5);
+    clients.push(stillReachable);
+
+    // 先発自身が閉じれば、正しく削除される。
+    inputA.end();
+    await doneA;
+    expect(fs.existsSync(socketPath)).toBe(false);
   });
 });

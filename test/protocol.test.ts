@@ -160,6 +160,29 @@ describe("decode 詳細", () => {
       ts: 1783016361453,
     });
   });
+
+  it("remote_pending / remote_pending_cleared を復元する", () => {
+    expect(decodeControlMessage(
+      '{"id":"a1","kind":"approval","session":"work","summary":"Run Bash","tool":"Bash","type":"remote_pending","v":1}',
+    )).toEqual({
+      type: "remote_pending",
+      v: 1,
+      id: "a1",
+      session: "work",
+      kind: "approval",
+      tool: "Bash",
+      summary: "Run Bash",
+    });
+    expect(decodeControlMessage(
+      '{"id":"q1","kind":"question","session":"work","type":"remote_pending_cleared","v":1}',
+    )).toEqual({
+      type: "remote_pending_cleared",
+      v: 1,
+      id: "q1",
+      session: "work",
+      kind: "question",
+    });
+  });
 });
 
 describe("encode 詳細", () => {
@@ -268,5 +291,28 @@ describe("encode 詳細", () => {
     expect(
       encodeControlMessage({ type: "channel_hello", v: 2, maxVersion: 2 }),
     ).toBe('{"maxVersion":2,"type":"channel_hello","v":2}');
+  });
+
+  it("remote_pending / remote_pending_cleared を canonical key order でエンコードする", () => {
+    expect(encodeControlMessage({
+      type: "remote_pending",
+      v: 1,
+      id: "a1",
+      session: "work",
+      kind: "approval",
+      tool: "Bash",
+      summary: "Run Bash",
+    })).toBe(
+      '{"id":"a1","kind":"approval","session":"work","summary":"Run Bash","tool":"Bash","type":"remote_pending","v":1}',
+    );
+    expect(encodeControlMessage({
+      type: "remote_pending_cleared",
+      v: 1,
+      id: "q1",
+      session: "work",
+      kind: "question",
+    })).toBe(
+      '{"id":"q1","kind":"question","session":"work","type":"remote_pending_cleared","v":1}',
+    );
   });
 });

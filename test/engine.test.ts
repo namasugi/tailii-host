@@ -5,6 +5,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { ImageService } from "../src/imageService.js";
+import { sendRemotePendingToEngine } from "../src/engineRelaySocket.js";
 import type { EngineLauncher } from "../src/launch.js";
 import { ClaudeSessionStore } from "../src/claudeSessionStore.js";
 import { decodeControlMessage } from "../src/protocol.js";
@@ -19,6 +20,7 @@ import {
   startEngine,
   waitForCommand,
 } from "./helpers.js";
+import { canListenUnixSocket, tempSocketPath } from "./socketHelpers.js";
 
 function makeManager(runner: MockTmuxRunner, store = makeTempStore()): TmuxSessionManager {
   return new TmuxSessionManager({ runner: runner.runner, store });
@@ -38,6 +40,81 @@ describe("EngineControl — 横断制御チャネル", () => {
     expect(hello).toContain('"v":1');
 
     engine.writeLine('{"maxVersion":1,"type":"channel_hello","v":1}');
+    await engine.teardown();
+  });
+
+  test("engine relay socket で受けた remote_pending を engine チャネルへ流す", async () => {
+    if (!(await canListenUnixSocket())) return;
+    const relayPath = tempSocketPath("engine-remote-pending");
+    fs.rmSync(relayPath, { force: true });
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({
+      sessionManager: makeManager(runner),
+      engineRelaySocketPath: relayPath,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    await sendRemotePendingToEngine({
+      type: "remote_pending",
+      v: 1,
+      id: "a1",
+      session: "other",
+      kind: "approval",
+      tool: "Bash",
+      summary: "Bash: echo hi",
+    }, relayPath);
+
+    expect(await engine.lines.nextOfType("remote_pending")).toBe(
+      '{"id":"a1","kind":"approval","session":"other","summary":"Bash: echo hi","tool":"Bash","type":"remote_pending","v":2}',
+    );
+    await engine.teardown();
+    fs.rmSync(relayPath, { force: true });
+  });
+
+  test("別 live session の新規 question_prompt を remote_pending として流す", async () => {
+    const projectsRoot = makeTempDir("tailii-question-projects");
+    const cwd = makeTempDir("tailii-question-cwd");
+    const slug = fs.realpathSync.native(cwd).replaceAll("/", "-");
+    const projectDir = path.join(projectsRoot, slug);
+    fs.mkdirSync(projectDir, { recursive: true });
+    const transcriptPath = path.join(projectDir, "qsess.jsonl");
+    fs.writeFileSync(transcriptPath, '{"type":"user","message":{"role":"user","content":"hi"},"uuid":"u0"}\n');
+
+    const store = makeTempStore();
+    store.put({ name: "other", cwd, createdAt: 1, agent: "claude", claudeSessionId: "qsess" });
+    const runner = new MockTmuxRunner((args) => (args[0] === "ls" ? ok("other\n") : ok("")));
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store),
+      metadataStore: store,
+      chatTailProjectsRoot: projectsRoot,
+      remoteQuestionPollMs: 20,
+    });
+    await engine.lines.nextOfType("channel_hello");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    fs.appendFileSync(transcriptPath, JSON.stringify({
+      message: {
+        role: "assistant",
+        content: [{
+          type: "tool_use",
+          id: "toolu_q_remote",
+          name: "AskUserQuestion",
+          input: {
+            questions: [{
+              question: "どちらにしますか?",
+              header: "選択",
+              multiSelect: false,
+              options: [{ label: "A", description: "前者" }],
+            }],
+          },
+        }],
+      },
+      uuid: "a1",
+    }) + "\n");
+
+    expect(await engine.lines.nextOfType("remote_pending", 5000)).toBe(
+      '{"id":"toolu_q_remote","kind":"question","session":"other","summary":"どちらにしますか?","type":"remote_pending","v":1}',
+    );
     await engine.teardown();
   });
 
@@ -246,6 +323,43 @@ describe("EngineControl — 横断制御チャネル", () => {
     expect(resumed[3]).toBe("keep-me");
     expect(resumed[4]).toBeNull();
     expect(resumed[5]).toBeNull();
+
+    await engine.teardown();
+  });
+
+  test("session_start resume は同じ claudeSessionId の生存セッション名を返し、rename せず二重起動しない", async () => {
+    const store = makeTempStore();
+    const sessionId = "f622acb5-1111-2222-3333-444444444444";
+    store.put({ name: "s-c0de7369", cwd: "/tmp/fresh-dir", createdAt: 7, claudeSessionId: sessionId });
+    const runner = new MockTmuxRunner((args) => {
+      if (args[0] === "ls") return ok("s-c0de7369\n");
+      return ok("");
+    });
+    const launcherCalls: string[] = [];
+    const launcher: EngineLauncher = async (_cwd, name) => {
+      launcherCalls.push(name);
+      return { exitCode: 0, errorText: "" };
+    };
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store),
+      metadataStore: store,
+      launcher,
+    });
+
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine(
+      `{"cwd":"/tmp/fresh-dir","id":"S-resume","name":"cs-f622acb5","resumeSessionId":"${sessionId}","type":"session_start","v":1}`,
+    );
+
+    const resp = await engine.lines.nextOfType("session_list_response");
+    expect(resp).toContain('"id":"S-resume"');
+    expect(resp).toContain('"name":"s-c0de7369"');
+    expect(resp).toContain(`"claudeSessionId":"${sessionId}"`);
+    expect(resp).not.toContain('"name":"cs-f622acb5"');
+    expect(runner.recorded).not.toContainEqual(["rename-session", "-t", "s-c0de7369", "cs-f622acb5"]);
+    expect(launcherCalls).toEqual([]);
+    expect(store.get("s-c0de7369")?.claudeSessionId).toBe(sessionId);
+    expect(store.get("cs-f622acb5")).toBeNull();
 
     await engine.teardown();
   });

@@ -26,6 +26,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { makeProductionPushNotifier } from "./approvalPushNotifier.js";
+import { sendRemotePendingToEngine } from "./engineRelaySocket.js";
 import { ObservationLog, defaultObservationBase } from "./observationLog.js";
 import { resolveSocketPath } from "./socketPath.js";
 import { sleep } from "./sleep.js";
@@ -95,6 +96,8 @@ export interface RunHookOptions {
   notifier?: ApprovalPushNotifier;
   /** push 送信部の時間上限（ms）。gate 非阻害のためこの時間で打ち切る。既定 5000。 */
   notifierTimeLimitMs?: number;
+  /** connect 不能時に engine relay へ通知する socket path。省略時は既定パス。null なら送らない。 */
+  engineRelaySocketPath?: string | null;
   /** connect 不能ブランチでの retry-connect ポーリング間隔（秒）。既定 1.0。 */
   retryConnectIntervalSeconds?: number;
 }
@@ -137,17 +140,29 @@ export async function runHookCore(options: RunHookOptions): Promise<HookRunResul
   }
 
   // === connect 不能ブランチ（Req 2.1 / 8.1〜8.3） ===
+  const unavailableApprovalId = randomUUID();
+  if (options.engineRelaySocketPath !== null) {
+    await sendRemotePendingToEngine({
+      type: "remote_pending",
+      v: PROTOCOL_V1,
+      id: unavailableApprovalId,
+      session,
+      kind: "approval",
+      tool: parsed.toolName,
+      summary,
+    }, options.engineRelaySocketPath).catch(() => {});
+  }
   if (options.notifier) {
     await sendBackgroundPush(
       options.notifier,
-      { approvalId: randomUUID(), tool: parsed.toolName, session },
+      { approvalId: unavailableApprovalId, tool: parsed.toolName, session },
       options.notifierTimeLimitMs ?? 5000,
     );
   }
 
   const reconnected = await retryConnect(options.socketPath, deadlineAtMs, retryIntervalSeconds);
   if (reconnected) {
-    return sendRequestAndReflect(reconnected, parsed, summary, diff, options, deadlineAtMs);
+    return sendRequestAndReflect(reconnected, parsed, summary, diff, options, deadlineAtMs, unavailableApprovalId);
   }
 
   // 内部デッドライン内に一度も再接続できなかった → 安全側 deny（8.3）。
@@ -163,9 +178,10 @@ async function sendRequestAndReflect(
   diff: ToolDiff | undefined,
   options: RunHookOptions,
   deadlineAtMs: number,
+  requestIdOverride?: string,
 ): Promise<HookRunResult> {
   try {
-    const requestId = randomUUID();
+    const requestId = requestIdOverride ?? randomUUID();
 
     // 画像パス検出 → pending キュー投入（非ブロッキング・リサイズなし, 8.1/8.2/8.5）。
     if (options.imagesPendingBase !== undefined) {
@@ -191,17 +207,35 @@ async function sendRequestAndReflect(
     const outcome = await waitForDecision(socket, requestId, deadlineAtMs);
     switch (outcome.kind) {
       case "allow":
+        await clearRemotePendingIfNeeded(requestId, options);
         return allow(outcome.reason ?? "Approved on iPhone");
       case "deny":
+        await clearRemotePendingIfNeeded(requestId, options);
         return deny(outcome.reason ?? "Denied on iPhone");
       case "timeout":
+        await clearRemotePendingIfNeeded(requestId, options);
         return deny(`No response within ${Math.round(options.deadlineSeconds)}s`);
       case "disconnected":
+        await clearRemotePendingIfNeeded(requestId, options);
         return deny("iPhone disconnected");
     }
   } finally {
     socket.destroy();
   }
+}
+
+async function clearRemotePendingIfNeeded(
+  id: string,
+  options: RunHookOptions,
+): Promise<void> {
+  if (options.engineRelaySocketPath === null) return;
+  await sendRemotePendingToEngine({
+    type: "remote_pending_cleared",
+    v: PROTOCOL_V1,
+    id,
+    session: options.session ?? "default",
+    kind: "approval",
+  }, options.engineRelaySocketPath).catch(() => {});
 }
 
 // MARK: - 決定待機

@@ -113,6 +113,7 @@ export function startEngine(
   const done = runEngine({
     input,
     output,
+    engineRelaySocketPath: options.engineRelaySocketPath ?? null,
     // テストの既定はプラン使用状況なし（ネットワーク非依存）。個別テストで上書き可能。
     planUsage: options.planUsage ?? (async () => null),
     ...options,

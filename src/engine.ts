@@ -26,9 +26,11 @@ import { CodexSessionStore } from "./codexSessionStore.js";
 import { dirChildren, dirCreate, dirList } from "./dirLister.js";
 import { runIdleReaper } from "./idleReaper.js";
 import { ImageService } from "./imageService.js";
+import { startEngineRelaySocket, type EngineRelayServer } from "./engineRelaySocket.js";
 import { makeSessionLauncher, codexInnerCommand, type EngineLauncher } from "./launch.js";
 import { LineWriter } from "./lineWriter.js";
 import { parsePermissionMode } from "./permissionMode.js";
+import { RemoteQuestionMonitor } from "./remoteQuestionMonitor.js";
 import { fetchPlanUsage, type PlanUsageProvider } from "./planUsageFetcher.js";
 import {
   decodeControlMessage,
@@ -248,6 +250,10 @@ export interface RunEngineOptions {
   staleDistGuard?: StaleDistGuard | null;
   /** stale dist 検出時の通知（CLI では return によりプロセス終了、テストは観測用）。 */
   onStaleDist?: () => void;
+  /** hook → engine remote_pending relay の socket path。null なら relay listener を起動しない。 */
+  engineRelaySocketPath?: string | null;
+  /** remote question monitor のポーリング間隔（テスト短縮用）。 */
+  remoteQuestionPollMs?: number;
 }
 
 interface ModeTiming {
@@ -297,6 +303,8 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     modeTiming = {},
     staleDistGuard = createStaleDistGuard(),
     onStaleDist = undefined,
+    engineRelaySocketPath = undefined,
+    remoteQuestionPollMs = undefined,
   } = options;
   const resolvedModeTiming: ModeTiming = { ...DEFAULT_MODE_TIMING, ...modeTiming };
 
@@ -329,6 +337,19 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
 
   const lifecycleAbort = new AbortController();
   const background: Promise<unknown>[] = [];
+  const activeChatSession: { name: string | null } = { name: null };
+  let relayServer: EngineRelayServer | null = null;
+  const remoteQuestionMonitor =
+    metadataStore !== null && chatTailProjectsRoot !== null
+      ? new RemoteQuestionMonitor({
+          sessionManager,
+          metadataStore,
+          projectsRoot: chatTailProjectsRoot,
+          writer,
+          activeSession: () => activeChatSession.name,
+          ...(remoteQuestionPollMs !== undefined ? { pollIntervalMs: remoteQuestionPollMs } : {}),
+        })
+      : null;
 
   try {
     // ---- 1. channel_hello を送出（確立直後）----
@@ -346,6 +367,21 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
         writer.write(message);
       }
     }
+
+    if (engineRelaySocketPath !== null) {
+      relayServer = await startEngineRelaySocket({
+        ...(engineRelaySocketPath !== undefined ? { socketPath: engineRelaySocketPath } : {}),
+        onMessage: (message) => {
+          try {
+            writer.write({ ...message, v: state.negotiatedVersion });
+          } catch (error) {
+            process.stderr.write(`[tailii-host engine] remote_pending 書込失敗: ${String(error)}\n`);
+          }
+        },
+        log: (message) => process.stderr.write(message),
+      });
+    }
+    remoteQuestionMonitor?.start();
 
     // ---- 1.6 会話出力 tail を開始し chat_output を engine チャネルへ逐次送出 ----
     if (transcriptTailer !== null && transcriptPath !== null) {
@@ -405,6 +441,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           homeDir,
           modeTiming: resolvedModeTiming,
           defaultAgent: agent,
+          activeChatSession,
         });
         if (didProcessMessage && isStaleDist(staleDistGuard)) {
           process.stderr.write("[tailii-host engine] stale dist を検出、再起動のため終了\n");
@@ -419,6 +456,8 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
   } finally {
     // ---- 3. チャネル断で chat_output tail / reaper を確実に停止する（全経路） ----
     lifecycleAbort.abort();
+    await relayServer?.close();
+    remoteQuestionMonitor?.stop();
     chatTailController?.stop();
     await Promise.allSettled(background);
   }
@@ -455,6 +494,7 @@ interface HandlerContext {
   modeTiming: ModeTiming;
   /** host 側の既定エージェント（session_start が agentType を指定しないときのフォールバック）。 */
   defaultAgent: ChatAgent;
+  activeChatSession: { name: string | null };
 }
 
 /** 1行（改行なし）をデコードし、メッセージ種別ごとに処理する。decode 失敗は破棄。 */
@@ -514,6 +554,7 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
           writeSessionListResponse(writer, v, message.id, [result.info], null);
           const meta = metadataStore?.get(message.name) ?? null;
           const openCwd = meta?.cwd ?? result.info.cwd;
+          ctx.activeChatSession.name = message.name;
           // セッション記録の agent（codex/claude）で tail mode を選ぶ。
           chatTailController?.open(
             openCwd,
@@ -544,6 +585,7 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
             if (res.exitCode === 0) {
               const info: SessionInfo = { name: message.name, cwd: meta.cwd, alive: true };
               writeSessionListResponse(writer, v, message.id, [info], null);
+              ctx.activeChatSession.name = message.name;
               chatTailController?.open(meta.cwd, meta.claudeSessionId ?? null, null, reAgent);
             } else {
               const m = res.errorText || `resume 失敗 (exit ${res.exitCode})`;
@@ -584,6 +626,7 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
     case "session_idle_hint": {
       // アイドル起点を記録する（chat 離脱, 要件 4.2）。以後 reaper が timeout 超過で kill する。
       ctx.idleTracker?.markIdle(message.name, Math.floor(Date.now() / 1000));
+      if (ctx.activeChatSession.name === message.name) ctx.activeChatSession.name = null;
       break;
     }
 
@@ -610,13 +653,34 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
         sessionAgent === "codex"
           ? (perSessionCodexLauncher ?? ctx.codexLauncher ?? ctx.launcher)
           : ctx.launcher;
+      const resumeSessionId = message.resumeSessionId ?? null;
+      if (sessionAgent === "claude" && resumeSessionId !== null && metadataStore !== null) {
+        const aliases = await sessionManager.list();
+        const liveAlias = aliases.find((info) => {
+          if (!info.alive || info.name === message.name) return false;
+          return metadataStore.get(info.name)?.claudeSessionId === resumeSessionId;
+        });
+        if (liveAlias !== undefined) {
+          ChatTailController.diag(
+            `session_start resume alias reuse existing=${liveAlias.name} requested=${message.name} claudeSessionId=${resumeSessionId}`,
+          );
+          ctx.activeChatSession.name = liveAlias.name;
+          chatTailController?.open(liveAlias.cwd, resumeSessionId, null, sessionAgent);
+          try {
+            const sessions = await sessionManager.list();
+            writeSessionListResponse(writer, v, message.id, sessions, null);
+          } catch {
+            writeSessionListResponse(writer, v, message.id, [liveAlias], null);
+          }
+          break;
+        }
+      }
       if (chosenLauncher === null) {
         // 未注入（テスト構成漏れ等）: 安全側 — 実起動せず構造化 error を返す。
         process.stderr.write("[tailii-host engine] session_start: launcher 未構成\n");
         writeError(writer, v, message.id, "launch_failed", "launch 機能が構成されていません。");
         break;
       }
-      const resumeSessionId = message.resumeSessionId ?? null;
       // 新規起動は host 生成の session-id で claude を起動し（`--session-id <uuid>`）、
       // 会話 jsonl 名を事前に確定させる。tail はその id の jsonl だけを追うため、同一 cwd に
       // 別の稼働セッションがあっても、そのログが新セッションへ流れ込まない（取り違え防止）。
@@ -638,6 +702,7 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
       if (result.exitCode === 0) {
         // cwd は launcher が権威記録した解決後 cwd（メタ）を優先。
         const openCwd = metadataStore?.get(message.name)?.cwd ?? message.cwd;
+        ctx.activeChatSession.name = message.name;
         // tail は確定した会話 id（resume=既存 id / 新規=生成 id）だけを追う。newerThanMs は
         // codex（mtime 解決）の新規起動でのみ効き、claude は preferred で厳密束縛される。
         chatTailController?.open(
@@ -731,6 +796,13 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
     case "question_answer": {
       try {
         await injectQuestionAnswers(message.answers, message.session, sessionManager);
+        writer.write({
+          type: "remote_pending_cleared",
+          v,
+          id: message.id,
+          session: message.session,
+          kind: "question",
+        });
       } catch (error) {
         writeError(writer, v, message.id, "question_answer_failed", String(error));
       }

@@ -83,7 +83,11 @@ export class TmuxSessionManager {
     const metas = this.store.all();
 
     const cwdByName = new Map<string, string>();
-    for (const meta of metas) cwdByName.set(meta.name, meta.cwd);
+    const claudeSessionIdByName = new Map<string, string>();
+    for (const meta of metas) {
+      cwdByName.set(meta.name, meta.cwd);
+      if (meta.claudeSessionId !== undefined) claudeSessionIdByName.set(meta.name, meta.claudeSessionId);
+    }
 
     const names = new Set<string>(alive);
     for (const meta of metas) names.add(meta.name);
@@ -92,6 +96,7 @@ export class TmuxSessionManager {
       name,
       cwd: cwdByName.get(name) ?? "",
       alive: alive.has(name),
+      ...(claudeSessionIdByName.has(name) ? { claudeSessionId: claudeSessionIdByName.get(name)! } : {}),
     }));
     return infos.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   }

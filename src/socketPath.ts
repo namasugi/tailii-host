@@ -43,6 +43,17 @@ export function resolveSocketPath(session: string, base?: string): string {
   return path.join(baseDir, `${session}.sock`);
 }
 
+/** engine 常駐プロセスが foreground relay 用に listen する session 非依存 socket。 */
+export function resolveEngineRelaySocketPath(base?: string): string {
+  const baseDir = base ?? defaultSocketBase();
+  try {
+    ensureDirectory0700(baseDir);
+  } catch (error) {
+    throw new SocketPathError("directory-creation-failed", `${baseDir}: ${String(error)}`);
+  }
+  return path.join(baseDir, "engine-relay.sock");
+}
+
 /** session 名が安全かどうかを検証する（Swift 版 validateSessionName と同一規約）。 */
 function validateSessionName(session: string): void {
   if (session.length === 0) {

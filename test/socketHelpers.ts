@@ -14,6 +14,26 @@ export function tempSocketPath(suffix: string): string {
   return `${os.tmpdir()}/pc-${suffix}-${process.pid}.sock`;
 }
 
+/** sandbox によって unix socket listen が禁止されている環境を検出する。 */
+export async function canListenUnixSocket(): Promise<boolean> {
+  const socketPath = tempSocketPath(`probe-${Date.now()}`);
+  const server = net.createServer();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(socketPath, () => {
+        server.removeListener("error", reject);
+        resolve();
+      });
+    });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
 /** unix domain socket に接続するクライアントを開く（listen 開始前でもリトライで待つ）。 */
 export async function connectUnixClient(socketPath: string, retries = 50): Promise<net.Socket> {
   for (let attempt = 0; attempt < retries; attempt += 1) {

@@ -25,6 +25,7 @@ import {
 import { decodeControlMessage, type ControlMessage } from "../src/protocol.js";
 import {
   SocketLineReader,
+  canListenUnixSocket,
   startListener,
   tempSocketPath,
   writeLine,
@@ -572,6 +573,7 @@ describe("Hook — 待機延長・retry-connect（Req 8.1/8.2/8.3）", () => {
       session: "sess-reconnect-1",
       notifier: spy.notifier,
       notifierTimeLimitMs: 1000,
+      engineRelaySocketPath: null,
       retryConnectIntervalSeconds: 0.05,
     });
     const message = await served;
@@ -598,6 +600,7 @@ describe("Hook — 待機延長・retry-connect（Req 8.1/8.2/8.3）", () => {
       session: "sess-reconnect-2",
       notifier: spy.notifier,
       notifierTimeLimitMs: 1000,
+      engineRelaySocketPath: null,
       retryConnectIntervalSeconds: 0.05,
     });
     await served;
@@ -621,6 +624,7 @@ describe("Hook — 待機延長・retry-connect（Req 8.1/8.2/8.3）", () => {
       session: "sess-reconnect-3",
       notifier: spy.notifier,
       notifierTimeLimitMs: 1000,
+      engineRelaySocketPath: null,
       retryConnectIntervalSeconds: 0.05,
     });
     const elapsed = (Date.now() - start) / 1000;
@@ -635,6 +639,41 @@ describe("Hook — 待機延長・retry-connect（Req 8.1/8.2/8.3）", () => {
     expect(spy.calls.length).toBe(1);
   });
 
+  it("connect 不能 → engine relay socket へ remote_pending を best-effort 送出する", async () => {
+    if (!(await canListenUnixSocket())) return;
+    socketPath = tempSocketPath(`relay-target-${randomUUID().slice(0, 8)}`);
+    const relayPath = tempSocketPath(`engine-relay-${randomUUID().slice(0, 8)}`);
+    fs.rmSync(socketPath, { force: true });
+    fs.rmSync(relayPath, { force: true });
+    const relay = await startListener(relayPath);
+    try {
+      const run = runHookCore({
+        stdinData: bashPreToolUse("echo relay", "/work"),
+        socketPath,
+        deadlineSeconds: 0.4,
+        session: "sess-relay",
+        engineRelaySocketPath: relayPath,
+        retryConnectIntervalSeconds: 0.05,
+      });
+      const socket = await relay.nextConnection();
+      const reader = new SocketLineReader(socket);
+      const pending = decodeControlMessage(await reader.nextLine());
+      const { stdout } = await run;
+
+      expect(pending).toMatchObject({
+        type: "remote_pending",
+        session: "sess-relay",
+        kind: "approval",
+        tool: "Bash",
+        summary: "echo relay",
+      });
+      expect(parseDecision(stdout).decision).toBe("deny");
+    } finally {
+      await relay.close();
+      fs.rmSync(relayPath, { force: true });
+    }
+  });
+
   it("notifier 無しでも connect 不能→retry-connect→deadline deny（後方互換・8.3）", async () => {
     socketPath = tempSocketPath(`reconnect-nilnotif-${randomUUID().slice(0, 8)}`);
     fs.rmSync(socketPath, { force: true });
@@ -645,6 +684,7 @@ describe("Hook — 待機延長・retry-connect（Req 8.1/8.2/8.3）", () => {
       socketPath,
       deadlineSeconds: 0.5,
       session: "sess-reconnect-4",
+      engineRelaySocketPath: null,
       retryConnectIntervalSeconds: 0.05,
     });
     const elapsed = (Date.now() - start) / 1000;
