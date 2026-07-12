@@ -3,7 +3,7 @@
 //
 // claude の ClaudeSessionStore に対応する codex 版。`ClaudeSessionStore` が
 // `~/.claude/projects/**.jsonl` を列挙するのに対し、codex は 2 ソースを突合する:
-//   1. `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` の先頭 `session_meta` 行 → { id, cwd, timestamp }
+//   1. `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` の先頭 `session_meta` 行 → { id, cwd, timestamp, source }
 //   2. `~/.codex/session_index.jsonl` の各行 → { id, thread_name(=タイトル), updated_at }
 // session UUID(id) をキーに結合し、`ClaudeSessionInfo`（agent:"codex"）へ落として updatedAt 降順で返す。
 //
@@ -18,12 +18,19 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ClaudeSessionInfo } from "./protocol.js";
 import { isInsideBase } from "./paths.js";
+import type { CodexAppServerManager, CodexAppServerThreadInfo } from "./codexAppServer.js";
 
 /** session_meta 先頭行を読む最大バイト数（先頭 1 行のみ使用。base_instructions を含み得るため広め）。 */
 const META_READ_LIMIT_BYTES = 512 * 1024;
 /** タイトルの最大長（claude と揃える）。 */
 const TITLE_MAX_LENGTH = 60;
-/** 走査する rollout の上限（mtime 新しい順）。大量セッション時の I/O 保護。 */
+/** 最終メッセージプレビューの最大長（一覧行の 1 行スニペット。claude の list-preview と揃える）。 */
+const LAST_MESSAGE_MAX_LENGTH = 80;
+/** 最終メッセージの後方スキャンの 1 回分の読み幅。 */
+const TAIL_CHUNK_BYTES = 16 * 1024;
+/** 最終メッセージの後方スキャンの上限バイト数（token_count 等が延々続くファイルへの保険）。 */
+const TAIL_BYTES_CAP = 256 * 1024;
+/** 返す対話セッションの上限（mtime 新しい順）。 */
 const DEFAULT_MAX_SESSIONS = 200;
 
 /** 既定の codex ホーム（`~/.codex`）。 */
@@ -36,6 +43,12 @@ interface IndexEntry {
   updatedAt: number | null;
 }
 
+interface RolloutEntry {
+  path: string;
+  cwd: string | null;
+  isBackgroundSession: boolean;
+}
+
 /** codex のマシン内会話一覧を導出する値型サービス（agent-tag）。 */
 export class CodexSessionStore {
   private readonly sessionsRoot: string;
@@ -44,7 +57,7 @@ export class CodexSessionStore {
 
   /**
    * @param home codex ホーム（既定 `~/.codex`）。テストは一時 dir を注入する。
-   * @param maxSessions 走査上限（既定 200、mtime 新しい順）。
+   * @param maxSessions 返却上限（既定 200、mtime 新しい順）。
    */
   constructor(home?: string, maxSessions: number = DEFAULT_MAX_SESSIONS) {
     const base = home ?? defaultCodexHome();
@@ -59,15 +72,14 @@ export class CodexSessionStore {
    */
   list(baseDir?: string): ClaudeSessionInfo[] {
     const index = this.readIndex();
-    const files = this.listRollouts()
-      .sort((a, b) => b.mtimeMs - a.mtimeMs)
-      .slice(0, this.maxSessions);
+    const files = this.listRollouts().sort((a, b) => b.mtimeMs - a.mtimeMs);
 
     let result: ClaudeSessionInfo[] = [];
     const seen = new Set<string>();
     for (const file of files) {
+      if (result.length >= this.maxSessions) break;
       const meta = readSessionMeta(file.path);
-      if (meta === null || meta.cwd === null) continue;
+      if (meta === null || meta.cwd === null || meta.isBackgroundSession) continue;
       const sessionId = meta.id ?? path.basename(file.path);
       if (seen.has(sessionId)) continue;
       seen.add(sessionId);
@@ -86,11 +98,10 @@ export class CodexSessionStore {
         agent: "codex",
       };
       if (updatedAt !== undefined) info.updatedAt = updatedAt;
+      if (baseDir && !isInsideBase(info.cwd, baseDir)) continue;
+      const lastMessage = readLastRolloutMessage(file.path);
+      if (lastMessage !== null) info.lastMessage = lastMessage;
       result.push(info);
-    }
-
-    if (baseDir) {
-      result = result.filter((info) => isInsideBase(info.cwd, baseDir));
     }
 
     return result.sort((lhs, rhs) => {
@@ -99,6 +110,72 @@ export class CodexSessionStore {
       if (l !== r) return r - l;
       return lhs.sessionId < rhs.sessionId ? -1 : lhs.sessionId > rhs.sessionId ? 1 : 0;
     });
+  }
+
+  /**
+   * 稼働中の App Server を権威に一覧を返す。不達・停止中・不正応答は rollout 一覧へ完全に戻す。
+   * この経路は App Server を起動しない。
+   */
+  async listWithAppServer(
+    appServer: Pick<CodexAppServerManager, "listThreads">,
+    baseDir?: string,
+  ): Promise<ClaudeSessionInfo[]> {
+    try {
+      const threads = await appServer.listThreads(this.maxSessions);
+      if (threads === null) return this.list(baseDir);
+      return this.mapAppServerThreads(threads, baseDir);
+    } catch {
+      return this.list(baseDir);
+    }
+  }
+
+  private mapAppServerThreads(
+    threads: readonly CodexAppServerThreadInfo[],
+    baseDir?: string,
+  ): ClaudeSessionInfo[] {
+    const rollouts = this.rolloutsById();
+    const result: ClaudeSessionInfo[] = [];
+    const seen = new Set<string>();
+    for (const thread of threads) {
+      if (result.length >= this.maxSessions) break;
+      if (seen.has(thread.id) || isBackgroundThread(thread)) continue;
+      seen.add(thread.id);
+
+      const rollout = rollouts.get(thread.id);
+      if (rollout?.isBackgroundSession === true) continue;
+      const cwd = thread.cwd ?? rollout?.cwd ?? null;
+      if (cwd === null || (baseDir !== undefined && !isInsideBase(cwd, baseDir))) continue;
+      const fallbackTitle = rollout === undefined ? null : readFirstUserMessage(rollout.path);
+      const rawTitle = nonEmptyString(thread.name) ?? nonEmptyString(thread.preview);
+      const info: ClaudeSessionInfo = {
+        sessionId: thread.id,
+        cwd,
+        title: rawTitle === null ? (fallbackTitle ?? thread.id.slice(0, 8)) : normalizeTitle(rawTitle),
+        updatedAt: Math.floor(thread.updatedAt),
+        agent: "codex",
+      };
+      if (rollout !== undefined) {
+        const lastMessage = readLastRolloutMessage(rollout.path);
+        if (lastMessage !== null) info.lastMessage = lastMessage;
+      }
+      result.push(info);
+    }
+    return result.sort(compareSessions);
+  }
+
+  private rolloutsById(): Map<string, RolloutEntry> {
+    const result = new Map<string, RolloutEntry>();
+    const files = this.listRollouts().sort((a, b) => b.mtimeMs - a.mtimeMs);
+    for (const file of files) {
+      const meta = readSessionMeta(file.path);
+      if (meta?.id === null || meta === null || result.has(meta.id)) continue;
+      result.set(meta.id, {
+        path: file.path,
+        cwd: meta.cwd,
+        isBackgroundSession: meta.isBackgroundSession,
+      });
+    }
+    return result;
   }
 
   /** `session_index.jsonl` を id → { title, updatedAt(秒) } に読む（無ければ空マップ）。 */
@@ -166,10 +243,15 @@ export class CodexSessionStore {
   }
 }
 
-/** rollout の先頭 `session_meta` 行から { id, cwd, timestamp } を読む。読めなければ null。 */
+/** rollout の先頭 `session_meta` 行から会話メタデータを読む。読めなければ null。 */
 function readSessionMeta(
   rolloutPath: string,
-): { id: string | null; cwd: string | null; timestamp: string | null } | null {
+): {
+  id: string | null;
+  cwd: string | null;
+  timestamp: string | null;
+  isBackgroundSession: boolean;
+} | null {
   let fd: number;
   try {
     fd = fs.openSync(rolloutPath, "r");
@@ -197,7 +279,14 @@ function readSessionMeta(
     const id = typeof p["id"] === "string" && p["id"].length > 0 ? (p["id"] as string) : null;
     const cwd = typeof p["cwd"] === "string" && p["cwd"].length > 0 ? (p["cwd"] as string) : null;
     const timestamp = typeof p["timestamp"] === "string" ? (p["timestamp"] as string) : null;
-    return { id, cwd, timestamp };
+    const source = p["source"];
+    // `exec` は一回限りの非対話ジョブ、object.subagent は親会話から派生した内部スレッド。
+    // どちらも Codex の再開可能なユーザー会話一覧には出さない。
+    const isBackgroundSession =
+      source === "exec" ||
+      source === "subagent" ||
+      (typeof source === "object" && source !== null && "subagent" in source);
+    return { id, cwd, timestamp, isBackgroundSession };
   } catch {
     return null;
   } finally {
@@ -263,7 +352,88 @@ function readFirstUserMessage(rolloutPath: string): string | null {
 
 /** タイトルを 1 行・先頭 ~60 字へ整形する。 */
 function normalizeTitle(raw: string): string {
+  return normalizeSnippet(raw, TITLE_MAX_LENGTH);
+}
+
+function nonEmptyString(value: string | null): string | null {
+  return value !== null && value.trim().length > 0 ? value : null;
+}
+
+function isBackgroundThread(thread: CodexAppServerThreadInfo): boolean {
+  if (thread.parentThreadId !== null || thread.source === "exec" || thread.source === "subagent") return true;
+  return typeof thread.source === "object" && thread.source !== null && "subAgent" in thread.source;
+}
+
+function compareSessions(lhs: ClaudeSessionInfo, rhs: ClaudeSessionInfo): number {
+  const l = lhs.updatedAt ?? Number.MIN_SAFE_INTEGER;
+  const r = rhs.updatedAt ?? Number.MIN_SAFE_INTEGER;
+  if (l !== r) return r - l;
+  return lhs.sessionId < rhs.sessionId ? -1 : lhs.sessionId > rhs.sessionId ? 1 : 0;
+}
+
+/** 1 行・先頭 maxLength 字へ整形する。 */
+function normalizeSnippet(raw: string, maxLength: number): string {
   let text = raw.replaceAll("\n", " ").replaceAll("\r", " ").trim();
-  if (text.length > TITLE_MAX_LENGTH) text = text.slice(0, TITLE_MAX_LENGTH);
+  if (text.length > maxLength) text = text.slice(0, maxLength);
   return text;
+}
+
+/**
+ * rollout 末尾から最後の user/agent メッセージ本文を後方スキャンで読む（list-preview）。
+ *
+ * 対象は `event_msg` の payload.type `user_message` / `agent_message`（どちらも素のテキストを
+ * `message` に持つ）。token_count 等のイベント行は自然に skip される。チャンク境界で行が
+ * 切れた場合はその行を捨てて次のチャンクで読み直す。上限まで遡って無ければ null。
+ */
+function readLastRolloutMessage(rolloutPath: string): string | null {
+  let fd: number;
+  try {
+    fd = fs.openSync(rolloutPath, "r");
+  } catch {
+    return null;
+  }
+  try {
+    const size = fs.fstatSync(fd).size;
+    const maxSpan = Math.min(size, TAIL_BYTES_CAP);
+    let span = 0;
+    while (span < maxSpan) {
+      span = Math.min(span + TAIL_CHUNK_BYTES, maxSpan);
+      const buf = Buffer.alloc(span);
+      const bytesRead = fs.readSync(fd, buf, 0, span, size - span);
+      const lines = buf.subarray(0, bytesRead).toString("utf8").split("\n");
+      // 途中から読んだ場合、先頭要素は行の途中で切れている可能性があるため捨てる。
+      const first = span < size ? 1 : 0;
+      for (let i = lines.length - 1; i >= first; i--) {
+        const line = lines[i] ?? "";
+        // 早期スキップ（大半の行は対象 payload を含まない）。
+        if (!line.includes("user_message") && !line.includes("agent_message")) continue;
+        let obj: unknown;
+        try {
+          obj = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (typeof obj !== "object" || obj === null) continue;
+        if ((obj as { type?: unknown }).type !== "event_msg") continue;
+        const payload = (obj as { payload?: unknown }).payload;
+        if (typeof payload !== "object" || payload === null) continue;
+        const pl = payload as Record<string, unknown>;
+        if (pl["type"] !== "user_message" && pl["type"] !== "agent_message") continue;
+        const message = pl["message"];
+        if (typeof message === "string" && message.trim().length > 0) {
+          return normalizeSnippet(message, LAST_MESSAGE_MAX_LENGTH);
+        }
+      }
+      if (span >= size) return null;
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      // close 失敗は無視。
+    }
+  }
 }

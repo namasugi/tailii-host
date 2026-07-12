@@ -51,10 +51,16 @@ interface FileTailState {
 export class SubagentTailer {
   private readonly pollIntervalMs: number;
   private readonly tailIndefinitely: boolean;
+  private readonly jsonlPaths = new Map<string, string>();
 
   constructor(options: SubagentTailerOptions = {}) {
     this.pollIntervalMs = options.pollIntervalMs ?? 50;
     this.tailIndefinitely = options.tailIndefinitely ?? true;
+  }
+
+  /** 現在 tail 中の nodeId から transcript 実体を引く。 */
+  jsonlPath(nodeId: string): string | null {
+    return this.jsonlPaths.get(nodeId) ?? null;
   }
 
   async *streamProjectDir(
@@ -63,6 +69,7 @@ export class SubagentTailer {
     newerThanMs: number | null = null,
     signal?: AbortSignal,
   ): AsyncGenerator<ControlMessage, void, void> {
+    this.jsonlPaths.clear();
     const start = Date.now();
     let mainTranscript: string | null = null;
     while (!signal?.aborted) {
@@ -90,6 +97,9 @@ export class SubagentTailer {
 
     while (!signal?.aborted) {
       if (discoverMetaFiles(subagentsDir, tracked)) aggregateDirty = true;
+      for (const node of tracked.values()) {
+        if (node.jsonlPath !== null) this.jsonlPaths.set(node.nodeId, node.jsonlPath);
+      }
 
       const transcriptOwners = transcriptFiles(mainTranscript, tracked);
       for (const transcript of transcriptOwners) {

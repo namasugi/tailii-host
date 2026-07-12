@@ -8,6 +8,7 @@ import { describe, expect, test } from "vitest";
 import { claudeHookLaunchSettings } from "../src/hookSettings.js";
 import {
   DEFAULT_CODEX_COMMAND,
+  claudeInnerCommand,
   codexInnerCommand,
   launchCore,
   makeSessionLauncher,
@@ -209,6 +210,17 @@ describe("claudeHookLaunchSettings", () => {
       expect(list[0]?.hooks[0]?.command).toBe("/usr/local/bin/tailii hook --session work");
       expect(list[0]?.hooks[0]?.timeout).toBe(600);
     }
+    // 処理中/処理完了のライフサイクル通知（reaper の処理中保護用）。matcher 無し・短 timeout。
+    for (const event of ["UserPromptSubmit", "Stop"]) {
+      const list = settings.hooks[event] as {
+        matcher?: string;
+        hooks: { command: string; timeout: number }[];
+      }[];
+      expect(list).toHaveLength(1);
+      expect(list[0]?.matcher).toBeUndefined();
+      expect(list[0]?.hooks[0]?.command).toBe("/usr/local/bin/tailii hook --session work");
+      expect(list[0]?.hooks[0]?.timeout).toBe(30);
+    }
   });
 
   test(".tailii-nohook マーカーがある dir は null（フック無し）", () => {
@@ -236,7 +248,10 @@ describe("launchCore（codex モード）", () => {
   test("codex: 信頼を -c で事前付与し、claude 固有の settings.json/.claude.json を書かない", async () => {
     const dir = makeTempDir("launch-codex");
     const store = new SessionMetadataStore(makeTempDir("launch-codex-store"));
-    const { runner, recorded } = mockRunner();
+    const { runner, recorded } = mockRunner((_exe, args) => ({
+      exitCode: args[0] === "has-session" ? 1 : 0,
+      stdout: args[0] === "display-message" ? "%12\n" : "",
+    }));
     const claudeJsonPath = path.join(makeTempDir("launch-codex-cj"), ".claude.json");
     const errors: string[] = [];
 
@@ -253,61 +268,82 @@ describe("launchCore（codex モード）", () => {
       errorSink: (m) => errors.push(m),
       runner,
       agent: "codex",
+      providerSessionId: "thread-direct",
       claudeJsonPath,
       hookGlobalMarkerPath: path.join(dir, "no-such-marker"),
     });
 
     expect(code).toBe(0);
     const newCall = recorded.find((c) => c.args[0] === "new");
-    // 信頼オーバーライド + フック信頼バイパスが innerCommand に付与されている。
-    expect(newCall?.args[4]).toBe(
-      `codex -a never -s workspace-write -c projects."${dir}".trust_level="trusted" --dangerously-bypass-hook-trust`,
-    );
+    // App Server 経路では hook を使わず、信頼オーバーライドだけを付与する。
+    expect(newCall?.args[4]).toBe("codex -a never -s workspace-write");
     expect(newCall?.cwd).toBe(dir);
     // codex セッションは metadata に agent="codex" を記録する（per-session tail/resume 判別用）。
-    expect(store.get("cdx")).toEqual({ name: "cdx", cwd: dir, createdAt: 7, agent: "codex" });
+    expect(store.get("cdx")).toEqual({
+      name: "cdx",
+      cwd: dir,
+      createdAt: 7,
+      agent: "codex",
+      providerSessionId: "thread-direct",
+      tmuxPaneId: "%12",
+    });
     // claude 固有のフック/事前信頼ファイルは書かれない。
     expect(fs.existsSync(path.join(dir, ".claude", "settings.json"))).toBe(false);
     expect(fs.existsSync(claudeJsonPath)).toBe(false);
-    // codex 用の承認フックが .codex/hooks.json に導入される（PreToolUse, --agent codex）。
-    const codexHooks = JSON.parse(fs.readFileSync(path.join(dir, ".codex", "hooks.json"), "utf8"));
-    const pre = codexHooks.hooks.PreToolUse;
-    expect(Array.isArray(pre)).toBe(true);
-    const cmd = pre[0].hooks[0].command;
-    expect(cmd).toContain("hook --session cdx --agent codex");
-    expect(pre.map((e) => e.matcher)).toEqual(expect.arrayContaining(["Bash", "Write|Edit"]));
+    // Codex App Server の承認 request を使うため、Codex hook は新規作成しない。
+    expect(fs.existsSync(path.join(dir, ".codex", "hooks.json"))).toBe(false);
   });
 
   test("makeSessionLauncher(agent=codex): resume なしの新規起動は既定コマンド", async () => {
     const dir = makeTempDir("launch-codex-def");
     const store = new SessionMetadataStore(makeTempDir("launch-codex-def-store"));
     const { runner, recorded } = mockRunner();
-    const launcher = makeSessionLauncher({ store, agent: "codex", runner });
+    const appServer = {
+      remoteEndpoint: "unix://",
+      ensureRunning: async () => {},
+      startThread: async () => "thread-new",
+    };
+    const launcher = makeSessionLauncher({ store, agent: "codex", runner, codexAppServer: appServer });
 
-    // resumeSessionId=null（新規起動）は DEFAULT_CODEX_COMMAND を使う。
-    const { exitCode } = await launcher(dir, "cdx2", null, null);
+    // 新規threadをApp Serverで作ってから、tmux TUIは同じthreadへremote resumeする。
+    const { exitCode, providerSessionId } = await launcher(dir, "cdx2", null, null);
     expect(exitCode).toBe(0);
+    expect(providerSessionId).toBe("thread-new");
     const newCall = recorded.find((c) => c.args[0] === "new");
-    // DEFAULT_CODEX_COMMAND + 信頼オーバーライド + フック信頼バイパス。resume は付かない。
-    expect(newCall?.args[4]).toBe(
-      `${DEFAULT_CODEX_COMMAND} -c projects."${dir}".trust_level="trusted" --dangerously-bypass-hook-trust`,
+    // App Server共有threadへのremote resume + inline scrollback。Codex hook は付けない。
+    expect(newCall?.args[4]).toContain(
+      "-name '*thread-new*.jsonl' -print -quit 2>/dev/null | grep -q .; do sleep 0.2; done",
     );
-    expect(newCall?.args[4]).not.toContain("codex resume");
+    expect(newCall?.args[4]).toContain(
+      "; exec codex resume --remote unix:// --no-alt-screen thread-new",
+    );
+    expect(store.get("cdx2")?.providerSessionId).toBe("thread-new");
   });
 
   test("makeSessionLauncher(agent=codex): resume 指定は `codex resume <id>` で継続する（agent-tag）", async () => {
     const dir = makeTempDir("launch-codex-res");
     const store = new SessionMetadataStore(makeTempDir("launch-codex-res-store"));
     const { runner, recorded } = mockRunner();
-    const launcher = makeSessionLauncher({ store, agent: "codex", runner });
+    let ensured = 0;
+    const appServer = {
+      remoteEndpoint: "unix://",
+      ensureRunning: async () => { ensured += 1; },
+      startThread: async () => { throw new Error("resumeでは呼ばない"); },
+    };
+    const launcher = makeSessionLauncher({ store, agent: "codex", runner, codexAppServer: appServer });
 
     const { exitCode } = await launcher(dir, "cdx3", null, "abc-123");
     expect(exitCode).toBe(0);
+    expect(ensured).toBe(1);
     const newCall = recorded.find((c) => c.args[0] === "new");
-    // `codex resume -a never -s workspace-write <id>` + 信頼オーバーライド + フック信頼バイパス。
-    expect(newCall?.args[4]).toBe(
-      `codex resume -a never -s workspace-write abc-123 -c projects."${dir}".trust_level="trusted" --dangerously-bypass-hook-trust`,
+    // remote resume + 信頼オーバーライド。App Server 経路では hook は付けない。
+    expect(newCall?.args[4]).toContain("-name '*abc-123*.jsonl'");
+    expect(newCall?.args[4]).toContain(
+      "; exec codex resume --remote unix:// --no-alt-screen abc-123",
     );
+    expect(newCall?.args[4]).not.toContain("CLAUDE_CODE_RESUME_THRESHOLD_MINUTES");
+    expect(newCall?.args[4]).not.toContain("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD");
+    expect(store.get("cdx3")?.providerSessionId).toBe("abc-123");
   });
 });
 
@@ -328,6 +364,32 @@ describe("codexInnerCommand", () => {
   test("不正な文字を含むモデル slug は無視する（コマンド注入防止）", () => {
     expect(codexInnerCommand({ model: "gpt; rm -rf /" })).toBe("codex -a never -s workspace-write");
     expect(codexInnerCommand({ model: "" })).toBe("codex -a never -s workspace-write");
+  });
+});
+
+describe("claudeInnerCommand", () => {
+  test("既定（未指定）は素の claude", () => {
+    expect(claudeInnerCommand({})).toBe("claude");
+    expect(claudeInnerCommand({ model: null, permissionMode: null })).toBe("claude");
+  });
+
+  test("モデルと permission mode を指定するとフラグに反映する", () => {
+    expect(claudeInnerCommand({ model: "opus", permissionMode: "acceptEdits" })).toBe(
+      "claude --model opus --permission-mode acceptEdits",
+    );
+    expect(claudeInnerCommand({ model: "claude-sonnet-5" })).toBe("claude --model claude-sonnet-5");
+    expect(claudeInnerCommand({ permissionMode: "auto" })).toBe("claude --permission-mode auto");
+    expect(claudeInnerCommand({ permissionMode: "plan" })).toBe("claude --permission-mode plan");
+  });
+
+  test("default モードはフラグ無しと等価なので付けない", () => {
+    expect(claudeInnerCommand({ permissionMode: "default" })).toBe("claude");
+  });
+
+  test("不正なモデル slug / 未知モードは無視する（コマンド注入防止）", () => {
+    expect(claudeInnerCommand({ model: "opus; rm -rf /" })).toBe("claude");
+    expect(claudeInnerCommand({ permissionMode: "yolo; rm -rf /" })).toBe("claude");
+    expect(claudeInnerCommand({ model: "", permissionMode: "" })).toBe("claude");
   });
 });
 
@@ -395,7 +457,9 @@ describe("makeSessionLauncher: claude --session-id / --name の合成（lazy-ses
       // resume 時は title を渡しても付与しない。
       await launcher(dir, "s-3", null, "resume-id", null, "無視される名前");
       const inner = recorded.find((c) => c.args[0] === "new")?.args[4];
-      expect(inner).toContain("claude --resume resume-id");
+      expect(inner).toMatch(
+        /^CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=525600 CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=1000000000 claude --resume resume-id/,
+      );
       expect(inner).not.toContain("--name");
       expect(inner).not.toContain("--session-id");
       // resume でも実効会話 id を権威記録する（以後の reattach が厳密束縛できる）。
@@ -408,11 +472,22 @@ describe("makeSessionLauncher: claude --session-id / --name の合成（lazy-ses
       const dir = makeTempDir("launcher-codex-name");
       const store = new SessionMetadataStore(makeTempDir("launcher-codex-name-store"));
       const { runner, recorded } = mockRunner();
-      const launcher = makeSessionLauncher({ store, agent: "codex", runner });
+      const launcher = makeSessionLauncher({
+        store,
+        agent: "codex",
+        runner,
+        codexAppServer: {
+          remoteEndpoint: "unix://",
+          ensureRunning: async () => {},
+          startThread: async () => "thread-name",
+        },
+      });
       await launcher(dir, "cdx", null, null, UUID, "会話名");
       const inner = recorded.find((c) => c.args[0] === "new")?.args[4];
       expect(inner).not.toContain("--name");
       expect(inner).not.toContain("--session-id");
+      expect(inner).not.toContain("CLAUDE_CODE_RESUME_THRESHOLD_MINUTES");
+      expect(inner).not.toContain("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD");
     });
   });
 });

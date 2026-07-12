@@ -232,12 +232,19 @@ describe("Broker — 双方向中継", () => {
     // 先発が listen を終えるまで待つ（接続できることで確認）。
     (await connectUnixClient(socketPath)).destroy();
 
-    // 後発（reconnect 起点などで割り込んだ 2 本目の serve）は先発が生きているため起動失敗する。
+    // 後発（reconnect 起点などで割り込んだ 2 本目の serve）は先発が生きているため、
+    // 解放待ち猶予を使い切ったのち起動失敗する（テストは猶予を短縮注入）。
     const inputB = new PassThrough();
     const outputB = new PassThrough();
-    await expect(runBroker({ socketPath, input: inputB, output: outputB })).rejects.toThrow(
-      /already in use/,
-    );
+    await expect(
+      runBroker({
+        socketPath,
+        input: inputB,
+        output: outputB,
+        socketWaitGraceMs: 300,
+        socketWaitIntervalMs: 50,
+      }),
+    ).rejects.toThrow(/already in use/);
 
     // 先発の socket ファイルは無傷で、新規 connect も引き続き成功しなければならない。
     expect(fs.existsSync(socketPath)).toBe(true);
@@ -247,6 +254,39 @@ describe("Broker — 双方向中継", () => {
     // 先発自身が閉じれば、正しく削除される。
     inputA.end();
     await doneA;
+    expect(fs.existsSync(socketPath)).toBe(false);
+  });
+
+  it("先発が解放待ち猶予内に閉じれば、後発が同一 socket パスを引き継いで listen できる", async () => {
+    // iOS の chat 離脱（旧 serve チャネル close）と同一会話の開き直し（新 serve 起動）は
+    // 非同期に競走する。後発は即失敗せず、先発の解放を猶予内で待ってから引き継ぐこと。
+    const socketPath = tempSocketPath("takeover-grace");
+    const inputA = new PassThrough();
+    const outputA = new PassThrough();
+    const doneA = runBroker({ socketPath, input: inputA, output: outputA });
+    doneA.catch(() => {});
+    (await connectUnixClient(socketPath)).destroy();
+
+    // 後発を起動してから少し遅れて先発を閉じる（close 完了前に後発が probe する形を再現）。
+    const inputB = new PassThrough();
+    const outputB = new PassThrough();
+    const doneB = runBroker({
+      socketPath,
+      input: inputB,
+      output: outputB,
+      socketWaitGraceMs: 3000,
+      socketWaitIntervalMs: 50,
+    });
+    doneB.catch(() => {});
+    setTimeout(() => inputA.end(), 150);
+    await doneA;
+
+    // 後発が引き継いで listen し、新規 connect が成功する（≒承認要求が再び届く）。
+    const client = await connectUnixClient(socketPath, 40);
+    clients.push(client);
+
+    inputB.end();
+    await doneB;
     expect(fs.existsSync(socketPath)).toBe(false);
   });
 });

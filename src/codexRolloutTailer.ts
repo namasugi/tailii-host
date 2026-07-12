@@ -19,8 +19,12 @@ import { abortableSleep } from "./sleep.js";
 
 /** 履歴再生完了マーカーの streamId（claude 側と共通。iOS `ChatLogModel` と対で解釈）。 */
 export const HISTORY_DONE_STREAM_ID = "pc:history-done";
+/** 利用中モデル通知マーカーの streamId（claude 側と共通）。 */
+export const MODEL_STREAM_ID = "pc:model";
 /** 現在コンテキストトークン数通知マーカーの streamId（claude 側と共通）。 */
 export const CONTEXT_STREAM_ID = "pc:context";
+/** モデルに割り当てられたコンテキスト窓通知マーカーの streamId。 */
+export const CONTEXT_WINDOW_STREAM_ID = "pc:context-window";
 
 /** 既定の codex セッションルート（`~/.codex/sessions`）。 */
 export function defaultCodexSessionsRoot(): string {
@@ -45,7 +49,9 @@ export interface CodexRolloutTailerOptions {
 
 interface TailState {
   seq: number;
+  lastModel: string | null;
   lastContextTokens: number | null;
+  lastContextWindow: number | null;
 }
 
 export class CodexRolloutTailer {
@@ -64,8 +70,12 @@ export class CodexRolloutTailer {
   }
 
   /** この tailer の走査ルートで `cwd` 対応の rollout を解決する（未出現は null）。 */
-  resolve(cwd: string, newerThanMs: number | null = null): string | null {
-    return CodexRolloutTailer.resolveRollout(cwd, this.sessionsRoot, newerThanMs);
+  resolve(
+    cwd: string,
+    newerThanMs: number | null = null,
+    preferredSessionId: string | null = null,
+  ): string | null {
+    return CodexRolloutTailer.resolveRollout(cwd, this.sessionsRoot, newerThanMs, preferredSessionId);
   }
 
   /**
@@ -76,11 +86,17 @@ export class CodexRolloutTailer {
     cwd: string,
     newerThanMs: number | null = null,
     signal?: AbortSignal,
+    preferredSessionId: string | null = null,
   ): AsyncGenerator<ControlMessage, void, void> {
     const start = Date.now();
     let resolved: string | null = null;
     while (!signal?.aborted) {
-      resolved = CodexRolloutTailer.resolveRollout(cwd, this.sessionsRoot, newerThanMs);
+      resolved = CodexRolloutTailer.resolveRollout(
+        cwd,
+        this.sessionsRoot,
+        newerThanMs,
+        preferredSessionId,
+      );
       if (resolved !== null) break;
       if (!this.tailIndefinitely) {
         if (this.tailDeadlineMs === null || Date.now() - start >= this.tailDeadlineMs) return;
@@ -88,7 +104,7 @@ export class CodexRolloutTailer {
       await abortableSleep(this.pollIntervalMs, signal);
     }
     if (resolved !== null && !signal?.aborted) {
-      yield* this.runTail(resolved, signal);
+      yield* this.runTail(resolved, newerThanMs, signal);
     }
   }
 
@@ -101,6 +117,7 @@ export class CodexRolloutTailer {
     cwd: string,
     sessionsRoot: string,
     newerThanMs: number | null = null,
+    preferredSessionId: string | null = null,
   ): string | null {
     const target = canonicalPath(cwd);
     const files = listRolloutFiles(sessionsRoot);
@@ -108,9 +125,10 @@ export class CodexRolloutTailer {
     files.sort((a, b) => b.mtimeMs - a.mtimeMs);
     for (const file of files) {
       if (newerThanMs !== null && file.mtimeMs <= newerThanMs) continue;
-      const metaCwd = readRolloutCwd(file.path);
-      if (metaCwd === null) continue;
-      if (canonicalPath(metaCwd) === target) return file.path;
+      const meta = readRolloutMeta(file.path);
+      if (meta === null) continue;
+      if (preferredSessionId !== null && meta.id !== preferredSessionId) continue;
+      if (canonicalPath(meta.cwd) === target) return file.path;
     }
     return null;
   }
@@ -118,6 +136,7 @@ export class CodexRolloutTailer {
   /** 単一 rollout JSONL を頭から読み、tail する共有ループ（TranscriptTailer と同構造）。 */
   private async *runTail(
     rolloutPath: string,
+    newerThanMs: number | null,
     signal?: AbortSignal,
   ): AsyncGenerator<ControlMessage, void, void> {
     let fd: number;
@@ -129,7 +148,12 @@ export class CodexRolloutTailer {
     try {
       let position = 0;
       let lineBuf = Buffer.alloc(0);
-      const state: TailState = { seq: 0, lastContextTokens: null };
+      const state: TailState = {
+        seq: 0,
+        lastModel: null,
+        lastContextTokens: null,
+        lastContextWindow: null,
+      };
       const start = Date.now();
       let announcedReplayDone = false;
       const chunk = Buffer.alloc(4096);
@@ -147,7 +171,7 @@ export class CodexRolloutTailer {
           if (this.emitReplayDoneMarker && !announcedReplayDone) {
             announcedReplayDone = true;
             if (lineBuf.length > 0) {
-              yield* emitLine(lineBuf, state);
+              yield* emitLineAfter(lineBuf, state, newerThanMs);
               lineBuf = Buffer.alloc(0);
             }
             yield {
@@ -161,7 +185,7 @@ export class CodexRolloutTailer {
           }
           if (!this.tailIndefinitely) {
             if (this.tailDeadlineMs === null || Date.now() - start >= this.tailDeadlineMs) {
-              if (lineBuf.length > 0) yield* emitLine(lineBuf, state);
+              if (lineBuf.length > 0) yield* emitLineAfter(lineBuf, state, newerThanMs);
               return;
             }
           }
@@ -175,7 +199,7 @@ export class CodexRolloutTailer {
         while (nl >= 0) {
           const line = lineBuf.subarray(0, nl);
           lineBuf = lineBuf.subarray(nl + 1);
-          yield* emitLine(line, state);
+          yield* emitLineAfter(line, state, newerThanMs);
           nl = lineBuf.indexOf(0x0a);
         }
       }
@@ -187,6 +211,30 @@ export class CodexRolloutTailer {
       }
     }
   }
+}
+
+/** Hub 世代変更時は切断後の rollout 行だけを再送し、既表示本文を backfill しない。 */
+function* emitLineAfter(
+  line: Buffer,
+  state: TailState,
+  newerThanMs: number | null,
+): Generator<ControlMessage, void, void> {
+  if (newerThanMs !== null && lineTimestampMs(line) <= newerThanMs) return;
+  yield* emitLine(line, state);
+}
+
+function lineTimestampMs(line: Buffer): number {
+  try {
+    const parsed = JSON.parse(line.toString("utf8")) as { timestamp?: unknown };
+    if (typeof parsed.timestamp === "string") {
+      const timestamp = Date.parse(parsed.timestamp);
+      return Number.isFinite(timestamp) ? timestamp : Number.NEGATIVE_INFINITY;
+    }
+    if (typeof parsed.timestamp === "number" && Number.isFinite(parsed.timestamp)) {
+      return parsed.timestamp < 10_000_000_000 ? parsed.timestamp * 1_000 : parsed.timestamp;
+    }
+  } catch { /* emitLine と同様に不正行は破棄する。 */ }
+  return Number.NEGATIVE_INFINITY;
 }
 
 /** rollout ファイル（mtime 付き）を日付階層から列挙する。 */
@@ -219,7 +267,7 @@ function listRolloutFiles(sessionsRoot: string): { path: string; mtimeMs: number
 }
 
 /** rollout の先頭 `session_meta` 行から `payload.cwd` を読む。読めなければ null。 */
-function readRolloutCwd(rolloutPath: string): string | null {
+function readRolloutMeta(rolloutPath: string): { id: string | null; cwd: string } | null {
   let fd: number;
   try {
     fd = fs.openSync(rolloutPath, "r");
@@ -242,7 +290,10 @@ function readRolloutCwd(rolloutPath: string): string | null {
       const payload = (parsed as { payload?: unknown }).payload;
       if (typeof payload === "object" && payload !== null) {
         const cwd = (payload as { cwd?: unknown }).cwd;
-        if (typeof cwd === "string" && cwd.length > 0) return cwd;
+        const id = (payload as { id?: unknown }).id;
+        if (typeof cwd === "string" && cwd.length > 0) {
+          return { id: typeof id === "string" && id.length > 0 ? id : null, cwd };
+        }
       }
     }
     return null;
@@ -259,10 +310,12 @@ function readRolloutCwd(rolloutPath: string): string | null {
 
 /**
  * codex rollout の 1 行（JSONL）をパースし、生成メッセージを列挙する。
- * 対象は `event_msg`:
- *   - user_message  → user ロールの chat_output
- *   - agent_message（phase == final_answer）→ assistant ロールの chat_output
- *   - token_count   → コンテキストトークン数マーカー
+ * 対象:
+ *   - turn_context → 利用中モデルマーカー
+ *   - `event_msg`:
+ *     - user_message  → user ロールの chat_output
+ *     - agent_message（commentary / final_answer）→ assistant ロールの chat_output
+ *     - token_count   → コンテキストトークン数／窓マーカー
  * 解釈できない行・対象外イベントはスキップ。
  */
 export function* emitLine(line: Buffer, state: TailState): Generator<ControlMessage, void, void> {
@@ -275,16 +328,27 @@ export function* emitLine(line: Buffer, state: TailState): Generator<ControlMess
     return;
   }
   if (typeof parsed !== "object" || parsed === null) return;
-  if ((parsed as { type?: unknown }).type !== "event_msg") return;
-  const payload = (parsed as { payload?: unknown }).payload;
+  const record = parsed as { type?: unknown; payload?: unknown };
+  if (record.type === "turn_context") {
+    const context = asRecord(record.payload);
+    const model = context?.["model"];
+    if (typeof model === "string" && model.length > 0 && model !== state.lastModel) {
+      state.lastModel = model;
+      yield marker(MODEL_STREAM_ID, model);
+    }
+    return;
+  }
+  if (record.type !== "event_msg") return;
+  const payload = record.payload;
   if (typeof payload !== "object" || payload === null) return;
   const kind = (payload as { type?: unknown }).type;
 
   if (kind === "user_message" || kind === "agent_message") {
-    // agent_message は phase == final_answer のみ採用（中間 phase の重複を避ける）。
+    // commentary は長時間ターンの途中経過、final_answer は最終回答としてどちらも表示する。
+    // 未知 phase は将来形式を誤表示しないよう破棄する。phase 欠落は旧版互換で採用する。
     if (kind === "agent_message") {
       const phase = (payload as { phase?: unknown }).phase;
-      if (phase !== undefined && phase !== "final_answer") return;
+      if (phase !== undefined && phase !== "commentary" && phase !== "final_answer") return;
     }
     const message = (payload as { message?: unknown }).message;
     if (typeof message !== "string" || message.length === 0) return;
@@ -304,22 +368,47 @@ export function* emitLine(line: Buffer, state: TailState): Generator<ControlMess
   if (kind === "token_count") {
     const info = (payload as { info?: unknown }).info;
     if (typeof info === "object" && info !== null) {
-      const usage = (info as { total_token_usage?: unknown }).total_token_usage;
+      // total_token_usage は全ターン累積で context window と比較できない。
+      // 現在の会話コンテキスト量を表す last_token_usage を使用する。
+      const usage = (info as { last_token_usage?: unknown }).last_token_usage;
       if (typeof usage === "object" && usage !== null) {
         const total = (usage as { total_tokens?: unknown }).total_tokens;
-        if (typeof total === "number" && total !== state.lastContextTokens) {
+        if (isNonNegativeInteger(total) && total !== state.lastContextTokens) {
           state.lastContextTokens = total;
-          yield {
-            type: "chat_output",
-            v: PROTOCOL_V1,
-            streamId: CONTEXT_STREAM_ID,
-            role: "system",
-            text: String(total),
-            eof: true,
-          };
+          yield marker(CONTEXT_STREAM_ID, String(total));
         }
+      }
+      const contextWindow = (info as { model_context_window?: unknown }).model_context_window;
+      if (isPositiveInteger(contextWindow) && contextWindow !== state.lastContextWindow) {
+        state.lastContextWindow = contextWindow;
+        yield marker(CONTEXT_WINDOW_STREAM_ID, String(contextWindow));
       }
     }
     return;
   }
+}
+
+function marker(streamId: string, text: string): ControlMessage {
+  return {
+    type: "chat_output",
+    v: PROTOCOL_V1,
+    streamId,
+    role: "system",
+    text,
+    eof: true,
+  };
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return isNonNegativeInteger(value) && value > 0;
 }

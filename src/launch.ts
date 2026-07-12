@@ -9,7 +9,8 @@ import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { claudeHookLaunchSettings, installCodexHookSettings } from "./hookSettings.js";
+import { CodexAppServerManager, type CodexThreadStartOptions } from "./codexAppServer.js";
+import { claudeHookLaunchSettings, removeCodexHookSettings } from "./hookSettings.js";
 import { isInsideBase, standardize, expandTilde } from "./paths.js";
 import { SessionMetadataStore } from "./sessionMetadataStore.js";
 import { DEFAULT_TMUX_PATH } from "./tmux.js";
@@ -32,15 +33,48 @@ export const DEFAULT_CODEX_COMMAND = "codex -a never -s workspace-write";
  */
 export const CODEX_RESUME_FLAGS = "-a never -s workspace-write";
 
-/** codex サンドボックスモード（承認モード相当。承認は PreToolUse フックでゲートするため -a は常に never）。 */
+/** codex サンドボックスモード（承認要求は App Server の JSON-RPC で処理する）。 */
 export type CodexSandbox = "read-only" | "workspace-write" | "danger-full-access";
 
 /** モデル slug の安全文字（コマンド注入防止。カタログ由来だが二重に検証する）。 */
 const CODEX_MODEL_SAFE = /^[A-Za-z0-9._-]+$/;
 
+/** claude の permission mode 既知値（--permission-mode に安全に渡せる値のみ）。 */
+const CLAUDE_PERMISSION_MODES = new Set(["default", "acceptEdits", "plan", "auto"]);
+
+/**
+ * claude の resume/continue は古く大きいセッションで TUI 専用設問
+ * `Resume from summary?` を出してブロックする。この設問は transcript にもフックにも乗らず
+ * リモートから見えないため、閾値を実質無効化して常に従来どおりフル resume にする。
+ * claude 2.1.207 で確認した環境変数。
+ */
+const CLAUDE_RESUME_THRESHOLD_ENV =
+  "CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=525600 CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=1000000000";
+
+/**
+ * claude 新規起動の inner コマンドを組み立てる（起動前モデル/モード選択の反映）。
+ * @param model 省略/不正文字は無視（アカウント既定モデル）。alias（'opus' 等）と完全 id の両方可。
+ * @param permissionMode 既知 4 値のみ採用。"default" はフラグ無しと等価なので付けない。
+ */
+export function claudeInnerCommand(opts: {
+  model?: string | null;
+  permissionMode?: string | null;
+}): string {
+  let cmd = DEFAULT_INNER_COMMAND;
+  if (opts.model && CODEX_MODEL_SAFE.test(opts.model)) cmd += ` --model ${opts.model}`;
+  if (
+    opts.permissionMode &&
+    opts.permissionMode !== "default" &&
+    CLAUDE_PERMISSION_MODES.has(opts.permissionMode)
+  ) {
+    cmd += ` --permission-mode ${opts.permissionMode}`;
+  }
+  return cmd;
+}
+
 /**
  * codex 新規起動の inner コマンドを組み立てる（codex-input）。
- * 承認は PreToolUse フックでゲートするため `-a never` 固定。sandbox とモデルのみ可変にする。
+ * 承認は App Server の JSON-RPC で処理する。sandbox とモデルのみ可変にする。
  * @param model 省略/不正文字は無視（既定モデル）。
  * @param sandbox 省略時は workspace-write。
  */
@@ -82,7 +116,19 @@ export type EngineLauncher = (
   newSessionId?: string | null,
   /** Claude の表示名（`claude --name`。会話名を付けた新規起動のみ, lazy-session）。null なら付与しない。 */
   title?: string | null,
-) => Promise<{ exitCode: number; errorText: string }>;
+  /** Codex 新規threadのApp Server設定。Claude/resumeでは無視。 */
+  launchOptions?: {
+    codexModel?: string | null;
+    codexSandbox?: CodexSandbox | null;
+  },
+) => Promise<{ exitCode: number; errorText: string; providerSessionId?: string }>;
+
+/** makeSessionLauncher が必要とする共有App Serverの最小境界。 */
+export interface CodexAppServerRuntime {
+  readonly remoteEndpoint: string;
+  ensureRunning(): Promise<void>;
+  startThread(options: CodexThreadStartOptions): Promise<string>;
+}
 
 /** シェル single-quote で安全に包む（内部の `'` は `'\''` へ）。tmux new に渡す inner コマンド用。 */
 export function shellSingleQuote(value: string): string {
@@ -159,6 +205,7 @@ export function makeSessionLauncher(options: {
   innerCommand?: string | null;
   tmuxPath?: string | null;
   runner?: ProcessRunner;
+  codexAppServer?: CodexAppServerRuntime;
   /** 起動対象エージェント（既定 claude）。codex は claude 固有処理を行わない。 */
   agent?: LaunchAgent;
 } = {}): EngineLauncher {
@@ -169,7 +216,9 @@ export function makeSessionLauncher(options: {
   const tmux = options.tmuxPath ?? DEFAULT_TMUX_PATH;
   const binary = currentBinaryPath();
   const runner = options.runner ?? defaultProcessRunner();
-  return async (cwd, name, baseDir, resumeSessionId, newSessionId, title) => {
+  const codexAppServer =
+    agent === "codex" ? (options.codexAppServer ?? new CodexAppServerManager()) : null;
+  return async (cwd, name, baseDir, resumeSessionId, newSessionId, title, launchOptions) => {
     let errorText = "";
     // resume: claude は `<inner> --resume <id>`。resume でない新規起動は
     // `<inner> --session-id <uuid>` で会話 id を固定し、host が tail 対象 jsonl を
@@ -177,6 +226,10 @@ export function makeSessionLauncher(options: {
     // 新規起動は `--name '<title>'`（/resume ピッカー等に出る表示名, lazy-session）を添える。
     // codex はこれらの制御を持たないため従来どおり素の inner（resume 指定も本スライスでは無視）。
     let effectiveInner: string;
+    let effectiveProviderSessionId: string | null =
+      agent === "claude" ? (resumeSessionId ?? newSessionId ?? null) : resumeSessionId;
+    let effectiveCwd = cwd;
+    let effectiveBaseDir = baseDir;
     if (agent === "claude") {
       if (resumeSessionId) {
         effectiveInner = `${inner} --resume ${resumeSessionId}`;
@@ -186,16 +239,52 @@ export function makeSessionLauncher(options: {
       } else {
         effectiveInner = inner;
       }
-    } else if (resumeSessionId) {
-      // codex は既存会話を `codex resume <SESSION_ID>` で継続する（agent-tag）。
-      effectiveInner = `codex resume ${CODEX_RESUME_FLAGS} ${resumeSessionId}`;
+      effectiveInner = `${CLAUDE_RESUME_THRESHOLD_ENV} ${effectiveInner}`;
     } else {
-      effectiveInner = inner;
+      if (codexAppServer === null) {
+        return { exitCode: 1, errorText: "Codex App Server が構成されていません。" };
+      }
+      // App Serverのthread/startには絶対cwdが必要。launchCoreと同じ規則で先に解決する。
+      const resolved = resolveWorkdir(cwd, baseDir, (message) => {
+        errorText += message;
+      });
+      if (resolved === null) return { exitCode: 1, errorText };
+      effectiveCwd = resolved;
+      effectiveBaseDir = null;
+      try {
+        if (resumeSessionId !== null) {
+          await codexAppServer.ensureRunning();
+          effectiveProviderSessionId = resumeSessionId;
+        } else {
+          effectiveProviderSessionId = await codexAppServer.startThread({
+            cwd: resolved,
+            model:
+              launchOptions?.codexModel && CODEX_MODEL_SAFE.test(launchOptions.codexModel)
+                ? launchOptions.codexModel
+                : null,
+            sandbox: launchOptions?.codexSandbox ?? "workspace-write",
+          });
+        }
+      } catch (error) {
+        return { exitCode: 1, errorText: `Codex App Server 起動失敗: ${String(error)}` };
+      }
+      const selectedInner =
+        launchOptions?.codexModel !== undefined || launchOptions?.codexSandbox !== undefined
+          ? codexInnerCommand({
+              model: launchOptions.codexModel ?? null,
+              sandbox: launchOptions.codexSandbox ?? null,
+            })
+          : inner;
+      effectiveInner = codexRemoteResumeCommand(
+        selectedInner,
+        effectiveProviderSessionId,
+        codexAppServer.remoteEndpoint,
+      );
     }
     const exitCode = await launchCore({
-      dir: cwd,
+      dir: effectiveCwd,
       session: name,
-      baseDir,
+      baseDir: effectiveBaseDir,
       binaryPath: binary,
       tmuxPath: tmux,
       innerCommand: effectiveInner,
@@ -210,9 +299,38 @@ export function makeSessionLauncher(options: {
       // resume は同一会話 id の jsonl に書き続ける（engine の tail 束縛と同じ前提）ため、
       // resume 起動でも実効会話 id を権威記録し、以後の reattach で厳密束縛できるようにする。
       claudeSessionId: agent === "claude" ? (resumeSessionId ?? newSessionId ?? null) : null,
+      providerSessionId: effectiveProviderSessionId,
     });
-    return { exitCode, errorText };
+    return {
+      exitCode,
+      errorText,
+      ...(effectiveProviderSessionId !== null
+        ? { providerSessionId: effectiveProviderSessionId }
+        : {}),
+    };
   };
+}
+
+/** Codex TUIを共有App Serverの同一threadへ接続する安全なresumeコマンド。 */
+export function codexRemoteResumeCommand(
+  _innerCommand: string,
+  sessionId: string,
+  remoteEndpoint: string,
+): string {
+  if (!/^[A-Za-z0-9._-]+$/.test(sessionId)) throw new Error("invalid Codex session ID");
+  if (!/^unix:\/\/[A-Za-z0-9_./-]*$/.test(remoteEndpoint)) {
+    throw new Error("invalid Codex App Server endpoint");
+  }
+  // model/sandbox/approval は thread/start/thread/resume の App Server 側を権威にする。
+  // TUI の resume 引数で `-a never` 等を再指定すると native approval 設定を上書きするため、
+  // remote TUI は同一 thread の表示クライアントとして必要最小限の引数だけで接続する。
+  // thread/start 直後は最初の user turn まで rollout が存在せず、running thread でも TUI の
+  // thread/resume は `no rollout found` になる。tmux pane を生かしたまま rollout 生成を待ち、
+  // App Server turn/start が materialize した直後に TUI を同じ thread へ接続する。
+  const sessionsRoot = '"${CODEX_HOME:-$HOME/.codex}/sessions"';
+  const waitForRollout =
+    `while ! find ${sessionsRoot} -type f -name '*${sessionId}*.jsonl' -print -quit 2>/dev/null | grep -q .; do sleep 0.2; done`;
+  return `${waitForRollout}; exec codex resume --remote ${remoteEndpoint} --no-alt-screen ${sessionId}`;
 }
 
 /**
@@ -236,6 +354,8 @@ export async function launchCore(options: {
   agent?: LaunchAgent;
   /** host が `--session-id` で固定した Claude 会話 id。新規 claude 起動だけに記録する。 */
   claudeSessionId?: string | null;
+  /** provider 共通の論理会話 ID（Claude UUID / Codex thread ID）。 */
+  providerSessionId?: string | null;
   /** `~/.claude.json`（事前信頼記録）の場所。テスト注入用。省略時は実ホーム。 */
   claudeJsonPath?: string;
   /** フックのグローバル無効化マーカーの場所。テスト注入用（実マシンのマーカーに左右されない密閉性）。 */
@@ -251,27 +371,20 @@ export async function launchCore(options: {
 
   // エージェント別の起動前準備。
   // claude: 「フォルダを信頼しますか?」の事前回避（~/.claude.json）と settings.json フック注入。
-  // codex:  claude 固有処理は行わず、代わりに codex の信頼を `-c` オーバーライドで事前付与し、
-  //         トラストダイアログを回避する（config.toml は書き換えない）。承認/フック統合は後続。
+  // codex: Claude 固有処理は行わない。App Server が承認要求を JSON-RPC で配信するため、
+  //        旧版 Tailii の Codex hook を除去し、プロジェクト信頼だけを起動引数で付与する。
   let innerCommand = options.innerCommand;
   if (agent === "codex") {
-    // 承認ゲート: プロジェクトローカル `.codex/hooks.json` に PreToolUse フックを導入し、
-    // 自前フックなので `--dangerously-bypass-hook-trust` で信頼ハッシュ確認を省く。
+    // App Server の native approval と二重化しないよう、旧版が追加した hook だけを消す。
     // 併せて `-c` で信頼を事前付与しトラストダイアログを回避（config.toml は書き換えない）。
     try {
-      installCodexHookSettings({
-        dir,
-        binaryPath,
-        session,
-        ...(options.hookGlobalMarkerPath !== undefined && {
-          globalMarkerPath: options.hookGlobalMarkerPath,
-        }),
-      });
+      removeCodexHookSettings({ dir, binaryPath });
     } catch (error) {
-      errorSink(`tailii launch: .codex/hooks.json 書込失敗: ${String(error)}\n`);
+      errorSink(`tailii launch: 旧 Codex hook の除去失敗: ${String(error)}\n`);
       return 1;
     }
-    innerCommand = `${innerCommand} -c projects."${dir}".trust_level="trusted" --dangerously-bypass-hook-trust`;
+    // App Server thread/start が cwd/permission を構造化設定する。remote TUI は表示購読者なので、
+    // CLI 側の trust/approval override を重ねず thread 設定をそのまま使う。
   } else {
     // --- 1.5. claude の初回「フォルダを信頼しますか?」プロンプトを事前回避する ---
     preTrustFolder(dir, options.claudeJsonPath);
@@ -333,6 +446,11 @@ export async function launchCore(options: {
     }
   }
 
+  // session名はrenameやmulti-pane化で曖昧になるため、以後の入出力target用に安定pane IDを保存する。
+  const paneResult = await runTmux(["display-message", "-p", "-t", session, "#{pane_id}"]);
+  const paneIdCandidate = paneResult.code === 0 ? paneResult.out.trim() : "";
+  const tmuxPaneId = /^%\d+$/.test(paneIdCandidate) ? paneIdCandidate : null;
+
   // --- 4. cwd を権威記録（tmux は起動 cwd を安定に返さないため本ストアを権威とする） ---
   try {
     // 任意メタは必要なときだけ記録する（古いメタ形式との後方互換を保つ）。
@@ -344,6 +462,8 @@ export async function launchCore(options: {
       ...(agent === "claude" && options.claudeSessionId
         ? { claudeSessionId: options.claudeSessionId }
         : {}),
+      ...(options.providerSessionId ? { providerSessionId: options.providerSessionId } : {}),
+      ...(tmuxPaneId !== null ? { tmuxPaneId } : {}),
     });
   } catch (error) {
     errorSink(`tailii launch: メタデータ保存失敗: ${String(error)}\n`);

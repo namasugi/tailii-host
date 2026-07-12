@@ -1,6 +1,6 @@
 // units.test.ts — 純ロジック/値型サービスの単体テスト
 // Swift 版 PermissionModeTests / SessionListServiceTests / DirListerTests / UsageAggregatorTests /
-// PlanUsageFetcherTests / SessionMetadataStoreTests / SessionIdleTrackerTests /
+// PlanUsageFetcherTests / SessionMetadataStoreTests / HeartbeatTests /
 // TmuxSessionManagerTests / ClaudeSessionStoreTests の要点を移植する。
 
 import * as fs from "node:fs";
@@ -11,7 +11,13 @@ import { ClaudeSessionStore, cwdFromSlug } from "../src/claudeSessionStore.js";
 import { dirChildren, dirCreate, dirList } from "../src/dirLister.js";
 import { parsePermissionMode } from "../src/permissionMode.js";
 import { extractCredential, orderCandidates, parsePlanUsage } from "../src/planUsageFetcher.js";
-import { SessionIdleTracker } from "../src/sessionIdleTracker.js";
+import {
+  bumpHeartbeat,
+  listHeartbeatSessions,
+  readHeartbeat,
+  removeHeartbeat,
+  writeHeartbeat,
+} from "../src/heartbeat.js";
 import { searchClaudeSessions } from "../src/sessionSearch.js";
 import {
   SessionListService,
@@ -296,21 +302,72 @@ describe("SessionMetadataStore", () => {
     fs.writeFileSync(path.join(base, "old.json"), '{"createdAt":3,"cwd":"/tmp/old","name":"old"}');
     expect(store.get("old")).toEqual({ name: "old", cwd: "/tmp/old", createdAt: 3 });
   });
+
+  test("providerSessionId と tmuxPaneId を往復し、provider + id で逆引きできる", () => {
+    const store = new SessionMetadataStore(makeTempDir("metastore-provider-session"));
+    store.put({
+      name: "cdx",
+      cwd: "/tmp/codex",
+      createdAt: 4,
+      agent: "codex",
+      providerSessionId: "thread-123",
+      tmuxPaneId: "%42",
+    });
+
+    expect(store.get("cdx")).toEqual({
+      name: "cdx",
+      cwd: "/tmp/codex",
+      createdAt: 4,
+      agent: "codex",
+      providerSessionId: "thread-123",
+      tmuxPaneId: "%42",
+    });
+    expect(store.findByProviderSessionId("codex", "thread-123")?.name).toBe("cdx");
+    expect(store.findByProviderSessionId("claude", "thread-123")).toBeNull();
+  });
 });
 
-// MARK: - SessionIdleTracker
+// MARK: - Heartbeat（reaper daemon の判定権威ファイル）
 
-describe("SessionIdleTracker", () => {
-  test("markIdle → expired、markActive/remove で解除", () => {
-    const tracker = new SessionIdleTracker(60);
-    tracker.markIdle("a", 100);
-    tracker.markIdle("b", 150);
-    expect(tracker.expired(160)).toEqual(["a"]);
-    expect(tracker.expired(210)).toEqual(["a", "b"]);
-    tracker.markActive("a");
-    expect(tracker.expired(210)).toEqual(["b"]);
-    tracker.remove("b");
-    expect(tracker.expired(1000)).toEqual([]);
+describe("Heartbeat", () => {
+  test("write → read 往復（内容の ts が正、event 付き）", () => {
+    const dir = makeTempDir("heartbeat");
+    writeHeartbeat(dir, "cs-a", { ts: 100, state: "active", event: "PreToolUse" });
+    expect(readHeartbeat(dir, "cs-a")).toEqual({ ts: 100, state: "active", event: "PreToolUse" });
+  });
+
+  test("不在・壊れたファイルは null（呼び手が採番する）", () => {
+    const dir = makeTempDir("heartbeat");
+    expect(readHeartbeat(dir, "cs-none")).toBeNull();
+    fs.writeFileSync(path.join(dir, "cs-broken"), "not json");
+    expect(readHeartbeat(dir, "cs-broken")).toBeNull();
+    fs.writeFileSync(path.join(dir, "cs-badstate"), JSON.stringify({ ts: 1, state: "??" }));
+    expect(readHeartbeat(dir, "cs-badstate")).toBeNull();
+  });
+
+  test("bump は ts のみ更新し state を保持する（不在時は fallback）", () => {
+    const dir = makeTempDir("heartbeat");
+    writeHeartbeat(dir, "cs-a", { ts: 100, state: "active", event: "PreToolUse" });
+    bumpHeartbeat(dir, "cs-a", 200, "engine-tick");
+    expect(readHeartbeat(dir, "cs-a")).toEqual({ ts: 200, state: "active", event: "engine-tick" });
+    bumpHeartbeat(dir, "cs-new", 300, "chat-open");
+    expect(readHeartbeat(dir, "cs-new")).toEqual({ ts: 300, state: "idle", event: "chat-open" });
+  });
+
+  test("remove と list（tmp 残骸は list から除外）", () => {
+    const dir = makeTempDir("heartbeat");
+    writeHeartbeat(dir, "cs-a", { ts: 1, state: "idle" });
+    writeHeartbeat(dir, "cs-b", { ts: 2, state: "idle" });
+    fs.writeFileSync(path.join(dir, "cs-c.tmp-999"), "{}");
+    expect(listHeartbeatSessions(dir)).toEqual(["cs-a", "cs-b"]);
+    removeHeartbeat(dir, "cs-a");
+    removeHeartbeat(dir, "cs-a"); // 二重削除は無害
+    expect(listHeartbeatSessions(dir)).toEqual(["cs-b"]);
+  });
+
+  test("セッション名の検証（パス外書き込み拒否）", () => {
+    const dir = makeTempDir("heartbeat");
+    expect(() => writeHeartbeat(dir, "../evil", { ts: 1, state: "idle" })).toThrow();
   });
 });
 
@@ -352,6 +409,31 @@ describe("TmuxSessionManager", () => {
     );
     const mgr = new TmuxSessionManager({ runner: runner.runner, store: makeTempStore() });
     expect(await mgr.capturePane("s")).toBe("a\nb");
+  });
+
+  test("capturePane は折り返し行結合と取得行数を指定できる", async () => {
+    const runner = new MockTmuxRunner(() => ok("joined\n"));
+    const mgr = new TmuxSessionManager({ runner: runner.runner, store: makeTempStore() });
+    expect(await mgr.capturePane("s", { lines: 60, joinWrappedLines: true })).toBe("joined");
+    expect(runner.recorded[0]).toEqual(["capture-pane", "-p", "-J", "-t", "s", "-S", "-60"]);
+  });
+
+  test("sendKeys/capturePane は記録済み tmux pane ID を直接 target にする", async () => {
+    const store = makeTempStore();
+    store.put({
+      name: "s",
+      cwd: "/tmp/s",
+      createdAt: 0,
+      tmuxPaneId: "%9",
+    });
+    const runner = new MockTmuxRunner(() => ok("pane\n"));
+    const mgr = new TmuxSessionManager({ runner: runner.runner, store });
+
+    await mgr.sendKeys("s", ["hello"], true);
+    await mgr.capturePane("s", { lines: 10 });
+
+    expect(runner.recorded[0]).toEqual(["send-keys", "-t", "%9", "-l", "hello"]);
+    expect(runner.recorded[1]).toEqual(["capture-pane", "-p", "-t", "%9", "-S", "-10"]);
   });
 
   test("不正セッション名は tmux を呼ばず拒否する", async () => {
@@ -442,6 +524,32 @@ describe("ClaudeSessionStore", () => {
         '{"type":"user","message":{"content":"実際の質問"}}\n',
     );
     expect(new ClaudeSessionStore(root).list()[0]?.title).toBe("実際の質問");
+  });
+
+  test("lastMessage は最後の user/assistant テキストを ~80 字で返す（tool_result/状態行は skip）", () => {
+    const root = makeTempDir("claude-sessions-preview");
+    const slugDir = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slugDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(slugDir, "ffffffff-6666.jsonl"),
+      '{"type":"user","cwd":"/tmp/proj","timestamp":"2026-01-01T00:00:00Z","message":{"content":"最初の質問"}}\n' +
+        '{"type":"assistant","timestamp":"2026-01-01T00:01:00Z","message":{"content":[{"type":"thinking","thinking":"内心"},{"type":"text","text":"修正が完了しました。\\nテストも緑です。"}]}}\n' +
+        // 末尾側: テキストを持たない行（tool_result のみの user 行 / 状態行）は skip される。
+        '{"type":"user","timestamp":"2026-01-01T00:02:00Z","message":{"content":[{"type":"tool_result","content":[{"type":"text","text":"ok"}]}]}}\n' +
+        '{"type":"mode","mode":"normal"}\n',
+    );
+    const list = new ClaudeSessionStore(root).list();
+    expect(list[0]?.lastMessage).toBe("修正が完了しました。 テストも緑です。");
+    expect(list[0]?.title).toBe("最初の質問");
+    expect(list[0]?.updatedAt).toBe(Math.floor(Date.parse("2026-01-01T00:02:00Z") / 1000));
+  });
+
+  test("lastMessage が無い（状態行のみ）transcript では省略される", () => {
+    const root = makeTempDir("claude-sessions-preview-none");
+    const slugDir = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slugDir, { recursive: true });
+    fs.writeFileSync(path.join(slugDir, "gggggggg-7777.jsonl"), '{"type":"mode","mode":"normal"}\n');
+    expect(new ClaudeSessionStore(root).list()[0]?.lastMessage).toBeUndefined();
   });
 
   test("cwdFromSlug は lossy 復元（空は /）", () => {

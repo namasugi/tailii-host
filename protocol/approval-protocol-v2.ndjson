@@ -3,3 +3,15 @@
 {"maxVersion":2,"serverVersion":"0.1.0","type":"channel_hello","v":2}
 {"id":"ss11aa22-0000-0000-0000-000000000401","limit":2,"query":"approval","type":"session_search_request","v":2}
 {"id":"ss11aa22-0000-0000-0000-000000000401","results":[{"cwd":"/Users/alice/project","sessionId":"11111111-2222-3333-4444-555555555555","snippet":"...Please review the approval flow around session search.","title":"Search implementation","updatedAt":1720100000}],"type":"session_search_response","v":2}
+{"active":true,"seq":7,"session":"tailii-abc123","text":"⏺ Bash(npm test)\n  ⎿ Running…\n\n次の一手を検討しています。\n\n✳ Pondering… (12s · esc to interrupt)","type":"pane_preview","v":2}
+{"active":false,"seq":8,"session":"tailii-abc123","text":"","type":"pane_preview","v":2}
+{"cwd":"/Users/alice/project","id":"ms11aa22-0000-0000-0000-000000000501","model":"opus","name":"proj-model","permissionMode":"acceptEdits","type":"session_start","v":2}
+{"id":"cs11aa22-0000-0000-0000-000000000601","type":"claude_session_list_request","v":2}
+{"claudeSessions":[{"cwd":"/Users/alice/Documents/ClaudeCode/code0630","lastMessage":"テストは全件緑です。次はデプロイに進みます。","sessionId":"11111111-2222-3333-4444-555555555555","title":"最初の会話","updatedAt":1720100000},{"agent":"codex","cwd":"/Users/alice/other","sessionId":"22222222-3333-4444-5555-666666666666","title":"3f2a1b0c"}],"id":"cs11aa22-0000-0000-0000-000000000601","type":"claude_session_list_response","v":2}
+{"id":"tr11aa22-0000-0000-0000-000000000701","nodeId":"node-42","type":"subagent_transcript_request","v":2}
+{"entries":[{"role":"user","text":"原因を調べてください。"},{"role":"assistant","text":"ログを確認します。","ts":1783016361000},{"kind":"tool_use","role":"tool","text":"Read: {\"file_path\":\"/tmp/app.log\"}","ts":1783016362000},{"kind":"tool_result","role":"tool","text":"エラー行を確認しました。","ts":1783016362500}],"id":"tr11aa22-0000-0000-0000-000000000701","nodeId":"node-42","omitted":7,"type":"subagent_transcript_response","v":2}
+{"id":"cm11aa22-0000-0000-0000-000000000801","type":"codex_model_list_request","v":2}
+{"id":"cm11aa22-0000-0000-0000-000000000801","models":[{"contextWindow":353400,"defaultReasoningEffort":"medium","description":"最新のエージェント型コーディングモデル。","displayName":"GPT-5.6-Sol","id":"gpt-5.6-sol","isDefault":true,"supportedReasoningEfforts":["low","medium","high","xhigh","ultra"]},{"contextWindow":121600,"defaultReasoningEffort":"high","description":"高速なコーディングモデル。","displayName":"GPT-5.3-Codex-Spark","id":"gpt-5.3-codex-spark","isDefault":false,"supportedReasoningEfforts":["low","medium","high","xhigh"]}],"type":"codex_model_list_response","v":2}
+{"id":"ci11aa22-0000-0000-0000-000000000901","session":"tailii-abc123","type":"codex_turn_interrupt","v":2}
+{"clientMessageId":"cs11aa22-0000-0000-0000-000000001001","id":"cs11aa22-0000-0000-0000-000000001002","session":"tailii-abc123","text":"次の実装を進めてください。","type":"chat_send","v":2}
+{"id":"cs11aa22-0000-0000-0000-000000001002","status":"accepted","type":"chat_send_result","v":2}

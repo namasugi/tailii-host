@@ -4,13 +4,25 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, test, vi } from "vitest";
+import {
+  CodexAppServerManager,
+  type CodexAppServerThreadOptions,
+} from "../src/codexAppServer.js";
 import { ImageService } from "../src/imageService.js";
-import { sendRemotePendingToEngine } from "../src/engineRelaySocket.js";
+import {
+  sendQuestionEventToEngine,
+  sendRemotePendingToEngine,
+  sendSessionProcessingToEngine,
+} from "../src/engineRelaySocket.js";
 import type { EngineLauncher } from "../src/launch.js";
+import type { CodexTurnControllerRuntime } from "../src/codexNativeTurnController.js";
+import type { HubLink } from "../src/hubClient.js";
 import { ClaudeSessionStore } from "../src/claudeSessionStore.js";
 import { decodeControlMessage } from "../src/protocol.js";
 import { TranscriptTailer } from "../src/transcriptTailer.js";
 import { TmuxSessionManager } from "../src/tmux.js";
+import { SessionHub } from "../src/sessionHub.js";
+import { injectQuestionAnswers } from "../src/questionInjection.js";
 import { readPackageVersion } from "../src/version.js";
 import {
   MockTmuxRunner,
@@ -26,7 +38,109 @@ function makeManager(runner: MockTmuxRunner, store = makeTempStore()): TmuxSessi
   return new TmuxSessionManager({ runner: runner.runner, store });
 }
 
+function makeQuestionHub(manager: TmuxSessionManager, id: string): SessionHub {
+  const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("question-hub"),
+    metadataStore: manager.store, timeoutSeconds: 1800,
+    questionInjector: (answers, session) => injectQuestionAnswers(answers, session, manager) });
+  hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id,
+    questions: [{ header: "h", question: "q", options: [], multiSelect: false }] });
+  return hub;
+}
+
 describe("EngineControl — 横断制御チャネル", () => {
+  test("Hub 世代変更時は旧 afterSeq を捨て、切断時刻から再購読する", async () => {
+    const store = makeTempStore();
+    store.put({ name: "work", cwd: "/tmp/work", createdAt: 1, agent: "claude",
+      providerSessionId: "provider-1" });
+    const sent: unknown[] = [];
+    const hubLink: HubLink = {
+      onMessage: null, onReconnect: null,
+      send(message) {
+        sent.push(message);
+        if (message.type === "hub_state_request") queueMicrotask(() => hubLink.onMessage?.({
+          type: "hub_state_response", id: message.id, session: message.session,
+          pendingQuestion: null, processing: false,
+        }));
+      },
+      close: vi.fn(),
+    };
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("work\n") : ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner, store), metadataStore: store, hubLink });
+    await engine.lines.nextOfType("channel_hello");
+    hubLink.onReconnect?.({ bootId: "boot-a", disconnectedAtMs: null });
+    engine.writeLine('{"id":"open","name":"work","type":"session_reattach","v":2}');
+    await engine.lines.nextOfType("session_list_response");
+    hubLink.onMessage?.({ type: "conversation_event", session: "work", serverSeq: 7,
+      payload: { type: "chat_output", v: 1, streamId: "visible", role: "assistant", text: "visible", eof: true } });
+    await engine.lines.nextOfType("chat_output");
+
+    sent.length = 0;
+    hubLink.onReconnect?.({ bootId: "boot-a", disconnectedAtMs: 1_000 });
+    expect(sent).toContainEqual({
+      type: "conversation_subscribe", session: "work", afterSeq: 7, preview: true,
+    });
+
+    sent.length = 0;
+    hubLink.onReconnect?.({ bootId: "boot-b", disconnectedAtMs: 2_000 });
+    expect(sent).toEqual([{
+      type: "conversation_subscribe", session: "work", newerThanMs: 2_000, preview: true,
+    }]);
+    await engine.teardown();
+  });
+
+  test("chat_send を Hub へ転送し結果を中継する", async () => {
+    const sent: unknown[] = [];
+    const hubLink: HubLink = {
+      onMessage: null, onReconnect: null,
+      send(message) {
+        sent.push(message);
+        if (message.type === "chat_send") {
+          queueMicrotask(() => hubLink.onMessage?.({
+            type: "chat_send_result", id: message.id, status: "accepted",
+          }));
+        }
+      },
+      close: vi.fn(),
+    };
+    const engine = startEngine({ sessionManager: makeManager(new MockTmuxRunner(() => ok(""))), hubLink });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine('{"clientMessageId":"client-1","id":"send-1","session":"work","text":"hello","type":"chat_send","v":2}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("chat_send_result"))).toMatchObject({
+      type: "chat_send_result", id: "send-1", status: "accepted",
+    });
+    expect(sent).toContainEqual({ type: "chat_send", id: "send-1", session: "work",
+      clientMessageId: "client-1", text: "hello" });
+    await engine.teardown();
+  });
+
+  test("chat_send は Hub timeout 時に tmux へ fail-open 注入する", async () => {
+    const runner = new MockTmuxRunner(() => ok(""));
+    const unavailableHub: HubLink = { onMessage: null, onReconnect: null, send: vi.fn(), close: vi.fn() };
+    const engine = startEngine({ sessionManager: makeManager(runner), hubLink: unavailableHub });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine('{"clientMessageId":"client-1","id":"send-1","session":"work","text":"hello","type":"chat_send","v":2}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("chat_send_result", 3_000))).toMatchObject({
+      type: "chat_send_result", id: "send-1", status: "accepted",
+    });
+    // pane ID 未登録の store では paneTarget がセッション名へフォールバックする（tmux.ts）。
+    expect(runner.recorded).toContainEqual(["send-keys", "-t", "work", "-l", "hello"]);
+    expect(runner.recorded).toContainEqual(["send-keys", "-t", "work", "Enter"]);
+    await engine.teardown();
+  });
+
+  test("codex セッションの chat_send は unsupported", async () => {
+    const store = makeTempStore();
+    store.put({ name: "codex-work", cwd: "/tmp/codex-work", createdAt: 1, agent: "codex" });
+    const engine = startEngine({ sessionManager: makeManager(new MockTmuxRunner(() => ok("")), store),
+      metadataStore: store });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine('{"clientMessageId":"client-1","id":"send-1","session":"codex-work","text":"hello","type":"chat_send","v":2}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("error"))).toMatchObject({
+      type: "error", id: "send-1", code: "chat_send_unsupported",
+    });
+    await engine.teardown();
+  });
+
   // MARK: 1. channel_hello 交換
 
   test("engine は確立直後に channel_hello を送出し、相手 hello 受信後に採用版を決める", async () => {
@@ -71,51 +185,206 @@ describe("EngineControl — 横断制御チャネル", () => {
     fs.rmSync(relayPath, { force: true });
   });
 
-  test("別 live session の新規 question_prompt を remote_pending として流す", async () => {
+  test("tail 由来の question_prompt/question_dismiss は転送しない（回答済みの残骸のため）", async () => {
+    // Claude Code は設問が未回答の間 transcript に tool_use 行を書かないため、transcript に
+    // 現れる設問は常に回答済み。履歴 replay で流すと hook relay 由来の現行シートを
+    // 上書き・消灯してしまう（再オープン時にモーダルが一瞬出て消えるバグの再発防止）。
     const projectsRoot = makeTempDir("tailii-question-projects");
     const cwd = makeTempDir("tailii-question-cwd");
     const slug = fs.realpathSync.native(cwd).replaceAll("/", "-");
     const projectDir = path.join(projectsRoot, slug);
     fs.mkdirSync(projectDir, { recursive: true });
     const transcriptPath = path.join(projectDir, "qsess.jsonl");
-    fs.writeFileSync(transcriptPath, '{"type":"user","message":{"role":"user","content":"hi"},"uuid":"u0"}\n');
+    // 回答済みの設問（tool_use + tool_result）を含む履歴。
+    fs.writeFileSync(transcriptPath, [
+      '{"type":"user","message":{"role":"user","content":"hi"},"uuid":"u0"}',
+      JSON.stringify({
+        message: {
+          role: "assistant",
+          content: [{
+            type: "tool_use",
+            id: "toolu_q_hist",
+            name: "AskUserQuestion",
+            input: {
+              questions: [{
+                question: "どちらにしますか?",
+                header: "選択",
+                multiSelect: false,
+                options: [{ label: "A", description: "前者" }],
+              }],
+            },
+          }],
+        },
+        uuid: "a1",
+      }),
+      '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_q_hist","content":"answered"}]},"uuid":"u1"}',
+      '{"message":{"role":"assistant","content":[{"type":"text","text":"done"}]},"uuid":"a2"}',
+    ].join("\n") + "\n");
 
     const store = makeTempStore();
-    store.put({ name: "other", cwd, createdAt: 1, agent: "claude", claudeSessionId: "qsess" });
-    const runner = new MockTmuxRunner((args) => (args[0] === "ls" ? ok("other\n") : ok("")));
+    store.put({ name: "conv", cwd, createdAt: 1, agent: "claude", claudeSessionId: "qsess" });
+    const runner = new MockTmuxRunner((args) => (args[0] === "ls" ? ok("conv\n") : ok("")));
     const engine = startEngine({
       sessionManager: makeManager(runner, store),
       metadataStore: store,
       chatTailProjectsRoot: projectsRoot,
-      remoteQuestionPollMs: 20,
     });
     await engine.lines.nextOfType("channel_hello");
-    await new Promise((resolve) => setTimeout(resolve, 200));
 
-    fs.appendFileSync(transcriptPath, JSON.stringify({
-      message: {
-        role: "assistant",
-        content: [{
-          type: "tool_use",
-          id: "toolu_q_remote",
-          name: "AskUserQuestion",
-          input: {
-            questions: [{
-              question: "どちらにしますか?",
-              header: "選択",
-              multiSelect: false,
-              options: [{ label: "A", description: "前者" }],
-            }],
-          },
-        }],
-      },
-      uuid: "a1",
-    }) + "\n");
+    // chat を開くと履歴 replay が走る。replay 完了（pc:history-done）までの全行を検分し、
+    // question_prompt / question_dismiss が 1 行も転送されないことを確認する
+    // （replay では設問イベントは history-done より前に現れるはずの位置関係）。
+    engine.writeLine('{"id":"r1","name":"conv","type":"session_reattach","v":1}');
+    for (;;) {
+      const line = await engine.lines.next(5000);
+      expect(line).not.toContain('"type":"question_prompt"');
+      expect(line).not.toContain('"type":"question_dismiss"');
+      if (line.includes("pc:history-done")) break;
+    }
 
-    expect(await engine.lines.nextOfType("remote_pending", 5000)).toBe(
-      '{"id":"toolu_q_remote","kind":"question","session":"other","summary":"どちらにしますか?","type":"remote_pending","v":1}',
-    );
     await engine.teardown();
+  });
+
+  test("hook relay の question_event: 前面会話は question_prompt/question_dismiss として届ける", async () => {
+    if (!(await canListenUnixSocket())) return;
+    const relayPath = tempSocketPath("engine-question-active");
+    fs.rmSync(relayPath, { force: true });
+    const store = makeTempStore();
+    store.put({ name: "conv", cwd: "/tmp/conv", createdAt: 1 });
+    const runner = new MockTmuxRunner((args) => (args[0] === "ls" ? ok("conv\n") : ok("")));
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store),
+      metadataStore: store,
+      engineRelaySocketPath: relayPath,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    // chat を開いて conv を前面会話にする。
+    engine.writeLine('{"id":"r1","name":"conv","type":"session_reattach","v":1}');
+    await engine.lines.nextOfType("session_list_response");
+
+    await sendQuestionEventToEngine({
+      type: "question_event",
+      session: "conv",
+      event: "prompt",
+      id: "toolu_qa",
+      questions: [{
+        header: "選択",
+        question: "どっち?",
+        multiSelect: false,
+        options: [{ label: "A", description: "前者" }],
+      }],
+    }, relayPath);
+    const prompt = await engine.lines.nextOfType("question_prompt");
+    expect(prompt).toContain('"id":"toolu_qa"');
+    expect(prompt).toContain("どっち?");
+
+    await sendQuestionEventToEngine(
+      { type: "question_event", session: "conv", event: "dismiss", id: "toolu_qa" },
+      relayPath,
+    );
+    expect(await engine.lines.nextOfType("question_dismiss")).toContain('"id":"toolu_qa"');
+
+    await engine.teardown();
+    fs.rmSync(relayPath, { force: true });
+  });
+
+  test("hook relay の question_event: 別会話は remote_pending(kind=question)/cleared に変換する", async () => {
+    if (!(await canListenUnixSocket())) return;
+    const relayPath = tempSocketPath("engine-question-remote");
+    fs.rmSync(relayPath, { force: true });
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({
+      sessionManager: makeManager(runner),
+      engineRelaySocketPath: relayPath,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    await sendQuestionEventToEngine({
+      type: "question_event",
+      session: "other",
+      event: "prompt",
+      id: "toolu_qb",
+      questions: [{ header: "選択", question: "どちらに?", multiSelect: false, options: [] }],
+    }, relayPath);
+    const pending = await engine.lines.nextOfType("remote_pending");
+    expect(pending).toContain('"kind":"question"');
+    expect(pending).toContain('"session":"other"');
+    expect(pending).toContain("どちらに?");
+
+    await sendQuestionEventToEngine(
+      { type: "question_event", session: "other", event: "dismiss", id: "toolu_qb" },
+      relayPath,
+    );
+    const cleared = await engine.lines.nextOfType("remote_pending_cleared");
+    expect(cleared).toContain('"id":"toolu_qb"');
+    expect(cleared).toContain('"kind":"question"');
+
+    await engine.teardown();
+    fs.rmSync(relayPath, { force: true });
+  });
+
+  test("未回答の設問は chat 再オープン（session_reattach）で question_prompt を再送する", async () => {
+    if (!(await canListenUnixSocket())) return;
+    const relayPath = tempSocketPath("engine-question-reopen");
+    fs.rmSync(relayPath, { force: true });
+    const store = makeTempStore();
+    store.put({ name: "conv", cwd: "/tmp/conv", createdAt: 1 });
+    const runner = new MockTmuxRunner((args) => (args[0] === "ls" ? ok("conv\n") : ok("")));
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store),
+      metadataStore: store,
+      engineRelaySocketPath: relayPath,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    // 開いていない状態で設問到着 → 一覧バッジ（remote_pending）になる。
+    await sendQuestionEventToEngine({
+      type: "question_event",
+      session: "conv",
+      event: "prompt",
+      id: "toolu_qc",
+      questions: [{ header: "選択", question: "再送テスト?", multiSelect: false, options: [] }],
+    }, relayPath);
+    await engine.lines.nextOfType("remote_pending");
+
+    // chat を開くと保持中の設問が question_prompt で再送される（transcript には無いため）。
+    engine.writeLine('{"id":"r2","name":"conv","type":"session_reattach","v":1}');
+    const prompt = await engine.lines.nextOfType("question_prompt");
+    expect(prompt).toContain('"id":"toolu_qc"');
+    expect(prompt).toContain("再送テスト?");
+
+    await engine.teardown();
+    fs.rmSync(relayPath, { force: true });
+  });
+
+  test("Stop（session_processing done）で未回答の設問を掃除して閉じる", async () => {
+    if (!(await canListenUnixSocket())) return;
+    const relayPath = tempSocketPath("engine-question-stop");
+    fs.rmSync(relayPath, { force: true });
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({
+      sessionManager: makeManager(runner),
+      engineRelaySocketPath: relayPath,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    await sendQuestionEventToEngine({
+      type: "question_event",
+      session: "other",
+      event: "prompt",
+      id: "toolu_qd",
+      questions: [{ header: "選択", question: "中断?", multiSelect: false, options: [] }],
+    }, relayPath);
+    await engine.lines.nextOfType("remote_pending");
+
+    // Esc 中断等 = PostToolUse dismiss 無しでターン終了 → Stop 通知で掃除される。
+    await sendSessionProcessingToEngine({ type: "session_processing", session: "other", state: "done" }, relayPath);
+    const cleared = await engine.lines.nextOfType("remote_pending_cleared");
+    expect(cleared).toContain('"id":"toolu_qd"');
+
+    await engine.teardown();
+    fs.rmSync(relayPath, { force: true });
   });
 
   test("engine はメッセージ処理後に stale dist を検出し、応答を書き終えてから終了する", async () => {
@@ -191,6 +460,73 @@ describe("EngineControl — 横断制御チャネル", () => {
     engine.writeLine('{"id":"K1","name":"doomed","type":"session_kill","v":1}');
 
     expect(await waitForCommand(runner, ["kill-session", "-t", "doomed"])).toBe(true);
+
+    await engine.teardown();
+  });
+
+  test("session_kill 後の再オープン（別 tmux 名で resume）でも履歴が再生される", async () => {
+    // kill が tail を止めないと、再オープンの open() が「同一会話 tail 中」でスキップして
+    // 履歴を再生せず、tmux 名の変化でクライアントキャッシュも外れて空表示になる（根治の回帰テスト）。
+    const projectsRoot = makeTempDir("tailii-kill-reopen-projects");
+    const cwd = makeTempDir("tailii-kill-reopen-cwd");
+    const slug = fs.realpathSync.native(cwd).replaceAll("/", "-");
+    const projectDir = path.join(projectsRoot, slug);
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(projectDir, "convkill.jsonl"),
+      '{"type":"user","message":{"role":"user","content":"hi"},"uuid":"u0"}\n',
+    );
+
+    const store = makeTempStore();
+    store.put({ name: "alias-kill", cwd, createdAt: 1, agent: "claude", claudeSessionId: "convkill" });
+    let killed = false;
+    const runner = new MockTmuxRunner((args) => {
+      if (args[0] === "kill-session") {
+        killed = true;
+        return ok("");
+      }
+      if (args[0] === "ls") return killed ? ok("") : ok("alias-kill\n");
+      return ok("");
+    });
+    const launcher: EngineLauncher = async (dir, name, _base, resumeSessionId) => {
+      store.put({
+        name, cwd: dir, createdAt: 2, agent: "claude",
+        ...(resumeSessionId !== null ? { claudeSessionId: resumeSessionId } : {}),
+      });
+      return { exitCode: 0, errorText: "" };
+    };
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store),
+      metadataStore: store,
+      launcher,
+      // transcriptTailer は注入しない: engine 既定（tail 継続 + 履歴完了マーカー）が
+      // 本番の tail スキップ条件（currentPump 生存）を再現する。
+      chatTailProjectsRoot: projectsRoot,
+    });
+
+    await engine.lines.nextOfType("channel_hello");
+    // 1. 生存中の別名（alias-kill）で開く: 履歴が再生される（マーカーまで待って再生完了を確定）。
+    engine.writeLine(
+      `{"cwd":"${cwd}","id":"S-k1","name":"alias-kill","resumeSessionId":"convkill","type":"session_start","v":1}`,
+    );
+    expect(await engine.lines.nextOfType("chat_output")).toContain("hi");
+    expect(await engine.lines.nextOfType("chat_output")).toContain("pc:history-done");
+
+    // 2. kill（kill 要求への現況一覧応答まで読み進める。S-k1 への一覧応答が
+    //    tail 出力より後に並ぶことがあるため、id 一致まで読む）。
+    engine.writeLine('{"id":"K-k1","name":"alias-kill","type":"session_kill","v":1}');
+    let killResp = await engine.lines.nextOfType("session_list_response");
+    if (!killResp.includes('"id":"K-k1"')) {
+      killResp = await engine.lines.nextOfType("session_list_response");
+    }
+    expect(killResp).toContain('"id":"K-k1"');
+
+    // 3. 再オープン: 生存セッションが無いので tmux 名は cs-<id> に変わる。tail が
+    //    kill で停止済みなら再 tail され、履歴（hi）がもう一度再生される。
+    engine.writeLine(
+      `{"cwd":"${cwd}","id":"S-k2","name":"cs-convkill","resumeSessionId":"convkill","type":"session_start","v":1}`,
+    );
+    expect(await engine.lines.nextOfType("chat_output")).toContain("hi");
 
     await engine.teardown();
   });
@@ -501,6 +837,256 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
+  test("codex_turn_start は metadata の provider thread へ App Server turn を開始する", async () => {
+    const store = makeTempStore();
+    store.put({
+      name: "codex-work",
+      cwd: "/tmp/codex-work",
+      createdAt: 1,
+      agent: "codex",
+      providerSessionId: "thread-123",
+    });
+    const startTurn = vi.fn(async () => "turn-1");
+    const close = vi.fn();
+    const controller: CodexTurnControllerRuntime = {
+      startTurn,
+      closeSession: vi.fn(),
+      close,
+    };
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store),
+      metadataStore: store,
+      codexTurnController: controller,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine(
+      '{"clientUserMessageId":"client-1","effort":"xhigh","id":"req-1","session":"codex-work","text":"run tests","type":"codex_turn_start","v":2}',
+    );
+    await vi.waitFor(() => {
+      expect(startTurn).toHaveBeenCalledWith({
+        session: "codex-work",
+        threadId: "thread-123",
+        cwd: "/tmp/codex-work",
+        text: "run tests",
+        clientUserMessageId: "client-1",
+        effort: "xhigh",
+        sandbox: null,
+      });
+    });
+
+    await engine.teardown();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  test("codex_turn_start の同じ request id 再送は turn を1回だけ実行する", async () => {
+    const store = makeTempStore();
+    store.put({ name: "codex-work", cwd: "/tmp/codex-work", createdAt: 1,
+      agent: "codex", providerSessionId: "thread-123" });
+    const startTurn = vi.fn(async () => "turn-1");
+    const controller: CodexTurnControllerRuntime = { startTurn, closeSession: vi.fn(), close: vi.fn() };
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner, store), metadataStore: store,
+      codexTurnController: controller });
+    await engine.lines.nextOfType("channel_hello");
+    const line = '{"id":"same","session":"codex-work","text":"run","type":"codex_turn_start","v":2}';
+    engine.writeLine(line); engine.writeLine(line);
+    await vi.waitFor(() => expect(startTurn).toHaveBeenCalledOnce());
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(startTurn).toHaveBeenCalledOnce();
+    await engine.teardown();
+  });
+
+  test("codex_turn_start は Hub RPC timeout 時に engine controller へ fail-open する", async () => {
+    const store = makeTempStore();
+    store.put({ name: "codex-work", cwd: "/tmp/codex-work", createdAt: 1,
+      agent: "codex", providerSessionId: "thread-123" });
+    const startTurn = vi.fn(async () => "fallback-turn");
+    const controller: CodexTurnControllerRuntime = {
+      startTurn, closeSession: vi.fn(), close: vi.fn(),
+    };
+    const sent: unknown[] = [];
+    const unavailableHub: HubLink = {
+      onMessage: null, onReconnect: null,
+      send: (message) => { sent.push(message); },
+      close: vi.fn(),
+    };
+    const engine = startEngine({ sessionManager: makeManager(new MockTmuxRunner(() => ok("")), store),
+      metadataStore: store, codexTurnController: controller, hubLink: unavailableHub });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine('{"id":"fallback","session":"codex-work","text":"run","type":"codex_turn_start","v":2}');
+    await vi.waitFor(() => expect(startTurn).toHaveBeenCalledOnce(), { timeout: 3_000 });
+    expect(sent).toContainEqual(expect.objectContaining({ type: "codex_turn_submit", id: "fallback",
+      threadId: "thread-123", clientUserMessageId: "fallback" }));
+    await engine.teardown();
+  });
+
+  test("codex_turn_interrupt は Hub へ fire-and-forget 転送しつつローカル controller にも中断を試みる", async () => {
+    const store = makeTempStore();
+    store.put({ name: "codex-work", cwd: "/tmp/codex-work", createdAt: 1,
+      agent: "codex", providerSessionId: "thread-123" });
+    const interruptTurn = vi.fn(async () => {});
+    const controller: CodexTurnControllerRuntime = {
+      startTurn: vi.fn(async () => "turn-1"), interruptTurn, closeSession: vi.fn(), close: vi.fn(),
+    };
+    const sent: unknown[] = [];
+    const hubLink: HubLink = {
+      onMessage: null, onReconnect: null,
+      send: (message) => { sent.push(message); },
+      close: vi.fn(),
+    };
+    const engine = startEngine({ sessionManager: makeManager(new MockTmuxRunner(() => ok("")), store),
+      metadataStore: store, codexTurnController: controller, hubLink });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine(
+      '{"id":"interrupt-1","session":"codex-work","type":"codex_turn_interrupt","v":2}',
+    );
+    await vi.waitFor(() => expect(sent).toContainEqual({
+      type: "codex_turn_interrupt", id: "interrupt-1", session: "codex-work",
+    }));
+    // hub 断中の fail-open turn は engine ローカル controller しか止められないため、
+    // 常に両方へ中断を試みる（未所有側は no-op）。
+    await vi.waitFor(() => expect(interruptTurn).toHaveBeenCalledWith("codex-work"));
+    await engine.teardown();
+  });
+
+  test("Hub App Server のモデルと token usage 通知を conversation_event marker へ変換する", async () => {
+    const store = makeTempStore();
+    store.put({
+      name: "codex-work",
+      cwd: "/tmp/codex-work",
+      createdAt: 1,
+      agent: "codex",
+      providerSessionId: "thread-123",
+    });
+    const runner = new MockTmuxRunner((args) =>
+      args[0] === "ls" ? ok("codex-work\n") : ok(""),
+    );
+    const manager = new CodexAppServerManager();
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    vi.spyOn(manager, "openThread").mockImplementation(async (options) => {
+      openOptions = options;
+      return {
+        threadId: options.threadId,
+        startTurn: async () => "turn-1",
+        interruptTurn: async () => {},
+        close: () => {},
+      };
+    });
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store),
+      metadataStore: store,
+      codexAppServer: manager,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"id":"open-1","name":"codex-work","type":"session_reattach","v":2}');
+    await engine.lines.nextOfType("session_list_response");
+    engine.writeLine(
+      '{"id":"turn-1","session":"codex-work","text":"run","type":"codex_turn_start","v":2}',
+    );
+    await vi.waitFor(() => expect(openOptions).not.toBeNull());
+
+    openOptions?.onNotification?.({
+      method: "thread/settings/updated",
+      params: { threadSettings: { model: "gpt-5.6-sol" } },
+    });
+    openOptions?.onNotification?.({
+      method: "thread/tokenUsage/updated",
+      params: {
+        tokenUsage: {
+          total: { totalTokens: 987_654 },
+          last: { totalTokens: 12_345 },
+          modelContextWindow: 353_400,
+        },
+      },
+    });
+
+    expect(decodeControlMessage(await engine.lines.nextOfType("chat_output"))).toMatchObject({
+      streamId: "pc:model",
+      text: "gpt-5.6-sol",
+    });
+    expect(decodeControlMessage(await engine.lines.nextOfType("chat_output"))).toMatchObject({
+      streamId: "pc:context",
+      text: "12345",
+    });
+    expect(decodeControlMessage(await engine.lines.nextOfType("chat_output"))).toMatchObject({
+      streamId: "pc:context-window",
+      text: "353400",
+    });
+
+    await engine.teardown();
+  });
+
+  test("codex_model_list_request は共有 App Server の動的モデル一覧を返す", async () => {
+    const manager = new CodexAppServerManager();
+    const listModels = vi.spyOn(manager, "listModels").mockResolvedValue([
+      {
+        id: "gpt-5.6-sol",
+        displayName: "GPT-5.6-Sol",
+        description: "Latest frontier agentic coding model.",
+        contextWindow: 353_400,
+        isDefault: true,
+      },
+    ]);
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({
+      sessionManager: makeManager(runner),
+      codexAppServer: manager,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"id":"models-1","type":"codex_model_list_request","v":2}');
+
+    expect(await engine.lines.nextOfType("codex_model_list_response")).toBe(
+      '{"id":"models-1","models":[{"contextWindow":353400,"description":"Latest frontier agentic coding model.","displayName":"GPT-5.6-Sol","id":"gpt-5.6-sol","isDefault":true}],"type":"codex_model_list_response","v":2}',
+    );
+    expect(listModels).toHaveBeenCalledOnce();
+    await engine.teardown();
+  });
+
+  test("codex_model_list_request の App Server 失敗は error を返す", async () => {
+    const manager = new CodexAppServerManager();
+    vi.spyOn(manager, "listModels").mockRejectedValue(new Error("model/list unavailable"));
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({
+      sessionManager: makeManager(runner),
+      codexAppServer: manager,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"id":"models-2","type":"codex_model_list_request","v":2}');
+
+    const error = await engine.lines.nextOfType("error");
+    expect(decodeControlMessage(error)).toEqual({
+      type: "error",
+      v: 2,
+      id: "models-2",
+      code: "codex_model_list_failed",
+      message: "Error: model/list unavailable",
+    });
+    await engine.teardown();
+  });
+
+  test("codex_model_list_request は App Server 未構成時に error を返す", async () => {
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner) });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"id":"models-3","type":"codex_model_list_request","v":2}');
+
+    const error = await engine.lines.nextOfType("error");
+    expect(decodeControlMessage(error)).toEqual({
+      type: "error",
+      v: 2,
+      id: "models-3",
+      code: "codex_app_server_unavailable",
+      message: "Codex App Server が未構成です。",
+    });
+    await engine.teardown();
+  });
+
   // MARK: 6. decode 失敗行は破棄（クラッシュしない）
 
   test("decode 不能な行は破棄され、以降のメッセージは処理される", async () => {
@@ -519,9 +1105,27 @@ describe("EngineControl — 横断制御チャネル", () => {
 
   // MARK: question_answer → tmux send-keys 変換
 
-  test("question_answer は tmux send-keys へ変換される", async () => {
+  test("question_answer の already_resolved は既存 error 封筒で返す", async () => {
     const runner = new MockTmuxRunner(() => ok(""));
-    const engine = startEngine({ sessionManager: makeManager(runner) });
+    const manager = makeManager(runner);
+    const hub = makeQuestionHub(manager, "answered");
+    const winner = {};
+    hub.registerClient(winner, () => {});
+    hub.handleClientMessage(winner, JSON.stringify({ type: "question_answer_submit", id: "winner",
+      session: "work", questionId: "answered", answers: [] }));
+    const engine = startEngine({ sessionManager: manager, hub });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine('{"answers":[],"id":"answered","session":"work","type":"question_answer","v":1}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("error"))).toMatchObject({
+      id: "answered", code: "question_answer_failed", message: "この設問は既に回答済みです。",
+    });
+    await engine.teardown();
+  });
+
+  test("question_answer: 複数の単一選択は各回答後にレビューを Submit する", async () => {
+    const runner = new MockTmuxRunner(() => ok(""));
+    const manager = makeManager(runner);
+    const engine = startEngine({ sessionManager: manager, hub: makeQuestionHub(manager, "Q1") });
 
     await engine.lines.nextOfType("channel_hello");
     engine.writeLine(
@@ -534,6 +1138,8 @@ describe("EngineControl — 横断制御チャネル", () => {
     expect(await waitForCommand(runner, ["send-keys", "-t", "work", "3"])).toBe(true);
     expect(await waitForCommand(runner, ["send-keys", "-t", "work", "-l", "custom"])).toBe(true);
     expect(await waitForCommand(runner, ["send-keys", "-t", "work", "Enter"])).toBe(true);
+    // 2 問以上は最終問も単一選択でもレビュー画面へ進むため、Submit answers の 1 が必要。
+    expect(await waitForCommand(runner, ["send-keys", "-t", "work", "1"])).toBe(true);
     // Enter は Other 確定の1回だけ。
     const enterCount = runner.recorded.filter(
       (cmd) => JSON.stringify(cmd) === JSON.stringify(["send-keys", "-t", "work", "Enter"]),
@@ -543,9 +1149,32 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
+  test("question_answer: 1問だけの単一選択は数字キーで即確定しレビュー送信しない", async () => {
+    const runner = new MockTmuxRunner(() => ok(""));
+    const manager = makeManager(runner);
+    const engine = startEngine({ sessionManager: manager, hub: makeQuestionHub(manager, "Q-single") });
+
+    await engine.lines.nextOfType("channel_hello");
+    const before = runner.recorded.length;
+    engine.writeLine(
+      '{"answers":[{"multiSelect":false,"questionIndex":0,"selectedOptionIndexes":[1]}],"id":"Q-single","session":"work","type":"question_answer","v":1}',
+    );
+
+    expect(await waitForCommand(runner, ["send-keys", "-t", "work", "2"])).toBe(true);
+    await engine.lines.nextOfType("remote_pending_cleared");
+    const keys = runner.recorded
+      .slice(before)
+      .filter((cmd) => cmd[0] === "send-keys")
+      .map((cmd) => cmd.slice(3));
+    expect(keys).toEqual([["2"]]);
+
+    await engine.teardown();
+  });
+
   test("question_answer: multiSelect は ↓/Space トグル + Right + レビュー確定（1）に変換される", async () => {
     const runner = new MockTmuxRunner(() => ok(""));
-    const engine = startEngine({ sessionManager: makeManager(runner) });
+    const manager = makeManager(runner);
+    const engine = startEngine({ sessionManager: manager, hub: makeQuestionHub(manager, "Q2") });
 
     await engine.lines.nextOfType("channel_hello");
     const before = runner.recorded.length;
@@ -936,6 +1565,44 @@ describe("EngineControl — 横断制御チャネル", () => {
     expect(msg.commands).toEqual([
       { name: "/linked-command", summary: "linked command" },
       { name: "/linked-skill", summary: "linked skill" },
+    ]);
+
+    await engine.teardown();
+  });
+
+  test("slash_list_request は installed plugin の skills/commands を /plugin:name で収集する", async () => {
+    const home = makeTempDir("tailii-slash-plugin-home");
+    const cache = makeTempDir("tailii-slash-plugin-cache");
+    writeMd(path.join(cache, "alpha", "skills", "run", "SKILL.md"), "plugin skill");
+    writeMd(path.join(cache, "alpha", "commands", "fix.md"), "plugin command");
+    writeMd(path.join(cache, "beta", "skills", "run", "SKILL.md"), "disabled plugin skill");
+    fs.mkdirSync(path.join(home, ".claude", "plugins"), { recursive: true });
+    fs.writeFileSync(
+      path.join(home, ".claude", "plugins", "installed_plugins.json"),
+      JSON.stringify({
+        version: 2,
+        plugins: {
+          "alpha@market": [{ scope: "user", installPath: path.join(cache, "alpha") }],
+          "beta@market": [{ scope: "user", installPath: path.join(cache, "beta") }],
+        },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(home, ".claude", "settings.json"),
+      JSON.stringify({ enabledPlugins: { "alpha@market": true, "beta@market": false } }),
+    );
+
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner), homeDir: home });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"id":"SL3","type":"slash_list_request","v":1}');
+    const line = await engine.lines.nextOfType("slash_list_response");
+    const msg = decodeControlMessage(line);
+    if (msg.type !== "slash_list_response") throw new Error(`応答型不一致: ${msg.type}`);
+    expect(msg.commands).toEqual([
+      { name: "/alpha:fix", summary: "plugin command" },
+      { name: "/alpha:run", summary: "plugin skill" },
     ]);
 
     await engine.teardown();

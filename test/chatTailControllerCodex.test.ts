@@ -32,10 +32,10 @@ function capturingWriter(): { writer: LineWriter; messages: () => ControlMessage
   };
 }
 
-function writeRollout(root: string, cwd: string): void {
+function writeRollout(root: string, cwd: string, sessionId = "x", suffix = ""): void {
   const dir = path.join(root, "2026", "07", "06");
   fs.mkdirSync(dir, { recursive: true });
-  const meta = JSON.stringify({ type: "session_meta", payload: { id: "x", cwd } });
+  const meta = JSON.stringify({ type: "session_meta", payload: { id: sessionId, cwd } });
   const user = JSON.stringify({
     type: "event_msg",
     payload: { type: "user_message", message: "コンパイルして" },
@@ -44,7 +44,7 @@ function writeRollout(root: string, cwd: string): void {
     type: "event_msg",
     payload: { type: "agent_message", message: "完了しました", phase: "final_answer" },
   });
-  fs.writeFileSync(path.join(dir, "rollout.jsonl"), [meta, user, agent].join("\n") + "\n");
+  fs.writeFileSync(path.join(dir, `rollout${suffix}.jsonl`), [meta, user, agent].join("\n") + "\n");
 }
 
 describe("ChatTailController — codex モード", () => {
@@ -82,5 +82,33 @@ describe("ChatTailController — codex モード", () => {
     ]);
     // codex モードでは usage 集計対象パスは返さない。
     expect(controller.currentTranscriptPath()).toBeNull();
+  });
+
+  test("open() は Codex provider session ID に一致する rollout だけを追う", async () => {
+    const sessionsRoot = makeTempDir("cc-codex-preferred-sessions");
+    const cwd = makeTempDir("cc-codex-preferred-cwd");
+    writeRollout(sessionsRoot, cwd, "wanted", "-wanted");
+    writeRollout(sessionsRoot, cwd, "other", "-other");
+
+    const { writer, messages } = capturingWriter();
+    const controller = new ChatTailController({
+      writer,
+      tailer: undefined as never,
+      projectsRoot: makeTempDir("cc-codex-preferred-projects"),
+      agent: "codex",
+      codexTailer: new CodexRolloutTailer({
+        sessionsRoot,
+        tailDeadlineMs: 0,
+        emitReplayDoneMarker: true,
+      }),
+    });
+
+    controller.open(cwd, "wanted");
+    await (controller as unknown as { currentPump: Promise<void> | null }).currentPump;
+
+    const chats = messages().filter(
+      (m): m is Extract<ControlMessage, { type: "chat_output" }> => m.type === "chat_output",
+    );
+    expect(chats.filter((m) => m.role === "user")).toHaveLength(1);
   });
 });

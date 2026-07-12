@@ -4,7 +4,10 @@
 // Claude Code の PreToolUse / PostToolUse フック。stdin JSON の `hook_event_name` で分岐する。
 //
 // PreToolUse（ツール実行の唯一のゲート意思決定点）:
-//   summary と構造化 diff（Write=create+全文 / Edit=edit+old/new）を生成し、
+//   まず現在の permission mode（tmux pane の mode-picker 表示）を判定し、
+//   auto（全自動）なら即 allow、acceptEdits なら編集系ツールのみ即 allow して
+//   iPhone 承認をスキップする（mode_set での途中切替が確認モーダルに反映される）。
+//   それ以外は summary と構造化 diff（Write=create+全文 / Edit=edit+old/new）を生成し、
 //   unix domain socket クライアントとして broker（=iPhone）へ approval_request（一意 id）を
 //   送り、内部デッドライン内に approval_decision を受信して permissionDecision を stdout 出力。
 //   決定はブロードキャストされるため自 id のみ受理する（5.4）。tool_input のパスが
@@ -14,6 +17,9 @@
 //   即 deny せず背景 push（notifier 注入時のみ・このブランチのみ, 相互排他 7.1）→
 //   内部デッドライン内で同一 SocketPath へ retry-connect（8.1）。接続できたら残り予算で
 //   送出＋決定待ち（8.2）。デッドライン到達で安全側 deny（8.3）。
+//   決定待ち中の切断（iOS の chat 離脱＝serve チャネル close / SSH 断）も同じフォールバック
+//   に合流する: remote_pending（一覧バッジ/バナー）と push で気づかせ、再接続後に同一 id で
+//   approval_request を送り直す（chat を開き直せば承認を続行できる）。
 //
 // PostToolUse（別呼び出し、ゲートしない）: ObservationLog に監査追記して exit 0（5.8）。
 //
@@ -25,11 +31,27 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
-import { makeProductionPushNotifier } from "./approvalPushNotifier.js";
-import { sendRemotePendingToEngine } from "./engineRelaySocket.js";
+import {
+  makeProductionPushNotifier,
+  ObservationLogPushObserver,
+  type PushObserving,
+} from "./approvalPushNotifier.js";
+import {
+  sendQuestionEventToEngine,
+  sendRemotePendingToEngine,
+  sendSessionProcessingToEngine,
+} from "./engineRelaySocket.js";
+import type { QuestionEventMessage } from "./engineRelaySocket.js";
+import { questionsFromToolInput } from "./transcriptTailer.js";
+import { defaultHeartbeatDir, writeHeartbeat } from "./heartbeat.js";
+import { ensureHubDaemon } from "./hubDaemon.js";
+import { decodeHubServerLine, encodeHubMessage } from "./hubProtocol.js";
 import { ObservationLog, defaultObservationBase } from "./observationLog.js";
-import { resolveSocketPath } from "./socketPath.js";
+import { parsePermissionMode } from "./permissionMode.js";
+import { resolveHubSocketPath, resolveSocketPath } from "./socketPath.js";
+import { attachedSessions } from "./reaper.js";
 import { sleep } from "./sleep.js";
+import { processTmuxCommandRunner, TmuxSessionManager, type TmuxCommandRunner } from "./tmux.js";
 import {
   PROTOCOL_V1,
   decodeControlMessage,
@@ -78,6 +100,15 @@ export type ApprovalPushNotifier = (
   timeLimitMs: number,
 ) => Promise<void>;
 
+export type PresenceReason = "mac-attached" | "client-live";
+export type PresenceProbe = (session: string) => Promise<PresenceReason | null>;
+
+/** presence 判定全体の上限。失敗・超過は push 送信へ倒す。 */
+export const PRESENCE_PROBE_TIME_LIMIT_MS = 500;
+
+/** Hub への使い捨て presence RPC の上限。 */
+export const HUB_PRESENCE_RPC_TIMEOUT_MS = 300;
+
 // MARK: - テスタブルコア
 
 export interface RunHookOptions {
@@ -96,10 +127,27 @@ export interface RunHookOptions {
   notifier?: ApprovalPushNotifier;
   /** push 送信部の時間上限（ms）。gate 非阻害のためこの時間で打ち切る。既定 5000。 */
   notifierTimeLimitMs?: number;
+  /** 背景 push 前の presence 判定。例外・超過は不在扱いにせず fail-open で push する。 */
+  presenceProbe?: PresenceProbe;
+  /** presence により push を抑制した場合の観測先。 */
+  pushObserver?: Pick<PushObserving, "recordSkipped">;
   /** connect 不能時に engine relay へ通知する socket path。省略時は既定パス。null なら送らない。 */
   engineRelaySocketPath?: string | null;
   /** connect 不能ブランチでの retry-connect ポーリング間隔（秒）。既定 1.0。 */
   retryConnectIntervalSeconds?: number;
+  /**
+   * 現在の permission mode（"default" | "acceptEdits" | "plan" | "auto" | null）を返す
+   * provider（注入）。auto/acceptEdits の自動許可判定に使う。省略・null・例外は
+   * 「判定不能」として従来どおり iPhone ゲートへフォールバックする（安全側）。
+   */
+  permissionModeProvider?: () => Promise<string | null>;
+  /**
+   * reaper daemon の判定権威となる heartbeat ファイルの置き場（注入）。
+   * 省略時は書かない（テスト密閉）。runHookCommand が既定パスを渡す。
+   */
+  heartbeatDir?: string;
+  /** Session Hub daemon の常駐保証（注入）。省略時は何もしない。UserPromptSubmit でのみ呼ぶ。 */
+  ensureHub?: () => void;
 }
 
 export interface HookRunResult {
@@ -111,16 +159,77 @@ export interface HookRunResult {
 export async function runHookCore(options: RunHookOptions): Promise<HookRunResult> {
   const session = options.session ?? "default";
   const deadlineSeconds = options.deadlineSeconds;
-  const retryIntervalSeconds =
-    options.retryConnectIntervalSeconds ?? HOOK_RETRY_CONNECT_INTERVAL_SECONDS;
   const parsed = parsePreToolUse(options.stdinData);
 
   // --- 0. hook_event_name で分岐 ---
+  // 処理中/処理完了のライフサイクル通知（idle reaper の「処理中は殺さない」判定用）。
+  // UserPromptSubmit=処理開始 / Stop=処理完了。engine relay へ一方向送信して即終了する。
+  // UserPromptSubmit の stdout は Claude のコンテキストへ注入されるため、必ず無出力にする。
+  if (parsed.eventName === "UserPromptSubmit" || parsed.eventName === "Stop") {
+    if (parsed.eventName === "UserPromptSubmit") {
+      // ターン開始＝Session Hub の常駐を保証する好機（engine 不在でも hook は発火する）。
+      try {
+        options.ensureHub?.();
+      } catch {
+        // ensure は best-effort。
+      }
+    }
+    await notifySessionProcessing(options, session, parsed.eventName === "Stop" ? "done" : "active", parsed.eventName);
+    return { exitCode: 0, stdout: "" };
+  }
+
   if (parsed.eventName === "PostToolUse") {
+    // ツールイベント＝処理中ハートビート（長時間ターンでも処理中判定が失効しないよう更新）。
+    await notifySessionProcessing(options, session, "active", parsed.eventName);
+    // 設問の解決通知（iOS/TUI どちらで回答されても sheet/バッジを閉じる, question-hook-relay）。
+    if (parsed.toolName === "AskUserQuestion") {
+      await notifyQuestionEvent(options, {
+        type: "question_event",
+        session,
+        event: "dismiss",
+        id: parsed.toolUseId,
+      });
+    }
     return runPostToolUse(parsed, session, options.observationBase);
   }
 
   // === 以降 PreToolUse（既定） ===
+  // ツールイベント＝処理中ハートビート（承認ゲート待ちの間も処理中扱いを維持する）。
+  await notifySessionProcessing(options, session, "active", parsed.eventName);
+
+  // --- 0.4 設問ツール（承認ゲートせず、設問を engine relay 経由で iOS へ届ける） ---
+  // AskUserQuestion は「ユーザーへの設問」そのもので実行許可を問う意味がなく、ゲートすると
+  // iPhone に設問シートではなく承認モーダルが出てしまう。さらに Claude Code は設問が未回答の
+  // 間 transcript に tool_use 行を書かない（v2.1.206 実測）ため、transcript tail では設問を
+  // リアルタイム検知できない。よってここが唯一の即時ソース: tool_input から設問を抽出して
+  // engine relay へ question_event(prompt) を送り（engine が question_prompt / remote_pending に
+  // 変換）、即 allow で TUI ダイアログを出す。回答は従来どおり question_answer のキー注入。
+  if (parsed.toolName === "AskUserQuestion") {
+    const questions = questionsFromToolInput(parsed.toolInput);
+    if (questions.length > 0) {
+      await notifyQuestionEvent(options, {
+        type: "question_event",
+        session,
+        event: "prompt",
+        id: parsed.toolUseId,
+        questions,
+      });
+    }
+    return allow("AskUserQuestion is presented natively (Tailii auto-approved)");
+  }
+
+  // --- 0.5 permission mode による自動許可（mode-picker 連動） ---
+  // TUI が auto（全自動）のとき、および acceptEdits の編集系ツールは iPhone 承認を
+  // 出さずに即 allow する。これが無いと mode_set で Auto に切り替えても hook が
+  // 常にゲートし、確認モーダルが出続ける（= モード変更が反映されない）。
+  // 判定不能（provider 無し・capture 失敗・ダイアログ表示中 = null）は従来どおり
+  // iPhone ゲートへフォールバックする（安全側）。
+  const autoAllowReason = autoAllowReasonForMode(
+    await currentPermissionMode(options),
+    parsed.toolName,
+  );
+  if (autoAllowReason !== null) return allow(autoAllowReason);
+
   const summary = buildSummary(parsed.toolName, parsed.toolInput);
   const diff = buildDiff(parsed.toolName, parsed.toolInput);
 
@@ -140,12 +249,156 @@ export async function runHookCore(options: RunHookOptions): Promise<HookRunResul
   }
 
   // === connect 不能ブランチ（Req 2.1 / 8.1〜8.3） ===
-  const unavailableApprovalId = randomUUID();
+  return publishPendingAndAwaitReconnect(
+    options.socketPath,
+    parsed,
+    summary,
+    diff,
+    options,
+    deadlineAtMs,
+    randomUUID(),
+    false,
+  );
+}
+
+// MARK: - 処理中/処理完了ライフサイクル通知
+
+/**
+ * engine relay へ session_processing を送り、reaper daemon の判定権威である heartbeat
+ * ファイルも更新する（失敗は握り潰し＝ゲート/監査へ影響させない）。
+ * `engineRelaySocketPath: null` は「送らない」明示指定（テスト密閉用）。
+ */
+async function notifySessionProcessing(
+  options: RunHookOptions,
+  session: string,
+  state: "active" | "done",
+  event: string,
+): Promise<void> {
+  // heartbeat は engine の生死と無関係に書ける唯一の経路（reaper daemon が読む）。
+  // session 未解決（"default"）は書かない — 実在しない tmux 名の残骸ファイルを作らない。
+  if (options.heartbeatDir !== undefined && session !== "default") {
+    try {
+      writeHeartbeat(options.heartbeatDir, session, {
+        ts: Math.floor(Date.now() / 1000),
+        state: state === "done" ? "idle" : "active",
+        event,
+      });
+    } catch {
+      // heartbeat 書込失敗は無視（reaper 保護が弱まるだけで安全性は変わらない）。
+    }
+  }
+  if (options.engineRelaySocketPath === null) return;
+  try {
+    const message = { type: "session_processing", session, state } as const;
+    // best-effort・短予算（60ms）: engine 不在時にゲート/監査を遅らせない。
+    if (options.engineRelaySocketPath !== undefined) {
+      await sendSessionProcessingToEngine(message, options.engineRelaySocketPath, 60);
+    } else {
+      await sendSessionProcessingToEngine(message, undefined, 60);
+    }
+  } catch {
+    // relay 不達（engine 不在等）は無視する。reaper 保護が弱まるだけで安全性は変わらない。
+  }
+}
+
+/**
+ * engine relay へ question_event を送る（失敗は握り潰し＝設問表示は best-effort、allow は阻害しない）。
+ * `engineRelaySocketPath: null` は「送らない」明示指定（テスト密閉用）。
+ */
+async function notifyQuestionEvent(
+  options: RunHookOptions,
+  message: QuestionEventMessage,
+): Promise<void> {
+  if (options.engineRelaySocketPath === null) return;
+  try {
+    if (options.engineRelaySocketPath !== undefined) {
+      await sendQuestionEventToEngine(message, options.engineRelaySocketPath);
+    } else {
+      await sendQuestionEventToEngine(message);
+    }
+  } catch {
+    // relay 不達（engine 不在等）は無視する。TUI 側のダイアログは出るため回答手段は残る。
+  }
+}
+
+// MARK: - permission mode 自動許可（mode-picker 連動）
+
+/** acceptEdits で自動許可するファイル編集系ツール名（Claude Code の accept-edits 対象に合わせる）。 */
+const ACCEPT_EDITS_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
+
+/**
+ * permission mode によって iPhone 承認をスキップできる場合、その理由文字列を返す（純ロジック）。
+ * - auto: 全ツールを自動許可。
+ * - acceptEdits: 編集系ツール（Write/Edit/MultiEdit/NotebookEdit）のみ自動許可。
+ * - それ以外（default / plan / null = 判定不能）: null（従来どおり iPhone ゲート）。
+ */
+export function autoAllowReasonForMode(mode: string | null, toolName: string): string | null {
+  if (mode === "auto") return "auto mode on (Tailii auto-approved)";
+  if (mode === "acceptEdits" && ACCEPT_EDITS_TOOLS.has(toolName)) {
+    return "accept edits on (Tailii auto-approved)";
+  }
+  return null;
+}
+
+/** provider から現在の permission mode を安全に取得する（未注入・例外は null = 判定不能）。 */
+async function currentPermissionMode(options: RunHookOptions): Promise<string | null> {
+  if (options.permissionModeProvider === undefined) return null;
+  try {
+    return await options.permissionModeProvider();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * tmux pane 表示から permission mode を判定する本番 provider を作る（claude 専用）。
+ * capture-pane が timeLimitMs 内に返らない・失敗する場合は null（判定不能 → 従来ゲート）。
+ * 本番の hook CLI は Claude 専用なので、この provider も Claude にだけ配線する。
+ */
+export function makeTmuxPermissionModeProvider(
+  session: string,
+  timeLimitMs = 1500,
+): () => Promise<string | null> {
+  return async () => {
+    try {
+      const manager = new TmuxSessionManager();
+      const pane = await Promise.race([
+        manager.capturePane(session),
+        sleep(timeLimitMs).then(() => null),
+      ]);
+      return pane === null ? null : parsePermissionMode(pane);
+    } catch {
+      return null;
+    }
+  };
+}
+
+// MARK: - 接続不能/切断フォールバック（Req 8.1〜8.3）
+
+/**
+ * 承認を iPhone に届けられない間の共有フォールバック（connect 不能と決定待ち中の切断の両方）。
+ * remote_pending を engine relay へ流して会話一覧のバッジ/バナーに出し、背景 push
+ * （notifier 注入時のみ, 相互排他 7.1 — 前面 connect 済み経路では送らない）で気づかせた
+ * うえで、内部デッドラインの残りで同一 socket パスへ retry-connect する（8.1）。
+ * 再接続できたら同一 id で approval_request を送り直す（8.2 — iOS 側は id で pending と
+ * 突合できる）。デッドラインまで回復しなければ安全側 deny（8.3）。
+ */
+async function publishPendingAndAwaitReconnect(
+  socketPath: string,
+  parsed: ParsedPreToolUse,
+  summary: string,
+  diff: ToolDiff | undefined,
+  options: RunHookOptions,
+  deadlineAtMs: number,
+  requestId: string,
+  imagesAlreadyEnqueued: boolean,
+): Promise<HookRunResult> {
+  const session = options.session ?? "default";
   if (options.engineRelaySocketPath !== null) {
     await sendRemotePendingToEngine({
       type: "remote_pending",
       v: PROTOCOL_V1,
-      id: unavailableApprovalId,
+      id: requestId,
       session,
       kind: "approval",
       tool: parsed.toolName,
@@ -153,20 +406,36 @@ export async function runHookCore(options: RunHookOptions): Promise<HookRunResul
     }, options.engineRelaySocketPath).catch(() => {});
   }
   if (options.notifier) {
-    await sendBackgroundPush(
-      options.notifier,
-      { approvalId: unavailableApprovalId, tool: parsed.toolName, session },
-      options.notifierTimeLimitMs ?? 5000,
+    const presence = await probePresence(options.presenceProbe, session);
+    if (presence !== null) {
+      try { options.pushObserver?.recordSkipped(requestId, presence, session); } catch { /* 観測失敗は無視。 */ }
+    } else {
+      await sendBackgroundPush(
+        options.notifier,
+        { approvalId: requestId, tool: parsed.toolName, session },
+        options.notifierTimeLimitMs ?? 5000,
+      );
+    }
+  }
+
+  const retryIntervalSeconds =
+    options.retryConnectIntervalSeconds ?? HOOK_RETRY_CONNECT_INTERVAL_SECONDS;
+  const reconnected = await retryConnect(socketPath, deadlineAtMs, retryIntervalSeconds);
+  if (reconnected) {
+    return sendRequestAndReflect(
+      reconnected,
+      parsed,
+      summary,
+      diff,
+      options,
+      deadlineAtMs,
+      requestId,
+      imagesAlreadyEnqueued,
     );
   }
 
-  const reconnected = await retryConnect(options.socketPath, deadlineAtMs, retryIntervalSeconds);
-  if (reconnected) {
-    return sendRequestAndReflect(reconnected, parsed, summary, diff, options, deadlineAtMs, unavailableApprovalId);
-  }
-
   // 内部デッドライン内に一度も再接続できなかった → 安全側 deny（8.3）。
-  return deny(`iPhone unavailable (no reconnect within ${Math.round(deadlineSeconds)}s)`);
+  return deny(`iPhone unavailable (no reconnect within ${Math.round(options.deadlineSeconds)}s)`);
 }
 
 // MARK: - approval_request 送出＋決定反映（connect 成功／再接続で共有）
@@ -179,12 +448,14 @@ async function sendRequestAndReflect(
   options: RunHookOptions,
   deadlineAtMs: number,
   requestIdOverride?: string,
+  imagesAlreadyEnqueued = false,
 ): Promise<HookRunResult> {
   try {
     const requestId = requestIdOverride ?? randomUUID();
 
     // 画像パス検出 → pending キュー投入（非ブロッキング・リサイズなし, 8.1/8.2/8.5）。
-    if (options.imagesPendingBase !== undefined) {
+    // 切断→再接続の送り直しでは投入済み（同一承認 id での二重投入を防ぐ）。
+    if (options.imagesPendingBase !== undefined && !imagesAlreadyEnqueued) {
       enqueuePendingImages(parsed.toolInput, requestId, options.imagesPendingBase);
     }
 
@@ -200,7 +471,11 @@ async function sendRequestAndReflect(
     try {
       socket.write(encoded + "\n");
     } catch {
-      return deny("iPhone disconnected (write failed)");
+      // 送出直前に serve チャネルが落ちた（chat 離脱/開き直しレース）。切断と同じ扱い。
+      if (options.socketPath === null) return deny("iPhone disconnected (write failed)");
+      return publishPendingAndAwaitReconnect(
+        options.socketPath, parsed, summary, diff, options, deadlineAtMs, requestId, true,
+      );
     }
 
     // 残りデッドライン内で approval_decision を待つ（自 id のみ受理, 5.4）。
@@ -216,8 +491,13 @@ async function sendRequestAndReflect(
         await clearRemotePendingIfNeeded(requestId, options);
         return deny(`No response within ${Math.round(options.deadlineSeconds)}s`);
       case "disconnected":
-        await clearRemotePendingIfNeeded(requestId, options);
-        return deny("iPhone disconnected");
+        // 決定待ち中の切断 = iOS の chat 離脱（serve チャネル close）や SSH 断。
+        // 承認自体はまだ生きているので即 deny せず、connect 不能ブランチと同じ
+        // フォールバックに合流して再接続（chat 開き直し）後に同一 id で送り直す。
+        if (options.socketPath === null) return deny("iPhone disconnected");
+        return publishPendingAndAwaitReconnect(
+          options.socketPath, parsed, summary, diff, options, deadlineAtMs, requestId, true,
+        );
     }
   } finally {
     socket.destroy();
@@ -361,6 +641,78 @@ async function retryConnect(
 }
 
 // MARK: - 背景 push 送出（connect 不能ブランチのみ）
+
+/** 注入された presence 判定を全体上限内で実行する。失敗・超過は null（push 継続）。 */
+async function probePresence(probe: PresenceProbe | undefined, session: string): Promise<PresenceReason | null> {
+  if (probe === undefined) return null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const timeout = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), PRESENCE_PROBE_TIME_LIMIT_MS);
+    });
+    return await Promise.race([probe(session).catch(() => null), timeout]);
+  } catch {
+    return null;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
+ * Hub socket へ短命接続し、1回だけ presence RPC を行う。
+ * false は正常応答で購読者なし、null は接続・応答失敗を表す。
+ */
+export function requestHubPresence(
+  session: string,
+  socketPath: string,
+  timeoutMs = HUB_PRESENCE_RPC_TIMEOUT_MS,
+): Promise<boolean | null> {
+  return new Promise((resolve) => {
+    const id = randomUUID();
+    const socket = net.createConnection(socketPath);
+    let buffer = "";
+    let settled = false;
+    const finish = (value: boolean | null): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(null), Math.max(0, timeoutMs));
+    socket.once("connect", () => {
+      socket.write(encodeHubMessage({ type: "presence_request", id, session }));
+    });
+    socket.on("data", (chunk: Buffer) => {
+      buffer += chunk.toString("utf8");
+      for (;;) {
+        const newline = buffer.indexOf("\n");
+        if (newline < 0) break;
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        const message = decodeHubServerLine(line);
+        if (message?.type === "presence_response" && message.id === id && message.session === session) {
+          finish(message.subscriberCount > 0);
+          return;
+        }
+      }
+    });
+    socket.once("error", () => finish(null));
+    socket.once("close", () => finish(null));
+  });
+}
+
+/** tmux attach と Hub subscriber を順に調べる本番 presence probe。 */
+export function makePresenceProbe(
+  runner: TmuxCommandRunner = processTmuxCommandRunner(),
+  hubSocketPath?: string,
+): PresenceProbe {
+  return async (session) => {
+    if ((await attachedSessions(runner)).has(session)) return "mac-attached";
+    const effectiveHubSocketPath = hubSocketPath ?? resolveHubSocketPath();
+    return await requestHubPresence(session, effectiveHubSocketPath) === true ? "client-live" : null;
+  };
+}
 
 /** 背景 push を送出する。timeLimit で打ち切り、成否は deny 判断に影響しない。 */
 async function sendBackgroundPush(
@@ -585,11 +937,8 @@ export async function runHookCommand(args: string[]): Promise<number> {
   let imagesDirArg: string | null = null;
   let deadlineSeconds = HOOK_INTERNAL_DEADLINE_SECONDS;
   let retryIntervalSeconds = HOOK_RETRY_CONNECT_INTERVAL_SECONDS;
-  // codex モード: codex は PreToolUse フックの permissionDecision で "allow"/"ask" を
-  // 「unsupported」として拒否し、有効なのは "deny"（またはコード2）だけ。よって
-  // 承認（allow）時は decision JSON を出さず exit 0 無出力＝続行にし、拒否時のみ deny JSON を出す。
-  // 承認ゲートは codex がフック完了を同期ブロックで待つ性質で成立する（既定 timeout 600s > 内部 540s）。
-  let agent: "claude" | "codex" = "claude";
+  // Codex の承認は App Server native 経路（codexNativeTurnController）に統一済み。
+  // この hook CLI は Claude のフックだけを扱う。
 
   for (let i = 0; i < args.length; i += 1) {
     const next = (): string | null => (i + 1 < args.length ? args[++i]! : null);
@@ -600,11 +949,6 @@ export async function runHookCommand(args: string[]): Promise<number> {
       case "--session":
         sessionArg = next();
         break;
-      case "--agent": {
-        const raw = next();
-        if (raw === "codex" || raw === "claude") agent = raw;
-        break;
-      }
       case "--deadline": {
         const raw = next();
         const value = raw === null ? Number.NaN : Number.parseFloat(raw);
@@ -625,47 +969,47 @@ export async function runHookCommand(args: string[]): Promise<number> {
     }
   }
 
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) {
+    chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+  }
+  const stdinData = Buffer.concat(chunks);
+  const effectiveSession =
+    sessionArg !== null && sessionArg.trim().length > 0 ? sessionArg : null;
+
   let socketPath: string | null = null;
   if (socketArg !== null) {
     socketPath = socketArg;
-  } else if (sessionArg !== null) {
+  } else if (effectiveSession !== null) {
     try {
-      socketPath = resolveSocketPath(sessionArg);
+      socketPath = resolveSocketPath(effectiveSession);
     } catch {
       socketPath = null;
     }
   }
 
-  const chunks: Buffer[] = [];
-  for await (const chunk of process.stdin) {
-    chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
-  }
-
+  const pushObserver = new ObservationLogPushObserver();
   const { exitCode, stdout } = await runHookCore({
-    stdinData: Buffer.concat(chunks),
+    stdinData,
     socketPath,
     deadlineSeconds,
-    session: sessionArg ?? "default",
+    session: effectiveSession ?? "default",
     observationBase: defaultObservationBase(),
     imagesPendingBase:
       imagesDirArg !== null ? path.join(imagesDirArg, "pending") : defaultImagesPendingBase(),
     notifier: makeProductionPushNotifier(),
+    pushObserver,
     retryConnectIntervalSeconds: retryIntervalSeconds,
+    heartbeatDir: defaultHeartbeatDir(),
+    ensureHub: ensureHubDaemon,
+    // tmux pane の mode-picker 表示から auto/acceptEdits の自動許可を判定する。
+    ...(effectiveSession !== null
+      ? {
+          permissionModeProvider: makeTmuxPermissionModeProvider(effectiveSession),
+          presenceProbe: makePresenceProbe(),
+        }
+      : {}),
   });
-  const out = hookStdoutForAgent(agent, stdout);
-  if (out !== null) process.stdout.write(out + "\n");
+  process.stdout.write(stdout + "\n");
   return exitCode;
-}
-
-/**
- * エージェント別にフックが実際に stdout へ書く文字列を決める（TESTABLE）。
- * claude: 生成した decision JSON をそのまま出す。
- * codex : allow/ask を「unsupported」として拒否するため、承認（allow 決定）時は無出力（null）で
- *         exit 0 続行にする。拒否（deny）や監査出力はそのまま出す（deny JSON は codex も解釈する）。
- */
-export function hookStdoutForAgent(agent: "claude" | "codex", stdout: string): string | null {
-  if (agent === "codex" && stdout.includes('"permissionDecision":"allow"')) {
-    return null;
-  }
-  return stdout;
 }

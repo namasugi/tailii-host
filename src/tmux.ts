@@ -20,6 +20,13 @@ export type TmuxCommandRunner = (args: string[]) => Promise<TmuxCommandResult>;
 /** tmux 実行ファイルの既定絶対パス（PATH 外のため絶対指定）。 */
 export const DEFAULT_TMUX_PATH = "/opt/homebrew/bin/tmux";
 
+export interface CapturePaneOptions {
+  /** 取得する末尾行数。未指定なら manager 既定値。 */
+  lines?: number;
+  /** 折り返し行を結合する（tmux capture-pane -J）。 */
+  joinWrappedLines?: boolean;
+}
+
 /** 実 tmux を絶対パスで起動する既定ランナー。tmux 非0 exit は throw せず結果で表現する。 */
 export function processTmuxCommandRunner(tmuxPath: string = DEFAULT_TMUX_PATH): TmuxCommandRunner {
   return (args) =>
@@ -84,9 +91,15 @@ export class TmuxSessionManager {
 
     const cwdByName = new Map<string, string>();
     const claudeSessionIdByName = new Map<string, string>();
+    const providerSessionIdByName = new Map<string, string>();
+    const agentByName = new Map<string, "claude" | "codex">();
     for (const meta of metas) {
       cwdByName.set(meta.name, meta.cwd);
       if (meta.claudeSessionId !== undefined) claudeSessionIdByName.set(meta.name, meta.claudeSessionId);
+      const agent = meta.agent ?? "claude";
+      if (meta.agent !== undefined) agentByName.set(meta.name, meta.agent);
+      const providerSessionId = meta.providerSessionId ?? (agent === "claude" ? meta.claudeSessionId : undefined);
+      if (providerSessionId !== undefined) providerSessionIdByName.set(meta.name, providerSessionId);
     }
 
     const names = new Set<string>(alive);
@@ -97,6 +110,10 @@ export class TmuxSessionManager {
       cwd: cwdByName.get(name) ?? "",
       alive: alive.has(name),
       ...(claudeSessionIdByName.has(name) ? { claudeSessionId: claudeSessionIdByName.get(name)! } : {}),
+      ...(agentByName.has(name) ? { agent: agentByName.get(name)! } : {}),
+      ...(providerSessionIdByName.has(name)
+        ? { providerSessionId: providerSessionIdByName.get(name)! }
+        : {}),
     }));
     return infos.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   }
@@ -135,7 +152,7 @@ export class TmuxSessionManager {
   async sendKeys(name: string, keys: string[], literal = false): Promise<void> {
     validateSessionName(name);
     if (keys.length === 0) return;
-    const args = ["send-keys", "-t", name];
+    const args = ["send-keys", "-t", this.paneTarget(name)];
     if (literal) args.push("-l");
     args.push(...keys);
     const result = await this.runner(args);
@@ -145,8 +162,10 @@ export class TmuxSessionManager {
   }
 
   /** `capture-pane -p -t <name> -S -<N>` で末尾 N 行のペイン内容を返す（末尾空行は削る）。 */
-  async capturePane(name: string): Promise<string> {
-    const args = ["capture-pane", "-p", "-t", name, "-S", `-${this.captureLines}`];
+  async capturePane(name: string, options: CapturePaneOptions = {}): Promise<string> {
+    const args = ["capture-pane", "-p"];
+    if (options.joinWrappedLines ?? false) args.push("-J");
+    args.push("-t", this.paneTarget(name), "-S", `-${options.lines ?? this.captureLines}`);
     const result = await this.runner(args);
     if (result.exitCode !== 0) {
       throw new TmuxFailedError(args, result.exitCode, result.stderr);
@@ -156,6 +175,12 @@ export class TmuxSessionManager {
       lines.pop();
     }
     return lines.join("\n");
+  }
+
+  /** pane ID が記録済みなら `%N` を使い、旧メタデータでは session 名へ戻す。 */
+  private paneTarget(name: string): string {
+    validateSessionName(name);
+    return this.store.get(name)?.tmuxPaneId ?? name;
   }
 
   /** `tmux ls` の生存セッション名集合。サーバ未起動 = 空集合として扱う。 */

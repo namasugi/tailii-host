@@ -19,39 +19,56 @@ import * as readline from "node:readline";
 import * as fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { Readable, Writable } from "node:stream";
-import { ChatTailController, type ChatAgent } from "./chatTailController.js";
-import { CodexRolloutTailer } from "./codexRolloutTailer.js";
+import type { ChatAgent } from "./chatTailController.js";
+import {
+  CodexRolloutTailer,
+  CONTEXT_STREAM_ID as CODEX_CONTEXT_STREAM_ID,
+  CONTEXT_WINDOW_STREAM_ID as CODEX_CONTEXT_WINDOW_STREAM_ID,
+  MODEL_STREAM_ID as CODEX_MODEL_STREAM_ID,
+} from "./codexRolloutTailer.js";
+import { CodexAppServerManager } from "./codexAppServer.js";
+import {
+  CodexNativeTurnController,
+  type CodexTurnControllerRuntime,
+} from "./codexNativeTurnController.js";
 import { ClaudeSessionStore } from "./claudeSessionStore.js";
 import { CodexSessionStore } from "./codexSessionStore.js";
 import { dirChildren, dirCreate, dirList } from "./dirLister.js";
-import { runIdleReaper } from "./idleReaper.js";
+import { ensureHubDaemon } from "./hubDaemon.js";
+import { connectHubSocket, type HubLink } from "./hubClient.js";
+import type { HubClientMessage, HubServerMessage } from "./hubProtocol.js";
 import { ImageService } from "./imageService.js";
-import { startEngineRelaySocket, type EngineRelayServer } from "./engineRelaySocket.js";
-import { makeSessionLauncher, codexInnerCommand, type EngineLauncher } from "./launch.js";
+import type { QuestionEventMessage, SessionProcessingMessage } from "./engineRelaySocket.js";
+import { makeSessionLauncher, claudeInnerCommand, type EngineLauncher } from "./launch.js";
+import { readSubagentTranscript } from "./subagentTranscript.js";
 import { LineWriter } from "./lineWriter.js";
 import { parsePermissionMode } from "./permissionMode.js";
-import { RemoteQuestionMonitor } from "./remoteQuestionMonitor.js";
 import { fetchPlanUsage, type PlanUsageProvider } from "./planUsageFetcher.js";
 import {
   decodeControlMessage,
   PROTOCOL_MAX_SUPPORTED,
   PROTOCOL_V1,
+  PROTOCOL_V2,
   type ControlMessage,
-  type QuestionAnswer,
+  type QuestionPromptQuestion,
   type SessionInfo,
   type SlashCommandInfo,
 } from "./protocol.js";
 import { ownTranscriptActivityProvider } from "./sessionActivityProvider.js";
-import { SessionIdleTracker } from "./sessionIdleTracker.js";
 import { SessionListService } from "./sessionListService.js";
 import { searchClaudeSessions } from "./sessionSearch.js";
 import { SessionMetadataStore } from "./sessionMetadataStore.js";
-import { sleep } from "./sleep.js";
+import { abortableSleep, sleep } from "./sleep.js";
 import { TranscriptTailer } from "./transcriptTailer.js";
 import { TmuxSessionManager } from "./tmux.js";
 import { aggregateUsage, emptyUsageTotals } from "./usageAggregator.js";
 import { aggregateCodexUsage, type CodexUsage } from "./codexUsage.js";
 import { createStaleDistGuard, isStaleDist, readPackageVersion, type StaleDistGuard } from "./version.js";
+import { canonicalPath } from "./paths.js";
+
+function engineDiag(message: string): void {
+  if (process.env["TAILII_DEBUG"] === "1") process.stderr.write(`[tailii-host engine] ${message}\n`);
+}
 
 // MARK: - エントリポイント（cli から呼ばれる）
 
@@ -85,7 +102,6 @@ export async function runEngineCommand(args: string[]): Promise<number> {
   let imagesDirArg: string | null = null;
   let transcriptArg: string | null = null;
   let claudeProjectsDirArg: string | null = null;
-  let idleTimeoutArg: number | null = null;
   let resumeCommandArg: string | null = null;
   // 既定エージェントは host 側設定ファイルで切替可能（iOS 改修不要のトグル）。
   // `--agent` フラグが渡ればそちらが優先する。
@@ -113,12 +129,6 @@ export async function runEngineCommand(args: string[]): Promise<number> {
       case "--claude-projects-dir":
         claudeProjectsDirArg = next();
         break;
-      case "--idle-timeout": {
-        const raw = next();
-        const parsed = raw === null ? Number.NaN : Number.parseInt(raw, 10);
-        if (Number.isFinite(parsed)) idleTimeoutArg = parsed;
-        break;
-      }
       case "--resume-command":
         resumeCommandArg = next();
         break;
@@ -159,10 +169,9 @@ export async function runEngineCommand(args: string[]): Promise<number> {
     }),
   );
 
-  // アイドルライフサイクル: timeout は host 側設定（既定 30 分）。
-  const idleTimeout = idleTimeoutArg ?? 1800;
-  const idleTracker = new SessionIdleTracker(idleTimeout);
-  const reaperInterval = Math.min(idleTimeout, 60);
+  // アイドルライフサイクル: kill 判定は Session Hub の周期 tick が担う。
+  // engine は heartbeat（判定権威ファイル）の書き手 + Hub 常駐の保証だけを行う。
+  ensureHubDaemon();
   // resume 再起動 launcher（kill 済みセッションを記録 cwd で claude --continue 再起動）。
   const resumeLauncher = makeSessionLauncher({
     store,
@@ -171,8 +180,17 @@ export async function runEngineCommand(args: string[]): Promise<number> {
   });
   // per-session: agentType=codex のセッション用に codex launcher / resume launcher を用意する。
   // codex は resume 未対応のため既定コマンドで新規起動する（新しい rollout を tail）。
-  const codexLauncher = makeSessionLauncher({ store, agent: "codex" });
-  const codexResumeLauncher = makeSessionLauncher({ store, agent: "codex" });
+  const codexAppServer = new CodexAppServerManager();
+  const codexLauncher = makeSessionLauncher({
+    store,
+    agent: "codex",
+    codexAppServer,
+  });
+  const codexResumeLauncher = makeSessionLauncher({
+    store,
+    agent: "codex",
+    codexAppServer,
+  });
 
   try {
     await runEngine({
@@ -188,13 +206,11 @@ export async function runEngineCommand(args: string[]): Promise<number> {
       codexLauncher,
       sessionListService,
       metadataStore: store,
-      idleTracker,
       resumeLauncher,
       codexResumeLauncher,
       claudeSessionStore,
       codexSessionStore,
-      reaperCheckIntervalSeconds: reaperInterval,
-      chatTailProjectsRoot: claudeProjectsRoot,
+      codexAppServer,
       agent: agentArg,
     });
     return 0;
@@ -224,20 +240,22 @@ export interface RunEngineOptions {
   codexLauncher?: EngineLauncher | null;
   sessionListService?: SessionListService | null;
   metadataStore?: SessionMetadataStore | null;
-  idleTracker?: SessionIdleTracker | null;
+  /** @deprecated heartbeat 書き込みは Hub が所有する。 */
+  heartbeatDir?: string | null;
+  /** @deprecated heartbeat tick は Hub が所有する。 */
+  heartbeatTickSeconds?: number;
   resumeLauncher?: EngineLauncher | null;
   /** codex セッションの reattach 時 resume 用 launcher。省略時は resumeLauncher にフォールバック。 */
   codexResumeLauncher?: EngineLauncher | null;
   claudeSessionStore?: ClaudeSessionStore | null;
   /** codex 会話一覧の導出（agent-tag）。省略時は codex 会話を一覧に含めない（後方互換）。 */
   codexSessionStore?: CodexSessionStore | null;
-  reaperCheckIntervalSeconds?: number;
-  /** セッション連動 chat_output tail の projects ルート（--transcript 指定時は使わない）。 */
-  chatTailProjectsRoot?: string | null;
   /** 対象エージェント（既定 claude）。codex は rollout tail を使う。 */
   agent?: ChatAgent;
-  /** codex モードの rollout tailer（テスト注入用。省略時は既定ルートで自動生成）。 */
-  codexTailer?: CodexRolloutTailer;
+  /** Codex turn/approval を同一 App Server 接続で扱う共有 runtime。 */
+  codexAppServer?: CodexAppServerManager | null;
+  /** テスト注入用の native turn controller。指定時は codexAppServer より優先する。 */
+  codexTurnController?: CodexTurnControllerRuntime | null;
   /** 自分がサポートする最大版（既定 PROTOCOL_MAX_SUPPORTED）。 */
   maxVersion?: number;
   /** プラン使用状況の取得（既定は実 OAuth 使用量 API。テストは () => null を注入する）。 */
@@ -250,10 +268,10 @@ export interface RunEngineOptions {
   staleDistGuard?: StaleDistGuard | null;
   /** stale dist 検出時の通知（CLI では return によりプロセス終了、テストは観測用）。 */
   onStaleDist?: () => void;
-  /** hook → engine remote_pending relay の socket path。null なら relay listener を起動しない。 */
+  /** @deprecated Hub 移管前のテスト互換。現在は使用しない。 */
   engineRelaySocketPath?: string | null;
-  /** remote question monitor のポーリング間隔（テスト短縮用）。 */
-  remoteQuestionPollMs?: number;
+  /** Session Hub link。省略時は daemon の hub.sock へ接続する。 */
+  hubLink?: HubLink;
 }
 
 interface ModeTiming {
@@ -288,25 +306,23 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     codexLauncher = null,
     sessionListService = null,
     metadataStore = null,
-    idleTracker = null,
     resumeLauncher = null,
     codexResumeLauncher = null,
     claudeSessionStore = null,
     codexSessionStore = null,
-    reaperCheckIntervalSeconds = 60,
-    chatTailProjectsRoot = null,
     agent = "claude",
-    codexTailer = undefined,
+    codexAppServer = null,
+    codexTurnController: injectedCodexTurnController = null,
     maxVersion = PROTOCOL_MAX_SUPPORTED,
     planUsage = () => fetchPlanUsage(),
     homeDir = os.homedir(),
     modeTiming = {},
     staleDistGuard = createStaleDistGuard(),
     onStaleDist = undefined,
-    engineRelaySocketPath = undefined,
-    remoteQuestionPollMs = undefined,
+    hubLink: injectedHubLink = undefined,
   } = options;
   const resolvedModeTiming: ModeTiming = { ...DEFAULT_MODE_TIMING, ...modeTiming };
+  const hubLink = injectedHubLink ?? connectHubSocket();
 
   // 出力の直列化（Node の Writable は書込順序を保証する）。
   const writer = new LineWriter(options.output);
@@ -318,38 +334,14 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     modeSetInFlight: new Set(),
   };
 
-  // ---- セッション連動 chat_output tail（本番配線）----
-  // `--transcript` 明示指定が無く projectsRoot が注入されたときだけ controller を構築する。
-  const chatTailController =
-    transcriptPath === null && chatTailProjectsRoot !== null
-      ? new ChatTailController({
-          writer,
-          tailer:
-            transcriptTailer ??
-            new TranscriptTailer({ tailIndefinitely: true, emitReplayDoneMarker: true }),
-          projectsRoot: chatTailProjectsRoot,
-          imageService,
-          protocolVersion: () => state.negotiatedVersion,
-          agent,
-          ...(codexTailer !== undefined && { codexTailer }),
-        })
-      : null;
-
   const lifecycleAbort = new AbortController();
   const background: Promise<unknown>[] = [];
   const activeChatSession: { name: string | null } = { name: null };
-  let relayServer: EngineRelayServer | null = null;
-  const remoteQuestionMonitor =
-    metadataStore !== null && chatTailProjectsRoot !== null
-      ? new RemoteQuestionMonitor({
-          sessionManager,
-          metadataStore,
-          projectsRoot: chatTailProjectsRoot,
-          writer,
-          activeSession: () => activeChatSession.name,
-          ...(remoteQuestionPollMs !== undefined ? { pollIntervalMs: remoteQuestionPollMs } : {}),
-        })
-      : null;
+  const lastServerSeq = new Map<string, number>();
+  let hubBootId: string | null = null;
+  // Hub ブロードキャストから作る接続ローカル read-model。
+  const processingSessions = new Map<string, number>();
+  let codexTurnController: CodexTurnControllerRuntime | null = injectedCodexTurnController;
 
   try {
     // ---- 1. channel_hello を送出（確立直後）----
@@ -368,20 +360,186 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
       }
     }
 
-    if (engineRelaySocketPath !== null) {
-      relayServer = await startEngineRelaySocket({
-        ...(engineRelaySocketPath !== undefined ? { socketPath: engineRelaySocketPath } : {}),
-        onMessage: (message) => {
-          try {
-            writer.write({ ...message, v: state.negotiatedVersion });
-          } catch (error) {
-            process.stderr.write(`[tailii-host engine] remote_pending 書込失敗: ${String(error)}\n`);
+    // 設問の解決を iOS へ届ける（前面会話= question_dismiss / 別会話= remote_pending_cleared）。
+    const dismissQuestion = (session: string, id: string): void => {
+      const wire: ControlMessage =
+        session === activeChatSession.name
+          ? { type: "question_dismiss", v: PROTOCOL_V1, id }
+          : { type: "remote_pending_cleared", v: PROTOCOL_V1, id, session, kind: "question" };
+      try {
+        writer.write(wire);
+      } catch (error) {
+        process.stderr.write(`[tailii-host engine] question dismiss 書込失敗: ${String(error)}\n`);
+      }
+    };
+
+    // 設問イベントの反映（question-hook-relay）。前面会話ならネイティブ設問シート
+    // （question_prompt）、別会話なら一覧バッジ（remote_pending kind=question）へ変換する。
+    const handleQuestionEvent = (message: QuestionEventMessage): void => {
+      if (message.event === "dismiss") {
+        dismissQuestion(message.session, message.id);
+        return;
+      }
+      const questions = message.questions ?? [];
+      const first = questions[0];
+      const wire: ControlMessage =
+        message.session === activeChatSession.name
+          ? { type: "question_prompt", v: PROTOCOL_V1, id: message.id, questions }
+          : {
+              type: "remote_pending",
+              v: PROTOCOL_V1,
+              id: message.id,
+              session: message.session,
+              kind: "question",
+              summary: first?.question || first?.header || "Question prompt",
+            };
+      try {
+        writer.write(wire);
+      } catch (error) {
+        process.stderr.write(`[tailii-host engine] question prompt 書込失敗: ${String(error)}\n`);
+      }
+    };
+
+    // Hub ブロードキャストを接続ローカル read-model に反映する。
+    const handleSessionProcessing = (message: SessionProcessingMessage): void => {
+      const now = Math.floor(Date.now() / 1000);
+      if (message.state === "active") {
+        processingSessions.set(message.session, now);
+        return;
+      }
+      processingSessions.delete(message.session);
+    };
+
+    if (codexTurnController === null && codexAppServer !== null) {
+      const writeCodexMarker = (session: string, streamId: string, text: string): void => {
+        // chat_output には session ID が無いため、現在開いている会話だけへ流す。
+        if (session !== activeChatSession.name) return;
+        try {
+          writer.write({
+            type: "chat_output",
+            v: state.negotiatedVersion,
+            streamId,
+            role: "system",
+            text,
+            eof: true,
+          });
+        } catch (error) {
+          process.stderr.write(
+            `[tailii-host engine] Codex model/context marker 書込失敗: ${String(error)}\n`,
+          );
+        }
+      };
+      codexTurnController = new CodexNativeTurnController({
+        appServer: codexAppServer,
+        onProcessing: (session, processingState) => {
+          hubLink.send({
+            type: "session_processing",
+            session,
+            state: processingState,
+          });
+        },
+        onModel: (session, model) => {
+          writeCodexMarker(session, CODEX_MODEL_STREAM_ID, model);
+        },
+        onTokenUsage: (session, totalTokens, contextWindow) => {
+          writeCodexMarker(session, CODEX_CONTEXT_STREAM_ID, String(totalTokens));
+          if (contextWindow !== null) {
+            writeCodexMarker(
+              session,
+              CODEX_CONTEXT_WINDOW_STREAM_ID,
+              String(contextWindow),
+            );
           }
         },
-        log: (message) => process.stderr.write(message),
+        onQuestion: ({ session, id, questions }) => {
+          handleQuestionEvent({ type: "question_event", session, event: "prompt", id, questions });
+        },
+        onQuestionDismiss: (session, id) => {
+          handleQuestionEvent({ type: "question_event", session, event: "dismiss", id });
+        },
       });
     }
-    remoteQuestionMonitor?.start();
+
+    const rpcWaiters = new Map<string, (message: HubServerMessage) => void>();
+    hubLink.onMessage = (message) => {
+      if (message.type === "hub_hello_ack") return;
+      if (message.type === "conversation_event") {
+        if (message.session !== activeChatSession.name) return;
+        if (message.serverSeq > 0) lastServerSeq.set(message.session, message.serverSeq);
+        try { writer.write(message.payload); }
+        catch (error) { process.stderr.write(`[tailii-host engine] conversation_event 書込失敗: ${String(error)}\n`); }
+        return;
+      }
+      if (message.type === "conversation_pane_preview") {
+        if (message.session !== activeChatSession.name) return;
+        try { writer.write(message.payload); }
+        catch (error) { process.stderr.write(`[tailii-host engine] pane_preview 書込失敗: ${String(error)}\n`); }
+        return;
+      }
+      if (message.type === "conversation_mode") {
+        // tmux 側で切り替わった permission mode の現況通知（mode_set_response 形式）。
+        if (message.session !== activeChatSession.name) return;
+        try { writer.write({ ...message.payload, v: state.negotiatedVersion }); }
+        catch (error) { process.stderr.write(`[tailii-host engine] mode_push 書込失敗: ${String(error)}\n`); }
+        return;
+      }
+      if (message.type === "hub_state_response" || message.type === "question_answer_result" ||
+        message.type === "input_claim_result" || message.type === "runtime_claim_result" ||
+        message.type === "codex_turn_result" || message.type === "chat_send_result" ||
+        message.type === "presence_response") {
+        rpcWaiters.get(message.id)?.(message);
+        rpcWaiters.delete(message.id);
+      } else if (message.type === "session_processing") handleSessionProcessing(message);
+      else if (message.type === "question_event") handleQuestionEvent(message);
+      else {
+        try { writer.write({ ...message, v: state.negotiatedVersion }); }
+        catch (error) { process.stderr.write(`[tailii-host engine] remote_pending 書込失敗: ${String(error)}\n`); }
+      }
+    };
+    const hubRpc = <T extends HubServerMessage>(request: HubClientMessage, id: string, timeoutMs: number): Promise<T> =>
+      new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          rpcWaiters.delete(id);
+          reject(new Error("Session Hub RPC timeout"));
+        }, timeoutMs);
+        rpcWaiters.set(id, (response) => {
+          clearTimeout(timer);
+          resolve(response as T);
+        });
+        hubLink.send(request);
+      });
+    hubLink.onReconnect = ({ bootId, disconnectedAtMs }) => {
+      const session = activeChatSession.name;
+      const restarted = hubBootId !== null && hubBootId !== bootId;
+      hubBootId = bootId;
+      if (session === null) return;
+      if (restarted) {
+        // serverSeq は Hub プロセス内の採番なので世代を越えて比較できない。切断時刻以降だけを
+        // transcript から backfill し、既表示本文の全履歴再送と停止中の追記欠落をともに避ける。
+        lastServerSeq.delete(session);
+        hubLink.send({ type: "conversation_subscribe", session,
+          ...(disconnectedAtMs !== null ? { newerThanMs: disconnectedAtMs } : {}), preview: true });
+      } else {
+        hubLink.send({ type: "conversation_subscribe", session,
+          ...(lastServerSeq.has(session) ? { afterSeq: lastServerSeq.get(session)! } : {}), preview: true });
+      }
+    };
+    const requestHubState = (session: string): Promise<{ id: string; questions: QuestionPromptQuestion[] } | null> => {
+      const id = randomUUID();
+      return new Promise((resolve) => {
+        rpcWaiters.set(id, (raw) => {
+          const response = raw as Extract<HubServerMessage, { type: "hub_state_response" }>;
+          if (response.processing) processingSessions.set(session, Math.floor(Date.now() / 1000));
+          else processingSessions.delete(session);
+          resolve(response.pendingQuestion);
+        });
+        hubLink.send({ type: "hub_state_request", id, session });
+      });
+    };
+    // remoteQuestionMonitor は起動しない（question-hook-relay で陳腐化）。transcript には
+    // 回答済みの設問しか現れなくなったため、monitor が出せるのは「回答直後の
+    // remote_pending→cleared の一瞬のバッジ明滅」だけで有害無益。別会話の未回答設問の
+    // バッジは hook relay の question_event（handleQuestionEvent）が正しく賄う。
 
     // ---- 1.6 会話出力 tail を開始し chat_output を engine チャネルへ逐次送出 ----
     if (transcriptTailer !== null && transcriptPath !== null) {
@@ -405,20 +563,8 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
       );
     }
 
-    // ---- 1.7 アイドル reaper を常駐起動 ----
-    if (idleTracker !== null) {
-      background.push(
-        runIdleReaper({
-          tracker: idleTracker,
-          sessionManager,
-          checkIntervalSeconds: reaperCheckIntervalSeconds,
-          signal: lifecycleAbort.signal,
-        }),
-      );
-    }
-
     // ---- 2. 行読み取りループ ----
-    ChatTailController.diag(`engine readLoop 開始 pid=${process.pid}`);
+    engineDiag(`engine readLoop 開始 pid=${process.pid}`);
     const rl = readline.createInterface({ input: options.input, crlfDelay: Number.POSITIVE_INFINITY });
     try {
       for await (const line of rl) {
@@ -431,17 +577,21 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           codexLauncher,
           sessionListService,
           metadataStore,
-          idleTracker,
+          hubLink,
+          requestHubState,
+          hubRpc,
           resumeLauncher,
           codexResumeLauncher,
           claudeSessionStore,
           codexSessionStore,
-          chatTailController,
           planUsage,
           homeDir,
           modeTiming: resolvedModeTiming,
           defaultAgent: agent,
           activeChatSession,
+          processingSessions,
+          codexAppServer,
+          codexTurnController,
         });
         if (didProcessMessage && isStaleDist(staleDistGuard)) {
           process.stderr.write("[tailii-host engine] stale dist を検出、再起動のため終了\n");
@@ -452,13 +602,12 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     } finally {
       rl.close();
     }
-    ChatTailController.diag(`engine readLoop EOF（チャネル断）pid=${process.pid}`);
+    engineDiag(`engine readLoop EOF（チャネル断）pid=${process.pid}`);
   } finally {
     // ---- 3. チャネル断で chat_output tail / reaper を確実に停止する（全経路） ----
     lifecycleAbort.abort();
-    await relayServer?.close();
-    remoteQuestionMonitor?.stop();
-    chatTailController?.stop();
+    hubLink.close();
+    codexTurnController?.close();
     await Promise.allSettled(background);
   }
 }
@@ -481,20 +630,78 @@ interface HandlerContext {
   codexLauncher: EngineLauncher | null;
   sessionListService: SessionListService | null;
   metadataStore: SessionMetadataStore | null;
-  idleTracker: SessionIdleTracker | null;
+  hubLink: HubLink;
+  requestHubState: (session: string) => Promise<{ id: string; questions: QuestionPromptQuestion[] } | null>;
+  hubRpc: <T extends HubServerMessage>(request: HubClientMessage, id: string, timeoutMs: number) => Promise<T>;
   resumeLauncher: EngineLauncher | null;
   /** codex セッションの reattach 時 resume 用 launcher。 */
   codexResumeLauncher: EngineLauncher | null;
   claudeSessionStore: ClaudeSessionStore | null;
   /** codex 会話一覧の導出（agent-tag）。 */
   codexSessionStore: CodexSessionStore | null;
-  chatTailController: ChatTailController | null;
   planUsage: PlanUsageProvider;
   homeDir: string;
   modeTiming: ModeTiming;
   /** host 側の既定エージェント（session_start が agentType を指定しないときのフォールバック）。 */
   defaultAgent: ChatAgent;
   activeChatSession: { name: string | null };
+  /** 処理中セッションの最終ハートビート（Unix 秒）。明示 kill 時に掃除する。 */
+  processingSessions: Map<string, number>;
+  /** Codex モデル一覧を取得する共有 App Server。 */
+  codexAppServer: CodexAppServerManager | null;
+  /** Codex native turn/approval 接続。 */
+  codexTurnController: CodexTurnControllerRuntime | null;
+}
+
+/**
+ * chat オープン/再オープン時、そのセッションに未回答の設問があれば question_prompt を再送する。
+ * 未回答の間 transcript に tool_use 行が無く履歴再生では設問が復元されないため、engine の
+ * 保持分から再掲する（question-hook-relay）。
+ */
+async function emitPendingQuestion(ctx: HandlerContext, session: string): Promise<void> {
+  const pending = await ctx.requestHubState(session);
+  if (pending === null) return;
+  ctx.writer.write({
+    type: "question_prompt",
+    v: PROTOCOL_V1,
+    id: pending.id,
+    questions: pending.questions,
+  });
+}
+
+function subscribeConversation(ctx: HandlerContext, session: string, newerThanMs?: number): void {
+  const previous = ctx.activeChatSession.name;
+  if (previous !== null && previous !== session) {
+    ctx.hubLink.send({ type: "conversation_unsubscribe", session: previous });
+  }
+  ctx.activeChatSession.name = session;
+  ctx.hubLink.send({ type: "conversation_subscribe", session,
+    ...(newerThanMs !== undefined ? { newerThanMs } : {}), preview: true });
+}
+
+async function claimRuntime(ctx: HandlerContext, session: string): Promise<"granted" | "held"> {
+  const id = randomUUID();
+  try {
+    const result = await ctx.hubRpc<Extract<HubServerMessage, { type: "runtime_claim_result" }>>(
+      { type: "runtime_claim", id, session }, id, 1_500,
+    );
+    return result.status;
+  } catch {
+    // Hub 障害時は可用性を優先し、排他導入前と同じく engine 自身で起動を続行する。
+    return "granted";
+  }
+}
+
+async function waitForLiveSession(
+  sessionManager: TmuxSessionManager, predicate: (info: SessionInfo) => boolean,
+): Promise<SessionInfo | null> {
+  const deadline = Date.now() + 8_000;
+  while (Date.now() < deadline) {
+    const found = (await sessionManager.list()).find((info) => info.alive && predicate(info));
+    if (found !== undefined) return found;
+    await sleep(500);
+  }
+  return null;
 }
 
 /** 1行（改行なし）をデコードし、メッセージ種別ごとに処理する。decode 失敗は破棄。 */
@@ -507,15 +714,15 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
     message = decodeControlMessage(trimmed);
   } catch (error) {
     // 破棄（不正 JSON / 未知 type / 非対応版 / 必須欠落）。承認文脈でないので無視。
-    ChatTailController.diag(
+    engineDiag(
       `engine decode 失敗（行破棄）: ${String(error)} 生=${trimmed.slice(0, 120)}`,
     );
     process.stderr.write(`[tailii-host engine] decode 失敗、行破棄: ${String(error)}\n`);
     return false;
   }
-  ChatTailController.diag(`engine 受信 type=${message.type}`);
+  engineDiag(`engine 受信 type=${message.type}`);
 
-  const { writer, state, sessionManager, metadataStore, chatTailController } = ctx;
+  const { writer, state, sessionManager, metadataStore } = ctx;
   const v = state.negotiatedVersion;
 
   switch (message.type) {
@@ -545,48 +752,67 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
     }
 
     case "session_reattach": {
-      // 再アクティブ化（アイドル計時解除）→ 生存なら即 reattach / メタあり tmux 不在は
-      // 記録 cwd で resume 再起動 → attached / メタ無しは従来の not_found。
-      ctx.idleTracker?.markActive(message.name);
+      // 再アクティブ化（heartbeat 更新 = アイドル計時リセット）→ 生存なら即 reattach /
+      // メタあり tmux 不在は記録 cwd で resume 再起動 → attached / メタ無しは従来の not_found。
       try {
         const result = await sessionManager.reattach(message.name);
         if (result.kind === "attached") {
           writeSessionListResponse(writer, v, message.id, [result.info], null);
           const meta = metadataStore?.get(message.name) ?? null;
-          const openCwd = meta?.cwd ?? result.info.cwd;
-          ctx.activeChatSession.name = message.name;
-          // セッション記録の agent（codex/claude）で tail mode を選ぶ。
-          chatTailController?.open(
-            openCwd,
-            meta?.claudeSessionId ?? null,
-            null,
-            meta?.agent ?? ctx.defaultAgent,
-          );
+          subscribeConversation(ctx, message.name);
+          await emitPendingQuestion(ctx, message.name);
         } else {
           const meta = metadataStore?.get(message.name) ?? null;
           if (ctx.resumeLauncher !== null && meta !== null) {
             // codex セッションは codex 用 resume launcher で再起動する。
             const reAgent = meta.agent ?? ctx.defaultAgent;
+            const providerSessionId = meta.providerSessionId ?? meta.claudeSessionId ?? null;
             // claude で会話 id が記録済みなら通常 launcher の `--resume <id>` で同一会話を
             // 厳密に再開する（resumeLauncher の `--continue` は cwd の最新会話を拾うため、
             // 別会話を再開して tail 束縛と食い違い得る）。id 未記録の旧メタは従来経路。
             const strictClaudeResume =
-              reAgent === "claude" && meta.claudeSessionId != null && ctx.launcher !== null;
+              reAgent === "claude" && providerSessionId !== null && ctx.launcher !== null;
             const chosenResume =
               reAgent === "codex"
                 ? (ctx.codexResumeLauncher ?? ctx.resumeLauncher)
                 : strictClaudeResume
                   ? ctx.launcher!
                   : ctx.resumeLauncher;
-            const res = await chosenResume(
-              meta.cwd, message.name, null,
-              strictClaudeResume ? (meta.claudeSessionId ?? null) : null,
-            );
+            const claim = await claimRuntime(ctx, message.name);
+            if (claim === "held") {
+              const appeared = await waitForLiveSession(sessionManager, (info) => info.name === message.name);
+              if (appeared !== null) {
+                writeSessionListResponse(writer, v, message.id, [appeared], null);
+                subscribeConversation(ctx, message.name);
+                await emitPendingQuestion(ctx, message.name);
+              } else {
+                writeError(writer, v, message.id, "launch_failed", "他の接続による会話の起動を確認できませんでした。");
+              }
+              break;
+            }
+            let res;
+            try {
+              res = await chosenResume(
+                meta.cwd, message.name, null,
+                reAgent === "codex" || strictClaudeResume ? providerSessionId : null,
+              );
+            } finally {
+              ctx.hubLink.send({ type: "runtime_claim_release", session: message.name });
+            }
             if (res.exitCode === 0) {
-              const info: SessionInfo = { name: message.name, cwd: meta.cwd, alive: true };
+              const info: SessionInfo = {
+                name: message.name,
+                cwd: meta.cwd,
+                alive: true,
+                ...(meta.agent !== undefined ? { agent: meta.agent } : {}),
+                ...(providerSessionId !== null ? { providerSessionId } : {}),
+                ...(meta.claudeSessionId !== undefined
+                  ? { claudeSessionId: meta.claudeSessionId }
+                  : {}),
+              };
               writeSessionListResponse(writer, v, message.id, [info], null);
-              ctx.activeChatSession.name = message.name;
-              chatTailController?.open(meta.cwd, meta.claudeSessionId ?? null, null, reAgent);
+              subscribeConversation(ctx, message.name);
+              await emitPendingQuestion(ctx, message.name);
             } else {
               const m = res.errorText || `resume 失敗 (exit ${res.exitCode})`;
               writeError(writer, v, message.id, "launch_failed", m);
@@ -608,6 +834,15 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
 
     case "session_kill": {
       try {
+        // 明示 kill はユーザー意思なので処理中保護より優先する（保護記録も掃除）。
+        ctx.processingSessions.delete(message.name);
+        ctx.hubLink.send({ type: "conversation_unsubscribe", session: message.name });
+        ctx.codexTurnController?.closeSession(message.name);
+        // kill する会話を tail 中なら止める（生かしたままだと再オープンの open() が
+        // 「同一会話 tail 中」でスキップし、履歴が再生されず空表示になる）。
+        if (ctx.activeChatSession.name === message.name) {
+          ctx.activeChatSession.name = null;
+        }
         await sessionManager.kill(message.name);
         // kill 成功は list 応答（現況一覧）で返す（疎通確認）。
         let sessions: SessionInfo[] = [];
@@ -623,10 +858,153 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
       break;
     }
 
+    case "codex_model_list_request": {
+      if (ctx.codexAppServer === null) {
+        writeError(
+          writer,
+          v,
+          message.id,
+          "codex_app_server_unavailable",
+          "Codex App Server が未構成です。",
+        );
+        break;
+      }
+      try {
+        const models = await ctx.codexAppServer.listModels();
+        writer.write({ type: "codex_model_list_response", v, id: message.id, models });
+      } catch (error) {
+        writeError(writer, v, message.id, "codex_model_list_failed", String(error));
+      }
+      break;
+    }
+
+    case "codex_turn_start": {
+      const meta = metadataStore?.get(message.session) ?? null;
+      const providerSessionId = meta?.providerSessionId ?? null;
+      if (meta?.agent !== "codex" || providerSessionId === null) {
+        writeError(
+          writer,
+          v,
+          message.id,
+          "codex_thread_not_found",
+          `Codex App Server thread がセッション '${message.session}' に束縛されていません。`,
+        );
+        break;
+      }
+      try {
+        try {
+          const result = await ctx.hubRpc<Extract<HubServerMessage, { type: "codex_turn_result" }>>(
+            { type: "codex_turn_submit", id: message.id, session: message.session,
+              text: message.text, clientUserMessageId: message.clientUserMessageId ?? message.id,
+              effort: message.effort ?? null, sandbox: message.sandbox ?? null,
+              threadId: providerSessionId, cwd: meta.cwd }, message.id, 1_500,
+          );
+          if (result.status === "duplicate" || result.status === "started") break;
+          writeError(writer, v, message.id, "codex_turn_start_failed", result.error ?? "Session Hub turn start failed");
+          break;
+        } catch {
+          // Hub 不達/timeout 時だけ engine 所有の従来 controller へ fail-open する。
+        }
+        if (ctx.codexTurnController === null) {
+          writeError(writer, v, message.id, "codex_app_server_unavailable", "Codex App Server が未構成です。");
+          break;
+        }
+        await ctx.codexTurnController.startTurn({
+          session: message.session,
+          threadId: providerSessionId,
+          cwd: meta.cwd,
+          text: message.text,
+          clientUserMessageId: message.clientUserMessageId ?? message.id,
+          effort: message.effort ?? null,
+          sandbox: message.sandbox ?? null,
+        });
+      } catch (error) {
+        writeError(writer, v, message.id, "codex_turn_start_failed", String(error));
+      }
+      break;
+    }
+
+    case "chat_send": {
+      const meta = metadataStore?.get(message.session) ?? null;
+      if (meta?.agent === "codex") {
+        writeError(writer, v, message.id, "chat_send_unsupported", "Codex セッションは codex_turn_start を使用してください。");
+        break;
+      }
+      try {
+        try {
+          const result = await ctx.hubRpc<Extract<HubServerMessage, { type: "chat_send_result" }>>(
+            { type: "chat_send", id: message.id, session: message.session,
+              clientMessageId: message.clientMessageId, text: message.text }, message.id, 1_500,
+          );
+          writer.write({ type: "chat_send_result", v, id: result.id, status: result.status,
+            ...(result.error !== undefined ? { error: result.error } : {}) });
+          break;
+        } catch {
+          // Hub 不達/timeout 時は queue されないため、engine 自身で一度だけ注入する。
+        }
+        await sessionManager.sendKeys(message.session, [message.text], true);
+        await sleep(150);
+        await sessionManager.sendKeys(message.session, ["Enter"]);
+        writer.write({ type: "chat_send_result", v, id: message.id, status: "accepted" });
+      } catch (error) {
+        writeError(writer, v, message.id, "chat_send_failed", String(error));
+      }
+      break;
+    }
+
+    case "codex_turn_interrupt": {
+      const meta = metadataStore?.get(message.session) ?? null;
+      const providerSessionId = meta?.providerSessionId ?? null;
+      if (meta?.agent !== "codex" || providerSessionId === null) {
+        writeError(
+          writer,
+          v,
+          message.id,
+          "codex_thread_not_found",
+          `Codex App Server thread がセッション '${message.session}' に束縛されていません。`,
+        );
+        break;
+      }
+      // hub 所有 turn への中断。hubLink.send は切断中でも throw せず queue する
+      // （hubClient.ts）ため、失敗分岐は存在しない。hub 断で遅延配送されても、その時点で
+      // hub 所有 turn は存在せず無害な no-op になる。
+      ctx.hubLink.send({
+        type: "codex_turn_interrupt",
+        id: message.id,
+        session: message.session,
+      });
+      // fail-open で engine ローカル controller が実行している turn は hub からは中断
+      // できないため、ローカルにも常に中断を試みる（turn 未所有なら no-op）。
+      try {
+        await ctx.codexTurnController?.interruptTurn?.(message.session);
+      } catch (error) {
+        writeError(writer, v, message.id, "codex_turn_interrupt_failed", String(error));
+      }
+      break;
+    }
+
     case "session_idle_hint": {
-      // アイドル起点を記録する（chat 離脱, 要件 4.2）。以後 reaper が timeout 超過で kill する。
-      ctx.idleTracker?.markIdle(message.name, Math.floor(Date.now() / 1000));
-      if (ctx.activeChatSession.name === message.name) ctx.activeChatSession.name = null;
+      // アイドル起点を更新する（chat 離脱, 要件 4.2）。以後 reaper daemon が timeout 超過で kill する。
+      // state は保持（bump）: 処理中（active）に離脱しても idle へ降格させない — state の権威は
+      // hook / turn controller のライフサイクル通知であり、離脱はただの計時リセット。
+      if (ctx.activeChatSession.name === message.name) {
+        ctx.activeChatSession.name = null;
+        // 未回答の設問を残して離脱した → 一覧バッジへ引き継ぐ（question-hook-relay）。
+        const pending = await ctx.requestHubState(message.name);
+        if (pending !== null) {
+          const first = pending.questions[0];
+          writer.write({
+            type: "remote_pending",
+            v,
+            id: pending.id,
+            session: message.name,
+            kind: "question",
+            summary: first?.question || first?.header || "Question prompt",
+          });
+        }
+      }
+      // focus の有無にかかわらず、指定 session の離脱時刻を Hub に記録する。
+      ctx.hubLink.send({ type: "conversation_unsubscribe", session: message.name });
       break;
     }
 
@@ -634,38 +1012,42 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
       // session_start → launch() 結線。agentType でセッション毎に claude/codex を選ぶ
       //（未指定は host 既定 defaultAgent）。codex は agentType=codex 時の専用 launcher を使う。
       const sessionAgent: ChatAgent = message.agentType ?? ctx.defaultAgent;
-      // codex 新規起動でモデル/サンドボックス指定があれば、その flags を持つ launcher をその場で組む
-      //（codex-input）。resume は元セッションの設定を継ぐため既定 codexLauncher を使う。
-      const perSessionCodexLauncher =
-        sessionAgent === "codex" &&
+      // claude 新規起動でモデル/permission mode 指定があれば、その flags（--model /
+      // --permission-mode）を持つ launcher をその場で組む（起動前選択の反映）。
+      // resume は元セッションの設定を継ぐため既定 launcher を使う。
+      const perSessionClaudeLauncher =
+        sessionAgent === "claude" &&
         message.resumeSessionId === undefined &&
-        (message.codexModel !== undefined || message.codexSandbox !== undefined)
+        (message.model !== undefined || message.permissionMode !== undefined)
           ? makeSessionLauncher({
               ...(ctx.metadataStore !== null && { store: ctx.metadataStore }),
-              agent: "codex",
-              innerCommand: codexInnerCommand({
-                model: message.codexModel ?? null,
-                sandbox: message.codexSandbox ?? null,
+              agent: "claude",
+              innerCommand: claudeInnerCommand({
+                model: message.model ?? null,
+                permissionMode: message.permissionMode ?? null,
               }),
             })
           : null;
       const chosenLauncher =
         sessionAgent === "codex"
-          ? (perSessionCodexLauncher ?? ctx.codexLauncher ?? ctx.launcher)
-          : ctx.launcher;
+          ? (ctx.codexLauncher ?? ctx.launcher)
+          : (perSessionClaudeLauncher ?? ctx.launcher);
       const resumeSessionId = message.resumeSessionId ?? null;
-      if (sessionAgent === "claude" && resumeSessionId !== null && metadataStore !== null) {
+      if (resumeSessionId !== null && metadataStore !== null) {
         const aliases = await sessionManager.list();
         const liveAlias = aliases.find((info) => {
           if (!info.alive || info.name === message.name) return false;
-          return metadataStore.get(info.name)?.claudeSessionId === resumeSessionId;
+          const aliasAgent = info.agent ?? "claude";
+          return aliasAgent === sessionAgent && info.providerSessionId === resumeSessionId;
         });
         if (liveAlias !== undefined) {
-          ChatTailController.diag(
-            `session_start resume alias reuse existing=${liveAlias.name} requested=${message.name} claudeSessionId=${resumeSessionId}`,
+          engineDiag(
+            `session_start resume alias reuse existing=${liveAlias.name} requested=${message.name} providerSessionId=${resumeSessionId}`,
           );
-          ctx.activeChatSession.name = liveAlias.name;
-          chatTailController?.open(liveAlias.cwd, resumeSessionId, null, sessionAgent);
+          // 再開＝アクティブ化。前回離脱時の stale な heartbeat が残ったままだと、会話中でも
+          // reaper daemon が timeout 超過で kill してしまう（resume 直後に post が沈黙する根因）。
+          subscribeConversation(ctx, liveAlias.name);
+          await emitPendingQuestion(ctx, liveAlias.name);
           try {
             const sessions = await sessionManager.list();
             writeSessionListResponse(writer, v, message.id, sessions, null);
@@ -681,34 +1063,63 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
         writeError(writer, v, message.id, "launch_failed", "launch 機能が構成されていません。");
         break;
       }
+      const runtimeClaim = await claimRuntime(ctx, message.name);
+      if (runtimeClaim === "held") {
+        const appeared = await waitForLiveSession(sessionManager, (info) => {
+          if (resumeSessionId === null) return info.name === message.name;
+          return (info.agent ?? "claude") === sessionAgent && info.providerSessionId === resumeSessionId;
+        });
+        if (appeared !== null) {
+          subscribeConversation(ctx, appeared.name);
+          await emitPendingQuestion(ctx, appeared.name);
+          try { writeSessionListResponse(writer, v, message.id, await sessionManager.list(), null); }
+          catch { writeSessionListResponse(writer, v, message.id, [appeared], null); }
+        } else {
+          writeError(writer, v, message.id, "launch_failed", "他の接続による会話の起動を確認できませんでした。");
+        }
+        break;
+      }
       // 新規起動は host 生成の session-id で claude を起動し（`--session-id <uuid>`）、
       // 会話 jsonl 名を事前に確定させる。tail はその id の jsonl だけを追うため、同一 cwd に
       // 別の稼働セッションがあっても、そのログが新セッションへ流れ込まない（取り違え防止）。
-      const newSessionId = resumeSessionId === null ? randomUUID() : null;
+      const newSessionId =
+        sessionAgent === "claude" && resumeSessionId === null ? randomUUID() : null;
       // codex は session-id 固定を持たず mtime で rollout を解決するため、新規起動は
       // 「起動時刻より後に更新された rollout」に限定する（古い rollout の流入防止）。
       // claude は preferred=newSessionId で厳密束縛するため newerThanMs は効かない（無害）。
       const launchedAtMs = Date.now();
-      ChatTailController.diag(
+      engineDiag(
         `session_start launcher 呼出前 cwd=${message.cwd} name=${message.name} resume=${resumeSessionId ?? "nil"} newId=${newSessionId ?? "nil"}`,
       );
-      const result = await chosenLauncher(
-        message.cwd, message.name, message.baseDir ?? null, resumeSessionId, newSessionId,
-        message.title ?? null,
-      );
-      ChatTailController.diag(
-        `session_start launcher 結果 exit=${result.exitCode} err=${result.errorText.slice(0, 100)} tailCtrl=${chatTailController === null ? "nil" : "ok"}`,
+      let result;
+      try {
+        result = await chosenLauncher(
+          message.cwd, message.name, message.baseDir ?? null, resumeSessionId, newSessionId,
+          message.title ?? null,
+          sessionAgent === "codex"
+            ? {
+                codexModel: message.codexModel ?? null,
+                codexSandbox: message.codexSandbox ?? null,
+              }
+            : undefined,
+        );
+      } finally {
+        ctx.hubLink.send({ type: "runtime_claim_release", session: message.name });
+      }
+      engineDiag(
+        `session_start launcher 結果 exit=${result.exitCode} err=${result.errorText.slice(0, 100)}`,
       );
       if (result.exitCode === 0) {
+        const providerSessionId =
+          result.providerSessionId ?? resumeSessionId ?? newSessionId;
         // cwd は launcher が権威記録した解決後 cwd（メタ）を優先。
-        const openCwd = metadataStore?.get(message.name)?.cwd ?? message.cwd;
-        ctx.activeChatSession.name = message.name;
+        // 起動/再開＝アクティブ化。同名の stale heartbeat が残っていると、起動直後の
+        // reaper daemon tick（最長 60 秒後）が新しい tmux セッションを即 kill してしまう。
         // tail は確定した会話 id（resume=既存 id / 新規=生成 id）だけを追う。newerThanMs は
         // codex（mtime 解決）の新規起動でのみ効き、claude は preferred で厳密束縛される。
-        chatTailController?.open(
-          openCwd, resumeSessionId ?? newSessionId, resumeSessionId === null ? launchedAtMs : null,
-          sessionAgent,
-        );
+        subscribeConversation(ctx, message.name,
+          providerSessionId === null && resumeSessionId === null ? launchedAtMs : undefined);
+        await emitPendingQuestion(ctx, message.name);
         // 成功: 現況一覧で応答する（kill と同じ疎通様式）。
         try {
           const sessions = await sessionManager.list();
@@ -736,9 +1147,14 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
       // 分岐は「rollout が解決済みか」ではなく「tail 中の会話が codex か」で行う。rollout 未解決でも
       // Claude の OAuth プラン使用量 API へは絶対に落とさない（codex 会話に Claude の状態が出る不具合
       // の防止, 2026-07-07 ユーザー指摘）。codex は OAuth プラン使用量非対応なので planUsage は使わない。
-      const tailAgent = chatTailController?.currentAgent() ?? ctx.defaultAgent;
+      const tailAgent = ctx.activeChatSession.name === null
+        ? ctx.defaultAgent
+        : metadataStore?.get(ctx.activeChatSession.name)?.agent ?? ctx.defaultAgent;
       if (tailAgent === "codex") {
-        const codexRollout = chatTailController?.currentCodexRolloutPath() ?? null;
+        const currentMeta = ctx.activeChatSession.name === null ? null : metadataStore?.get(ctx.activeChatSession.name) ?? null;
+        const codexRollout = currentMeta === null ? null : new CodexRolloutTailer().resolve(
+          currentMeta.cwd, null, currentMeta.providerSessionId ?? null,
+        );
         // rollout 未解決（起動直後等）は空集計で返す。Claude 分岐へは落とさない。
         const cu: CodexUsage =
           codexRollout !== null ? aggregateCodexUsage(codexRollout) : { ...emptyUsageTotals() };
@@ -763,7 +1179,12 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
         break;
       }
       // 使用量（claude）: プラン使用率（OAuth 使用量 API, ベストエフォート）+ tail 中会話の usage 合算。
-      const transcript = chatTailController?.currentTranscriptPath() ?? null;
+      const currentMeta = ctx.activeChatSession.name === null ? null : metadataStore?.get(ctx.activeChatSession.name) ?? null;
+      const transcript = currentMeta === null ? null : TranscriptTailer.resolveJsonl(
+        path.join(os.homedir(), ".claude", "projects", canonicalPath(currentMeta.cwd).replaceAll("/", "-")),
+        currentMeta.providerSessionId ?? currentMeta.claudeSessionId ?? null,
+        null,
+      );
       const totals = transcript !== null ? aggregateUsage(transcript) : emptyUsageTotals();
       const plan = await ctx.planUsage();
       try {
@@ -795,14 +1216,17 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
 
     case "question_answer": {
       try {
-        await injectQuestionAnswers(message.answers, message.session, sessionManager);
-        writer.write({
-          type: "remote_pending_cleared",
-          v,
-          id: message.id,
-          session: message.session,
-          kind: "question",
-        });
+        const requestId = randomUUID();
+        const result = await ctx.hubRpc<Extract<HubServerMessage, { type: "question_answer_result" }>>(
+          { type: "question_answer_submit", id: requestId, session: message.session,
+            questionId: message.id, answers: message.answers }, requestId, 2_000,
+        );
+        if (result.status === "accepted") {
+          writer.write({ type: "remote_pending_cleared", v, id: message.id,
+            session: message.session, kind: "question" });
+        } else {
+          writeError(writer, v, message.id, "question_answer_failed", "この設問は既に回答済みです。");
+        }
       } catch (error) {
         writeError(writer, v, message.id, "question_answer_failed", String(error));
       }
@@ -896,6 +1320,19 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
       break;
     }
 
+    case "subagent_transcript_request": {
+      const result = readSubagentTranscript(null);
+      try {
+        writer.write({
+          type: "subagent_transcript_response", v: PROTOCOL_V2, id: message.id, nodeId: message.nodeId,
+          entries: result.entries, omitted: result.omitted,
+        });
+      } catch (error) {
+        process.stderr.write(`[tailii-host engine] subagent_transcript_response 書込失敗: ${String(error)}\n`);
+      }
+      break;
+    }
+
     case "dir_list_request": {
       // ディレクトリ候補問い合わせ。base 外・不正・一致なしは空 entries（エラーにしない）。
       const entries = dirList(message.baseDir, message.partial);
@@ -911,13 +1348,13 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
 
     case "browse_request": {
       // ディレクトリ非限定ブラウズ。不存在・読取不能は空 entries（エラーにしない）。
-      ChatTailController.diag(`browse_request id=${message.id} path=${message.path}`);
+      engineDiag(`browse_request id=${message.id} path=${message.path}`);
       const entries = dirChildren(message.path);
       try {
         writer.write({ type: "browse_response", v, id: message.id, path: message.path, entries });
-        ChatTailController.diag(`browse_response id=${message.id} entries=${entries.length}`);
+        engineDiag(`browse_response id=${message.id} entries=${entries.length}`);
       } catch (error) {
-        ChatTailController.diag(`browse_response 書込失敗 id=${message.id}: ${String(error)}`);
+        engineDiag(`browse_response 書込失敗 id=${message.id}: ${String(error)}`);
         process.stderr.write(
           `[tailii-host engine] browse_response 書込失敗: ${String(error)}\n`,
         );
@@ -928,16 +1365,20 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
     case "claude_session_list_request": {
       // 会話一覧: claude(jsonl) + codex(rollout) をマージし updatedAt 降順で返す（agent-tag）。
       // store 未注入時はその分を空一覧扱い（後方互換 — 会話機能なし）。
-      ChatTailController.diag(`claude_session_list_request id=${message.id}`);
+      engineDiag(`claude_session_list_request id=${message.id}`);
       const claudeSessions = ctx.claudeSessionStore?.list() ?? [];
-      const codexSessions = ctx.codexSessionStore?.list() ?? [];
+      const codexSessions = ctx.codexSessionStore === null
+        ? []
+        : ctx.codexAppServer === null
+          ? ctx.codexSessionStore.list()
+          : await ctx.codexSessionStore.listWithAppServer(ctx.codexAppServer);
       const sessions = [...claudeSessions, ...codexSessions].sort((lhs, rhs) => {
         const l = lhs.updatedAt ?? Number.MIN_SAFE_INTEGER;
         const r = rhs.updatedAt ?? Number.MIN_SAFE_INTEGER;
         if (l !== r) return r - l;
         return lhs.sessionId < rhs.sessionId ? -1 : lhs.sessionId > rhs.sessionId ? 1 : 0;
       });
-      ChatTailController.diag(
+      engineDiag(
         `claude_session_list_response id=${message.id} count=${sessions.length}`,
       );
       try {
@@ -954,12 +1395,12 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
 
     case "session_search_request": {
       // Claude 会話本文検索。長時間 read loop を塞がないよう検索関数側で件数/時間/読取量を制限する。
-      ChatTailController.diag(`session_search_request id=${message.id} query=${message.query}`);
+      engineDiag(`session_search_request id=${message.id} query=${message.query}`);
       const response =
         ctx.claudeSessionStore !== null
           ? searchClaudeSessions(ctx.claudeSessionStore, message.query, { limit: message.limit })
           : { results: [], stats: { scannedFiles: 0, truncated: false } };
-      ChatTailController.diag(
+      engineDiag(
         `session_search_response id=${message.id} count=${response.results.length} scanned=${response.stats.scannedFiles} truncated=${response.stats.truncated}`,
       );
       try {
@@ -992,89 +1433,6 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
       break;
   }
   return true;
-}
-
-/**
- * multiSelect のカーソル移動・トグル・入力の各キー送出の間に挟むウェイト（ms）。
- * 連続キーを一気に送ると TUI（Ink 再描画）が取りこぼすため、1 キーごとに待つ。
- */
-const KEY_STEP_MS = 150;
-
-/**
- * iOS の選択結果を Claude Code TUI の AskUserQuestion ダイアログへ送る。
- * 実 TUI の操作体系（2026-07-07 に tmux + 実 claude で再検証済み）:
- * - 単一選択 = 数字キー（1-based）で即確定（Enter は送らない — 誤爆防止）。
- * - 単一選択の Other = 数字キーで行がインライン入力欄化 → literal 入力 → Enter。空なら押さない。
- * - multiSelect = 数字キーは無反応。カーソル（先頭 index 0 から開始）を ↓ で対象行へ移動し
- *   Space でトグル → Right でレビュー → 最終問後に「1」Submit answers。
- *   Other 行は Space でチェック＆入力欄化 → literal 入力 → ↑ でテキスト欄を抜けてから Right。
- * - Other の synthetic index（= options.count）は選択肢中で最大の index になるため、
- *   otherText があるときは最大 index を Other 行とみなす。
- */
-async function injectQuestionAnswers(
-  answers: QuestionAnswer[],
-  session: string,
-  sessionManager: TmuxSessionManager,
-): Promise<void> {
-  const sorted = answers.slice().sort((a, b) => a.questionIndex - b.questionIndex);
-  let needsReviewSubmit = false;
-  for (let position = 0; position < sorted.length; position += 1) {
-    const answer = sorted[position]!;
-    const isLast = position === sorted.length - 1;
-    const other = (answer.otherText ?? "").trim();
-    let indexes = answer.selectedOptionIndexes.filter((i) => i >= 0).sort((a, b) => a - b);
-    // otherText があるとき、最大 index は Other（Type something.）行。
-    let otherIndex: number | null = null;
-    if (other.length > 0 && indexes.length > 0) {
-      otherIndex = indexes[indexes.length - 1]!;
-      indexes = indexes.slice(0, -1);
-    }
-    if (answer.multiSelect) {
-      // multiSelect は数字キーではトグルできない（実 TUI）。カーソルを ↓ で移動し Space でトグルする。
-      // カーソルは先頭（index 0）から開始。indexes / otherIndex は昇順なので下方向のみで足りる。
-      let cursor = 0;
-      const moveTo = async (target: number): Promise<void> => {
-        for (let n = cursor; n < target; n += 1) {
-          await sessionManager.sendKeys(session, ["Down"]);
-          await sleep(KEY_STEP_MS);
-        }
-        cursor = target;
-      };
-      for (const idx of indexes) {
-        await moveTo(idx);
-        await sessionManager.sendKeys(session, ["Space"]);
-        await sleep(KEY_STEP_MS);
-      }
-      if (otherIndex !== null) {
-        await moveTo(otherIndex);
-        // Other 行を Space でチェックすると同時に入力欄がフォーカスされる。
-        await sessionManager.sendKeys(session, ["Space"]);
-        await sleep(KEY_STEP_MS);
-        await sessionManager.sendKeys(session, [other], true);
-        await sleep(KEY_STEP_MS);
-        // テキスト欄にいると Right がタブ移動に効かないため、↑ で通常行へ退避してから進む。
-        await sessionManager.sendKeys(session, ["Up"]);
-        await sleep(KEY_STEP_MS);
-        cursor = otherIndex - 1;
-      }
-      // レビュー（最終問）または次の質問タブへ進む。
-      await sessionManager.sendKeys(session, ["Right"]);
-      if (isLast) needsReviewSubmit = true;
-    } else if (otherIndex !== null) {
-      await sessionManager.sendKeys(session, [String(otherIndex + 1)]);
-      await sessionManager.sendKeys(session, [other], true);
-      await sessionManager.sendKeys(session, ["Enter"]);
-    } else if (indexes.length > 0) {
-      // 数字キーで即確定（Enter は送らない）。
-      await sessionManager.sendKeys(session, [String(indexes[0]! + 1)]);
-    }
-    // TUI の再描画/タブ送りを待つ（連続注入の取りこぼし防止）。
-    await sleep(200);
-  }
-  if (needsReviewSubmit) {
-    // レビュー画面「Ready to submit your answers?」で 1. Submit answers を確定する。
-    await sessionManager.sendKeys(session, ["1"]);
-  }
 }
 
 /** pane から mode が判定できるまで、指定回数だけ短く待つ。 */
@@ -1137,12 +1495,13 @@ interface SlashCandidate {
   priority: number;
 }
 
-/** slash_list_request 用に、ユーザー/プロジェクトの skills と commands を収集する。 */
+/** slash_list_request 用に、ユーザー/プロジェクト/プラグインの skills と commands を収集する。 */
 function collectSlashCommands(homeDir: string, cwd?: string): SlashCommandInfo[] {
   const byName = new Map<string, SlashCandidate>();
   const userClaude = path.join(homeDir, ".claude");
   const projectClaude = cwd === undefined ? null : path.join(cwd, ".claude");
 
+  scanPluginCommands(userClaude, byName);
   scanSkillCommands(path.join(userClaude, "skills"), 2, byName);
   if (projectClaude !== null) scanSkillCommands(path.join(projectClaude, "skills"), 4, byName);
   scanMarkdownCommands(path.join(userClaude, "commands"), 1, byName);
@@ -1154,11 +1513,55 @@ function collectSlashCommands(homeDir: string, cwd?: string): SlashCommandInfo[]
     .slice(0, 200);
 }
 
-/** ~/.claude/skills/<name>/SKILL.md 形式のコマンド候補を読む。 */
+/** installed_plugins.json に登録されたプラグインの skills/commands を `/plugin:name` として読む。 */
+function scanPluginCommands(claudeDir: string, byName: Map<string, SlashCandidate>): void {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(
+      fs.readFileSync(path.join(claudeDir, "plugins", "installed_plugins.json"), "utf8"),
+    );
+  } catch {
+    return;
+  }
+  const plugins = (parsed as { plugins?: unknown } | null)?.plugins;
+  if (typeof plugins !== "object" || plugins === null) return;
+  const disabled = readDisabledPlugins(claudeDir);
+  for (const [key, installs] of Object.entries(plugins)) {
+    if (disabled.has(key)) continue;
+    const pluginName = key.split("@")[0] ?? "";
+    if (pluginName === "" || !Array.isArray(installs)) continue;
+    for (const install of installs) {
+      const installPath = (install as { installPath?: unknown } | null)?.installPath;
+      if (typeof installPath !== "string") continue;
+      scanSkillCommands(path.join(installPath, "skills"), 0, byName, `${pluginName}:`);
+      scanMarkdownCommands(path.join(installPath, "commands"), 0, byName, `${pluginName}:`);
+    }
+  }
+}
+
+/** ~/.claude/settings.json の enabledPlugins で明示的に false のプラグインキー集合。 */
+function readDisabledPlugins(claudeDir: string): Set<string> {
+  const disabled = new Set<string>();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(path.join(claudeDir, "settings.json"), "utf8"));
+  } catch {
+    return disabled;
+  }
+  const enabled = (parsed as { enabledPlugins?: unknown } | null)?.enabledPlugins;
+  if (typeof enabled !== "object" || enabled === null) return disabled;
+  for (const [key, value] of Object.entries(enabled)) {
+    if (value === false) disabled.add(key);
+  }
+  return disabled;
+}
+
+/** ~/.claude/skills/<name>/SKILL.md 形式のコマンド候補を読む（namePrefix はプラグイン名前空間用）。 */
 function scanSkillCommands(
   root: string,
   priority: number,
   byName: Map<string, SlashCandidate>,
+  namePrefix = "",
 ): void {
   let entries: fs.Dirent[];
   try {
@@ -1177,15 +1580,21 @@ function scanSkillCommands(
       }
     }
     if (!isDirectory) continue;
-    addSlashCandidate(byName, `/${entry.name}`, path.join(skillDir, "SKILL.md"), priority);
+    addSlashCandidate(
+      byName,
+      `/${namePrefix}${entry.name}`,
+      path.join(skillDir, "SKILL.md"),
+      priority,
+    );
   }
 }
 
-/** ~/.claude/commands/<name>.md 形式のコマンド候補を読む。 */
+/** ~/.claude/commands/<name>.md 形式のコマンド候補を読む（namePrefix はプラグイン名前空間用）。 */
 function scanMarkdownCommands(
   root: string,
   priority: number,
   byName: Map<string, SlashCandidate>,
+  namePrefix = "",
 ): void {
   let entries: fs.Dirent[];
   try {
@@ -1205,7 +1614,7 @@ function scanMarkdownCommands(
       }
     }
     if (!isFile) continue;
-    addSlashCandidate(byName, `/${entry.name.slice(0, -3)}`, filePath, priority);
+    addSlashCandidate(byName, `/${namePrefix}${entry.name.slice(0, -3)}`, filePath, priority);
   }
 }
 

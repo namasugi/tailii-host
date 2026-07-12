@@ -5,7 +5,7 @@
 // 細工した PreToolUse JSON を stdinData として runHookCore に渡し、
 // allow / deny / 無応答 / 切断 / connect 失敗 / 不正行 / retry-connect を網羅する。
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -13,16 +13,17 @@ import { randomUUID } from "node:crypto";
 import type * as net from "node:net";
 import {
   HOOK_INTERNAL_DEADLINE_SECONDS,
-  hookStdoutForAgent,
+  autoAllowReasonForMode,
   runHookCore,
   type ApprovalPushRequest,
 } from "../src/hook.js";
 import {
   HOOK_EXTERNAL_TIMEOUT_SECONDS,
   claudeHookLaunchSettings,
-  installCodexHookSettings,
+  removeCodexHookSettings,
 } from "../src/hookSettings.js";
 import { decodeControlMessage, type ControlMessage } from "../src/protocol.js";
+import { startEngineRelaySocket, type EngineRelayMessage } from "../src/engineRelaySocket.js";
 import {
   SocketLineReader,
   canListenUnixSocket,
@@ -65,6 +66,28 @@ function editPreToolUse(filePath: string, oldString: string, newString: string, 
       tool_name: "Edit",
       tool_input: { file_path: filePath, old_string: oldString, new_string: newString },
       cwd,
+    }),
+  );
+}
+
+function askUserQuestionPreToolUse(toolUseId: string): Buffer {
+  return Buffer.from(
+    JSON.stringify({
+      session_id: "sess-q",
+      hook_event_name: "PreToolUse",
+      tool_name: "AskUserQuestion",
+      tool_use_id: toolUseId,
+      tool_input: {
+        questions: [
+          {
+            question: "どっち?",
+            header: "選択",
+            multiSelect: false,
+            options: [{ label: "A", description: "前者" }],
+          },
+        ],
+      },
+      cwd: "/w",
     }),
   );
 }
@@ -218,27 +241,67 @@ describe("Hook — PreToolUse 承認ゲート", () => {
     expect(elapsed).toBeLessThan(0.9);
   });
 
-  it("接続後すぐ切断（EOF）→ deny（Req 5.2）", async () => {
-    socketPath = tempSocketPath("disconnect");
+  it("決定待ち中の切断（EOF）→ 即 deny せず、再接続後に同一 id で送り直して決定を受理（Req 8.2）", async () => {
+    socketPath = tempSocketPath("disconnect-resend");
     listener = await startListener(socketPath);
 
     const served = (async () => {
-      const socket = await listener!.nextConnection();
-      const reader = new SocketLineReader(socket);
-      await reader.nextLine(); // request を読み捨ててから即切断
-      socket.destroy();
+      // 1 回目: request を受けてから即切断（iOS の chat 離脱＝serve チャネル close 相当）。
+      const first = await listener!.nextConnection();
+      const firstReader = new SocketLineReader(first);
+      const firstMessage = decodeControlMessage(await firstReader.nextLine());
+      if (firstMessage.type !== "approval_request") throw new Error("approval_request ではない");
+      first.destroy();
+      // 2 回目: 再接続（chat 開き直し相当）→ 送り直された request に allow を返す。
+      const second = await listener!.nextConnection();
+      const secondReader = new SocketLineReader(second);
+      const secondMessage = decodeControlMessage(await secondReader.nextLine());
+      if (secondMessage.type !== "approval_request") throw new Error("approval_request ではない");
+      writeLine(second, encodeDecision(secondMessage.id, "allow", "approved-after-reopen"));
+      return { firstId: firstMessage.id, secondId: secondMessage.id };
     })();
     const { exitCode, stdout } = await runHookCore({
       stdinData: bashPreToolUse("echo x", "/work"),
       socketPath,
       deadlineSeconds: 5,
+      retryConnectIntervalSeconds: 0.05,
+      engineRelaySocketPath: null,
+    });
+    const { firstId, secondId } = await served;
+
+    expect(exitCode).toBe(0);
+    const parsed = parseDecision(stdout);
+    expect(parsed.decision).toBe("allow");
+    expect(parsed.reason).toBe("approved-after-reopen");
+    // iOS 側が一覧の pending と突合できるよう、送り直しは同一 id で行う。
+    expect(secondId).toBe(firstId);
+  });
+
+  it("決定待ち中の切断後、再接続できないままデッドライン → 安全側 deny（Req 8.3）", async () => {
+    socketPath = tempSocketPath("disconnect-gone");
+    listener = await startListener(socketPath);
+
+    const served = (async () => {
+      const socket = await listener!.nextConnection();
+      const reader = new SocketLineReader(socket);
+      await reader.nextLine(); // request を読み捨てる
+      await listener!.close(); // 接続ごと listener を落とす（再接続先なし）
+      listener = null;
+      fs.rmSync(socketPath, { force: true });
+    })();
+    const { exitCode, stdout } = await runHookCore({
+      stdinData: bashPreToolUse("echo x", "/work"),
+      socketPath,
+      deadlineSeconds: 0.5,
+      retryConnectIntervalSeconds: 0.05,
+      engineRelaySocketPath: null,
     });
     await served;
 
     expect(exitCode).toBe(0);
     const parsed = parseDecision(stdout);
     expect(parsed.decision).toBe("deny");
-    expect(parsed.reason).toBe("iPhone disconnected");
+    expect(parsed.reason).toContain("iPhone unavailable");
   });
 
   it("接続失敗（broker 不在）→ deny（fail-safe）", async () => {
@@ -250,6 +313,7 @@ describe("Hook — PreToolUse 承認ゲート", () => {
       socketPath,
       deadlineSeconds: 0.4,
       retryConnectIntervalSeconds: 0.05,
+      engineRelaySocketPath: null,
     });
 
     expect(exitCode).toBe(0);
@@ -500,6 +564,216 @@ describe("Hook — PreToolUse 承認ゲート", () => {
   });
 });
 
+describe("Hook — permission mode 自動許可（mode-picker 連動）", () => {
+  it("auto モード → iPhone 接続なしで即 allow", async () => {
+    const { exitCode, stdout } = await runHookCore({
+      stdinData: bashPreToolUse("echo x", "/w"),
+      socketPath: null,
+      deadlineSeconds: 5,
+      permissionModeProvider: async () => "auto",
+    });
+    expect(exitCode).toBe(0);
+    const parsed = parseDecision(stdout);
+    expect(parsed.decision).toBe("allow");
+    expect(parsed.reason).toContain("auto mode on");
+  });
+
+  it("acceptEdits モード + Edit → 即 allow", async () => {
+    const { exitCode, stdout } = await runHookCore({
+      stdinData: editPreToolUse("/w/a.swift", "old", "new", "/w"),
+      socketPath: null,
+      deadlineSeconds: 5,
+      permissionModeProvider: async () => "acceptEdits",
+    });
+    expect(exitCode).toBe(0);
+    const parsed = parseDecision(stdout);
+    expect(parsed.decision).toBe("allow");
+    expect(parsed.reason).toContain("accept edits on");
+  });
+
+  it("acceptEdits モード + Bash → 従来どおりゲート（socket 不能なら deny）", async () => {
+    const { stdout } = await runHookCore({
+      stdinData: bashPreToolUse("rm -rf /", "/w"),
+      socketPath: null,
+      deadlineSeconds: 5,
+      permissionModeProvider: async () => "acceptEdits",
+    });
+    expect(parseDecision(stdout).decision).toBe("deny");
+  });
+
+  it("default / plan / null（判定不能）→ 従来どおりゲート", async () => {
+    for (const mode of ["default", "plan", null]) {
+      const { stdout } = await runHookCore({
+        stdinData: bashPreToolUse("echo x", "/w"),
+        socketPath: null,
+        deadlineSeconds: 5,
+        permissionModeProvider: async () => mode,
+      });
+      expect(parseDecision(stdout).decision).toBe("deny");
+    }
+  });
+
+  it("provider が throw → 判定不能として従来どおりゲート", async () => {
+    const { stdout } = await runHookCore({
+      stdinData: bashPreToolUse("echo x", "/w"),
+      socketPath: null,
+      deadlineSeconds: 5,
+      permissionModeProvider: async () => {
+        throw new Error("capture failed");
+      },
+    });
+    expect(parseDecision(stdout).decision).toBe("deny");
+  });
+
+  it("接続可能でも auto モードなら approval_request を送らない", async () => {
+    const socketPath = tempSocketPath("auto");
+    const listener = await startListener(socketPath);
+    let connected = false;
+    // 接続が来ないことを期待するテストのため、accept タイムアウト（5s 後）は握り潰す
+    // （握り潰さないと後続テストファイル実行中に unhandled rejection として漏れる）。
+    void listener
+      .nextConnection()
+      .then(() => {
+        connected = true;
+      })
+      .catch(() => {});
+    try {
+      const { stdout } = await runHookCore({
+        stdinData: bashPreToolUse("echo x", "/w"),
+        socketPath,
+        deadlineSeconds: 5,
+        permissionModeProvider: async () => "auto",
+      });
+      expect(parseDecision(stdout).decision).toBe("allow");
+      expect(connected).toBe(false);
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("AskUserQuestion → 接続なし・mode 判定なしで即 allow（設問は承認ゲートしない）", async () => {
+    let providerCalled = false;
+    const { exitCode, stdout } = await runHookCore({
+      stdinData: askUserQuestionPreToolUse("toolu_q1"),
+      socketPath: null,
+      deadlineSeconds: 5,
+      engineRelaySocketPath: null,
+      permissionModeProvider: async () => {
+        providerCalled = true;
+        return "default";
+      },
+    });
+    expect(exitCode).toBe(0);
+    const parsed = parseDecision(stdout);
+    expect(parsed.decision).toBe("allow");
+    expect(parsed.reason).toContain("AskUserQuestion");
+    expect(providerCalled).toBe(false);
+  });
+
+  it("AskUserQuestion PreToolUse → engine relay へ question_event(prompt) を送ってから allow", async () => {
+    if (!(await canListenUnixSocket())) return;
+    const relayPath = tempSocketPath("q-relay-prompt");
+    fs.rmSync(relayPath, { force: true });
+    const received: EngineRelayMessage[] = [];
+    const relay = await startEngineRelaySocket({
+      socketPath: relayPath,
+      onMessage: (m) => received.push(m),
+    });
+    expect(relay).not.toBeNull();
+    try {
+      const { stdout } = await runHookCore({
+        stdinData: askUserQuestionPreToolUse("toolu_q2"),
+        socketPath: null,
+        deadlineSeconds: 5,
+        session: "sess-q",
+        engineRelaySocketPath: relayPath,
+      });
+      expect(parseDecision(stdout).decision).toBe("allow");
+      // onMessage は data イベント経由（非同期）なので短く待つ。
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const events = received.filter((m) => m.type === "question_event");
+      expect(events).toHaveLength(1);
+      const event = events[0]!;
+      expect(event.type).toBe("question_event");
+      if (event.type === "question_event") {
+        expect(event.event).toBe("prompt");
+        expect(event.session).toBe("sess-q");
+        expect(event.id).toBe("toolu_q2");
+        expect(event.questions).toHaveLength(1);
+        expect(event.questions?.[0]?.question).toBe("どっち?");
+        expect(event.questions?.[0]?.options).toEqual([{ label: "A", description: "前者" }]);
+      }
+    } finally {
+      await relay?.close();
+    }
+  });
+
+  it("AskUserQuestion PostToolUse → engine relay へ question_event(dismiss) を送る", async () => {
+    if (!(await canListenUnixSocket())) return;
+    const relayPath = tempSocketPath("q-relay-dismiss");
+    fs.rmSync(relayPath, { force: true });
+    const received: EngineRelayMessage[] = [];
+    const relay = await startEngineRelaySocket({
+      socketPath: relayPath,
+      onMessage: (m) => received.push(m),
+    });
+    expect(relay).not.toBeNull();
+    try {
+      const { exitCode } = await runHookCore({
+        stdinData: Buffer.from(
+          JSON.stringify({
+            session_id: "sess-q",
+            hook_event_name: "PostToolUse",
+            tool_name: "AskUserQuestion",
+            tool_use_id: "toolu_q3",
+            tool_input: {},
+            tool_response: {},
+          }),
+        ),
+        socketPath: null,
+        deadlineSeconds: 5,
+        session: "sess-q",
+        engineRelaySocketPath: relayPath,
+      });
+      expect(exitCode).toBe(0);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const events = received.filter((m) => m.type === "question_event");
+      expect(events).toHaveLength(1);
+      const event = events[0]!;
+      if (event.type === "question_event") {
+        expect(event.event).toBe("dismiss");
+        expect(event.session).toBe("sess-q");
+        expect(event.id).toBe("toolu_q3");
+      }
+    } finally {
+      await relay?.close();
+    }
+  });
+
+  it("AskUserQuestion で relay 不達でも allow は阻害されない", async () => {
+    const { stdout } = await runHookCore({
+      stdinData: askUserQuestionPreToolUse("toolu_q4"),
+      socketPath: null,
+      deadlineSeconds: 5,
+      engineRelaySocketPath: tempSocketPath("q-relay-absent"),
+    });
+    expect(parseDecision(stdout).decision).toBe("allow");
+  });
+
+  it("autoAllowReasonForMode 純ロジック", () => {
+    expect(autoAllowReasonForMode("auto", "Bash")).toContain("auto mode on");
+    expect(autoAllowReasonForMode("auto", "Read")).toContain("auto mode on");
+    expect(autoAllowReasonForMode("acceptEdits", "Write")).toContain("accept edits on");
+    expect(autoAllowReasonForMode("acceptEdits", "Edit")).toContain("accept edits on");
+    expect(autoAllowReasonForMode("acceptEdits", "MultiEdit")).toContain("accept edits on");
+    expect(autoAllowReasonForMode("acceptEdits", "NotebookEdit")).toContain("accept edits on");
+    expect(autoAllowReasonForMode("acceptEdits", "Bash")).toBeNull();
+    expect(autoAllowReasonForMode("plan", "Bash")).toBeNull();
+    expect(autoAllowReasonForMode("default", "Edit")).toBeNull();
+    expect(autoAllowReasonForMode(null, "Bash")).toBeNull();
+  });
+});
+
 describe("Hook — タイムアウト順序不変条件（Req 5.7）", () => {
   it("内部デッドライン(540s) が外部タイムアウト(600s) より厳密に小さく、十分な余裕がある", () => {
     expect(HOOK_INTERNAL_DEADLINE_SECONDS).toBeLessThan(HOOK_EXTERNAL_TIMEOUT_SECONDS);
@@ -655,6 +929,14 @@ describe("Hook — 待機延長・retry-connect（Req 8.1/8.2/8.3）", () => {
         engineRelaySocketPath: relayPath,
         retryConnectIntervalSeconds: 0.05,
       });
+      // PreToolUse はまず処理中ハートビート（session_processing）を relay へ送る（別接続）。
+      const beatSocket = await relay.nextConnection();
+      const beatLine = await new SocketLineReader(beatSocket).nextLine();
+      expect(JSON.parse(beatLine)).toEqual({
+        type: "session_processing",
+        session: "sess-relay",
+        state: "active",
+      });
       const socket = await relay.nextConnection();
       const reader = new SocketLineReader(socket);
       const pending = decodeControlMessage(await reader.nextLine());
@@ -668,6 +950,67 @@ describe("Hook — 待機延長・retry-connect（Req 8.1/8.2/8.3）", () => {
         summary: "echo relay",
       });
       expect(parseDecision(stdout).decision).toBe("deny");
+    } finally {
+      await relay.close();
+      fs.rmSync(relayPath, { force: true });
+    }
+  });
+
+  it("UserPromptSubmit は session_processing(active) を relay へ送り無出力で終了する", async () => {
+    if (!(await canListenUnixSocket())) return;
+    const relayPath = tempSocketPath(`relay-life-a-${randomUUID().slice(0, 8)}`);
+    fs.rmSync(relayPath, { force: true });
+    const relay = await startListener(relayPath);
+    try {
+      const run = runHookCore({
+        stdinData: Buffer.from(JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "s1" })),
+        socketPath: null,
+        deadlineSeconds: 1,
+        session: "sess-life",
+        engineRelaySocketPath: relayPath,
+      });
+      const socket = await relay.nextConnection();
+      const line = await new SocketLineReader(socket).nextLine();
+      const { exitCode, stdout } = await run;
+
+      expect(JSON.parse(line)).toEqual({
+        type: "session_processing",
+        session: "sess-life",
+        state: "active",
+      });
+      expect(exitCode).toBe(0);
+      // UserPromptSubmit の stdout はコンテキスト注入されるため必ず無出力。
+      expect(stdout).toBe("");
+    } finally {
+      await relay.close();
+      fs.rmSync(relayPath, { force: true });
+    }
+  });
+
+  it("Stop は session_processing(done) を relay へ送り無出力で終了する", async () => {
+    if (!(await canListenUnixSocket())) return;
+    const relayPath = tempSocketPath(`relay-life-b-${randomUUID().slice(0, 8)}`);
+    fs.rmSync(relayPath, { force: true });
+    const relay = await startListener(relayPath);
+    try {
+      const run = runHookCore({
+        stdinData: Buffer.from(JSON.stringify({ hook_event_name: "Stop", session_id: "s1" })),
+        socketPath: null,
+        deadlineSeconds: 1,
+        session: "sess-life",
+        engineRelaySocketPath: relayPath,
+      });
+      const socket = await relay.nextConnection();
+      const line = await new SocketLineReader(socket).nextLine();
+      const { exitCode, stdout } = await run;
+
+      expect(JSON.parse(line)).toEqual({
+        type: "session_processing",
+        session: "sess-life",
+        state: "done",
+      });
+      expect(exitCode).toBe(0);
+      expect(stdout).toBe("");
     } finally {
       await relay.close();
       fs.rmSync(relayPath, { force: true });
@@ -695,64 +1038,121 @@ describe("Hook — 待機延長・retry-connect（Req 8.1/8.2/8.3）", () => {
   });
 });
 
-describe("Hook — codex 出力適応", () => {
-  const allowJson =
-    '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"ok"}}';
-  const denyJson =
-    '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"no"}}';
+describe("Hook — presence による背景 push 抑制", () => {
+  async function runWithPresence(
+    presenceProbe: (session: string) => Promise<"mac-attached" | "client-live" | null>,
+  ) {
+    const absentSocket = tempSocketPath(`presence-${randomUUID().slice(0, 8)}`);
+    fs.rmSync(absentSocket, { force: true });
+    const notifier = vi.fn(async () => {});
+    const recordSkipped = vi.fn();
+    const result = await runHookCore({
+      stdinData: bashPreToolUse("rm -rf /tmp/example", "/work"),
+      socketPath: absentSocket,
+      deadlineSeconds: 0.05,
+      session: "sess-presence",
+      notifier,
+      presenceProbe,
+      pushObserver: { recordSkipped },
+      engineRelaySocketPath: null,
+      retryConnectIntervalSeconds: 0.01,
+    });
+    return { ...result, notifier, recordSkipped };
+  }
 
-  it("claude はそのまま出力する（allow/deny とも）", () => {
-    expect(hookStdoutForAgent("claude", allowJson)).toBe(allowJson);
-    expect(hookStdoutForAgent("claude", denyJson)).toBe(denyJson);
+  for (const reason of ["mac-attached", "client-live"] as const) {
+    it(`${reason} なら push を抑制し pushSkipped を記録する`, async () => {
+      const result = await runWithPresence(async () => reason);
+      expect(result.notifier).not.toHaveBeenCalled();
+      expect(result.recordSkipped).toHaveBeenCalledOnce();
+      expect(result.recordSkipped).toHaveBeenCalledWith(expect.any(String), reason, "sess-presence");
+      expect(result.exitCode).toBe(0);
+      expect(parseDecision(result.stdout).decision).toBe("deny");
+    });
+  }
+
+  it("不在なら従来どおり push を送る", async () => {
+    const result = await runWithPresence(async () => null);
+    expect(result.notifier).toHaveBeenCalledOnce();
+    expect(result.recordSkipped).not.toHaveBeenCalled();
+    expect(result.exitCode).toBe(0);
+    expect(parseDecision(result.stdout).decision).toBe("deny");
   });
 
-  it("codex は allow を無出力（null=exit0 続行）にし、deny はそのまま出す", () => {
-    // codex は permissionDecision:allow を unsupported として拒否するため無出力にする。
-    expect(hookStdoutForAgent("codex", allowJson)).toBeNull();
-    // deny は codex も解釈するのでそのまま。
-    expect(hookStdoutForAgent("codex", denyJson)).toBe(denyJson);
+  it("presence 判定の例外は fail-open で push を送る", async () => {
+    const result = await runWithPresence(async () => { throw new Error("probe failed"); });
+    expect(result.notifier).toHaveBeenCalledOnce();
+    expect(result.recordSkipped).not.toHaveBeenCalled();
+    expect(result.exitCode).toBe(0);
+    expect(parseDecision(result.stdout).decision).toBe("deny");
+  });
+
+  it("presence 判定の超過は500msで fail-open し push を送る", async () => {
+    const startedAt = Date.now();
+    const result = await runWithPresence(() => new Promise(() => {}));
+    const elapsedMs = Date.now() - startedAt;
+    expect(result.notifier).toHaveBeenCalledOnce();
+    expect(result.recordSkipped).not.toHaveBeenCalled();
+    expect(elapsedMs).toBeGreaterThanOrEqual(450);
+    expect(elapsedMs).toBeLessThan(1500);
+    expect(result.exitCode).toBe(0);
+    expect(parseDecision(result.stdout).decision).toBe("deny");
   });
 });
 
-describe("installCodexHookSettings", () => {
-  it(".codex/hooks.json に PreToolUse(Bash/Write|Edit, --agent codex) を書く", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-hooks-"));
-    const marker = path.join(dir, "no-such-marker");
-    installCodexHookSettings({ dir, binaryPath: "/bin/pc", session: "work", globalMarkerPath: marker });
-    const root = JSON.parse(fs.readFileSync(path.join(dir, ".codex", "hooks.json"), "utf8"));
-    const pre = root.hooks.PreToolUse;
-    expect(pre.map((e: { matcher: string }) => e.matcher)).toEqual(["Bash", "Write|Edit"]);
-    expect(pre[0].hooks[0].command).toBe("/bin/pc hook --session work --agent codex");
-    expect(pre[0].hooks[0].timeout).toBe(HOOK_EXTERNAL_TIMEOUT_SECONDS);
-    // claude 用 settings.json は書かない。
-    expect(fs.existsSync(path.join(dir, ".claude", "settings.json"))).toBe(false);
-  });
-
-  it("再実行しても同一 command を重複追加しない（マージ保全）", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-hooks2-"));
-    const marker = path.join(dir, "no-such-marker");
-    installCodexHookSettings({ dir, binaryPath: "/bin/pc", session: "work", globalMarkerPath: marker });
-    installCodexHookSettings({ dir, binaryPath: "/bin/pc", session: "work", globalMarkerPath: marker });
-    const root = JSON.parse(fs.readFileSync(path.join(dir, ".codex", "hooks.json"), "utf8"));
-    // Bash + Write|Edit の 2 件のみ（重複なし）。
-    expect(root.hooks.PreToolUse.length).toBe(2);
-  });
-
-  it("既存の無関係フックは保持する", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-hooks3-"));
+describe("removeCodexHookSettings", () => {
+  it("Tailii の旧 Codex hook だけを全 event から除去し、無関係な hook を保持する", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-hooks-remove-"));
     fs.mkdirSync(path.join(dir, ".codex"), { recursive: true });
+    const hooksPath = path.join(dir, ".codex", "hooks.json");
     fs.writeFileSync(
-      path.join(dir, ".codex", "hooks.json"),
+      hooksPath,
       JSON.stringify({
+        custom: { keep: true },
         hooks: {
-          PostToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "other.sh" }] }],
+          PreToolUse: [
+            {
+              matcher: "Bash",
+              hooks: [
+                { type: "command", command: "/bin/pc hook --session old --agent codex" },
+                { type: "command", command: "other.sh" },
+              ],
+            },
+          ],
+          Stop: [
+            { hooks: [{ type: "command", command: "/bin/pc hook --agent codex" }] },
+          ],
         },
       }),
     );
-    const marker = path.join(dir, "no-such-marker");
-    installCodexHookSettings({ dir, binaryPath: "/bin/pc", session: "work", globalMarkerPath: marker });
-    const root = JSON.parse(fs.readFileSync(path.join(dir, ".codex", "hooks.json"), "utf8"));
-    expect(root.hooks.PostToolUse[0].hooks[0].command).toBe("other.sh");
-    expect(root.hooks.PreToolUse.length).toBe(2);
+
+    removeCodexHookSettings({ dir, binaryPath: "/bin/pc" });
+
+    const root = JSON.parse(fs.readFileSync(hooksPath, "utf8"));
+    expect(root.custom).toEqual({ keep: true });
+    expect(root.hooks.PreToolUse[0].hooks).toEqual([
+      { type: "command", command: "other.sh" },
+    ]);
+    expect(root.hooks.Stop).toBeUndefined();
+  });
+
+  it("Tailii hook 以外に内容が無ければ hooks.json を削除する", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-hooks-remove-empty-"));
+    fs.mkdirSync(path.join(dir, ".codex"), { recursive: true });
+    const hooksPath = path.join(dir, ".codex", "hooks.json");
+    fs.writeFileSync(
+      hooksPath,
+      JSON.stringify({
+        hooks: {
+          PreToolUse: [
+            { hooks: [{ type: "command", command: "/bin/pc hook --agent codex" }] },
+          ],
+        },
+      }),
+    );
+
+    removeCodexHookSettings({ dir, binaryPath: "/bin/pc" });
+
+    expect(fs.existsSync(hooksPath)).toBe(false);
   });
 });

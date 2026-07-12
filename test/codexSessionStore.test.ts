@@ -15,6 +15,7 @@ function writeRollout(
   cwd: string,
   mtime?: Date,
   userMessage?: string,
+  source?: unknown,
 ): string {
   const dir = path.join(home, "sessions", relDir);
   fs.mkdirSync(dir, { recursive: true });
@@ -22,7 +23,7 @@ function writeRollout(
   const meta = JSON.stringify({
     timestamp: "2026-07-06T00:00:00.000Z",
     type: "session_meta",
-    payload: { id, cwd, cli_version: "0.142.5" },
+    payload: { id, cwd, cli_version: "0.142.5", ...(source === undefined ? {} : { source }) },
   });
   let content = meta + "\n";
   if (userMessage !== undefined) {
@@ -152,5 +153,182 @@ describe("CodexSessionStore.list", () => {
   test("sessions ディレクトリが無ければ空一覧", () => {
     const home = makeTempDir("codex-store-empty");
     expect(new CodexSessionStore(home).list()).toEqual([]);
+  });
+
+  test("非対話の exec と subagent rollout は会話一覧から除外する", () => {
+    const home = makeTempDir("codex-store-subagent");
+    writeRollout(
+      home,
+      "2026/07/11",
+      "rollout-parent.jsonl",
+      "parent-id",
+      "/work/project",
+      undefined,
+      "同じ会話",
+      "vscode",
+    );
+    writeRollout(
+      home,
+      "2026/07/11",
+      "rollout-exec.jsonl",
+      "exec-id",
+      "/work/project",
+      undefined,
+      "同じ会話",
+      "exec",
+    );
+    writeRollout(
+      home,
+      "2026/07/11",
+      "rollout-child.jsonl",
+      "child-id",
+      "/work/project",
+      undefined,
+      "同じ会話",
+      {
+        subagent: {
+          thread_spawn: {
+            parent_thread_id: "parent-id",
+            depth: 1,
+            agent_path: "/root/audit",
+          },
+        },
+      },
+    );
+
+    const list = new CodexSessionStore(home).list();
+    expect(list.map((session) => session.sessionId)).toEqual(["parent-id"]);
+  });
+
+  test("最後の agent_message を lastMessage プレビューとして返す（token_count 等は skip）", () => {
+    const home = makeTempDir("codex-store-preview");
+    const p = writeRollout(
+      home, "2026/07/11", "rollout-preview.jsonl", "id-preview", "/work/p",
+      undefined, "最初の発話",
+    );
+    const agentMsg = JSON.stringify({
+      type: "event_msg",
+      payload: { type: "agent_message", message: "修正しました。\n詳細は次の通り。" },
+    });
+    const tokenCount = JSON.stringify({
+      type: "event_msg",
+      payload: { type: "token_count", info: { total: 123 } },
+    });
+    fs.appendFileSync(p, agentMsg + "\n" + tokenCount + "\n" + tokenCount + "\n");
+
+    const list = new CodexSessionStore(home).list();
+    // 改行は空白へ畳んで 1 行スニペットにする（claude の list-preview と同様式）。
+    expect(list[0]?.lastMessage).toBe("修正しました。 詳細は次の通り。");
+  });
+
+  test("user/agent メッセージが無い rollout は lastMessage を持たない", () => {
+    const home = makeTempDir("codex-store-no-preview");
+    writeRollout(home, "2026/07/11", "rollout-bare.jsonl", "id-bare", "/work/b");
+
+    const list = new CodexSessionStore(home).list();
+    expect(list[0]?.lastMessage).toBeUndefined();
+  });
+
+  test("新しい非対話 rollout が上限を占有しても古い対話セッションを返す", () => {
+    const home = makeTempDir("codex-store-visible-limit");
+    writeRollout(
+      home, "2026/07/10", "rollout-parent.jsonl", "parent-id", "/work/project",
+      new Date("2026-07-10T00:00:00Z"), "親会話", "vscode",
+    );
+    writeRollout(
+      home, "2026/07/11", "rollout-exec.jsonl", "exec-id", "/work/project",
+      new Date("2026-07-11T00:00:00Z"), "自動処理", "exec",
+    );
+
+    const list = new CodexSessionStore(home, 1).list();
+    expect(list.map((session) => session.sessionId)).toEqual(["parent-id"]);
+  });
+
+  test("App Server thread を写像し、cwd 補完・title 整形・非対話除外を行う", async () => {
+    const home = makeTempDir("codex-store-app-server");
+    const complemented = writeRollout(
+      home, "2026/07/12", "rollout-complemented.jsonl", "thread-complemented", "/rollout/cwd",
+      undefined, "rollout のタイトル候補",
+    );
+    fs.appendFileSync(complemented, JSON.stringify({
+      type: "event_msg",
+      payload: { type: "agent_message", message: "最後の応答" },
+    }) + "\n");
+    writeRollout(
+      home, "2026/07/12", "rollout-exec.jsonl", "thread-rollout-exec", "/work/exec",
+      undefined, "除外", "exec",
+    );
+    const longTitle = `  1行目\n${"x".repeat(70)}  `;
+    const store = new CodexSessionStore(home);
+
+    const sessions = await store.listWithAppServer({
+      listThreads: async () => [
+        {
+          id: "thread-named", name: longTitle, preview: "preview", updatedAt: 300,
+          cwd: "/app/cwd", source: "vscode", parentThreadId: null,
+        },
+        {
+          id: "thread-complemented", name: null, preview: "preview title", updatedAt: 200,
+          cwd: null, source: "cli", parentThreadId: null,
+        },
+        {
+          id: "thread-no-cwd", name: null, preview: "hidden", updatedAt: 190,
+          cwd: null, source: "cli", parentThreadId: null,
+        },
+        {
+          id: "thread-exec", name: "exec", preview: "exec", updatedAt: 180,
+          cwd: "/work/exec", source: "exec", parentThreadId: null,
+        },
+        {
+          id: "thread-subagent", name: "child", preview: "child", updatedAt: 170,
+          cwd: "/work/child", source: { subAgent: { threadSpawn: {} } }, parentThreadId: "parent",
+        },
+        {
+          id: "thread-rollout-exec", name: "looks interactive", preview: "preview", updatedAt: 160,
+          cwd: "/work/exec", source: "unknown", parentThreadId: null,
+        },
+      ],
+    });
+
+    expect(sessions).toHaveLength(2);
+    expect(sessions[0]).toMatchObject({
+      sessionId: "thread-named",
+      cwd: "/app/cwd",
+      title: `1行目 ${"x".repeat(56)}`,
+      updatedAt: 300,
+      agent: "codex",
+    });
+    expect(sessions[0]?.title).toHaveLength(60);
+    expect(sessions[1]).toMatchObject({
+      sessionId: "thread-complemented",
+      cwd: "/rollout/cwd",
+      title: "preview title",
+      updatedAt: 200,
+      lastMessage: "最後の応答",
+      agent: "codex",
+    });
+  });
+
+  test("App Server 接続失敗時は既存 rollout 一覧へフォールバックする", async () => {
+    const home = makeTempDir("codex-store-app-server-fallback");
+    writeRollout(
+      home, "2026/07/12", "rollout-fallback.jsonl", "fallback-id", "/work/fallback",
+      undefined, "rollout fallback",
+    );
+    const store = new CodexSessionStore(home);
+
+    const sessions = await store.listWithAppServer({
+      listThreads: async () => {
+        throw new Error("connection failed");
+      },
+    });
+
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]).toMatchObject({
+      sessionId: "fallback-id",
+      cwd: "/work/fallback",
+      title: "rollout fallback",
+      agent: "codex",
+    });
   });
 });

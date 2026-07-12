@@ -9,6 +9,7 @@
 //   kick          承認待ちの起床
 //   push-token    APNs デバイストークン登録
 //   setup         ペアリング（鍵生成 + QR / ペアリングコード受け渡し）
+//   hub           Session Hub daemon
 //
 // 移植は protocol → engine → serve/hook → launch/setup の順に段階的に行う。
 // 未移植サブコマンドは明示エラーで落ちる（黙って別挙動をしない）。
@@ -21,6 +22,7 @@ import { runKickCommand } from "./kick.js";
 import { runPushTokenCommand } from "./pushTokenCommand.js";
 import { runSetupCommand } from "./setup.js";
 import { runDoctorCommand } from "./doctor.js";
+import { runHubCommand } from "./hubDaemon.js";
 import { migrateLegacyHome } from "./legacyHomeMigration.js";
 
 const PORTED: Record<string, (args: string[]) => Promise<number>> = {
@@ -32,6 +34,7 @@ const PORTED: Record<string, (args: string[]) => Promise<number>> = {
   "push-token": runPushTokenCommand,
   setup: runSetupCommand,
   doctor: runDoctorCommand,
+  hub: runHubCommand,
 };
 
 async function main(): Promise<number> {
@@ -39,7 +42,7 @@ async function main(): Promise<number> {
   const [subcommand, ...rest] = process.argv.slice(2);
   if (!subcommand || subcommand === "--help" || subcommand === "-h") {
     process.stderr.write(
-      "usage: tailii <engine|serve|hook|launch|kick|push-token|setup|doctor> [options]\n",
+      "usage: tailii <engine|serve|hook|launch|kick|push-token|setup|doctor|hub> [options]\n",
     );
     return 64;
   }

@@ -54,6 +54,17 @@ export function resolveEngineRelaySocketPath(base?: string): string {
   return path.join(baseDir, "engine-relay.sock");
 }
 
+/** Session Hub daemon が listen する単一 socket。 */
+export function resolveHubSocketPath(base?: string): string {
+  const baseDir = base ?? defaultSocketBase();
+  try {
+    ensureDirectory0700(baseDir);
+  } catch (error) {
+    throw new SocketPathError("directory-creation-failed", `${baseDir}: ${String(error)}`);
+  }
+  return path.join(baseDir, "hub.sock");
+}
+
 /** session 名が安全かどうかを検証する（Swift 版 validateSessionName と同一規約）。 */
 function validateSessionName(session: string): void {
   if (session.length === 0) {

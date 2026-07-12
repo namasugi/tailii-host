@@ -1,8 +1,8 @@
 // hookSettings.ts
-// tailii (TS host) — claude 起動時に渡す承認フック設定の生成 + codex 用 .codex/hooks.json 書込。
+// tailii (TS host) — Claude 起動時に渡す承認フック設定と、旧 Codex hook の移行用管理。
 // claude 側はファイル（settings.json）へは書かず、`claude --settings '<json>'` でこの起動プロセス
-// 限定にフックを渡す（後述 claudeHookLaunchSettings 参照）。codex はプロジェクトローカルの
-// .codex/hooks.json を読む仕様のため従来どおりマージ書込する。
+// 限定にフックを渡す（後述 claudeHookLaunchSettings 参照）。Codex App Server 経路は承認を
+// JSON-RPC で受けるため hook を使わず、旧版 Tailii が登録した Codex hook は起動時に除去する。
 
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -62,7 +62,19 @@ export function claudeHookLaunchSettings(options: {
       hooks: [{ type: "command", command, timeout: HOOK_EXTERNAL_TIMEOUT_SECONDS }],
     },
   ];
-  return JSON.stringify({ hooks: { PreToolUse: entry(), PostToolUse: entry() } });
+  // UserPromptSubmit（処理開始）+ Stop（処理完了）: reaper daemon の「処理中は殺さない」判定用の
+  // heartbeat 書込 + engine relay への一方向送信のみで即終了するため timeout は短くてよい。
+  const lifecycleEntry = (): Record<string, unknown>[] => [
+    { hooks: [{ type: "command", command, timeout: 30 }] },
+  ];
+  return JSON.stringify({
+    hooks: {
+      PreToolUse: entry(),
+      PostToolUse: entry(),
+      UserPromptSubmit: lifecycleEntry(),
+      Stop: lifecycleEntry(),
+    },
+  });
 }
 
 /**
@@ -71,16 +83,18 @@ export function claudeHookLaunchSettings(options: {
  * （`{ "hooks": { "PreToolUse": [...] } }`）でフックを実行する。stdin/permissionDecision も互換だが、
  * codex は allow/ask を拒否し deny のみ有効なため、hook 側は `--agent codex` で allow を無出力にする。
  * codex はフック完了を同期ブロックで待つので、承認プッシュ待ちがそのままゲートになる。
+ * command はセッション非依存の dispatcher 1 組だけにする。セッション名を command に埋め込むと、
+ * 同一 cwd で会話を開くたびに全 command hook が累積・並列実行され、同じ承認が複数届くため。
+ * 実セッションは Tailii 起動時に付ける `TAILII_SESSION` 環境変数から hook 側で解決する。
  * グローバル `~/.codex/hooks.json`（ユーザーの既存フック）には触れない（非侵襲）。
  */
 export function installCodexHookSettings(options: {
   dir: string;
   binaryPath: string;
-  session: string;
   /** グローバル無効化マーカーのパス（注入可能）。省略時は `~/.tailii/nohook`。 */
   globalMarkerPath?: string;
 }): void {
-  const { dir, binaryPath, session } = options;
+  const { dir, binaryPath } = options;
 
   // グローバル/ローカル無効化マーカーは claude 版と共通。
   const globalMarker =
@@ -115,7 +129,7 @@ export function installCodexHookSettings(options: {
   }
 
   // 承認ゲート対象: シェル実行（Bash）とファイル編集（Write|Edit）。codex 実績のある matcher。
-  const command = `${binaryPath} hook --session ${session} --agent codex`;
+  const command = `${binaryPath} hook --agent codex`;
   const hooksObject =
     typeof root["hooks"] === "object" && root["hooks"] !== null && !Array.isArray(root["hooks"])
       ? (root["hooks"] as Record<string, unknown>)
@@ -124,16 +138,15 @@ export function installCodexHookSettings(options: {
   let list: Record<string, unknown>[] = Array.isArray(rawList)
     ? (rawList.filter((e) => typeof e === "object" && e !== null) as Record<string, unknown>[])
     : [];
-  // 既存の同一 command を除去（再実行で重複しない）。
-  list = list.filter((entry) => {
+  // Tailii 所有の旧/現行 command をすべて除去する。旧版は `--session <name>` を含むため、
+  // 完全一致だけを消すとセッションごとに残り続ける。1 entry に他社 hook が混在する場合は
+  // Tailii command だけを抜き、残りは保持する。
+  list = list.flatMap((entry) => {
     const inner = entry["hooks"];
-    if (!Array.isArray(inner)) return true;
-    return !inner.some(
-      (h) =>
-        typeof h === "object" &&
-        h !== null &&
-        (h as Record<string, unknown>)["command"] === command,
-    );
+    if (!Array.isArray(inner)) return [entry];
+    const remaining = inner.filter((hook) => !isTailiiCodexHook(hook, binaryPath));
+    if (remaining.length === 0) return [];
+    return [{ ...entry, hooks: remaining }];
   });
   for (const matcher of ["Bash", "Write|Edit"]) {
     list.push({
@@ -148,6 +161,71 @@ export function installCodexHookSettings(options: {
   const tmp = hooksPath + ".tmp";
   fs.writeFileSync(tmp, out);
   fs.renameSync(tmp, hooksPath);
+}
+
+/**
+ * 旧版 Tailii が `<dir>/.codex/hooks.json` に追加した Codex hook だけを除去する。
+ *
+ * Codex App Server は承認要求を server-initiated JSON-RPC request として配信するため、
+ * App Server 経路に PreToolUse hook を重ねると同じ承認が二重化する。無関係なユーザー hook は
+ * event/entry 内で混在していても保持し、Tailii hook を除いた結果が空なら hooks.json 自体を消す。
+ */
+export function removeCodexHookSettings(options: {
+  dir: string;
+  binaryPath: string;
+}): void {
+  const hooksPath = path.join(options.dir, ".codex", "hooks.json");
+  if (!fs.existsSync(hooksPath)) return;
+
+  const text = fs.readFileSync(hooksPath, "utf8");
+  if (text.trim().length === 0) return;
+  const parsed = JSON.parse(text) as unknown;
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`既存 .codex/hooks.json が JSON オブジェクトとして解釈できない: ${hooksPath}`);
+  }
+  const root = parsed as Record<string, unknown>;
+  const rawHooks = root["hooks"];
+  if (typeof rawHooks !== "object" || rawHooks === null || Array.isArray(rawHooks)) return;
+
+  const hooksObject = rawHooks as Record<string, unknown>;
+  for (const [event, rawEntries] of Object.entries(hooksObject)) {
+    if (!Array.isArray(rawEntries)) continue;
+    const entries = rawEntries.flatMap((rawEntry): unknown[] => {
+      if (typeof rawEntry !== "object" || rawEntry === null || Array.isArray(rawEntry)) {
+        return [rawEntry];
+      }
+      const entry = rawEntry as Record<string, unknown>;
+      const rawInner = entry["hooks"];
+      if (!Array.isArray(rawInner)) return [entry];
+      const remaining = rawInner.filter(
+        (hook) => !isTailiiCodexHook(hook, options.binaryPath),
+      );
+      if (remaining.length === 0) return [];
+      return [{ ...entry, hooks: remaining }];
+    });
+    if (entries.length === 0) delete hooksObject[event];
+    else hooksObject[event] = entries;
+  }
+
+  if (Object.keys(hooksObject).length === 0) delete root["hooks"];
+  else root["hooks"] = hooksObject;
+
+  if (Object.keys(root).length === 0) {
+    fs.rmSync(hooksPath);
+    return;
+  }
+  const out = JSON.stringify(sortKeysDeep(root), null, 2);
+  const tmp = hooksPath + ".tmp";
+  fs.writeFileSync(tmp, out);
+  fs.renameSync(tmp, hooksPath);
+}
+
+/** 指定 binary が登録した Codex hook か。旧 `--session` 形式もまとめて所有扱いする。 */
+function isTailiiCodexHook(value: unknown, binaryPath: string): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const hookCommand = (value as Record<string, unknown>)["command"];
+  if (typeof hookCommand !== "string") return false;
+  return hookCommand.startsWith(`${binaryPath} hook `) && /(?:^|\s)--agent\s+codex(?:\s|$)/.test(hookCommand);
 }
 
 /** オブジェクトのキーを再帰的に辞書順へ並べ替える（Swift 版 .sortedKeys 相当）。 */

@@ -82,6 +82,10 @@ export interface SessionInfo {
   updatedAt?: number;
   /** Claude の会話 JSONL 名に対応する session-id。既知の live session 再利用に使う。 */
   claudeSessionId?: string;
+  /** 会話 provider。未指定は後方互換で claude 相当。 */
+  agent?: "claude" | "codex";
+  /** provider 共通の論理会話 ID。live runtime の再利用キー。 */
+  providerSessionId?: string;
 }
 
 /** マシン内会話 1 件（claude=jsonl / codex=rollout）。 */
@@ -92,6 +96,8 @@ export interface ClaudeSessionInfo {
   updatedAt?: number;
   /** 会話を駆動するエージェント（claude=既定 / codex, agent-tag）。未指定は claude 相当。 */
   agent?: "claude" | "codex";
+  /** 最終 user/assistant メッセージの 1 行スニペット（一覧プレビュー, list-preview）。 */
+  lastMessage?: string;
 }
 
 /** session_search_response の 1 検索結果。 */
@@ -107,6 +113,20 @@ export interface SessionSearchResult {
 export interface SlashCommandInfo {
   name: string;
   summary: string;
+}
+
+/** Codex App Server `model/list` を iOS のモデル選択へ渡すための 1 要素。 */
+export interface CodexModelInfo {
+  id: string;
+  displayName: string;
+  description: string;
+  /** Codex が会話へ割り当てる実効コンテキスト窓。取得不能時は省略。 */
+  contextWindow?: number;
+  /** モデル既定の reasoning effort。 */
+  defaultReasoningEffort?: string;
+  /** モデルが受理する reasoning effort（速い→高性能の順）。 */
+  supportedReasoningEfforts?: string[];
+  isDefault: boolean;
 }
 
 /** AskUserQuestion の選択肢。 */
@@ -135,6 +155,14 @@ export interface QuestionAnswer {
 // MARK: - ControlMessage（タグ付き union）
 
 export type ChatRole = "assistant" | "user" | "system";
+export type SubagentTranscriptRole = "assistant" | "user" | "tool";
+export type SubagentTranscriptKind = "tool_use" | "tool_result";
+export interface SubagentTranscriptEntry {
+  role: SubagentTranscriptRole;
+  text: string;
+  ts?: number;
+  kind?: SubagentTranscriptKind;
+}
 export type Decision = "allow" | "deny";
 export type RemotePendingKind = "approval" | "question";
 
@@ -146,17 +174,30 @@ export type ControlMessage =
   | { type: "remote_pending_cleared"; v: number; id: string; session: string; kind: RemotePendingKind }
   | { type: "session_list_request"; v: number; id: string; limit?: number; cursor?: string }
   | { type: "session_list_response"; v: number; id: string; sessions: SessionInfo[]; nextCursor?: string }
-  | { type: "session_start"; v: number; id: string; cwd: string; name: string; baseDir?: string; resumeSessionId?: string; title?: string; agentType?: "claude" | "codex"; codexModel?: string; codexSandbox?: "read-only" | "workspace-write" | "danger-full-access" }
+  | { type: "session_start"; v: number; id: string; cwd: string; name: string; baseDir?: string; resumeSessionId?: string; title?: string; agentType?: "claude" | "codex"; model?: string; permissionMode?: "default" | "acceptEdits" | "plan" | "auto"; codexModel?: string; codexSandbox?: "read-only" | "workspace-write" | "danger-full-access" }
   | { type: "session_reattach"; v: number; id: string; name: string }
   | { type: "session_kill"; v: number; id: string; name: string }
   | { type: "session_idle_hint"; v: number; id: string; name: string }
+  | { type: "codex_model_list_request"; v: number; id: string }
+  | { type: "codex_model_list_response"; v: number; id: string; models: CodexModelInfo[] }
+  | { type: "codex_turn_start"; v: number; id: string; session: string; text: string; clientUserMessageId?: string; effort?: string; sandbox?: "read-only" | "workspace-write" | "danger-full-access" }
+  | { type: "codex_turn_interrupt"; v: number; id: string; session: string }
+  | { type: "chat_send"; v: number; id: string; session: string; clientMessageId: string; text: string }
+  | { type: "chat_send_result"; v: number; id: string; status: "accepted" | "duplicate" | "failed"; error?: string }
   | { type: "error"; v: number; id?: string; code: string; message: string }
   | { type: "image_available"; v: number; id: string; path: string; mime: string; thumbnail: string; width: number; height: number; relatedApprovalId?: string }
   | { type: "image_fetch_request"; v: number; id: string }
   | { type: "image_fetch_response"; v: number; id: string; seq: number; data: string; eof: boolean; mime: string }
+  | { type: "subagent_transcript_request"; v: number; id: string; nodeId: string }
+  | { type: "subagent_transcript_response"; v: number; id: string; nodeId: string; entries: SubagentTranscriptEntry[]; omitted: number }
   | { type: "chat_output"; v: number; streamId: string; role: ChatRole; text: string; eof: boolean }
   | { type: "tool_activity"; v: number; activity: ToolActivity }
   | { type: "subagent_node"; v: number; node: SubagentNode }
+  | {
+      type: "pane_preview"; v: number; session: string; seq: number; active: boolean; text: string;
+      /** 省略時は従来の Claude ステータス表示。Codex のみ terminal capture を指定する。 */
+      mode?: "codex_terminal";
+    }
   | { type: "question_prompt"; v: number; id: string; questions: QuestionPromptQuestion[] }
   | { type: "question_answer"; v: number; id: string; session: string; answers: QuestionAnswer[] }
   | { type: "question_dismiss"; v: number; id: string }
@@ -372,6 +413,13 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
             alive: requireBoolean(obj, "alive"),
             updatedAt: optionalNumber(obj, "updatedAt"),
             claudeSessionId: optionalString(obj, "claudeSessionId"),
+            agent:
+              optionalString(obj, "agent") === "codex"
+                ? "codex"
+                : optionalString(obj, "agent") === "claude"
+                  ? "claude"
+                  : undefined,
+            providerSessionId: optionalString(obj, "providerSessionId"),
           });
         }),
         nextCursor: optionalString(raw, "nextCursor"),
@@ -387,6 +435,13 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         rawSandbox === "read-only" || rawSandbox === "workspace-write" || rawSandbox === "danger-full-access"
           ? rawSandbox
           : undefined;
+      // permissionMode は既知 4 値のみ採用（claude 新規起動の --permission-mode）。未知/未指定は
+      // undefined（フラグ無し＝claude 既定）。
+      const rawMode = optionalString(raw, "permissionMode");
+      const permissionMode =
+        rawMode === "default" || rawMode === "acceptEdits" || rawMode === "plan" || rawMode === "auto"
+          ? rawMode
+          : undefined;
       return compact({
         type, v,
         id: requireString(raw, "id"),
@@ -396,6 +451,8 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         resumeSessionId: optionalString(raw, "resumeSessionId"),
         title: optionalString(raw, "title"),
         agentType,
+        model: optionalString(raw, "model"),
+        permissionMode,
         codexModel: optionalString(raw, "codexModel"),
         codexSandbox,
       });
@@ -405,6 +462,75 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
     case "session_kill":
     case "session_idle_hint":
       return { type, v, id: requireString(raw, "id"), name: requireString(raw, "name") };
+
+    case "codex_model_list_request":
+      return { type, v, id: requireString(raw, "id") };
+
+    case "codex_model_list_response":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        models: requireArray(raw, "models").map((element) => {
+          const obj = requireObject(element, "models");
+          const contextWindow = optionalNumber(obj, "contextWindow");
+          if (contextWindow !== undefined && (!Number.isInteger(contextWindow) || contextWindow <= 0)) {
+            throw new ProtocolDecodeError("missing-field", "models.contextWindow");
+          }
+          return compact<CodexModelInfo>({
+            id: requireString(obj, "id"),
+            displayName: requireString(obj, "displayName"),
+            description: requireString(obj, "description"),
+            contextWindow,
+            defaultReasoningEffort: optionalString(obj, "defaultReasoningEffort"),
+            supportedReasoningEfforts:
+              obj["supportedReasoningEfforts"] === undefined
+                ? undefined
+                : requireStringArray(obj, "supportedReasoningEfforts"),
+            isDefault: requireBoolean(obj, "isDefault"),
+          });
+        }),
+      };
+
+    case "codex_turn_start":
+      const rawTurnSandbox = optionalString(raw, "sandbox");
+      const sandbox = rawTurnSandbox === "read-only" || rawTurnSandbox === "workspace-write" || rawTurnSandbox === "danger-full-access"
+        ? rawTurnSandbox : undefined;
+      return compact({
+        type, v,
+        id: requireString(raw, "id"),
+        session: requireString(raw, "session"),
+        text: requireString(raw, "text"),
+        clientUserMessageId: optionalString(raw, "clientUserMessageId"),
+        effort: optionalString(raw, "effort"),
+        sandbox,
+      });
+
+    case "codex_turn_interrupt":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        session: requireString(raw, "session"),
+      };
+
+    case "chat_send": {
+      const text = requireString(raw, "text");
+      if (text.length === 0) throw new ProtocolDecodeError("missing-field", "text");
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        session: requireString(raw, "session"),
+        clientMessageId: requireString(raw, "clientMessageId"),
+        text,
+      };
+    }
+
+    case "chat_send_result": {
+      const status = requireString(raw, "status");
+      if (status !== "accepted" && status !== "duplicate" && status !== "failed") {
+        throw new ProtocolDecodeError("missing-field", "status");
+      }
+      return compact({ type, v, id: requireString(raw, "id"), status, error: optionalString(raw, "error") });
+    }
 
     case "error":
       return compact({
@@ -442,6 +568,33 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         mime: requireString(raw, "mime"),
       };
 
+    case "subagent_transcript_request":
+      return { type, v, id: requireString(raw, "id"), nodeId: requireString(raw, "nodeId") };
+
+    case "subagent_transcript_response":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        nodeId: requireString(raw, "nodeId"),
+        entries: requireArray(raw, "entries").map((element) => {
+          const entry = requireObject(element, "entries");
+          const role = requireString(entry, "role");
+          if (role !== "user" && role !== "assistant" && role !== "tool") {
+            throw new ProtocolDecodeError("missing-field", "entries.role");
+          }
+          const rawKind = optionalString(entry, "kind");
+          const kind = role === "tool" && (rawKind === "tool_use" || rawKind === "tool_result")
+            ? rawKind : undefined;
+          return compact<SubagentTranscriptEntry>({
+            role,
+            text: requireString(entry, "text"),
+            ts: optionalNumber(entry, "ts"),
+            kind,
+          });
+        }),
+        omitted: requireNumber(raw, "omitted"),
+      };
+
     case "chat_output": {
       const role = requireString(raw, "role");
       if (role !== "assistant" && role !== "user" && role !== "system") {
@@ -461,6 +614,21 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
 
     case "subagent_node":
       return { type, v, node: decodeSubagentNode(raw) };
+
+    case "pane_preview": {
+      const mode = optionalString(raw, "mode");
+      if (mode !== undefined && mode !== "codex_terminal") {
+        throw new ProtocolDecodeError("missing-field", "mode");
+      }
+      return compact({
+        type, v,
+        session: requireString(raw, "session"),
+        seq: requireNumber(raw, "seq"),
+        active: requireBoolean(raw, "active"),
+        text: requireString(raw, "text"),
+        mode,
+      });
+    }
 
     case "question_prompt":
       return {
@@ -586,6 +754,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
             title: requireString(obj, "title"),
             updatedAt: optionalNumber(obj, "updatedAt"),
             agent: sessionAgent,
+            lastMessage: optionalString(obj, "lastMessage"),
           });
         }),
       };

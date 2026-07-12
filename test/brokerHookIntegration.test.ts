@@ -9,7 +9,7 @@
 //   1. allow/deny 往復（request 内容の中継含む）
 //   2. 取り違え防止（5.4）: id=B の deny がブロードキャストされても hook A は無視
 //   3. fan-in 行混線なし（4.2）: 約 8KB summary の同時送出
-//   4. SSH 断（5.6）: 承認待ち中の broker stdin EOF で全 hook が EOF→deny
+//   4. SSH 断（8.2）: 承認待ち中の broker stdin EOF でも hook は生存し、serve 再開で同一 id 再送→決定受理
 //   5. 無応答（5.5）: 各 hook の内部デッドラインで deny
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -98,6 +98,7 @@ function launchHook(
     socketPath: harness.socketPath,
     deadlineSeconds,
     retryConnectIntervalSeconds: 0.05,
+    engineRelaySocketPath: null,
   });
 }
 
@@ -197,22 +198,31 @@ describe("Broker↔Hook 統合", () => {
     expect(parseDecision((await hookB).stdout).decision).toBe("allow");
   });
 
-  it("切断: 承認待ち中の SSH 断（stdin EOF）で 2 hook とも EOF→deny に倒れる（5.6）", async () => {
+  it("切断: 承認待ち中の SSH 断（stdin EOF）でも hook は生き残り、serve 再開後に同一 id で送り直して決定を受理（8.2）", async () => {
     harness = await startBrokerReady("int-disc");
     const hookA = launchHook(harness, "echo DISC-A", "/work", 30);
     const hookB = launchHook(harness, "echo DISC-B", "/work", 30);
 
     // 両 hook の request が中継されて承認待ちに入ったことを確認してから切断する。
-    await readTwoRequests(harness, "DISC-A", "DISC-B");
-    harness.input.end();
+    const before = await readTwoRequests(harness, "DISC-A", "DISC-B");
+    await harness.teardown();
+
+    // serve 再開（iOS が chat を開き直した相当）: 同一 socket パスで新 broker を起動すると、
+    // 両 hook が retry-connect で復帰し、同一 id で approval_request を送り直す。
+    harness = await startBrokerReady("int-disc");
+    const after = await readTwoRequests(harness, "DISC-A", "DISC-B");
+    expect(after.idA).toBe(before.idA);
+    expect(after.idB).toBe(before.idB);
+
+    writeDecision(harness, after.idA, "allow", "allow-after-reopen");
+    writeDecision(harness, after.idB, "deny", "deny-after-reopen");
 
     const resultA = parseDecision((await hookA).stdout);
     const resultB = parseDecision((await hookB).stdout);
-    expect(resultA.decision).toBe("deny");
+    expect(resultA.decision).toBe("allow");
+    expect(resultA.reason).toBe("allow-after-reopen");
     expect(resultB.decision).toBe("deny");
-    // deadline（30s）経路ではなく EOF 経路で確定したことを reason で確認する。
-    expect(resultA.reason).toBe("iPhone disconnected");
-    expect(resultB.reason).toBe("iPhone disconnected");
+    expect(resultB.reason).toBe("deny-after-reopen");
   });
 
   it("無応答: iPhone が応答しないとき 2 hook とも各自の内部デッドラインで deny に倒れる（5.5）", async () => {

@@ -7,8 +7,16 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 import { PassThrough } from "node:stream";
 import { runEngine, type RunEngineOptions } from "../src/engine.js";
+import { connectInProcessHub } from "../src/hubClient.js";
+import { startEngineRelaySocket } from "../src/engineRelaySocket.js";
+import { SessionHub } from "../src/sessionHub.js";
+import { injectQuestionAnswers } from "../src/questionInjection.js";
 import { SessionMetadataStore } from "../src/sessionMetadataStore.js";
 import type { TmuxCommandResult, TmuxCommandRunner } from "../src/tmux.js";
+import { ChatTailController } from "../src/chatTailController.js";
+import { TranscriptTailer } from "../src/transcriptTailer.js";
+import { LineWriter } from "../src/lineWriter.js";
+import type { ControlMessage } from "../src/protocol.js";
 
 /** 出力行の非同期キュー（タイムアウト付き読み出し）。 */
 export class LineQueue {
@@ -102,7 +110,12 @@ export interface EngineHarness {
 }
 
 export function startEngine(
-  options: Omit<RunEngineOptions, "input" | "output"> & { planUsage?: RunEngineOptions["planUsage"] },
+  options: Omit<RunEngineOptions, "input" | "output"> & {
+    planUsage?: RunEngineOptions["planUsage"];
+    hub?: SessionHub;
+    /** Session Hub の本物 tail factory を組むテスト用 projects root。 */
+    chatTailProjectsRoot?: string;
+  },
 ): EngineHarness {
   const input = new PassThrough();
   const output = new PassThrough();
@@ -110,13 +123,49 @@ export function startEngine(
   const rl = readline.createInterface({ input: output, crlfDelay: Number.POSITIVE_INFINITY });
   rl.on("line", (line) => lines.push(line));
 
+  const { chatTailProjectsRoot, hub: injectedHub, ...engineOptions } = options;
+  const callbackWriter = (write: (message: ControlMessage) => void): LineWriter => {
+    const stream = new PassThrough();
+    const reader = readline.createInterface({ input: stream, crlfDelay: Number.POSITIVE_INFINITY });
+    reader.on("line", (line) => write(JSON.parse(line) as ControlMessage));
+    return new LineWriter(stream);
+  };
+  const hub = injectedHub ?? new SessionHub({
+    runner: async () => ok(""),
+    heartbeatDir: options.heartbeatDir ?? makeTempDir("hub-heartbeat"),
+    metadataStore: options.metadataStore ?? makeTempStore(),
+    timeoutSeconds: 1800,
+    questionInjector: (answers, session) => injectQuestionAnswers(answers, session, options.sessionManager),
+    ...(options.codexTurnController !== undefined && options.codexTurnController !== null ? {
+      codexAppServerFactory: () => ({ openThread: async () => { throw new Error("unused test app server"); } }),
+      codexTurnControllerFactory: () => options.codexTurnController!,
+    } : options.codexAppServer !== undefined && options.codexAppServer !== null ? {
+      codexAppServerFactory: () => options.codexAppServer!,
+    } : {}),
+    ...(chatTailProjectsRoot !== undefined ? {
+      tailFactory: (write: (message: ControlMessage) => void) => new ChatTailController({
+        writer: callbackWriter(write),
+        tailer: options.transcriptTailer ?? new TranscriptTailer({ tailIndefinitely: true, emitReplayDoneMarker: true }),
+        projectsRoot: chatTailProjectsRoot,
+        imageService: options.imageService ?? null,
+      }),
+    } : {}),
+  });
+  // 移管前の relay 直送テストも、受信者は engine ではなく同じ Hub にする。
+  const relayServer = options.engineRelaySocketPath
+    ? startEngineRelaySocket({
+        socketPath: options.engineRelaySocketPath,
+        onMessage: (message) => hub.handleRelayMessage(message),
+      })
+    : Promise.resolve(null);
   const done = runEngine({
     input,
     output,
     engineRelaySocketPath: options.engineRelaySocketPath ?? null,
     // テストの既定はプラン使用状況なし（ネットワーク非依存）。個別テストで上書き可能。
     planUsage: options.planUsage ?? (async () => null),
-    ...options,
+    ...engineOptions,
+    hubLink: options.hubLink ?? connectInProcessHub(hub),
   });
   // teardown 前に reject されても unhandled rejection にしない。
   done.catch(() => {});
@@ -128,6 +177,7 @@ export function startEngine(
     teardown: async () => {
       input.end();
       await done.catch(() => {});
+      await (await relayServer)?.close();
       rl.close();
     },
   };

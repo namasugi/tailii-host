@@ -86,7 +86,7 @@ export class TranscriptTailer {
     transcriptPath: string,
     signal?: AbortSignal,
   ): AsyncGenerator<ControlMessage, void, void> {
-    yield* this.runTail(transcriptPath, signal);
+    yield* this.runTail(transcriptPath, null, signal);
   }
 
   /**
@@ -111,7 +111,7 @@ export class TranscriptTailer {
       await abortableSleep(this.pollIntervalMs, signal);
     }
     if (resolved !== null && !signal?.aborted) {
-      yield* this.runTail(resolved, signal);
+      yield* this.runTail(resolved, newerThanMs, signal);
     }
   }
 
@@ -158,6 +158,7 @@ export class TranscriptTailer {
   /** 単一 JSONL ファイルを頭から読み、tail する共有ループ。 */
   private async *runTail(
     transcriptPath: string,
+    newerThanMs: number | null,
     signal?: AbortSignal,
   ): AsyncGenerator<ControlMessage, void, void> {
     let fd: number;
@@ -192,7 +193,7 @@ export class TranscriptTailer {
           if (this.emitReplayDoneMarker && !announcedReplayDone) {
             announcedReplayDone = true;
             if (lineBuf.length > 0) {
-              yield* emitLine(lineBuf, state);
+              yield* emitLineAfter(lineBuf, state, newerThanMs);
               lineBuf = Buffer.alloc(0);
             }
             yield {
@@ -206,7 +207,7 @@ export class TranscriptTailer {
           }
           if (!this.tailIndefinitely) {
             if (this.tailDeadlineMs === null || Date.now() - start >= this.tailDeadlineMs) {
-              if (lineBuf.length > 0) yield* emitLine(lineBuf, state);
+              if (lineBuf.length > 0) yield* emitLineAfter(lineBuf, state, newerThanMs);
               return;
             }
           }
@@ -221,7 +222,7 @@ export class TranscriptTailer {
         while (nl >= 0) {
           const line = lineBuf.subarray(0, nl);
           lineBuf = lineBuf.subarray(nl + 1);
-          yield* emitLine(line, state);
+          yield* emitLineAfter(line, state, newerThanMs);
           nl = lineBuf.indexOf(0x0a);
         }
       }
@@ -233,6 +234,30 @@ export class TranscriptTailer {
       }
     }
   }
+}
+
+/** 世代変更後の backfill は切断後に記録された行だけを通す。timestamp 不明行は重複回避を優先して除外。 */
+function* emitLineAfter(
+  line: Buffer,
+  state: TailState,
+  newerThanMs: number | null,
+): Generator<ControlMessage, void, void> {
+  if (newerThanMs !== null && lineTimestampMs(line) <= newerThanMs) return;
+  yield* emitLine(line, state);
+}
+
+function lineTimestampMs(line: Buffer): number {
+  try {
+    const parsed = JSON.parse(line.toString("utf8")) as { timestamp?: unknown };
+    if (typeof parsed.timestamp === "string") {
+      const timestamp = Date.parse(parsed.timestamp);
+      return Number.isFinite(timestamp) ? timestamp : Number.NEGATIVE_INFINITY;
+    }
+    if (typeof parsed.timestamp === "number" && Number.isFinite(parsed.timestamp)) {
+      return parsed.timestamp < 10_000_000_000 ? parsed.timestamp * 1_000 : parsed.timestamp;
+    }
+  } catch { /* emitLine と同様に不正行は破棄する。 */ }
+  return Number.NEGATIVE_INFINITY;
 }
 
 /** 1 行（JSONL）をパースし、生成メッセージを列挙する。解釈できない行はスキップ。 */
@@ -312,6 +337,29 @@ export function extractTurn(line: string): Turn | null {
   if (typeof obj !== "object" || obj === null) return null;
   const rec = obj as Record<string, unknown>;
 
+  // claude 2.x: ターン処理中に送信されたメッセージは通常の user 行ではなく、配信時点の
+  // attachment(queued_command) 行としてだけ transcript に残る（queue-operation の
+  // enqueue/remove はキュー操作のログで、取り消しがあり得るため写像しない）。
+  if (rec["type"] === "attachment") {
+    const attachment =
+      typeof rec["attachment"] === "object" && rec["attachment"] !== null
+        ? (rec["attachment"] as Record<string, unknown>)
+        : null;
+    if (attachment?.["type"] !== "queued_command") return null;
+    const prompt = typeof attachment["prompt"] === "string" ? attachment["prompt"] : "";
+    if (prompt.length === 0) return null;
+    return {
+      id: typeof rec["uuid"] === "string" ? rec["uuid"] : null,
+      role: "user",
+      text: prompt,
+      toolActivities: [],
+      questionPrompts: [],
+      toolResultIds: [],
+      model: null,
+      contextTokens: null,
+    };
+  }
+
   const message =
     typeof rec["message"] === "object" && rec["message"] !== null
       ? (rec["message"] as Record<string, unknown>)
@@ -327,7 +375,11 @@ export function extractTurn(line: string): Turn | null {
     (typeof rec["id"] === "string" ? rec["id"] : null);
 
   const rawContent = message?.["content"] ?? rec["content"];
-  const text = extractText(rawContent);
+  const plainText = extractText(rawContent);
+  // AskUserQuestion の回答行は text ブロックではなく tool_result +
+  // top-level toolUseResult.answers に記録される。通常の tool_result は会話ログへ
+  // 流さず、設問と回答の構造を持つ行だけ user バブル用の要約へ変換する。
+  const text = plainText || extractQuestionAnswerText(rec["toolUseResult"]);
   const toolActivities = extractToolActivities(rawContent);
   const questionPrompts = extractQuestionPrompts(rawContent, id);
   const toolResultIds = extractToolResultIds(rawContent);
@@ -363,6 +415,33 @@ function extractText(content: unknown): string {
     if (typeof rec["text"] === "string") parts.push(rec["text"]);
   }
   return parts.join("");
+}
+
+/** AskUserQuestion の toolUseResult を、会話ログへ表示するユーザー回答文へ整形する。 */
+function extractQuestionAnswerText(value: unknown): string {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return "";
+  const result = value as Record<string, unknown>;
+  const rawQuestions = result["questions"];
+  const rawAnswers = result["answers"];
+  if (!Array.isArray(rawQuestions)) return "";
+  if (typeof rawAnswers !== "object" || rawAnswers === null || Array.isArray(rawAnswers)) return "";
+  const answers = rawAnswers as Record<string, unknown>;
+  const rows: string[] = [];
+  for (const rawQuestion of rawQuestions) {
+    if (typeof rawQuestion !== "object" || rawQuestion === null || Array.isArray(rawQuestion)) continue;
+    const question = (rawQuestion as Record<string, unknown>)["question"];
+    if (typeof question !== "string" || question.trim().length === 0) continue;
+    const rawAnswer = answers[question];
+    const answer =
+      typeof rawAnswer === "string"
+        ? rawAnswer.trim()
+        : Array.isArray(rawAnswer)
+          ? rawAnswer.filter((item): item is string => typeof item === "string").join("、").trim()
+          : "";
+    if (answer.length === 0) continue;
+    rows.push(`・${question.trim()} → ${answer}`);
+  }
+  return rows.length > 0 ? `回答:\n${rows.join("\n")}` : "";
 }
 
 /** content から tool_use ブロックを構造化表示データへ変換する。 */
@@ -606,6 +685,23 @@ function extractQuestionPrompts(
     prompts.push({ id, questions });
   }
   return prompts;
+}
+
+/**
+ * AskUserQuestion の tool_input（`{questions:[...]}`）から設問を抽出する（PreToolUse hook 用）。
+ * transcript の tool_use ブロックと同じデコーダを共有する（表示仕様の単一情報源）。
+ * 解釈できる設問が 1 件も無ければ空配列。
+ */
+export function questionsFromToolInput(toolInput: Record<string, unknown>): QuestionPromptQuestion[] {
+  const rawQuestions = toolInput["questions"];
+  if (!Array.isArray(rawQuestions)) return [];
+  const questions: QuestionPromptQuestion[] = [];
+  for (const raw of rawQuestions) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const q = decodeQuestionPromptQuestion(raw as Record<string, unknown>);
+    if (q !== null) questions.push(q);
+  }
+  return questions;
 }
 
 function decodeQuestionPromptQuestion(raw: Record<string, unknown>): QuestionPromptQuestion | null {

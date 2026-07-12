@@ -17,6 +17,10 @@ export interface SessionMeta {
   agent?: "claude" | "codex";
   /** Claude の会話 JSONL 名に対応する session-id。未記録は従来どおり最新 JSONL 解決へ戻す。 */
   claudeSessionId?: string;
+  /** provider 共通の論理会話 ID。Claude UUID / Codex thread ID を同じ欄で扱う。 */
+  providerSessionId?: string;
+  /** runtime を収容する tmux pane の安定 ID（`%N`）。未記録時は session 名へフォールバック。 */
+  tmuxPaneId?: string;
 }
 
 /** session 名が安全でないときに投げる型付きエラー。 */
@@ -63,6 +67,8 @@ export class SessionMetadataStore {
         createdAt: meta.createdAt,
         cwd: meta.cwd,
         name: meta.name,
+        ...(meta.providerSessionId !== undefined ? { providerSessionId: meta.providerSessionId } : {}),
+        ...(meta.tmuxPaneId !== undefined ? { tmuxPaneId: meta.tmuxPaneId } : {}),
       },
     );
     const target = this.fileFor(meta.name);
@@ -108,6 +114,17 @@ export class SessionMetadataStore {
     return result;
   }
 
+  /** provider + 会話 ID から現在の tmux メタデータを逆引きする。 */
+  findByProviderSessionId(agent: "claude" | "codex", providerSessionId: string): SessionMeta | null {
+    for (const meta of this.all()) {
+      const metaAgent = meta.agent ?? "claude";
+      if (metaAgent !== agent) continue;
+      const id = meta.providerSessionId ?? (metaAgent === "claude" ? meta.claudeSessionId : undefined);
+      if (id === providerSessionId) return meta;
+    }
+    return null;
+  }
+
   private fileFor(name: string): string {
     return path.join(this.base, `${name}.json`);
   }
@@ -126,11 +143,19 @@ function decodeMeta(raw: unknown): SessionMeta | null {
   const agent = obj["agent"] === "codex" || obj["agent"] === "claude" ? obj["agent"] : undefined;
   const claudeSessionId =
     typeof obj["claudeSessionId"] === "string" ? obj["claudeSessionId"] : undefined;
+  const providerSessionId =
+    typeof obj["providerSessionId"] === "string" ? obj["providerSessionId"] : undefined;
+  const tmuxPaneId =
+    typeof obj["tmuxPaneId"] === "string" && /^%\d+$/.test(obj["tmuxPaneId"])
+      ? obj["tmuxPaneId"]
+      : undefined;
   return {
     name: obj["name"],
     cwd: obj["cwd"],
     createdAt: obj["createdAt"],
     ...(agent !== undefined ? { agent } : {}),
     ...(claudeSessionId !== undefined ? { claudeSessionId } : {}),
+    ...(providerSessionId !== undefined ? { providerSessionId } : {}),
+    ...(tmuxPaneId !== undefined ? { tmuxPaneId } : {}),
   };
 }

@@ -67,6 +67,11 @@ export class ChatTailController {
       options.codexTailer ?? new CodexRolloutTailer({ tailIndefinitely: true, emitReplayDoneMarker: true });
   }
 
+  /** 全文取得要求向けに、現在の subagent transcript パスを解決する。 */
+  subagentTranscriptPath(nodeId: string): string | null {
+    return this.subagentTailer.jsonlPath(nodeId);
+  }
+
   /**
    * `cwd` からそのセッションの project dir を解決し、transcript tail を開始/切替する。
    * 同一会話（解決先 jsonl が同じ）への張り直しはスキップする。
@@ -83,7 +88,7 @@ export class ChatTailController {
     }
     this.openAgent = agent;
     if (agent === "codex") {
-      this.openCodex(cwd, newerThanMs);
+      this.openCodex(cwd, preferredSessionId, newerThanMs);
       return;
     }
     // claude はシンボリックリンクを解決した canonical パスで project slug を作る
@@ -126,6 +131,14 @@ export class ChatTailController {
           if (ac.signal.aborted) {
             ChatTailController.diag(`tail cancelled (emitted ${count})`);
             break;
+          }
+          // AskUserQuestion のライフサイクルは hook relay（question_event → engine）が唯一の
+          // ソース。Claude Code は設問が未回答の間 transcript に tool_use 行を書かない
+          // （v2.1.206 実測）ため、tail に現れる question_prompt/question_dismiss は常に
+          // 「回答済みの残骸」であり、履歴 replay や回答時 flush のたびに現行の設問シートを
+          // 上書き・消灯してしまう（再オープン時にモーダルが一瞬出て消えるバグ）。転送しない。
+          if (message.type === "question_prompt" || message.type === "question_dismiss") {
+            continue;
           }
           count += 1;
           if (count <= 3 || count % 25 === 0) ChatTailController.diag(`emit chat_output #${count}`);
@@ -199,8 +212,12 @@ export class ChatTailController {
    * codex モードの tail 開始/切替。claude の slug/subagent/添付は使わず、
    * cwd から rollout を解決して chat_output を流す。同一 rollout への張り直しはスキップする。
    */
-  private openCodex(cwd: string, newerThanMs: number | null): void {
-    const resolvedNow = this.codexTailer.resolve(cwd, newerThanMs);
+  private openCodex(
+    cwd: string,
+    preferredSessionId: string | null,
+    newerThanMs: number | null,
+  ): void {
+    const resolvedNow = this.codexTailer.resolve(cwd, newerThanMs, preferredSessionId);
     if (resolvedNow !== null && this.currentPump !== null && resolvedNow === this.currentResolvedPath) {
       ChatTailController.diag(`openCodex skipped: same rollout already tailing (${resolvedNow})`);
       return;
@@ -210,19 +227,24 @@ export class ChatTailController {
     const ac = new AbortController();
     this.abortController = ac;
     this.currentDir = cwd;
-    this.currentPreferred = null;
+    this.currentPreferred = preferredSessionId;
     this.currentNewerThanMs = newerThanMs;
     this.currentResolvedPath = resolvedNow;
     this.currentSubagentPump = null;
 
     const { writer, codexTailer } = this;
     ChatTailController.diag(
-      `openCodex cwd=${cwd} newerThan=${newerThanMs === null ? "nil" : String(newerThanMs)} resolved=${resolvedNow ?? "nil"}`,
+      `openCodex cwd=${cwd} preferred=${preferredSessionId ?? "nil"} newerThan=${newerThanMs === null ? "nil" : String(newerThanMs)} resolved=${resolvedNow ?? "nil"}`,
     );
     this.currentPump = (async () => {
       let count = 0;
       try {
-        for await (const message of codexTailer.streamForCwd(cwd, newerThanMs, ac.signal)) {
+        for await (const message of codexTailer.streamForCwd(
+          cwd,
+          newerThanMs,
+          ac.signal,
+          preferredSessionId,
+        )) {
           if (ac.signal.aborted) break;
           count += 1;
           if (count <= 3 || count % 25 === 0) ChatTailController.diag(`emit codex chat_output #${count}`);
@@ -309,6 +331,31 @@ export class ChatTailController {
    */
   currentAgent(): ChatAgent {
     return this.openAgent;
+  }
+
+  /**
+   * kill された tmux セッションのメタから、その会話を tail 中なら tail を停止する。
+   *
+   * tail を生かしたままだと、次の再オープン（session_start）の `open()` が
+   * 「同一会話を tail 中」としてスキップして履歴を再生しない。kill 後の再オープンは
+   * tmux 名が変わり得る（生存別名 → `cs-<id>`）ためクライアントのキャッシュも外れ、
+   * 何も表示されなくなる。kill の全経路（session_kill / idle reaper / 処理完了時 kill）
+   * から呼ぶこと。
+   */
+  stopIfSession(meta: { cwd: string; agent?: ChatAgent; claudeSessionId?: string } | null): void {
+    if (meta === null || this.currentPump === null) return;
+    if (this.openAgent === "codex") {
+      // codex は会話 id 束縛を持たないため cwd 一致で判定する（openCodex の解決単位）。
+      if (meta.agent === "codex" && meta.cwd === this.currentDir) {
+        ChatTailController.diag(`stopIfSession: codex tail 停止 cwd=${meta.cwd}`);
+        this.stop();
+      }
+      return;
+    }
+    if (meta.claudeSessionId !== undefined && meta.claudeSessionId === this.currentPreferred) {
+      ChatTailController.diag(`stopIfSession: claude tail 停止 claudeSessionId=${meta.claudeSessionId}`);
+      this.stop();
+    }
   }
 
   /** tail を停止する（engine チャネル断）。 */

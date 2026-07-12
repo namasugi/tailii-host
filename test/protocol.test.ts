@@ -77,6 +77,44 @@ describe("decode 詳細", () => {
     expect(encodeControlMessage(codex)).toContain('"agentType":"codex"');
   });
 
+  it("session_list_response は providerSessionId と agent を additive に復元する", () => {
+    const decoded = decodeControlMessage(
+      '{"id":"x","sessions":[{"agent":"codex","alive":true,"cwd":"/t","name":"n","providerSessionId":"thread-1"}],"type":"session_list_response","v":2}',
+    );
+    if (decoded.type !== "session_list_response") throw new Error("session_list_response を期待");
+    expect(decoded.sessions[0]).toEqual({
+      name: "n",
+      cwd: "/t",
+      alive: true,
+      agent: "codex",
+      providerSessionId: "thread-1",
+    });
+    expect(encodeControlMessage(decoded)).toContain('"providerSessionId":"thread-1"');
+  });
+
+  it("session_start の model/permissionMode を復元する（permissionMode は既知4値のみ採用）", () => {
+    const full = decodeControlMessage(
+      '{"type":"session_start","v":2,"id":"x","cwd":"/t","name":"n","model":"opus","permissionMode":"acceptEdits"}',
+    );
+    expect(full).toMatchObject({
+      type: "session_start",
+      model: "opus",
+      permissionMode: "acceptEdits",
+    });
+    // ラウンドトリップで保持される。
+    expect(encodeControlMessage(full)).toContain('"model":"opus"');
+    expect(encodeControlMessage(full)).toContain('"permissionMode":"acceptEdits"');
+    // 未知モードは undefined（host 既定に委ねる）。
+    const bad = decodeControlMessage(
+      '{"type":"session_start","v":2,"id":"x","cwd":"/t","name":"n","permissionMode":"yolo"}',
+    );
+    expect((bad as { permissionMode?: string }).permissionMode).toBeUndefined();
+    // 未指定はどちらも undefined。
+    const none = decodeControlMessage('{"type":"session_start","v":2,"id":"x","cwd":"/t","name":"n"}');
+    expect((none as { model?: string }).model).toBeUndefined();
+    expect((none as { permissionMode?: string }).permissionMode).toBeUndefined();
+  });
+
   it("v1 tool_activity(TodoWrite) の todos を復元する", () => {
     const lines = goldenLines("approval-protocol-v1.ndjson");
     const todoLine = lines.find((line) => line.includes('"name":"TodoWrite"'));
@@ -159,6 +197,54 @@ describe("decode 詳細", () => {
       status: "running",
       ts: 1783016361453,
     });
+  });
+
+  it("subagent transcript entry の optional ts/kind を検証して復元する", () => {
+    const decoded = decodeControlMessage(
+      '{"entries":[{"kind":"tool_use","role":"tool","text":"Read: x","ts":1000},{"kind":"tool_use","role":"assistant","text":"ok","ts":"bad"}],"id":"tr","nodeId":"n","omitted":0,"type":"subagent_transcript_response","v":2}',
+    );
+    if (decoded.type !== "subagent_transcript_response") {
+      throw new Error("subagent_transcript_response を期待");
+    }
+    expect(decoded.entries).toEqual([
+      { role: "tool", text: "Read: x", ts: 1000, kind: "tool_use" },
+      { role: "assistant", text: "ok" },
+    ]);
+  });
+
+  it("v2 golden の codex_turn_interrupt を復元する", () => {
+    const line = goldenLines("approval-protocol-v2.ndjson").find((entry) =>
+      entry.includes('"type":"codex_turn_interrupt"')
+    );
+    expect(line).toBeDefined();
+    expect(decodeControlMessage(line!)).toEqual({
+      type: "codex_turn_interrupt",
+      v: 2,
+      id: "ci11aa22-0000-0000-0000-000000000901",
+      session: "tailii-abc123",
+    });
+  });
+
+  it("chat_send / chat_send_result を復元し、空本文を拒否する", () => {
+    const lines = goldenLines("approval-protocol-v2.ndjson");
+    const request = lines.find((entry) => entry.includes('"type":"chat_send"'));
+    const result = lines.find((entry) => entry.includes('"type":"chat_send_result"'));
+    expect(request).toBeDefined();
+    expect(result).toBeDefined();
+    expect(decodeControlMessage(request!)).toEqual({
+      type: "chat_send", v: 2,
+      id: "cs11aa22-0000-0000-0000-000000001002",
+      session: "tailii-abc123",
+      clientMessageId: "cs11aa22-0000-0000-0000-000000001001",
+      text: "次の実装を進めてください。",
+    });
+    expect(decodeControlMessage(result!)).toEqual({
+      type: "chat_send_result", v: 2,
+      id: "cs11aa22-0000-0000-0000-000000001002", status: "accepted",
+    });
+    expect(() => decodeControlMessage(
+      '{"clientMessageId":"c","id":"r","session":"s","text":"","type":"chat_send","v":2}',
+    )).toThrow(ProtocolDecodeError);
   });
 
   it("remote_pending / remote_pending_cleared を復元する", () => {
@@ -314,5 +400,109 @@ describe("encode 詳細", () => {
     })).toBe(
       '{"id":"q1","kind":"question","session":"work","type":"remote_pending_cleared","v":1}',
     );
+  });
+
+  it("codex_turn_start は App Server thread への user input を往復する", () => {
+    const wire = encodeControlMessage({
+      type: "codex_turn_start",
+      v: 2,
+      id: "req-1",
+      session: "codex-work",
+      text: "テストを実行して",
+      clientUserMessageId: "client-1",
+      effort: "xhigh",
+    });
+    expect(wire).toBe(
+      '{"clientUserMessageId":"client-1","effort":"xhigh","id":"req-1","session":"codex-work","text":"テストを実行して","type":"codex_turn_start","v":2}',
+    );
+    expect(decodeControlMessage(wire)).toEqual({
+      type: "codex_turn_start",
+      v: 2,
+      id: "req-1",
+      session: "codex-work",
+      text: "テストを実行して",
+      clientUserMessageId: "client-1",
+      effort: "xhigh",
+    });
+  });
+
+  it("codex_turn_interrupt は session を指定して往復する", () => {
+    const wire = encodeControlMessage({
+      type: "codex_turn_interrupt",
+      v: 2,
+      id: "interrupt-1",
+      session: "codex-work",
+    });
+    expect(wire).toBe(
+      '{"id":"interrupt-1","session":"codex-work","type":"codex_turn_interrupt","v":2}',
+    );
+    expect(decodeControlMessage(wire)).toEqual({
+      type: "codex_turn_interrupt",
+      v: 2,
+      id: "interrupt-1",
+      session: "codex-work",
+    });
+  });
+
+  it("codex_model_list は App Server 由来のモデル別 context を往復する", () => {
+    const request = encodeControlMessage({
+      type: "codex_model_list_request",
+      v: 2,
+      id: "models-1",
+    });
+    expect(request).toBe('{"id":"models-1","type":"codex_model_list_request","v":2}');
+    expect(decodeControlMessage(request)).toEqual({
+      type: "codex_model_list_request",
+      v: 2,
+      id: "models-1",
+    });
+
+    const response = encodeControlMessage({
+      type: "codex_model_list_response",
+      v: 2,
+      id: "models-1",
+      models: [
+        {
+          id: "gpt-5.6-sol",
+          displayName: "GPT-5.6-Sol",
+          description: "Latest frontier agentic coding model.",
+          contextWindow: 353_400,
+          defaultReasoningEffort: "medium",
+          supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "ultra"],
+          isDefault: true,
+        },
+        {
+          id: "gpt-5.6-terra",
+          displayName: "GPT-5.6-Terra",
+          description: "Frontier coding model.",
+          isDefault: false,
+        },
+      ],
+    });
+    expect(response).toBe(
+      '{"id":"models-1","models":[{"contextWindow":353400,"defaultReasoningEffort":"medium","description":"Latest frontier agentic coding model.","displayName":"GPT-5.6-Sol","id":"gpt-5.6-sol","isDefault":true,"supportedReasoningEfforts":["low","medium","high","xhigh","ultra"]},{"description":"Frontier coding model.","displayName":"GPT-5.6-Terra","id":"gpt-5.6-terra","isDefault":false}],"type":"codex_model_list_response","v":2}',
+    );
+    expect(decodeControlMessage(response)).toEqual({
+      type: "codex_model_list_response",
+      v: 2,
+      id: "models-1",
+      models: [
+        {
+          id: "gpt-5.6-sol",
+          displayName: "GPT-5.6-Sol",
+          description: "Latest frontier agentic coding model.",
+          contextWindow: 353_400,
+          defaultReasoningEffort: "medium",
+          supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "ultra"],
+          isDefault: true,
+        },
+        {
+          id: "gpt-5.6-terra",
+          displayName: "GPT-5.6-Terra",
+          description: "Frontier coding model.",
+          isDefault: false,
+        },
+      ],
+    });
   });
 });

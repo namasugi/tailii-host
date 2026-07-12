@@ -10,7 +10,8 @@
 //   - SSH→hook 方向は input の完全行を登録中の全クライアントへブロードキャスト
 //     （宛先選別なし＝各 hook が自 id を照合）。購読者ゼロ時は行を保持しない（非永続）。
 //   - channel_hello を含むあらゆる行を非解釈で透過する。
-//   - SSH 断（input EOF）→ 全クライアント socket を閉じ（各 hook EOF→deny, 5.6）、
+//   - SSH 断（input EOF）→ 全クライアント socket を閉じ（各 hook は EOF を切断と検知して
+//     retry-connect フォールバックへ, hook.ts 参照）、
 //     listen を止めて socket ファイルを削除して終了する。
 //   - EOF 時の残余バッファ（改行なしの部分行）は Swift 版同様そのまま転送する。
 
@@ -18,6 +19,7 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import type { Readable, Writable } from "node:stream";
 import { resolveSocketPath } from "./socketPath.js";
+import { sleep } from "./sleep.js";
 import { encodeControlMessage, PROTOCOL_MAX_SUPPORTED, PROTOCOL_V1 } from "./protocol.js";
 import { createStaleDistGuard, isStaleDist, readPackageVersion, type StaleDistGuard } from "./version.js";
 
@@ -59,6 +61,14 @@ export interface RunBrokerOptions {
   onStaleDist?: () => void;
   /** 起動直後に SSH 側へ channel_hello を送る（CLI の serve 経路で有効）。 */
   sendHello?: boolean;
+  /**
+   * 先発 listener の解放待ち猶予（ms）。iOS が chat 離脱で旧 serve チャネルを閉じた直後に
+   * 同一会話を開き直すと、旧 serve の終了（socket 解放）と新 serve の起動が競走する。
+   * 即失敗にせず短時間だけ解放を待って引き継ぐ（猶予内に解放されなければ従来どおり失敗）。
+   */
+  socketWaitGraceMs?: number;
+  /** 解放待ちの再確認間隔（ms）。 */
+  socketWaitIntervalMs?: number;
 }
 
 /**
@@ -90,11 +100,19 @@ export async function runBroker(options: RunBrokerOptions): Promise<void> {
   const log = options.log ?? (() => {});
   const staleDistGuard = options.staleDistGuard ?? createStaleDistGuard();
 
-  // 既存 socket ファイルが生きていれば奪わず諦める（上記コメント参照）。
+  // 既存 socket ファイルが生きていれば奪わず、まず解放を短時間待つ（chat 離脱→開き直しで
+  // 旧 serve の終了と競走するケースの吸収）。猶予内に解放されなければ従来どおり諦める
+  // （生きている正当な所有者からは決して奪わない, 上記コメント参照）。
   // 生きていなければ（前回異常終了のスタール残骸）安全に削除して bind し直す
   // （Swift 版 unlink→bind と同一の後始末）。
-  if (await isSocketAlive(socketPath)) {
-    throw new Error(`socket already in use by a live listener: ${socketPath}`);
+  const graceMs = options.socketWaitGraceMs ?? 4000;
+  const intervalMs = options.socketWaitIntervalMs ?? 200;
+  const waitDeadline = Date.now() + graceMs;
+  while (await isSocketAlive(socketPath)) {
+    if (Date.now() >= waitDeadline) {
+      throw new Error(`socket already in use by a live listener: ${socketPath}`);
+    }
+    await sleep(intervalMs);
   }
   fs.rmSync(socketPath, { force: true });
 

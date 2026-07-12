@@ -12,6 +12,8 @@ import { isInsideBase } from "./paths.js";
 
 /** タイトル抽出の最大長（先頭 ~60 字）。 */
 const TITLE_MAX_LENGTH = 60;
+/** 最終メッセージプレビューの最大長（一覧行の 1 行スニペット, list-preview）。 */
+const LAST_MESSAGE_MAX_LENGTH = 80;
 /** cwd/title を探すためにスキャンする最大行数。 */
 const SCAN_LINE_CAP = 400;
 /** jsonl から先頭を読む最大バイト数（1 ファイル数十MBになり得るため全読みを避ける）。 */
@@ -113,12 +115,31 @@ export class ClaudeSessionStore {
  * - 上限まで読んでも見つからない（巨大な無 timestamp 行）→ mtime へ保守的にフォールバック
  */
 export function lastConversationTimestamp(filePath: string): number | null {
+  return scanTranscriptTail(filePath).updatedAt;
+}
+
+/** 末尾後方スキャンの結果（最終会話時刻 + 最終メッセージのスニペット）。 */
+export interface TranscriptTailSummary {
+  updatedAt: number | null;
+  lastMessage: string | null;
+}
+
+/**
+ * transcript 末尾の後方スキャンを 1 パスで行い、最終会話時刻と
+ * 最終 user/assistant メッセージ本文（先頭 ~80 字, list-preview）をまとめて返す。
+ * updatedAt の解決規則は `lastConversationTimestamp` の docstring の通り。
+ * lastMessage はテキストを持つ最後の user/assistant 行から取る（tool_result/thinking
+ * のみの行はテキスト抽出に失敗して自然に skip される）。見つからなければ null。
+ */
+export function scanTranscriptTail(filePath: string): TranscriptTailSummary {
   let fd: number;
   try {
     fd = fs.openSync(filePath, "r");
   } catch {
-    return null;
+    return { updatedAt: null, lastMessage: null };
   }
+  let updatedAt: number | null = null;
+  let lastMessage: string | null = null;
   try {
     const size = fs.fstatSync(fd).size;
     const maxSpan = Math.min(size, TAIL_BYTES_CAP);
@@ -131,22 +152,31 @@ export function lastConversationTimestamp(filePath: string): number | null {
       // 途中から読んだ場合、先頭要素は行の途中で切れている可能性があるため捨てる。
       const first = span < size ? 1 : 0;
       for (let i = lines.length - 1; i >= first; i--) {
-        const ts = parseEntryTimestamp(lines[i] ?? "");
-        if (ts !== null) return ts;
+        const rec = parseEntry(lines[i] ?? "");
+        if (rec === null) continue;
+        if (updatedAt === null) updatedAt = entryTimestamp(rec);
+        if (lastMessage === null && (rec["type"] === "user" || rec["type"] === "assistant")) {
+          lastMessage = extractMessageText(rec, LAST_MESSAGE_MAX_LENGTH);
+        }
+        if (updatedAt !== null && lastMessage !== null) {
+          return { updatedAt, lastMessage };
+        }
       }
-      if (span >= size) return null; // 全読みして無し = 会話エントリなし
+      // 全読みして timestamp 無し = 会話エントリなし（状態行のみ）。
+      if (span >= size) return { updatedAt, lastMessage };
     }
     // 上限到達: timestamp 不明だが中身はある。mtime で近似する。
-    return Math.floor(fs.fstatSync(fd).mtimeMs / 1000);
+    if (updatedAt === null) updatedAt = Math.floor(fs.fstatSync(fd).mtimeMs / 1000);
+    return { updatedAt, lastMessage };
   } catch {
-    return null;
+    return { updatedAt, lastMessage };
   } finally {
     fs.closeSync(fd);
   }
 }
 
-/** jsonl 1 行の トップレベル `timestamp`（ISO 文字列）を Unix 秒に読む。無ければ null。 */
-function parseEntryTimestamp(line: string): number | null {
+/** jsonl 1 行をオブジェクトへパースする。空行/非 JSON/非オブジェクトは null。 */
+function parseEntry(line: string): Record<string, unknown> | null {
   const trimmed = line.trim();
   if (!trimmed) return null;
   let obj: unknown;
@@ -156,7 +186,12 @@ function parseEntryTimestamp(line: string): number | null {
     return null;
   }
   if (typeof obj !== "object" || obj === null) return null;
-  const raw = (obj as Record<string, unknown>)["timestamp"];
+  return obj as Record<string, unknown>;
+}
+
+/** エントリのトップレベル `timestamp`（ISO 文字列）を Unix 秒に読む。無ければ null。 */
+function entryTimestamp(rec: Record<string, unknown>): number | null {
+  const raw = rec["timestamp"];
   if (typeof raw !== "string") return null;
   const ms = Date.parse(raw);
   return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
@@ -164,7 +199,8 @@ function parseEntryTimestamp(line: string): number | null {
 
 /** 1 つの jsonl から ClaudeSessionInfo を導出する（先頭 + 末尾チャンクのみ読む）。 */
 function deriveInfo(filePath: string, sessionId: string, slug: string): ClaudeSessionInfo {
-  const updatedAt = lastConversationTimestamp(filePath) ?? undefined;
+  const tail = scanTranscriptTail(filePath);
+  const updatedAt = tail.updatedAt ?? undefined;
 
   let cwd: string | null = null;
   let title: string | null = null;
@@ -210,11 +246,17 @@ function deriveInfo(filePath: string, sessionId: string, slug: string): ClaudeSe
     title: title ?? sessionId.slice(0, 8),
   };
   if (updatedAt !== undefined) info.updatedAt = updatedAt;
+  if (tail.lastMessage !== null) info.lastMessage = tail.lastMessage;
   return info;
 }
 
-/** `type=="user"` 行のメッセージ本文を取り出し、先頭 ~60 字へ整形する。 */
+/** `type=="user"` 行のメッセージ本文を取り出し、先頭 ~60 字へ整形する（タイトル用）。 */
 function extractUserText(obj: Record<string, unknown>): string | null {
+  return extractMessageText(obj, TITLE_MAX_LENGTH);
+}
+
+/** user/assistant 行のメッセージ本文テキストを取り出し、先頭 maxLength 字へ整形する。 */
+function extractMessageText(obj: Record<string, unknown>, maxLength: number): string | null {
   const message = obj["message"];
   if (typeof message !== "object" || message === null) return null;
   const content = (message as Record<string, unknown>)["content"];
@@ -227,9 +269,9 @@ function extractUserText(obj: Record<string, unknown>): string | null {
   if (raw === null) return null;
   let text = raw.replaceAll("\n", " ").replaceAll("\r", " ").trim();
   if (!text) return null;
-  // slash コマンドのメタ包み（`<command-…>` で始まる）はタイトルに向かないので除外。
+  // slash コマンドのメタ包み（`<command-…>` で始まる）は提示に向かないので除外。
   if (text.startsWith("<command-") || text.startsWith("<local-command")) return null;
-  if (text.length > TITLE_MAX_LENGTH) text = text.slice(0, TITLE_MAX_LENGTH);
+  if (text.length > maxLength) text = text.slice(0, maxLength);
   return text;
 }
 

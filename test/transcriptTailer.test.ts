@@ -11,6 +11,7 @@ import {
   HISTORY_DONE_STREAM_ID,
   MODEL_STREAM_ID,
   TranscriptTailer,
+  questionsFromToolInput,
 } from "../src/transcriptTailer.js";
 import { makeTempDir } from "./helpers.js";
 
@@ -30,6 +31,24 @@ function writeTranscript(lines: string[]): string {
 }
 
 describe("TranscriptTailer", () => {
+  test("streamProjectDir の newerThanMs は JSONL 内の切断前本文を除外する", async () => {
+    const dir = makeTempDir("tailer-newer-lines");
+    const transcript = path.join(dir, "session-1.jsonl");
+    fs.writeFileSync(transcript, [
+      JSON.stringify({ timestamp: "2026-07-12T00:00:00.000Z", type: "user",
+        message: { role: "user", content: "既表示" }, uuid: "old" }),
+      JSON.stringify({ timestamp: "2026-07-12T00:00:02.000Z", type: "assistant",
+        message: { role: "assistant", content: [{ type: "text", text: "停止中の追記" }] }, uuid: "new" }),
+    ].join("\n") + "\n");
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
+    const messages = await collect(tailer.streamProjectDir(
+      dir, "session-1", Date.parse("2026-07-12T00:00:01.000Z"),
+    ));
+    expect(messages.filter((message) => message.type === "chat_output")).toEqual([
+      { type: "chat_output", v: 1, streamId: "new", role: "assistant", text: "停止中の追記", eof: true },
+    ]);
+  });
+
   test("assistant/user ターンを 1 ターン = 1 chat_output（eof:true）で流す", async () => {
     const p = writeTranscript([
       '{"type":"user","message":{"role":"user","content":"やあ"},"uuid":"u1"}',
@@ -42,6 +61,21 @@ describe("TranscriptTailer", () => {
     expect(chats).toEqual([
       { type: "chat_output", v: 1, streamId: "u1", role: "user", text: "やあ", eof: true },
       { type: "chat_output", v: 1, streamId: "a1", role: "assistant", text: "どうも", eof: true },
+    ]);
+  });
+
+  test("ターン処理中に送信された queued_command attachment を user ターンとして流す", async () => {
+    const p = writeTranscript([
+      '{"type":"queue-operation","operation":"enqueue","content":"あとで"}',
+      '{"type":"queue-operation","operation":"remove","content":"あとで"}',
+      '{"type":"attachment","attachment":{"type":"queued_command","prompt":"あとで","commandMode":"prompt","origin":{"kind":"human"}},"uuid":"q1"}',
+      '{"type":"attachment","attachment":{"type":"queued_command","prompt":""},"uuid":"q2"}',
+      '{"type":"attachment","attachment":{"type":"other"},"uuid":"q3"}',
+    ]);
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
+    const chats = (await collect(tailer.streamTranscript(p))).filter((m) => m.type === "chat_output");
+    expect(chats).toEqual([
+      { type: "chat_output", v: 1, streamId: "q1", role: "user", text: "あとで", eof: true },
     ]);
   });
 
@@ -285,6 +319,20 @@ describe("TranscriptTailer", () => {
         role: "user",
         content: [{ type: "tool_result", tool_use_id: "toolu_q1", content: "A" }],
       },
+      toolUseResult: {
+        questions: [
+          {
+            question: "どちらにしますか?",
+            header: "選択",
+            multiSelect: false,
+            options: [
+              { label: "A", description: "前者" },
+              { label: "B", description: "後者" },
+            ],
+          },
+        ],
+        answers: { "どちらにしますか?": "A" },
+      },
       uuid: "u1",
     });
     const p = writeTranscript([ask, result]);
@@ -309,6 +357,19 @@ describe("TranscriptTailer", () => {
     });
     const dismisses = messages.filter((m) => m.type === "question_dismiss");
     expect(dismisses).toEqual([{ type: "question_dismiss", v: 1, id: "toolu_q1" }]);
+    const answerOutputs = messages.filter(
+      (m) => m.type === "chat_output" && m.role === "user",
+    );
+    expect(answerOutputs).toEqual([
+      {
+        type: "chat_output",
+        v: 1,
+        streamId: "u1",
+        role: "user",
+        text: "回答:\n・どちらにしますか? → A",
+        eof: true,
+      },
+    ]);
   });
 
   test("追記 tail: 上限 tail 中に追記された行も拾う", async () => {
@@ -361,5 +422,38 @@ describe("TranscriptTailer", () => {
     const older = new Date(Date.now() - 120_000);
     fs.utimesSync(mine, older, older); // other より古くても preferred を優先。
     expect(TranscriptTailer.resolveJsonl(dir, "mine")).toBe(mine);
+  });
+});
+
+describe("questionsFromToolInput — hook 用の tool_input 抽出", () => {
+  test("questions 配列から transcript 由来と同一形の設問を抽出する", () => {
+    expect(
+      questionsFromToolInput({
+        questions: [
+          {
+            question: "Q",
+            header: "H",
+            multiSelect: true,
+            options: [{ label: "A", description: "d" }, { label: "B" }],
+          },
+        ],
+      }),
+    ).toEqual([
+      {
+        header: "H",
+        question: "Q",
+        multiSelect: true,
+        options: [
+          { label: "A", description: "d" },
+          { label: "B", description: "" },
+        ],
+      },
+    ]);
+  });
+
+  test("questions 欠落・不正要素は空配列/スキップになる", () => {
+    expect(questionsFromToolInput({})).toEqual([]);
+    expect(questionsFromToolInput({ questions: "x" })).toEqual([]);
+    expect(questionsFromToolInput({ questions: [{ header: "H" }] })).toEqual([]);
   });
 });

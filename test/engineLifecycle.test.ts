@@ -1,11 +1,14 @@
 // engineLifecycle.test.ts — Engine アイドルライフサイクル / ページング結線テスト
 // Swift 版 EngineLifecycleTests.swift の移植（session-list-lifecycle 2.3/3.3）。
 
+import * as fs from "node:fs";
 import { describe, expect, test } from "vitest";
+import { sendSessionProcessingToEngine } from "../src/engineRelaySocket.js";
+import { readHeartbeat, writeHeartbeat, type Heartbeat } from "../src/heartbeat.js";
 import type { EngineLauncher } from "../src/launch.js";
 import { decodeControlMessage } from "../src/protocol.js";
-import { SessionIdleTracker } from "../src/sessionIdleTracker.js";
 import { SessionListService } from "../src/sessionListService.js";
+import { SessionHub } from "../src/sessionHub.js";
 import { TmuxSessionManager } from "../src/tmux.js";
 import {
   MockTmuxRunner,
@@ -15,9 +18,26 @@ import {
   startEngine,
   waitForCommand,
 } from "./helpers.js";
+import { canListenUnixSocket, tempSocketPath } from "./socketHelpers.js";
 
 // 更新時刻を全て未解決（null）にする provider → 並びは名前昇順で決定的。
 const unresolvedProvider = (): null => null;
+
+/** heartbeat ファイルが条件を満たすまでポーリングで待つ。 */
+async function waitForHeartbeat(
+  dir: string,
+  session: string,
+  predicate: (heartbeat: Heartbeat) => boolean,
+  timeoutMs = 5000,
+): Promise<Heartbeat | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const heartbeat = readHeartbeat(dir, session);
+    if (heartbeat !== null && predicate(heartbeat)) return heartbeat;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return null;
+}
 
 describe("Engine — アイドルライフサイクル/ページング", () => {
   // MARK: 1. ページング応答
@@ -52,30 +72,39 @@ describe("Engine — アイドルライフサイクル/ページング", () => {
 
   // MARK: 2. idle_hint 記録
 
-  test("session_idle_hint で tracker にアイドル起点が記録される（4.2）", async () => {
+  test("session_idle_hint で heartbeat にアイドル起点が記録される（4.2）", async () => {
     const runner = new MockTmuxRunner(() => ok(""));
     const mgr = new TmuxSessionManager({ runner: runner.runner, store: makeTempStore() });
-    // 大きな timeout・大きな reaper 間隔で「記録のみ」を観測（kill させない）。
-    const tracker = new SessionIdleTracker(100_000);
+    const heartbeatDir = makeTempDir("heartbeat");
 
-    const engine = startEngine({
-      sessionManager: mgr,
-      idleTracker: tracker,
-      reaperCheckIntervalSeconds: 3600,
-    });
+    const engine = startEngine({ sessionManager: mgr, heartbeatDir });
     await engine.lines.nextOfType("channel_hello");
 
+    const before = Math.floor(Date.now() / 1000);
     engine.writeLine('{"id":"H1","name":"work","type":"session_idle_hint","v":1}');
 
-    let recorded = false;
-    for (let i = 0; i < 200; i += 1) {
-      if (JSON.stringify(tracker.idleNames()) === JSON.stringify(["work"])) {
-        recorded = true;
-        break;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-    expect(recorded).toBe(true);
+    // 離脱は計時リセット（bump）。未採番なら idle として作られ、ts は今。
+    const heartbeat = await waitForHeartbeat(heartbeatDir, "work", (hb) => hb.ts >= before);
+    expect(heartbeat?.state).toBe("idle");
+    expect(heartbeat?.event).toBe("chat-leave");
+
+    await engine.teardown();
+  });
+
+  test("session_idle_hint は処理中（active）の state を idle へ降格させない", async () => {
+    const runner = new MockTmuxRunner(() => ok(""));
+    const mgr = new TmuxSessionManager({ runner: runner.runner, store: makeTempStore() });
+    const heartbeatDir = makeTempDir("heartbeat");
+    // 処理中に chat を離脱した状況: hook が書いた active が残っている。
+    writeHeartbeat(heartbeatDir, "work", { ts: 100, state: "active", event: "PreToolUse" });
+
+    const engine = startEngine({ sessionManager: mgr, heartbeatDir });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"id":"H1b","name":"work","type":"session_idle_hint","v":1}');
+
+    const heartbeat = await waitForHeartbeat(heartbeatDir, "work", (hb) => hb.ts > 100);
+    expect(heartbeat?.state).toBe("active");
 
     await engine.teardown();
   });
@@ -97,12 +126,12 @@ describe("Engine — アイドルライフサイクル/ページング", () => {
       return { exitCode: 0, errorText: "" };
     };
 
+    const heartbeatDir = makeTempDir("heartbeat");
     const engine = startEngine({
       sessionManager: mgr,
       metadataStore: store,
-      idleTracker: new SessionIdleTracker(100_000),
+      heartbeatDir,
       resumeLauncher: resume,
-      reaperCheckIntervalSeconds: 3600,
     });
     await engine.lines.nextOfType("channel_hello");
 
@@ -113,6 +142,8 @@ describe("Engine — アイドルライフサイクル/ページング", () => {
     expect(msg.id).toBe("R1");
     expect(msg.sessions.map((s) => s.name)).toEqual(["work"]);
     expect(resumeCalls).toEqual([]);
+    // 再アクティブ化 = heartbeat 更新（reaper daemon の計時リセット）。
+    expect(readHeartbeat(heartbeatDir, "work")?.event).toBe("chat-open");
 
     await engine.teardown();
   });
@@ -134,9 +165,7 @@ describe("Engine — アイドルライフサイクル/ページング", () => {
     const engine = startEngine({
       sessionManager: mgr,
       metadataStore: store,
-      idleTracker: new SessionIdleTracker(100_000),
       resumeLauncher: resume,
-      reaperCheckIntervalSeconds: 3600,
     });
     await engine.lines.nextOfType("channel_hello");
 
@@ -167,9 +196,7 @@ describe("Engine — アイドルライフサイクル/ページング", () => {
     const engine = startEngine({
       sessionManager: mgr,
       metadataStore: store,
-      idleTracker: new SessionIdleTracker(100_000),
       resumeLauncher: resume,
-      reaperCheckIntervalSeconds: 3600,
     });
     await engine.lines.nextOfType("channel_hello");
 
@@ -183,27 +210,165 @@ describe("Engine — アイドルライフサイクル/ページング", () => {
     await engine.teardown();
   });
 
-  // MARK: 6. reaper 経由の timeout kill
+  // MARK: 6. 処理中/処理完了の heartbeat 反映（session_processing → reaper daemon の判定権威）
 
-  test("idle_hint 後、timeout 到達で reaper が当該のみ kill する（4.3）", async () => {
+  test("session_processing active/done が heartbeat の state に反映される", async () => {
+    if (!(await canListenUnixSocket())) return;
+    const relayPath = tempSocketPath("engine-processing");
+    fs.rmSync(relayPath, { force: true });
     const store = makeTempStore();
-    store.put({ name: "idle1", cwd: "/tmp/idle1", createdAt: 0 });
+    store.put({ name: "busy1", cwd: "/tmp/busy1", createdAt: 0 });
     const runner = new MockTmuxRunner(() => ok(""));
     const mgr = new TmuxSessionManager({ runner: runner.runner, store });
-    // timeout 0 → idle_hint 直後に期限切れ。短い reaper 間隔で速やかに kill。
-    const tracker = new SessionIdleTracker(0);
+    const heartbeatDir = makeTempDir("heartbeat");
 
     const engine = startEngine({
       sessionManager: mgr,
       metadataStore: store,
-      idleTracker: tracker,
-      reaperCheckIntervalSeconds: 0.02,
+      heartbeatDir,
+      engineRelaySocketPath: relayPath,
     });
     await engine.lines.nextOfType("channel_hello");
 
-    engine.writeLine('{"id":"H2","name":"idle1","type":"session_idle_hint","v":1}');
+    // 処理開始（hook / codex turn controller 相当）→ active。
+    await sendSessionProcessingToEngine(
+      { type: "session_processing", session: "busy1", state: "active" },
+      relayPath,
+    );
+    const active = await waitForHeartbeat(heartbeatDir, "busy1", (hb) => hb.state === "active");
+    expect(active?.event).toBe("hub-processing");
 
-    expect(await waitForCommand(runner, ["kill-session", "-t", "idle1"])).toBe(true);
+    // 処理完了 → idle（以後 reaper daemon が timeout 計時する）。
+    await sendSessionProcessingToEngine(
+      { type: "session_processing", session: "busy1", state: "done" },
+      relayPath,
+    );
+    const idle = await waitForHeartbeat(heartbeatDir, "busy1", (hb) => hb.state === "idle");
+    expect(idle?.event).toBe("hub-processing-done");
+    // engine 自身は kill しない（kill は reaper daemon の責務）。
+    const killArgs = JSON.stringify(["kill-session", "-t", "busy1"]);
+    expect(runner.recorded.some((cmd) => JSON.stringify(cmd) === killArgs)).toBe(false);
+
+    await engine.teardown();
+    fs.rmSync(relayPath, { force: true });
+  });
+
+  // MARK: 6.3. 表示中/処理中セッションの定期 bump（reaper daemon への生存通知）
+
+  test("開いている会話と処理中セッションは定期 tick で heartbeat が bump される", async () => {
+    if (!(await canListenUnixSocket())) return;
+    const relayPath = tempSocketPath("engine-tick");
+    fs.rmSync(relayPath, { force: true });
+    const store = makeTempStore();
+    store.put({ name: "s-work", cwd: "/tmp/s-work", createdAt: 0 });
+    store.put({ name: "s-turn", cwd: "/tmp/s-turn", createdAt: 0, agent: "codex" });
+    const runner = new MockTmuxRunner((args) => {
+      if (args[0] === "ls") return ok("s-work\ns-turn\n");
+      if (args[0] === "capture-pane") return ok("hi\n");
+      return ok("");
+    });
+    const mgr = new TmuxSessionManager({ runner: runner.runner, store });
+    const heartbeatDir = makeTempDir("heartbeat");
+    const hub = new SessionHub({
+      runner: runner.runner,
+      heartbeatDir,
+      metadataStore: store,
+      timeoutSeconds: 1800,
+    });
+
+    const engine = startEngine({
+      sessionManager: mgr,
+      metadataStore: store,
+      heartbeatDir,
+      engineRelaySocketPath: relayPath,
+      hub,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    // 会話を開く（activeChatSession = s-work）。
+    engine.writeLine('{"id":"R9","name":"s-work","type":"session_reattach","v":1}');
+    await engine.lines.nextOfType("session_list_response");
+    const opened = readHeartbeat(heartbeatDir, "s-work");
+    expect(opened).not.toBeNull();
+
+    // 処理中セッション（chat 非表示）も tick の bump 対象。
+    await sendSessionProcessingToEngine(
+      { type: "session_processing", session: "s-turn", state: "active" },
+      relayPath,
+    );
+    const turnStart = await waitForHeartbeat(heartbeatDir, "s-turn", (hb) => hb.state === "active");
+    expect(turnStart).not.toBeNull();
+
+    // 周期実行者である Hub を明示 tick し、双方の state を保持したまま bump する。
+    await hub.tick();
+    expect(readHeartbeat(heartbeatDir, "s-work")).toMatchObject({ event: "hub-tick" });
+    expect(readHeartbeat(heartbeatDir, "s-turn")).toMatchObject({ event: "hub-processing", state: "active" });
+
+    await engine.teardown();
+    fs.rmSync(relayPath, { force: true });
+  });
+
+  // MARK: 6.5. resume 再開は heartbeat を更新する（stale 起点による会話中 kill の根治）
+
+  test("session_start(resume) は stale な heartbeat を更新する（再開直後の reaper kill 防止）", async () => {
+    const store = makeTempStore();
+    const runner = new MockTmuxRunner((args) => (args[0] === "ls" ? ok("cs-res1\n") : ok("")));
+    const launcher: EngineLauncher = async (cwd, name) => {
+      store.put({ name, cwd, createdAt: 7 });
+      return { exitCode: 0, errorText: "" };
+    };
+    const heartbeatDir = makeTempDir("heartbeat");
+    // 前回離脱時の idle 起点が 30 分以上前のまま残っている状況を再現する。
+    writeHeartbeat(heartbeatDir, "cs-res1", { ts: 0, state: "idle", event: "chat-leave" });
+
+    const engine = startEngine({
+      sessionManager: new TmuxSessionManager({ runner: runner.runner, store }),
+      metadataStore: store,
+      launcher,
+      heartbeatDir,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    const before = Math.floor(Date.now() / 1000);
+    engine.writeLine(
+      '{"cwd":"/tmp/res1","id":"SR1","name":"cs-res1","resumeSessionId":"sid-res1","type":"session_start","v":1}',
+    );
+    await engine.lines.nextOfType("session_list_response");
+
+    // 再開成功で heartbeat の ts が更新されている（reaper daemon の次 tick で殺されない）。
+    const heartbeat = readHeartbeat(heartbeatDir, "cs-res1");
+    expect(heartbeat).not.toBeNull();
+    expect(heartbeat!.ts).toBeGreaterThanOrEqual(before);
+
+    await engine.teardown();
+  });
+
+  test("session_start resume の生存エイリアス再利用も heartbeat を更新する", async () => {
+    const store = makeTempStore();
+    const sessionId = "f622acb5-1111-2222-3333-444444444444";
+    store.put({ name: "s-alias", cwd: "/tmp/alias", createdAt: 7, claudeSessionId: sessionId });
+    const runner = new MockTmuxRunner((args) => (args[0] === "ls" ? ok("s-alias\n") : ok("")));
+    const launcher: EngineLauncher = async () => ({ exitCode: 0, errorText: "" });
+    const heartbeatDir = makeTempDir("heartbeat");
+    writeHeartbeat(heartbeatDir, "s-alias", { ts: 0, state: "idle", event: "chat-leave" });
+
+    const engine = startEngine({
+      sessionManager: new TmuxSessionManager({ runner: runner.runner, store }),
+      metadataStore: store,
+      launcher,
+      heartbeatDir,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    const before = Math.floor(Date.now() / 1000);
+    engine.writeLine(
+      `{"cwd":"/tmp/alias","id":"SR2","name":"cs-f622acb5","resumeSessionId":"${sessionId}","type":"session_start","v":1}`,
+    );
+    await engine.lines.nextOfType("session_list_response");
+
+    const heartbeat = readHeartbeat(heartbeatDir, "s-alias");
+    expect(heartbeat).not.toBeNull();
+    expect(heartbeat!.ts).toBeGreaterThanOrEqual(before);
 
     await engine.teardown();
   });
