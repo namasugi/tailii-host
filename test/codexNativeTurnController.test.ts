@@ -13,6 +13,7 @@ class FakeThread implements CodexThreadClient {
   readonly steers: { turnId: string; text: string }[] = [];
   readonly interrupts: string[] = [];
   nextTurnId = "turn-1";
+  initialActiveTurnId: string | null = null;
   steerError: Error | null = null;
   closed = 0;
 
@@ -175,6 +176,39 @@ describe("CodexNativeTurnController", () => {
     });
     await controller.interruptTurn("work");
     expect(thread.interrupts).toEqual(["turn-1"]);
+  });
+
+  test("別 client の turn/started 通知から turnId を追跡して中断する", async () => {
+    const thread = new FakeThread();
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return thread; } },
+    });
+    await controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" });
+
+    openOptions?.onNotification?.({
+      method: "turn/started",
+      params: { threadId: "thread-1", turn: { id: "turn-external", status: "inProgress" } },
+    });
+    await controller.interruptTurn("work");
+
+    expect(thread.interrupts).toEqual(["turn-external"]);
+  });
+
+  test("再購読時の実行中 turnId を復元して中断する", async () => {
+    const thread = new FakeThread();
+    thread.initialActiveTurnId = "turn-resumed";
+    const processing: string[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => thread },
+      onProcessing: (session, state) => processing.push(`${session}:${state}`),
+    });
+
+    await controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" });
+    await controller.interruptTurn("work");
+
+    expect(processing).toEqual(["work:active"]);
+    expect(thread.interrupts).toEqual(["turn-resumed"]);
   });
 
   test("App Server の利用中モデルと token usage を session callback へ反映する", async () => {

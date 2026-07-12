@@ -34,6 +34,7 @@ import { TmuxSessionManager } from "./tmux.js";
 import { Writable } from "node:stream";
 import { PROTOCOL_MAX_SUPPORTED, type ControlMessage } from "./protocol.js";
 import { injectQuestionAnswers } from "./questionInjection.js";
+import { ImageService } from "./imageService.js";
 
 export interface HubLock {
   pid: number;
@@ -303,6 +304,10 @@ export async function runHubCommand(args: string[]): Promise<number> {
   const runner = processTmuxCommandRunner();
   const metadataStore = new SessionMetadataStore();
   const tmuxManager = new TmuxSessionManager({ runner, store: metadataStore });
+  // Session Hub 導入後は Hub 所有の ChatTailController が会話を配信する。
+  // ここで ImageService を渡さないと engine 側のサービスは tail を通らず、
+  // user 添付の image_available が消失する。index は engine と共通の既定パスへ書く。
+  const imageService = new ImageService();
   const callbackWriter = (write: (message: ControlMessage) => void): LineWriter =>
     new LineWriter(new Writable({ write(chunk, _encoding, callback) {
       try { write(JSON.parse(String(chunk)) as ControlMessage); callback(); } catch (error) { callback(error as Error); }
@@ -318,6 +323,7 @@ export async function runHubCommand(args: string[]): Promise<number> {
       writer: callbackWriter(write),
       tailer: new TranscriptTailer({ tailIndefinitely: true, emitReplayDoneMarker: true }),
       projectsRoot: path.join(os.homedir(), ".claude", "projects"),
+      imageService,
       protocolVersion: () => PROTOCOL_MAX_SUPPORTED,
     }),
     previewPumpFactory: (write, onPermissionMode) => new PanePreviewPump({

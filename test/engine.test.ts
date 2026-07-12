@@ -48,6 +48,41 @@ function makeQuestionHub(manager: TmuxSessionManager, id: string): SessionHub {
 }
 
 describe("EngineControl — 横断制御チャネル", () => {
+  test("再オープン時と live 更新で現在会話の処理中状態を iOS へ同期する", async () => {
+    const store = makeTempStore();
+    store.put({ name: "work", cwd: "/tmp/work", createdAt: 1, agent: "claude" });
+    const hub = new SessionHub({
+      runner: async () => ok(""),
+      heartbeatDir: makeTempDir("processing-state-hub"),
+      metadataStore: store,
+      timeoutSeconds: 1_800,
+    });
+    hub.handleRelayMessage({ type: "session_processing", session: "work", state: "active" });
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("work\n") : ok(""));
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store),
+      metadataStore: store,
+      hub,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"id":"open","name":"work","type":"session_reattach","v":2}');
+    await engine.lines.nextOfType("session_list_response");
+    expect(decodeControlMessage(
+      await engine.lines.nextOfType("session_processing_state"),
+    )).toEqual({
+      type: "session_processing_state", v: 2, session: "work", active: true,
+    });
+
+    hub.handleRelayMessage({ type: "session_processing", session: "work", state: "done" });
+    expect(decodeControlMessage(
+      await engine.lines.nextOfType("session_processing_state"),
+    )).toEqual({
+      type: "session_processing_state", v: 2, session: "work", active: false,
+    });
+    await engine.teardown();
+  });
+
   test("subagent transcript 全文要求を現在会話の Hub tail へ中継する", async () => {
     const store = makeTempStore();
     store.put({
@@ -756,6 +791,34 @@ describe("EngineControl — 横断制御チャネル", () => {
     expect(store.get("s-c0de7369")?.claudeSessionId).toBe(sessionId);
     expect(store.get("cs-f622acb5")).toBeNull();
 
+    await engine.teardown();
+  });
+
+  test("session_start resume は同じ会話の tmux がシェルだけなら再利用せず launcher を呼ぶ", async () => {
+    const store = makeTempStore();
+    const sessionId = "deadbeef-1111-2222-3333-444444444444";
+    store.put({ name: "s-old", cwd: "/tmp/work", createdAt: 7, claudeSessionId: sessionId });
+    const runner = new MockTmuxRunner((args) => {
+      if (args[0] === "ls") return ok("s-old\n");
+      if (args[0] === "display-message") return ok("zsh\n");
+      return ok("");
+    });
+    const launcherCalls: string[] = [];
+    const launcher: EngineLauncher = async (_cwd, name) => {
+      launcherCalls.push(name);
+      return { exitCode: 0, errorText: "", providerSessionId: sessionId };
+    };
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store), metadataStore: store, launcher,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine(
+      `{"cwd":"/tmp/work","id":"S-dead","name":"cs-deadbeef","resumeSessionId":"${sessionId}","type":"session_start","v":1}`,
+    );
+    await engine.lines.nextOfType("session_list_response");
+
+    expect(launcherCalls).toEqual(["cs-deadbeef"]);
     await engine.teardown();
   });
 
@@ -1550,6 +1613,47 @@ describe("EngineControl — 横断制御チャネル", () => {
     expect(resp).toContain('"id":"DC1"');
     expect(resp).toContain('"ok":true');
     expect(fs.statSync(path.join(base, "created")).isDirectory()).toBe(true);
+
+    await engine.teardown();
+  });
+
+  // MARK: web-preview: preview_open → preview_ready / preview_error
+
+  test("preview_open で loopback 静的サーバーが立ち preview_ready を返す（close で解放）", async () => {
+    const dir = makeTempDir("tailii-preview-engine");
+    fs.writeFileSync(path.join(dir, "index.html"), "<p>preview</p>");
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner) });
+
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine(
+      `{"id":"PV1","target":"${path.join(dir, "index.html")}","type":"preview_open","v":2}`,
+    );
+
+    const ready = await engine.lines.nextOfType("preview_ready");
+    expect(ready).toContain('"id":"PV1"');
+    const url = JSON.parse(ready).url as string;
+    expect(url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/t\/[0-9a-f]{32}\/index\.html$/);
+    const response = await fetch(url);
+    expect(response.status).toBe(200);
+
+    engine.writeLine('{"id":"PV1","type":"preview_close","v":2}');
+    // close 後は接続拒否になる（ポーリングで確定を待つ）。
+    await expect.poll(async () => fetch(url).then(() => "alive", () => "closed")).toBe("closed");
+
+    await engine.teardown();
+  });
+
+  test("preview_open の不正 target には preview_error を返す", async () => {
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner) });
+
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine('{"id":"PV2","target":"/tmp/nonexistent-tailii.html","type":"preview_open","v":2}');
+
+    const error = await engine.lines.nextOfType("preview_error");
+    expect(error).toContain('"id":"PV2"');
+    expect(error).toContain("not-found");
 
     await engine.teardown();
   });

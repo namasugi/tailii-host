@@ -137,3 +137,51 @@ describe("ChatTailController — Read 画像のインライン化", () => {
     expect(messages().filter((m) => m.type === "image_available")).toHaveLength(0);
   });
 });
+
+describe("ChatTailController — Tailii 添付画像のインライン化", () => {
+  test("裸の upload パスを含む user 発話で att-<streamId>-<n> を発行する", async () => {
+    const cwd = makeTempDir("cc-attachment-cwd");
+    const uploadDir = path.join(makeTempDir("cc-attachment-home"), ".tailii", "uploads");
+    fs.mkdirSync(uploadDir, { recursive: true });
+    const imagePath = path.join(uploadDir, "img-ABCD1234.jpg");
+    fs.writeFileSync(imagePath, Buffer.from([0xff, 0xd8, 0xff]));
+
+    const { writer, messages } = capturingWriter();
+    const controller = new ChatTailController({
+      writer,
+      tailer: fakeTailer([{
+        type: "chat_output",
+        v: 1,
+        streamId: "user-attachment",
+        role: "user",
+        text: `${imagePath} この画像を見て`,
+        eof: true,
+      }]) as never,
+      subagentTailer: fakeTailer([]) as never,
+      projectsRoot: makeTempDir("cc-attachment-projects"),
+      imageService: stubImageService(makeTempDir("cc-attachment-index")),
+    });
+
+    controller.open(cwd, null);
+    const c = controller as unknown as {
+      currentPump: Promise<void> | null;
+      currentSubagentPump: Promise<void> | null;
+    };
+    await c.currentPump;
+    await c.currentSubagentPump;
+
+    const available = messages().filter(
+      (message): message is Extract<ControlMessage, { type: "image_available" }> =>
+        message.type === "image_available",
+    );
+    expect(available).toHaveLength(1);
+    expect(available[0]).toMatchObject({
+      id: "att-user-attachment-0",
+      path: imagePath,
+      mime: "image/jpeg",
+      thumbnail: "QUFB",
+      width: 8,
+      height: 6,
+    });
+  });
+});

@@ -637,16 +637,22 @@ describe("searchClaudeSessions", () => {
 // MARK: - ChatTailController（添付抽出の純ロジック）
 
 describe("ChatTailController.attachmentImagePaths", () => {
-  test("引用形式・非引用形式の画像パスを重複なく抽出する（画像拡張子のみ）", () => {
+  test("引用・非引用・Tailii upload 形式の画像パスを重複なく抽出する", () => {
     const text =
-      '見て @"/tmp/my photo.png" と @/tmp/shot.jpeg と @/tmp/doc.pdf と @"/tmp/my photo.png"';
+      '見て @"/tmp/my photo.png" と @/tmp/shot.jpeg と @/tmp/doc.pdf と ' +
+      '/Users/alice/.tailii/uploads/img-ABCD1234.jpg と @"/tmp/my photo.png"';
     expect(ChatTailController.attachmentImagePaths(text)).toEqual([
       "/tmp/my photo.png",
       "/tmp/shot.jpeg",
+      "/Users/alice/.tailii/uploads/img-ABCD1234.jpg",
     ]);
   });
 
-  test("@ が無ければ空", () => {
+  test("通常の裸画像パスは添付と誤認しない", () => {
+    expect(ChatTailController.attachmentImagePaths("参照 /tmp/diagram.png")).toEqual([]);
+  });
+
+  test("画像パスが無ければ空", () => {
     expect(ChatTailController.attachmentImagePaths("画像なし")).toEqual([]);
   });
 });

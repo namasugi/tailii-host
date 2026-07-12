@@ -216,6 +216,7 @@ export class CodexAppServerThread {
   constructor(
     readonly threadId: string,
     readonly initialItems: readonly Record<string, unknown>[],
+    readonly initialActiveTurnId: string | null,
     private readonly connection: CodexAppServerConnection,
   ) {}
 
@@ -517,6 +518,7 @@ export class CodexAppServerManager {
     const removeDisconnect = connection.onDisconnect?.((error) => options.onDisconnect?.(error)) ?? (() => {});
     try {
       let initialItems: Record<string, unknown>[] = [];
+      let initialActiveTurnId: string | null = null;
       if (bootstrap === null) {
         await connection.initialize();
         try {
@@ -528,6 +530,7 @@ export class CodexAppServerManager {
             excludeTurns: false,
           });
           initialItems = extractThreadItems(response);
+          initialActiveTurnId = extractActiveTurnId(response);
         } catch (error) {
           // thread/start から最初の user turn まで rollout は未作成で、別接続からの
           // thread/resume は "no rollout found" になる。ただし共有 App Server 内の
@@ -537,7 +540,12 @@ export class CodexAppServerManager {
           if (!isUnmaterializedThreadError(error, options.threadId)) throw error;
         }
       }
-      return new CodexAppServerThread(options.threadId, initialItems, connection);
+      return new CodexAppServerThread(
+        options.threadId,
+        initialItems,
+        initialActiveTurnId,
+        connection,
+      );
     } catch (error) {
       removeNotification();
       removeServerRequest();
@@ -607,6 +615,24 @@ function extractThreadItems(response: unknown): Record<string, unknown>[] {
     }
   }
   return result;
+}
+
+/** thread/resume が返す turn 一覧から、別 client が開始した実行中 turn を復元する。 */
+function extractActiveTurnId(response: unknown): string | null {
+  if (typeof response !== "object" || response === null) return null;
+  const thread = (response as Record<string, unknown>)["thread"];
+  if (typeof thread !== "object" || thread === null) return null;
+  const turns = (thread as Record<string, unknown>)["turns"];
+  if (!Array.isArray(turns)) return null;
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    const turn = turns[index];
+    if (typeof turn !== "object" || turn === null || Array.isArray(turn)) continue;
+    const record = turn as Record<string, unknown>;
+    if (record["status"] !== "inProgress") continue;
+    const id = record["id"];
+    if (typeof id === "string" && id.length > 0) return id;
+  }
+  return null;
 }
 
 function defaultLaunch(executable: string, args: string[], env: NodeJS.ProcessEnv): void {

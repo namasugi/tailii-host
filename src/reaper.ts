@@ -26,7 +26,7 @@ import {
   writeHeartbeat,
 } from "./heartbeat.js";
 import { SessionMetadataStore } from "./sessionMetadataStore.js";
-import type { TmuxCommandRunner } from "./tmux.js";
+import { paneCommandLooksLikeAgent, type TmuxCommandRunner } from "./tmux.js";
 
 /** 一律のアイドル timeout(秒)。idle/active(bump 停止)の両方に同じ値を使う。 */
 export const REAPER_IDLE_TIMEOUT_SECONDS = 1800;
@@ -36,9 +36,6 @@ export const REAPER_CHECK_INTERVAL_SECONDS = 60;
 
 /** tailii が管理する tmux セッション名(これ以外は絶対に触らない)。 */
 export const TAILII_SESSION_PATTERN = /^(cs|s)-/;
-
-/** pane_current_command がこの集合ならエージェントプロセスは死んでいる(シェルだけ)。 */
-const SHELL_COMMANDS = new Set(["zsh", "bash", "sh", "dash", "fish", "tcsh", "csh", "ksh", "login"]);
 
 export interface ReaperTickOptions {
   runner: TmuxCommandRunner;
@@ -103,9 +100,7 @@ export async function agentProcessAlive(
   try {
     const result = await runner(["display-message", "-p", "-t", target, "#{pane_current_command}"]);
     if (result.exitCode !== 0) return true;
-    const command = result.stdout.trim().toLowerCase();
-    if (command.length === 0) return true;
-    return !SHELL_COMMANDS.has(command);
+    return paneCommandLooksLikeAgent(result.stdout);
   } catch {
     return true;
   }

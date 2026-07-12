@@ -71,6 +71,7 @@ export interface CodexTurnControllerRuntime {
 
 export interface CodexThreadClient {
   readonly initialItems?: readonly Record<string, unknown>[];
+  readonly initialActiveTurnId?: string | null;
   startTurn(text: string, clientUserMessageId?: string | null, effort?: string | null, sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null): Promise<string>;
   steerTurn(turnId: string, text: string): Promise<void>;
   interruptTurn(turnId: string): Promise<void>;
@@ -236,10 +237,17 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     if (existing !== undefined) this.closeSession(session);
 
     const items = new Map<string, Record<string, unknown>>();
+    const bufferedNotifications: CodexAppServerNotification[] = [];
+    let notificationTargetReady = false;
     const thread = await this.appServer.openThread({
       threadId,
-      onNotification: (notification) =>
-        this.handleNotification(session, threadId, items, notification),
+      onNotification: (notification) => {
+        if (!notificationTargetReady) {
+          bufferedNotifications.push(notification);
+          return;
+        }
+        this.handleNotification(session, threadId, items, notification);
+      },
       onServerRequest: (request) => this.handleServerRequest(session, cwd, items, request),
       onDisconnect: (error) => {
         const current = this.open.get(session);
@@ -250,8 +258,19 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
         this.onDisconnect(session, error);
       },
     });
-    const opened = { threadId, cwd, thread, items, activeTurnId: null };
+    const opened = {
+      threadId,
+      cwd,
+      thread,
+      items,
+      activeTurnId: thread.initialActiveTurnId ?? null,
+    };
     this.open.set(session, opened);
+    notificationTargetReady = true;
+    if (opened.activeTurnId !== null) this.onProcessing(session, "active");
+    for (const notification of bufferedNotifications) {
+      this.handleNotification(session, threadId, items, notification);
+    }
     return opened;
   }
 
@@ -271,7 +290,14 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
         if (payload !== null) this.onChatItem({ session, itemId: id, payload });
       }
     }
-    if (notification.method === "turn/started") this.onProcessing(session, "active");
+    if (notification.method === "turn/started") {
+      const current = this.open.get(session);
+      const startedTurn = asRecord(params?.["turn"])?.["id"];
+      if (current?.threadId === threadId && typeof startedTurn === "string" && startedTurn.length > 0) {
+        current.activeTurnId = startedTurn;
+      }
+      this.onProcessing(session, "active");
+    }
     if (notification.method === "turn/completed") {
       const current = this.open.get(session);
       const completedTurn = asRecord(params?.["turn"])?.["id"];

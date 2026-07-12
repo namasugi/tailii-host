@@ -305,12 +305,37 @@ describe("CodexAppServerManager", () => {
 
     const thread = await manager.openThread({ threadId: "thread-fresh" });
     expect(thread.initialItems).toEqual([]);
+    expect(thread.initialActiveTurnId).toBeNull();
     await expect(thread.startTurn("first", "client-first")).resolves.toBe("turn-first");
     expect(connection.requests.map((request) => request.method)).toEqual([
       "thread/resume",
       "turn/start",
     ]);
     expect(connection.closed).toBe(0);
+  });
+
+  test("thread/resume から別 client が開始した実行中 turn ID を復元する", async () => {
+    const probe = new FakeConnection();
+    const connection = new FakeConnection("thread-running");
+    connection.request = async (method, params) => {
+      connection.requests.push({ method, params });
+      if (method === "thread/resume") {
+        return { thread: { id: "thread-running", turns: [
+          { id: "turn-done", status: "completed", items: [] },
+          { id: "turn-live", status: "inProgress", items: [] },
+        ] } };
+      }
+      return {};
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-running-turn"),
+      connect: async () => probe.closed === 0 ? probe : connection,
+      launch: () => {},
+    });
+
+    const thread = await manager.openThread({ threadId: "thread-running" });
+
+    expect(thread.initialActiveTurnId).toBe("turn-live");
   });
 
   test("未materialize以外のresume失敗は接続を閉じて伝播する", async () => {

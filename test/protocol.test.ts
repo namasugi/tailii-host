@@ -69,6 +69,25 @@ describe("decode 詳細", () => {
     expect(() => decodeControlMessage("not json")).toThrow(ProtocolDecodeError);
   });
 
+  it("preview_open は target 必須、preview_ready は url 必須", () => {
+    expect(() => decodeControlMessage('{"id":"x","type":"preview_open","v":2}')).toThrow(
+      ProtocolDecodeError,
+    );
+    expect(() => decodeControlMessage('{"id":"x","type":"preview_ready","v":2}')).toThrow(
+      ProtocolDecodeError,
+    );
+    const open = decodeControlMessage(
+      '{"id":"x","target":"/tmp/a.html","type":"preview_open","v":2}',
+    );
+    expect(open).toMatchObject({ type: "preview_open", target: "/tmp/a.html" });
+  });
+
+  it("v 欠落の preview 型は破棄される（v0 は承認 2 型のみ）", () => {
+    expect(() => decodeControlMessage('{"id":"x","type":"preview_close"}')).toThrow(
+      ProtocolDecodeError,
+    );
+  });
+
   it("session_start の agentType は codex/claude のみ採用、未知/未指定は undefined", () => {
     const codex = decodeControlMessage(
       '{"type":"session_start","v":1,"id":"x","cwd":"/t","name":"n","agentType":"codex"}',

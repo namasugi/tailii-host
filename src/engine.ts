@@ -45,6 +45,7 @@ import { makeSessionLauncher, claudeInnerCommand, type EngineLauncher } from "./
 import { LineWriter } from "./lineWriter.js";
 import { parsePermissionMode } from "./permissionMode.js";
 import { fetchPlanUsage, type PlanUsageProvider } from "./planUsageFetcher.js";
+import { PreviewServer } from "./previewServer.js";
 import {
   decodeControlMessage,
   PROTOCOL_MAX_SUPPORTED,
@@ -343,6 +344,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
   // Hub ブロードキャストから作る接続ローカル read-model。
   const processingSessions = new Map<string, number>();
   let codexTurnController: CodexTurnControllerRuntime | null = injectedCodexTurnController;
+  let previewServer: PreviewServer | null = null;
 
   try {
     // ---- 1. channel_hello を送出（確立直後）----
@@ -406,9 +408,17 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
       const now = Math.floor(Date.now() / 1000);
       if (message.state === "active") {
         processingSessions.set(message.session, now);
-        return;
+      } else {
+        processingSessions.delete(message.session);
       }
-      processingSessions.delete(message.session);
+      if (message.session === activeChatSession.name) {
+        writer.write({
+          type: "session_processing_state",
+          v: state.negotiatedVersion,
+          session: message.session,
+          active: message.state === "active",
+        });
+      }
     };
 
     if (codexTurnController === null && codexAppServer !== null) {
@@ -533,6 +543,14 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           const response = raw as Extract<HubServerMessage, { type: "hub_state_response" }>;
           if (response.processing) processingSessions.set(session, Math.floor(Date.now() / 1000));
           else processingSessions.delete(session);
+          if (session === activeChatSession.name) {
+            writer.write({
+              type: "session_processing_state",
+              v: state.negotiatedVersion,
+              session,
+              active: response.processing,
+            });
+          }
           resolve(response.pendingQuestion);
         });
         hubLink.send({ type: "hub_state_request", id, session });
@@ -565,6 +583,9 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
       );
     }
 
+    // Web プレビュー: HTML ファイル配信用の loopback 静的サーバー（lazy、open まで待受なし）。
+    previewServer = new PreviewServer();
+
     // ---- 2. 行読み取りループ ----
     engineDiag(`engine readLoop 開始 pid=${process.pid}`);
     const rl = readline.createInterface({ input: options.input, crlfDelay: Number.POSITIVE_INFINITY });
@@ -594,6 +615,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           processingSessions,
           codexAppServer,
           codexTurnController,
+          previewServer,
         });
         if (didProcessMessage && isStaleDist(staleDistGuard)) {
           process.stderr.write("[tailii-host engine] stale dist を検出、再起動のため終了\n");
@@ -610,6 +632,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     lifecycleAbort.abort();
     hubLink.close();
     codexTurnController?.close();
+    await previewServer?.closeAll();
     await Promise.allSettled(background);
   }
 }
@@ -653,6 +676,8 @@ interface HandlerContext {
   codexAppServer: CodexAppServerManager | null;
   /** Codex native turn/approval 接続。 */
   codexTurnController: CodexTurnControllerRuntime | null;
+  /** Web プレビュー用 loopback 静的ファイルサーバー。 */
+  previewServer: PreviewServer;
 }
 
 /**
@@ -1037,11 +1062,20 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
       const resumeSessionId = message.resumeSessionId ?? null;
       if (resumeSessionId !== null && metadataStore !== null) {
         const aliases = await sessionManager.list();
-        const liveAlias = aliases.find((info) => {
+        const liveAliases = aliases.filter((info) => {
           if (!info.alive || info.name === message.name) return false;
           const aliasAgent = info.agent ?? "claude";
           return aliasAgent === sessionAgent && info.providerSessionId === resumeSessionId;
         });
+        let liveAlias: SessionInfo | undefined;
+        for (const candidate of liveAliases) {
+          // Claude の tmux が残っていても pane がシェルだけなら再利用不能。launcher の
+          // --resume 経路へ進める。Codex は App Server 駆動なので tmux TUI の状態に依存しない。
+          if (sessionAgent === "codex" || await sessionManager.agentProcessAlive(candidate.name)) {
+            liveAlias = candidate;
+            break;
+          }
+        }
         if (liveAlias !== undefined) {
           engineDiag(
             `session_start resume alias reuse existing=${liveAlias.name} requested=${message.name} providerSessionId=${resumeSessionId}`,
@@ -1537,6 +1571,30 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
           `[tailii-host engine] dir_create_response 書込失敗: ${String(error)}\n`,
         );
       }
+      break;
+    }
+
+    case "preview_open": {
+      // Web プレビュー: HTML ファイルの loopback 静的配信を開始し、到達 URL を返す。
+      // iOS はこの URL の port へ direct-tcpip トンネルを張って開く。
+      try {
+        const { url } = await ctx.previewServer.open(message.id, message.target);
+        writer.write({ type: "preview_ready", v, id: message.id, url });
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        try {
+          writer.write({ type: "preview_error", v, id: message.id, message: detail });
+        } catch (writeError) {
+          process.stderr.write(
+            `[tailii-host engine] preview_error 書込失敗: ${String(writeError)}\n`,
+          );
+        }
+      }
+      break;
+    }
+
+    case "preview_close": {
+      await ctx.previewServer.close(message.id);
       break;
     }
 

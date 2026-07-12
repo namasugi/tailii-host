@@ -13,7 +13,7 @@ import { CodexAppServerManager, type CodexThreadStartOptions } from "./codexAppS
 import { claudeHookLaunchSettings, removeCodexHookSettings } from "./hookSettings.js";
 import { isInsideBase, standardize, expandTilde } from "./paths.js";
 import { SessionMetadataStore } from "./sessionMetadataStore.js";
-import { DEFAULT_TMUX_PATH } from "./tmux.js";
+import { DEFAULT_TMUX_PATH, paneCommandLooksLikeAgent } from "./tmux.js";
 
 /** tmux 内で起動する既定コマンド（claude TUI）。テストでは無害な値に差し替える。 */
 export const DEFAULT_INNER_COMMAND = "claude";
@@ -419,7 +419,17 @@ export async function launchCore(options: {
   if ((await runTmux(["has-session", "-t", session])).code === 0) {
     const panes = await runTmux(["list-panes", "-t", session, "-F", "#{pane_dead}"]);
     const hasLive = panes.out.split("\n").some((line) => line.trim() === "0");
-    if (!hasLive) {
+    // Claude が終了してシェルだけ残った pane も stale。これを生存扱いすると --resume を
+    // 起動せず、iOS からの会話入力がシェルへ送られて無反応になる。
+    // Codex は App Server がターンを駆動し、rollout 待ち中の TUI が shell に見えるため除外する。
+    let hasAgent = true;
+    if (hasLive && agent === "claude") {
+      const current = await runTmux([
+        "display-message", "-p", "-t", session, "#{pane_current_command}",
+      ]);
+      hasAgent = current.code !== 0 || paneCommandLooksLikeAgent(current.out);
+    }
+    if (!hasLive || !hasAgent) {
       await runTmux(["kill-session", "-t", session]);
     }
   }

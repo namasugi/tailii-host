@@ -189,6 +189,41 @@ describe("launchCore", () => {
     expect(recorded.some((c) => c.args[0] === "kill-session")).toBe(true);
     expect(recorded.some((c) => c.args[0] === "new")).toBe(true);
   });
+
+  test("Claude が終了してシェルだけ残った同名セッションは kill して resume を起動し直す", async () => {
+    const dir = makeTempDir("launch-shell-only");
+    const store = new SessionMetadataStore(makeTempDir("launch-shell-only-store"));
+    let killed = false;
+    const { runner, recorded } = mockRunner((_exe, args) => {
+      if (args[0] === "has-session") return { exitCode: killed ? 1 : 0, stdout: "" };
+      if (args[0] === "list-panes") return { exitCode: 0, stdout: "0\n" };
+      if (args[0] === "display-message" && args[4] === "#{pane_current_command}") {
+        return { exitCode: 0, stdout: "zsh\n" };
+      }
+      if (args[0] === "kill-session") killed = true;
+      return { exitCode: 0, stdout: args[0] === "display-message" ? "%21\n" : "" };
+    });
+
+    const code = await launchCore({
+      dir,
+      session: "shell-only",
+      baseDir: null,
+      binaryPath: "/bin/x",
+      tmuxPath: "/opt/homebrew/bin/tmux",
+      innerCommand: "claude --resume conversation-1",
+      path: "/usr/bin:/bin",
+      store,
+      now: () => 1,
+      errorSink: () => {},
+      runner,
+      claudeJsonPath: path.join(makeTempDir("launch-shell-only-cj"), ".claude.json"),
+      hookGlobalMarkerPath: path.join(dir, "no-such-marker"),
+    });
+
+    expect(code).toBe(0);
+    expect(recorded.some((c) => c.args[0] === "kill-session")).toBe(true);
+    expect(recorded.some((c) => c.args[0] === "new")).toBe(true);
+  });
 });
 
 describe("claudeHookLaunchSettings", () => {

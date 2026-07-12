@@ -220,6 +220,7 @@ export type ControlMessage =
   | { type: "codex_model_list_response"; v: number; id: string; models: CodexModelInfo[] }
   | { type: "codex_turn_start"; v: number; id: string; session: string; text: string; clientUserMessageId?: string; effort?: string; sandbox?: "read-only" | "workspace-write" | "danger-full-access" }
   | { type: "codex_turn_interrupt"; v: number; id: string; session: string }
+  | { type: "session_processing_state"; v: number; session: string; active: boolean }
   | { type: "chat_send"; v: number; id: string; session: string; clientMessageId: string; text: string }
   | { type: "chat_send_result"; v: number; id: string; status: "accepted" | "duplicate" | "failed"; error?: string }
   | { type: "error"; v: number; id?: string; code: string; message: string }
@@ -275,7 +276,11 @@ export type ControlMessage =
   | { type: "dir_create_request"; v: number; id: string; baseDir: string; relative: string }
   | { type: "dir_create_response"; v: number; id: string; path: string; ok: boolean }
   | { type: "session_search_request"; v: number; id: string; query: string; limit?: number }
-  | { type: "session_search_response"; v: number; id: string; results: SessionSearchResult[] };
+  | { type: "session_search_response"; v: number; id: string; results: SessionSearchResult[] }
+  | { type: "preview_open"; v: number; id: string; target: string }
+  | { type: "preview_ready"; v: number; id: string; url: string }
+  | { type: "preview_error"; v: number; id: string; message: string }
+  | { type: "preview_close"; v: number; id: string };
 
 export type ControlMessageType = ControlMessage["type"];
 
@@ -562,6 +567,13 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         type, v,
         id: requireString(raw, "id"),
         session: requireString(raw, "session"),
+      };
+
+    case "session_processing_state":
+      return {
+        type, v,
+        session: requireString(raw, "session"),
+        active: requireBoolean(raw, "active"),
       };
 
     case "chat_send": {
@@ -961,6 +973,33 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
             updatedAt: optionalNumber(obj, "updatedAt"),
           });
         }),
+      };
+
+    case "preview_open":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        target: requireString(raw, "target"),
+      };
+
+    case "preview_ready":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        url: requireString(raw, "url"),
+      };
+
+    case "preview_error":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        message: requireString(raw, "message"),
+      };
+
+    case "preview_close":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
       };
 
     default:

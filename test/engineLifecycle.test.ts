@@ -148,6 +148,38 @@ describe("Engine — アイドルライフサイクル/ページング", () => {
     await engine.teardown();
   });
 
+  test("tmux が生存しても Claude が終了してシェルだけなら resume 再起動する", async () => {
+    const store = makeTempStore();
+    store.put({ name: "shell-only", cwd: "/tmp/shell-only", createdAt: 0,
+      providerSessionId: "conversation-shell" });
+    let killed = false;
+    const runner = new MockTmuxRunner((args) => {
+      if (args[0] === "ls") return ok(killed ? "" : "shell-only\n");
+      if (args[0] === "display-message") return ok("zsh\n");
+      if (args[0] === "kill-session") killed = true;
+      return ok("");
+    });
+    const resumeCalls: string[][] = [];
+    const resume: EngineLauncher = async (cwd, name, _base, resumeSessionId) => {
+      resumeCalls.push([cwd, name, resumeSessionId ?? ""]);
+      return { exitCode: 0, errorText: "" };
+    };
+    const engine = startEngine({
+      sessionManager: new TmuxSessionManager({ runner: runner.runner, store }),
+      metadataStore: store,
+      launcher: resume,
+      resumeLauncher: resume,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"id":"R-shell","name":"shell-only","type":"session_reattach","v":1}');
+    await engine.lines.nextOfType("session_list_response");
+
+    expect(runner.recorded).toContainEqual(["kill-session", "-t", "shell-only"]);
+    expect(resumeCalls).toEqual([["/tmp/shell-only", "shell-only", "conversation-shell"]]);
+    await engine.teardown();
+  });
+
   // MARK: 4. reattach メタあり tmux 不在 → resume 再起動
 
   test("メタあり・tmux 不在の reattach は resume 再起動して attached（4.6）", async () => {

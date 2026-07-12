@@ -20,6 +20,15 @@ export type TmuxCommandRunner = (args: string[]) => Promise<TmuxCommandResult>;
 /** tmux 実行ファイルの既定絶対パス（PATH 外のため絶対指定）。 */
 export const DEFAULT_TMUX_PATH = "/opt/homebrew/bin/tmux";
 
+/** pane_current_command がこの集合なら、Claude 本体は終了してシェルだけが残っている。 */
+const SHELL_COMMANDS = new Set(["zsh", "bash", "sh", "dash", "fish", "tcsh", "csh", "ksh", "login"]);
+
+/** tmux の pane_current_command がエージェント実行中に見えるか。空文字は判定不能なので安全側。 */
+export function paneCommandLooksLikeAgent(command: string): boolean {
+  const normalized = command.trim().toLowerCase();
+  return normalized.length === 0 || !SHELL_COMMANDS.has(normalized);
+}
+
 export interface CapturePaneOptions {
   /** 取得する末尾行数。未指定なら manager 既定値。 */
   lines?: number;
@@ -133,9 +142,34 @@ export class TmuxSessionManager {
         },
       };
     }
+    // Claude が終了してシェルだけ残った tmux は、存在していても入力先としては無効。
+    // stale session を消して notFound と同じ再開経路へ流し、engine に --resume 起動させる。
+    // Codex のターンは App Server が駆動し、TUI が shell command に見える待機期間もあるため除外する。
+    if ((this.store.get(name)?.agent ?? "claude") === "claude" && !(await this.agentProcessAlive(name))) {
+      await this.kill(name);
+      return {
+        kind: "notFound",
+        error: {
+          type: "error",
+          v: this.protocolVersion,
+          code: "session_not_found",
+          message: `セッション '${name}' のエージェントを再起動します。`,
+        },
+      };
+    }
     const cwd = this.store.get(name)?.cwd ?? "";
     const recent = await this.capturePane(name);
     return { kind: "attached", info: { name, cwd, alive: true }, recentOutput: recent };
+  }
+
+  /** pane 内のエージェント生存判定。tmux エラーや空出力は二重起動を避けて true に倒す。 */
+  async agentProcessAlive(name: string): Promise<boolean> {
+    validateSessionName(name);
+    const result = await this.runner([
+      "display-message", "-p", "-t", this.paneTarget(name), "#{pane_current_command}",
+    ]);
+    if (result.exitCode !== 0) return true;
+    return paneCommandLooksLikeAgent(result.stdout);
   }
 
   /** 指定セッションのみを終了する（tmux kill-session -t <name>）。 */

@@ -28,7 +28,7 @@ export class ChatTailController {
   private readonly tailer: TranscriptTailer;
   private readonly subagentTailer: SubagentTailer;
   private readonly projectsRoot: string;
-  /** チャット添付（user 発話の `@"path"`）のサムネ発行に使う。null なら発行しない。 */
+  /** チャット添付（user 発話の `@"path"` / Tailii upload path）のサムネ発行に使う。 */
   private readonly imageService: ImageService | null;
   /** subagent_node の送出可否を判断する negotiated protocol version。 */
   private readonly protocolVersion: () => number;
@@ -153,7 +153,8 @@ export class ChatTailController {
           if (count <= 3 || count % 25 === 0) ChatTailController.diag(`emit chat_output #${count}`);
           try {
             writer.write(message);
-            // user 発話中の添付画像（@"path"）はサムネ（image_available）を後続で発行し、
+            // user 発話中の添付画像（@"path" / Tailii upload path）は
+            // サムネ（image_available）を後続で発行し、
             // iOS にインライン表示させる（chat-attachments）。id は決定的（att-<streamId>-<n>）。
             if (imageService !== null && message.type === "chat_output" && message.role === "user") {
               const paths = ChatTailController.attachmentImagePaths(message.text);
@@ -277,15 +278,23 @@ export class ChatTailController {
 
   /**
    * user 発話テキストから添付「画像」ファイルの絶対パスを抽出する（chat-attachments, TESTABLE）。
-   * `@"/path with space.png"`（引用形式）と `@/path/to/file.png`（非引用）の両方を対象にする。
+   * `@"/path with space.png"`（引用形式）、`@/path/to/file.png`（非引用）に加え、
+   * iOS の添付チップが本文へ合成する裸の `~/.tailii/uploads/<name>` も対象にする。
+   * 裸パスは Tailii 管理配下に限定し、通常本文の任意の画像パスを添付と誤認しない。
    */
   static attachmentImagePaths(text: string): string[] {
-    if (!text.includes("@")) return [];
     const paths: string[] = [];
     for (const match of text.matchAll(/@"(\/[^"]+)"/g)) {
       if (match[1] !== undefined) paths.push(match[1]);
     }
     for (const match of text.matchAll(/@(\/[^\s"]+)/g)) {
+      if (match[1] !== undefined) paths.push(match[1]);
+    }
+    // MessageInputBar.composeOutgoing は upload 済みパスを @ なしで本文先頭へ置く。
+    // ファイル名は iOS 側で安全な文字へ正規化済みなので、空白/引用符を境界に抽出できる。
+    for (const match of text.matchAll(
+      /(?:^|[\s"])(\/(?:[^\s"]*\/)?\.tailii\/uploads\/[^\s"]+)/g,
+    )) {
       if (match[1] !== undefined) paths.push(match[1]);
     }
     const seen = new Set<string>();
