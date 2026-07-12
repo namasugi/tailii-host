@@ -494,6 +494,44 @@ describe("Engine — アイドルライフサイクル/ページング", () => {
     await engine.teardown();
   });
 
+  test("mode_set は BTab 後の再描画中を default と誤認せず明示マーカーまで待つ", async () => {
+    const panes = [
+      "⏸ manual mode on · ? for shortcuts\n",
+      "画面を再描画中\n",
+      "⏵⏵ accept edits on (shift+tab to cycle)\n",
+      "Puttering…\n… · esc to interrupt · ← for agents\n",
+      "⏸ plan mode on (shift+tab to cycle)\n",
+      "画面を再描画中\n",
+      "⏵⏵ auto mode on (shift+tab to cycle)\n",
+    ];
+    let captureCount = 0;
+    const runner = new MockTmuxRunner((args) => {
+      if (args[0] === "capture-pane") {
+        const pane = panes[Math.min(captureCount, panes.length - 1)]!;
+        captureCount += 1;
+        return ok(pane);
+      }
+      return ok("");
+    });
+    const mgr = new TmuxSessionManager({ runner: runner.runner, store: makeTempStore() });
+    const engine = startEngine({
+      sessionManager: mgr,
+      modeTiming: { setChangePollMs: 1, setChangeTimeoutMs: 30 },
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"id":"M2-redraw","mode":"auto","session":"work","type":"mode_set","v":1}');
+    const resp = await engine.lines.nextOfType("mode_set_response");
+    expect(resp).toContain('"id":"M2-redraw"');
+    expect(resp).toContain('"mode":"auto"');
+    const btabCount = runner.recorded.filter(
+      (cmd) => JSON.stringify(cmd) === JSON.stringify(["send-keys", "-t", "work", "BTab"]),
+    ).length;
+    expect(btabCount).toBe(3);
+
+    await engine.teardown();
+  });
+
   test("mode_set はダイアログが閉じてマーカーが出るまで待って成功する", async () => {
     const panes = [
       "Enter to confirm · Esc to cancel\n",

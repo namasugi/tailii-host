@@ -1474,18 +1474,16 @@ async function setPermissionMode(
     let changed = false;
     while (Date.now() <= changeDeadline) {
       const next = parsePermissionMode(await sessionManager.capturePane(session));
-      if (next === null) {
-        current = null;
-        break;
-      }
-      if (next !== before) {
+      // BTab 直後はステータス行が一瞬消える。判定不能を失敗や default とせず、
+      // 明示的な次モードが描画されるまで待つ。
+      if (next !== null && next !== before) {
         current = next;
         changed = true;
         break;
       }
       await sleep(timing.setChangePollMs);
     }
-    if (current === null || !changed) break;
+    if (!changed) break;
   }
   return { kind: "ok", mode: current };
 }

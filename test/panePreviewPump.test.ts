@@ -95,6 +95,15 @@ describe("PanePreviewPump", () => {
     await vi.advanceTimersByTimeAsync(10);
     expect(modes).toEqual(["auto", "acceptEdits"]);
 
+    // 処理中・再描画中も mode 行が消えるが、default へ戻したとは通知しない。
+    paneText = "Puttering…\n… · esc to interrupt · ← for agents";
+    await vi.advanceTimersByTimeAsync(10);
+    expect(modes).toEqual(["auto", "acceptEdits"]);
+
+    paneText = "body\n⏸ manual mode on · ? for shortcuts";
+    await vi.advanceTimersByTimeAsync(10);
+    expect(modes).toEqual(["auto", "acceptEdits", "default"]);
+
     pump.stop();
   });
 

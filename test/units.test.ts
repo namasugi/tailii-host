@@ -55,8 +55,10 @@ describe("parsePermissionMode", () => {
     expect(parsePermissionMode("本文\n⏵⏵ accept edits on (shift+tab to cycle)")).toBe("acceptEdits");
     expect(parsePermissionMode("本文\n⏸ plan mode on (shift+tab to cycle)")).toBe("plan");
     expect(parsePermissionMode("本文\n⏵⏵ auto mode on (shift+tab to cycle)")).toBe("auto");
+    expect(parsePermissionMode("本文\n⏸ manual mode on · ? for shortcuts")).toBe("default");
     expect(parsePermissionMode("本文\n? for shortcuts")).toBe("default");
-    expect(parsePermissionMode("処理中\n...· esc to interrupt · ← for agents")).toBe("default");
+    expect(parsePermissionMode("処理中\n...· esc to interrupt · ← for agents")).toBeNull();
+    expect(parsePermissionMode("本文だけでステータス行がまだ無い")).toBeNull();
   });
 
   test("会話本文に同じ語があっても末尾4行しか見ない", () => {
