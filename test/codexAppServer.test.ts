@@ -286,6 +286,51 @@ describe("CodexAppServerManager", () => {
     expect(connection.closed).toBe(1);
   });
 
+  test("未materialize threadはresume失敗後も同じ接続から最初のturnを開始する", async () => {
+    const probe = new FakeConnection();
+    const connection = new FakeConnection("thread-fresh");
+    connection.request = async (method, params) => {
+      connection.requests.push({ method, params });
+      if (method === "thread/resume") {
+        throw new Error("no rollout found for thread id thread-fresh");
+      }
+      if (method === "turn/start") return { turn: { id: "turn-first" } };
+      return {};
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-unmaterialized"),
+      connect: async () => probe.closed === 0 ? probe : connection,
+      launch: () => {},
+    });
+
+    const thread = await manager.openThread({ threadId: "thread-fresh" });
+    expect(thread.initialItems).toEqual([]);
+    await expect(thread.startTurn("first", "client-first")).resolves.toBe("turn-first");
+    expect(connection.requests.map((request) => request.method)).toEqual([
+      "thread/resume",
+      "turn/start",
+    ]);
+    expect(connection.closed).toBe(0);
+  });
+
+  test("未materialize以外のresume失敗は接続を閉じて伝播する", async () => {
+    const probe = new FakeConnection();
+    const connection = new FakeConnection("thread-missing");
+    connection.request = async (method, params) => {
+      connection.requests.push({ method, params });
+      throw new Error("thread not found");
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-missing"),
+      connect: async () => probe.closed === 0 ? probe : connection,
+      launch: () => {},
+    });
+
+    await expect(manager.openThread({ threadId: "thread-missing" }))
+      .rejects.toThrow("thread not found");
+    expect(connection.closed).toBe(1);
+  });
+
   test("model/list をページングし、APIキャッシュのモデル別実効contextを結合する", async () => {
     const home = makeTempDir("codex-model-list");
     fs.writeFileSync(path.join(home, "models_cache.json"), JSON.stringify({

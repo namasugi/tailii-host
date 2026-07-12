@@ -519,14 +519,23 @@ export class CodexAppServerManager {
       let initialItems: Record<string, unknown>[] = [];
       if (bootstrap === null) {
         await connection.initialize();
-        const response = await connection.request("thread/resume", {
-          threadId: options.threadId,
-          approvalPolicy: "on-request",
-          approvalsReviewer: "user",
-          // Hub の rollout backfill と live 通知の厳密な境界に履歴 item ID を使う。
-          excludeTurns: false,
-        });
-        initialItems = extractThreadItems(response);
+        try {
+          const response = await connection.request("thread/resume", {
+            threadId: options.threadId,
+            approvalPolicy: "on-request",
+            approvalsReviewer: "user",
+            // Hub の rollout backfill と live 通知の厳密な境界に履歴 item ID を使う。
+            excludeTurns: false,
+          });
+          initialItems = extractThreadItems(response);
+        } catch (error) {
+          // thread/start から最初の user turn まで rollout は未作成で、別接続からの
+          // thread/resume は "no rollout found" になる。ただし共有 App Server 内の
+          // live thread 自体は存在し、この接続から turn/start を直接送れば materialize
+          // できる。engine と Session Hub は別プロセスなので、この場合だけ履歴ゼロとして
+          // 接続を維持し、最初の turn/start へ進ませる。
+          if (!isUnmaterializedThreadError(error, options.threadId)) throw error;
+        }
       }
       return new CodexAppServerThread(options.threadId, initialItems, connection);
     } catch (error) {
@@ -574,6 +583,11 @@ export class CodexAppServerManager {
     }
     return null;
   }
+}
+
+function isUnmaterializedThreadError(error: unknown, threadId: string): boolean {
+  return error instanceof Error &&
+    error.message === `no rollout found for thread id ${threadId}`;
 }
 
 function extractThreadItems(response: unknown): Record<string, unknown>[] {
