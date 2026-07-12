@@ -31,6 +31,13 @@ describe("golden roundtrip", () => {
     }
   });
 
+  it("git/file browser v1 golden 全行が byte-exact でラウンドトリップする", () => {
+    for (const line of goldenLines("git-file-browser-v1.ndjson")) {
+      const decoded = decodeControlMessage(line);
+      expect(encodeControlMessage(decoded)).toBe(line);
+    }
+  });
+
   it("v2 golden 全行が byte-exact でラウンドトリップする", () => {
     for (const line of goldenLines("approval-protocol-v2.ndjson")) {
       const decoded = decodeControlMessage(line);

@@ -31,9 +31,11 @@ export function connectHubSocket(options: {
     send(message) {
       if (socket?.writable === true) socket.write(encodeHubMessage(message));
       // chat_send は RPC timeout 後に engine が fail-open 注入するため、再接続 queue へ
-      // 残すと hub 復旧後に遅延配送され二重注入になる。
+      // 残すと hub 復旧後に遅延配送され二重注入になる。全文 pull も timeout 後の応答は
+      // 使われず、表示中ポーリングで再要求されるため stale な要求を溜めない。
       else if (message.type !== "conversation_subscribe" && message.type !== "hub_hello" &&
-        message.type !== "chat_send") queued.push(message);
+        message.type !== "chat_send" &&
+        message.type !== "conversation_subagent_transcript_request") queued.push(message);
     },
     close() {
       closed = true;

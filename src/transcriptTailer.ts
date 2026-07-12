@@ -379,13 +379,22 @@ export function extractTurn(line: string): Turn | null {
   // AskUserQuestion の回答行は text ブロックではなく tool_result +
   // top-level toolUseResult.answers に記録される。通常の tool_result は会話ログへ
   // 流さず、設問と回答の構造を持つ行だけ user バブル用の要約へ変換する。
-  const text = plainText || extractQuestionAnswerText(rec["toolUseResult"]);
+  // Claude Code はスキル実行時、<command-name> 行の直後に展開済み SKILL.md 全文を
+  // user の text ブロックとして transcript へ注入する。これはユーザー発話ではなく
+  // エージェント内部コンテキストなので、会話画面へ転送しない。
+  const visiblePlainText = isExpandedSkillPrompt(role, plainText) ? "" : plainText;
+  const text = visiblePlainText || extractQuestionAnswerText(rec["toolUseResult"]);
   const toolActivities = extractToolActivities(rawContent);
   const questionPrompts = extractQuestionPrompts(rawContent, id);
   const toolResultIds = extractToolResultIds(rawContent);
   const model = typeof message?.["model"] === "string" ? (message["model"] as string) : null;
   const contextTokens = role === "assistant" ? extractContextTokens(message?.["usage"]) : null;
   return { id, role, text, toolActivities, questionPrompts, toolResultIds, model, contextTokens };
+}
+
+/** Claude Code が user ターンへ注入した展開済みスキル本文か。 */
+function isExpandedSkillPrompt(role: ChatRole, text: string): boolean {
+  return role === "user" && text.trimStart().startsWith("Base directory for this skill:");
 }
 
 /** usage から現在コンテキスト相当のトークン数を合算する（未知フィールドは 0 扱い）。 */

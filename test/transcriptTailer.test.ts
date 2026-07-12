@@ -64,6 +64,58 @@ describe("TranscriptTailer", () => {
     ]);
   });
 
+  test("スキル実行時に注入される展開済み SKILL.md 本文は会話へ流さない", async () => {
+    const p = writeTranscript([
+      JSON.stringify({
+        type: "user",
+        message: {
+          role: "user",
+          content: "<command-message>example</command-message>\n<command-name>/example</command-name>",
+        },
+        uuid: "command",
+      }),
+      JSON.stringify({
+        type: "user",
+        message: {
+          role: "user",
+          content: [{
+            type: "text",
+            text: "Base directory for this skill: /tmp/example\n\n# Example\n\n非表示のスキル本文",
+          }],
+        },
+        uuid: "expanded-skill",
+      }),
+      JSON.stringify({
+        type: "user",
+        message: { role: "user", content: "通常のユーザー発話" },
+        uuid: "normal-user",
+      }),
+    ]);
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
+    const chats = (await collect(tailer.streamTranscript(p))).filter(
+      (message) => message.type === "chat_output",
+    );
+
+    expect(chats).toEqual([
+      {
+        type: "chat_output",
+        v: 1,
+        streamId: "command",
+        role: "user",
+        text: "<command-message>example</command-message>\n<command-name>/example</command-name>",
+        eof: true,
+      },
+      {
+        type: "chat_output",
+        v: 1,
+        streamId: "normal-user",
+        role: "user",
+        text: "通常のユーザー発話",
+        eof: true,
+      },
+    ]);
+  });
+
   test("ターン処理中に送信された queued_command attachment を user ターンとして流す", async () => {
     const p = writeTranscript([
       '{"type":"queue-operation","operation":"enqueue","content":"あとで"}',

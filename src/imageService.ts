@@ -23,6 +23,8 @@ export interface ThumbnailResult {
    * 形式を自動判定するため、どちらでも復号できる。
    */
   thumbnailBase64: string;
+  /** 実際に生成したサムネ形式。旧注入実装との互換のため省略可。 */
+  imageFormat?: "heic" | "png";
   width: number;
   height: number;
 }
@@ -34,7 +36,7 @@ export type Thumbnailer = (imagePath: string, maxPixelSize: number) => Promise<T
 const FETCH_CHUNK_SIZE = 32 * 1024;
 
 /** 画像として扱う拡張子集合（小文字・ドットなし）。 */
-const IMAGE_EXTENSIONS = new Set([
+export const IMAGE_EXTENSIONS = new Set([
   "png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "tiff", "tif",
 ]);
 
@@ -78,7 +80,9 @@ export function sipsThumbnailer(sipsPath = "/usr/bin/sips"): Thumbnailer {
     // アルファ保持）。sips が HEIC を書けない環境（write 非対応）では PNG へフォールバックする。
     // （macOS の sips は WebP を read 専用で write 不可のため HEIC を採用。）
     // 一時ファイルの拡張子は sips が出力フォーマット判定に使うため format と一致させる。
-    const attempt = async (format: "heic" | "png"): Promise<string | null> => {
+    const attempt = async (
+      format: "heic" | "png",
+    ): Promise<{ base64: string; format: "heic" | "png" } | null> => {
       const tmp = path.join(
         os.tmpdir(),
         `tailii-thumb-${process.pid}-${Math.random().toString(36).slice(2)}.${format}`,
@@ -91,7 +95,7 @@ export function sipsThumbnailer(sipsPath = "/usr/bin/sips"): Thumbnailer {
           "--out", tmp,
         ]);
         if (convert.code !== 0) return null;
-        return fs.readFileSync(tmp).toString("base64");
+        return { base64: fs.readFileSync(tmp).toString("base64"), format };
       } catch {
         return null;
       } finally {
@@ -103,9 +107,14 @@ export function sipsThumbnailer(sipsPath = "/usr/bin/sips"): Thumbnailer {
       }
     };
 
-    const base64 = (await attempt("heic")) ?? (await attempt("png"));
-    if (base64 === null) return null;
-    return { thumbnailBase64: base64, width, height };
+    const converted = (await attempt("heic")) ?? (await attempt("png"));
+    if (converted === null) return null;
+    return {
+      thumbnailBase64: converted.base64,
+      imageFormat: converted.format,
+      width,
+      height,
+    };
   };
 }
 

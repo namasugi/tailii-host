@@ -12,6 +12,10 @@ import type { LineWriter } from "./lineWriter.js";
 import type { ImageService } from "./imageService.js";
 import { TranscriptTailer } from "./transcriptTailer.js";
 import { SubagentTailer } from "./subagentTailer.js";
+import {
+  readSubagentTranscript,
+  type SubagentTranscriptResult,
+} from "./subagentTranscript.js";
 import { CodexRolloutTailer } from "./codexRolloutTailer.js";
 import { canonicalPath } from "./paths.js";
 
@@ -70,6 +74,11 @@ export class ChatTailController {
   /** 全文取得要求向けに、現在の subagent transcript パスを解決する。 */
   subagentTranscriptPath(nodeId: string): string | null {
     return this.subagentTailer.jsonlPath(nodeId);
+  }
+
+  /** Hub からのオンデマンド要求に、現在 tail 中のノード全文を返す。 */
+  subagentTranscript(nodeId: string): SubagentTranscriptResult {
+    return readSubagentTranscript(this.subagentTranscriptPath(nodeId));
   }
 
   /**

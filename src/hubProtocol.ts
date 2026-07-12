@@ -8,6 +8,7 @@ export type HubClientMessage =
   | { type: "hub_hello" }
   | { type: "conversation_subscribe"; session: string; afterSeq?: number; newerThanMs?: number; preview?: boolean }
   | { type: "conversation_unsubscribe"; session: string }
+  | { type: "conversation_subagent_transcript_request"; id: string; session: string; nodeId: string }
   | { type: "hub_state_request"; id: string; session: string }
   | { type: "presence_request"; id: string; session: string }
   | { type: "question_answer_submit"; id: string; session: string; questionId: string; answers: QuestionAnswer[] }
@@ -40,6 +41,12 @@ export type HubServerMessage =
     }
   | { type: "presence_response"; id: string; session: string; subscriberCount: number }
   | { type: "conversation_event"; session: string; serverSeq: number; payload: ControlMessage }
+  | {
+      type: "conversation_subagent_transcript_response";
+      id: string;
+      session: string;
+      payload: Extract<ControlMessage, { type: "subagent_transcript_response" }>;
+    }
   | { type: "conversation_pane_preview"; session: string; payload: ControlMessage }
   | { type: "conversation_mode"; session: string; payload: ControlMessage }
   | { type: "question_answer_result"; id: string; status: "accepted" | "already_resolved" | "unknown" }
@@ -73,6 +80,16 @@ export function decodeHubClientLine(line: string): HubClientMessage | null {
   if (record["type"] === "conversation_unsubscribe") {
     const session = record["session"];
     return typeof session === "string" && session.length > 0 ? { type: "conversation_unsubscribe", session } : null;
+  }
+  if (record["type"] === "conversation_subagent_transcript_request") {
+    const id = record["id"];
+    const session = record["session"];
+    const nodeId = record["nodeId"];
+    return typeof id === "string" && id.length > 0 &&
+      typeof session === "string" && session.length > 0 &&
+      typeof nodeId === "string" && nodeId.length > 0
+      ? { type: "conversation_subagent_transcript_request", id, session, nodeId }
+      : null;
   }
   if (record["type"] === "hub_state_request") {
     const id = record["id"];
@@ -194,6 +211,17 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
     const id = record["id"], status = record["status"];
     return typeof id === "string" && (status === "granted" || status === "held")
       ? { type: "runtime_claim_result", id, status } : null;
+  }
+  if (record["type"] === "conversation_subagent_transcript_response") {
+    const id = record["id"];
+    const session = record["session"];
+    if (typeof id !== "string" || id.length === 0 ||
+      typeof session !== "string" || session.length === 0) return null;
+    let payload: ControlMessage;
+    try { payload = decodeControlMessage(JSON.stringify(record["payload"])); } catch { return null; }
+    return payload.type === "subagent_transcript_response" && payload.id === id
+      ? { type: record["type"], id, session, payload }
+      : null;
   }
   if (record["type"] === "conversation_event" || record["type"] === "conversation_pane_preview" ||
     record["type"] === "conversation_mode") {

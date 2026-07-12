@@ -115,6 +115,44 @@ export interface SlashCommandInfo {
   summary: string;
 }
 
+/** file_list_response の 1 エントリ。 */
+export interface FileEntry {
+  name: string;
+  kind: "dir" | "file" | "symlink";
+  size: number;
+  mtimeMs: number;
+}
+
+/** file_read_response のサービス内部表現。 */
+export interface FileReadResult {
+  path: string;
+  kind: "text" | "image" | "binary" | "tooLarge" | "error";
+  size: number;
+  mtimeMs: number;
+  content?: string;
+  truncated?: boolean;
+  imageBase64?: string;
+  imageFormat?: string;
+  error?: string;
+}
+
+/** git_status_response の変更ファイル 1 件。 */
+export interface GitStatusFile {
+  path: string;
+  indexStatus: string;
+  worktreeStatus: string;
+  renamedFrom: string | null;
+}
+
+/** git_log_response のコミット 1 件。 */
+export interface GitCommitInfo {
+  hash: string;
+  shortHash: string;
+  subject: string;
+  authorName: string;
+  dateMs: number;
+}
+
 /** Codex App Server `model/list` を iOS のモデル選択へ渡すための 1 要素。 */
 export interface CodexModelInfo {
   id: string;
@@ -218,6 +256,20 @@ export type ControlMessage =
   | { type: "dir_list_response"; v: number; id: string; entries: string[] }
   | { type: "browse_request"; v: number; id: string; path: string }
   | { type: "browse_response"; v: number; id: string; path: string; entries: string[] }
+  | { type: "file_list_request"; v: number; id: string; path: string }
+  | { type: "file_list_response"; v: number; id: string; path: string; entries: FileEntry[]; truncated: boolean }
+  | { type: "file_read_request"; v: number; id: string; path: string }
+  | ({ type: "file_read_response"; v: number; id: string } & FileReadResult)
+  | { type: "git_status_request"; v: number; id: string; path: string }
+  | { type: "git_status_response"; v: number; id: string; isRepo: boolean; branch: string; upstream: string | null; ahead: number; behind: number; files: GitStatusFile[] }
+  | { type: "git_diff_request"; v: number; id: string; path: string; file?: string; staged?: boolean; commit?: string | null }
+  | { type: "git_diff_response"; v: number; id: string; isRepo: boolean; diff: string; truncated: boolean }
+  | { type: "git_log_request"; v: number; id: string; path: string; limit?: number }
+  | { type: "git_log_response"; v: number; id: string; isRepo: boolean; commits: GitCommitInfo[] }
+  | { type: "git_stage_request"; v: number; id: string; path: string; files: string[]; unstage?: boolean }
+  | { type: "git_stage_response"; v: number; id: string; ok: boolean; error: string | null }
+  | { type: "git_commit_request"; v: number; id: string; path: string; message: string }
+  | { type: "git_commit_response"; v: number; id: string; ok: boolean; hash: string | null; error: string | null }
   | { type: "claude_session_list_request"; v: number; id: string }
   | { type: "claude_session_list_response"; v: number; id: string; claudeSessions: ClaudeSessionInfo[] }
   | { type: "dir_create_request"; v: number; id: string; baseDir: string; relative: string }
@@ -737,6 +789,118 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         id: requireString(raw, "id"),
         path: requireString(raw, "path"),
         entries: requireStringArray(raw, "entries"),
+      };
+
+    case "file_list_request":
+    case "file_read_request":
+    case "git_status_request":
+      return { type, v, id: requireString(raw, "id"), path: requireString(raw, "path") };
+
+    case "file_list_response":
+      return {
+        type, v,
+        id: requireString(raw, "id"), path: requireString(raw, "path"),
+        entries: requireArray(raw, "entries").map((element): FileEntry => {
+          const entry = requireObject(element, "entries");
+          const kind = requireString(entry, "kind");
+          if (kind !== "dir" && kind !== "file" && kind !== "symlink") {
+            throw new ProtocolDecodeError("missing-field", "entries.kind");
+          }
+          return {
+            name: requireString(entry, "name"), kind,
+            size: requireNumber(entry, "size"), mtimeMs: requireNumber(entry, "mtimeMs"),
+          };
+        }),
+        truncated: requireBoolean(raw, "truncated"),
+      };
+
+    case "file_read_response": {
+      const kind = requireString(raw, "kind");
+      if (kind !== "text" && kind !== "image" && kind !== "binary" &&
+        kind !== "tooLarge" && kind !== "error") {
+        throw new ProtocolDecodeError("missing-field", "kind");
+      }
+      return compact({
+        type, v,
+        id: requireString(raw, "id"), path: requireString(raw, "path"), kind,
+        size: requireNumber(raw, "size"), mtimeMs: requireNumber(raw, "mtimeMs"),
+        content: optionalString(raw, "content"), truncated: optionalBoolean(raw, "truncated"),
+        imageBase64: optionalString(raw, "imageBase64"), imageFormat: optionalString(raw, "imageFormat"),
+        error: optionalString(raw, "error"),
+      });
+    }
+
+    case "git_status_response":
+      return {
+        type, v,
+        id: requireString(raw, "id"), isRepo: requireBoolean(raw, "isRepo"),
+        branch: requireString(raw, "branch"), upstream: optionalNullableString(raw, "upstream") ?? null,
+        ahead: requireNumber(raw, "ahead"), behind: requireNumber(raw, "behind"),
+        files: requireArray(raw, "files").map((element): GitStatusFile => {
+          const file = requireObject(element, "files");
+          return {
+            path: requireString(file, "path"), indexStatus: requireString(file, "indexStatus"),
+            worktreeStatus: requireString(file, "worktreeStatus"),
+            renamedFrom: optionalNullableString(file, "renamedFrom") ?? null,
+          };
+        }),
+      };
+
+    case "git_diff_request":
+      return compact({
+        type, v, id: requireString(raw, "id"), path: requireString(raw, "path"),
+        file: optionalString(raw, "file"), staged: optionalBoolean(raw, "staged"),
+        commit: optionalNullableString(raw, "commit"),
+      });
+
+    case "git_diff_response":
+      return {
+        type, v, id: requireString(raw, "id"), isRepo: requireBoolean(raw, "isRepo"),
+        diff: requireString(raw, "diff"), truncated: requireBoolean(raw, "truncated"),
+      };
+
+    case "git_log_request":
+      return compact({
+        type, v, id: requireString(raw, "id"), path: requireString(raw, "path"),
+        limit: optionalNumber(raw, "limit"),
+      });
+
+    case "git_log_response":
+      return {
+        type, v, id: requireString(raw, "id"), isRepo: requireBoolean(raw, "isRepo"),
+        commits: requireArray(raw, "commits").map((element): GitCommitInfo => {
+          const commit = requireObject(element, "commits");
+          return {
+            hash: requireString(commit, "hash"), shortHash: requireString(commit, "shortHash"),
+            subject: requireString(commit, "subject"), authorName: requireString(commit, "authorName"),
+            dateMs: requireNumber(commit, "dateMs"),
+          };
+        }),
+      };
+
+    case "git_stage_request":
+      return compact({
+        type, v, id: requireString(raw, "id"), path: requireString(raw, "path"),
+        files: requireStringArray(raw, "files"), unstage: optionalBoolean(raw, "unstage"),
+      });
+
+    case "git_stage_response":
+      return {
+        type, v, id: requireString(raw, "id"), ok: requireBoolean(raw, "ok"),
+        error: optionalNullableString(raw, "error") ?? null,
+      };
+
+    case "git_commit_request":
+      return {
+        type, v, id: requireString(raw, "id"), path: requireString(raw, "path"),
+        message: requireString(raw, "message"),
+      };
+
+    case "git_commit_response":
+      return {
+        type, v, id: requireString(raw, "id"), ok: requireBoolean(raw, "ok"),
+        hash: optionalNullableString(raw, "hash") ?? null,
+        error: optionalNullableString(raw, "error") ?? null,
       };
 
     case "claude_session_list_response":

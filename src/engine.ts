@@ -38,9 +38,10 @@ import { ensureHubDaemon } from "./hubDaemon.js";
 import { connectHubSocket, type HubLink } from "./hubClient.js";
 import type { HubClientMessage, HubServerMessage } from "./hubProtocol.js";
 import { ImageService } from "./imageService.js";
+import { fileList, fileRead } from "./fileService.js";
+import { gitCommit, gitDiff, gitLog, gitStage, gitStatus } from "./gitService.js";
 import type { QuestionEventMessage, SessionProcessingMessage } from "./engineRelaySocket.js";
 import { makeSessionLauncher, claudeInnerCommand, type EngineLauncher } from "./launch.js";
-import { readSubagentTranscript } from "./subagentTranscript.js";
 import { LineWriter } from "./lineWriter.js";
 import { parsePermissionMode } from "./permissionMode.js";
 import { fetchPlanUsage, type PlanUsageProvider } from "./planUsageFetcher.js";
@@ -486,7 +487,8 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
       if (message.type === "hub_state_response" || message.type === "question_answer_result" ||
         message.type === "input_claim_result" || message.type === "runtime_claim_result" ||
         message.type === "codex_turn_result" || message.type === "chat_send_result" ||
-        message.type === "presence_response") {
+        message.type === "presence_response" ||
+        message.type === "conversation_subagent_transcript_response") {
         rpcWaiters.get(message.id)?.(message);
         rpcWaiters.delete(message.id);
       } else if (message.type === "session_processing") handleSessionProcessing(message);
@@ -1321,12 +1323,36 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
     }
 
     case "subagent_transcript_request": {
-      const result = readSubagentTranscript(null);
+      const session = ctx.activeChatSession.name;
+      let result: Extract<ControlMessage, { type: "subagent_transcript_response" }> = {
+        type: "subagent_transcript_response",
+        v: PROTOCOL_V2,
+        id: message.id,
+        nodeId: message.nodeId,
+        entries: [],
+        omitted: 0,
+      };
+      if (session !== null) {
+        try {
+          const response = await ctx.hubRpc<Extract<HubServerMessage, {
+            type: "conversation_subagent_transcript_response";
+          }>>(
+            {
+              type: "conversation_subagent_transcript_request",
+              id: message.id,
+              session,
+              nodeId: message.nodeId,
+            },
+            message.id,
+            1_500,
+          );
+          result = response.payload;
+        } catch {
+          // Hub 不達・対象 tail 不在は空応答にして、iOS の 10 秒待ちを発生させない。
+        }
+      }
       try {
-        writer.write({
-          type: "subagent_transcript_response", v: PROTOCOL_V2, id: message.id, nodeId: message.nodeId,
-          entries: result.entries, omitted: result.omitted,
-        });
+        writer.write(result);
       } catch (error) {
         process.stderr.write(`[tailii-host engine] subagent_transcript_response 書込失敗: ${String(error)}\n`);
       }
@@ -1358,6 +1384,92 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
         process.stderr.write(
           `[tailii-host engine] browse_response 書込失敗: ${String(error)}\n`,
         );
+      }
+      break;
+    }
+
+    case "file_list_request": {
+      engineDiag(`file_list_request id=${message.id} path=${message.path}`);
+      try {
+        const response = fileList(message.path);
+        writer.write({ type: "file_list_response", v, id: message.id, ...response });
+      } catch (error) {
+        process.stderr.write(`[tailii-host engine] file_list_response 書込失敗: ${String(error)}\n`);
+      }
+      break;
+    }
+
+    case "file_read_request": {
+      engineDiag(`file_read_request id=${message.id} path=${message.path}`);
+      try {
+        const response = await fileRead(message.path);
+        writer.write({ type: "file_read_response", v, id: message.id, ...response });
+      } catch (error) {
+        writer.write({
+          type: "file_read_response", v, id: message.id, path: message.path,
+          kind: "error", size: 0, mtimeMs: 0, error: String(error),
+        });
+      }
+      break;
+    }
+
+    case "git_status_request": {
+      engineDiag(`git_status_request id=${message.id} path=${message.path}`);
+      try {
+        writer.write({ type: "git_status_response", v, id: message.id, ...await gitStatus(message.path) });
+      } catch (error) {
+        engineDiag(`git_status_response 失敗 id=${message.id}: ${String(error)}`);
+        writer.write({
+          type: "git_status_response", v, id: message.id, isRepo: false,
+          branch: "", upstream: null, ahead: 0, behind: 0, files: [],
+        });
+      }
+      break;
+    }
+
+    case "git_diff_request": {
+      try {
+        const response = await gitDiff(message.path, {
+          file: message.file, staged: message.staged, commit: message.commit,
+        });
+        writer.write({ type: "git_diff_response", v, id: message.id, ...response });
+      } catch (error) {
+        engineDiag(`git_diff_response 失敗 id=${message.id}: ${String(error)}`);
+        writer.write({ type: "git_diff_response", v, id: message.id, isRepo: false, diff: "", truncated: false });
+      }
+      break;
+    }
+
+    case "git_log_request": {
+      try {
+        const response = await gitLog(message.path, message.limit);
+        writer.write({ type: "git_log_response", v, id: message.id, ...response });
+      } catch (error) {
+        engineDiag(`git_log_response 失敗 id=${message.id}: ${String(error)}`);
+        writer.write({ type: "git_log_response", v, id: message.id, isRepo: false, commits: [] });
+      }
+      break;
+    }
+
+    case "git_stage_request": {
+      try {
+        const response = await gitStage(message.path, message.files, message.unstage);
+        writer.write({ type: "git_stage_response", v, id: message.id, ...response });
+      } catch (error) {
+        writer.write({ type: "git_stage_response", v, id: message.id, ok: false, error: String(error) });
+      }
+      break;
+    }
+
+    case "git_commit_request": {
+      try {
+        const response = await gitCommit(message.path, message.message);
+        writer.write({ type: "git_commit_response", v, id: message.id, ...response });
+      } catch (error) {
+        writer.write({
+          type: "git_commit_response", v, id: message.id,
+          ok: false, hash: null, error: String(error),
+        });
       }
       break;
     }

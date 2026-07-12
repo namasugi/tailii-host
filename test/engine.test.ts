@@ -48,6 +48,65 @@ function makeQuestionHub(manager: TmuxSessionManager, id: string): SessionHub {
 }
 
 describe("EngineControl — 横断制御チャネル", () => {
+  test("subagent transcript 全文要求を現在会話の Hub tail へ中継する", async () => {
+    const store = makeTempStore();
+    store.put({
+      name: "work",
+      cwd: "/tmp/work",
+      createdAt: 1,
+      agent: "claude",
+      providerSessionId: "provider-1",
+    });
+    const transcript = vi.fn(() => ({
+      entries: [
+        { role: "user" as const, text: "調査して", ts: 1_000 },
+        { role: "assistant" as const, text: "完了しました", ts: 2_000 },
+      ],
+      omitted: 3,
+    }));
+    const tail: import("../src/sessionHub.js").HubTail = {
+      open: vi.fn(),
+      stop: vi.fn(),
+      subagentTranscript: transcript,
+    };
+    const hub = new SessionHub({
+      runner: async () => ok(""),
+      heartbeatDir: makeTempDir("subagent-transcript-hub"),
+      metadataStore: store,
+      timeoutSeconds: 1_800,
+      tailFactory: () => tail,
+    });
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("work\n") : ok(""));
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store),
+      metadataStore: store,
+      hub,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"id":"open","name":"work","type":"session_reattach","v":2}');
+    await engine.lines.nextOfType("session_list_response");
+    engine.writeLine(
+      '{"id":"transcript-1","nodeId":"agent-a","type":"subagent_transcript_request","v":2}',
+    );
+
+    expect(decodeControlMessage(
+      await engine.lines.nextOfType("subagent_transcript_response"),
+    )).toEqual({
+      type: "subagent_transcript_response",
+      v: 2,
+      id: "transcript-1",
+      nodeId: "agent-a",
+      entries: [
+        { role: "user", text: "調査して", ts: 1_000 },
+        { role: "assistant", text: "完了しました", ts: 2_000 },
+      ],
+      omitted: 3,
+    });
+    expect(transcript).toHaveBeenCalledWith("agent-a");
+    await engine.teardown();
+  });
+
   test("Hub 世代変更時は旧 afterSeq を捨て、切断時刻から再購読する", async () => {
     const store = makeTempStore();
     store.put({ name: "work", cwd: "/tmp/work", createdAt: 1, agent: "claude",

@@ -14,12 +14,16 @@ import {
   type HubClientMessage,
   type HubServerMessage,
 } from "./hubProtocol.js";
-import type { ControlMessage, QuestionPromptQuestion } from "./protocol.js";
+import type {
+  ControlMessage,
+  QuestionPromptQuestion,
+  SubagentTranscriptEntry,
+} from "./protocol.js";
 import { HISTORY_DONE_STREAM_ID } from "./transcriptTailer.js";
 import type { ChatAgent } from "./chatTailController.js";
 import type { PanePreviewMode } from "./panePreviewPump.js";
 import type { QuestionAnswer } from "./protocol.js";
-import { PROTOCOL_V1 } from "./protocol.js";
+import { PROTOCOL_V1, PROTOCOL_V2 } from "./protocol.js";
 import { CodexAppServerManager } from "./codexAppServer.js";
 import {
   CodexNativeTurnController,
@@ -37,6 +41,10 @@ import {
 export interface HubTail {
   open(cwd: string, preferredSessionId: string | null, newerThanMs?: number | null, agent?: ChatAgent): void;
   stop(): void;
+  subagentTranscript?(nodeId: string): {
+    entries: SubagentTranscriptEntry[];
+    omitted: number;
+  };
 }
 
 export interface HubPreviewPump {
@@ -201,6 +209,27 @@ export class SessionHub {
     if (message.type === "conversation_unsubscribe") {
       const actor = this.actor(message.session);
       this.unsubscribe(client, message.session, actor);
+      return;
+    }
+    if (message.type === "conversation_subagent_transcript_request") {
+      const actor = this.actors.get(message.session);
+      const transcript = actor?.tail?.subagentTranscript?.(message.nodeId) ?? {
+        entries: [],
+        omitted: 0,
+      };
+      this.sendTo(client, {
+        type: "conversation_subagent_transcript_response",
+        id: message.id,
+        session: message.session,
+        payload: {
+          type: "subagent_transcript_response",
+          v: PROTOCOL_V2,
+          id: message.id,
+          nodeId: message.nodeId,
+          entries: transcript.entries,
+          omitted: transcript.omitted,
+        },
+      });
       return;
     }
     if (message.type === "hub_state_request") {

@@ -1,0 +1,14 @@
+{"id":"fl1","path":"/Users/alice/project","type":"file_list_request","v":1}
+{"entries":[{"kind":"dir","mtimeMs":0,"name":"src","size":0},{"kind":"file","mtimeMs":1720000000000,"name":"a.txt","size":120}],"id":"fl1","path":"/Users/alice/project","truncated":false,"type":"file_list_response","v":1}
+{"id":"fr1","path":"/Users/alice/project/a.txt","type":"file_read_request","v":1}
+{"content":"hello\n","id":"fr1","kind":"text","mtimeMs":1720000000000,"path":"/Users/alice/project/a.txt","size":6,"truncated":false,"type":"file_read_response","v":1}
+{"id":"gs1","path":"/Users/alice/project","type":"git_status_request","v":1}
+{"ahead":1,"behind":0,"branch":"main","files":[{"indexStatus":"M","path":"src/a.ts","renamedFrom":null,"worktreeStatus":"."},{"indexStatus":"?","path":"new.txt","renamedFrom":null,"worktreeStatus":"?"}],"id":"gs1","isRepo":true,"type":"git_status_response","upstream":"origin/main","v":1}
+{"commit":null,"file":"src/a.ts","id":"gd1","path":"/Users/alice/project","staged":false,"type":"git_diff_request","v":1}
+{"diff":"diff --git a/src/a.ts b/src/a.ts\n","id":"gd1","isRepo":true,"truncated":false,"type":"git_diff_response","v":1}
+{"id":"gl1","limit":50,"path":"/Users/alice/project","type":"git_log_request","v":1}
+{"commits":[{"authorName":"Alice","dateMs":1720000000000,"hash":"abcdef0123456789","shortHash":"abcdef0","subject":"Initial commit"}],"id":"gl1","isRepo":true,"type":"git_log_response","v":1}
+{"files":["src/a.ts"],"id":"ga1","path":"/Users/alice/project","type":"git_stage_request","unstage":false,"v":1}
+{"error":null,"id":"ga1","ok":true,"type":"git_stage_response","v":1}
+{"id":"gc1","message":"Update a","path":"/Users/alice/project","type":"git_commit_request","v":1}
+{"error":null,"hash":"abcdef0","id":"gc1","ok":true,"type":"git_commit_response","v":1}
