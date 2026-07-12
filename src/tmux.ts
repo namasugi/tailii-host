@@ -165,11 +165,15 @@ export class TmuxSessionManager {
   /** pane 内のエージェント生存判定。tmux エラーや空出力は二重起動を避けて true に倒す。 */
   async agentProcessAlive(name: string): Promise<boolean> {
     validateSessionName(name);
-    const result = await this.runner([
-      "display-message", "-p", "-t", this.paneTarget(name), "#{pane_current_command}",
-    ]);
-    if (result.exitCode !== 0) return true;
-    return paneCommandLooksLikeAgent(result.stdout);
+    try {
+      const result = await this.runner([
+        "display-message", "-p", "-t", this.paneTarget(name), "#{pane_current_command}",
+      ]);
+      if (result.exitCode !== 0) return true;
+      return paneCommandLooksLikeAgent(result.stdout);
+    } catch {
+      return true;
+    }
   }
 
   /** 指定セッションのみを終了する（tmux kill-session -t <name>）。 */
