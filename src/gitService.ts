@@ -3,7 +3,7 @@
 
 import { execFile } from "node:child_process";
 import * as path from "node:path";
-import type { GitCommitInfo, GitStatusFile } from "./protocol.js";
+import type { GitBranchInfo, GitCommitInfo, GitStatusFile } from "./protocol.js";
 
 const GIT_TIMEOUT_MS = 10_000;
 const GIT_MAX_BUFFER = 8 * 1024 * 1024;
@@ -131,7 +131,38 @@ function decodeGitPath(value: string): string {
   try {
     return JSON.parse(value) as string;
   } catch {
-    return value;
+    // Git の C-style quote は JSON にない \a / \v / 3桁8進 byte escape も使う。
+    const inner = value.endsWith('"') ? value.slice(1, -1) : value.slice(1);
+    const bytes: number[] = [];
+    for (let index = 0; index < inner.length;) {
+      if (inner[index] !== "\\") {
+        const codePoint = inner.codePointAt(index)!;
+        const literal = String.fromCodePoint(codePoint);
+        bytes.push(...Buffer.from(literal));
+        index += literal.length;
+        continue;
+      }
+      const escaped = inner[index + 1];
+      const simpleEscapes: Record<string, number> = {
+        a: 0x07, b: 0x08, t: 0x09, n: 0x0a, v: 0x0b, f: 0x0c, r: 0x0d,
+        "\\": 0x5c, '"': 0x22,
+      };
+      const simpleEscape = escaped === undefined ? undefined : simpleEscapes[escaped];
+      if (simpleEscape !== undefined) {
+        bytes.push(simpleEscape);
+        index += 2;
+        continue;
+      }
+      const octal = inner.slice(index + 1).match(/^[0-7]{1,3}/)?.[0];
+      if (octal !== undefined) {
+        bytes.push(Number.parseInt(octal, 8));
+        index += 1 + octal.length;
+        continue;
+      }
+      bytes.push(0x5c);
+      index += 1;
+    }
+    return Buffer.from(bytes).toString("utf8");
   }
 }
 
@@ -142,13 +173,37 @@ export async function gitStatus(repositoryPath: string): Promise<{
   ahead: number;
   behind: number;
   files: GitStatusFile[];
+  repoRoot?: string;
+  diffAdditions?: number;
+  diffDeletions?: number;
 }> {
   if (!(await isGitRepository(repositoryPath))) {
     return { isRepo: false, branch: "", upstream: null, ahead: 0, behind: 0, files: [] };
   }
   const result = await runGit(repositoryPath, ["status", "--porcelain=v2", "--branch", "-z"]);
   if (!result.ok) return { isRepo: false, branch: "", upstream: null, ahead: 0, behind: 0, files: [] };
-  return { isRepo: true, ...parsePorcelainV2(result.stdout) };
+  const repoRootResult = await runGit(repositoryPath, ["rev-parse", "--show-toplevel"]);
+  const headDiffstat = await runGit(repositoryPath, ["diff", "--shortstat", "HEAD"]);
+  const diffstat = headDiffstat.ok
+    ? headDiffstat
+    : await runGit(repositoryPath, ["diff", "--shortstat"]);
+  const { additions: diffAdditions, deletions: diffDeletions } = parseDiffShortstat(diffstat.stdout);
+  return {
+    isRepo: true,
+    ...parsePorcelainV2(result.stdout),
+    repoRoot: repoRootResult.stdout.trim(),
+    diffAdditions,
+    diffDeletions,
+  };
+}
+
+function parseDiffShortstat(output: string): { additions: number; deletions: number } {
+  const additions = output.match(/(\d+) insertion(?:s)?\(\+\)/);
+  const deletions = output.match(/(\d+) deletion(?:s)?\(-\)/);
+  return {
+    additions: additions ? Number.parseInt(additions[1]!, 10) : 0,
+    deletions: deletions ? Number.parseInt(deletions[1]!, 10) : 0,
+  };
 }
 
 export async function gitDiff(
@@ -199,31 +254,122 @@ export async function gitLog(
   return { isRepo: true, commits };
 }
 
-export async function gitStage(
+export async function gitBranchList(
+  repositoryPath: string,
+): Promise<{ isRepo: boolean; branches: GitBranchInfo[] }> {
+  if (!(await isGitRepository(repositoryPath))) return { isRepo: false, branches: [] };
+  const result = await runGit(repositoryPath, [
+    "for-each-ref",
+    "refs/heads",
+    "--sort=-committerdate",
+    "--format=%(HEAD)%1f%(refname:short)%1f%(subject)%1f%(committerdate:unix)%1f%(upstream:track,nobracket)%1e",
+  ]);
+  if (!result.ok) return { isRepo: true, branches: [] };
+  const branches = result.stdout
+    .split("\x1e")
+    .map((record) => record.replace(/^\r?\n/, ""))
+    .filter(Boolean)
+    .flatMap((record): GitBranchInfo[] => {
+      const fields = record.split("\x1f");
+      if (fields.length !== 5) return [];
+      const tracking = fields[4]!;
+      const ahead = tracking.match(/(?:^|, )ahead (\d+)(?:,|$)/);
+      const behind = tracking.match(/(?:^|, )behind (\d+)(?:,|$)/);
+      return [{
+        name: fields[1]!,
+        subject: fields[2]!,
+        dateMs: Number.parseInt(fields[3]!, 10) * 1_000,
+        isCurrent: fields[0]!.trim() === "*",
+        ahead: ahead ? Number.parseInt(ahead[1]!, 10) : 0,
+        behind: behind ? Number.parseInt(behind[1]!, 10) : 0,
+      }];
+    });
+  return { isRepo: true, branches };
+}
+
+export async function gitCheckout(
+  repositoryPath: string,
+  branch: string,
+  create: boolean,
+): Promise<{ ok: boolean; branch: string; error: string | null }> {
+  const result = await runGit(repositoryPath, create ? ["checkout", "-b", branch] : ["checkout", branch]);
+  return { ok: result.ok, branch, error: result.ok ? null : result.stderr };
+}
+
+export async function gitDiscard(
   repositoryPath: string,
   files: string[],
-  unstage = false,
 ): Promise<{ ok: boolean; error: string | null }> {
   if (files.length === 0) return { ok: false, error: "files は1件以上必要です。" };
-  if (!(await isGitRepository(repositoryPath))) return { ok: false, error: "Git リポジトリではありません。" };
-  const result = await runGit(
-    repositoryPath,
-    unstage ? ["restore", "--staged", "--", ...files] : ["add", "--", ...files],
-  );
+  const status = await gitStatus(repositoryPath);
+  if (!status.isRepo) return { ok: false, error: "Git リポジトリではありません。" };
+
+  const requested = files.map(normalizeGitPath);
+  const tracked = new Set<string>();
+  const untracked = new Set<string>();
+  for (const file of status.files) {
+    const currentPath = normalizeGitPath(file.path);
+    const previousPath = file.renamedFrom === null ? null : normalizeGitPath(file.renamedFrom);
+    const selected = requested.some((candidate) =>
+      currentPath === candidate || currentPath.startsWith(`${candidate}/`) ||
+      previousPath === candidate || previousPath?.startsWith(`${candidate}/`) === true
+    );
+    if (!selected) continue;
+    if (file.indexStatus === "?" && file.worktreeStatus === "?") {
+      untracked.add(file.path);
+    } else {
+      tracked.add(file.path);
+      if (file.renamedFrom !== null) tracked.add(file.renamedFrom);
+    }
+  }
+
+  if (tracked.size > 0) {
+    const restored = await runGit(repositoryPath, [
+      "restore", "--source=HEAD", "--staged", "--worktree", "--", ...tracked,
+    ]);
+    if (!restored.ok) return { ok: false, error: restored.stderr };
+  }
+  if (untracked.size > 0) {
+    const cleaned = await runGit(repositoryPath, ["clean", "-f", "-d", "--", ...untracked]);
+    if (!cleaned.ok) return { ok: false, error: cleaned.stderr };
+  }
+  return { ok: true, error: null };
+}
+
+function normalizeGitPath(value: string): string {
+  return path.normalize(value).replace(/\/+$/, "");
+}
+
+export async function gitInit(
+  directoryPath: string,
+): Promise<{ ok: boolean; error: string | null }> {
+  if (await isGitRepository(directoryPath)) {
+    return { ok: false, error: "既に Git リポジトリです。" };
+  }
+  const result = await runGit(directoryPath, ["init", "-b", "main"]);
   return { ok: result.ok, error: result.ok ? null : result.stderr };
 }
 
-export async function gitCommit(
-  repositoryPath: string,
-  message: string,
-): Promise<{ ok: boolean; hash: string | null; error: string | null }> {
-  if (!(await isGitRepository(repositoryPath))) {
-    return { ok: false, hash: null, error: "Git リポジトリではありません。" };
+export async function gitEntryStatuses(
+  directoryPath: string,
+  names: string[],
+): Promise<Map<string, string>> {
+  const result = await runGit(directoryPath, [
+    "-c", "core.quotePath=false", "status", "--porcelain=v2", "--untracked-files=all", "--", ".",
+  ]);
+  if (!result.ok) return new Map();
+
+  const requestedNames = new Set(names);
+  const statuses = new Map<string, string>();
+  for (const file of parsePorcelainV2(result.stdout).files) {
+    const [entryName, ...descendants] = file.path.split("/");
+    if (entryName === undefined || !requestedNames.has(entryName)) continue;
+    if (descendants.length > 0) {
+      statuses.set(entryName, "M");
+      continue;
+    }
+    const status = file.worktreeStatus !== "." ? file.worktreeStatus : file.indexStatus;
+    if (status !== ".") statuses.set(entryName, status);
   }
-  if (message.trim().length === 0) return { ok: false, hash: null, error: "コミットメッセージが空です。" };
-  const committed = await runGit(repositoryPath, ["commit", "-m", message]);
-  if (!committed.ok) return { ok: false, hash: null, error: committed.stderr };
-  const hash = await runGit(repositoryPath, ["rev-parse", "--short", "HEAD"]);
-  if (!hash.ok) return { ok: false, hash: null, error: hash.stderr };
-  return { ok: true, hash: hash.stdout.trim(), error: null };
+  return statuses;
 }

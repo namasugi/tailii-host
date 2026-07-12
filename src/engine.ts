@@ -40,7 +40,16 @@ import type { HubClientMessage, HubServerMessage } from "./hubProtocol.js";
 import { bumpHeartbeat, defaultHeartbeatDir } from "./heartbeat.js";
 import { ImageService } from "./imageService.js";
 import { fileList, fileRead } from "./fileService.js";
-import { gitCommit, gitDiff, gitLog, gitStage, gitStatus } from "./gitService.js";
+import {
+  gitBranchList,
+  gitCheckout,
+  gitDiff,
+  gitDiscard,
+  gitEntryStatuses,
+  gitInit,
+  gitLog,
+  gitStatus,
+} from "./gitService.js";
 import type { QuestionEventMessage, SessionProcessingMessage } from "./engineRelaySocket.js";
 import { makeSessionLauncher, claudeInnerCommand, type EngineLauncher } from "./launch.js";
 import { LineWriter } from "./lineWriter.js";
@@ -1471,9 +1480,26 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
       engineDiag(`file_list_request id=${message.id} path=${message.path}`);
       try {
         const response = fileList(message.path);
-        writer.write({ type: "file_list_response", v, id: message.id, ...response });
+        let statuses = new Map<string, string>();
+        try {
+          statuses = await gitEntryStatuses(
+            message.path,
+            response.entries.map((entry) => entry.name),
+          );
+        } catch (error) {
+          engineDiag(`file_list gitStatus badge 取得失敗 id=${message.id}: ${String(error)}`);
+        }
+        const entries = response.entries.map((entry) => {
+          const gitStatus = statuses.get(entry.name);
+          return gitStatus === undefined ? entry : { ...entry, gitStatus };
+        });
+        writer.write({ type: "file_list_response", v, id: message.id, ...response, entries });
       } catch (error) {
-        process.stderr.write(`[tailii-host engine] file_list_response 書込失敗: ${String(error)}\n`);
+        engineDiag(`file_list_response 失敗 id=${message.id}: ${String(error)}`);
+        writer.write({
+          type: "file_list_response", v, id: message.id, path: message.path,
+          entries: [], truncated: false,
+        });
       }
       break;
     }
@@ -1530,25 +1556,49 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
       break;
     }
 
-    case "git_stage_request": {
+    case "git_branch_list_request": {
       try {
-        const response = await gitStage(message.path, message.files, message.unstage);
-        writer.write({ type: "git_stage_response", v, id: message.id, ...response });
+        const response = await gitBranchList(message.path);
+        writer.write({ type: "git_branch_list_response", v, id: message.id, ...response });
       } catch (error) {
-        writer.write({ type: "git_stage_response", v, id: message.id, ok: false, error: String(error) });
+        engineDiag(`git_branch_list_response 失敗 id=${message.id}: ${String(error)}`);
+        writer.write({ type: "git_branch_list_response", v, id: message.id, isRepo: false, branches: [] });
       }
       break;
     }
 
-    case "git_commit_request": {
+    case "git_checkout_request": {
       try {
-        const response = await gitCommit(message.path, message.message);
-        writer.write({ type: "git_commit_response", v, id: message.id, ...response });
+        const response = await gitCheckout(message.path, message.branch, message.create);
+        writer.write({ type: "git_checkout_response", v, id: message.id, ...response });
       } catch (error) {
+        engineDiag(`git_checkout_response 失敗 id=${message.id}: ${String(error)}`);
         writer.write({
-          type: "git_commit_response", v, id: message.id,
-          ok: false, hash: null, error: String(error),
+          type: "git_checkout_response", v, id: message.id,
+          ok: false, branch: message.branch, error: String(error),
         });
+      }
+      break;
+    }
+
+    case "git_discard_request": {
+      try {
+        const response = await gitDiscard(message.path, message.files);
+        writer.write({ type: "git_discard_response", v, id: message.id, ...response });
+      } catch (error) {
+        engineDiag(`git_discard_response 失敗 id=${message.id}: ${String(error)}`);
+        writer.write({ type: "git_discard_response", v, id: message.id, ok: false, error: String(error) });
+      }
+      break;
+    }
+
+    case "git_init_request": {
+      try {
+        const response = await gitInit(message.path);
+        writer.write({ type: "git_init_response", v, id: message.id, ...response });
+      } catch (error) {
+        engineDiag(`git_init_response 失敗 id=${message.id}: ${String(error)}`);
+        writer.write({ type: "git_init_response", v, id: message.id, ok: false, error: String(error) });
       }
       break;
     }

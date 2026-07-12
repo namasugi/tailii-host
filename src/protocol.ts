@@ -121,6 +121,7 @@ export interface FileEntry {
   kind: "dir" | "file" | "symlink";
   size: number;
   mtimeMs: number;
+  gitStatus?: string;
 }
 
 /** file_read_response のサービス内部表現。 */
@@ -151,6 +152,16 @@ export interface GitCommitInfo {
   subject: string;
   authorName: string;
   dateMs: number;
+}
+
+/** git_branch_list_response のローカルブランチ 1 件。 */
+export interface GitBranchInfo {
+  name: string;
+  subject: string;
+  dateMs: number;
+  isCurrent: boolean;
+  ahead: number;
+  behind: number;
 }
 
 /** Codex App Server `model/list` を iOS のモデル選択へ渡すための 1 要素。 */
@@ -262,15 +273,19 @@ export type ControlMessage =
   | { type: "file_read_request"; v: number; id: string; path: string }
   | ({ type: "file_read_response"; v: number; id: string } & FileReadResult)
   | { type: "git_status_request"; v: number; id: string; path: string }
-  | { type: "git_status_response"; v: number; id: string; isRepo: boolean; branch: string; upstream: string | null; ahead: number; behind: number; files: GitStatusFile[] }
+  | { type: "git_status_response"; v: number; id: string; isRepo: boolean; branch: string; upstream: string | null; ahead: number; behind: number; files: GitStatusFile[]; repoRoot?: string; diffAdditions?: number; diffDeletions?: number }
   | { type: "git_diff_request"; v: number; id: string; path: string; file?: string; staged?: boolean; commit?: string | null }
   | { type: "git_diff_response"; v: number; id: string; isRepo: boolean; diff: string; truncated: boolean }
   | { type: "git_log_request"; v: number; id: string; path: string; limit?: number }
   | { type: "git_log_response"; v: number; id: string; isRepo: boolean; commits: GitCommitInfo[] }
-  | { type: "git_stage_request"; v: number; id: string; path: string; files: string[]; unstage?: boolean }
-  | { type: "git_stage_response"; v: number; id: string; ok: boolean; error: string | null }
-  | { type: "git_commit_request"; v: number; id: string; path: string; message: string }
-  | { type: "git_commit_response"; v: number; id: string; ok: boolean; hash: string | null; error: string | null }
+  | { type: "git_branch_list_request"; v: number; id: string; path: string }
+  | { type: "git_branch_list_response"; v: number; id: string; isRepo: boolean; branches: GitBranchInfo[] }
+  | { type: "git_checkout_request"; v: number; id: string; path: string; branch: string; create: boolean }
+  | { type: "git_checkout_response"; v: number; id: string; ok: boolean; branch: string; error: string | null }
+  | { type: "git_discard_request"; v: number; id: string; path: string; files: string[] }
+  | { type: "git_discard_response"; v: number; id: string; ok: boolean; error: string | null }
+  | { type: "git_init_request"; v: number; id: string; path: string }
+  | { type: "git_init_response"; v: number; id: string; ok: boolean; error: string | null }
   | { type: "claude_session_list_request"; v: number; id: string }
   | { type: "claude_session_list_response"; v: number; id: string; claudeSessions: ClaudeSessionInfo[] }
   | { type: "dir_create_request"; v: number; id: string; baseDir: string; relative: string }
@@ -808,6 +823,8 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
     case "file_list_request":
     case "file_read_request":
     case "git_status_request":
+    case "git_branch_list_request":
+    case "git_init_request":
       return { type, v, id: requireString(raw, "id"), path: requireString(raw, "path") };
 
     case "file_list_response":
@@ -820,10 +837,11 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
           if (kind !== "dir" && kind !== "file" && kind !== "symlink") {
             throw new ProtocolDecodeError("missing-field", "entries.kind");
           }
-          return {
+          return compact<FileEntry>({
             name: requireString(entry, "name"), kind,
             size: requireNumber(entry, "size"), mtimeMs: requireNumber(entry, "mtimeMs"),
-          };
+            gitStatus: optionalString(entry, "gitStatus"),
+          });
         }),
         truncated: requireBoolean(raw, "truncated"),
       };
@@ -845,7 +863,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
     }
 
     case "git_status_response":
-      return {
+      return compact({
         type, v,
         id: requireString(raw, "id"), isRepo: requireBoolean(raw, "isRepo"),
         branch: requireString(raw, "branch"), upstream: optionalNullableString(raw, "upstream") ?? null,
@@ -858,7 +876,10 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
             renamedFrom: optionalNullableString(file, "renamedFrom") ?? null,
           };
         }),
-      };
+        repoRoot: optionalString(raw, "repoRoot"),
+        diffAdditions: optionalNumber(raw, "diffAdditions"),
+        diffDeletions: optionalNumber(raw, "diffDeletions"),
+      });
 
     case "git_diff_request":
       return compact({
@@ -892,28 +913,42 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         }),
       };
 
-    case "git_stage_request":
-      return compact({
-        type, v, id: requireString(raw, "id"), path: requireString(raw, "path"),
-        files: requireStringArray(raw, "files"), unstage: optionalBoolean(raw, "unstage"),
-      });
+    case "git_branch_list_response":
+      return {
+        type, v, id: requireString(raw, "id"), isRepo: requireBoolean(raw, "isRepo"),
+        branches: requireArray(raw, "branches").map((element): GitBranchInfo => {
+          const branch = requireObject(element, "branches");
+          return {
+            name: requireString(branch, "name"), subject: requireString(branch, "subject"),
+            dateMs: requireNumber(branch, "dateMs"), isCurrent: requireBoolean(branch, "isCurrent"),
+            ahead: requireNumber(branch, "ahead"), behind: requireNumber(branch, "behind"),
+          };
+        }),
+      };
 
-    case "git_stage_response":
+    case "git_checkout_request":
+      return {
+        type, v, id: requireString(raw, "id"), path: requireString(raw, "path"),
+        branch: requireString(raw, "branch"), create: requireBoolean(raw, "create"),
+      };
+
+    case "git_checkout_response":
       return {
         type, v, id: requireString(raw, "id"), ok: requireBoolean(raw, "ok"),
+        branch: requireString(raw, "branch"),
         error: optionalNullableString(raw, "error") ?? null,
       };
 
-    case "git_commit_request":
+    case "git_discard_request":
       return {
         type, v, id: requireString(raw, "id"), path: requireString(raw, "path"),
-        message: requireString(raw, "message"),
+        files: requireStringArray(raw, "files"),
       };
 
-    case "git_commit_response":
+    case "git_discard_response":
+    case "git_init_response":
       return {
         type, v, id: requireString(raw, "id"), ok: requireBoolean(raw, "ok"),
-        hash: optionalNullableString(raw, "hash") ?? null,
         error: optionalNullableString(raw, "error") ?? null,
       };
 

@@ -5,7 +5,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, test } from "vitest";
 import {
-  gitCommit, gitDiff, gitLog, gitStage, gitStatus, parsePorcelainV2,
+  gitBranchList,
+  gitCheckout,
+  gitDiff,
+  gitDiscard,
+  gitEntryStatuses,
+  gitInit,
+  gitLog,
+  gitStatus,
+  parsePorcelainV2,
 } from "../src/gitService.js";
 import { makeTempDir } from "./helpers.js";
 
@@ -21,7 +29,8 @@ function makeRepository(): string {
   fs.writeFileSync(path.join(root, "tracked.txt"), "one\n");
   git(root, ["add", "tracked.txt"]);
   git(root, ["commit", "-m", "initial"]);
-  return root;
+  // macOS の /tmp は /private への symlink で、git rev-parse --show-toplevel は実パスを返す。
+  return fs.realpathSync(root);
 }
 
 describe("parsePorcelainV2", () => {
@@ -35,6 +44,7 @@ describe("parsePorcelainV2", () => {
       "1 .M N... 100644 100644 100644 a a path with spaces.txt",
       "2 R. N... 100644 100644 100644 a a R100 new.ts\told.ts",
       "? new.txt",
+      '? "caf\\303\\251.txt"',
     ].join("\n"));
     expect(parsed).toEqual({
       branch: "main", upstream: "origin/main", ahead: 2, behind: 3,
@@ -43,50 +53,227 @@ describe("parsePorcelainV2", () => {
         { path: "path with spaces.txt", indexStatus: ".", worktreeStatus: "M", renamedFrom: null },
         { path: "new.ts", indexStatus: "R", worktreeStatus: ".", renamedFrom: "old.ts" },
         { path: "new.txt", indexStatus: "?", worktreeStatus: "?", renamedFrom: null },
+        { path: "café.txt", indexStatus: "?", worktreeStatus: "?", renamedFrom: null },
       ],
     });
   });
 });
 
 describe("gitService", () => {
-  test("status/diff/stage/unstage/commit/log を一連で処理する", async () => {
+  test("status は repoRoot と HEAD 基準の diffstat を返す", async () => {
     const root = makeRepository();
-    fs.writeFileSync(path.join(root, "tracked.txt"), "one\ntwo\n");
-    fs.writeFileSync(path.join(root, "new.txt"), "new\n");
+    await expect(gitStatus(root)).resolves.toMatchObject({
+      isRepo: true, repoRoot: root, diffAdditions: 0, diffDeletions: 0,
+    });
+    fs.writeFileSync(path.join(root, "tracked.txt"), "changed\nadded\n");
 
     const status = await gitStatus(root);
-    expect(status).toMatchObject({ isRepo: true, branch: "main", ahead: 0, behind: 0 });
-    expect(status.files).toEqual(expect.arrayContaining([
-      expect.objectContaining({ path: "tracked.txt", indexStatus: ".", worktreeStatus: "M" }),
-      expect.objectContaining({ path: "new.txt", indexStatus: "?", worktreeStatus: "?" }),
-    ]));
-    await expect(gitDiff(root, { file: "tracked.txt" })).resolves.toMatchObject({
-      isRepo: true, diff: expect.stringContaining("+two"), truncated: false,
+    expect(status).toMatchObject({
+      isRepo: true,
+      branch: "main",
+      ahead: 0,
+      behind: 0,
+      repoRoot: root,
+      diffAdditions: 2,
+      diffDeletions: 1,
     });
+    expect(status.files).toContainEqual(expect.objectContaining({
+      path: "tracked.txt", indexStatus: ".", worktreeStatus: "M",
+    }));
+  });
 
-    await expect(gitStage(root, ["tracked.txt", "new.txt"])).resolves.toEqual({ ok: true, error: null });
-    await expect(gitDiff(root, { staged: true })).resolves.toMatchObject({ diff: expect.stringContaining("new.txt") });
-    await expect(gitStage(root, ["new.txt"], true)).resolves.toEqual({ ok: true, error: null });
-    await expect(gitStage(root, ["new.txt"])).resolves.toEqual({ ok: true, error: null });
+  test("status は unborn HEAD で unstaged diffstat へフォールバックする", async () => {
+    const root = fs.realpathSync(makeTempDir("git-service-unborn"));
+    git(root, ["init", "-b", "main"]);
+    fs.writeFileSync(path.join(root, "new.txt"), "one\n");
+    git(root, ["add", "new.txt"]);
+    fs.appendFileSync(path.join(root, "new.txt"), "two\n");
 
-    const committed = await gitCommit(root, "second commit");
-    expect(committed).toMatchObject({ ok: true, hash: expect.stringMatching(/^[0-9a-f]+$/), error: null });
-    const log = await gitLog(root, 1);
-    expect(log.isRepo).toBe(true);
-    expect(log.commits).toHaveLength(1);
-    expect(log.commits[0]).toMatchObject({ subject: "second commit", authorName: "Tailii Test" });
-    await expect(gitDiff(root, { commit: committed.hash })).resolves.toMatchObject({
-      isRepo: true, diff: expect.stringContaining("second commit"),
+    await expect(gitStatus(root)).resolves.toMatchObject({
+      isRepo: true,
+      repoRoot: root,
+      diffAdditions: 1,
+      diffDeletions: 0,
     });
   });
 
+  test("diff と log を処理する", async () => {
+    const root = makeRepository();
+    fs.appendFileSync(path.join(root, "tracked.txt"), "two\n");
+
+    await expect(gitDiff(root, { file: "tracked.txt" })).resolves.toMatchObject({
+      isRepo: true, diff: expect.stringContaining("+two"), truncated: false,
+    });
+    const log = await gitLog(root, 1);
+    expect(log).toMatchObject({
+      isRepo: true,
+      commits: [expect.objectContaining({ subject: "initial", authorName: "Tailii Test" })],
+    });
+  });
+
+  test("branch list は upstream 有無と checkout -b 直後の current branch を返す", async () => {
+    const root = makeRepository();
+    git(root, ["branch", "without-upstream"]);
+    git(root, ["checkout", "-b", "tracking"]);
+    fs.writeFileSync(path.join(root, "branch.txt"), "tracking\n");
+    git(root, ["add", "branch.txt"]);
+    git(root, ["commit", "-m", "tracking commit"]);
+    git(root, ["branch", "--set-upstream-to=main", "tracking"]);
+
+    const listed = await gitBranchList(root);
+    expect(listed.isRepo).toBe(true);
+    expect(listed.branches.find((branch) => branch.name === "tracking")).toMatchObject({
+      subject: "tracking commit", isCurrent: true, ahead: 1, behind: 0,
+    });
+    expect(listed.branches.find((branch) => branch.name === "without-upstream")).toMatchObject({
+      isCurrent: false, ahead: 0, behind: 0,
+    });
+
+    await expect(gitCheckout(root, "fresh", true)).resolves.toEqual({
+      ok: true, branch: "fresh", error: null,
+    });
+    const fresh = (await gitBranchList(root)).branches.find((branch) => branch.name === "fresh");
+    expect(fresh).toMatchObject({ isCurrent: true, ahead: 0, behind: 0 });
+    expect(Number.isFinite(fresh?.dateMs)).toBe(true);
+  });
+
+  test("checkout は clean 切替に成功し、dirty 衝突を報告する", async () => {
+    const root = makeRepository();
+    git(root, ["checkout", "-b", "conflict"]);
+    fs.writeFileSync(path.join(root, "tracked.txt"), "branch version\n");
+    git(root, ["commit", "-am", "conflicting branch"]);
+    git(root, ["checkout", "main"]);
+
+    await expect(gitCheckout(root, "conflict", false)).resolves.toEqual({
+      ok: true, branch: "conflict", error: null,
+    });
+    await expect(gitCheckout(root, "main", false)).resolves.toEqual({
+      ok: true, branch: "main", error: null,
+    });
+
+    fs.writeFileSync(path.join(root, "tracked.txt"), "dirty worktree\n");
+    const failed = await gitCheckout(root, "conflict", false);
+    expect(failed).toMatchObject({ ok: false, branch: "conflict" });
+    expect(failed.error).toEqual(expect.any(String));
+    expect(failed.error?.length).toBeGreaterThan(0);
+  });
+
+  test("checkout -b は dirty worktree を保持して成功する", async () => {
+    const root = makeRepository();
+    fs.appendFileSync(path.join(root, "tracked.txt"), "dirty\n");
+    await expect(gitCheckout(root, "dirty-branch", true)).resolves.toEqual({
+      ok: true, branch: "dirty-branch", error: null,
+    });
+    expect(fs.readFileSync(path.join(root, "tracked.txt"), "utf8")).toContain("dirty");
+  });
+
+  test("discard は tracked の worktree 変更を復元する", async () => {
+    const root = makeRepository();
+    fs.writeFileSync(path.join(root, "tracked.txt"), "changed\n");
+    await expect(gitDiscard(root, ["tracked.txt"])).resolves.toEqual({ ok: true, error: null });
+    expect(fs.readFileSync(path.join(root, "tracked.txt"), "utf8")).toBe("one\n");
+  });
+
+  test("discard は staged と worktree の両方を HEAD へ復元する", async () => {
+    const root = makeRepository();
+    fs.writeFileSync(path.join(root, "tracked.txt"), "staged\n");
+    git(root, ["add", "tracked.txt"]);
+    fs.writeFileSync(path.join(root, "tracked.txt"), "worktree\n");
+
+    await expect(gitDiscard(root, ["tracked.txt"])).resolves.toEqual({ ok: true, error: null });
+    expect(fs.readFileSync(path.join(root, "tracked.txt"), "utf8")).toBe("one\n");
+    expect(git(root, ["status", "--porcelain"])).toBe("");
+  });
+
+  test("discard は untracked ファイルとディレクトリを削除する", async () => {
+    const root = makeRepository();
+    fs.writeFileSync(path.join(root, "untracked.txt"), "new\n");
+    fs.mkdirSync(path.join(root, "untracked-dir"));
+    fs.writeFileSync(path.join(root, "untracked-dir", "nested.txt"), "new\n");
+    await expect(gitDiscard(root, ["untracked.txt", "untracked-dir"])).resolves.toEqual({
+      ok: true, error: null,
+    });
+    expect(fs.existsSync(path.join(root, "untracked.txt"))).toBe(false);
+    expect(fs.existsSync(path.join(root, "untracked-dir"))).toBe(false);
+  });
+
+  test("discard は staged rename を元のパスへ戻す", async () => {
+    const root = makeRepository();
+    git(root, ["mv", "tracked.txt", "renamed.txt"]);
+    await expect(gitDiscard(root, ["renamed.txt"])).resolves.toEqual({ ok: true, error: null });
+    expect(fs.existsSync(path.join(root, "renamed.txt"))).toBe(false);
+    expect(fs.readFileSync(path.join(root, "tracked.txt"), "utf8")).toBe("one\n");
+    expect(git(root, ["status", "--porcelain"])).toBe("");
+  });
+
+  test("discard は tracked と untracked の混在選択を分類し直す", async () => {
+    const root = makeRepository();
+    fs.writeFileSync(path.join(root, "tracked.txt"), "changed\n");
+    fs.writeFileSync(path.join(root, "untracked.txt"), "new\n");
+
+    await expect(gitDiscard(root, ["tracked.txt", "untracked.txt"])).resolves.toEqual({
+      ok: true, error: null,
+    });
+    expect(fs.readFileSync(path.join(root, "tracked.txt"), "utf8")).toBe("one\n");
+    expect(fs.existsSync(path.join(root, "untracked.txt"))).toBe(false);
+  });
+
+  test("init は main ブランチで初期化し、二重 init を拒否する", async () => {
+    const root = makeTempDir("git-service-init");
+    await expect(gitInit(root)).resolves.toEqual({ ok: true, error: null });
+    expect(git(root, ["symbolic-ref", "--short", "HEAD"]).trim()).toBe("main");
+    const second = await gitInit(root);
+    expect(second.ok).toBe(false);
+    expect(second.error).toContain("既に Git リポジトリ");
+  });
+
+  test("entry statuses は変更ファイルと配下変更のあるディレクトリへ badge を返す", async () => {
+    const root = makeRepository();
+    fs.mkdirSync(path.join(root, "src"));
+    fs.writeFileSync(path.join(root, "src", "nested.txt"), "one\n");
+    git(root, ["add", "src/nested.txt"]);
+    git(root, ["commit", "-m", "add directory"]);
+    fs.appendFileSync(path.join(root, "tracked.txt"), "two\n");
+    fs.appendFileSync(path.join(root, "src", "nested.txt"), "two\n");
+
+    const statuses = await gitEntryStatuses(root, ["tracked.txt", "src"]);
+    expect(statuses).toEqual(new Map([["tracked.txt", "M"], ["src", "M"]]));
+    await expect(gitEntryStatuses(path.join(root, "src"), ["nested.txt"])).resolves.toEqual(new Map([
+      ["nested.txt", "M"],
+    ]));
+  });
+
+  test("entry statuses は clean と非 repo で空 Map を返す", async () => {
+    const root = makeRepository();
+    await expect(gitEntryStatuses(root, ["tracked.txt"])).resolves.toEqual(new Map());
+    const nonRepo = makeTempDir("git-service-entry-non-repo");
+    await expect(gitEntryStatuses(nonRepo, ["a.txt"])).resolves.toEqual(new Map());
+  });
+
+  test("entry statuses は index より worktree 側を優先する", async () => {
+    const root = makeRepository();
+    fs.writeFileSync(path.join(root, "tracked.txt"), "staged\n");
+    git(root, ["add", "tracked.txt"]);
+    fs.rmSync(path.join(root, "tracked.txt"));
+    await expect(gitEntryStatuses(root, ["tracked.txt"])).resolves.toEqual(new Map([
+      ["tracked.txt", "D"],
+    ]));
+  });
+
   test("非リポジトリは正常な isRepo:false / ok:false 応答にする", async () => {
-    const root = fs.mkdtempSync("/private/tmp/tailii-git-not-repo-");
-    await expect(gitStatus(root)).resolves.toMatchObject({ isRepo: false, files: [] });
+    const root = makeTempDir("git-service-not-repo");
+    await expect(gitStatus(root)).resolves.toEqual({
+      isRepo: false, branch: "", upstream: null, ahead: 0, behind: 0, files: [],
+    });
     await expect(gitDiff(root)).resolves.toEqual({ isRepo: false, diff: "", truncated: false });
     await expect(gitLog(root)).resolves.toEqual({ isRepo: false, commits: [] });
-    await expect(gitStage(root, ["a"])).resolves.toMatchObject({ ok: false });
-    await expect(gitCommit(root, "message")).resolves.toMatchObject({ ok: false, hash: null });
+    await expect(gitBranchList(root)).resolves.toEqual({ isRepo: false, branches: [] });
+    await expect(gitCheckout(root, "main", false)).resolves.toMatchObject({ ok: false, branch: "main" });
+    await expect(gitDiscard(root, ["a.txt"])).resolves.toMatchObject({ ok: false });
+  });
+
+  test("空の discard 対象を拒否する", async () => {
+    await expect(gitDiscard(makeRepository(), [])).resolves.toMatchObject({ ok: false });
   });
 
   test("diff を200000文字で切り詰める", async () => {
