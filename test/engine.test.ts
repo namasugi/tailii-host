@@ -19,6 +19,7 @@ import type { CodexTurnControllerRuntime } from "../src/codexNativeTurnControlle
 import type { HubLink } from "../src/hubClient.js";
 import { ClaudeSessionStore } from "../src/claudeSessionStore.js";
 import { decodeControlMessage } from "../src/protocol.js";
+import { readHeartbeat } from "../src/heartbeat.js";
 import { TranscriptTailer } from "../src/transcriptTailer.js";
 import { TmuxSessionManager } from "../src/tmux.js";
 import { SessionHub } from "../src/sessionHub.js";
@@ -783,6 +784,7 @@ describe("EngineControl — 横断制御チャネル", () => {
 
     const resp = await engine.lines.nextOfType("session_list_response");
     expect(resp).toContain('"id":"S-resume"');
+    expect(resp).toContain('"adoptedName":"s-c0de7369"');
     expect(resp).toContain('"name":"s-c0de7369"');
     expect(resp).toContain(`"claudeSessionId":"${sessionId}"`);
     expect(resp).not.toContain('"name":"cs-f622acb5"');
@@ -791,6 +793,107 @@ describe("EngineControl — 横断制御チャネル", () => {
     expect(store.get("s-c0de7369")?.claudeSessionId).toBe(sessionId);
     expect(store.get("cs-f622acb5")).toBeNull();
 
+    await engine.teardown();
+  });
+
+  test("session_start prepare は採用名を返し、reattach 前には会話購読しない", async () => {
+    const store = makeTempStore();
+    const heartbeatDir = makeTempDir("prepare-heartbeat");
+    const sessionId = "f622acb5-1111-2222-3333-444444444444";
+    store.put({ name: "s-c0de7369", cwd: "/tmp/fresh-dir", createdAt: 7,
+      claudeSessionId: sessionId });
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("s-c0de7369\n") : ok(""));
+    const sent: unknown[] = [];
+    const hubLink: HubLink = {
+      onMessage: null, onReconnect: null,
+      send: (message) => { sent.push(message); },
+      close: vi.fn(),
+    };
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store), metadataStore: store, heartbeatDir, hubLink,
+      launcher: async () => ({ exitCode: 0, errorText: "" }),
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine(
+      `{"cwd":"/tmp/fresh-dir","deferSubscribe":true,"id":"S-prepare","name":"cs-f622acb5","resumeSessionId":"${sessionId}","type":"session_start","v":2}`,
+    );
+
+    const response = decodeControlMessage(
+      await engine.lines.nextOfType("session_list_response"),
+    );
+    expect(response).toMatchObject({
+      type: "session_list_response", id: "S-prepare", adoptedName: "s-c0de7369",
+    });
+    if (response.type !== "session_list_response") throw new Error("unexpected response");
+    expect(response.sessions).toEqual([]);
+    expect(readHeartbeat(heartbeatDir, "s-c0de7369")).toMatchObject({
+      state: "idle", event: "session-prepare",
+    });
+    expect(sent.filter((message) =>
+      (message as { type?: string }).type === "conversation_subscribe",
+    )).toEqual([]);
+    await engine.teardown();
+  });
+
+  test("session_start prepare は Hub RPC を待たず heartbeat を直接更新する", async () => {
+    const store = makeTempStore();
+    const heartbeatDir = makeTempDir("prepare-heartbeat-direct");
+    const sessionId = "f622acb5-1111-2222-3333-444444444444";
+    store.put({ name: "s-live", cwd: "/tmp/work", createdAt: 7, claudeSessionId: sessionId });
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("s-live\n") : ok(""));
+    const unavailableHub: HubLink = {
+      onMessage: null, onReconnect: null, send: vi.fn(), close: vi.fn(),
+    };
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store), metadataStore: store,
+      heartbeatDir, hubLink: unavailableHub,
+      launcher: async () => ({ exitCode: 0, errorText: "" }),
+    });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine(
+      `{"cwd":"/tmp/work","deferSubscribe":true,"id":"S-fallback","name":"cs-f622acb5","resumeSessionId":"${sessionId}","type":"session_start","v":2}`,
+    );
+
+    await engine.lines.nextOfType("session_list_response", 2_000);
+    expect(readHeartbeat(heartbeatDir, "s-live")).toMatchObject({
+      state: "idle", event: "session-prepare",
+    });
+    expect(unavailableHub.send).not.toHaveBeenCalled();
+    await engine.teardown();
+  });
+
+  test("session_start prepare は直接 heartbeat が失敗したら error を返す", async () => {
+    const store = makeTempStore();
+    const root = makeTempDir("prepare-heartbeat-total-failure");
+    const invalidHeartbeatDir = path.join(root, "not-a-directory");
+    fs.writeFileSync(invalidHeartbeatDir, "file");
+    const sessionId = "f622acb5-1111-2222-3333-444444444444";
+    store.put({ name: "s-live", cwd: "/tmp/work", createdAt: 7, claudeSessionId: sessionId });
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("s-live\n") : ok(""));
+    const hubLink: HubLink = {
+      onMessage: null, onReconnect: null,
+      send: vi.fn(),
+      close: vi.fn(),
+    };
+    const testHub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir: makeTempDir("prepare-unused-hub"),
+      metadataStore: store, timeoutSeconds: 1800,
+    });
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store), metadataStore: store,
+      heartbeatDir: invalidHeartbeatDir, hubLink, hub: testHub,
+      launcher: async () => ({ exitCode: 0, errorText: "" }),
+    });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine(
+      `{"cwd":"/tmp/work","deferSubscribe":true,"id":"S-total-failure","name":"cs-f622acb5","resumeSessionId":"${sessionId}","type":"session_start","v":2}`,
+    );
+
+    const response = decodeControlMessage(await engine.lines.nextOfType("error", 2_000));
+    expect(response).toMatchObject({
+      type: "error", id: "S-total-failure", code: "session_prepare_heartbeat_failed",
+    });
     await engine.teardown();
   });
 

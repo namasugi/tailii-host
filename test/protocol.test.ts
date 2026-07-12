@@ -118,6 +118,15 @@ describe("decode 詳細", () => {
     expect(encodeControlMessage(decoded)).toContain('"providerSessionId":"thread-1"');
   });
 
+  it("prepare 用の deferSubscribe と adoptedName を additive に復元する", () => {
+    expect(decodeControlMessage(
+      '{"type":"session_start","v":2,"id":"p","cwd":"/t","name":"n","resumeSessionId":"sid","deferSubscribe":true}',
+    )).toMatchObject({ type: "session_start", deferSubscribe: true });
+    expect(decodeControlMessage(
+      '{"type":"session_list_response","v":2,"id":"p","sessions":[],"adoptedName":"s-live"}',
+    )).toMatchObject({ type: "session_list_response", adoptedName: "s-live" });
+  });
+
   it("session_start の model/permissionMode を復元する（permissionMode は既知4値のみ採用）", () => {
     const full = decodeControlMessage(
       '{"type":"session_start","v":2,"id":"x","cwd":"/t","name":"n","model":"opus","permissionMode":"acceptEdits"}',

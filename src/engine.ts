@@ -37,6 +37,7 @@ import { dirChildren, dirCreate, dirList } from "./dirLister.js";
 import { ensureHubDaemon } from "./hubDaemon.js";
 import { connectHubSocket, type HubLink } from "./hubClient.js";
 import type { HubClientMessage, HubServerMessage } from "./hubProtocol.js";
+import { bumpHeartbeat, defaultHeartbeatDir } from "./heartbeat.js";
 import { ImageService } from "./imageService.js";
 import { fileList, fileRead } from "./fileService.js";
 import { gitCommit, gitDiff, gitLog, gitStage, gitStatus } from "./gitService.js";
@@ -322,8 +323,10 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     staleDistGuard = createStaleDistGuard(),
     onStaleDist = undefined,
     hubLink: injectedHubLink = undefined,
+    heartbeatDir = defaultHeartbeatDir(),
   } = options;
   const resolvedModeTiming: ModeTiming = { ...DEFAULT_MODE_TIMING, ...modeTiming };
+  const resolvedHeartbeatDir = heartbeatDir ?? defaultHeartbeatDir();
   const hubLink = injectedHubLink ?? connectHubSocket();
 
   // 出力の直列化（Node の Writable は書込順序を保証する）。
@@ -603,6 +606,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           hubLink,
           requestHubState,
           hubRpc,
+          heartbeatDir: resolvedHeartbeatDir,
           resumeLauncher,
           codexResumeLauncher,
           claudeSessionStore,
@@ -658,6 +662,7 @@ interface HandlerContext {
   hubLink: HubLink;
   requestHubState: (session: string) => Promise<{ id: string; questions: QuestionPromptQuestion[] } | null>;
   hubRpc: <T extends HubServerMessage>(request: HubClientMessage, id: string, timeoutMs: number) => Promise<T>;
+  heartbeatDir: string;
   resumeLauncher: EngineLauncher | null;
   /** codex セッションの reattach 時 resume 用 launcher。 */
   codexResumeLauncher: EngineLauncher | null;
@@ -704,6 +709,39 @@ function subscribeConversation(ctx: HandlerContext, session: string, newerThanMs
   ctx.activeChatSession.name = session;
   ctx.hubLink.send({ type: "conversation_subscribe", session,
     ...(newerThanMs !== undefined ? { newerThanMs } : {}), preview: true });
+}
+
+/** prepare 中は購読を始めず、reaper が読む権威ファイルの idle deadline だけを即時に更新する。 */
+function touchPreparedSession(ctx: HandlerContext, session: string): boolean {
+  try {
+    bumpHeartbeat(ctx.heartbeatDir, session, Date.now() / 1_000, "session-prepare");
+    return true;
+  } catch {
+    // heartbeat を更新できないまま成功 ack を返すと、直後の reaper tick による kill を
+    // クライアントが防げない。prepare 自体を構造化エラーとして失敗させる。
+    return false;
+  }
+}
+
+/** 通常オープンは購読を開始し、prepare は購読せず heartbeat だけを保護する。 */
+async function activateOrTouchSession(
+  ctx: HandlerContext,
+  writer: LineWriter,
+  version: number,
+  requestId: string,
+  session: string,
+  shouldSubscribe: boolean,
+  newerThanMs?: number,
+): Promise<boolean> {
+  if (shouldSubscribe) {
+    subscribeConversation(ctx, session, newerThanMs);
+    await emitPendingQuestion(ctx, session);
+    return true;
+  }
+  if (touchPreparedSession(ctx, session)) return true;
+  writeError(writer, version, requestId, "session_prepare_heartbeat_failed",
+    "セッションの保護時刻を更新できませんでした。");
+  return false;
 }
 
 async function claimRuntime(ctx: HandlerContext, session: string): Promise<"granted" | "held"> {
@@ -1060,6 +1098,7 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
           ? (ctx.codexLauncher ?? ctx.launcher)
           : (perSessionClaudeLauncher ?? ctx.launcher);
       const resumeSessionId = message.resumeSessionId ?? null;
+      const shouldSubscribe = message.deferSubscribe !== true;
       if (resumeSessionId !== null && metadataStore !== null) {
         const aliases = await sessionManager.list();
         const liveAliases = aliases.filter((info) => {
@@ -1080,16 +1119,13 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
           engineDiag(
             `session_start resume alias reuse existing=${liveAlias.name} requested=${message.name} providerSessionId=${resumeSessionId}`,
           );
-          // 再開＝アクティブ化。前回離脱時の stale な heartbeat が残ったままだと、会話中でも
-          // reaper daemon が timeout 超過で kill してしまう（resume 直後に post が沈黙する根因）。
-          subscribeConversation(ctx, liveAlias.name);
-          await emitPendingQuestion(ctx, liveAlias.name);
-          try {
-            const sessions = await sessionManager.list();
-            writeSessionListResponse(writer, v, message.id, sessions, null);
-          } catch {
-            writeSessionListResponse(writer, v, message.id, [liveAlias], null);
-          }
+          // 通常再開はここで購読してアクティブ化する。prepare は正しい serve が開くまで遅延する。
+          if (!await activateOrTouchSession(
+            ctx, writer, v, message.id, liveAlias.name, shouldSubscribe,
+          )) break;
+          writeSessionListResponse(
+            writer, v, message.id, shouldSubscribe ? aliases : [], null, liveAlias.name,
+          );
           break;
         }
       }
@@ -1106,10 +1142,15 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
           return (info.agent ?? "claude") === sessionAgent && info.providerSessionId === resumeSessionId;
         });
         if (appeared !== null) {
-          subscribeConversation(ctx, appeared.name);
-          await emitPendingQuestion(ctx, appeared.name);
-          try { writeSessionListResponse(writer, v, message.id, await sessionManager.list(), null); }
-          catch { writeSessionListResponse(writer, v, message.id, [appeared], null); }
+          if (!await activateOrTouchSession(
+            ctx, writer, v, message.id, appeared.name, shouldSubscribe,
+          )) break;
+          if (shouldSubscribe) {
+            try { writeSessionListResponse(writer, v, message.id, await sessionManager.list(), null, appeared.name); }
+            catch { writeSessionListResponse(writer, v, message.id, [appeared], null, appeared.name); }
+          } else {
+            writeSessionListResponse(writer, v, message.id, [], null, appeared.name);
+          }
         } else {
           writeError(writer, v, message.id, "launch_failed", "他の接続による会話の起動を確認できませんでした。");
         }
@@ -1149,23 +1190,27 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
         const providerSessionId =
           result.providerSessionId ?? resumeSessionId ?? newSessionId;
         // cwd は launcher が権威記録した解決後 cwd（メタ）を優先。
-        // 起動/再開＝アクティブ化。同名の stale heartbeat が残っていると、起動直後の
-        // reaper daemon tick（最長 60 秒後）が新しい tmux セッションを即 kill してしまう。
+        // 通常起動/再開はここで購読してアクティブ化する。prepare は reattach まで遅延する。
         // tail は確定した会話 id（resume=既存 id / 新規=生成 id）だけを追う。newerThanMs は
         // codex（mtime 解決）の新規起動でのみ効き、claude は preferred で厳密束縛される。
-        subscribeConversation(ctx, message.name,
-          providerSessionId === null && resumeSessionId === null ? launchedAtMs : undefined);
-        await emitPendingQuestion(ctx, message.name);
+        if (!await activateOrTouchSession(
+          ctx, writer, v, message.id, message.name, shouldSubscribe,
+          providerSessionId === null && resumeSessionId === null ? launchedAtMs : undefined,
+        )) break;
         // 成功: 現況一覧で応答する（kill と同じ疎通様式）。
+        if (!shouldSubscribe) {
+          writeSessionListResponse(writer, v, message.id, [], null, message.name);
+          break;
+        }
         try {
           const sessions = await sessionManager.list();
-          writeSessionListResponse(writer, v, message.id, sessions, null);
+          writeSessionListResponse(writer, v, message.id, sessions, null, message.name);
         } catch {
           // 起動自体は成功しているため、一覧取得失敗時は当該セッション単独で応答する。
           try {
             writeSessionListResponse(
               writer, v, message.id,
-              [{ name: message.name, cwd: message.cwd, alive: true }], null,
+              [{ name: message.name, cwd: message.cwd, alive: true }], null, message.name,
             );
           } catch {
             // 書込失敗は握り潰す（Swift 版 try? と同じ）。
@@ -1832,13 +1877,14 @@ function stripYamlQuotes(value: string): string {
   return trimmed;
 }
 
-/** session_list_response を書き出す小ヘルパー（nextCursor は null なら省略）。 */
+/** session_list_response を書き出す（optional cursor / host 採用名は null なら省略）。 */
 function writeSessionListResponse(
   writer: LineWriter,
   v: number,
   id: string,
   sessions: SessionInfo[],
   nextCursor: string | null,
+  adoptedName: string | null = null,
 ): void {
   writer.write({
     type: "session_list_response",
@@ -1846,6 +1892,7 @@ function writeSessionListResponse(
     id,
     sessions,
     ...(nextCursor !== null && { nextCursor }),
+    ...(adoptedName !== null && { adoptedName }),
   });
 }
 

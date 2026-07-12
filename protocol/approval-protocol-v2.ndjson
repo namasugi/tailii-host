@@ -8,6 +8,8 @@
 {"cwd":"/Users/alice/project","id":"ms11aa22-0000-0000-0000-000000000501","model":"opus","name":"proj-model","permissionMode":"acceptEdits","type":"session_start","v":2}
 {"id":"cs11aa22-0000-0000-0000-000000000601","type":"claude_session_list_request","v":2}
 {"claudeSessions":[{"cwd":"/Users/alice/Documents/ClaudeCode/code0630","lastMessage":"テストは全件緑です。次はデプロイに進みます。","sessionId":"11111111-2222-3333-4444-555555555555","title":"最初の会話","updatedAt":1720100000},{"agent":"codex","cwd":"/Users/alice/other","sessionId":"22222222-3333-4444-5555-666666666666","title":"3f2a1b0c"}],"id":"cs11aa22-0000-0000-0000-000000000601","type":"claude_session_list_response","v":2}
+{"agentType":"codex","cwd":"/Users/alice/project","deferSubscribe":true,"id":"sp11aa22-0000-0000-0000-000000000701","name":"cs-provider","resumeSessionId":"provider-1","type":"session_start","v":2}
+{"adoptedName":"s-live","id":"sp11aa22-0000-0000-0000-000000000701","sessions":[],"type":"session_list_response","v":2}
 {"id":"tr11aa22-0000-0000-0000-000000000701","nodeId":"node-42","type":"subagent_transcript_request","v":2}
 {"entries":[{"role":"user","text":"原因を調べてください。"},{"role":"assistant","text":"ログを確認します。","ts":1783016361000},{"kind":"tool_use","role":"tool","text":"Read: {\"file_path\":\"/tmp/app.log\"}","ts":1783016362000},{"kind":"tool_result","role":"tool","text":"エラー行を確認しました。","ts":1783016362500}],"id":"tr11aa22-0000-0000-0000-000000000701","nodeId":"node-42","omitted":7,"type":"subagent_transcript_response","v":2}
 {"id":"cm11aa22-0000-0000-0000-000000000801","type":"codex_model_list_request","v":2}

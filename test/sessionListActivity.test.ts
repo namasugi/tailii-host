@@ -132,4 +132,28 @@ describe("session list activity ordering (own-transcript authority)", () => {
       expect(info.alive).toBe(true);
     }
   });
+
+  test("Codex activity は同一 cwd ごとに1回だけ解決する", async () => {
+    const store = makeTempStore();
+    for (const [name, cwd] of [
+      ["cs-codex-a", "/same"],
+      ["cs-codex-b", "/same"],
+      ["cs-codex-c", "/other"],
+    ] as const) {
+      store.put({ name, cwd, createdAt: 0, agent: "codex" });
+    }
+    const runner = new MockTmuxRunner((args) =>
+      args[0] === "ls" ? ok("cs-codex-a\ncs-codex-b\ncs-codex-c\n") : ok(""),
+    );
+    const calls: string[] = [];
+    const service = new SessionListService(
+      new TmuxSessionManager({ runner: runner.runner, store }),
+      (info) => { calls.push(info.cwd); return info.cwd === "/same" ? 20 : 10; },
+    );
+
+    const page = await service.page(10, undefined);
+
+    expect(calls).toEqual(["/same", "/other"]);
+    expect(page.sessions.map((info) => info.updatedAt)).toEqual([20, 20, 10]);
+  });
 });

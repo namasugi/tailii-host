@@ -57,9 +57,24 @@ export class SessionListService {
     // tmux の活動時刻や cwd 共有の mtime は使わない: 前者は作成だけで最新になり、
     // 後者は同一 cwd の別セッションの会話を継承するため、どちらも
     // 「会話していないセッションが実会話より上に浮く」誤整列を生む。
+    // Codex の activity provider は rollout 一覧を走査する。同一 cwd の複数メタは設計上
+    // 同じ updatedAt 近似値になるため、1ページ生成中は cwd ごとに1回だけ解決する。
+    // これが無いと過去セッション数に比例して同じ ~/.codex/sessions を再走査し、iOS の
+    // 一覧更新を不必要に遅らせる。
+    const codexActivityByCwd = new Map<string, number | null>();
     const annotated: SessionInfo[] = raw.map((info) => {
       if (info.updatedAt !== undefined) return info;
-      const updatedAt = this.activityProvider(info);
+      let updatedAt: number | null;
+      if (info.agent === "codex") {
+        if (codexActivityByCwd.has(info.cwd)) {
+          updatedAt = codexActivityByCwd.get(info.cwd) ?? null;
+        } else {
+          updatedAt = this.activityProvider(info);
+          codexActivityByCwd.set(info.cwd, updatedAt);
+        }
+      } else {
+        updatedAt = this.activityProvider(info);
+      }
       return updatedAt === null ? { ...info } : { ...info, updatedAt };
     });
 
