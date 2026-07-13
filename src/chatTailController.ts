@@ -17,7 +17,7 @@ import {
   type SubagentTranscriptResult,
 } from "./subagentTranscript.js";
 import { CodexRolloutTailer } from "./codexRolloutTailer.js";
-import { canonicalPath } from "./paths.js";
+import { canonicalPath, claudeProjectSlug } from "./paths.js";
 
 /** tail 対象エージェント種別（claude=既定 / codex=Codex CLI）。 */
 export type ChatAgent = "claude" | "codex";
@@ -103,7 +103,7 @@ export class ChatTailController {
     // claude はシンボリックリンクを解決した canonical パスで project slug を作る
     //（例 /tmp → /private/tmp）。tail も同じく解決してから slug 化する。
     const canonicalCwd = canonicalPath(cwd);
-    const slug = canonicalCwd.replaceAll("/", "-");
+    const slug = claudeProjectSlug(cwd);
     const dir = path.join(this.projectsRoot, slug);
     const dirExists = fs.existsSync(dir);
     ChatTailController.diag(

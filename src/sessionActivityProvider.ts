@@ -13,14 +13,14 @@ import { lastConversationTimestamp, type ClaudeSessionStore } from "./claudeSess
 import type { CodexSessionStore } from "./codexSessionStore.js";
 import type { SessionInfo } from "./protocol.js";
 import type { SessionMeta, SessionMetadataStore } from "./sessionMetadataStore.js";
-import { standardize } from "./paths.js";
+import { claudeProjectSlug, standardize } from "./paths.js";
 
 /** セッションの更新時刻（Unix 秒）を解決する注入可能な抽象。解決不能は null。 */
 export type SessionActivityProvider = (session: SessionInfo) => number | null;
 
-/** cwd を Claude Code projects の slug へ写す（`/` と `.` を `-` に置換）。 */
+/** cwd を Claude Code projects の slug へ写す（共通変換 claudeProjectSlug に委譲）。 */
 export function activitySlugForCwd(cwd: string): string {
-  return standardize(cwd).replaceAll("/", "-").replaceAll(".", "-");
+  return claudeProjectSlug(cwd);
 }
 
 /** セッション自身の会話 transcript の mtime を updatedAt として返す既定実装。 */

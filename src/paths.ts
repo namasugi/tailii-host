@@ -46,3 +46,13 @@ export function canonicalPath(p: string): string {
     return standardize(p);
   }
 }
+
+/**
+ * cwd → Claude Code の project ディレクトリ名（`~/.claude/projects/<slug>`）。
+ * Claude は `/` に加えて `.` も `-` へ置換する（例: `.claude/worktrees/x` →
+ * `--claude-worktrees-x`）。`/` だけ置換すると worktree など dot を含む cwd で
+ * transcript を見失う（実機で会話が表示されない事故の根因）。
+ */
+export function claudeProjectSlug(cwd: string): string {
+  return canonicalPath(cwd).replaceAll("/", "-").replaceAll(".", "-");
+}

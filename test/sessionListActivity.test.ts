@@ -11,6 +11,7 @@ import { ClaudeSessionStore } from "../src/claudeSessionStore.js";
 import { CodexSessionStore } from "../src/codexSessionStore.js";
 import { activitySlugForCwd, ownTranscriptActivityProvider } from "../src/sessionActivityProvider.js";
 import { SessionListService } from "../src/sessionListService.js";
+import { claudeProjectSlug } from "../src/paths.js";
 import { TmuxSessionManager } from "../src/tmux.js";
 import { MockTmuxRunner, makeTempDir, makeTempStore, ok } from "./helpers.js";
 
@@ -155,5 +156,15 @@ describe("session list activity ordering (own-transcript authority)", () => {
 
     expect(calls).toEqual(["/same", "/other"]);
     expect(page.sessions.map((info) => info.updatedAt)).toEqual([20, 20, 10]);
+  });
+});
+
+describe("claudeProjectSlug", () => {
+  test("Claude と同じ規則で / と . を - に置換する（worktree cwd）", () => {
+    // 実在しないパスは canonicalPath が字句正準化のみ行う（決定的）。
+    expect(claudeProjectSlug("/Users/alice/proj/.claude/worktrees/20260713-1200")).toBe(
+      "-Users-alice-proj--claude-worktrees-20260713-1200",
+    );
+    expect(claudeProjectSlug("/Users/alice/app.v2")).toBe("-Users-alice-app-v2");
   });
 });

@@ -3,7 +3,7 @@
 
 import * as path from "node:path";
 import type { LineWriter } from "./lineWriter.js";
-import { canonicalPath } from "./paths.js";
+import { claudeProjectSlug } from "./paths.js";
 import { PROTOCOL_V1 } from "./protocol.js";
 import type { SessionMetadataStore, SessionMeta } from "./sessionMetadataStore.js";
 import { abortableSleep } from "./sleep.js";
@@ -92,7 +92,7 @@ export class RemoteQuestionMonitor {
   private startPump(meta: SessionMeta, parentSignal: AbortSignal): void {
     const ac = new AbortController();
     this.pumps.set(meta.name, ac);
-    const dir = path.join(this.projectsRoot, canonicalPath(meta.cwd).replaceAll("/", "-"));
+    const dir = path.join(this.projectsRoot, claudeProjectSlug(meta.cwd));
     const tailer = new TranscriptTailer({ tailIndefinitely: true, emitReplayDoneMarker: true });
     (async () => {
       let replayDone = false;
