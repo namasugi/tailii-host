@@ -2,6 +2,8 @@
 // tailii (TS host) — cwd Git 状態・差分・履歴・更新サービス
 
 import { execFile } from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { GitBranchInfo, GitCommitInfo, GitStatusFile } from "./protocol.js";
 
@@ -10,6 +12,9 @@ const GIT_MAX_BUFFER = 8 * 1024 * 1024;
 const DIFF_CHARACTER_LIMIT = 200_000;
 const DEFAULT_LOG_LIMIT = 50;
 const MAX_LOG_LIMIT = 200;
+const MAX_WORKTREE_INCLUDE_FILES = 500;
+const WORKTREE_EXCLUDE_LINE = ".claude/worktrees/";
+const WORKTREE_LOCK_REASON = "tailii-session";
 
 interface GitRunResult {
   ok: boolean;
@@ -39,6 +44,147 @@ function runGit(repositoryPath: string, args: string[]): Promise<GitRunResult> {
       },
     );
   });
+}
+
+function formatWorktreeTimestamp(now: Date): string {
+  const pad = (value: number): string => String(value).padStart(2, "0");
+  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-` +
+    `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+}
+
+function resolveGitPath(repositoryPath: string, value: string): string {
+  return path.isAbsolute(value) ? path.normalize(value) : path.resolve(repositoryPath, value);
+}
+
+async function appendWorktreeExclude(repositoryPath: string): Promise<string | null> {
+  const commonDir = await runGit(repositoryPath, ["rev-parse", "--git-common-dir"]);
+  if (!commonDir.ok) return commonDir.stderr;
+  try {
+    const excludePath = path.join(resolveGitPath(repositoryPath, commonDir.stdout.trim()), "info", "exclude");
+    fs.mkdirSync(path.dirname(excludePath), { recursive: true });
+    const current = fs.existsSync(excludePath) ? fs.readFileSync(excludePath, "utf8") : "";
+    if (current.split(/\r?\n/).some((line) => line.trim() === WORKTREE_EXCLUDE_LINE)) return null;
+    const separator = current.length > 0 && !current.endsWith("\n") ? "\n" : "";
+    fs.appendFileSync(excludePath, `${separator}${WORKTREE_EXCLUDE_LINE}\n`);
+    return null;
+  } catch (error) {
+    return String(error);
+  }
+}
+
+function isPathInside(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relative);
+}
+
+function gitServiceDiag(message: string): void {
+  if (process.env["TAILII_DEBUG"] === "1") process.stderr.write(`[tailii-host git] ${message}\n`);
+}
+
+function parseNulSeparatedPaths(output: string): string[] {
+  if (output.length === 0) return [];
+  const records = output.split("\0");
+  if (records[records.length - 1] === "") records.pop();
+  return records.filter((record) => record.length > 0);
+}
+
+function pathEntryExists(candidate: string): boolean {
+  try {
+    fs.lstatSync(candidate);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function worktreeDestination(worktreePath: string, relativePath: string): string | null {
+  const destination = path.resolve(worktreePath, relativePath);
+  if (!isPathInside(worktreePath, destination)) return null;
+
+  let current = worktreePath;
+  const parentRelative = path.relative(worktreePath, path.dirname(destination));
+  for (const component of parentRelative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, component);
+    if (pathEntryExists(current)) {
+      const status = fs.lstatSync(current);
+      if (status.isSymbolicLink() || !status.isDirectory()) return null;
+    } else {
+      fs.mkdirSync(current);
+    }
+  }
+  return pathEntryExists(destination) ? null : destination;
+}
+
+async function copyWorktreeIncludes(repoRoot: string, worktreePath: string): Promise<string | null> {
+  const includePath = path.join(repoRoot, ".worktreeinclude");
+  if (!fs.existsSync(includePath)) return null;
+
+  let temporaryDirectory: string | null = null;
+  let errorMessage: string | null = null;
+  try {
+    const actuallyIgnored = await runGit(repoRoot, [
+      "ls-files", "--others", "--ignored", "--exclude-standard", "-z",
+    ]);
+    if (!actuallyIgnored.ok) {
+      errorMessage = actuallyIgnored.stderr || "gitignore 対象ファイルを取得できませんでした。";
+    } else {
+      temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "tailii-worktreeinclude-"));
+      const temporaryIncludePath = path.join(temporaryDirectory, "patterns");
+      fs.copyFileSync(includePath, temporaryIncludePath);
+      const matchingInclude = await runGit(repoRoot, [
+        "ls-files", "--others", "--ignored", `--exclude-from=${temporaryIncludePath}`, "-z",
+      ]);
+      if (!matchingInclude.ok) {
+        errorMessage = matchingInclude.stderr || ".worktreeinclude 対象ファイルを取得できませんでした。";
+      } else {
+        const ignoredPaths = new Set(parseNulSeparatedPaths(actuallyIgnored.stdout));
+        const copyPaths = parseNulSeparatedPaths(matchingInclude.stdout)
+          .filter((relativePath) => ignoredPaths.has(relativePath));
+        let copiedFiles = 0;
+        for (const relativePath of copyPaths) {
+          if (copiedFiles >= MAX_WORKTREE_INCLUDE_FILES) break;
+          const source = path.resolve(repoRoot, relativePath);
+          if (!isPathInside(repoRoot, source) || !fs.existsSync(source)) continue;
+          const sourceStatus = fs.lstatSync(source);
+          if (sourceStatus.isSymbolicLink() || !sourceStatus.isFile()) continue;
+          const destination = worktreeDestination(worktreePath, relativePath);
+          if (destination === null) continue;
+          fs.copyFileSync(source, destination);
+          copiedFiles += 1;
+        }
+      }
+    }
+  } catch (error) {
+    errorMessage = String(error);
+  } finally {
+    if (temporaryDirectory !== null) {
+      try {
+        fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+      } catch (error) {
+        const cleanupError = String(error);
+        errorMessage = errorMessage === null ? cleanupError : `${errorMessage}\n${cleanupError}`;
+      }
+    }
+  }
+  return errorMessage;
+}
+
+function normalizedExistingPath(value: string): string {
+  try {
+    return fs.realpathSync(value);
+  } catch {
+    return path.resolve(value);
+  }
+}
+
+function worktreeManagementPath(listOutput: string, worktreePath: string): string | null {
+  const target = normalizedExistingPath(worktreePath);
+  const listed = listOutput.split(/\r?\n/)
+    .filter((line) => line.startsWith("worktree "))
+    .map((line) => line.slice("worktree ".length));
+  return listed.find((candidate) => normalizedExistingPath(candidate) !== target) ?? listed[0] ?? null;
 }
 
 async function isGitRepository(repositoryPath: string): Promise<boolean> {
@@ -348,6 +494,124 @@ export async function gitInit(
   }
   const result = await runGit(directoryPath, ["init", "-b", "main"]);
   return { ok: result.ok, error: result.ok ? null : result.stderr };
+}
+
+export interface GitWorktreeCreateResult {
+  ok: boolean;
+  branch: string;
+  worktreePath: string;
+  error: string | null;
+}
+
+/** Claude Code Desktop と同じ `.claude/worktrees` 配下へセッション用 worktree を作る。 */
+export async function gitWorktreeCreate(
+  repositoryWorkdir: string,
+  baseBranch: string,
+): Promise<GitWorktreeCreateResult> {
+  const rootResult = await runGit(repositoryWorkdir, ["rev-parse", "--show-toplevel"]);
+  if (!rootResult.ok) {
+    return { ok: false, branch: "", worktreePath: "", error: rootResult.stderr };
+  }
+  const repoRoot = rootResult.stdout.trim();
+  if (!validRepositoryPath(repoRoot)) {
+    return { ok: false, branch: "", worktreePath: "", error: "Git ルートが絶対パスではありません。" };
+  }
+
+  const timestamp = formatWorktreeTimestamp(new Date());
+  let suffix = 1;
+  let slug = timestamp;
+  let branch = `worktree-${slug}`;
+  let worktreePath = path.join(repoRoot, ".claude", "worktrees", slug);
+  for (;;) {
+    const branchExists = await runGit(repoRoot, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
+    if (!fs.existsSync(worktreePath) && !branchExists.ok) break;
+    suffix += 1;
+    slug = `${timestamp}-${suffix}`;
+    branch = `worktree-${slug}`;
+    worktreePath = path.join(repoRoot, ".claude", "worktrees", slug);
+  }
+
+  const added = await runGit(repoRoot, ["worktree", "add", worktreePath, "-b", branch, baseBranch]);
+  if (!added.ok) return { ok: false, branch, worktreePath, error: added.stderr };
+
+  const errors: string[] = [];
+  const excludeError = await appendWorktreeExclude(repoRoot);
+  if (excludeError !== null) errors.push(excludeError);
+  const includeError = await copyWorktreeIncludes(repoRoot, worktreePath);
+  if (includeError !== null) {
+    gitServiceDiag(`.worktreeinclude コピー失敗 path=${worktreePath}: ${includeError}`);
+  }
+  const locked = await runGit(repoRoot, ["worktree", "lock", "--reason", WORKTREE_LOCK_REASON, worktreePath]);
+  if (!locked.ok) errors.push(locked.stderr);
+  return {
+    ok: errors.length === 0,
+    branch,
+    worktreePath,
+    error: errors.length === 0 ? null : errors.join("\n"),
+  };
+}
+
+/** worktree のロック解除。dirty worktree を残してセッションだけ終了する場合にも使う。 */
+export async function gitWorktreeUnlock(
+  worktreePath: string,
+): Promise<{ ok: boolean; error: string | null }> {
+  const result = await runGit(worktreePath, ["worktree", "unlock", worktreePath]);
+  return { ok: result.ok, error: result.ok ? null : result.stderr };
+}
+
+/**
+ * worktree に未保存変更がなく、HEAD が自分以外のローカルブランチから到達可能なら clean。
+ * 後者により worktree 上だけの新規コミットを自動削除しない。
+ */
+export async function gitWorktreeIsClean(worktreePath: string): Promise<boolean> {
+  const status = await runGit(worktreePath, ["status", "--porcelain"]);
+  if (!status.ok || status.stdout.length !== 0) return false;
+  const head = await runGit(worktreePath, ["rev-parse", "--verify", "HEAD"]);
+  if (!head.ok) return false;
+  const current = await runGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+  const branches = await runGit(worktreePath, [
+    "for-each-ref", "--format=%(refname:short)", "--contains=HEAD", "refs/heads",
+  ]);
+  if (!branches.ok) return false;
+  const currentBranch = current.ok ? current.stdout.trim() : null;
+  return branches.stdout.split(/\r?\n/).some((branchName) =>
+    branchName.length > 0 && branchName !== currentBranch
+  );
+}
+
+/** `.claude/worktrees` 配下を文字列だけで判定する純関数。 */
+export function isTailiiWorktreePath(candidate: string): boolean {
+  return candidate.replaceAll("\\", "/").includes("/.claude/worktrees/");
+}
+
+/** worktree と、安全な自動生成ブランチだけを削除して管理情報を prune する。 */
+export async function gitWorktreeRemove(
+  worktreePath: string,
+  force: boolean,
+): Promise<{ ok: boolean; error: string | null }> {
+  const listed = await runGit(worktreePath, ["worktree", "list", "--porcelain"]);
+  if (!listed.ok) return { ok: false, error: listed.stderr };
+  const managementPath = worktreeManagementPath(listed.stdout, worktreePath);
+  if (managementPath === null || !validRepositoryPath(managementPath)) {
+    return { ok: false, error: "worktree の管理リポジトリを特定できません。" };
+  }
+  const current = await runGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+  const branch = current.ok ? current.stdout.trim() : null;
+  await runGit(managementPath, ["worktree", "unlock", worktreePath]);
+
+  const errors: string[] = [];
+  const removed = await runGit(managementPath, [
+    "worktree", "remove", ...(force ? ["--force"] : []), worktreePath,
+  ]);
+  if (!removed.ok) errors.push(removed.stderr);
+  if (removed.ok && branch !== null &&
+    (branch.startsWith("worktree-") || branch.startsWith("tailii/"))) {
+    const deleted = await runGit(managementPath, ["branch", force ? "-D" : "-d", branch]);
+    if (!deleted.ok) errors.push(deleted.stderr);
+  }
+  const pruned = await runGit(managementPath, ["worktree", "prune"]);
+  if (!pruned.ok) errors.push(pruned.stderr);
+  return { ok: errors.length === 0, error: errors.length === 0 ? null : errors.join("\n") };
 }
 
 export async function gitEntryStatuses(

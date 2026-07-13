@@ -49,6 +49,11 @@ import {
   gitInit,
   gitLog,
   gitStatus,
+  gitWorktreeCreate,
+  gitWorktreeIsClean,
+  gitWorktreeRemove,
+  gitWorktreeUnlock,
+  isTailiiWorktreePath,
 } from "./gitService.js";
 import type { QuestionEventMessage, SessionProcessingMessage } from "./engineRelaySocket.js";
 import { makeSessionLauncher, claudeInnerCommand, type EngineLauncher } from "./launch.js";
@@ -76,7 +81,7 @@ import { TmuxSessionManager } from "./tmux.js";
 import { aggregateUsage, emptyUsageTotals } from "./usageAggregator.js";
 import { aggregateCodexUsage, type CodexUsage } from "./codexUsage.js";
 import { createStaleDistGuard, isStaleDist, readPackageVersion, type StaleDistGuard } from "./version.js";
-import { canonicalPath } from "./paths.js";
+import { canonicalPath, claudeProjectSlug } from "./paths.js";
 
 function engineDiag(message: string): void {
   if (process.env["TAILII_DEBUG"] === "1") process.stderr.write(`[tailii-host engine] ${message}\n`);
@@ -908,6 +913,8 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
 
     case "session_kill": {
       try {
+        // cwd の権威は tmux の現在位置ではなく永続 SessionMetadataStore。
+        const killedCwd = metadataStore?.get(message.name)?.cwd ?? null;
         // 明示 kill はユーザー意思なので処理中保護より優先する（保護記録も掃除）。
         ctx.processingSessions.delete(message.name);
         ctx.hubLink.send({ type: "conversation_unsubscribe", session: message.name });
@@ -918,6 +925,30 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
           ctx.activeChatSession.name = null;
         }
         await sessionManager.kill(message.name);
+        let worktreeResponse: WorktreeResponseFields | null = null;
+        if (killedCwd !== null && isTailiiWorktreePath(killedCwd)) {
+          worktreeResponse = { worktreePath: killedCwd };
+          try {
+            if (await gitWorktreeIsClean(killedCwd)) {
+              const removed = await gitWorktreeRemove(killedCwd, false);
+              if (removed.ok) {
+                worktreeResponse.worktreeRemoved = true;
+              } else {
+                engineDiag(`session_kill worktree 削除失敗 path=${killedCwd}: ${removed.error ?? "unknown"}`);
+              }
+            } else {
+              engineDiag(`session_kill worktree dirty または clean 判定不能のため保持 path=${killedCwd}`);
+              worktreeResponse.worktreeDirty = true;
+              const unlocked = await gitWorktreeUnlock(killedCwd);
+              if (!unlocked.ok) {
+                engineDiag(`session_kill worktree unlock 失敗 path=${killedCwd}: ${unlocked.error ?? "unknown"}`);
+              }
+            }
+          } catch (error) {
+            // worktree の判定・掃除は fail-open。ユーザーが要求した tmux kill の成功を覆さない。
+            engineDiag(`session_kill worktree 掃除失敗 path=${killedCwd}: ${String(error)}`);
+          }
+        }
         // kill 成功は list 応答（現況一覧）で返す（疎通確認）。
         let sessions: SessionInfo[] = [];
         try {
@@ -925,7 +956,7 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
         } catch {
           sessions = [];
         }
-        writeSessionListResponse(writer, v, message.id, sessions, null);
+        writeSessionListResponse(writer, v, message.id, sessions, null, null, worktreeResponse);
       } catch (error) {
         writeError(writer, v, message.id, "tmux_error", String(error));
       }
@@ -1271,7 +1302,7 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
       // 使用量（claude）: プラン使用率（OAuth 使用量 API, ベストエフォート）+ tail 中会話の usage 合算。
       const currentMeta = ctx.activeChatSession.name === null ? null : metadataStore?.get(ctx.activeChatSession.name) ?? null;
       const transcript = currentMeta === null ? null : TranscriptTailer.resolveJsonl(
-        path.join(os.homedir(), ".claude", "projects", canonicalPath(currentMeta.cwd).replaceAll("/", "-")),
+        path.join(os.homedir(), ".claude", "projects", claudeProjectSlug(currentMeta.cwd)),
         currentMeta.providerSessionId ?? currentMeta.claudeSessionId ?? null,
         null,
       );
@@ -1603,6 +1634,31 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
       break;
     }
 
+    case "git_worktree_create_request": {
+      try {
+        const response = await gitWorktreeCreate(message.path, message.baseBranch);
+        writer.write({ type: "git_worktree_create_response", v, id: message.id, ...response });
+      } catch (error) {
+        engineDiag(`git_worktree_create_response 失敗 id=${message.id}: ${String(error)}`);
+        writer.write({
+          type: "git_worktree_create_response", v, id: message.id,
+          ok: false, branch: "", worktreePath: "", error: String(error),
+        });
+      }
+      break;
+    }
+
+    case "git_worktree_remove_request": {
+      try {
+        const response = await gitWorktreeRemove(message.path, message.force);
+        writer.write({ type: "git_worktree_remove_response", v, id: message.id, ...response });
+      } catch (error) {
+        engineDiag(`git_worktree_remove_response 失敗 id=${message.id}: ${String(error)}`);
+        writer.write({ type: "git_worktree_remove_response", v, id: message.id, ok: false, error: String(error) });
+      }
+      break;
+    }
+
     case "claude_session_list_request": {
       // 会話一覧: claude(jsonl) + codex(rollout) をマージし updatedAt 降順で返す（agent-tag）。
       // store 未注入時はその分を空一覧扱い（後方互換 — 会話機能なし）。
@@ -1928,6 +1984,12 @@ function stripYamlQuotes(value: string): string {
 }
 
 /** session_list_response を書き出す（optional cursor / host 採用名は null なら省略）。 */
+interface WorktreeResponseFields {
+  worktreePath: string;
+  worktreeRemoved?: boolean;
+  worktreeDirty?: boolean;
+}
+
 function writeSessionListResponse(
   writer: LineWriter,
   v: number,
@@ -1935,6 +1997,7 @@ function writeSessionListResponse(
   sessions: SessionInfo[],
   nextCursor: string | null,
   adoptedName: string | null = null,
+  worktree: WorktreeResponseFields | null = null,
 ): void {
   writer.write({
     type: "session_list_response",
@@ -1943,6 +2006,7 @@ function writeSessionListResponse(
     sessions,
     ...(nextCursor !== null && { nextCursor }),
     ...(adoptedName !== null && { adoptedName }),
+    ...(worktree !== null && worktree),
   });
 }
 

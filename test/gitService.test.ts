@@ -3,7 +3,7 @@
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import {
   gitBranchList,
   gitCheckout,
@@ -13,6 +13,10 @@ import {
   gitInit,
   gitLog,
   gitStatus,
+  gitWorktreeCreate,
+  gitWorktreeIsClean,
+  gitWorktreeRemove,
+  isTailiiWorktreePath,
   parsePorcelainV2,
 } from "../src/gitService.js";
 import { makeTempDir } from "./helpers.js";
@@ -31,6 +35,28 @@ function makeRepository(): string {
   git(root, ["commit", "-m", "initial"]);
   // macOS の /tmp は /private への symlink で、git rev-parse --show-toplevel は実パスを返す。
   return fs.realpathSync(root);
+}
+
+function makeWorktreeRepository(): string {
+  const root = makeRepository();
+  fs.writeFileSync(path.join(root, ".gitignore"), "*.env\nignored-dir/\nignored-only.bin\n");
+  fs.writeFileSync(path.join(root, ".worktreeinclude"), [
+    "# worktree local files",
+    "",
+    "*.env",
+    "ignored-dir/",
+    "tracked.txt",
+    "unignored.txt",
+  ].join("\n"));
+  git(root, ["add", ".gitignore", ".worktreeinclude"]);
+  git(root, ["commit", "-m", "worktree config"]);
+  fs.writeFileSync(path.join(root, "app.env"), "TOKEN=test\n");
+  fs.mkdirSync(path.join(root, "ignored-dir", "nested"), { recursive: true });
+  fs.writeFileSync(path.join(root, "ignored-dir", "nested", "local.txt"), "local\n");
+  fs.writeFileSync(path.join(root, "ignored-only.bin"), "ignored but not included\n");
+  fs.writeFileSync(path.join(root, "unignored.txt"), "untracked but not ignored\n");
+  fs.writeFileSync(path.join(root, "tracked.txt"), "dirty source version\n");
+  return root;
 }
 
 describe("parsePorcelainV2", () => {
@@ -282,5 +308,176 @@ describe("gitService", () => {
     const result = await gitDiff(root);
     expect(result.diff).toHaveLength(200_000);
     expect(result.truncated).toBe(true);
+  });
+});
+
+describe("gitService worktree", () => {
+  test("create は公式 branch・lock・exclude を作り、worktreeinclude の積集合だけをコピーする", async () => {
+    const root = makeWorktreeRepository();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(2026, 6, 13, 12, 0, 0));
+    try {
+      const first = await gitWorktreeCreate(root, "main");
+      expect(first).toEqual({
+        ok: true,
+        branch: "worktree-20260713-120000",
+        worktreePath: path.join(root, ".claude", "worktrees", "20260713-120000"),
+        error: null,
+      });
+      expect(fs.realpathSync(first.worktreePath)).toBe(fs.realpathSync(path.join(
+        root, ".claude", "worktrees", "20260713-120000",
+      )));
+      expect(git(root, ["branch", "--list", first.branch]).trim()).toContain(first.branch);
+      expect(git(root, ["worktree", "list", "--porcelain"])).toContain(
+        `worktree ${fs.realpathSync(first.worktreePath)}\nHEAD `,
+      );
+      expect(git(root, ["worktree", "list", "--porcelain"])).toContain("locked tailii-session");
+      expect(fs.readFileSync(path.join(root, ".git", "info", "exclude"), "utf8")
+        .split(/\r?\n/).filter((line) => line === ".claude/worktrees/")).toHaveLength(1);
+      expect(fs.readFileSync(path.join(first.worktreePath, "app.env"), "utf8")).toBe("TOKEN=test\n");
+      expect(fs.readFileSync(path.join(
+        first.worktreePath, "ignored-dir", "nested", "local.txt",
+      ), "utf8")).toBe("local\n");
+      expect(fs.readFileSync(path.join(first.worktreePath, "tracked.txt"), "utf8")).toBe("one\n");
+      expect(fs.existsSync(path.join(first.worktreePath, "unignored.txt"))).toBe(false);
+      expect(fs.existsSync(path.join(first.worktreePath, "ignored-only.bin"))).toBe(false);
+
+      const second = await gitWorktreeCreate(root, "main");
+      expect(second).toMatchObject({
+        ok: true,
+        branch: "worktree-20260713-120000-2",
+        worktreePath: path.join(root, ".claude", "worktrees", "20260713-120000-2"),
+        error: null,
+      });
+      expect(fs.readFileSync(path.join(root, ".git", "info", "exclude"), "utf8")
+        .split(/\r?\n/).filter((line) => line === ".claude/worktrees/")).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("create は .worktreeinclude 不在なら ignored ファイルをコピーしない", async () => {
+    const root = makeRepository();
+    fs.writeFileSync(path.join(root, ".gitignore"), "*.env\n");
+    git(root, ["add", ".gitignore"]);
+    git(root, ["commit", "-m", "add ignore"]);
+    fs.writeFileSync(path.join(root, "local.env"), "TOKEN=test\n");
+
+    const created = await gitWorktreeCreate(root, "main");
+    expect(created.ok).toBe(true);
+    expect(fs.existsSync(path.join(created.worktreePath, "local.env"))).toBe(false);
+  });
+
+  test("create は worktreeinclude コピー失敗を best-effort にする", async () => {
+    const root = makeRepository();
+    fs.mkdirSync(path.join(root, ".worktreeinclude"));
+
+    const created = await gitWorktreeCreate(root, "main");
+    expect(created).toMatchObject({ ok: true, error: null });
+    expect(fs.existsSync(created.worktreePath)).toBe(true);
+  });
+
+  test("create は非 repo と存在しない base を ok:false に正規化する", async () => {
+    const nonRepo = fs.realpathSync(makeTempDir("git-worktree-non-repo"));
+    await expect(gitWorktreeCreate(nonRepo, "main")).resolves.toMatchObject({
+      ok: false, branch: "", worktreePath: "", error: expect.any(String),
+    });
+
+    const root = makeRepository();
+    const missingBase = await gitWorktreeCreate(root, "does-not-exist");
+    expect(missingBase).toMatchObject({ ok: false, error: expect.any(String) });
+    expect(missingBase.branch).toMatch(/^worktree-/);
+    expect(fs.existsSync(missingBase.worktreePath)).toBe(false);
+
+    const unborn = fs.realpathSync(makeTempDir("git-worktree-unborn"));
+    git(unborn, ["init", "-b", "main"]);
+    await expect(gitWorktreeCreate(unborn, "main")).resolves.toMatchObject({
+      ok: false, branch: expect.stringMatching(/^worktree-/), error: expect.any(String),
+    });
+  });
+
+  test("isClean は直後のみ true で、未コミット変更と worktree 上の新規 commit は false", async () => {
+    const root = makeRepository();
+    const created = await gitWorktreeCreate(root, "main");
+    expect(created.ok).toBe(true);
+    const worktreePath = fs.realpathSync(created.worktreePath);
+    await expect(gitWorktreeIsClean(worktreePath)).resolves.toBe(true);
+
+    fs.appendFileSync(path.join(worktreePath, "tracked.txt"), "dirty\n");
+    await expect(gitWorktreeIsClean(worktreePath)).resolves.toBe(false);
+    git(worktreePath, ["restore", "tracked.txt"]);
+    fs.writeFileSync(path.join(worktreePath, "commit.txt"), "new\n");
+    git(worktreePath, ["add", "commit.txt"]);
+    git(worktreePath, ["commit", "-m", "worktree-only commit"]);
+    await expect(gitWorktreeIsClean(worktreePath)).resolves.toBe(false);
+  });
+
+  test("remove は clean worktree と worktree- branch を削除して prune する", async () => {
+    const root = makeRepository();
+    const created = await gitWorktreeCreate(root, "main");
+    expect(created.ok).toBe(true);
+    const worktreePath = fs.realpathSync(created.worktreePath);
+
+    await expect(gitWorktreeRemove(worktreePath, false)).resolves.toEqual({ ok: true, error: null });
+    expect(fs.existsSync(worktreePath)).toBe(false);
+    expect(git(root, ["branch", "--list", created.branch]).trim()).toBe("");
+    expect(git(root, ["worktree", "list", "--porcelain"])).not.toContain(`worktree ${worktreePath}\n`);
+    const admin = path.join(root, ".git", "worktrees");
+    expect(fs.existsSync(admin) ? fs.readdirSync(admin) : []).toEqual([]);
+  });
+
+  test("remove force は dirty worktree と worktree- branch を強制削除する", async () => {
+    const root = makeRepository();
+    const created = await gitWorktreeCreate(root, "main");
+    expect(created.ok).toBe(true);
+    const worktreePath = fs.realpathSync(created.worktreePath);
+    fs.appendFileSync(path.join(worktreePath, "tracked.txt"), "dirty\n");
+
+    await expect(gitWorktreeRemove(worktreePath, true)).resolves.toEqual({ ok: true, error: null });
+    expect(fs.existsSync(worktreePath)).toBe(false);
+    expect(git(root, ["branch", "--list", created.branch]).trim()).toBe("");
+    expect(git(root, ["worktree", "list", "--porcelain"])).not.toContain(`worktree ${worktreePath}\n`);
+  });
+
+  test("remove 非 force は未 merge branch の削除失敗を返しつつ prune まで続ける", async () => {
+    const root = makeRepository();
+    const created = await gitWorktreeCreate(root, "main");
+    expect(created.ok).toBe(true);
+    const worktreePath = fs.realpathSync(created.worktreePath);
+    fs.writeFileSync(path.join(worktreePath, "commit.txt"), "new\n");
+    git(worktreePath, ["add", "commit.txt"]);
+    git(worktreePath, ["commit", "-m", "unmerged worktree commit"]);
+
+    const removed = await gitWorktreeRemove(worktreePath, false);
+    expect(removed).toMatchObject({ ok: false, error: expect.any(String) });
+    expect(fs.existsSync(worktreePath)).toBe(false);
+    expect(git(root, ["branch", "--list", created.branch])).toContain(created.branch);
+    expect(git(root, ["worktree", "list", "--porcelain"])).not.toContain(`worktree ${worktreePath}\n`);
+  });
+
+  test("remove は後方互換の tailii/ branch も削除する", async () => {
+    const root = makeRepository();
+    const worktreePath = path.join(root, ".claude", "worktrees", "legacy-tailii-branch");
+    git(root, ["worktree", "add", worktreePath, "-b", "tailii/legacy", "main"]);
+    const realWorktreePath = fs.realpathSync(worktreePath);
+
+    await expect(gitWorktreeRemove(realWorktreePath, false)).resolves.toEqual({ ok: true, error: null });
+    expect(git(root, ["branch", "--list", "tailii/legacy"])).not.toContain("tailii/legacy");
+  });
+
+  test("remove は無関係な branch を削除しない", async () => {
+    const root = makeRepository();
+    const worktreePath = path.join(root, ".claude", "worktrees", "manual-safe-branch");
+    git(root, ["worktree", "add", worktreePath, "-b", "feature/x", "main"]);
+    const realWorktreePath = fs.realpathSync(worktreePath);
+
+    await expect(gitWorktreeRemove(realWorktreePath, false)).resolves.toEqual({ ok: true, error: null });
+    expect(git(root, ["branch", "--list", "feature/x"])).toContain("feature/x");
+  });
+
+  test("isTailiiWorktreePath は marker を含むパスだけを判定する", () => {
+    expect(isTailiiWorktreePath("/repo/.claude/worktrees/20260713-120000")).toBe(true);
+    expect(isTailiiWorktreePath("/repo/.claude/worktrees")).toBe(false);
+    expect(isTailiiWorktreePath("/repo/worktrees/example")).toBe(false);
   });
 });

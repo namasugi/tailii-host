@@ -16,3 +16,7 @@
 {"error":null,"id":"gx1","ok":true,"type":"git_discard_response","v":1}
 {"id":"gi1","path":"/Users/alice/newproj","type":"git_init_request","v":1}
 {"error":null,"id":"gi1","ok":true,"type":"git_init_response","v":1}
+{"baseBranch":"main","id":"gw1","path":"/Users/alice/project","type":"git_worktree_create_request","v":1}
+{"branch":"tailii/20260713-120000","error":null,"id":"gw1","ok":true,"type":"git_worktree_create_response","v":1,"worktreePath":"/Users/alice/project/.claude/worktrees/20260713-120000"}
+{"force":false,"id":"gw2","path":"/Users/alice/project/.claude/worktrees/20260713-120000","type":"git_worktree_remove_request","v":1}
+{"error":null,"id":"gw2","ok":true,"type":"git_worktree_remove_response","v":1}

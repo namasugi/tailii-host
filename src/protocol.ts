@@ -222,7 +222,7 @@ export type ControlMessage =
   | { type: "remote_pending"; v: number; id: string; session: string; kind: RemotePendingKind; tool?: string; summary: string }
   | { type: "remote_pending_cleared"; v: number; id: string; session: string; kind: RemotePendingKind }
   | { type: "session_list_request"; v: number; id: string; limit?: number; cursor?: string }
-  | { type: "session_list_response"; v: number; id: string; sessions: SessionInfo[]; nextCursor?: string; adoptedName?: string }
+  | { type: "session_list_response"; v: number; id: string; sessions: SessionInfo[]; nextCursor?: string; adoptedName?: string; worktreePath?: string; worktreeRemoved?: boolean; worktreeDirty?: boolean }
   | { type: "session_start"; v: number; id: string; cwd: string; name: string; baseDir?: string; resumeSessionId?: string; title?: string; agentType?: "claude" | "codex"; model?: string; permissionMode?: "default" | "acceptEdits" | "plan" | "auto"; codexModel?: string; codexSandbox?: "read-only" | "workspace-write" | "danger-full-access"; deferSubscribe?: boolean }
   | { type: "session_reattach"; v: number; id: string; name: string }
   | { type: "session_kill"; v: number; id: string; name: string }
@@ -286,6 +286,10 @@ export type ControlMessage =
   | { type: "git_discard_response"; v: number; id: string; ok: boolean; error: string | null }
   | { type: "git_init_request"; v: number; id: string; path: string }
   | { type: "git_init_response"; v: number; id: string; ok: boolean; error: string | null }
+  | { type: "git_worktree_create_request"; v: number; id: string; path: string; baseBranch: string }
+  | { type: "git_worktree_create_response"; v: number; id: string; ok: boolean; branch: string; worktreePath: string; error: string | null }
+  | { type: "git_worktree_remove_request"; v: number; id: string; path: string; force: boolean }
+  | { type: "git_worktree_remove_response"; v: number; id: string; ok: boolean; error: string | null }
   | { type: "claude_session_list_request"; v: number; id: string }
   | { type: "claude_session_list_response"; v: number; id: string; claudeSessions: ClaudeSessionInfo[] }
   | { type: "dir_create_request"; v: number; id: string; baseDir: string; relative: string }
@@ -496,6 +500,9 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         }),
         nextCursor: optionalString(raw, "nextCursor"),
         adoptedName: optionalString(raw, "adoptedName"),
+        worktreePath: optionalString(raw, "worktreePath"),
+        worktreeRemoved: optionalBoolean(raw, "worktreeRemoved"),
+        worktreeDirty: optionalBoolean(raw, "worktreeDirty"),
       });
 
     case "session_start": {
@@ -827,6 +834,18 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
     case "git_init_request":
       return { type, v, id: requireString(raw, "id"), path: requireString(raw, "path") };
 
+    case "git_worktree_create_request":
+      return {
+        type, v, id: requireString(raw, "id"), path: requireString(raw, "path"),
+        baseBranch: requireString(raw, "baseBranch"),
+      };
+
+    case "git_worktree_remove_request":
+      return {
+        type, v, id: requireString(raw, "id"), path: requireString(raw, "path"),
+        force: requireBoolean(raw, "force"),
+      };
+
     case "file_list_response":
       return {
         type, v,
@@ -947,8 +966,16 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
 
     case "git_discard_response":
     case "git_init_response":
+    case "git_worktree_remove_response":
       return {
         type, v, id: requireString(raw, "id"), ok: requireBoolean(raw, "ok"),
+        error: optionalNullableString(raw, "error") ?? null,
+      };
+
+    case "git_worktree_create_response":
+      return {
+        type, v, id: requireString(raw, "id"), ok: requireBoolean(raw, "ok"),
+        branch: requireString(raw, "branch"), worktreePath: requireString(raw, "worktreePath"),
         error: optionalNullableString(raw, "error") ?? null,
       };
 
