@@ -164,6 +164,53 @@ describe("decode 詳細", () => {
     ]);
   });
 
+  it("v1 session_chat_output のセッション情報と本文を復元する", () => {
+    const line = goldenLines("approval-protocol-v1.ndjson").find((entry) =>
+      entry.includes('"type":"session_chat_output"'),
+    );
+    expect(line).toBeDefined();
+    const decoded = decodeControlMessage(line!);
+    expect(decoded).toEqual({
+      type: "session_chat_output",
+      v: 1,
+      session: "proj-bg",
+      serverSeq: 42,
+      streamId: "chat-bg-0001-0000-0000-000000000001",
+      role: "assistant",
+      text: "バックグラウンドで処理中",
+      eof: false,
+    });
+  });
+
+  it("v1 session_tool_activity の activity を flat wire から復元する", () => {
+    const line = goldenLines("approval-protocol-v1.ndjson").find((entry) =>
+      entry.includes('"type":"session_tool_activity"'),
+    );
+    expect(line).toBeDefined();
+    const decoded = decodeControlMessage(line!);
+    if (decoded.type !== "session_tool_activity") {
+      throw new Error("session_tool_activity を期待");
+    }
+    expect(decoded.session).toBe("proj-bg");
+    expect(decoded.serverSeq).toBe(43);
+    expect(decoded.activity).toEqual({
+      id: "tool-bg-0001-0000-0000-000000000001",
+      name: "Edit",
+      label: "編集済み Background.swift",
+      file: "/Users/alice/project/Background.swift",
+      addedLines: 2,
+      removedLines: 1,
+      commandTruncated: false,
+      descriptionTruncated: false,
+      diff: {
+        oldString: "let value = 1",
+        newString: "let value = 2",
+        oldStringTruncated: false,
+        newStringTruncated: false,
+      },
+    });
+  });
+
   it("v1 question_answer の multiSelect 欠落は false として復元する（additive 互換）", () => {
     const legacyAnswer =
       '{"answers":[{"questionIndex":0,"selectedOptionIndexes":[1]}],"id":"q1","session":"s","type":"question_answer","v":1}';
@@ -280,6 +327,15 @@ describe("decode 詳細", () => {
     expect(() => decodeControlMessage(
       '{"clientMessageId":"c","id":"r","session":"s","text":"","type":"chat_send","v":2}',
     )).toThrow(ProtocolDecodeError);
+
+    const explicitRetry = {
+      type: "chat_send" as const, v: 2 as const, id: "retry", session: "s",
+      clientMessageId: "c", text: "retry", explicitRetry: true,
+    };
+    expect(decodeControlMessage(encodeControlMessage(explicitRetry))).toEqual(explicitRetry);
+    expect(decodeControlMessage(
+      '{"clientMessageId":"c","explicitRetry":"yes","id":"r","session":"s","text":"x","type":"chat_send","v":2}',
+    )).not.toHaveProperty("explicitRetry");
   });
 
   it("remote_pending / remote_pending_cleared を復元する", () => {
@@ -459,6 +515,14 @@ describe("encode 詳細", () => {
       clientUserMessageId: "client-1",
       effort: "xhigh",
     });
+
+    const retryWire = encodeControlMessage({
+      type: "codex_turn_start", v: 2, id: "retry", session: "codex-work", text: "retry",
+      clientUserMessageId: "client-1", explicitRetry: true,
+    });
+    expect(decodeControlMessage(retryWire)).toMatchObject({
+      type: "codex_turn_start", id: "retry", explicitRetry: true,
+    });
   });
 
   it("codex_turn_interrupt は session を指定して往復する", () => {
@@ -476,6 +540,20 @@ describe("encode 詳細", () => {
       v: 2,
       id: "interrupt-1",
       session: "codex-work",
+    });
+  });
+
+  it("codex_turn_start_result は相関 id と送達結果を往復する", () => {
+    const wire = encodeControlMessage({
+      type: "codex_turn_start_result", v: 2, id: "turn-ack-1",
+      status: "failed", error: "hub timeout",
+    });
+    expect(wire).toBe(
+      '{"error":"hub timeout","id":"turn-ack-1","status":"failed","type":"codex_turn_start_result","v":2}',
+    );
+    expect(decodeControlMessage(wire)).toEqual({
+      type: "codex_turn_start_result", v: 2, id: "turn-ack-1",
+      status: "failed", error: "hub timeout",
     });
   });
 

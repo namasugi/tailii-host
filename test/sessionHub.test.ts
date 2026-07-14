@@ -59,7 +59,7 @@ describe("SessionHub actor", () => {
     });
   });
 
-  test("chat_send は即時 accepted、同じ clientMessageId は duplicate", async () => {
+  test("chat_send は注入完了後に accepted、注入中の同じ clientMessageId は同じ結果へ合流する", async () => {
     let release: (() => void) | undefined;
     const injection = new Promise<void>((resolve) => { release = resolve; });
     const chatInjector = vi.fn(async () => injection);
@@ -70,12 +70,14 @@ describe("SessionHub actor", () => {
     const send = (id: string) => hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id,
       session: "work", clientMessageId: "client-1", text: "hello" }));
     send("one");
-    expect(received).toContainEqual({ type: "chat_send_result", id: "one", status: "accepted" });
+    expect(received).not.toContainEqual(expect.objectContaining({ type: "chat_send_result" }));
     expect(hub.hasInjectionsInFlight).toBe(true);
     send("two");
-    expect(received).toContainEqual({ type: "chat_send_result", id: "two", status: "duplicate" });
+    expect(received).not.toContainEqual(expect.objectContaining({ type: "chat_send_result" }));
     release?.();
     await vi.waitFor(() => expect(hub.hasInjectionsInFlight).toBe(false));
+    expect(received).toContainEqual({ type: "chat_send_result", id: "one", status: "accepted" });
+    expect(received).toContainEqual({ type: "chat_send_result", id: "two", status: "accepted" });
     expect(chatInjector).toHaveBeenCalledOnce();
   });
 
@@ -104,28 +106,269 @@ describe("SessionHub actor", () => {
     ]));
   });
 
+  test("chat_send receipt は queued→injecting→delivered を永続化してから ACK する", async () => {
+    const receiptsPath = path.join(makeTempDir("hub-chat-receipt"), "receipts.json");
+    let release!: () => void;
+    const injection = new Promise<void>((resolve) => { release = resolve; });
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-chat-receipt-hb"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, chatReceiptsPath: receiptsPath,
+      chatInjector: async () => injection });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "one", session: "work",
+      clientMessageId: "client-1", text: "hello" }));
+
+    await vi.waitFor(() => expect(JSON.parse(fs.readFileSync(receiptsPath, "utf8")))
+      .toMatchObject({ sessions: { work: { injecting: [{ clientMessageId: "client-1" }] } } }));
+    expect(received).not.toContainEqual(expect.objectContaining({ type: "chat_send_result" }));
+    release();
+    await vi.waitFor(() => expect(received).toContainEqual({
+      type: "chat_send_result", id: "one", status: "accepted",
+    }));
+    expect(JSON.parse(fs.readFileSync(receiptsPath, "utf8"))).toMatchObject({
+      sessions: { work: { delivered: ["client-1"], queued: [], injecting: [] } },
+    });
+  });
+
+  test("delivered receipt は200件を越えて保持し、TTLを過ぎたIDだけ再利用可能にする", async () => {
+    const receiptsPath = path.join(makeTempDir("hub-chat-receipt-retention"), "receipts.json");
+    const now = Date.now();
+    const retained = Array.from({ length: 201 }, (_, index) => `retained-${index}`);
+    const expired = "expired-id";
+    fs.writeFileSync(receiptsPath, JSON.stringify({ version: 1, sessions: { work: {
+      delivered: [...retained, expired],
+      deliveredAtMs: Object.fromEntries([
+        ...retained.map((id) => [id, now] as const),
+        [expired, now - 31 * 24 * 60 * 60 * 1_000],
+      ]),
+      queued: [], injecting: [], chatOrder: [], deliveredCodex: [], startingCodex: [],
+    } } }));
+    const chatInjector = vi.fn(async () => {});
+    const hub = new SessionHub({ runner: async () => ok(""),
+      heartbeatDir: makeTempDir("hub-chat-receipt-retention-hb"), metadataStore: makeTempStore(),
+      timeoutSeconds: 1800, chatReceiptsPath: receiptsPath, chatInjector });
+    hub.restoreChatReceipts();
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "retained",
+      session: "work", clientMessageId: retained[0], text: "duplicate" }));
+    expect(received).toContainEqual({
+      type: "chat_send_result", id: "retained", status: "duplicate",
+    });
+
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "expired",
+      session: "work", clientMessageId: expired, text: "allowed after ttl" }));
+    await vi.waitFor(() => expect(received).toContainEqual({
+      type: "chat_send_result", id: "expired", status: "accepted",
+    }));
+    expect(chatInjector).toHaveBeenCalledOnce();
+  });
+
+  test("Hub restart の injecting は明示retryで解決し、後続queuedは先頭解決まで停止する", async () => {
+    const message = { type: "chat_send", id: "old", session: "work",
+      clientMessageId: "client-uncertain", text: "do not duplicate" };
+    const following = { type: "chat_send", id: "following", session: "work",
+      clientMessageId: "client-following", text: "after uncertain" };
+    const receiptsPath = path.join(makeTempDir("hub-chat-uncertain"), "receipts.json");
+    fs.writeFileSync(receiptsPath, JSON.stringify({ version: 1, sessions: { work: {
+      delivered: [], queued: [following], injecting: [message],
+      chatOrder: [message.clientMessageId, following.clientMessageId],
+      deliveredCodex: [], startingCodex: [],
+    } } }));
+    const chatInjector = vi.fn(async () => {});
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-chat-uncertain-hb"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, chatReceiptsPath: receiptsPath, chatInjector });
+    hub.restoreChatReceipts();
+    await Promise.resolve();
+    expect(chatInjector).not.toHaveBeenCalled();
+
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ ...message, id: "retry" }));
+    expect(received).toContainEqual(expect.objectContaining({
+      type: "chat_send_result", id: "retry", status: "failed",
+      error: expect.stringContaining("explicit retry"),
+    }));
+    expect(chatInjector).not.toHaveBeenCalled();
+
+    hub.handleClientMessage(client, JSON.stringify({ ...message, id: "force", explicitRetry: true }));
+    await vi.waitFor(() => expect(chatInjector.mock.calls.map((call) => call[0])).toEqual([
+      "do not duplicate", "after uncertain",
+    ]));
+    expect(received).toContainEqual({ type: "chat_send_result", id: "force", status: "accepted" });
+  });
+
+  test("注入後のdelivered receipt保存失敗はacceptedを返しdirty retryで二重注入を防ぐ", async () => {
+    const receiptsPath = path.join(makeTempDir("hub-chat-persist-failure"), "receipts.json");
+    let writeCount = 0;
+    const firstInjector = vi.fn(async () => {});
+    const first = new SessionHub({ runner: async () => ok(""),
+      heartbeatDir: makeTempDir("hub-chat-persist-failure-hb"), metadataStore: makeTempStore(),
+      timeoutSeconds: 1800, chatReceiptsPath: receiptsPath, chatInjector: firstInjector,
+      chatReceiptsWriter: (target, contents) => {
+        writeCount += 1;
+        if (writeCount === 3) throw new Error("disk full after injection");
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, contents);
+      } });
+    const client = {}, received: unknown[] = [];
+    first.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    const message = { type: "chat_send", id: "one", session: "work",
+      clientMessageId: "client-persist-failure", text: "run once" };
+    first.handleClientMessage(client, JSON.stringify(message));
+    await vi.waitFor(() => expect(received).toContainEqual({
+      type: "chat_send_result", id: "one", status: "accepted",
+    }));
+    expect(firstInjector).toHaveBeenCalledOnce();
+    await first.tick();
+
+    const retryInjector = vi.fn(async () => {});
+    const restored = new SessionHub({ runner: async () => ok(""),
+      heartbeatDir: makeTempDir("hub-chat-persist-retry-hb"), metadataStore: makeTempStore(),
+      timeoutSeconds: 1800, chatReceiptsPath: receiptsPath, chatInjector: retryInjector });
+    restored.restoreChatReceipts();
+    const retryClient = {}, retryReceived: unknown[] = [];
+    restored.registerClient(retryClient, (line) => retryReceived.push(decodeHubServerLine(line)));
+    restored.handleClientMessage(retryClient, JSON.stringify({ ...message, id: "retry", explicitRetry: true }));
+    await vi.waitFor(() => expect(retryReceived).toContainEqual({
+      type: "chat_send_result", id: "retry", status: "duplicate",
+    }));
+    expect(retryInjector).not.toHaveBeenCalled();
+  });
+
+  test("session_retire は待機中queueとreceiptを消し、同名の新セッションへ注入しない", async () => {
+    const receiptsPath = path.join(makeTempDir("hub-chat-retire"), "receipts.json");
+    const chatInjector = vi.fn(async () => {});
+    const hub = new SessionHub({ runner: async () => ok(""),
+      heartbeatDir: makeTempDir("hub-chat-retire-hb"), metadataStore: makeTempStore(),
+      timeoutSeconds: 1800, chatReceiptsPath: receiptsPath, chatInjector });
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q-retire",
+      questions: [{ header: "h", question: "q", options: [], multiSelect: false }] });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "old", session: "work",
+      clientMessageId: "old-client", text: "old command" }));
+    await Promise.resolve();
+    expect(chatInjector).not.toHaveBeenCalled();
+
+    hub.handleClientMessage(client, JSON.stringify({ type: "session_retire", session: "work" }));
+    expect(hub.actors.has("work")).toBe(false);
+    expect(JSON.parse(fs.readFileSync(receiptsPath, "utf8"))).toEqual({ version: 1, sessions: {} });
+    expect(received).toContainEqual(expect.objectContaining({
+      type: "chat_send_result", id: "old", status: "failed",
+    }));
+
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "new", session: "work",
+      clientMessageId: "new-client", text: "new command" }));
+    await vi.waitFor(() => expect(chatInjector).toHaveBeenCalledOnce());
+    expect(chatInjector).toHaveBeenCalledWith("new command", "work");
+  });
+
+  test("restore は同名でもsession世代が異なる旧queueを新paneへ注入しない", async () => {
+    const receiptsPath = path.join(makeTempDir("hub-chat-generation"), "receipts.json");
+    const metadataStore = makeTempStore();
+    metadataStore.put({
+      name: "work", cwd: "/tmp/old", createdAt: 100, agent: "claude",
+      providerSessionId: "old-conversation", tmuxPaneId: "%1",
+    });
+    const first = new SessionHub({ runner: async () => ok(""),
+      heartbeatDir: makeTempDir("hub-chat-generation-first-hb"), metadataStore,
+      timeoutSeconds: 1800, chatReceiptsPath: receiptsPath, chatInjector: async () => {} });
+    first.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q-old",
+      questions: [{ header: "h", question: "q", options: [], multiSelect: false }] });
+    const client = {};
+    first.registerClient(client, () => {});
+    first.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "old", session: "work",
+      clientMessageId: "old-client", text: "must stay in old conversation" }));
+    expect(JSON.parse(fs.readFileSync(receiptsPath, "utf8"))).toMatchObject({
+      sessions: { work: { queued: [{ clientMessageId: "old-client" }] } },
+    });
+
+    metadataStore.put({
+      name: "work", cwd: "/tmp/new", createdAt: 101, agent: "claude",
+      providerSessionId: "new-conversation", tmuxPaneId: "%2",
+    });
+    const restoredInjector = vi.fn(async () => {});
+    const restored = new SessionHub({ runner: async () => ok(""),
+      heartbeatDir: makeTempDir("hub-chat-generation-restored-hb"), metadataStore,
+      timeoutSeconds: 1800, chatReceiptsPath: receiptsPath, chatInjector: restoredInjector });
+    restored.restoreChatReceipts();
+    await Promise.resolve();
+
+    expect(restoredInjector).not.toHaveBeenCalled();
+    expect(restored.actors.has("work")).toBe(false);
+    expect(JSON.parse(fs.readFileSync(receiptsPath, "utf8"))).toEqual({ version: 1, sessions: {} });
+  });
+
+  test("session_retire は注入await中actorの後続queueも停止する", async () => {
+    let releaseFirst: (() => void) | null = null;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const chatInjector = vi.fn(async (text: string) => {
+      if (text === "first") await firstGate;
+    });
+    const hub = new SessionHub({ runner: async () => ok(""),
+      heartbeatDir: makeTempDir("hub-chat-retire-inflight-hb"), metadataStore: makeTempStore(),
+      timeoutSeconds: 1800, chatInjector });
+    const client = {};
+    hub.registerClient(client, () => {});
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "one", session: "work",
+      clientMessageId: "client-one", text: "first" }));
+    await vi.waitFor(() => expect(chatInjector).toHaveBeenCalledOnce());
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "two", session: "work",
+      clientMessageId: "client-two", text: "second" }));
+
+    hub.handleClientMessage(client, JSON.stringify({ type: "session_retire", session: "work" }));
+    releaseFirst?.();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(chatInjector.mock.calls.map((call) => call[0])).toEqual(["first"]);
+    expect(hub.actors.has("work")).toBe(false);
+  });
+
+  test("session_retire 後に注入awaitがrejectしても同名actorを復活させない", async () => {
+    let rejectFirst: ((error: Error) => void) | null = null;
+    const firstGate = new Promise<void>((_resolve, reject) => { rejectFirst = reject; });
+    const chatInjector = vi.fn(async () => firstGate);
+    const hub = new SessionHub({ runner: async () => ok(""),
+      heartbeatDir: makeTempDir("hub-chat-retire-reject-hb"), metadataStore: makeTempStore(),
+      timeoutSeconds: 1800, chatInjector });
+    const client = {};
+    hub.registerClient(client, () => {});
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "one", session: "work",
+      clientMessageId: "client-one", text: "first" }));
+    await vi.waitFor(() => expect(chatInjector).toHaveBeenCalledOnce());
+
+    hub.handleClientMessage(client, JSON.stringify({ type: "session_retire", session: "work" }));
+    rejectFirst?.(new Error("pane disappeared"));
+    await vi.waitFor(() => expect(hub.hasInjectionsInFlight).toBe(false));
+
+    expect(hub.actors.has("work")).toBe(false);
+  });
+
   test("pendingQuestion 中の chat_send は dismiss 後まで保留する", async () => {
     const chatInjector = vi.fn(async () => {});
     const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-chat-question"),
       metadataStore: makeTempStore(), timeoutSeconds: 1800, chatInjector });
     hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q1",
       questions: [{ header: "h", question: "q", options: [], multiSelect: false }] });
-    const client = {};
-    hub.registerClient(client, () => {});
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
     hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "one", session: "work",
       clientMessageId: "client-1", text: "after answer" }));
     await Promise.resolve();
+    expect(received).not.toContainEqual(expect.objectContaining({ type: "chat_send_result" }));
     expect(chatInjector).not.toHaveBeenCalled();
     hub.handleRelayMessage({ type: "question_event", session: "work", event: "dismiss", id: "q1" });
     await vi.waitFor(() => expect(chatInjector).toHaveBeenCalledWith("after answer", "work"));
   });
 
-  test("chat_send 注入失敗は marker を配信し claim を解放する", async () => {
+  test("chat_send 注入の部分失敗はmarker+failedにしてuncertain receiptで再注入を抑止する", async () => {
+    const receiptsPath = path.join(makeTempDir("hub-chat-partial"), "receipts.json");
     const chatInjector = vi.fn()
       .mockRejectedValueOnce(new Error("boom"))
       .mockResolvedValueOnce(undefined);
     const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-chat-fail"),
-      metadataStore: makeTempStore(), timeoutSeconds: 1800, chatInjector });
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, chatInjector, chatReceiptsPath: receiptsPath });
     const client = {}, received: unknown[] = [];
     hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
     hub.handleClientMessage(client, JSON.stringify({ type: "conversation_subscribe", session: "work" }));
@@ -133,12 +376,21 @@ describe("SessionHub actor", () => {
       session: "work", clientMessageId: "client-1", text: "retry me" }));
     send("one");
     await vi.waitFor(() => expect(received).toContainEqual(expect.objectContaining({
+      type: "chat_send_result", id: "one", status: "failed",
+    })));
+    await vi.waitFor(() => expect(received).toContainEqual(expect.objectContaining({
       type: "conversation_event", session: "work",
       payload: expect.objectContaining({ streamId: "chat-send-error-one", role: "system" }),
     })));
     send("two");
-    expect(received).toContainEqual({ type: "chat_send_result", id: "two", status: "accepted" });
-    await vi.waitFor(() => expect(chatInjector).toHaveBeenCalledTimes(2));
+    expect(received).toContainEqual(expect.objectContaining({
+      type: "chat_send_result", id: "two", status: "failed",
+      error: expect.stringContaining("uncertain"),
+    }));
+    expect(chatInjector).toHaveBeenCalledOnce();
+    expect(JSON.parse(fs.readFileSync(receiptsPath, "utf8"))).toMatchObject({
+      sessions: { work: { injecting: [{ clientMessageId: "client-1" }] } },
+    });
   });
 
   test("codex turn は遅延生成した Hub controller へ渡し clientUserMessageId で重複排除する", async () => {
@@ -175,7 +427,48 @@ describe("SessionHub actor", () => {
       text: "run", clientUserMessageId: "client-1", effort: null, sandbox: null });
   });
 
-  test("codex turn は即時 started を返し、startTurn 失敗で claim 解放+エラーマーカー配信する", async () => {
+  test("Codex開始後のdelivered保存失敗もstartedを返しdirty retryで重複開始を防ぐ", async () => {
+    const receiptsPath = path.join(makeTempDir("hub-codex-persist-failure"), "receipts.json");
+    let writeCount = 0;
+    const startTurn = vi.fn(async () => "turn-1");
+    const first = new SessionHub({ runner: async () => ok(""),
+      heartbeatDir: makeTempDir("hub-codex-persist-failure-hb"), metadataStore: makeTempStore(),
+      timeoutSeconds: 1800, chatReceiptsPath: receiptsPath,
+      chatReceiptsWriter: (target, contents) => {
+        writeCount += 1;
+        if (writeCount === 3) throw new Error("disk full after turn start");
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, contents);
+      },
+      codexAppServerFactory: () => ({ openThread: async () => { throw new Error("unused"); } }),
+      codexTurnControllerFactory: () => ({ startTurn, closeSession: vi.fn(), close: vi.fn() }) });
+    const client = {}, received: unknown[] = [];
+    first.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    const message = { type: "codex_turn_submit", id: "one", session: "work", text: "run",
+      clientUserMessageId: "codex-persist-failure", effort: null, sandbox: null,
+      threadId: "thread-1", cwd: "/tmp/work" };
+    first.handleClientMessage(client, JSON.stringify(message));
+    await vi.waitFor(() => expect(received).toContainEqual({
+      type: "codex_turn_result", id: "one", status: "started",
+    }));
+    expect(startTurn).toHaveBeenCalledOnce();
+    await first.tick();
+
+    const restoredStart = vi.fn(async () => "must-not-start");
+    const restored = new SessionHub({ runner: async () => ok(""),
+      heartbeatDir: makeTempDir("hub-codex-persist-restored-hb"), metadataStore: makeTempStore(),
+      timeoutSeconds: 1800, chatReceiptsPath: receiptsPath,
+      codexAppServerFactory: () => ({ openThread: async () => { throw new Error("unused"); } }),
+      codexTurnControllerFactory: () => ({ startTurn: restoredStart, closeSession: vi.fn(), close: vi.fn() }) });
+    restored.restoreChatReceipts();
+    const retryClient = {}, retryReceived: unknown[] = [];
+    restored.registerClient(retryClient, (line) => retryReceived.push(decodeHubServerLine(line)));
+    restored.handleClientMessage(retryClient, JSON.stringify({ ...message, id: "retry", explicitRetry: true }));
+    expect(retryReceived).toContainEqual({ type: "codex_turn_result", id: "retry", status: "duplicate" });
+    expect(restoredStart).not.toHaveBeenCalled();
+  });
+
+  test("codex turn は startTurn 成功後だけ started を返し、失敗は failed+marker にする", async () => {
     let failNext = true;
     const startTurn = vi.fn(async () => {
       if (failNext) { failNext = false; throw new Error("boom"); }
@@ -197,17 +490,96 @@ describe("SessionHub actor", () => {
       threadId: "thread-1", cwd: "/tmp/work",
     }));
     submit("one");
-    // 実行完了を待たず即時 ack（engine timeout の fail-open 誤発動防止）。
-    expect(received).toContainEqual({ type: "codex_turn_result", id: "one", status: "started" });
+    await vi.waitFor(() => expect(received).toContainEqual(expect.objectContaining({
+      type: "codex_turn_result", id: "one", status: "failed",
+    })));
     // 失敗 → 全 client が見えるエラーマーカーを conversation_event で配信。
     await vi.waitFor(() => expect(received).toContainEqual(expect.objectContaining({
       type: "conversation_event", session: "work",
       payload: expect.objectContaining({ streamId: "codex-turn-error-one" }),
     })));
-    // claim は解放済み: 同じ clientUserMessageId の再送は duplicate にならない。
+    // startTurn 自体が部分成功してから throw した可能性を排除できないため、同一 ID は
+    // uncertain として自動再試行しない。
     submit("two");
-    expect(received).toContainEqual({ type: "codex_turn_result", id: "two", status: "started" });
-    await vi.waitFor(() => expect(startTurn).toHaveBeenCalledTimes(2));
+    expect(received).toContainEqual(expect.objectContaining({
+      type: "codex_turn_result", id: "two", status: "failed",
+      error: expect.stringContaining("uncertain"),
+    }));
+    expect(startTurn).toHaveBeenCalledOnce();
+    hub.handleClientMessage(client, JSON.stringify({
+      type: "codex_turn_submit", id: "force", session: "work", text: "run",
+      clientUserMessageId: "client-1", effort: null, sandbox: null,
+      threadId: "thread-1", cwd: "/tmp/work", explicitRetry: true,
+    }));
+    await vi.waitFor(() => expect(received).toContainEqual({
+      type: "codex_turn_result", id: "force", status: "started",
+    }));
+    expect(startTurn).toHaveBeenCalledTimes(2);
+  });
+
+  test("復元starting Codexは明示retryで解決し、後続queued turnを順番に開始する", async () => {
+    const first = { type: "codex_turn_submit", id: "old", session: "work", text: "first",
+      clientUserMessageId: "codex-first", effort: null, sandbox: null,
+      threadId: "thread-1", cwd: "/tmp/work" };
+    const second = { ...first, id: "second", text: "second", clientUserMessageId: "codex-second" };
+    const receiptsPath = path.join(makeTempDir("hub-codex-uncertain"), "receipts.json");
+    fs.writeFileSync(receiptsPath, JSON.stringify({ version: 1, sessions: { work: {
+      delivered: [], queued: [], injecting: [], chatOrder: [], deliveredCodex: [],
+      queuedCodex: [second], startingCodex: [first],
+      codexOrder: [first.clientUserMessageId, second.clientUserMessageId],
+    } } }));
+    const startTurn = vi.fn(async () => "turn");
+    const hub = new SessionHub({ runner: async () => ok(""),
+      heartbeatDir: makeTempDir("hub-codex-uncertain-hb"), metadataStore: makeTempStore(),
+      timeoutSeconds: 1800, chatReceiptsPath: receiptsPath,
+      codexAppServerFactory: () => ({ openThread: async () => { throw new Error("unused"); } }),
+      codexTurnControllerFactory: () => ({ startTurn, closeSession: vi.fn(), close: vi.fn() }) });
+    hub.restoreChatReceipts();
+    await Promise.resolve();
+    expect(startTurn).not.toHaveBeenCalled();
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ ...first, id: "force", explicitRetry: true }));
+    await vi.waitFor(() => expect(startTurn.mock.calls.map((call) => call[0].text)).toEqual(["first", "second"]));
+    expect(received).toContainEqual({ type: "codex_turn_result", id: "force", status: "started" });
+  });
+
+  test("Codex started receipt は ACK 前に永続化し、Hub再起動後の同一IDを duplicate にする", async () => {
+    const receiptsPath = path.join(makeTempDir("hub-codex-receipt"), "receipts.json");
+    const makeController = () => ({
+      startTurn: vi.fn(async () => "turn-1"), closeSession: vi.fn(), close: vi.fn(),
+    } satisfies CodexTurnControllerRuntime);
+    const firstController = makeController();
+    const options = (controller: CodexTurnControllerRuntime) => ({
+      runner: async () => ok(""), heartbeatDir: makeTempDir("hub-codex-receipt-hb"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, chatReceiptsPath: receiptsPath,
+      codexAppServerFactory: () => ({ openThread: async () => { throw new Error("unused"); } }),
+      codexTurnControllerFactory: () => controller,
+    });
+    const message = { type: "codex_turn_submit", id: "one", session: "work", text: "run",
+      clientUserMessageId: "client-codex-1", effort: null, sandbox: null,
+      threadId: "thread-1", cwd: "/tmp/work" };
+    const first = new SessionHub(options(firstController));
+    const firstClient = {}, firstReceived: unknown[] = [];
+    first.registerClient(firstClient, (line) => firstReceived.push(decodeHubServerLine(line)));
+    first.handleClientMessage(firstClient, JSON.stringify(message));
+    await vi.waitFor(() => expect(firstReceived).toContainEqual({
+      type: "codex_turn_result", id: "one", status: "started",
+    }));
+    expect(JSON.parse(fs.readFileSync(receiptsPath, "utf8"))).toMatchObject({
+      sessions: { work: { deliveredCodex: ["client-codex-1"], startingCodex: [] } },
+    });
+
+    const secondController = makeController();
+    const second = new SessionHub(options(secondController));
+    second.restoreChatReceipts();
+    const secondClient = {}, secondReceived: unknown[] = [];
+    second.registerClient(secondClient, (line) => secondReceived.push(decodeHubServerLine(line)));
+    second.handleClientMessage(secondClient, JSON.stringify({ ...message, id: "retry" }));
+    expect(secondReceived).toContainEqual({
+      type: "codex_turn_result", id: "retry", status: "duplicate",
+    });
+    expect(secondController.startTurn).not.toHaveBeenCalled();
   });
 
   test("codex_turn_interrupt は controller へ渡し、失敗を全 client へマーカー配信する", async () => {
@@ -231,7 +603,12 @@ describe("SessionHub actor", () => {
     hub.handleClientMessage(clients[0]!, JSON.stringify({ type: "codex_turn_submit", id: "turn",
       session: "work", text: "run", clientUserMessageId: "client-1", effort: null, sandbox: null,
       threadId: "thread-1", cwd: "/tmp/work" }));
-    await vi.waitFor(() => expect(controller.startTurn).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(received[0]).toContainEqual({
+      type: "codex_turn_result", id: "turn", status: "started",
+    }));
+    await vi.waitFor(() => expect(received[0]).toContainEqual({
+      type: "codex_turn_result", id: "turn", status: "started",
+    }));
 
     hub.handleClientMessage(clients[0]!, JSON.stringify({
       type: "codex_turn_interrupt", id: "interrupt-1", session: "work",
@@ -283,7 +660,7 @@ describe("SessionHub actor", () => {
     }
     expect(hub.hasCodexTurnsInFlight).toBe(true);
     callbacks.onProcessing?.("work", "done");
-    expect(hub.hasCodexTurnsInFlight).toBe(false);
+    await vi.waitFor(() => expect(hub.hasCodexTurnsInFlight).toBe(false));
   });
 
   test("codex native 設問は first-wins で controller.answerQuestion へ1回だけ振り分ける", async () => {
@@ -411,8 +788,9 @@ describe("SessionHub actor", () => {
     expect(hub.actors.has("codex-session")).toBe(false);
   });
 
-  test("reaper の demote/掃除で processingSince を解除し bump を止める", async () => {
+  test("reaper の demote/reclaimでactorをretireし旧queueの持越しを防ぐ", async () => {
     const heartbeatDir = makeTempDir("hub-demote-sync");
+    const receiptsPath = path.join(makeTempDir("hub-demote-receipts"), "receipts.json");
     // tmux には cs-work だけが生存し、pane_current_command はシェル(=agent 死亡)を返す。
     const runner = async (args: string[]) => {
       if (args[0] === "ls") return ok("cs-work\n");
@@ -421,18 +799,28 @@ describe("SessionHub actor", () => {
       return ok("");
     };
     const hub = new SessionHub({ runner, heartbeatDir, metadataStore: makeTempStore(),
-      timeoutSeconds: 1800, now: () => 100 });
+      timeoutSeconds: 1800, now: () => 100, chatReceiptsPath: receiptsPath });
     writeHeartbeat(heartbeatDir, "cs-work", { ts: 90, state: "active", event: "hook" });
     writeHeartbeat(heartbeatDir, "cs-gone", { ts: 90, state: "active", event: "hook" });
     hub.restoreFromHeartbeats();
     expect(hub.actors.get("cs-work")?.processingSince).toBe(90);
     expect(hub.actors.get("cs-gone")?.processingSince).toBe(90);
+    const client = {};
+    hub.registerClient(client, () => {});
+    for (const session of ["cs-work", "cs-gone"]) {
+      hub.handleRelayMessage({ type: "question_event", session, event: "prompt", id: `q-${session}`,
+        questions: [{ header: "h", question: "q", options: [], multiSelect: false }] });
+      hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: `send-${session}`, session,
+        clientMessageId: `client-${session}`, text: "must not survive" }));
+    }
+    expect(Object.keys(JSON.parse(fs.readFileSync(receiptsPath, "utf8")).sessions)).toHaveLength(2);
     const result = await hub.tick();
-    // demote(agent 死亡)と残骸掃除の両方で actor の処理中フラグが同期解除される。
+    // demote(agent 死亡)と残骸掃除の両方で actor 自体を破棄する。
     expect(result.demoted).toEqual(["cs-work"]);
     expect(result.reclaimed).toEqual(["cs-gone"]);
-    expect(hub.actors.get("cs-work")?.processingSince).toBeNull();
-    expect(hub.actors.get("cs-gone")?.processingSince).toBeNull();
+    expect(hub.actors.has("cs-work")).toBe(false);
+    expect(hub.actors.has("cs-gone")).toBe(false);
+    expect(JSON.parse(fs.readFileSync(receiptsPath, "utf8"))).toEqual({ version: 1, sessions: {} });
     // 以後の tick は bump しない → heartbeat の ts が進まず通常計時で kill 対象になる。
     await hub.tick();
     expect(readHeartbeat(heartbeatDir, "cs-work")?.ts).toBe(100);
@@ -628,6 +1016,43 @@ describe("SessionHub conversation stream", () => {
     writes[0]!(output("three"));
     expect(tails).toHaveLength(1);
     expect(br).toMatchObject([{ serverSeq: 2 }, { serverSeq: 3 }]);
+  });
+
+  test("preview=false→true と unsubscribe後の再購読は afterSeq gap の image/subagent を replay する", () => {
+    const { hub, writes } = makeStreamingHub();
+    const client = {}, received: unknown[] = [];
+    subscribe(hub, client, received, { preview: false });
+    writes[0]!(output("one"));
+    writes[0]!({
+      type: "image_available", v: 1, id: "image-1", path: "/tmp/a.png",
+      mime: "image/png", thumbnail: "AA==", width: 1, height: 1,
+    });
+    writes[0]!({
+      type: "subagent_node", v: 2,
+      node: { nodeId: "agent-1", toolUseId: "tool-1", parentNodeId: null,
+        agentType: "Explore", label: "調査", depth: 1, status: "running", ts: 1 },
+    });
+    writes[0]!(output("four"));
+
+    received.length = 0;
+    hub.handleClientMessage(client, JSON.stringify({
+      type: "conversation_subscribe", session: "work", afterSeq: 1, preview: true,
+    }));
+    expect(received).toMatchObject([
+      { serverSeq: 2, payload: { type: "image_available", id: "image-1" } },
+      { serverSeq: 3, payload: { type: "subagent_node", node: { nodeId: "agent-1" } } },
+      { serverSeq: 4, payload: { type: "chat_output", streamId: "four" } },
+    ]);
+
+    hub.handleClientMessage(client, JSON.stringify({ type: "conversation_unsubscribe", session: "work" }));
+    received.length = 0;
+    hub.handleClientMessage(client, JSON.stringify({
+      type: "conversation_subscribe", session: "work", afterSeq: 1, preview: true,
+    }));
+    expect(received).toEqual(expect.arrayContaining([
+      expect.objectContaining({ serverSeq: 2, payload: expect.objectContaining({ type: "image_available" }) }),
+      expect.objectContaining({ serverSeq: 3, payload: expect.objectContaining({ type: "subagent_node" }) }),
+    ]));
   });
 
   test("切断した同じ engine は再接続後の afterSeq 再購読で replay と live を受け取る", () => {

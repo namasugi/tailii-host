@@ -229,10 +229,11 @@ export type ControlMessage =
   | { type: "session_idle_hint"; v: number; id: string; name: string }
   | { type: "codex_model_list_request"; v: number; id: string }
   | { type: "codex_model_list_response"; v: number; id: string; models: CodexModelInfo[] }
-  | { type: "codex_turn_start"; v: number; id: string; session: string; text: string; clientUserMessageId?: string; effort?: string; sandbox?: "read-only" | "workspace-write" | "danger-full-access" }
+  | { type: "codex_turn_start"; v: number; id: string; session: string; text: string; clientUserMessageId?: string; effort?: string; sandbox?: "read-only" | "workspace-write" | "danger-full-access"; explicitRetry?: boolean }
+  | { type: "codex_turn_start_result"; v: number; id: string; status: "started" | "duplicate" | "failed"; error?: string }
   | { type: "codex_turn_interrupt"; v: number; id: string; session: string }
   | { type: "session_processing_state"; v: number; session: string; active: boolean }
-  | { type: "chat_send"; v: number; id: string; session: string; clientMessageId: string; text: string }
+  | { type: "chat_send"; v: number; id: string; session: string; clientMessageId: string; text: string; explicitRetry?: boolean }
   | { type: "chat_send_result"; v: number; id: string; status: "accepted" | "duplicate" | "failed"; error?: string }
   | { type: "error"; v: number; id?: string; code: string; message: string }
   | { type: "image_available"; v: number; id: string; path: string; mime: string; thumbnail: string; width: number; height: number; relatedApprovalId?: string }
@@ -242,6 +243,8 @@ export type ControlMessage =
   | { type: "subagent_transcript_response"; v: number; id: string; nodeId: string; entries: SubagentTranscriptEntry[]; omitted: number }
   | { type: "chat_output"; v: number; streamId: string; role: ChatRole; text: string; eof: boolean }
   | { type: "tool_activity"; v: number; activity: ToolActivity }
+  | { type: "session_chat_output"; v: number; session: string; serverSeq: number; streamId: string; role: ChatRole; text: string; eof: boolean }
+  | { type: "session_tool_activity"; v: number; session: string; serverSeq: number; activity: ToolActivity }
   | { type: "subagent_node"; v: number; node: SubagentNode }
   | {
       type: "pane_preview"; v: number; session: string; seq: number; active: boolean; text: string;
@@ -584,7 +587,16 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         clientUserMessageId: optionalString(raw, "clientUserMessageId"),
         effort: optionalString(raw, "effort"),
         sandbox,
+        explicitRetry: optionalBoolean(raw, "explicitRetry"),
       });
+
+    case "codex_turn_start_result": {
+      const status = requireString(raw, "status");
+      if (status !== "started" && status !== "duplicate" && status !== "failed") {
+        throw new ProtocolDecodeError("missing-field", "status");
+      }
+      return compact({ type, v, id: requireString(raw, "id"), status, error: optionalString(raw, "error") });
+    }
 
     case "codex_turn_interrupt":
       return {
@@ -603,13 +615,14 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
     case "chat_send": {
       const text = requireString(raw, "text");
       if (text.length === 0) throw new ProtocolDecodeError("missing-field", "text");
-      return {
+      return compact({
         type, v,
         id: requireString(raw, "id"),
         session: requireString(raw, "session"),
         clientMessageId: requireString(raw, "clientMessageId"),
         text,
-      };
+        explicitRetry: optionalBoolean(raw, "explicitRetry"),
+      });
     }
 
     case "chat_send_result": {
@@ -697,8 +710,32 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
       };
     }
 
+    case "session_chat_output": {
+      const role = requireString(raw, "role");
+      if (role !== "assistant" && role !== "user" && role !== "system") {
+        throw new ProtocolDecodeError("missing-field", "role");
+      }
+      return {
+        type, v,
+        session: requireString(raw, "session"),
+        serverSeq: requireNumber(raw, "serverSeq"),
+        streamId: requireString(raw, "streamId"),
+        role,
+        text: requireString(raw, "text"),
+        eof: requireBoolean(raw, "eof"),
+      };
+    }
+
     case "tool_activity":
       return { type, v, activity: decodeToolActivity(raw) };
+
+    case "session_tool_activity":
+      return {
+        type, v,
+        session: requireString(raw, "session"),
+        serverSeq: requireNumber(raw, "serverSeq"),
+        activity: decodeToolActivity(raw),
+      };
 
     case "subagent_node":
       return { type, v, node: decodeSubagentNode(raw) };
@@ -1164,7 +1201,7 @@ function wireObject(message: ControlMessage): Raw {
   }
   if (message.v !== PROTOCOL_LEGACY) out["v"] = message.v;
 
-  if (message.type === "tool_activity") {
+  if (message.type === "tool_activity" || message.type === "session_tool_activity") {
     const activity = message.activity;
     out["id"] = activity.id;
     out["name"] = activity.name;

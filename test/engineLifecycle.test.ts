@@ -491,6 +491,31 @@ describe("Engine — アイドルライフサイクル/ページング", () => {
     await engine.teardown();
   });
 
+  test("mode_get は subagent 一覧の上にあるモードマーカーを返す", async () => {
+    const pane = [
+      "会話本文",
+      "⏵⏵ auto mode on (shift+tab to cycle) · ← for agents · ↓ to manage",
+      "⏺ main",
+      "◯ Explore agent-1",
+      "◯ Explore agent-2",
+      "◯ Explore agent-3",
+      "◯ Explore agent-4",
+    ].join("\n");
+    const runner = new MockTmuxRunner((args) =>
+      args[0] === "capture-pane" ? ok(pane) : ok("")
+    );
+    const mgr = new TmuxSessionManager({ runner: runner.runner, store: makeTempStore() });
+    const engine = startEngine({ sessionManager: mgr });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"id":"M1-subagents","session":"work","type":"mode_get","v":1}');
+    const resp = await engine.lines.nextOfType("mode_set_response");
+    expect(resp).toContain('"id":"M1-subagents"');
+    expect(resp).toContain('"mode":"auto"');
+
+    await engine.teardown();
+  });
+
   test("mode_set は目標モードまで BTab を注入し、実モードを返す", async () => {
     // capture-pane が呼ばれるたびにモードが1段進む TUI を模す（default → acceptEdits → plan）。
     const panes = [

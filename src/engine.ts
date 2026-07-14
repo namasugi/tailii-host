@@ -76,7 +76,7 @@ import { SessionListService } from "./sessionListService.js";
 import { searchClaudeSessions } from "./sessionSearch.js";
 import { SessionMetadataStore } from "./sessionMetadataStore.js";
 import { abortableSleep, sleep } from "./sleep.js";
-import { TranscriptTailer } from "./transcriptTailer.js";
+import { HISTORY_DONE_STREAM_ID, TranscriptTailer } from "./transcriptTailer.js";
 import { TmuxSessionManager } from "./tmux.js";
 import { aggregateUsage, emptyUsageTotals } from "./usageAggregator.js";
 import { aggregateCodexUsage, type CodexUsage } from "./codexUsage.js";
@@ -289,6 +289,8 @@ export interface RunEngineOptions {
   engineRelaySocketPath?: string | null;
   /** Session Hub link。省略時は daemon の hub.sock へ接続する。 */
   hubLink?: HubLink;
+  /** Codex Hub start ACK の待機時間（テスト注入用、既定15秒）。 */
+  codexHubRpcTimeoutMs?: number;
 }
 
 interface ModeTiming {
@@ -337,6 +339,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     staleDistGuard = createStaleDistGuard(),
     onStaleDist = undefined,
     hubLink: injectedHubLink = undefined,
+    codexHubRpcTimeoutMs = 15_000,
     heartbeatDir = defaultHeartbeatDir(),
   } = options;
   const resolvedModeTiming: ModeTiming = { ...DEFAULT_MODE_TIMING, ...modeTiming };
@@ -357,9 +360,62 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
   const background: Promise<unknown>[] = [];
   const activeChatSession: { name: string | null } = { name: null };
   const lastServerSeq = new Map<string, number>();
+  // socket close 時刻ではなく、engine channel へ最後に書き切った会話 event の時刻。
+  // Hub 世代変更時の transcript backfill 境界として session ごとに保持する。
+  const lastForwardedAtMs = new Map<string, number>();
   let hubBootId: string | null = null;
   // Hub ブロードキャストから作る接続ローカル read-model。
   const processingSessions = new Map<string, number>();
+  // フォーカス外でも処理中の会話だけを購読し、一覧表示中のログキャッシュを更新する。
+  // Hub 接続単位で上限を設け、異常な processing 通知でも購読を無制限に増やさない。
+  const backgroundChatSessions = new Set<string>();
+  // preview=false 中に iOS へ route できない event が来た場合、その直前 seq を保持する。
+  // 後続 chat/tool を表示できても gap を飛び越えて checkpoint を進めず、前面復帰時に
+  // Hub replay から image/subagent を含む連続区間を回収する。
+  const backgroundReplayFloors = new Map<string, number>();
+  // serverSeq=0 は transcript/rollout の履歴 backfill。完了マーカー前に Hub 世代が
+  // 変わった場合は時刻境界を使わず全履歴を再開し、古い未配送行を落とさない。
+  const historyBackfillSessions = new Set<string>();
+  const backgroundUnwatchTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const unwatchBackgroundSession = (session: string): void => {
+    const timer = backgroundUnwatchTimers.get(session);
+    if (timer !== undefined) clearTimeout(timer);
+    backgroundUnwatchTimers.delete(session);
+    if (!backgroundChatSessions.delete(session)) return;
+    if (activeChatSession.name !== session) {
+      hubLink.send({ type: "conversation_unsubscribe", session });
+    }
+  };
+  const watchBackgroundSession = (session: string, newerThanMs?: number, subscribe = true): void => {
+    const timer = backgroundUnwatchTimers.get(session);
+    if (timer !== undefined) clearTimeout(timer);
+    backgroundUnwatchTimers.delete(session);
+    if (activeChatSession.name === session) return;
+    if (!backgroundChatSessions.has(session) && backgroundChatSessions.size >= 16) {
+      const oldest = backgroundChatSessions.values().next().value as string | undefined;
+      if (oldest !== undefined) unwatchBackgroundSession(oldest);
+    }
+    backgroundChatSessions.add(session);
+    if (!subscribe) return;
+    hubLink.send({
+      type: "conversation_subscribe",
+      session,
+      ...(newerThanMs !== undefined
+        ? { newerThanMs }
+        : lastServerSeq.has(session) ? { afterSeq: lastServerSeq.get(session)! } : {}),
+      preview: false,
+    });
+  };
+  const finishWatchingBackgroundSession = (session: string): void => {
+    if (activeChatSession.name === session || !backgroundChatSessions.has(session)) return;
+    const previous = backgroundUnwatchTimers.get(session);
+    if (previous !== undefined) clearTimeout(previous);
+    // processing=done と transcript tail の最終 event は別経路なので、短い猶予を置いて
+    // 最終 assistant/tool 出力を取りこぼさずキャッシュへ合流させる。
+    const timer = setTimeout(() => unwatchBackgroundSession(session), 2_000);
+    timer.unref();
+    backgroundUnwatchTimers.set(session, timer);
+  };
   let codexTurnController: CodexTurnControllerRuntime | null = injectedCodexTurnController;
   let previewServer: PreviewServer | null = null;
 
@@ -425,17 +481,17 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
       const now = Math.floor(Date.now() / 1000);
       if (message.state === "active") {
         processingSessions.set(message.session, now);
+        watchBackgroundSession(message.session);
       } else {
         processingSessions.delete(message.session);
+        finishWatchingBackgroundSession(message.session);
       }
-      if (message.session === activeChatSession.name) {
-        writer.write({
-          type: "session_processing_state",
-          v: state.negotiatedVersion,
-          session: message.session,
-          active: message.state === "active",
-        });
-      }
+      writer.write({
+        type: "session_processing_state",
+        v: state.negotiatedVersion,
+        session: message.session,
+        active: message.state === "active",
+      });
     };
 
     if (codexTurnController === null && codexAppServer !== null) {
@@ -489,12 +545,59 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     }
 
     const rpcWaiters = new Map<string, (message: HubServerMessage) => void>();
+    const rpcDisconnectFailures = new Map<string, () => void>();
     hubLink.onMessage = (message) => {
       if (message.type === "hub_hello_ack") return;
       if (message.type === "conversation_event") {
-        if (message.session !== activeChatSession.name) return;
-        if (message.serverSeq > 0) lastServerSeq.set(message.session, message.serverSeq);
-        try { writer.write(message.payload); }
+        let payload: ControlMessage | null = null;
+        const isActive = message.session === activeChatSession.name;
+        if (message.session === activeChatSession.name) {
+          payload = message.payload;
+        } else if (backgroundChatSessions.has(message.session)) {
+          if (message.payload.type === "chat_output") {
+            payload = {
+              type: "session_chat_output",
+              v: state.negotiatedVersion,
+              session: message.session,
+              serverSeq: message.serverSeq,
+              streamId: message.payload.streamId,
+              role: message.payload.role,
+              text: message.payload.text,
+              eof: message.payload.eof,
+            };
+          } else if (message.payload.type === "tool_activity") {
+            payload = {
+              type: "session_tool_activity",
+              v: state.negotiatedVersion,
+              session: message.session,
+              serverSeq: message.serverSeq,
+              activity: message.payload.activity,
+            };
+          } else if (!backgroundReplayFloors.has(message.session)) {
+            const floor = lastServerSeq.get(message.session) ?? Math.max(0, message.serverSeq - 1);
+            backgroundReplayFloors.set(message.session, floor);
+            lastServerSeq.set(message.session, floor);
+          }
+        }
+        if (payload === null) return;
+        try {
+          writer.write(payload);
+          if (message.serverSeq === 0) {
+            historyBackfillSessions.add(message.session);
+            if ((payload.type === "chat_output" || payload.type === "session_chat_output") &&
+              payload.streamId === HISTORY_DONE_STREAM_ID) {
+              historyBackfillSessions.delete(message.session);
+            }
+          } else if (message.serverSeq > 0) {
+            lastForwardedAtMs.set(message.session, Date.now());
+            if (isActive) {
+              lastServerSeq.set(message.session, message.serverSeq);
+              backgroundReplayFloors.delete(message.session);
+            } else if (!backgroundReplayFloors.has(message.session)) {
+              lastServerSeq.set(message.session, message.serverSeq);
+            }
+          }
+        }
         catch (error) { process.stderr.write(`[tailii-host engine] conversation_event 書込失敗: ${String(error)}\n`); }
         return;
       }
@@ -518,6 +621,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
         message.type === "conversation_subagent_transcript_response") {
         rpcWaiters.get(message.id)?.(message);
         rpcWaiters.delete(message.id);
+        rpcDisconnectFailures.delete(message.id);
       } else if (message.type === "session_processing") handleSessionProcessing(message);
       else if (message.type === "question_event") handleQuestionEvent(message);
       else {
@@ -527,30 +631,96 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     };
     const hubRpc = <T extends HubServerMessage>(request: HubClientMessage, id: string, timeoutMs: number): Promise<T> =>
       new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-          rpcWaiters.delete(id);
-          reject(new Error("Session Hub RPC timeout"));
-        }, timeoutMs);
+        const timer = timeoutMs > 0
+          ? setTimeout(() => {
+            rpcWaiters.delete(id);
+            rpcDisconnectFailures.delete(id);
+            reject(new Error("Session Hub RPC timeout"));
+          }, timeoutMs)
+          : null;
         rpcWaiters.set(id, (response) => {
-          clearTimeout(timer);
+          if (timer !== null) clearTimeout(timer);
+          rpcDisconnectFailures.delete(id);
           resolve(response as T);
+        });
+        rpcDisconnectFailures.set(id, () => {
+          if (timer !== null) clearTimeout(timer);
+          rpcWaiters.delete(id);
+          reject(new Error("Session Hub disconnected during RPC"));
         });
         hubLink.send(request);
       });
-    hubLink.onReconnect = ({ bootId, disconnectedAtMs }) => {
-      const session = activeChatSession.name;
+    hubLink.onReconnect = ({ bootId, disconnectedAtMs, processingSessions: processingSnapshot }) => {
+      if (disconnectedAtMs !== null) {
+        const failures = [...rpcDisconnectFailures.values()];
+        rpcDisconnectFailures.clear();
+        for (const fail of failures) fail();
+      }
       const restarted = hubBootId !== null && hubBootId !== bootId;
       hubBootId = bootId;
-      if (session === null) return;
+      const requiresFullBackfill = restarted ? new Set(historyBackfillSessions) : new Set<string>();
       if (restarted) {
-        // serverSeq は Hub プロセス内の採番なので世代を越えて比較できない。切断時刻以降だけを
-        // transcript から backfill し、既表示本文の全履歴再送と停止中の追記欠落をともに避ける。
-        lastServerSeq.delete(session);
-        hubLink.send({ type: "conversation_subscribe", session,
-          ...(disconnectedAtMs !== null ? { newerThanMs: disconnectedAtMs } : {}), preview: true });
-      } else {
-        hubLink.send({ type: "conversation_subscribe", session,
-          ...(lastServerSeq.has(session) ? { afterSeq: lastServerSeq.get(session)! } : {}), preview: true });
+        // serverSeq は Hub 世代ローカル。現在未購読の会話も含め旧 checkpoint を全破棄し、
+        // 後日 open した会話が新世代の同じ数値を誤って afterSeq として使わないようにする。
+        lastServerSeq.clear();
+        backgroundReplayFloors.clear();
+        historyBackfillSessions.clear();
+      }
+      // hello snapshot を権威状態として扱う。切断中に完了した会話をローカル Map に
+      // active のまま残すと、一覧の処理中表示と背景購読が永久に残ってしまう。ただし
+      // processingSessions を送らない旧 Hub は「空」ではなく「snapshot 非対応」なので、
+      // その場合は既知状態を維持してローリング更新中の誤った inactive 化を避ける。
+      if (processingSnapshot !== undefined) {
+        const snapshotSet = new Set(processingSnapshot);
+        for (const session of [...processingSessions.keys()]) {
+          if (snapshotSet.has(session)) continue;
+          processingSessions.delete(session);
+          finishWatchingBackgroundSession(session);
+          writer.write({
+            type: "session_processing_state",
+            v: state.negotiatedVersion,
+            session,
+            active: false,
+          });
+        }
+        for (const processingSession of processingSnapshot) {
+          processingSessions.set(processingSession, Math.floor(Date.now() / 1_000));
+          // この直後の sessions loop が再接続境界を揃えて一度だけ subscribe する。
+          watchBackgroundSession(
+            processingSession,
+            restarted ? disconnectedAtMs ?? undefined : undefined,
+            false,
+          );
+          writer.write({
+            type: "session_processing_state",
+            v: state.negotiatedVersion,
+            session: processingSession,
+            active: true,
+          });
+        }
+      }
+      const sessions = new Set(backgroundChatSessions);
+      if (activeChatSession.name !== null) sessions.add(activeChatSession.name);
+      for (const session of sessions) {
+        const preview = session === activeChatSession.name;
+        if (restarted) {
+          // serverSeq は Hub プロセス内の採番なので世代を越えて比較できない。切断時刻以降だけを
+          // transcript から backfill し、既表示本文の全履歴再送と停止中の追記欠落をともに避ける。
+          // socket close は最後に engine channel へ配送できた event より大幅に遅れて観測され
+          // うる。session ごとの最終成功時刻を権威境界にし、tail の書込→転送遅延ぶんだけ5秒
+          // 重ねる。まだ一度も配送していない会話だけ close 時刻の1分 rewindへ fallbackする。
+          const forwardedAtMs = lastForwardedAtMs.get(session);
+          const backfillBoundary = requiresFullBackfill.has(session)
+            ? undefined
+            : forwardedAtMs !== undefined
+              ? Math.max(0, forwardedAtMs - 5_000)
+              : disconnectedAtMs !== null ? Math.max(0, disconnectedAtMs - 60_000) : undefined;
+          hubLink.send({ type: "conversation_subscribe", session,
+            ...(backfillBoundary !== undefined ? { newerThanMs: backfillBoundary } : {}), preview });
+        } else {
+          hubLink.send({ type: "conversation_subscribe", session,
+            ...(lastServerSeq.has(session) ? { afterSeq: lastServerSeq.get(session)! } : {}), preview });
+        }
       }
     };
     const requestHubState = (session: string): Promise<{ id: string; questions: QuestionPromptQuestion[] } | null> => {
@@ -558,16 +728,19 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
       return new Promise((resolve) => {
         rpcWaiters.set(id, (raw) => {
           const response = raw as Extract<HubServerMessage, { type: "hub_state_response" }>;
-          if (response.processing) processingSessions.set(session, Math.floor(Date.now() / 1000));
-          else processingSessions.delete(session);
-          if (session === activeChatSession.name) {
-            writer.write({
-              type: "session_processing_state",
-              v: state.negotiatedVersion,
-              session,
-              active: response.processing,
-            });
+          if (response.processing) {
+            processingSessions.set(session, Math.floor(Date.now() / 1000));
+            watchBackgroundSession(session);
+          } else {
+            processingSessions.delete(session);
+            finishWatchingBackgroundSession(session);
           }
+          writer.write({
+            type: "session_processing_state",
+            v: state.negotiatedVersion,
+            session,
+            active: response.processing,
+          });
           resolve(response.pendingQuestion);
         });
         hubLink.send({ type: "hub_state_request", id, session });
@@ -620,6 +793,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           hubLink,
           requestHubState,
           hubRpc,
+          codexHubRpcTimeoutMs,
           heartbeatDir: resolvedHeartbeatDir,
           resumeLauncher,
           codexResumeLauncher,
@@ -631,6 +805,8 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           defaultAgent: agent,
           activeChatSession,
           processingSessions,
+          backgroundChatSessions,
+          lastServerSeq,
           codexAppServer,
           codexTurnController,
           previewServer,
@@ -648,6 +824,8 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
   } finally {
     // ---- 3. チャネル断で chat_output tail / reaper を確実に停止する（全経路） ----
     lifecycleAbort.abort();
+    for (const timer of backgroundUnwatchTimers.values()) clearTimeout(timer);
+    backgroundUnwatchTimers.clear();
     hubLink.close();
     codexTurnController?.close();
     await previewServer?.closeAll();
@@ -676,6 +854,7 @@ interface HandlerContext {
   hubLink: HubLink;
   requestHubState: (session: string) => Promise<{ id: string; questions: QuestionPromptQuestion[] } | null>;
   hubRpc: <T extends HubServerMessage>(request: HubClientMessage, id: string, timeoutMs: number) => Promise<T>;
+  codexHubRpcTimeoutMs: number;
   heartbeatDir: string;
   resumeLauncher: EngineLauncher | null;
   /** codex セッションの reattach 時 resume 用 launcher。 */
@@ -691,6 +870,10 @@ interface HandlerContext {
   activeChatSession: { name: string | null };
   /** 処理中セッションの最終ハートビート（Unix 秒）。明示 kill 時に掃除する。 */
   processingSessions: Map<string, number>;
+  /** 一覧・別画面でも差分同期を続けるフォーカス外会話。 */
+  backgroundChatSessions: Set<string>;
+  /** Hub 世代内で iOS へ連続配送済みの最後の conversation seq。 */
+  lastServerSeq: Map<string, number>;
   /** Codex モデル一覧を取得する共有 App Server。 */
   codexAppServer: CodexAppServerManager | null;
   /** Codex native turn/approval 接続。 */
@@ -718,11 +901,21 @@ async function emitPendingQuestion(ctx: HandlerContext, session: string): Promis
 function subscribeConversation(ctx: HandlerContext, session: string, newerThanMs?: number): void {
   const previous = ctx.activeChatSession.name;
   if (previous !== null && previous !== session) {
-    ctx.hubLink.send({ type: "conversation_unsubscribe", session: previous });
+    if (ctx.processingSessions.has(previous)) {
+      ctx.backgroundChatSessions.add(previous);
+      ctx.hubLink.send({ type: "conversation_subscribe", session: previous, preview: false });
+    } else {
+      ctx.backgroundChatSessions.delete(previous);
+      ctx.hubLink.send({ type: "conversation_unsubscribe", session: previous });
+    }
   }
   ctx.activeChatSession.name = session;
+  ctx.backgroundChatSessions.delete(session);
   ctx.hubLink.send({ type: "conversation_subscribe", session,
-    ...(newerThanMs !== undefined ? { newerThanMs } : {}), preview: true });
+    ...(newerThanMs !== undefined
+      ? { newerThanMs }
+      : ctx.lastServerSeq.has(session) ? { afterSeq: ctx.lastServerSeq.get(session)! } : {}),
+    preview: true });
 }
 
 /** prepare 中は購読を始めず、reaper が読む権威ファイルの idle deadline だけを即時に更新する。 */
@@ -917,6 +1110,7 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
         const killedCwd = metadataStore?.get(message.name)?.cwd ?? null;
         // 明示 kill はユーザー意思なので処理中保護より優先する（保護記録も掃除）。
         ctx.processingSessions.delete(message.name);
+        ctx.backgroundChatSessions.delete(message.name);
         ctx.hubLink.send({ type: "conversation_unsubscribe", session: message.name });
         ctx.codexTurnController?.closeSession(message.name);
         // kill する会話を tail 中なら止める（生かしたままだと再オープンの open() が
@@ -925,6 +1119,9 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
           ctx.activeChatSession.name = null;
         }
         await sessionManager.kill(message.name);
+        // kill 成功後だけ Hub の actor / durable queue / delivered receipt を廃棄する。
+        // 同名セッションを後日作り直しても、旧会話の queued 入力を注入させない。
+        ctx.hubLink.send({ type: "session_retire", session: message.name });
         let worktreeResponse: WorktreeResponseFields | null = null;
         if (killedCwd !== null && isTailiiWorktreePath(killedCwd)) {
           worktreeResponse = { worktreePath: killedCwd };
@@ -1002,29 +1199,39 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
             { type: "codex_turn_submit", id: message.id, session: message.session,
               text: message.text, clientUserMessageId: message.clientUserMessageId ?? message.id,
               effort: message.effort ?? null, sandbox: message.sandbox ?? null,
-              threadId: providerSessionId, cwd: meta.cwd }, message.id, 1_500,
+              threadId: providerSessionId, cwd: meta.cwd,
+              ...(message.explicitRetry === true ? { explicitRetry: true } : {}) },
+            message.id, ctx.codexHubRpcTimeoutMs,
           );
-          if (result.status === "duplicate" || result.status === "started") break;
-          writeError(writer, v, message.id, "codex_turn_start_failed", result.error ?? "Session Hub turn start failed");
+          writer.write({
+            type: "codex_turn_start_result",
+            v,
+            id: result.id,
+            status: result.status,
+            ...(result.error !== undefined ? { error: result.error } : {}),
+          });
           break;
-        } catch {
-          // Hub 不達/timeout 時だけ engine 所有の従来 controller へ fail-open する。
-        }
-        if (ctx.codexTurnController === null) {
-          writeError(writer, v, message.id, "codex_app_server_unavailable", "Codex App Server が未構成です。");
+        } catch (error) {
+          // timeout は「未開始」と「開始済みだが ACK 消失」を区別できない。local controller
+          // へ fail-open すると後者で二重 turn になるため、相関可能な failed を返して
+          // durable outbox の同一 clientUserMessageId 再送へ委ねる。
+          writer.write({
+            type: "codex_turn_start_result",
+            v,
+            id: message.id,
+            status: "failed",
+            error: String(error),
+          });
           break;
         }
-        await ctx.codexTurnController.startTurn({
-          session: message.session,
-          threadId: providerSessionId,
-          cwd: meta.cwd,
-          text: message.text,
-          clientUserMessageId: message.clientUserMessageId ?? message.id,
-          effort: message.effort ?? null,
-          sandbox: message.sandbox ?? null,
-        });
       } catch (error) {
-        writeError(writer, v, message.id, "codex_turn_start_failed", String(error));
+        writer.write({
+          type: "codex_turn_start_result",
+          v,
+          id: message.id,
+          status: "failed",
+          error: String(error),
+        });
       }
       break;
     }
@@ -1035,25 +1242,22 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
         writeError(writer, v, message.id, "chat_send_unsupported", "Codex セッションは codex_turn_start を使用してください。");
         break;
       }
-      try {
+      // Hub は設問表示中、durable queue を保持したまま pane 注入可能になるまで応答を
+      // 保留する。read loop 自体がこの RPC を await すると、後続 question_answer を読めず
+      // 循環待ちになるため相関処理だけを非同期化する。ACK は注入完了の意味を維持する。
+      void (async () => {
         try {
           const result = await ctx.hubRpc<Extract<HubServerMessage, { type: "chat_send_result" }>>(
             { type: "chat_send", id: message.id, session: message.session,
-              clientMessageId: message.clientMessageId, text: message.text }, message.id, 1_500,
+              clientMessageId: message.clientMessageId, text: message.text,
+              ...(message.explicitRetry === true ? { explicitRetry: true } : {}) }, message.id, 0,
           );
           writer.write({ type: "chat_send_result", v, id: result.id, status: result.status,
             ...(result.error !== undefined ? { error: result.error } : {}) });
-          break;
-        } catch {
-          // Hub 不達/timeout 時は queue されないため、engine 自身で一度だけ注入する。
+        } catch (error) {
+          writeError(writer, v, message.id, "chat_send_failed", String(error));
         }
-        await sessionManager.sendKeys(message.session, [message.text], true);
-        await sleep(150);
-        await sessionManager.sendKeys(message.session, ["Enter"]);
-        writer.write({ type: "chat_send_result", v, id: message.id, status: "accepted" });
-      } catch (error) {
-        writeError(writer, v, message.id, "chat_send_failed", String(error));
-      }
+      })();
       break;
     }
 
@@ -1070,16 +1274,15 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
         );
         break;
       }
-      // hub 所有 turn への中断。hubLink.send は切断中でも throw せず queue する
-      // （hubClient.ts）ため、失敗分岐は存在しない。hub 断で遅延配送されても、その時点で
-      // hub 所有 turn は存在せず無害な no-op になる。
+      // hub 所有 turn への fire-and-forget 中断。切断中は hubClient が破棄する。
+      // 中断を再接続後まで queue すると、その時点の別 turn を誤って止めるため遅延配送しない。
       ctx.hubLink.send({
         type: "codex_turn_interrupt",
         id: message.id,
         session: message.session,
       });
-      // fail-open で engine ローカル controller が実行している turn は hub からは中断
-      // できないため、ローカルにも常に中断を試みる（turn 未所有なら no-op）。
+      // 埋め込み Hub / 旧構成との互換用に、注入されたローカル controller にも試みる。
+      // 現行の hub 所有構成では turn 未所有なので no-op。
       try {
         await ctx.codexTurnController?.interruptTurn?.(message.session);
       } catch (error) {
@@ -1094,6 +1297,12 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
       // hook / turn controller のライフサイクル通知であり、離脱はただの計時リセット。
       if (ctx.activeChatSession.name === message.name) {
         ctx.activeChatSession.name = null;
+        if (ctx.processingSessions.has(message.name)) {
+          ctx.backgroundChatSessions.add(message.name);
+          ctx.hubLink.send({ type: "conversation_subscribe", session: message.name, preview: false });
+        } else {
+          ctx.hubLink.send({ type: "conversation_unsubscribe", session: message.name });
+        }
         // 未回答の設問を残して離脱した → 一覧バッジへ引き継ぐ（question-hook-relay）。
         const pending = await ctx.requestHubState(message.name);
         if (pending !== null) {

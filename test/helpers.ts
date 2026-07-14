@@ -16,7 +16,7 @@ import type { TmuxCommandResult, TmuxCommandRunner } from "../src/tmux.js";
 import { ChatTailController } from "../src/chatTailController.js";
 import { TranscriptTailer } from "../src/transcriptTailer.js";
 import { LineWriter } from "../src/lineWriter.js";
-import type { ControlMessage } from "../src/protocol.js";
+import { decodeControlMessage, type ControlMessage } from "../src/protocol.js";
 
 /** 出力行の非同期キュー（タイムアウト付き読み出し）。 */
 export class LineQueue {
@@ -127,7 +127,7 @@ export function startEngine(
   const callbackWriter = (write: (message: ControlMessage) => void): LineWriter => {
     const stream = new PassThrough();
     const reader = readline.createInterface({ input: stream, crlfDelay: Number.POSITIVE_INFINITY });
-    reader.on("line", (line) => write(JSON.parse(line) as ControlMessage));
+    reader.on("line", (line) => write(decodeControlMessage(line)));
     return new LineWriter(stream);
   };
   const hub = injectedHub ?? new SessionHub({

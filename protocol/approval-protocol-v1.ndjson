@@ -42,3 +42,6 @@
 {"id":"md11aa22-0000-0000-0000-000000000202","mode":"acceptEdits","type":"mode_set_response","v":1}
 {"cwd":"/Users/dev/proj-a","id":"sl11aa22-0000-0000-0000-000000000301","type":"slash_list_request","v":1}
 {"commands":[{"name":"/kiro-spec-init","summary":"新しい仕様を初期化する"},{"name":"/code-review","summary":"変更差分をレビューする"}],"id":"sl11aa22-0000-0000-0000-000000000301","type":"slash_list_response","v":1}
+{"eof":false,"role":"assistant","serverSeq":42,"session":"proj-bg","streamId":"chat-bg-0001-0000-0000-000000000001","text":"バックグラウンドで処理中","type":"session_chat_output","v":1}
+{"addedLines":2,"diff":{"newString":"let value = 2","newStringTruncated":false,"oldString":"let value = 1","oldStringTruncated":false},"file":"/Users/alice/project/Background.swift","id":"tool-bg-0001-0000-0000-000000000001","label":"編集済み Background.swift","name":"Edit","removedLines":1,"serverSeq":43,"session":"proj-bg","type":"session_tool_activity","v":1}
+{"id":"codex-turn-0001-0000-0000-000000000001","status":"started","type":"codex_turn_start_result","v":1}

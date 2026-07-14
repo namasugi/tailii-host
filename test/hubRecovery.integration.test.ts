@@ -1,6 +1,7 @@
 // hubRecovery.integration.test.ts — 実 Unix socket を通す Session Hub 復旧シナリオ
 
 import * as fs from "node:fs";
+import * as net from "node:net";
 import * as path from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { connectHubSocket, type HubLink } from "../src/hubClient.js";
@@ -55,6 +56,158 @@ async function closeRecoveryFixture(
 }
 
 describe("Session Hub 復旧シナリオ (Unix socket)", () => {
+  test("不正helloで沈黙した接続をtimeout破棄し、有効helloへ再接続する", async () => {
+    if (!(await canListenUnixSocket())) return;
+    const socketPath = tempSocketPath(`hub-invalid-hello-${Date.now()}`);
+    let connectionCount = 0;
+    const server = net.createServer((socket) => {
+      connectionCount += 1;
+      const ordinal = connectionCount;
+      socket.on("error", () => {});
+      socket.once("data", () => {
+        socket.write(JSON.stringify(ordinal === 1
+          ? { type: "hub_hello_ack", version: "test", bootId: "" }
+          : { type: "hub_hello_ack", version: "test", bootId: "valid-boot", processingSessions: [] }) + "\n");
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(socketPath, resolve);
+    });
+    const link = connectHubSocket({ socketPath, ensureDaemon: () => {}, helloTimeoutMs: 50 });
+    const reconnected = vi.fn();
+    link.onReconnect = reconnected;
+    try {
+      await vi.waitFor(() => expect(reconnected).toHaveBeenCalledWith({
+        bootId: "valid-boot", disconnectedAtMs: expect.any(Number), processingSessions: [],
+      }), { timeout: 2_000 });
+      expect(connectionCount).toBeGreaterThanOrEqual(2);
+    } finally {
+      link.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      fs.rmSync(socketPath, { force: true });
+    }
+  });
+
+  test("未接続中は状態通知だけを合流し、期限切れになる相関 RPC を遅延実行しない", async () => {
+    if (!(await canListenUnixSocket())) return;
+    const socketPath = tempSocketPath(`hub-offline-queue-${Date.now()}`);
+    const chatInjector = vi.fn(async () => {});
+    const startTurn = vi.fn(async () => "turn");
+    const hub = new SessionHub({
+      runner: new MockTmuxRunner(() => ok("")).runner,
+      heartbeatDir: makeTempDir("hub-offline-queue-heartbeat"),
+      metadataStore: makeTempStore(),
+      timeoutSeconds: 1_800,
+      chatInjector,
+      codexAppServerFactory: () => ({ openThread: async () => { throw new Error("unused"); } }),
+      codexTurnControllerFactory: () => ({ startTurn, closeSession: vi.fn(), close: vi.fn() }),
+    });
+    const link = connectHubSocket({ socketPath, ensureDaemon: () => {} });
+    link.send({ type: "chat_send", id: "chat", session: "work",
+      clientMessageId: "client-chat", text: "must not run later" });
+    link.send({ type: "codex_turn_submit", id: "codex", session: "work",
+      clientUserMessageId: "client-codex", text: "must not run later", effort: null, sandbox: null,
+      threadId: "thread", cwd: "/tmp/work" });
+    link.send({ type: "session_processing", session: "work", state: "active" });
+    link.send({ type: "session_processing", session: "work", state: "done" });
+    for (let index = 0; index < 140; index += 1) {
+      link.send({ type: "session_processing", session: `bounded-${index}`, state: "active" });
+    }
+
+    let server: HubSocketServer | null = null;
+    try {
+      server = await startHubSocket({ hub, socketPath, version: "test", bootId: "boot-offline" });
+      expect(server).not.toBeNull();
+      const reconnected = vi.fn();
+      link.onReconnect = reconnected;
+      await vi.waitFor(() => expect(reconnected).toHaveBeenCalledOnce());
+      await vi.waitFor(() => expect(hub.processingSessionNames).toHaveLength(128));
+      expect(hub.processingSessionNames).not.toContain("bounded-0");
+      expect(hub.processingSessionNames).toContain("bounded-139");
+      expect(chatInjector).not.toHaveBeenCalled();
+      expect(startTurn).not.toHaveBeenCalled();
+    } finally {
+      await closeRecoveryFixture(link, server, hub);
+    }
+  });
+
+  test("offline session_retire はhello snapshotからも除外しactorを再購読させない", async () => {
+    if (!(await canListenUnixSocket())) return;
+    const socketPath = tempSocketPath(`hub-offline-retire-${Date.now()}`);
+    const hub = new SessionHub({
+      runner: new MockTmuxRunner(() => ok("")).runner,
+      heartbeatDir: makeTempDir("hub-offline-retire-heartbeat"),
+      metadataStore: makeTempStore(),
+      timeoutSeconds: 1_800,
+    });
+    hub.handleRelayMessage({ type: "session_processing", session: "doomed", state: "active" });
+    const link = connectHubSocket({ socketPath, ensureDaemon: () => {} });
+    link.send({ type: "session_retire", session: "doomed" });
+
+    let server: HubSocketServer | null = null;
+    const reconnected = vi.fn();
+    link.onReconnect = reconnected;
+    try {
+      server = await startHubSocket({ hub, socketPath, version: "test", bootId: "boot-retire" });
+      expect(server).not.toBeNull();
+      await vi.waitFor(() => expect(reconnected).toHaveBeenCalledWith({
+        bootId: "boot-retire", disconnectedAtMs: null, processingSessions: [],
+      }));
+      await vi.waitFor(() => expect(hub.actors.has("doomed")).toBe(false));
+    } finally {
+      await closeRecoveryFixture(link, server, hub);
+    }
+  });
+
+  test("hello 完了が先着しても onReconnect 登録時に snapshot を一度だけ配送する", async () => {
+    if (!(await canListenUnixSocket())) return;
+    const socketPath = tempSocketPath(`hub-late-reconnect-handler-${Date.now()}`);
+    const hub = new SessionHub({
+      runner: new MockTmuxRunner(() => ok("")).runner,
+      heartbeatDir: makeTempDir("hub-late-reconnect-handler-heartbeat"),
+      timeoutSeconds: 1_800,
+    });
+    hub.handleRelayMessage({
+      type: "session_processing",
+      session: "already-running",
+      state: "active",
+    });
+    const server = await startHubSocket({
+      hub,
+      socketPath,
+      version: "test",
+      bootId: "boot-before-handler",
+    });
+    expect(server).not.toBeNull();
+    const link = connectHubSocket({ socketPath, ensureDaemon: () => {} });
+    let helloSeen = false;
+    link.onMessage = (message) => {
+      if (message.type === "hub_hello_ack") helloSeen = true;
+    };
+
+    try {
+      // onReconnect は意図的に未設定のまま hello ack の処理完了を先行させる。
+      await vi.waitFor(() => expect(helloSeen).toBe(true));
+
+      const delayedHandler = vi.fn();
+      link.onReconnect = delayedHandler;
+      expect(delayedHandler).toHaveBeenCalledTimes(1);
+      expect(delayedHandler).toHaveBeenCalledWith({
+        bootId: "boot-before-handler",
+        disconnectedAtMs: null,
+        processingSessions: ["already-running"],
+      });
+
+      // 保持情報は最初の handler へ渡した時点で消費し、再代入では再配送しない。
+      const replacementHandler = vi.fn();
+      link.onReconnect = replacementHandler;
+      expect(replacementHandler).not.toHaveBeenCalled();
+    } finally {
+      await closeRecoveryFixture(link, server, hub);
+    }
+  });
+
   test("hub crash 後は世代変更境界から無重複復帰し pendingQuestion も復元する", async () => {
     if (!(await canListenUnixSocket())) return;
     const socketPath = tempSocketPath(`hub-recovery-${Date.now()}`);

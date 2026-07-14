@@ -2,12 +2,19 @@
 // tailii (TS host) — Hub と engine の間だけで使う内部 NDJSON プロトコル。
 
 import type { EngineRelayMessage, SessionProcessingMessage } from "./engineRelaySocket.js";
-import { decodeControlMessage, type ControlMessage, type QuestionAnswer, type QuestionPromptQuestion } from "./protocol.js";
+import {
+  decodeControlMessage,
+  encodeControlMessage,
+  type ControlMessage,
+  type QuestionAnswer,
+  type QuestionPromptQuestion,
+} from "./protocol.js";
 
 export type HubClientMessage =
   | { type: "hub_hello" }
   | { type: "conversation_subscribe"; session: string; afterSeq?: number; newerThanMs?: number; preview?: boolean }
   | { type: "conversation_unsubscribe"; session: string }
+  | { type: "session_retire"; session: string }
   | { type: "conversation_subagent_transcript_request"; id: string; session: string; nodeId: string }
   | { type: "hub_state_request"; id: string; session: string }
   | { type: "presence_request"; id: string; session: string }
@@ -23,15 +30,16 @@ export type HubClientMessage =
       sandbox: "read-only" | "workspace-write" | "danger-full-access" | null;
       threadId: string;
       cwd: string;
+      explicitRetry?: boolean;
     }
   | { type: "codex_turn_interrupt"; id: string; session: string }
-  | { type: "chat_send"; id: string; session: string; clientMessageId: string; text: string }
+  | { type: "chat_send"; id: string; session: string; clientMessageId: string; text: string; explicitRetry?: boolean }
   | { type: "runtime_claim"; id: string; session: string }
   | { type: "runtime_claim_release"; session: string }
   | SessionProcessingMessage;
 
 export type HubServerMessage =
-  | { type: "hub_hello_ack"; version: string | null; bootId: string }
+  | { type: "hub_hello_ack"; version: string | null; bootId: string; processingSessions?: string[] }
   | {
       type: "hub_state_response";
       id: string;
@@ -57,6 +65,15 @@ export type HubServerMessage =
   | EngineRelayMessage;
 
 export function encodeHubMessage(message: HubClientMessage | HubServerMessage): string {
+  if (message.type === "conversation_event" || message.type === "conversation_pane_preview" ||
+    message.type === "conversation_mode" || message.type === "conversation_subagent_transcript_response") {
+    // Hub 封筒内でも ControlMessage は外向け wire 表現を使う。特に tool_activity は
+    // activity を flat 化するため、単純な JSON.stringify では受信側 decoder と非対称になる。
+    return JSON.stringify({
+      ...message,
+      payload: JSON.parse(encodeControlMessage(message.payload)) as unknown,
+    }) + "\n";
+  }
   return JSON.stringify(message) + "\n";
 }
 
@@ -80,6 +97,10 @@ export function decodeHubClientLine(line: string): HubClientMessage | null {
   if (record["type"] === "conversation_unsubscribe") {
     const session = record["session"];
     return typeof session === "string" && session.length > 0 ? { type: "conversation_unsubscribe", session } : null;
+  }
+  if (record["type"] === "session_retire") {
+    const session = record["session"];
+    return typeof session === "string" && session.length > 0 ? { type: "session_retire", session } : null;
   }
   if (record["type"] === "conversation_subagent_transcript_request") {
     const id = record["id"];
@@ -121,16 +142,18 @@ export function decodeHubClientLine(line: string): HubClientMessage | null {
     const id = record["id"], session = record["session"], text = record["text"];
     const clientUserMessageId = record["clientUserMessageId"], effort = record["effort"];
     const sandbox = record["sandbox"], threadId = record["threadId"], cwd = record["cwd"];
+    const explicitRetry = record["explicitRetry"];
     const validSandbox = sandbox === null || sandbox === "read-only" ||
       sandbox === "workspace-write" || sandbox === "danger-full-access";
     return typeof id === "string" && id.length > 0 && typeof session === "string" && session.length > 0 &&
       typeof text === "string" && typeof clientUserMessageId === "string" && clientUserMessageId.length > 0 &&
       (effort === null || typeof effort === "string") && validSandbox &&
-      typeof threadId === "string" && threadId.length > 0 && typeof cwd === "string" && cwd.length > 0
+      typeof threadId === "string" && threadId.length > 0 && typeof cwd === "string" && cwd.length > 0 &&
+      (explicitRetry === undefined || typeof explicitRetry === "boolean")
       ? { type: "codex_turn_submit", id, session, text, clientUserMessageId,
           effort: effort as string | null,
           sandbox: sandbox as "read-only" | "workspace-write" | "danger-full-access" | null,
-          threadId, cwd }
+          threadId, cwd, ...(explicitRetry === true ? { explicitRetry: true } : {}) }
       : null;
   }
   if (record["type"] === "codex_turn_interrupt") {
@@ -141,10 +164,12 @@ export function decodeHubClientLine(line: string): HubClientMessage | null {
   }
   if (record["type"] === "chat_send") {
     const id = record["id"], session = record["session"], clientMessageId = record["clientMessageId"];
-    const text = record["text"];
+    const text = record["text"], explicitRetry = record["explicitRetry"];
     return typeof id === "string" && id.length > 0 && typeof session === "string" && session.length > 0 &&
-      typeof clientMessageId === "string" && clientMessageId.length > 0 && typeof text === "string" && text.length > 0
-      ? { type: "chat_send", id, session, clientMessageId, text }
+      typeof clientMessageId === "string" && clientMessageId.length > 0 && typeof text === "string" && text.length > 0 &&
+      (explicitRetry === undefined || typeof explicitRetry === "boolean")
+      ? { type: "chat_send", id, session, clientMessageId, text,
+          ...(explicitRetry === true ? { explicitRetry: true } : {}) }
       : null;
   }
   if (record["type"] === "runtime_claim") {
@@ -165,8 +190,24 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
   if (record["type"] === "hub_hello_ack") {
     const version = record["version"];
     const bootId = record["bootId"];
-    return (version === null || typeof version === "string") && typeof bootId === "string" && bootId.length > 0
-      ? { type: "hub_hello_ack", version, bootId } : null;
+    const rawProcessingSessions = record["processingSessions"];
+    if (!((version === null || typeof version === "string") &&
+      typeof bootId === "string" && bootId.length > 0)) return null;
+    // 旧 Hub の hello ack には processingSessions が無い。「処理中なし」とは区別して
+    // engine 側の既知状態を維持し、ローリング更新中の背景購読を誤解除しない。
+    // 将来版や一時的な破損で不正要素が混ざっても hello 全体を捨てない。有効な会話だけを
+    // 採用し、型自体が配列でない場合は旧 Hub 相当（snapshot 未提供）として扱う。
+    const processingSessions = rawProcessingSessions === undefined || !Array.isArray(rawProcessingSessions)
+      ? undefined
+      : rawProcessingSessions.filter(
+        (session): session is string => typeof session === "string" && session.length > 0,
+      );
+    return {
+      type: "hub_hello_ack",
+      version,
+      bootId,
+      ...(processingSessions !== undefined ? { processingSessions } : {}),
+    };
   }
   if (record["type"] === "hub_state_response") {
     const id = record["id"];
@@ -217,8 +258,8 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
     const session = record["session"];
     if (typeof id !== "string" || id.length === 0 ||
       typeof session !== "string" || session.length === 0) return null;
-    let payload: ControlMessage;
-    try { payload = decodeControlMessage(JSON.stringify(record["payload"])); } catch { return null; }
+    const payload = decodeHubControlPayload(record["payload"]);
+    if (payload === null) return null;
     return payload.type === "subagent_transcript_response" && payload.id === id
       ? { type: record["type"], id, session, payload }
       : null;
@@ -227,8 +268,8 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
     record["type"] === "conversation_mode") {
     const session = record["session"];
     if (typeof session !== "string" || session.length === 0) return null;
-    let payload: ControlMessage;
-    try { payload = decodeControlMessage(JSON.stringify(record["payload"])); } catch { return null; }
+    const payload = decodeHubControlPayload(record["payload"]);
+    if (payload === null) return null;
     if (record["type"] === "conversation_pane_preview") {
       return payload.type === "pane_preview" ? { type: record["type"], session, payload } : null;
     }
@@ -240,6 +281,45 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
       ? { type: record["type"], session, serverSeq, payload } : null;
   }
   return decodeRelay(record);
+}
+
+/**
+ * Hub envelope 内の ControlMessage を復元する。
+ *
+ * 現行 Hub は canonical flat wire を送る。一世代前の Hub は TypeScript の内部表現を
+ * JSON.stringify していたため、tool_activity.activity / subagent_node.node だけ nested だった。
+ * engine と daemon のローリング更新中にそれらを捨てないよう、Hub 内部境界に限って旧形を
+ * flat へ正規化する。外向け ControlMessage decoder の厳格な wire 契約は緩めない。
+ */
+function decodeHubControlPayload(value: unknown): ControlMessage | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const encoded = JSON.stringify(value);
+  if (encoded === undefined) return null;
+  try {
+    return decodeControlMessage(encoded);
+  } catch {
+    // legacy nested payload は下で限定的に正規化する。
+  }
+  const record = value as Record<string, unknown>;
+  const nestedKey = record["type"] === "tool_activity" || record["type"] === "session_tool_activity"
+    ? "activity"
+    : record["type"] === "subagent_node" ? "node" : null;
+  if (nestedKey === null) return null;
+  const nested = record[nestedKey];
+  if (typeof nested !== "object" || nested === null || Array.isArray(nested)) return null;
+  const flattened: Record<string, unknown> = {
+    ...record,
+    ...nested as Record<string, unknown>,
+    type: record["type"],
+  };
+  delete flattened[nestedKey];
+  if (record["v"] !== undefined) flattened["v"] = record["v"];
+  else delete flattened["v"];
+  try {
+    return decodeControlMessage(JSON.stringify(flattened));
+  } catch {
+    return null;
+  }
 }
 
 function parseRecord(line: string): Record<string, unknown> | null {

@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import {
   acquireHubLock,
+  controlMessageCallbackWriter,
   ensureHubDaemon,
   HUB_SOCKET_WRITABLE_LENGTH_LIMIT,
   pidAlive,
@@ -12,6 +13,8 @@ import {
   startHubSocket,
   writeHubSocketLine,
 } from "../src/hubDaemon.js";
+import { encodeHubMessage } from "../src/hubProtocol.js";
+import type { ControlMessage } from "../src/protocol.js";
 import { SessionHub } from "../src/sessionHub.js";
 import { sendQuestionEventToEngine, startEngineRelaySocket } from "../src/engineRelaySocket.js";
 import { readPackageVersion } from "../src/version.js";
@@ -127,6 +130,42 @@ describe("hub lock / ensure", () => {
 });
 
 describe("hub socket", () => {
+  test("LineWriter→daemon adapter→Hub encode で flat tool/subagent wire を内部表現へ復元する", async () => {
+    const payloads: ControlMessage[] = [];
+    const writer = controlMessageCallbackWriter((message) => payloads.push(message));
+    writer.write({
+      type: "tool_activity", v: 1,
+      activity: {
+        id: "tool-1", name: "Edit", label: "編集", file: "/tmp/A.swift",
+        commandTruncated: false, descriptionTruncated: false,
+      },
+    });
+    writer.write({
+      type: "subagent_node", v: 2,
+      node: {
+        nodeId: "agent-1", toolUseId: "tool-use-1", parentNodeId: null,
+        agentType: "Explore", label: "調査", depth: 1, status: "running", ts: 123,
+      },
+    });
+    await vi.waitFor(() => expect(payloads).toHaveLength(2));
+
+    const toolEnvelope = JSON.parse(encodeHubMessage({
+      type: "conversation_event", session: "work", serverSeq: 1, payload: payloads[0]!,
+    })) as { payload: Record<string, unknown> };
+    expect(toolEnvelope.payload).toMatchObject({
+      type: "tool_activity", id: "tool-1", name: "Edit", label: "編集",
+    });
+    expect(toolEnvelope.payload).not.toHaveProperty("activity");
+
+    const subagentEnvelope = JSON.parse(encodeHubMessage({
+      type: "conversation_event", session: "work", serverSeq: 2, payload: payloads[1]!,
+    })) as { payload: Record<string, unknown> };
+    expect(subagentEnvelope.payload).toMatchObject({
+      type: "subagent_node", nodeId: "agent-1", toolUseId: "tool-use-1", status: "running",
+    });
+    expect(subagentEnvelope.payload).not.toHaveProperty("node");
+  });
+
   test("書込前の writableLength が閾値超なら遅延 client を切断して監査記録する", () => {
     const write = vi.fn();
     const destroy = vi.fn();
@@ -160,7 +199,7 @@ describe("hub socket", () => {
     expect(log).toHaveBeenCalledWith("audit client_connect clients=1");
     writeLine(client, JSON.stringify({ type: "hub_hello" }));
     expect(JSON.parse(await reader.nextLine())).toEqual({
-      type: "hub_hello_ack", version: "1.2.3", bootId: "boot-test",
+      type: "hub_hello_ack", version: "1.2.3", bootId: "boot-test", processingSessions: [],
     });
 
     client.destroy();

@@ -32,7 +32,11 @@ import { LineWriter } from "./lineWriter.js";
 import { PanePreviewPump } from "./panePreviewPump.js";
 import { TmuxSessionManager } from "./tmux.js";
 import { Writable } from "node:stream";
-import { PROTOCOL_MAX_SUPPORTED, type ControlMessage } from "./protocol.js";
+import {
+  decodeControlMessage,
+  PROTOCOL_MAX_SUPPORTED,
+  type ControlMessage,
+} from "./protocol.js";
 import { injectQuestionAnswers } from "./questionInjection.js";
 import { ImageService } from "./imageService.js";
 
@@ -47,6 +51,32 @@ export function defaultHubLockPath(): string {
 
 export function defaultPendingQuestionsPath(): string {
   return path.join(os.homedir(), ".tailii", "hub", "pending-questions.json");
+}
+
+export function defaultChatReceiptsPath(): string {
+  return path.join(os.homedir(), ".tailii", "hub", "chat-receipts.json");
+}
+
+/**
+ * LineWriter の canonical flat wire を Hub 内部の ControlMessage へ戻す adapter。
+ *
+ * tool_activity / subagent_node は内部表現だけ nested で、wire は flat になる。
+ * JSON.parse の型 assertion だけでは activity/node が欠けた偽 ControlMessage を作るため、
+ * 必ず protocol decoder を通して境界を検証・復元する。
+ */
+export function controlMessageCallbackWriter(
+  write: (message: ControlMessage) => void,
+): LineWriter {
+  return new LineWriter(new Writable({
+    write(chunk, _encoding, callback) {
+      try {
+        write(decodeControlMessage(String(chunk).trimEnd()));
+        callback();
+      } catch (error) {
+        callback(error as Error);
+      }
+    },
+  }));
 }
 
 /** lockfile を読む。不在・壊れは null。 */
@@ -182,7 +212,12 @@ export async function startHubSocket(options: {
         try {
           const message = JSON.parse(line) as { type?: unknown };
           if (message.type === "hub_hello") {
-            write(encodeHubMessage({ type: "hub_hello_ack", version: options.version, bootId }));
+            write(encodeHubMessage({
+              type: "hub_hello_ack",
+              version: options.version,
+              bootId,
+              processingSessions: options.hub.processingSessionNames,
+            }));
           }
         } catch { /* Hub コア側でも不正行を破棄する。 */ }
         options.hub.handleClientMessage(socket, line);
@@ -308,26 +343,23 @@ export async function runHubCommand(args: string[]): Promise<number> {
   // ここで ImageService を渡さないと engine 側のサービスは tail を通らず、
   // user 添付の image_available が消失する。index は engine と共通の既定パスへ書く。
   const imageService = new ImageService();
-  const callbackWriter = (write: (message: ControlMessage) => void): LineWriter =>
-    new LineWriter(new Writable({ write(chunk, _encoding, callback) {
-      try { write(JSON.parse(String(chunk)) as ControlMessage); callback(); } catch (error) { callback(error as Error); }
-    } }));
   const hub = new SessionHub({
     runner,
     heartbeatDir: defaultHeartbeatDir(),
     metadataStore,
     timeoutSeconds,
     pendingQuestionsPath: defaultPendingQuestionsPath(),
+    chatReceiptsPath: defaultChatReceiptsPath(),
     log,
     tailFactory: (write) => new ChatTailController({
-      writer: callbackWriter(write),
+      writer: controlMessageCallbackWriter(write),
       tailer: new TranscriptTailer({ tailIndefinitely: true, emitReplayDoneMarker: true }),
       projectsRoot: path.join(os.homedir(), ".claude", "projects"),
       imageService,
       protocolVersion: () => PROTOCOL_MAX_SUPPORTED,
     }),
     previewPumpFactory: (write, onPermissionMode) => new PanePreviewPump({
-      writer: callbackWriter(write),
+      writer: controlMessageCallbackWriter(write),
       capture: (session) => tmuxManager.capturePane(session, { lines: 60, joinWrappedLines: true }),
       onPermissionMode,
     }),
@@ -340,6 +372,7 @@ export async function runHubCommand(args: string[]): Promise<number> {
   });
   hub.restoreFromHeartbeats();
   hub.restorePendingQuestions();
+  hub.restoreChatReceipts();
   let socketServer: HubSocketServer | null = null;
   let relayServer: EngineRelayServer | null = null;
 

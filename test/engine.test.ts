@@ -84,6 +84,115 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
+  test("フォーカス外の処理中会話を購読し session 付き差分として配信する", async () => {
+    const store = makeTempStore();
+    store.put({
+      name: "background-work", cwd: "/tmp/background-work", createdAt: 1,
+      agent: "claude", providerSessionId: "provider-background",
+    });
+    let publish: ((payload: import("../src/protocol.js").ControlMessage) => void) | null = null;
+    const hub = new SessionHub({
+      runner: async () => ok(""),
+      heartbeatDir: makeTempDir("background-sync-hub"),
+      metadataStore: store,
+      timeoutSeconds: 1_800,
+      tailFactory: (write) => {
+        publish = write;
+        return { open: vi.fn(), stop: vi.fn() };
+      },
+    });
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("background-work\n") : ok(""));
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store), metadataStore: store, hub,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    hub.handleRelayMessage({
+      type: "session_processing", session: "background-work", state: "active",
+    });
+    expect(decodeControlMessage(
+      await engine.lines.nextOfType("session_processing_state"),
+    )).toEqual({
+      type: "session_processing_state", v: 2, session: "background-work", active: true,
+    });
+    expect(publish).not.toBeNull();
+    publish?.({
+      type: "chat_output", v: 2, streamId: "answer-1",
+      role: "assistant", text: "background answer", eof: true,
+    });
+
+    expect(decodeControlMessage(
+      await engine.lines.nextOfType("session_chat_output"),
+    )).toEqual({
+      type: "session_chat_output",
+      v: 2,
+      session: "background-work",
+      serverSeq: 1,
+      streamId: "answer-1",
+      role: "assistant",
+      text: "background answer",
+      eof: true,
+    });
+    publish?.({
+      type: "tool_activity",
+      v: 2,
+      activity: {
+        id: "tool-background-1",
+        name: "Bash",
+        label: "バックグラウンド処理",
+        command: "npm test",
+        commandTruncated: false,
+        description: "テストを実行",
+        descriptionTruncated: false,
+      },
+    });
+
+    expect(decodeControlMessage(
+      await engine.lines.nextOfType("session_tool_activity"),
+    )).toEqual({
+      type: "session_tool_activity",
+      v: 2,
+      session: "background-work",
+      serverSeq: 2,
+      activity: {
+        id: "tool-background-1",
+        name: "Bash",
+        label: "バックグラウンド処理",
+        command: "npm test",
+        commandTruncated: false,
+        description: "テストを実行",
+        descriptionTruncated: false,
+      },
+    });
+
+    // background wire を持たない event は checkpoint gap として保持し、後続の
+    // session_chat_output を表示できても seq を飛び越えない。
+    publish?.({
+      type: "image_available", v: 2, id: "image-background-1", path: "/tmp/bg.png",
+      mime: "image/png", thumbnail: "AA==", width: 1, height: 1,
+    });
+    publish?.({
+      type: "subagent_node", v: 2,
+      node: { nodeId: "agent-bg", toolUseId: "tool-bg", parentNodeId: null,
+        agentType: "Explore", label: "調査", depth: 1, status: "running", ts: 1 },
+    });
+    publish?.({
+      type: "chat_output", v: 2, streamId: "answer-after-gap",
+      role: "assistant", text: "after gap", eof: true,
+    });
+    await engine.lines.nextOfType("session_chat_output");
+
+    // processing 完了・unsubscribe の有無にかかわらず前面昇格は floor(seq=2)から replay。
+    engine.writeLine('{"id":"open-bg","name":"background-work","type":"session_reattach","v":2}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("image_available"))).toMatchObject({
+      type: "image_available", id: "image-background-1",
+    });
+    expect(decodeControlMessage(await engine.lines.nextOfType("subagent_node"))).toMatchObject({
+      type: "subagent_node", node: { nodeId: "agent-bg" },
+    });
+    await engine.teardown();
+  });
+
   test("subagent transcript 全文要求を現在会話の Hub tail へ中継する", async () => {
     const store = makeTempStore();
     store.put({
@@ -165,6 +274,7 @@ describe("EngineControl — 横断制御チャネル", () => {
     hubLink.onReconnect?.({ bootId: "boot-a", disconnectedAtMs: null });
     engine.writeLine('{"id":"open","name":"work","type":"session_reattach","v":2}');
     await engine.lines.nextOfType("session_list_response");
+    const now = vi.spyOn(Date, "now").mockReturnValue(200_000);
     hubLink.onMessage?.({ type: "conversation_event", session: "work", serverSeq: 7,
       payload: { type: "chat_output", v: 1, streamId: "visible", role: "assistant", text: "visible", eof: true } });
     await engine.lines.nextOfType("chat_output");
@@ -176,10 +286,137 @@ describe("EngineControl — 横断制御チャネル", () => {
     });
 
     sent.length = 0;
-    hubLink.onReconnect?.({ bootId: "boot-b", disconnectedAtMs: 2_000 });
+    // socket close が最終配送から1分超遅れても close-heuristic ではなく最終成功時刻を使う。
+    hubLink.onReconnect?.({ bootId: "boot-b", disconnectedAtMs: 1_000_000 });
     expect(sent).toEqual([{
-      type: "conversation_subscribe", session: "work", newerThanMs: 2_000, preview: true,
+      type: "conversation_subscribe", session: "work", newerThanMs: 195_000, preview: true,
     }]);
+
+    // 履歴 backfill の途中でさらに Hub が再起動した場合、serverSeq=0 の配送時刻を
+    // 差分境界にせず、完了マーカー前の古い行を含む全履歴を取り直す。
+    hubLink.onMessage?.({ type: "conversation_event", session: "work", serverSeq: 0,
+      payload: { type: "chat_output", v: 1, streamId: "old-history", role: "assistant",
+        text: "old history", eof: true } });
+    await engine.lines.nextOfType("chat_output");
+    sent.length = 0;
+    hubLink.onReconnect?.({ bootId: "boot-c", disconnectedAtMs: 2_000_000 });
+    expect(sent).toEqual([{
+      type: "conversation_subscribe", session: "work", preview: true,
+    }]);
+    now.mockRestore();
+    await engine.teardown();
+  });
+
+  test("Hub 世代変更は未購読 session の旧 serverSeq checkpoint も破棄する", async () => {
+    const store = makeTempStore();
+    for (const name of ["work", "other"]) {
+      store.put({ name, cwd: `/tmp/${name}`, createdAt: 1, agent: "claude",
+        providerSessionId: `provider-${name}` });
+    }
+    const sent: unknown[] = [];
+    const hubLink: HubLink = {
+      onMessage: null, onReconnect: null,
+      send(message) {
+        sent.push(message);
+        if (message.type === "hub_state_request") queueMicrotask(() => hubLink.onMessage?.({
+          type: "hub_state_response", id: message.id, session: message.session,
+          pendingQuestion: null, processing: false,
+        }));
+      },
+      close: vi.fn(),
+    };
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("work\nother\n") : ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner, store), metadataStore: store, hubLink });
+    await engine.lines.nextOfType("channel_hello");
+    hubLink.onReconnect?.({ bootId: "boot-a", disconnectedAtMs: null });
+
+    engine.writeLine('{"id":"open-work","name":"work","type":"session_reattach","v":2}');
+    await engine.lines.nextOfType("session_list_response");
+    hubLink.onMessage?.({ type: "conversation_event", session: "work", serverSeq: 9,
+      payload: { type: "chat_output", v: 1, streamId: "work-live", role: "assistant",
+        text: "live", eof: true } });
+    await engine.lines.nextOfType("chat_output");
+
+    engine.writeLine('{"id":"open-other","name":"other","type":"session_reattach","v":2}');
+    await engine.lines.nextOfType("session_list_response");
+    sent.length = 0;
+    hubLink.onReconnect?.({ bootId: "boot-b", disconnectedAtMs: 100_000 });
+
+    sent.length = 0;
+    engine.writeLine('{"id":"reopen-work","name":"work","type":"session_reattach","v":2}');
+    await engine.lines.nextOfType("session_list_response");
+    expect(sent).toContainEqual({
+      type: "conversation_subscribe", session: "work", preview: true,
+    });
+    expect(sent).not.toContainEqual(expect.objectContaining({
+      type: "conversation_subscribe", session: "work", afterSeq: 9,
+    }));
+    await engine.teardown();
+  });
+
+  test("Hub hello snapshot で切断中に完了した背景会話を inactive へ収束する", async () => {
+    const send = vi.fn();
+    const hubLink: HubLink = {
+      onMessage: null, onReconnect: null, send, close: vi.fn(),
+    };
+    const engine = startEngine({
+      sessionManager: makeManager(new MockTmuxRunner(() => ok(""))),
+      hubLink,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    hubLink.onReconnect?.({
+      bootId: "boot-a", disconnectedAtMs: null, processingSessions: ["background-work"],
+    });
+    expect(decodeControlMessage(
+      await engine.lines.nextOfType("session_processing_state"),
+    )).toEqual({
+      type: "session_processing_state", v: 2, session: "background-work", active: true,
+    });
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledWith({
+      type: "conversation_subscribe", session: "background-work", preview: false,
+    });
+
+    hubLink.onReconnect?.({
+      bootId: "boot-a", disconnectedAtMs: 1_000, processingSessions: [],
+    });
+    expect(decodeControlMessage(
+      await engine.lines.nextOfType("session_processing_state"),
+    )).toEqual({
+      type: "session_processing_state", v: 2, session: "background-work", active: false,
+    });
+    await engine.teardown();
+  });
+
+  test("旧 Hub の hello に snapshot が無い場合は既知の背景処理状態を維持する", async () => {
+    const send = vi.fn();
+    const hubLink: HubLink = {
+      onMessage: null, onReconnect: null, send, close: vi.fn(),
+    };
+    const engine = startEngine({
+      sessionManager: makeManager(new MockTmuxRunner(() => ok(""))),
+      hubLink,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    hubLink.onMessage?.({
+      type: "session_processing", session: "legacy-background", state: "active",
+    });
+    expect(decodeControlMessage(
+      await engine.lines.nextOfType("session_processing_state"),
+    )).toMatchObject({ session: "legacy-background", active: true });
+
+    send.mockClear();
+    hubLink.onReconnect?.({ bootId: "old-hub", disconnectedAtMs: 1_000 });
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledWith({
+      type: "conversation_subscribe", session: "legacy-background", preview: false,
+    });
+    await expect(
+      engine.lines.nextOfType("session_processing_state", 50),
+    ).rejects.toThrow("timeout");
     await engine.teardown();
   });
 
@@ -199,27 +436,55 @@ describe("EngineControl — 横断制御チャネル", () => {
     };
     const engine = startEngine({ sessionManager: makeManager(new MockTmuxRunner(() => ok(""))), hubLink });
     await engine.lines.nextOfType("channel_hello");
-    engine.writeLine('{"clientMessageId":"client-1","id":"send-1","session":"work","text":"hello","type":"chat_send","v":2}');
+    engine.writeLine('{"clientMessageId":"client-1","explicitRetry":true,"id":"send-1","session":"work","text":"hello","type":"chat_send","v":2}');
     expect(decodeControlMessage(await engine.lines.nextOfType("chat_send_result"))).toMatchObject({
       type: "chat_send_result", id: "send-1", status: "accepted",
     });
     expect(sent).toContainEqual({ type: "chat_send", id: "send-1", session: "work",
-      clientMessageId: "client-1", text: "hello" });
+      clientMessageId: "client-1", text: "hello", explicitRetry: true });
     await engine.teardown();
   });
 
-  test("chat_send は Hub timeout 時に tmux へ fail-open 注入する", async () => {
+  test("設問中chat_sendのACK待ちと並行して同じread loopでquestion_answerを処理できる", async () => {
+    const chatInjector = vi.fn(async () => {});
+    const hub = new SessionHub({
+      runner: async () => ok(""),
+      heartbeatDir: makeTempDir("engine-chat-question-ack"),
+      metadataStore: makeTempStore(),
+      timeoutSeconds: 1_800,
+      chatInjector,
+      questionInjector: async () => {},
+    });
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "Q1",
+      questions: [{ header: "h", question: "q", options: [], multiSelect: false }] });
+    const engine = startEngine({ sessionManager: makeManager(new MockTmuxRunner(() => ok(""))), hub });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"clientMessageId":"client-1","id":"send-1","session":"work","text":"after answer","type":"chat_send","v":2}');
+    await expect(engine.lines.nextOfType("chat_send_result", 100)).rejects.toThrow("timeout");
+    expect(chatInjector).not.toHaveBeenCalled();
+
+    engine.writeLine('{"answers":[],"id":"Q1","session":"work","type":"question_answer","v":2}');
+    await engine.lines.nextOfType("remote_pending_cleared");
+    await vi.waitFor(() => expect(chatInjector).toHaveBeenCalledWith("after answer", "work"));
+    expect(decodeControlMessage(await engine.lines.nextOfType("chat_send_result"))).toMatchObject({
+      id: "send-1", status: "accepted",
+    });
+    await engine.teardown();
+  });
+
+  test("chat_send は設問待ち相当で固定timeoutせず、Hub切断時だけ結果不明を返す", async () => {
     const runner = new MockTmuxRunner(() => ok(""));
     const unavailableHub: HubLink = { onMessage: null, onReconnect: null, send: vi.fn(), close: vi.fn() };
     const engine = startEngine({ sessionManager: makeManager(runner), hubLink: unavailableHub });
     await engine.lines.nextOfType("channel_hello");
     engine.writeLine('{"clientMessageId":"client-1","id":"send-1","session":"work","text":"hello","type":"chat_send","v":2}');
-    expect(decodeControlMessage(await engine.lines.nextOfType("chat_send_result", 3_000))).toMatchObject({
-      type: "chat_send_result", id: "send-1", status: "accepted",
+    await expect(engine.lines.nextOfType("error", 100)).rejects.toThrow("timeout");
+    unavailableHub.onReconnect?.({ bootId: "reconnected", disconnectedAtMs: Date.now() });
+    expect(decodeControlMessage(await engine.lines.nextOfType("error"))).toMatchObject({
+      type: "error", id: "send-1", code: "chat_send_failed",
     });
-    // pane ID 未登録の store では paneTarget がセッション名へフォールバックする（tmux.ts）。
-    expect(runner.recorded).toContainEqual(["send-keys", "-t", "work", "-l", "hello"]);
-    expect(runner.recorded).toContainEqual(["send-keys", "-t", "work", "Enter"]);
+    expect(runner.recorded.filter(([command]) => command === "send-keys")).toEqual([]);
     await engine.teardown();
   });
 
@@ -549,12 +814,17 @@ describe("EngineControl — 横断制御チャネル", () => {
 
   test("session_kill で tmux kill-session -t <name> が発行される", async () => {
     const runner = new MockTmuxRunner(() => ok(""));
-    const engine = startEngine({ sessionManager: makeManager(runner) });
+    const hubSend = vi.fn();
+    const hubLink: HubLink = { onMessage: null, onReconnect: null, send: hubSend, close: vi.fn() };
+    const engine = startEngine({ sessionManager: makeManager(runner), hubLink });
 
     await engine.lines.nextOfType("channel_hello");
     engine.writeLine('{"id":"K1","name":"doomed","type":"session_kill","v":1}');
 
     expect(await waitForCommand(runner, ["kill-session", "-t", "doomed"])).toBe(true);
+    await vi.waitFor(() => expect(hubSend).toHaveBeenCalledWith({
+      type: "session_retire", session: "doomed",
+    }));
 
     await engine.teardown();
   });
@@ -1123,7 +1393,7 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
-  test("codex_turn_start は Hub RPC timeout 時に engine controller へ fail-open する", async () => {
+  test("codex_turn_start は Hub RPC timeout 時に local controller へ fail-open せず相関 failed を返す", async () => {
     const store = makeTempStore();
     store.put({ name: "codex-work", cwd: "/tmp/codex-work", createdAt: 1,
       agent: "codex", providerSessionId: "thread-123" });
@@ -1138,12 +1408,17 @@ describe("EngineControl — 横断制御チャネル", () => {
       close: vi.fn(),
     };
     const engine = startEngine({ sessionManager: makeManager(new MockTmuxRunner(() => ok("")), store),
-      metadataStore: store, codexTurnController: controller, hubLink: unavailableHub });
+      metadataStore: store, codexTurnController: controller, hubLink: unavailableHub,
+      codexHubRpcTimeoutMs: 25 });
     await engine.lines.nextOfType("channel_hello");
-    engine.writeLine('{"id":"fallback","session":"codex-work","text":"run","type":"codex_turn_start","v":2}');
-    await vi.waitFor(() => expect(startTurn).toHaveBeenCalledOnce(), { timeout: 3_000 });
+    engine.writeLine('{"explicitRetry":true,"id":"fallback","session":"codex-work","text":"run","type":"codex_turn_start","v":2}');
+    const result = decodeControlMessage(await engine.lines.nextOfType("codex_turn_start_result"));
+    expect(result).toMatchObject({
+      type: "codex_turn_start_result", id: "fallback", status: "failed",
+    });
+    expect(startTurn).not.toHaveBeenCalled();
     expect(sent).toContainEqual(expect.objectContaining({ type: "codex_turn_submit", id: "fallback",
-      threadId: "thread-123", clientUserMessageId: "fallback" }));
+      threadId: "thread-123", clientUserMessageId: "fallback", explicitRetry: true }));
     await engine.teardown();
   });
 

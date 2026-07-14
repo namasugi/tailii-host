@@ -90,19 +90,32 @@ describe("PanePreviewPump", () => {
     await vi.advanceTimersByTimeAsync(10);
     expect(modes).toEqual(["auto", "acceptEdits"]);
 
+    // subagent 一覧がモード行の下に展開されても明示行を追跡する。
+    paneText = [
+      "body",
+      "⏵⏵ auto mode on (shift+tab to cycle) · ← for agents · ↓ to manage",
+      "⏺ main",
+      "◯ Explore agent-1",
+      "◯ Explore agent-2",
+      "◯ Explore agent-3",
+      "◯ Explore agent-4",
+    ].join("\n");
+    await vi.advanceTimersByTimeAsync(10);
+    expect(modes).toEqual(["auto", "acceptEdits", "auto"]);
+
     // ダイアログ表示中（mode 行が消え null 判定）は直前の値を保持し通知しない。
     paneText = "body\n↑↓ to navigate · enter to confirm";
     await vi.advanceTimersByTimeAsync(10);
-    expect(modes).toEqual(["auto", "acceptEdits"]);
+    expect(modes).toEqual(["auto", "acceptEdits", "auto"]);
 
     // 処理中・再描画中も mode 行が消えるが、default へ戻したとは通知しない。
     paneText = "Puttering…\n… · esc to interrupt · ← for agents";
     await vi.advanceTimersByTimeAsync(10);
-    expect(modes).toEqual(["auto", "acceptEdits"]);
+    expect(modes).toEqual(["auto", "acceptEdits", "auto"]);
 
     paneText = "body\n⏸ manual mode on · ? for shortcuts";
     await vi.advanceTimersByTimeAsync(10);
-    expect(modes).toEqual(["auto", "acceptEdits", "default"]);
+    expect(modes).toEqual(["auto", "acceptEdits", "auto", "default"]);
 
     pump.stop();
   });

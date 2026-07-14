@@ -51,7 +51,7 @@ describe("resolveDefaultAgent", () => {
 // MARK: - PermissionModeDetector
 
 describe("parsePermissionMode", () => {
-  test("末尾4行のマーカーからモードを判定する", () => {
+  test("明示的な TUI ステータス行からモードを判定する", () => {
     expect(parsePermissionMode("本文\n⏵⏵ accept edits on (shift+tab to cycle)")).toBe("acceptEdits");
     expect(parsePermissionMode("本文\n⏸ plan mode on (shift+tab to cycle)")).toBe("plan");
     expect(parsePermissionMode("本文\n⏵⏵ auto mode on (shift+tab to cycle)")).toBe("auto");
@@ -61,14 +61,43 @@ describe("parsePermissionMode", () => {
     expect(parsePermissionMode("本文だけでステータス行がまだ無い")).toBeNull();
   });
 
-  test("会話本文に同じ語があっても末尾4行しか見ない", () => {
-    const pane = ["plan mode on の説明", "a", "b", "c", "d", "? for shortcuts"].join("\n");
-    expect(parsePermissionMode(pane)).toBe("default");
+  test("サブエージェント一覧で末尾4行から押し出されたモード行も検出する", () => {
+    const pane = [
+      "本文",
+      "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents · ↓ to manage",
+      "  ⏺ main",
+      "  ◯ Explore agent-1",
+      "  ◯ Explore agent-2",
+      "  ◯ Explore agent-3",
+      "  ◯ Explore agent-4",
+    ].join("\n");
+    expect(parsePermissionMode(pane)).toBe("auto");
+  });
+
+  test("会話本文のモード語や active ヒントを default と誤認しない", () => {
+    expect(parsePermissionMode("本文\nplan mode on の説明\n続き")).toBeNull();
+    expect(
+      parsePermissionMode("処理中\n? for shortcuts · esc to interrupt · ← for agents"),
+    ).toBeNull();
+    expect(parsePermissionMode("本文\n? for shortcuts")).toBe("default");
   });
 
   test("ダイアログヒント行だけがあるときは判定不能として null を返す", () => {
     expect(parsePermissionMode("本文\nEnter to select · ↑/↓ to navigate · Esc to cancel")).toBeNull();
     expect(parsePermissionMode("本文\nEnter to confirm · Esc to cancel")).toBeNull();
+  });
+
+  test("ダイアログの下にサブエージェント一覧があっても背後のモードを返さない", () => {
+    const pane = [
+      "⏵⏵ auto mode on (shift+tab to cycle)",
+      "Enter to confirm · Esc to cancel",
+      "⏺ main",
+      "◯ Explore agent-1",
+      "◯ Explore agent-2",
+      "◯ Explore agent-3",
+      "◯ Explore agent-4",
+    ].join("\n");
+    expect(parsePermissionMode(pane)).toBeNull();
   });
 });
 
