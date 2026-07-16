@@ -17,6 +17,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { findCommand } from "./doctor.js";
+import { defaultInjectedPath } from "./launch.js";
 
 /** launchd ジョブのラベル（plist ファイル名と対）。 */
 export const QUIC_GW_LAUNCHD_LABEL = "com.tailii.quic-gw";
@@ -44,6 +45,43 @@ export function quicCredentialsDir(): string {
 /** ゲートウェイの監査ログパス（launchd が stdout/stderr をここへ向ける）。 */
 export function quicGatewayLogPath(): string {
   return path.join(os.homedir(), ".tailii", "quic-gw.log");
+}
+
+/**
+ * launchd が起動する gateway バイナリの設置先（`~/.tailii/bin/tailii-quic-gw`）。
+ *
+ * 重要（実機で判明した罠）: launchd の LaunchAgent は `~/Documents` `~/Desktop`
+ * `~/Downloads` 等の **TCC 保護フォルダにアクセスできない**。ビルド成果物や npm 配布物が
+ * そうした場所にあると、launchd 起動時に dyld がバイナリを map できず **dyld 段階で無限
+ * ストール**する（プロセスは生存するが bind に到達せず、ログも出ない）。Terminal 起動は
+ * ユーザーの TCC 付与を継承するため成功し、差分に気付きにくい。回避のため、常駐用バイナリは
+ * 必ず非 TCC 保護の隠しディレクトリ `~/.tailii/bin` へコピーしてから launchd に渡す。
+ */
+export function quicGatewayInstalledBinaryPath(): string {
+  return path.join(os.homedir(), ".tailii", "bin", "tailii-quic-gw");
+}
+
+/**
+ * gateway バイナリを非 TCC 保護の `~/.tailii/bin` へコピーして、その設置先パスを返す。
+ * 内容が同一なら再コピーしない（mtime/サイズで判定）。常に実行ビットを立てる。
+ */
+export function installQuicGatewayBinary(sourcePath: string): string {
+  const dest = quicGatewayInstalledBinaryPath();
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  const sourceStat = fs.statSync(sourcePath);
+  let needCopy = true;
+  try {
+    const destStat = fs.statSync(dest);
+    // サイズ一致 かつ コピー先が新しければ据え置き（cargo 再ビルドは mtime が進む）。
+    needCopy = !(destStat.size === sourceStat.size && destStat.mtimeMs >= sourceStat.mtimeMs);
+  } catch {
+    needCopy = true;
+  }
+  if (needCopy) {
+    fs.copyFileSync(sourcePath, dest);
+  }
+  fs.chmodSync(dest, 0o755);
+  return dest;
 }
 
 /** LaunchAgent plist の設置先。 */
@@ -126,8 +164,46 @@ export async function ensureQuicCredentials(
 
 // MARK: - launchd LaunchAgent
 
-/** LaunchAgent plist の内容（KeepAlive 常駐・監査ログは stdout/stderr リダイレクト）。 */
-export function quicLaunchAgentPlist(gatewayPath: string, logPath: string): string {
+/** XML テキストノードのエスケープ（plist 値に埋める文字列用）。 */
+function xmlEscape(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+/** `quicLaunchAgentPlist` に渡す解決済み絶対パス群。 */
+export interface QuicLaunchAgentConfig {
+  gatewayPath: string;
+  logPath: string;
+  /** 資格情報ディレクトリ（絶対パス）。`--dir` に明示的に渡す。 */
+  credentialsDir: string;
+  /** exec 子プロセスへ注入する PATH（launch.ts の defaultInjectedPath と同一）。 */
+  injectedPath: string;
+  /** ユーザーの HOME 絶対パス（EnvironmentVariables に設定）。 */
+  home: string;
+}
+
+/**
+ * LaunchAgent plist の内容（KeepAlive 常駐・監査ログは stdout/stderr リダイレクト）。
+ *
+ * 重要（実機で判明した罠）: macOS の GUI LaunchAgent は **HOME を継承しない**。
+ * ゲートウェイは `~/.tailii/quic` の展開・`default_injected_path` の両方で HOME を読むため、
+ * HOME 空だと資格情報ディレクトリが `/.tailii/quic` に化けて `create_dir_all` が失敗し、
+ * serve が即終了 → KeepAlive 再起動ループに陥る。対策として:
+ *   1. `EnvironmentVariables` に HOME を明示（gateway 本体 + exec 子プロセス双方に効く）。
+ *   2. `--dir` / `--path` を **絶対パスで明示的に渡し**、HOME 展開へ依存しない（防御多重化）。
+ */
+export function quicLaunchAgentPlist(config: QuicLaunchAgentConfig): string {
+  const args = [
+    config.gatewayPath,
+    "serve",
+    "--dir",
+    config.credentialsDir,
+    "--path",
+    config.injectedPath,
+  ];
+  const programArguments = args.map((arg) => `    <string>${xmlEscape(arg)}</string>`).join("\n");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -136,17 +212,23 @@ export function quicLaunchAgentPlist(gatewayPath: string, logPath: string): stri
   <string>${QUIC_GW_LAUNCHD_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${gatewayPath}</string>
-    <string>serve</string>
+${programArguments}
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>${xmlEscape(config.home)}</string>
+    <key>PATH</key>
+    <string>${xmlEscape(config.injectedPath)}</string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>${logPath}</string>
+  <string>${xmlEscape(config.logPath)}</string>
   <key>StandardErrorPath</key>
-  <string>${logPath}</string>
+  <string>${xmlEscape(config.logPath)}</string>
 </dict>
 </plist>
 `;
@@ -164,9 +246,21 @@ const defaultLaunchctl: LaunchctlRunner = (args) =>
   });
 
 export interface InstallLaunchAgentOptions {
+  /** 解決済み gateway バイナリ（ビルド/配布物の場所。TCC 保護下でも可）。 */
   gatewayPath: string;
   plistPath?: string;
   logPath?: string;
+  /** 資格情報ディレクトリ（絶対パス）。省略時 `quicCredentialsDir()`。 */
+  credentialsDir?: string;
+  /** exec 子プロセスの PATH。省略時 `defaultInjectedPath()`。 */
+  injectedPath?: string;
+  /** HOME 絶対パス。省略時 `os.homedir()`。 */
+  home?: string;
+  /**
+   * launchd が実際に起動するバイナリパス（`gatewayPath` からのコピー先）。
+   * 省略時 `~/.tailii/bin/tailii-quic-gw` へコピーする（TCC 回避）。テストで無効化可。
+   */
+  installBinary?: (gatewayPath: string) => string;
   uid?: number;
   launchctl?: LaunchctlRunner;
 }
@@ -174,15 +268,33 @@ export interface InstallLaunchAgentOptions {
 /**
  * LaunchAgent を設置して（再）起動する（冪等）。
  * 既存ジョブは bootout してから bootstrap し、plist 更新を確実に反映する。
+ *
+ * gateway バイナリは非 TCC 保護の `~/.tailii/bin` へコピーしてから launchd に渡す
+ * （`installQuicGatewayBinary` 参照。TCC 保護フォルダ由来の dyld ストール回避）。
  */
 export async function installQuicLaunchAgent(options: InstallLaunchAgentOptions): Promise<void> {
   const plistPath = options.plistPath ?? quicLaunchAgentPlistPath();
   const logPath = options.logPath ?? quicGatewayLogPath();
   const uid = options.uid ?? process.getuid?.() ?? 501;
   const launchctl = options.launchctl ?? defaultLaunchctl;
+  const installBinary = options.installBinary ?? installQuicGatewayBinary;
+
+  // TCC 保護フォルダ（~/Documents 等）から launchd 起動すると dyld がストールするため、
+  // 常駐用バイナリは非保護の隠しディレクトリへコピーしてそこを起動する。
+  const launchBinary = installBinary(options.gatewayPath);
 
   fs.mkdirSync(path.dirname(plistPath), { recursive: true });
-  fs.writeFileSync(plistPath, quicLaunchAgentPlist(options.gatewayPath, logPath), { mode: 0o644 });
+  fs.writeFileSync(
+    plistPath,
+    quicLaunchAgentPlist({
+      gatewayPath: launchBinary,
+      logPath,
+      credentialsDir: options.credentialsDir ?? quicCredentialsDir(),
+      injectedPath: options.injectedPath ?? defaultInjectedPath(),
+      home: options.home ?? os.homedir(),
+    }),
+    { mode: 0o644 },
+  );
 
   // 既存ジョブは落としてから載せ直す（未登録の bootout 失敗は無視）。
   try {

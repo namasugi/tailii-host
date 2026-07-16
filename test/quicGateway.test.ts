@@ -69,32 +69,76 @@ describe("ensureQuicCredentials", () => {
 });
 
 describe("quicLaunchAgentPlist", () => {
+  const config = {
+    gatewayPath: "/opt/gw/tailii-quic-gw",
+    logPath: "/Users/alice/.tailii/quic-gw.log",
+    credentialsDir: "/Users/alice/.tailii/quic",
+    injectedPath: "/opt/homebrew/bin:/Users/alice/.local/bin:/usr/bin",
+    home: "/Users/alice",
+  };
+
   it("ラベル・serve 引数・KeepAlive・ログリダイレクトを含む", () => {
-    const plist = quicLaunchAgentPlist("/opt/gw/tailii-quic-gw", "/Users/alice/.tailii/quic-gw.log");
+    const plist = quicLaunchAgentPlist(config);
     expect(plist).toContain(`<string>${QUIC_GW_LAUNCHD_LABEL}</string>`);
     expect(plist).toContain("<string>/opt/gw/tailii-quic-gw</string>");
     expect(plist).toContain("<string>serve</string>");
     expect(plist).toContain("<key>KeepAlive</key>");
     expect(plist).toContain("<string>/Users/alice/.tailii/quic-gw.log</string>");
   });
+
+  it("HOME を EnvironmentVariables に明示する（GUI LaunchAgent は HOME 非継承の罠対策）", () => {
+    const plist = quicLaunchAgentPlist(config);
+    expect(plist).toContain("<key>EnvironmentVariables</key>");
+    expect(plist).toContain("<key>HOME</key>");
+    expect(plist).toContain("<string>/Users/alice</string>");
+  });
+
+  it("--dir / --path を絶対パスで明示的に渡す（HOME 展開へ依存しない）", () => {
+    const plist = quicLaunchAgentPlist(config);
+    expect(plist).toContain("<string>--dir</string>");
+    expect(plist).toContain("<string>/Users/alice/.tailii/quic</string>");
+    expect(plist).toContain("<string>--path</string>");
+    expect(plist).toContain("<string>/opt/homebrew/bin:/Users/alice/.local/bin:/usr/bin</string>");
+  });
+
+  it("XML 特殊文字を含むパスをエスケープする", () => {
+    const plist = quicLaunchAgentPlist({ ...config, home: "/Users/a&b" });
+    expect(plist).toContain("<string>/Users/a&amp;b</string>");
+    expect(plist).not.toContain("/Users/a&b<");
+  });
 });
 
 describe("installQuicLaunchAgent", () => {
-  it("plist を書き、bootout → bootstrap の順で launchctl を叩く", async () => {
+  it("バイナリを設置先へコピーし、plist はそのコピーを指す + bootout → bootstrap", async () => {
     const dir = tempDir("launchd");
     const plistPath = path.join(dir, "com.tailii.quic-gw.plist");
+    const installedBinary = path.join(dir, "installed", "tailii-quic-gw");
     const calls: string[][] = [];
+    const installedFrom: string[] = [];
     await installQuicLaunchAgent({
       gatewayPath: "/opt/gw/tailii-quic-gw",
       plistPath,
       logPath: "/tmp/quic-gw.log",
       uid: 501,
+      // 実 ~/.tailii/bin を触らないよう注入（TCC コピーは実機検証で確認済み）。
+      installBinary: (src) => {
+        installedFrom.push(src);
+        return installedBinary;
+      },
       launchctl: async (args) => {
         calls.push(args);
       },
     });
     expect(fs.existsSync(plistPath)).toBe(true);
-    expect(fs.readFileSync(plistPath, "utf8")).toContain("<string>serve</string>");
+    const written = fs.readFileSync(plistPath, "utf8");
+    expect(written).toContain("<string>serve</string>");
+    // plist はソースではなく設置先バイナリを指す（TCC 保護フォルダ由来の dyld ストール回避）。
+    expect(installedFrom).toEqual(["/opt/gw/tailii-quic-gw"]);
+    expect(written).toContain(`<string>${installedBinary}</string>`);
+    expect(written).not.toContain("<string>/opt/gw/tailii-quic-gw</string>");
+    // 既定で HOME を EnvironmentVariables に入れる（GUI LaunchAgent の HOME 非継承対策）。
+    expect(written).toContain("<key>HOME</key>");
+    expect(written).toContain(`<string>${os.homedir()}</string>`);
     expect(calls).toEqual([
       ["bootout", "gui/501/com.tailii.quic-gw"],
       ["bootstrap", "gui/501", plistPath],
@@ -110,6 +154,7 @@ describe("installQuicLaunchAgent", () => {
       plistPath,
       logPath: "/tmp/quic-gw.log",
       uid: 501,
+      installBinary: (src) => src,
       launchctl: async (args) => {
         calls.push(args);
         if (args[0] === "bootout" || args[0] === "bootstrap") {
@@ -119,6 +164,32 @@ describe("installQuicLaunchAgent", () => {
     });
     expect(calls.map((c) => c[0])).toEqual(["bootout", "bootstrap", "load"]);
     expect(calls[2]).toEqual(["load", "-w", plistPath]);
+  });
+});
+
+describe("installQuicGatewayBinary", () => {
+  it("バイナリを設置先へコピーし実行ビットを立てる・冪等", async () => {
+    const { installQuicGatewayBinary, quicGatewayInstalledBinaryPath } = await import(
+      "../src/quicGateway.js"
+    );
+    // 実 HOME を汚さないよう一時 HOME を差す。
+    const fakeHome = tempDir("home");
+    const origHome = process.env["HOME"];
+    process.env["HOME"] = fakeHome;
+    try {
+      const src = path.join(tempDir("src"), "tailii-quic-gw");
+      fs.writeFileSync(src, "#!/bin/sh\necho gw\n");
+      const dest = installQuicGatewayBinary(src);
+      expect(dest).toBe(quicGatewayInstalledBinaryPath());
+      expect(dest.startsWith(fakeHome)).toBe(true);
+      expect(fs.readFileSync(dest, "utf8")).toContain("echo gw");
+      expect(fs.statSync(dest).mode & 0o111).not.toBe(0);
+      // 冪等: 同一内容で再実行しても壊れない。
+      expect(installQuicGatewayBinary(src)).toBe(dest);
+    } finally {
+      if (origHome === undefined) delete process.env["HOME"];
+      else process.env["HOME"] = origHome;
+    }
   });
 });
 
