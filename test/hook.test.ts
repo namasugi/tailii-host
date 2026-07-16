@@ -35,13 +35,14 @@ import {
 
 // MARK: - フック入力生成
 
-function bashPreToolUse(command: string, cwd: string): Buffer {
+function bashPreToolUse(command: string, cwd: string, permissionMode?: string): Buffer {
   return Buffer.from(
     JSON.stringify({
       session_id: "sess-abc",
       tool_name: "Bash",
       tool_input: { command },
       cwd,
+      ...(permissionMode !== undefined ? { permission_mode: permissionMode } : {}),
     }),
   );
 }
@@ -58,7 +59,13 @@ function writePreToolUse(filePath: string, content: string, cwd: string): Buffer
   );
 }
 
-function editPreToolUse(filePath: string, oldString: string, newString: string, cwd: string): Buffer {
+function editPreToolUse(
+  filePath: string,
+  oldString: string,
+  newString: string,
+  cwd: string,
+  permissionMode?: string,
+): Buffer {
   return Buffer.from(
     JSON.stringify({
       session_id: "sess-edit",
@@ -66,6 +73,7 @@ function editPreToolUse(filePath: string, oldString: string, newString: string, 
       tool_name: "Edit",
       tool_input: { file_path: filePath, old_string: oldString, new_string: newString },
       cwd,
+      ...(permissionMode !== undefined ? { permission_mode: permissionMode } : {}),
     }),
   );
 }
@@ -565,6 +573,62 @@ describe("Hook — PreToolUse 承認ゲート", () => {
 });
 
 describe("Hook — permission mode 自動許可（mode-picker 連動）", () => {
+  it("hook 入力 permission_mode=auto を pane 判定より優先して即 allow", async () => {
+    let providerCalled = false;
+    const { exitCode, stdout } = await runHookCore({
+      stdinData: bashPreToolUse("echo x", "/w", "auto"),
+      socketPath: null,
+      deadlineSeconds: 5,
+      permissionModeProvider: async () => {
+        providerCalled = true;
+        return null;
+      },
+    });
+    expect(exitCode).toBe(0);
+    expect(parseDecision(stdout).decision).toBe("allow");
+    expect(providerCalled).toBe(false);
+  });
+
+  it("hook 入力 permission_mode=acceptEdits + Edit → 即 allow", async () => {
+    const { stdout } = await runHookCore({
+      stdinData: editPreToolUse("/w/a.swift", "old", "new", "/w", "acceptEdits"),
+      socketPath: null,
+      deadlineSeconds: 5,
+      permissionModeProvider: async () => null,
+    });
+    expect(parseDecision(stdout).decision).toBe("allow");
+  });
+
+  it("hook 入力の default は provider の古い auto より優先してゲートする", async () => {
+    let providerCalled = false;
+    const { stdout } = await runHookCore({
+      stdinData: bashPreToolUse("echo x", "/w", "default"),
+      socketPath: null,
+      deadlineSeconds: 5,
+      permissionModeProvider: async () => {
+        providerCalled = true;
+        return "auto";
+      },
+    });
+    expect(parseDecision(stdout).decision).toBe("deny");
+    expect(providerCalled).toBe(false);
+  });
+
+  it("hook 入力の未知 mode は provider で上書きせず安全側へ倒す", async () => {
+    let providerCalled = false;
+    const { stdout } = await runHookCore({
+      stdinData: bashPreToolUse("echo x", "/w", "futureMode"),
+      socketPath: null,
+      deadlineSeconds: 5,
+      permissionModeProvider: async () => {
+        providerCalled = true;
+        return "auto";
+      },
+    });
+    expect(parseDecision(stdout).decision).toBe("deny");
+    expect(providerCalled).toBe(false);
+  });
+
   it("auto モード → iPhone 接続なしで即 allow", async () => {
     const { exitCode, stdout } = await runHookCore({
       stdinData: bashPreToolUse("echo x", "/w"),

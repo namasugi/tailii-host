@@ -4,7 +4,8 @@
 // Claude Code の PreToolUse / PostToolUse フック。stdin JSON の `hook_event_name` で分岐する。
 //
 // PreToolUse（ツール実行の唯一のゲート意思決定点）:
-//   まず現在の permission mode（tmux pane の mode-picker 表示）を判定し、
+//   まず hook 入力の `permission_mode`（Claude Code が渡す現在値）を判定し、
+//   旧版互換で欠落時だけ tmux pane の mode-picker 表示へフォールバックする。
 //   auto（全自動）なら即 allow、acceptEdits なら編集系ツールのみ即 allow して
 //   iPhone 承認をスキップする（mode_set での途中切替が確認モーダルに反映される）。
 //   それ以外は summary と構造化 diff（Write=create+全文 / Edit=edit+old/new）を生成し、
@@ -222,10 +223,11 @@ export async function runHookCore(options: RunHookOptions): Promise<HookRunResul
   // TUI が auto（全自動）のとき、および acceptEdits の編集系ツールは iPhone 承認を
   // 出さずに即 allow する。これが無いと mode_set で Auto に切り替えても hook が
   // 常にゲートし、確認モーダルが出続ける（= モード変更が反映されない）。
-  // 判定不能（provider 無し・capture 失敗・ダイアログ表示中 = null）は従来どおり
-  // iPhone ゲートへフォールバックする（安全側）。
+  // hook 入力の permission_mode は処理中にも消えない権威値として優先する。旧版で
+  // 欠落する場合だけ provider を使い、provider 無し・capture 失敗・ダイアログ表示中
+  // = null なら従来どおり iPhone ゲートへフォールバックする（安全側）。
   const autoAllowReason = autoAllowReasonForMode(
-    await currentPermissionMode(options),
+    await currentPermissionMode(options, parsed.permissionMode),
     parsed.toolName,
   );
   if (autoAllowReason !== null) return allow(autoAllowReason);
@@ -340,8 +342,16 @@ export function autoAllowReasonForMode(mode: string | null, toolName: string): s
   return null;
 }
 
-/** provider から現在の permission mode を安全に取得する（未注入・例外は null = 判定不能）。 */
-async function currentPermissionMode(options: RunHookOptions): Promise<string | null> {
+/**
+ * 現在の permission mode を取得する。
+ * Claude Code の hook 入力値を権威として優先し、フィールド自体が無い旧版だけ provider へ
+ * フォールバックする。未知の入力値も provider で上書きせず、そのまま安全側判定へ渡す。
+ */
+async function currentPermissionMode(
+  options: RunHookOptions,
+  hookPermissionMode: string | undefined,
+): Promise<string | null> {
+  if (hookPermissionMode !== undefined) return hookPermissionMode;
   if (options.permissionModeProvider === undefined) return null;
   try {
     return await options.permissionModeProvider();
@@ -849,6 +859,8 @@ interface ParsedPreToolUse {
   toolName: string;
   toolInput: Record<string, unknown>;
   cwd: string;
+  /** Claude Code が hook 発火時点で渡す現在の permission mode。旧版では欠落し得る。 */
+  permissionMode?: string;
   /** 監査 id（`tool_use_id` があれば優先、無ければ `session_id`）。秘密ではない。 */
   toolUseId: string;
   /** PostToolUse の tool_response 内 permissionDecision（あれば）。 */
@@ -880,6 +892,9 @@ function parsePreToolUse(data: Buffer): ParsedPreToolUse {
     parsed.toolInput = toolInput as Record<string, unknown>;
   }
   if (typeof raw["cwd"] === "string") parsed.cwd = raw["cwd"];
+  if (typeof raw["permission_mode"] === "string") {
+    parsed.permissionMode = raw["permission_mode"];
+  }
   if (typeof raw["tool_use_id"] === "string" && raw["tool_use_id"].length > 0) {
     parsed.toolUseId = raw["tool_use_id"];
   } else if (typeof raw["session_id"] === "string") {
@@ -1002,7 +1017,8 @@ export async function runHookCommand(args: string[]): Promise<number> {
     retryConnectIntervalSeconds: retryIntervalSeconds,
     heartbeatDir: defaultHeartbeatDir(),
     ensureHub: ensureHubDaemon,
-    // tmux pane の mode-picker 表示から auto/acceptEdits の自動許可を判定する。
+    // 現行 Claude は hook 入力の permission_mode を使う。tmux provider は旧版互換の
+    // 欠落時フォールバックとしてだけ呼ばれる。
     ...(effectiveSession !== null
       ? {
           permissionModeProvider: makeTmuxPermissionModeProvider(effectiveSession),
