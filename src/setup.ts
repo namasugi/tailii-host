@@ -45,25 +45,42 @@ import {
   formatDoctorChecks,
   resolveOwnCliPath,
 } from "./doctor.js";
+import {
+  ensureQuicCredentials,
+  installQuicLaunchAgent,
+  resolveQuicGatewayBinary,
+} from "./quicGateway.js";
 
 // MARK: - ペアリング payload の byte-exact 符号化
 
-/** ペアリング payload の入力（v は sessionName の有無で 2/1 が決まる）。 */
+/** payload v3 の QUIC 接続情報（3 点セットで載せる。部分的な指定は型で禁止）。 */
+export interface QuicPayloadFields {
+  /** ゲートウェイの UDP ポート。 */
+  port: number;
+  /** SPKI SHA-256 ピン（base64）。 */
+  pin: string;
+  /** 32byte トークン（base64）。 */
+  token: string;
+}
+
+/** ペアリング payload の入力（v は quic > sessionName の順で 3/2/1 が決まる）。 */
 export interface PairingPayloadInput {
   host: string;
   port: number;
   user: string;
   /** 秘密鍵 PEM 全文。 */
   key: string;
-  /** 指定で v2。 */
+  /** 指定で v2 以上。 */
   sessionName?: string;
-  /** v2 のみ。未指定なら JSON から省略される。 */
+  /** v2 以上のみ。未指定なら JSON から省略される。 */
   sessionCwd?: string;
+  /** 指定で v3（QUIC トランスポート対応アプリ向け）。 */
+  quic?: QuicPayloadFields;
 }
 
 /**
  * ペアリング payload を Swift `JSONEncoder`（`.prettyPrinted + .sortedKeys`）と byte 一致で符号化する。
- * 末尾改行は含めない（呼び出し側が付与）。golden `protocol/pairing-payload-v{1,2}.json` と契約整合。
+ * 末尾改行は含めない（呼び出し側が付与）。golden `protocol/pairing-payload-v{1,2,3}.json` と契約整合。
  */
 export function encodePairingPayload(input: PairingPayloadInput): string {
   const obj: Record<string, string | number> = {
@@ -71,12 +88,18 @@ export function encodePairingPayload(input: PairingPayloadInput): string {
     key: input.key,
     port: input.port,
     user: input.user,
-    v: input.sessionName !== undefined ? 2 : 1,
+    v: input.quic !== undefined ? 3 : input.sessionName !== undefined ? 2 : 1,
   };
   if (input.sessionName !== undefined) {
     obj["sessionName"] = input.sessionName;
     // v2 でも cwd 未指定なら Swift の optional=nil と同じく JSON から省略する。
     if (input.sessionCwd !== undefined) obj["sessionCwd"] = input.sessionCwd;
+  }
+  if (input.quic !== undefined) {
+    // フィールド名は凍結対象（docs/quic-transport.md「凍結対象」）。
+    obj["quicPort"] = input.quic.port;
+    obj["quicPin"] = input.quic.pin;
+    obj["quicToken"] = input.quic.token;
   }
 
   // sortedKeys: キーを辞書順に並べ、prettyPrinted（2スペース字下げ・" : " 区切り）で整形する。
@@ -366,7 +389,11 @@ export async function runSetupCommand(argv: string[]): Promise<number> {
     );
   }
 
-  // --- 3) ペアリング payload を構築（v1/v2） ---
+  // --- 2.7) QUIC ゲートウェイ（任意機能）: 資格情報生成 + launchd 常駐 ---
+  // 失敗しても SSH-only でペアリングを続行する（QUIC は優先経路であって必須ではない）。
+  const quic = await setupQuicGateway();
+
+  // --- 3) ペアリング payload を構築（v1/v2/v3） ---
   // 接続先は自動選定（Tailscale があれば優先・無ければ LAN）。--host で明示上書きも可。
   // ユーザーは経路（Tailscale か LAN か）を意識しなくてよい。
   const lanIP = args.host ?? detectPreferredIP();
@@ -380,14 +407,17 @@ export async function runSetupCommand(argv: string[]): Promise<number> {
     key: keypair.privateKeyPem,
     ...(args.sessionName !== undefined ? { sessionName: args.sessionName } : {}),
     ...(args.sessionCwd !== undefined ? { sessionCwd: args.sessionCwd } : {}),
+    ...(quic !== null ? { quic } : {}),
   });
 
   // --- 4) QR（スキャン用）を表示 ---
   const qr = await renderTerminalQR(json);
-  const versionLine =
+  const baseVersionLine =
     args.sessionName !== undefined
-      ? `  version : v2 (session)\n  session : ${args.sessionName}\n  cwd     : ${args.sessionCwd ?? "(未指定)"}`
-      : "  version : v1";
+      ? `  version : v${quic !== null ? 3 : 2} (session)\n  session : ${args.sessionName}\n  cwd     : ${args.sessionCwd ?? "(未指定)"}`
+      : `  version : v${quic !== null ? 3 : 1}`;
+  const versionLine =
+    quic !== null ? `${baseVersionLine}\n  quic    : udp/${quic.port}（SSH フォールバック付き）` : baseVersionLine;
   process.stdout.write(
     "\n================ ① QR でペアリング ================\n" +
       `${versionLine}\n` +
@@ -409,6 +439,33 @@ export async function runSetupCommand(argv: string[]): Promise<number> {
     sessionName: args.sessionName,
     sessionCwd: args.sessionCwd,
   });
+}
+
+/**
+ * QUIC ゲートウェイの用意（任意機能・失敗しても null で SSH-only 続行）。
+ * 資格情報の生成（冪等）→ launchd LaunchAgent 設置（冪等）→ payload v3 用の 3 点セットを返す。
+ */
+async function setupQuicGateway(): Promise<QuicPayloadFields | null> {
+  const gatewayPath = resolveQuicGatewayBinary();
+  if (gatewayPath === null) {
+    process.stdout.write(
+      "QUIC ゲートウェイ: バイナリ未検出のためスキップ（SSH のみでペアリングします）。\n",
+    );
+    return null;
+  }
+  try {
+    const creds = await ensureQuicCredentials(gatewayPath);
+    await installQuicLaunchAgent({ gatewayPath });
+    process.stdout.write(
+      `QUIC ゲートウェイ: 常駐を設置しました（udp/${creds.port}, pin=${creds.spkiPin}）。\n`,
+    );
+    return { port: creds.port, pin: creds.spkiPin, token: creds.token };
+  } catch (error) {
+    process.stderr.write(
+      `QUIC ゲートウェイの設置に失敗（SSH のみで続行します）: ${String(error)}\n`,
+    );
+    return null;
+  }
 }
 
 /** payload をターミナル QR 文字列へ描画する（ゼロ依存 qrcode-terminal, small=密度重視）。 */

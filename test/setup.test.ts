@@ -70,6 +70,50 @@ describe("encodePairingPayload", () => {
     expect(Object.keys(obj).sort()).toEqual(["host", "key", "port", "sessionName", "user", "v"]);
   });
 
+  it("v3 が golden pairing-payload-v3.json と byte 一致する（quic 3点セット + `/`エスケープ）", () => {
+    const golden = fs.readFileSync(path.join(REPO_ROOT, "protocol", "pairing-payload-v3.json"), "utf8");
+    const encoded = encodePairingPayload({
+      host: "192.168.1.2",
+      port: 22,
+      user: "alice",
+      key: REDACTED_KEY,
+      sessionName: "work",
+      sessionCwd: "/Users/alice/proj",
+      quic: {
+        port: 46853,
+        pin: "m5nX2gT9m0hZ8bK1fJc3vR7wQp4sU6yD0aE/LkNhOiA=",
+        token: "dGFpbGlpLXF1aWMtdG9rZW4tcGxhY2Vob2xkZXItMDE=",
+      },
+    });
+    expect(encoded + "\n").toBe(golden);
+    // pin 内の `/` も `\/` にエスケープされる（Swift JSONEncoder パリティ）。
+    expect(encoded).toContain('"quicPin" : "m5nX2gT9m0hZ8bK1fJc3vR7wQp4sU6yD0aE\\/LkNhOiA="');
+  });
+
+  it("v3 は session 無しでも成立する（quic だけで v=3）", () => {
+    const encoded = encodePairingPayload({
+      host: "h",
+      port: 22,
+      user: "u",
+      key: "k",
+      quic: { port: 46853, pin: "PIN", token: "TOKEN" },
+    });
+    const obj = JSON.parse(encoded);
+    expect(obj.v).toBe(3);
+    expect(obj.quicPort).toBe(46853);
+    expect(obj.sessionName).toBeUndefined();
+    expect(Object.keys(obj).sort()).toEqual([
+      "host", "key", "port", "quicPin", "quicPort", "quicToken", "user", "v",
+    ]);
+  });
+
+  it("quic 未指定なら従来どおり v1/v2 のまま（後方互換）", () => {
+    expect(JSON.parse(encodePairingPayload({ host: "h", port: 22, user: "u", key: "k" })).v).toBe(1);
+    expect(
+      JSON.parse(encodePairingPayload({ host: "h", port: 22, user: "u", key: "k", sessionName: "s" })).v,
+    ).toBe(2);
+  });
+
   it("秘密鍵内の `/` も `\\/` にエスケープする（Swift JSONEncoder パリティ）", () => {
     const encoded = encodePairingPayload({ host: "h", port: 22, user: "u", key: "a/b+c" });
     expect(encoded).toContain('"key" : "a\\/b+c"');

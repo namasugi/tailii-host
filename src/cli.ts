@@ -23,6 +23,7 @@ import { runPushTokenCommand } from "./pushTokenCommand.js";
 import { runSetupCommand } from "./setup.js";
 import { runDoctorCommand } from "./doctor.js";
 import { runHubCommand } from "./hubDaemon.js";
+import { runQuicInfoCommand } from "./quicGateway.js";
 import { migrateLegacyHome } from "./legacyHomeMigration.js";
 
 const PORTED: Record<string, (args: string[]) => Promise<number>> = {
@@ -35,6 +36,7 @@ const PORTED: Record<string, (args: string[]) => Promise<number>> = {
   setup: runSetupCommand,
   doctor: runDoctorCommand,
   hub: runHubCommand,
+  "quic-info": runQuicInfoCommand,
 };
 
 async function main(): Promise<number> {

@@ -172,6 +172,37 @@ export async function collectDoctorChecks(envPath: string = defaultInjectedPath(
     detail: shimOk ? shimPath : "未生成。`tailii setup` を実行すると自動生成されます",
   });
 
+  // --- QUIC ゲートウェイ（任意機能。未整備でも SSH のみで全機能が動く） ---
+  const { isQuicGatewayLoaded, quicCredentialsDir, resolveQuicGatewayBinary } = await import(
+    "./quicGateway.js"
+  );
+  const gatewayPath = resolveQuicGatewayBinary(process.env);
+  checks.push({
+    label: "QUIC GW バイナリ(任意)",
+    ok: gatewayPath !== null,
+    required: false,
+    detail: gatewayPath ?? "未検出(QUIC は使わず SSH のみで動作します)",
+  });
+  const credsDir = quicCredentialsDir();
+  const credsOk = ["cert.pem", "key.pem", "token"].every((name) =>
+    fs.existsSync(path.join(credsDir, name)),
+  );
+  checks.push({
+    label: "QUIC 資格情報(~/.tailii/quic)",
+    ok: credsOk,
+    required: false,
+    detail: credsOk ? credsDir : "未生成。`tailii setup` を実行すると自動生成されます",
+  });
+  const loaded = gatewayPath !== null ? await isQuicGatewayLoaded() : false;
+  checks.push({
+    label: "QUIC GW 常駐(launchd)",
+    ok: loaded,
+    required: false,
+    detail: loaded
+      ? "com.tailii.quic-gw 稼働中"
+      : "未常駐。`tailii setup` を実行すると launchd に登録されます",
+  });
+
   return checks;
 }
 
