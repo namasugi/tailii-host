@@ -142,6 +142,7 @@ export class PanePreviewPump {
       ) {
         this.emitActive(session, this.pendingText, now, mode);
       } else if (
+        mode !== "codex_terminal" &&
         this.active &&
         !this.inactiveSent &&
         this.hasEmitted &&

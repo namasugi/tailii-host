@@ -141,7 +141,7 @@ describe("PanePreviewPump", () => {
     pump.stop();
   });
 
-  test("Codex terminal は初回 capture を即送信するが quiet 後は消灯する", async () => {
+  test("Codex terminal は初回 capture を即送信し、入力待ちを quiet で消灯しない", async () => {
     vi.useFakeTimers();
     const { writer, messages } = memoryWriter();
     const pump = new PanePreviewPump({
@@ -165,6 +165,9 @@ describe("PanePreviewPump", () => {
     }]);
 
     await vi.advanceTimersByTimeAsync(100);
+    expect(messages()).toHaveLength(1);
+
+    pump.stop();
     expect(messages()[1]).toEqual({
       type: "pane_preview",
       v: 2,
@@ -174,8 +177,6 @@ describe("PanePreviewPump", () => {
       text: "",
       mode: "codex_terminal",
     });
-
-    pump.stop();
     expect(messages()).toHaveLength(2);
   });
 
