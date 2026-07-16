@@ -229,7 +229,7 @@ export type ControlMessage =
   | { type: "session_idle_hint"; v: number; id: string; name: string }
   | { type: "codex_model_list_request"; v: number; id: string }
   | { type: "codex_model_list_response"; v: number; id: string; models: CodexModelInfo[] }
-  | { type: "codex_turn_start"; v: number; id: string; session: string; text: string; clientUserMessageId?: string; effort?: string; sandbox?: "read-only" | "workspace-write" | "danger-full-access"; explicitRetry?: boolean }
+  | { type: "codex_turn_start"; v: number; id: string; session: string; text: string; clientUserMessageId?: string; effort?: string; approvalPolicy?: "untrusted" | "on-request" | "never"; sandbox?: "read-only" | "workspace-write" | "danger-full-access"; explicitRetry?: boolean }
   | { type: "codex_turn_start_result"; v: number; id: string; status: "started" | "duplicate" | "failed"; error?: string }
   | { type: "codex_turn_interrupt"; v: number; id: string; session: string }
   | { type: "session_processing_state"; v: number; session: string; active: boolean }
@@ -579,6 +579,11 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
       const rawTurnSandbox = optionalString(raw, "sandbox");
       const sandbox = rawTurnSandbox === "read-only" || rawTurnSandbox === "workspace-write" || rawTurnSandbox === "danger-full-access"
         ? rawTurnSandbox : undefined;
+      const rawApprovalPolicy = optionalString(raw, "approvalPolicy");
+      const approvalPolicy =
+        rawApprovalPolicy === "untrusted" || rawApprovalPolicy === "on-request" || rawApprovalPolicy === "never"
+          ? rawApprovalPolicy
+          : undefined;
       return compact({
         type, v,
         id: requireString(raw, "id"),
@@ -586,6 +591,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         text: requireString(raw, "text"),
         clientUserMessageId: optionalString(raw, "clientUserMessageId"),
         effort: optionalString(raw, "effort"),
+        approvalPolicy,
         sandbox,
         explicitRetry: optionalBoolean(raw, "explicitRetry"),
       });

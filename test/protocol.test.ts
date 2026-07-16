@@ -502,9 +502,10 @@ describe("encode 詳細", () => {
       text: "テストを実行して",
       clientUserMessageId: "client-1",
       effort: "xhigh",
+      approvalPolicy: "never",
     });
     expect(wire).toBe(
-      '{"clientUserMessageId":"client-1","effort":"xhigh","id":"req-1","session":"codex-work","text":"テストを実行して","type":"codex_turn_start","v":2}',
+      '{"approvalPolicy":"never","clientUserMessageId":"client-1","effort":"xhigh","id":"req-1","session":"codex-work","text":"テストを実行して","type":"codex_turn_start","v":2}',
     );
     expect(decodeControlMessage(wire)).toEqual({
       type: "codex_turn_start",
@@ -514,6 +515,7 @@ describe("encode 詳細", () => {
       text: "テストを実行して",
       clientUserMessageId: "client-1",
       effort: "xhigh",
+      approvalPolicy: "never",
     });
 
     const retryWire = encodeControlMessage({

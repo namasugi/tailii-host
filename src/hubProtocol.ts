@@ -27,6 +27,7 @@ export type HubClientMessage =
       text: string;
       clientUserMessageId: string;
       effort: string | null;
+      approvalPolicy: "untrusted" | "on-request" | "never" | null;
       sandbox: "read-only" | "workspace-write" | "danger-full-access" | null;
       threadId: string;
       cwd: string;
@@ -141,17 +142,21 @@ export function decodeHubClientLine(line: string): HubClientMessage | null {
   if (record["type"] === "codex_turn_submit") {
     const id = record["id"], session = record["session"], text = record["text"];
     const clientUserMessageId = record["clientUserMessageId"], effort = record["effort"];
+    const approvalPolicy = record["approvalPolicy"] ?? null;
     const sandbox = record["sandbox"], threadId = record["threadId"], cwd = record["cwd"];
     const explicitRetry = record["explicitRetry"];
     const validSandbox = sandbox === null || sandbox === "read-only" ||
       sandbox === "workspace-write" || sandbox === "danger-full-access";
+    const validApprovalPolicy = approvalPolicy === null || approvalPolicy === "untrusted" ||
+      approvalPolicy === "on-request" || approvalPolicy === "never";
     return typeof id === "string" && id.length > 0 && typeof session === "string" && session.length > 0 &&
       typeof text === "string" && typeof clientUserMessageId === "string" && clientUserMessageId.length > 0 &&
-      (effort === null || typeof effort === "string") && validSandbox &&
+      (effort === null || typeof effort === "string") && validApprovalPolicy && validSandbox &&
       typeof threadId === "string" && threadId.length > 0 && typeof cwd === "string" && cwd.length > 0 &&
       (explicitRetry === undefined || typeof explicitRetry === "boolean")
       ? { type: "codex_turn_submit", id, session, text, clientUserMessageId,
           effort: effort as string | null,
+          approvalPolicy: approvalPolicy as "untrusted" | "on-request" | "never" | null,
           sandbox: sandbox as "read-only" | "workspace-write" | "danger-full-access" | null,
           threadId, cwd, ...(explicitRetry === true ? { explicitRetry: true } : {}) }
       : null;

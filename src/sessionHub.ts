@@ -1285,7 +1285,9 @@ export class SessionHub {
       await this.ensureCodexTurnController().startTurn({
         session: message.session, threadId: message.threadId, cwd: message.cwd,
         text: message.text, clientUserMessageId: message.clientUserMessageId,
-        effort: message.effort, sandbox: message.sandbox,
+        effort: message.effort,
+        approvalPolicy: message.approvalPolicy,
+        sandbox: message.sandbox,
       });
       const actor = this.actors.get(message.session);
       if (actor === undefined || actor !== expectedActor) return;
@@ -1604,7 +1606,9 @@ function sameCodexRetry(
 ): boolean {
   return left.session === right.session && left.text === right.text &&
     left.clientUserMessageId === right.clientUserMessageId && left.effort === right.effort &&
-    left.sandbox === right.sandbox && left.threadId === right.threadId && left.cwd === right.cwd;
+    (left.approvalPolicy ?? null) === (right.approvalPolicy ?? null) &&
+    left.sandbox === right.sandbox &&
+    left.threadId === right.threadId && left.cwd === right.cwd;
 }
 
 function incrementCount(counts: Map<string, number>, key: string): void {

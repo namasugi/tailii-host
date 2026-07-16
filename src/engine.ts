@@ -1198,7 +1198,9 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
           const result = await ctx.hubRpc<Extract<HubServerMessage, { type: "codex_turn_result" }>>(
             { type: "codex_turn_submit", id: message.id, session: message.session,
               text: message.text, clientUserMessageId: message.clientUserMessageId ?? message.id,
-              effort: message.effort ?? null, sandbox: message.sandbox ?? null,
+              effort: message.effort ?? null,
+              approvalPolicy: message.approvalPolicy ?? null,
+              sandbox: message.sandbox ?? null,
               threadId: providerSessionId, cwd: meta.cwd,
               ...(message.explicitRetry === true ? { explicitRetry: true } : {}) },
             message.id, ctx.codexHubRpcTimeoutMs,

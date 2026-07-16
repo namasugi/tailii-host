@@ -72,7 +72,8 @@ describe("hubProtocol durable send retry", () => {
     };
     const codex: HubClientMessage = {
       type: "codex_turn_submit", id: "codex", session: "work", clientUserMessageId: "client-codex",
-      text: "retry", effort: null, sandbox: null, threadId: "thread", cwd: "/tmp/work",
+      text: "retry", effort: null, approvalPolicy: null, sandbox: null,
+      threadId: "thread", cwd: "/tmp/work",
       explicitRetry: true,
     };
     expect(decodeHubClientLine(encodeHubMessage(chat))).toEqual(chat);

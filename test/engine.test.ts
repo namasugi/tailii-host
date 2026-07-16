@@ -1367,6 +1367,7 @@ describe("EngineControl — 横断制御チャネル", () => {
         text: "run tests",
         clientUserMessageId: "client-1",
         effort: "xhigh",
+        approvalPolicy: null,
         sandbox: null,
       });
     });

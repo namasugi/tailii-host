@@ -2,6 +2,7 @@
 
 import * as net from "node:net";
 import type {
+  CodexAppServerApprovalPolicy,
   CodexAppServerNotification,
   CodexAppServerRequest,
   CodexAppServerThreadOptions,
@@ -62,6 +63,7 @@ export interface CodexTurnControllerRuntime {
     clientUserMessageId?: string | null;
     effort?: string | null;
     sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null;
+    approvalPolicy?: CodexAppServerApprovalPolicy | null;
   }): Promise<string>;
   interruptTurn?(session: string): Promise<void>;
   closeSession(session: string): void;
@@ -72,7 +74,13 @@ export interface CodexTurnControllerRuntime {
 export interface CodexThreadClient {
   readonly initialItems?: readonly Record<string, unknown>[];
   readonly initialActiveTurnId?: string | null;
-  startTurn(text: string, clientUserMessageId?: string | null, effort?: string | null, sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null): Promise<string>;
+  startTurn(
+    text: string,
+    clientUserMessageId?: string | null,
+    effort?: string | null,
+    sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null,
+    approvalPolicy?: CodexAppServerApprovalPolicy | null,
+  ): Promise<string>;
   steerTurn(turnId: string, text: string): Promise<void>;
   interruptTurn(turnId: string): Promise<void>;
   close(): void;
@@ -161,6 +169,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     clientUserMessageId?: string | null;
     effort?: string | null;
     sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null;
+    approvalPolicy?: CodexAppServerApprovalPolicy | null;
   }): Promise<string> {
     const opened = await this.threadFor(options.session, options.threadId, options.cwd);
     this.onProcessing(options.session, "active");
@@ -175,7 +184,11 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
         }
       }
       const turnId = await opened.thread.startTurn(
-        options.text, options.clientUserMessageId, options.effort, options.sandbox,
+        options.text,
+        options.clientUserMessageId,
+        options.effort,
+        options.sandbox,
+        options.approvalPolicy,
       );
       opened.activeTurnId = turnId;
       return turnId;
@@ -241,6 +254,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     let notificationTargetReady = false;
     const thread = await this.appServer.openThread({
       threadId,
+      cwd,
       onNotification: (notification) => {
         if (!notificationTargetReady) {
           bufferedNotifications.push(notification);

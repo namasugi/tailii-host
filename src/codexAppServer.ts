@@ -11,6 +11,7 @@ import { ensureDirectory0700 } from "./paths.js";
 import type { CodexModelInfo } from "./protocol.js";
 
 export type CodexAppServerSandbox = "read-only" | "workspace-write" | "danger-full-access";
+export type CodexAppServerApprovalPolicy = "untrusted" | "on-request" | "never";
 
 export interface CodexThreadStartOptions {
   cwd: string;
@@ -31,6 +32,7 @@ export interface CodexAppServerRequest extends CodexAppServerNotification {
 
 export interface CodexAppServerThreadOptions {
   threadId: string;
+  cwd?: string | null;
   onNotification?: (notification: CodexAppServerNotification) => void;
   onServerRequest?: (request: CodexAppServerRequest) => Promise<unknown>;
   onDisconnect?: (error: Error) => void;
@@ -218,6 +220,7 @@ export class CodexAppServerThread {
     readonly initialItems: readonly Record<string, unknown>[],
     readonly initialActiveTurnId: string | null,
     private readonly connection: CodexAppServerConnection,
+    private readonly cwd: string | null,
   ) {}
 
   async startTurn(
@@ -225,16 +228,26 @@ export class CodexAppServerThread {
     clientUserMessageId?: string | null,
     effort?: string | null,
     sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null,
+    approvalPolicy?: CodexAppServerApprovalPolicy | null,
   ): Promise<string> {
     if (text.length === 0) throw new Error("Codex turn text must not be empty");
+    const inherited =
+      sandbox === null || approvalPolicy === null
+        ? await readCodexSecurityDefaults(this.connection, this.cwd)
+        : null;
+    const effectiveSandbox = sandbox === null ? inherited?.sandbox ?? null : sandbox;
+    const effectiveApprovalPolicy =
+      approvalPolicy === null ? inherited?.approvalPolicy ?? null : approvalPolicy;
+    const effectiveApprovalsReviewer =
+      approvalPolicy === null ? inherited?.approvalsReviewer ?? null : null;
     const response = await this.connection.request("turn/start", {
       threadId: this.threadId,
       input: [{ type: "text", text }],
-      approvalPolicy: "on-request",
-      approvalsReviewer: "user",
       ...(clientUserMessageId ? { clientUserMessageId } : {}),
       ...(effort ? { effort } : {}),
-      ...(sandbox ? { sandboxPolicy: codexSandboxPolicy(sandbox) } : {}),
+      ...(effectiveSandbox ? { sandboxPolicy: codexSandboxPolicy(effectiveSandbox) } : {}),
+      ...(effectiveApprovalPolicy ? { approvalPolicy: effectiveApprovalPolicy } : {}),
+      ...(effectiveApprovalsReviewer ? { approvalsReviewer: effectiveApprovalsReviewer } : {}),
     });
     const turnId = extractTurnId(response);
     if (turnId === null) throw new Error("Codex App Server turn/start response omitted turn.id");
@@ -260,6 +273,56 @@ export class CodexAppServerThread {
   close(): void {
     this.connection.close();
   }
+}
+
+interface CodexSecurityDefaults {
+  approvalPolicy: CodexAppServerApprovalPolicy | null;
+  approvalsReviewer: "user" | "auto_review" | "guardian_subagent" | null;
+  sandbox: CodexAppServerSandbox | null;
+}
+
+async function readCodexSecurityDefaults(
+  connection: CodexAppServerConnection,
+  cwd: string | null,
+): Promise<CodexSecurityDefaults> {
+  let rawResponse: unknown;
+  try {
+    rawResponse = await connection.request("config/read", {
+      includeLayers: false,
+      cwd,
+    });
+  } catch {
+    // 旧 App Server や制限付きで起動された常駐プロセスでは、現在の thread 設定へ委ねる。
+    return { approvalPolicy: null, approvalsReviewer: null, sandbox: null };
+  }
+  const response = objectRecord(rawResponse);
+  const config = objectRecord(response?.["config"]);
+  const rawApprovalPolicy = config?.["approval_policy"];
+  const approvalPolicy =
+    rawApprovalPolicy === "untrusted" ||
+    rawApprovalPolicy === "on-request" ||
+    rawApprovalPolicy === "never"
+      ? rawApprovalPolicy
+      : null;
+  const reviewer = config?.["approvals_reviewer"];
+  const approvalsReviewer =
+    reviewer === "user" || reviewer === "auto_review" || reviewer === "guardian_subagent"
+      ? reviewer
+      : null;
+  const rawSandbox = config?.["sandbox_mode"];
+  const sandbox =
+    rawSandbox === "read-only" ||
+    rawSandbox === "workspace-write" ||
+    rawSandbox === "danger-full-access"
+      ? rawSandbox
+      : null;
+  return { approvalPolicy, approvalsReviewer, sandbox };
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
 }
 
 function codexSandboxPolicy(sandbox: "read-only" | "workspace-write" | "danger-full-access"): Record<string, unknown> {
@@ -417,8 +480,6 @@ export class CodexAppServerManager {
     try {
       await connection.initialize();
       const params: Record<string, unknown> = {
-        approvalPolicy: "on-request",
-        approvalsReviewer: "user",
         cwd: options.cwd,
       };
       if (options.model) params["model"] = options.model;
@@ -524,8 +585,6 @@ export class CodexAppServerManager {
         try {
           const response = await connection.request("thread/resume", {
             threadId: options.threadId,
-            approvalPolicy: "on-request",
-            approvalsReviewer: "user",
             // Hub の rollout backfill と live 通知の厳密な境界に履歴 item ID を使う。
             excludeTurns: false,
           });
@@ -545,6 +604,7 @@ export class CodexAppServerManager {
         initialItems,
         initialActiveTurnId,
         connection,
+        options.cwd ?? null,
       );
     } catch (error) {
       removeNotification();

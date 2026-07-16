@@ -74,9 +74,9 @@ export function claudeInnerCommand(opts: {
 
 /**
  * codex 新規起動の inner コマンドを組み立てる（codex-input）。
- * 承認は App Server の JSON-RPC で処理する。sandbox とモデルのみ可変にする。
+ * 承認は App Server の JSON-RPC で処理する。ここでは TUI 単体起動用のsandboxとモデルを組み立てる。
  * @param model 省略/不正文字は無視（既定モデル）。
- * @param sandbox 省略時は workspace-write。
+ * @param sandbox TUI 単体起動では省略時 workspace-write。remote resume ではこの文字列を使わない。
  */
 export function codexInnerCommand(opts: { model?: string | null; sandbox?: CodexSandbox | null }): string {
   const sandbox: CodexSandbox = opts.sandbox ?? "workspace-write";
@@ -262,7 +262,7 @@ export function makeSessionLauncher(options: {
               launchOptions?.codexModel && CODEX_MODEL_SAFE.test(launchOptions.codexModel)
                 ? launchOptions.codexModel
                 : null,
-            sandbox: launchOptions?.codexSandbox ?? "workspace-write",
+            sandbox: launchOptions?.codexSandbox ?? null,
           });
         }
       } catch (error) {

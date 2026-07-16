@@ -165,8 +165,6 @@ describe("CodexAppServerManager", () => {
       {
         method: "thread/start",
         params: {
-          approvalPolicy: "on-request",
-          approvalsReviewer: "user",
           cwd: "/tmp/project",
           model: "gpt-5.4",
           sandbox: "workspace-write",
@@ -221,7 +219,7 @@ describe("CodexAppServerManager", () => {
     await expect(manager.startThread({ cwd: "/tmp/bad" })).rejects.toThrow("thread.id");
   });
 
-  test("openThread は native approval を有効にして resume し、turn RPC を同じ接続で送る", async () => {
+  test("openThread は resume で設定を上書きせず、turn RPC の明示設定だけを送る", async () => {
     const connections: FakeConnection[] = [];
     let calls = 0;
     const manager = new CodexAppServerManager({
@@ -244,7 +242,13 @@ describe("CodexAppServerManager", () => {
     });
 
     const thread = await manager.openThread({ threadId: "thread-live" });
-    expect(await thread.startTurn("hello", "client-1", "xhigh")).toBe("turn-1");
+    expect(await thread.startTurn(
+      "hello",
+      "client-1",
+      "xhigh",
+      "workspace-write",
+      "on-request",
+    )).toBe("turn-1");
     await expect(thread.steerTurn("turn-1", "")).rejects.toThrow("must not be empty");
     await thread.steerTurn("turn-1", "追加指示");
     await thread.interruptTurn("turn-1");
@@ -253,8 +257,6 @@ describe("CodexAppServerManager", () => {
       method: "thread/resume",
       params: {
         threadId: "thread-live",
-        approvalPolicy: "on-request",
-        approvalsReviewer: "user",
         excludeTurns: false,
       },
     });
@@ -264,9 +266,15 @@ describe("CodexAppServerManager", () => {
         threadId: "thread-live",
         input: [{ type: "text", text: "hello" }],
         approvalPolicy: "on-request",
-        approvalsReviewer: "user",
         clientUserMessageId: "client-1",
         effort: "xhigh",
+        sandboxPolicy: {
+          type: "workspaceWrite",
+          writableRoots: [],
+          networkAccess: false,
+          excludeTmpdirEnvVar: false,
+          excludeSlashTmp: false,
+        },
       },
     });
     expect(connection.requests).toContainEqual({
@@ -284,6 +292,113 @@ describe("CodexAppServerManager", () => {
     expect(calls).toBeGreaterThan(0);
     thread.close();
     expect(connection.closed).toBe(1);
+  });
+
+  test("turn の未指定セキュリティ設定は project-aware config/read から復元する", async () => {
+    const probe = new FakeConnection();
+    const connection = new FakeConnection("thread-inherit");
+    connection.request = async (method, params) => {
+      connection.requests.push({ method, params });
+      if (method === "thread/resume") {
+        return { thread: { id: "thread-inherit", turns: [] } };
+      }
+      if (method === "config/read") {
+        return {
+          config: {
+            approval_policy: "never",
+            approvals_reviewer: "user",
+            sandbox_mode: "danger-full-access",
+          },
+          origins: {},
+          layers: null,
+        };
+      }
+      if (method === "turn/start") return { turn: { id: "turn-inherit" } };
+      return {};
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-inherit"),
+      connect: async () => probe.closed === 0 ? probe : connection,
+      launch: () => {},
+    });
+
+    const thread = await manager.openThread({
+      threadId: "thread-inherit",
+      cwd: "/tmp/project",
+    });
+    await expect(thread.startTurn(
+      "inherit",
+      "client-inherit",
+      null,
+      null,
+      null,
+    )).resolves.toBe("turn-inherit");
+
+    expect(connection.requests).toContainEqual({
+      method: "config/read",
+      params: { includeLayers: false, cwd: "/tmp/project" },
+    });
+    expect(connection.requests).toContainEqual({
+      method: "turn/start",
+      params: {
+        threadId: "thread-inherit",
+        input: [{ type: "text", text: "inherit" }],
+        clientUserMessageId: "client-inherit",
+        approvalPolicy: "never",
+        approvalsReviewer: "user",
+        sandboxPolicy: { type: "dangerFullAccess" },
+      },
+    });
+  });
+
+  test("未対応の granular approval は turn override に再送しない", async () => {
+    const probe = new FakeConnection();
+    const connection = new FakeConnection("thread-granular");
+    connection.request = async (method, params) => {
+      connection.requests.push({ method, params });
+      if (method === "thread/resume") {
+        return { thread: { id: "thread-granular", turns: [] } };
+      }
+      if (method === "config/read") {
+        return {
+          config: {
+            approval_policy: {
+              granular: {
+                sandbox_approval: true,
+                rules: true,
+                mcp_elicitations: true,
+              },
+            },
+            approvals_reviewer: "auto_review",
+            sandbox_mode: "workspace-write",
+          },
+          origins: {},
+        };
+      }
+      if (method === "turn/start") return { turn: { id: "turn-granular" } };
+      return {};
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-granular"),
+      connect: async () => probe.closed === 0 ? probe : connection,
+      launch: () => {},
+    });
+
+    const thread = await manager.openThread({
+      threadId: "thread-granular",
+      cwd: "/tmp/project",
+    });
+    await expect(thread.startTurn("inherit", "client-granular", null, null, null))
+      .resolves.toBe("turn-granular");
+
+    const turnStart = connection.requests.find((request) => request.method === "turn/start");
+    expect(turnStart?.params).not.toHaveProperty("approvalPolicy");
+    expect(turnStart?.params).toMatchObject({
+      approvalsReviewer: "auto_review",
+      sandboxPolicy: {
+        type: "workspaceWrite",
+      },
+    });
   });
 
   test("未materialize threadはresume失敗後も同じ接続から最初のturnを開始する", async () => {

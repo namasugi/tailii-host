@@ -424,7 +424,8 @@ describe("SessionHub actor", () => {
     expect(controllerOptions).not.toBeNull();
     expect(startTurn).toHaveBeenCalledOnce();
     expect(startTurn).toHaveBeenCalledWith({ session: "work", threadId: "thread-1", cwd: "/tmp/work",
-      text: "run", clientUserMessageId: "client-1", effort: null, sandbox: null });
+      text: "run", clientUserMessageId: "client-1", effort: null,
+      approvalPolicy: null, sandbox: null });
   });
 
   test("Codex開始後のdelivered保存失敗もstartedを返しdirty retryで重複開始を防ぐ", async () => {
