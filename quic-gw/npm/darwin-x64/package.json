@@ -1,0 +1,19 @@
+{
+  "name": "@tailii/quic-gw-darwin-x64",
+  "version": "0.1.1",
+  "description": "Prebuilt tailii-quic-gw binary for macOS x64 (Intel). Installed automatically as an optional dependency of tailii-host.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/namasugi/tailii-host.git"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin"
+  ]
+}

@@ -1,0 +1,2 @@
+# prebuilt バイナリは CI が配置する成果物（コミットしない）。
+*/bin/tailii-quic-gw

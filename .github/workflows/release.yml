@@ -1,0 +1,67 @@
+name: Release
+
+# タグ push（例: v0.1.2）で tailii-host と QUIC ゲートウェイ prebuilt を npm 公開する。
+# 手動実行（workflow_dispatch）でも起動できる。
+#
+# 公開順は platform package（@tailii/quic-gw-darwin-*）→ tailii-host（optionalDependencies が
+# 参照するため、先に platform package が registry に存在している必要がある）。
+#
+# 前提: リポジトリ secrets に NPM_TOKEN（@tailii スコープと tailii-host の publish 権限）。
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    # macos-latest（arm64）1台で aarch64 と x86_64 を両方クロスビルドする。
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+          cache: npm
+
+      - name: Install Rust targets
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Build gateway (both arches)
+        working-directory: quic-gw
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+
+      - name: Stage prebuilt binaries into platform packages
+        run: node scripts/stage-prebuilt.mjs
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+      - run: npm test
+
+      # platform package を先に公開（tailii-host の optionalDependencies が参照するため）。
+      - name: Publish @tailii/quic-gw-darwin-arm64
+        working-directory: quic-gw/npm/darwin-arm64
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish @tailii/quic-gw-darwin-x64
+        working-directory: quic-gw/npm/darwin-x64
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish tailii-host
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

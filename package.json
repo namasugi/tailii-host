@@ -48,5 +48,9 @@
   "dependencies": {
     "qrcode-terminal": "^0.12.0",
     "ws": "^8.21.0"
+  },
+  "optionalDependencies": {
+    "@tailii/quic-gw-darwin-arm64": "0.1.1",
+    "@tailii/quic-gw-darwin-x64": "0.1.1"
   }
 }
