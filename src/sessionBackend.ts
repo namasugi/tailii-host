@@ -31,6 +31,12 @@ export interface SessionBackend {
   reattach(name: string): Promise<ReattachResult>;
   kill(name: string): Promise<void>;
   sendKeys(name: string, keys: string[], literal?: boolean): Promise<void>;
+  /**
+   * 本文入力と送信確定（Enter）を 1 操作で行う（chat 注入・kick 用）。
+   * tmux は従来どおり literal 送出 → 150ms → Enter。herdr は本文+CR を単一コールで送る
+   * （分割すると Ink のペースト取り込み窓に CR が飲まれ送信されない。実測 2026-07-22）。
+   */
+  sendTextSubmit(name: string, text: string): Promise<void>;
   capturePane(name: string, options?: CapturePaneOptions): Promise<string>;
   agentProcessAlive(name: string): Promise<boolean>;
 }
@@ -114,6 +120,10 @@ export class CompositeSessionBackend implements SessionBackend {
 
   sendKeys(name: string, keys: string[], literal = false): Promise<void> {
     return this.backendFor(name).sendKeys(name, keys, literal);
+  }
+
+  sendTextSubmit(name: string, text: string): Promise<void> {
+    return this.backendFor(name).sendTextSubmit(name, text);
   }
 
   capturePane(name: string, options: CapturePaneOptions = {}): Promise<string> {

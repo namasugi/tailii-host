@@ -187,6 +187,16 @@ export class TmuxSessionManager {
     }
   }
 
+  /**
+   * 本文入力と送信確定を 1 操作で行う（chat 注入・kick 用, SessionBackend 共通面）。
+   * literal 送出 → 150ms（Ink 再描画待ち）→ Enter。
+   */
+  async sendTextSubmit(name: string, text: string): Promise<void> {
+    await this.sendKeys(name, [text], true);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await this.sendKeys(name, ["Enter"]);
+  }
+
   /** 指定セッションの pane へ tmux send-keys を発行する（literal は -l）。 */
   async sendKeys(name: string, keys: string[], literal = false): Promise<void> {
     validateSessionName(name);

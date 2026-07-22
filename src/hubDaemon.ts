@@ -367,11 +367,9 @@ export async function runHubCommand(args: string[]): Promise<number> {
       onPermissionMode,
     }),
     questionInjector: (answers, session) => injectQuestionAnswers(answers, session, sessionBackend),
-    chatInjector: async (text, session) => {
-      await sessionBackend.sendKeys(session, [text], true);
-      await new Promise((resolve) => setTimeout(resolve, 150));
-      await sessionBackend.sendKeys(session, ["Enter"]);
-    },
+    // 本文+送信確定は backend 側の 1 操作に委ねる（herdr は本文+CR 単一コール必須。
+    // 分割すると Ink のペースト取り込み窓に CR が飲まれ送信されない）。
+    chatInjector: (text, session) => sessionBackend.sendTextSubmit(session, text),
   });
   hub.restoreFromHeartbeats();
   hub.restorePendingQuestions();

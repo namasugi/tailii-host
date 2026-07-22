@@ -2,12 +2,14 @@
 // tailii (TS host) — herdr backend のセッション操作（list / reattach / kill / send / read）。
 // TmuxSessionManager と同じ面（SessionBackend）を herdr CLI（socket API のフロント）で実装する。
 //
-// 実測済みの herdr 0.7.4 挙動（protocol 16）:
-// - `agent start <name> --workspace <id> --no-focus -- /bin/zsh -lc '<cmd>'` で pane 起動
+// 実測済みの herdr 0.7.4 挙動（protocol 16。設計正本は docs/herdr-backend.md）:
+// - 全 pane は専用 named session `tailii` に収容（全コマンドに `--session tailii` 前置）。
+//   `agent start <name> --no-focus -- /bin/zsh -lc '<cmd>'` で pane 起動 → session 名タブへ分離。
 // - `pane read --source recent-unwrapped --lines N` は tmux `capture-pane -J -S -N` 相当。
 //   ただし出力リングが空の新規 pane では空文字を返すため visible へフォールバックする。
 //   `--source visible` は viewport 全行を返し `--lines` を無視する（自前で末尾を切る）。
-// - `pane send-keys` は Enter/Escape/Up/Down/Left/Right/Tab/Space/C-x 系のみ受理。
+// - `pane send-keys` は Escape/Up/Down/Left/Right/Tab/Space/C-x 系のみ実用。
+//   Enter は claude TUI(Ink) が submit と認識しないため生 CR を `send-text` で送る。
 //   BTab（Shift+Tab）は不可 → 生シーケンス ESC [ Z を `pane send-text` で送る（cat -v 検証済み）。
 // - `pane process-info` の foreground_processes[0].name が tmux `#{pane_current_command}` 相当。
 
@@ -111,6 +113,14 @@ const HERDR_KEY_NAMES = new Set([
 /** Shift+Tab の生シーケンス（herdr send-keys は BTab を受理しないため send-text で送る）。 */
 const SHIFT_TAB_SEQUENCE = "\u001b[Z";
 
+/**
+ * Enter の生シーケンス（CR）。herdr の `send-keys Enter` は zsh 等の行編集では確定として
+ * 効くが、claude TUI(Ink) は submit と認識しない（実測 2026-07-22: 注入本文が入力欄に
+ * 残ったまま新規会話が始まらない）。Ink の return 判定は CR そのものを要求するため
+ * `send-text` で生 `\r` を送る。
+ */
+const ENTER_SEQUENCE = "\r";
+
 /** herdr CLI の JSON stdout から `result` を取り出す。JSON でない/エラー封筒は null。 */
 export function parseHerdrResult(stdout: string): Record<string, unknown> | null {
   try {
@@ -181,6 +191,15 @@ export function parseHerdrStartedPaneId(stdout: string): string | null {
   return typeof id === "string" && HERDR_PANE_ID_PATTERN.test(id) ? id : null;
 }
 
+/** `agent get` stdout から agent_status を取り出す（判定不能は null）。 */
+export function parseHerdrAgentStatus(stdout: string): string | null {
+  const result = parseHerdrResult(stdout);
+  const agent = result?.["agent"];
+  if (typeof agent !== "object" || agent === null) return null;
+  const status = (agent as Record<string, unknown>)["agent_status"];
+  return typeof status === "string" ? status : null;
+}
+
 /** `pane process-info` stdout から前面プロセス名を取り出す（判定不能は空文字）。 */
 export function parseHerdrForegroundCommand(stdout: string): string {
   const result = parseHerdrResult(stdout);
@@ -200,17 +219,32 @@ export class HerdrSessionManager {
   readonly store: SessionMetadataStore;
   private readonly captureLines: number;
   private readonly protocolVersion: number;
+  /** sendTextSubmit の本文→CR 間隔 ms（実測 300ms 未満で CR が飲まれる。テスト注入用）。 */
+  private readonly submitDelayMs: number;
+  /** sendTextSubmit の CR→残留確認 間隔 ms（テスト注入用）。 */
+  private readonly submitVerifyDelayMs: number;
+  /** 注入前の claude 検出待ちの上限/間隔 ms（テスト注入用）。 */
+  private readonly readyTimeoutMs: number;
+  private readonly readyPollMs: number;
 
   constructor(options: {
     runner?: HerdrCommandRunner;
     store?: SessionMetadataStore;
     captureLines?: number;
     protocolVersion?: number;
+    submitDelayMs?: number;
+    submitVerifyDelayMs?: number;
+    readyTimeoutMs?: number;
+    readyPollMs?: number;
   } = {}) {
     this.runner = options.runner ?? processHerdrCommandRunner();
     this.store = options.store ?? new SessionMetadataStore();
     this.captureLines = options.captureLines ?? 50;
     this.protocolVersion = options.protocolVersion ?? PROTOCOL_V1;
+    this.submitDelayMs = options.submitDelayMs ?? 600;
+    this.submitVerifyDelayMs = options.submitVerifyDelayMs ?? 700;
+    this.readyTimeoutMs = options.readyTimeoutMs ?? 10_000;
+    this.readyPollMs = options.readyPollMs ?? 300;
   }
 
   /**
@@ -312,6 +346,67 @@ export class HerdrSessionManager {
   }
 
   /**
+   * 本文入力と送信確定を 1 操作で行う（chat 注入・kick 用, SessionBackend 共通面）。
+   * 実測（2026-07-22, jsonl を ground truth に検証）:
+   * - 本文+CR の単一 send-text は不成立（ペースト末尾の改行として除去され本文が残る）
+   * - 分割送信でも claude TUI ブート直後は 600ms 間隔の CR すら飲まれる
+   *   （アイドル時は 300ms 以上で成立。遅れて送る単発 CR は常に成立）
+   * よって「本文 → CR → 入力欄を読んで残留確認 → 残っていれば CR 再送」の確認つき
+   * リトライで確定させる。submit 済みの空入力への Enter は no-op なので二重送信は起きない。
+   */
+  async sendTextSubmit(name: string, text: string): Promise<void> {
+    // ブート直後の注入は本文ごと TUI 初期化に破棄され得る（実測: 入力欄にも jsonl にも
+    // 残らない）。herdr の claude 検出（agent_status が unknown を抜けるまで）を注入の
+    // 準備完了ゲートにする。working（処理中の queue 入力）も注入可。判定不能は fail-open。
+    await this.waitForAgentReady(name);
+    await this.sendKeys(name, [text], true);
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, this.submitDelayMs));
+      await this.sendKeys(name, ["Enter"]);
+      await new Promise((resolve) => setTimeout(resolve, this.submitVerifyDelayMs));
+      if (!(await this.inputBoxHasPendingText(name))) return;
+    }
+  }
+
+  /** claude TUI の入力準備完了（herdr の agent 検出が unknown を抜ける）を待つ。 */
+  private async waitForAgentReady(name: string): Promise<void> {
+    const deadline = Date.now() + this.readyTimeoutMs;
+    for (;;) {
+      try {
+        const result = await this.runner(["agent", "get", name]);
+        if (result.exitCode === 0) {
+          const status = parseHerdrAgentStatus(result.stdout);
+          if (status !== null && status !== "unknown") return;
+        }
+      } catch {
+        return; // herdr 不在等は fail-open（呼び出し側の送出エラーで顕在化させる）
+      }
+      if (Date.now() > deadline) return; // タイムアウトも fail-open
+      await new Promise((resolve) => setTimeout(resolve, this.readyPollMs));
+    }
+  }
+
+  /**
+   * claude TUI の入力欄（画面末尾側の `❯` 行）に未送信テキストが残っているか。
+   * 送信済みメッセージのエコーも `❯` で始まるため、**最後の** `❯` 行だけを見る。
+   * 判定不能（読取失敗・`❯` 行なし）は false = 送信成立扱い（fail-open。
+   * 誤リトライしても空入力 Enter の no-op で無害だが、無限再送はしない側に倒す）。
+   */
+  private async inputBoxHasPendingText(name: string): Promise<boolean> {
+    try {
+      const screen = await this.capturePane(name, { lines: 30 });
+      const promptLines = screen
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.startsWith("❯"));
+      const last = promptLines[promptLines.length - 1];
+      return last !== undefined && last.slice(1).trim().length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * 指定セッションの pane へキー/テキストを送出する。
    * literal はテキスト送出。非 literal は herdr が受理するキー名のみ send-keys、
    * BTab は生 Shift+Tab シーケンス、その他（数字キー等）はテキストとして送る。
@@ -327,6 +422,9 @@ export class HerdrSessionManager {
       let args: string[];
       if (literal) {
         args = ["pane", "send-text", target, key];
+      } else if (key === "Enter") {
+        // Ink(claude TUI) の submit は CR 必須（send-keys Enter は不認識。上記実測）。
+        args = ["pane", "send-text", target, ENTER_SEQUENCE];
       } else if (key === "BTab") {
         args = ["pane", "send-text", target, SHIFT_TAB_SEQUENCE];
       } else if (HERDR_KEY_NAMES.has(key) || /^C-[a-z]$/.test(key)) {

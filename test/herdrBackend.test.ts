@@ -143,15 +143,56 @@ describe("HerdrSessionManager", () => {
     const manager = new HerdrSessionManager({ runner: runner.runner, store });
     await manager.sendKeys("s-a", ["hello world"], true);
     await manager.sendKeys("s-a", ["Enter"]);
+    await manager.sendKeys("s-a", ["Down"]);
     await manager.sendKeys("s-a", ["BTab"]);
     await manager.sendKeys("s-a", ["1"]);
     const sends = runner.recorded.filter((args) => args[1]?.startsWith("send-"));
     expect(sends).toEqual([
       ["pane", "send-text", "w4:p2", "hello world"],
-      ["pane", "send-keys", "w4:p2", "Enter"],
+      // Enter は生 CR（send-keys Enter は Ink が submit と認識しない。実測 2026-07-22）。
+      ["pane", "send-text", "w4:p2", "\r"],
+      ["pane", "send-keys", "w4:p2", "Down"],
       ["pane", "send-text", "w4:p2", "\u001b[Z"],
       ["pane", "send-text", "w4:p2", "1"],
     ]);
+  });
+
+  test("sendTextSubmit: 本文→CR→残留確認。入力欄が空になれば終了、残留していれば CR を再送する", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    // 1回目の CR は飲まれた想定: 1度目の read は本文残留、2度目で空。
+    let reads = 0;
+    const screenWith = (input: string) => `❯ 古いメッセージのエコー\n──\n${input}\n──\n  ⏸ manual mode on`;
+    let agentGets = 0;
+    const runner = new MockHerdrRunner((args) => {
+      if (args[0] === "pane" && args[1] === "list") return herdrOk(paneListJson([{ pane_id: "w4:p2" }]));
+      if (args[0] === "agent" && args[1] === "get") {
+        agentGets += 1;
+        // 1回目は boot 中(unknown) → 2回目で idle（準備完了ゲートの検証）。
+        return herdrOk(JSON.stringify({
+          result: { agent: { pane_id: "w4:p2", agent_status: agentGets === 1 ? "unknown" : "idle" } },
+        }));
+      }
+      if (args[0] === "pane" && args[1] === "read") {
+        reads += 1;
+        return herdrOk(screenWith(reads === 1 ? "❯ こんにちは" : "❯"));
+      }
+      return herdrOk("");
+    });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    await manager.sendTextSubmit("s-a", "こんにちは");
+    const sends = runner.recorded.filter((args) => args[1]?.startsWith("send-"));
+    // agent 検出待ち(unknown→idle) → 本文 → CR → (残留検知) → CR 再送 → (空検知で終了)。
+    expect(agentGets).toBe(2);
+    expect(sends).toEqual([
+      ["pane", "send-text", "w4:p2", "こんにちは"],
+      ["pane", "send-text", "w4:p2", "\r"],
+      ["pane", "send-text", "w4:p2", "\r"],
+    ]);
+    expect(reads).toBe(2);
   });
 
   test("capturePane: joinWrappedLines は recent-unwrapped、空なら visible 末尾へフォールバック", async () => {

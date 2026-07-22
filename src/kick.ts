@@ -76,8 +76,7 @@ export async function runKickCommand(args: string[]): Promise<number> {
   if (store.get(sessionArg)?.backend === "herdr") {
     try {
       const backend = makeBackendForSession(sessionArg, store);
-      await backend.sendKeys(sessionArg, [promptArg], true);
-      await backend.sendKeys(sessionArg, ["Enter"]);
+      await backend.sendTextSubmit(sessionArg, promptArg);
       return 0;
     } catch (error) {
       process.stderr.write(`tailii kick: herdr 送出失敗: ${String(error)}\n`);

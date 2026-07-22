@@ -66,8 +66,8 @@ export async function injectQuestionAnswers(
       await sessionManager.sendKeys(session, ["Right"]);
     } else if (otherIndex !== null) {
       await sessionManager.sendKeys(session, [String(otherIndex + 1)]);
-      await sessionManager.sendKeys(session, [other], true);
-      await sessionManager.sendKeys(session, ["Enter"]);
+      // 本文+確定は 1 操作（herdr は分割すると CR が飲まれる。sendTextSubmit に集約）。
+      await sessionManager.sendTextSubmit(session, other);
     } else if (indexes.length > 0) {
       // 数字キーで即確定（Enter は送らない）。
       await sessionManager.sendKeys(session, [String(indexes[0]! + 1)]);
