@@ -62,6 +62,26 @@ fn parse_flags(rest: &[String]) -> Result<Flags> {
     Ok(flags)
 }
 
+/// RLIMIT_NOFILE の soft limit を `desired`（hard limit が下ならそこ）まで引き上げる。
+/// 失敗しても起動は続行する（従来の soft limit で動く）。
+fn raise_nofile_limit(desired: u64) {
+    unsafe {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            return;
+        }
+        let target = desired.min(limit.rlim_max);
+        if limit.rlim_cur >= target {
+            return;
+        }
+        limit.rlim_cur = target;
+        let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+    }
+}
+
 fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -73,6 +93,10 @@ fn main() -> Result<()> {
 
     match mode {
         "serve" => {
+            // launchd 既定の soft limit (256) は pty セッション常駐で枯渇し得る
+            // （枯渇すると全 exec が spawn 失敗しアプリがチャネルを開けなくなる。
+            // 実測 2026-07-23: pty master 240 個蓄積で EMFILE）。hard limit まで引き上げる。
+            raise_nofile_limit(4096);
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(serve(GatewayOptions {
                 dir: flags.dir,

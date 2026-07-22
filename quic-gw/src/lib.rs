@@ -509,9 +509,9 @@ async fn handle_exec(
 
 /// PTY 付き exec（対話シェル / tmux attach 用）。
 ///
-/// stderr は PTY に合流する（端末セマンティクス）。クライアント FIN は「入力終了」として
-/// 書き込みだけを止める（master を閉じると SIGHUP で即死するため）。ストリーム消失時は
-/// master クローズ（SIGHUP）→ 猶予後 kill で回収する。
+/// stderr は PTY に合流する（端末セマンティクス）。クライアント FIN / reset / 接続断は
+/// いずれもセッション破棄として扱い、master クローズ + プロセスグループへの
+/// SIGHUP → 猶予後 SIGKILL で回収する（FIN 維持だと静かな PTY が永遠に残る）。
 async fn handle_exec_pty(
     conn_id: usize,
     mut send: quinn::SendStream,
@@ -565,10 +565,12 @@ async fn handle_exec_pty(
 
     let master = Arc::new(AsyncFd::new(master)?);
 
-    // クライアント→PTY master（キー入力）。FIN（half-close）は「入力終了」として書き込み
-    // だけを止め、セッションは維持する。reset / 接続断は「セッション破棄」の合図として
-    // main ループへ通知する — 出力の無い静かな PTY（例: 無操作の tmux attach）では
-    // 書き込み失敗による消失検知が永遠に起きず、tmux client が残留してしまうため。
+    // クライアント→PTY master（キー入力）。FIN / reset / 接続断のいずれも
+    // 「セッション破棄」の合図として main ループへ通知する。
+    // 以前は FIN を「入力終了・セッション維持」としていたが、pty シェルへ FIN を送る
+    // 正当なクライアントは存在せず（NWConnection.cancel の正常クローズが FIN になる）、
+    // 出力の無い静かな PTY（例: 無操作の tmux attach / 生シェル）が誰にも回収されず
+    // master fd が蓄積 → EMFILE で全 exec 不能に至った（実測 2026-07-23: 240 個）。
     let client_reset = Arc::new(tokio::sync::Notify::new());
     let reset_signal = client_reset.clone();
     let writer_master = master.clone();
@@ -582,8 +584,7 @@ async fn handle_exec_pty(
                         break;
                     }
                 }
-                Ok(None) => break,
-                Err(_) => {
+                Ok(None) | Err(_) => {
                     reset_signal.notify_one();
                     break;
                 }

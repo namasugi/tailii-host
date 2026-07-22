@@ -215,6 +215,57 @@ async fn pty_client_reset_hangs_up_session() {
 }
 
 #[tokio::test]
+async fn pty_client_fin_hangs_up_session() {
+    // クライアント FIN（正常クローズ）でも静かな PTY セッションを破棄することの回帰固定。
+    // iOS の closeInteractiveShell（NWConnection.cancel）は QUIC 上では reset ではなく
+    // FIN として届く — FIN を「入力終了・セッション維持」にしていた旧実装では、無出力の
+    // シェルが誰にも回収されず pty master fd が蓄積し EMFILE で全 exec 不能に至った
+    // （実機障害 2026-07-23: 1.5 日で 240 個 / soft limit 256）。
+    let gw = start_gateway("ptyfin").await;
+    let (_endpoint, conn) = connect(&gw).await;
+
+    let marker = std::env::temp_dir().join(format!(
+        "quicgw-fin-{}-{:x}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&marker);
+
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let cmd = format!(
+        "trap 'touch {}; exit 0' HUP; echo ready; while :; do sleep 0.2; done",
+        marker.display()
+    );
+    let header = format!(
+        "{{\"t\":\"exec\",\"v\":1,\"token\":\"{}\",\"cmd\":{},\"pty\":{{\"cols\":80,\"rows\":24}}}}\n",
+        gw.token_b64,
+        serde_json::to_string(&cmd).unwrap()
+    );
+    send.write_all(header.as_bytes()).await.unwrap();
+    let ok = read_line(&mut recv, HEADER_CAP).await.unwrap().unwrap();
+    assert!(ok.contains("\"ok\":true"), "unexpected response: {ok}");
+    let ready = read_line(&mut recv, HEADER_CAP).await.unwrap().unwrap();
+    assert!(ready.starts_with("ready"), "expected ready marker: {ready:?}");
+
+    // 正常クローズを模擬: 書き込み側 FIN のみ（受信側は開けたまま）。
+    send.finish().unwrap();
+
+    let mut hung_up = false;
+    for _ in 0..100 {
+        if marker.exists() {
+            hung_up = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let _ = std::fs::remove_file(&marker);
+    assert!(hung_up, "PTY session was not hung up after client FIN");
+}
+
+#[tokio::test]
 async fn tcp_pipes_to_loopback_and_half_closes() {
     let gw = start_gateway("tcp").await;
     let (_endpoint, conn) = connect(&gw).await;
