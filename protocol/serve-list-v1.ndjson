@@ -1,0 +1,6 @@
+{"id":"sv1","type":"serve_list_request","v":1}
+{"id":"sv1","servers":[{"command":"node","commandLine":"node /Users/alice/project/node_modules/.bin/vite --port 5173","cwd":"/Users/alice/project","pid":4321,"port":5173},{"command":"python3","pid":4400,"port":8000}],"type":"serve_list_response","v":1}
+{"id":"sv2","servers":[],"type":"serve_list_response","v":1}
+{"id":"st1","pid":4321,"port":5173,"type":"serve_stop_request","v":1}
+{"error":null,"id":"st1","ok":true,"type":"serve_stop_response","v":1}
+{"error":"対象のサーバーが見つかりません（すでに停止済み？）","id":"st2","ok":false,"type":"serve_stop_response","v":1}

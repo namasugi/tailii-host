@@ -61,6 +61,7 @@ import { LineWriter } from "./lineWriter.js";
 import { parsePermissionMode } from "./permissionMode.js";
 import { fetchPlanUsage, type PlanUsageProvider } from "./planUsageFetcher.js";
 import { PreviewServer } from "./previewServer.js";
+import { listServeProcesses, stopServeProcess } from "./serveService.js";
 import {
   decodeControlMessage,
   PROTOCOL_MAX_SUPPORTED,
@@ -1957,6 +1958,33 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
 
     case "preview_close": {
       await ctx.previewServer.close(message.id);
+      break;
+    }
+
+    case "serve_list_request": {
+      // Mac 上で LISTEN 中の開発サーバー一覧（serve-list）。engine 自身
+      // （previewServer の loopback 静的サーバー含む）は除外する。
+      engineDiag(`serve_list_request id=${message.id}`);
+      try {
+        const servers = await listServeProcesses({ excludePids: [process.pid] });
+        writer.write({ type: "serve_list_response", v, id: message.id, servers });
+      } catch (error) {
+        engineDiag(`serve_list_response 失敗 id=${message.id}: ${String(error)}`);
+        writer.write({ type: "serve_list_response", v, id: message.id, servers: [] });
+      }
+      break;
+    }
+
+    case "serve_stop_request": {
+      // 開発サーバーの停止。pid+port の現在照合つき（pid 再利用の誤爆防止）。
+      engineDiag(`serve_stop_request id=${message.id} pid=${message.pid} port=${message.port}`);
+      try {
+        const result = await stopServeProcess(message.pid, message.port);
+        writer.write({ type: "serve_stop_response", v, id: message.id, ...result });
+      } catch (error) {
+        engineDiag(`serve_stop_response 失敗 id=${message.id}: ${String(error)}`);
+        writer.write({ type: "serve_stop_response", v, id: message.id, ok: false, error: String(error) });
+      }
       break;
     }
 

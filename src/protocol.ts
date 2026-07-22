@@ -109,6 +109,18 @@ export interface SessionSearchResult {
   updatedAt?: number;
 }
 
+/** serve_list_response の 1 サーバー（Mac 上で LISTEN 中の開発サーバー, serve-list）。 */
+export interface ServeProcessInfo {
+  pid: number;
+  port: number;
+  /** プロセス名（lsof の COMMAND 列）。 */
+  command: string;
+  /** フルコマンドライン（表示用。長いものは切り詰め済み）。 */
+  commandLine?: string;
+  /** プロセスの作業ディレクトリ（会話 workdir とのグルーピング判定に使う）。 */
+  cwd?: string;
+}
+
 /** slash_list_response の 1 コマンド候補。 */
 export interface SlashCommandInfo {
   name: string;
@@ -302,7 +314,11 @@ export type ControlMessage =
   | { type: "preview_open"; v: number; id: string; target: string }
   | { type: "preview_ready"; v: number; id: string; url: string }
   | { type: "preview_error"; v: number; id: string; message: string }
-  | { type: "preview_close"; v: number; id: string };
+  | { type: "preview_close"; v: number; id: string }
+  | { type: "serve_list_request"; v: number; id: string }
+  | { type: "serve_list_response"; v: number; id: string; servers: ServeProcessInfo[] }
+  | { type: "serve_stop_request"; v: number; id: string; pid: number; port: number }
+  | { type: "serve_stop_response"; v: number; id: string; ok: boolean; error: string | null };
 
 export type ControlMessageType = ControlMessage["type"];
 
@@ -1107,6 +1123,41 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
       return {
         type, v,
         id: requireString(raw, "id"),
+      };
+
+    case "serve_list_request":
+      return { type, v, id: requireString(raw, "id") };
+
+    case "serve_list_response":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        servers: requireArray(raw, "servers").map((element) => {
+          const obj = requireObject(element, "servers");
+          return compact<ServeProcessInfo>({
+            pid: requireNumber(obj, "pid"),
+            port: requireNumber(obj, "port"),
+            command: requireString(obj, "command"),
+            commandLine: optionalString(obj, "commandLine"),
+            cwd: optionalString(obj, "cwd"),
+          });
+        }),
+      };
+
+    case "serve_stop_request":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        pid: requireNumber(raw, "pid"),
+        port: requireNumber(raw, "port"),
+      };
+
+    case "serve_stop_response":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        ok: requireBoolean(raw, "ok"),
+        error: optionalNullableString(raw, "error") ?? null,
       };
 
     default:
