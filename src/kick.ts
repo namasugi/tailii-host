@@ -7,6 +7,8 @@
 // tmux は絶対パス指定（PATH 外のため）。
 
 import { spawnSync } from "node:child_process";
+import { makeBackendForSession } from "./sessionBackend.js";
+import { SessionMetadataStore } from "./sessionMetadataStore.js";
 import { DEFAULT_TMUX_PATH } from "./tmux.js";
 
 /**
@@ -67,6 +69,20 @@ export async function runKickCommand(args: string[]): Promise<number> {
   if (promptArg === null) {
     process.stderr.write("tailii kick: --prompt <text> が必要です\n");
     return 2;
+  }
+
+  // herdr backend のセッションは herdr pane へ送出する（メタデータの backend 欄で判定）。
+  const store = new SessionMetadataStore();
+  if (store.get(sessionArg)?.backend === "herdr") {
+    try {
+      const backend = makeBackendForSession(sessionArg, store);
+      await backend.sendKeys(sessionArg, [promptArg], true);
+      await backend.sendKeys(sessionArg, ["Enter"]);
+      return 0;
+    } catch (error) {
+      process.stderr.write(`tailii kick: herdr 送出失敗: ${String(error)}\n`);
+      return 1;
+    }
   }
 
   return kickCore(sessionArg, promptArg, DEFAULT_TMUX_PATH, (m) => process.stderr.write(m));

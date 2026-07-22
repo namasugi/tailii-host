@@ -1557,7 +1557,7 @@ function receiptSessionIdentity(meta: SessionMeta | null): string | undefined {
     meta.createdAt,
     meta.agent ?? "claude",
     meta.providerSessionId ?? null,
-    meta.tmuxPaneId ?? null,
+    meta.tmuxPaneId ?? meta.herdrPaneId ?? null,
     meta.cwd,
   ]);
 }

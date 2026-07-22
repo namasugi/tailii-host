@@ -16,6 +16,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { defaultInjectedPath } from "./launch.js";
+import { resolveSessionBackendKind } from "./sessionBackend.js";
 
 // MARK: - ホストシム生成（テスタブル）
 
@@ -135,6 +136,20 @@ export async function collectDoctorChecks(envPath: string = defaultInjectedPath(
     ok: tmux !== null,
     required: true,
     detail: tmux ?? "見つかりません。`brew install tmux` 等で導入してください",
+  });
+
+  // 端末バックエンドに herdr を選んでいる場合のみ必須（既定 tmux では情報提供のみ）。
+  const backendKind = resolveSessionBackendKind();
+  const herdr = findCommand("herdr", envPath);
+  checks.push({
+    label: backendKind === "herdr" ? "herdr(backend=herdr)" : "herdr(任意)",
+    ok: herdr !== null,
+    required: backendKind === "herdr",
+    detail:
+      herdr ??
+      (backendKind === "herdr"
+        ? "見つかりません。~/.tailii/backend が herdr ですが herdr CLI が PATH にありません"
+        : "未導入(~/.tailii/backend で herdr backend を使う場合のみ必要)"),
   });
 
   const claude = findCommand("claude", envPath);

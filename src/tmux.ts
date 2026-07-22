@@ -96,7 +96,8 @@ export class TmuxSessionManager {
    */
   async list(): Promise<SessionInfo[]> {
     const alive = await this.liveSessionNames();
-    const metas = this.store.all();
+    // herdr backend のメタは HerdrSessionManager が列挙する（Composite で和を取る）。
+    const metas = this.store.all().filter((meta) => meta.backend !== "herdr");
 
     const cwdByName = new Map<string, string>();
     const claudeSessionIdByName = new Map<string, string>();

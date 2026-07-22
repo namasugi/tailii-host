@@ -5,7 +5,7 @@
 
 import type { SessionInfo } from "./protocol.js";
 import type { SessionActivityProvider } from "./sessionActivityProvider.js";
-import type { TmuxSessionManager } from "./tmux.js";
+import type { SessionBackend } from "./sessionBackend.js";
 
 /** 1 ページ分の整列済みセッションと続き位置。 */
 export interface SessionListPage {
@@ -44,7 +44,7 @@ export function decodeSessionListCursor(token: string): CursorKey | null {
 /** list を更新時間降順/名前昇順に整列し keyset ページングする純サービス。 */
 export class SessionListService {
   constructor(
-    private readonly sessionManager: TmuxSessionManager,
+    private readonly sessionManager: SessionBackend,
     private readonly activityProvider: SessionActivityProvider,
   ) {}
 

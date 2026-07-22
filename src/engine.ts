@@ -78,7 +78,12 @@ import { searchClaudeSessions } from "./sessionSearch.js";
 import { SessionMetadataStore } from "./sessionMetadataStore.js";
 import { abortableSleep, sleep } from "./sleep.js";
 import { HISTORY_DONE_STREAM_ID, TranscriptTailer } from "./transcriptTailer.js";
-import { TmuxSessionManager } from "./tmux.js";
+import {
+  makeSessionBackend,
+  resolveSessionBackendKind,
+  type SessionBackend,
+  type SessionBackendKind,
+} from "./sessionBackend.js";
 import { aggregateUsage, emptyUsageTotals } from "./usageAggregator.js";
 import { aggregateCodexUsage, type CodexUsage } from "./codexUsage.js";
 import { createStaleDistGuard, isStaleDist, readPackageVersion, type StaleDistGuard } from "./version.js";
@@ -175,7 +180,10 @@ export async function runEngineCommand(args: string[]): Promise<number> {
 
   // 一覧整形（session-list-lifecycle）: updatedAt 付与・整列・ページング。
   // updatedAt の権威はセッション自身の会話 transcript（会話が無ければ最下位）。
-  const sessionManager = new TmuxSessionManager({ store });
+  // 端末バックエンド（tmux / herdr）は host 側設定ファイルで切替可能（iOS 改修不要のトグル）。
+  // herdr 設定時も既存 tmux セッションは Composite 経由で引き続き操作できる。
+  const backendKind = resolveSessionBackendKind();
+  const sessionManager = makeSessionBackend({ kind: backendKind, store });
   const claudeSessionStore = new ClaudeSessionStore(claudeProjectsRoot);
   const codexSessionStore = new CodexSessionStore();
   const sessionListService = new SessionListService(
@@ -195,6 +203,7 @@ export async function runEngineCommand(args: string[]): Promise<number> {
     store,
     innerCommand: resumeCommandArg ?? "claude --continue",
     agent: "claude",
+    backend: backendKind,
   });
   // per-session: agentType=codex のセッション用に codex launcher / resume launcher を用意する。
   // codex は resume 未対応のため既定コマンドで新規起動する（新しい rollout を tail）。
@@ -203,11 +212,13 @@ export async function runEngineCommand(args: string[]): Promise<number> {
     store,
     agent: "codex",
     codexAppServer,
+    backend: backendKind,
   });
   const codexResumeLauncher = makeSessionLauncher({
     store,
     agent: "codex",
     codexAppServer,
+    backend: backendKind,
   });
 
   try {
@@ -220,7 +231,13 @@ export async function runEngineCommand(args: string[]): Promise<number> {
       transcriptPath: transcriptArg,
       // launcher は常に claude 版。codex は codexLauncher で分岐する（per-session）。
       // agentType 未指定時にどちらへ倒すかは engine 内 defaultAgent(=agentArg) が決める。
-      launcher: makeSessionLauncher({ store, innerCommand: innerCommandArg, agent: "claude" }),
+      launcher: makeSessionLauncher({
+        store,
+        innerCommand: innerCommandArg,
+        agent: "claude",
+        backend: backendKind,
+      }),
+      backendKind,
       codexLauncher,
       sessionListService,
       metadataStore: store,
@@ -245,7 +262,9 @@ export interface RunEngineOptions {
   input: Readable;
   /** "stdout" 側（Mac→iOS の応答を流す）。 */
   output: Writable;
-  sessionManager: TmuxSessionManager;
+  sessionManager: SessionBackend;
+  /** 新規セッションの端末バックエンド種別（既定 tmux。per-session launcher 組立に使う）。 */
+  backendKind?: SessionBackendKind;
   /** 画像通知/取得の橋渡し（省略時は画像処理なし = 後方互換）。 */
   imageService?: ImageService | null;
   /** 会話出力キャプチャ（省略時は chat_output なし = 後方互換）。 */
@@ -319,6 +338,7 @@ const DEFAULT_MODE_TIMING: ModeTiming = {
 export async function runEngine(options: RunEngineOptions): Promise<void> {
   const {
     sessionManager,
+    backendKind = "tmux",
     imageService = null,
     transcriptTailer = null,
     transcriptPath = null,
@@ -786,6 +806,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           writer,
           state,
           sessionManager,
+          backendKind,
           imageService,
           launcher,
           codexLauncher,
@@ -845,7 +866,9 @@ interface EngineState {
 interface HandlerContext {
   writer: LineWriter;
   state: EngineState;
-  sessionManager: TmuxSessionManager;
+  sessionManager: SessionBackend;
+  /** 新規セッションの端末バックエンド種別。 */
+  backendKind: SessionBackendKind;
   imageService: ImageService | null;
   launcher: EngineLauncher | null;
   /** codex セッション用 launcher（session_start の agentType=codex 時に使用）。 */
@@ -966,7 +989,7 @@ async function claimRuntime(ctx: HandlerContext, session: string): Promise<"gran
 }
 
 async function waitForLiveSession(
-  sessionManager: TmuxSessionManager, predicate: (info: SessionInfo) => boolean,
+  sessionManager: SessionBackend, predicate: (info: SessionInfo) => boolean,
 ): Promise<SessionInfo | null> {
   const deadline = Date.now() + 8_000;
   while (Date.now() < deadline) {
@@ -1339,6 +1362,7 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
           ? makeSessionLauncher({
               ...(ctx.metadataStore !== null && { store: ctx.metadataStore }),
               agent: "claude",
+              backend: ctx.backendKind,
               innerCommand: claudeInnerCommand({
                 model: message.model ?? null,
                 permissionMode: message.permissionMode ?? null,
@@ -1997,7 +2021,7 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
 
 /** pane から mode が判定できるまで、指定回数だけ短く待つ。 */
 async function waitForPermissionMode(
-  sessionManager: TmuxSessionManager,
+  sessionManager: SessionBackend,
   session: string,
   attempts: number,
   intervalMs: number,
@@ -2012,7 +2036,7 @@ async function waitForPermissionMode(
 
 /** mode_set の実体。dialog が閉じるのを待ち、BTab 後は実際に変化した mode だけを採用する。 */
 async function setPermissionMode(
-  sessionManager: TmuxSessionManager,
+  sessionManager: SessionBackend,
   session: string,
   target: string,
   timing: ModeTiming,

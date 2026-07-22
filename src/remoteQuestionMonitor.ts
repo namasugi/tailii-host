@@ -8,10 +8,10 @@ import { PROTOCOL_V1 } from "./protocol.js";
 import type { SessionMetadataStore, SessionMeta } from "./sessionMetadataStore.js";
 import { abortableSleep } from "./sleep.js";
 import { HISTORY_DONE_STREAM_ID, TranscriptTailer } from "./transcriptTailer.js";
-import type { TmuxSessionManager } from "./tmux.js";
+import type { SessionBackend } from "./sessionBackend.js";
 
 export class RemoteQuestionMonitor {
-  private readonly sessionManager: TmuxSessionManager;
+  private readonly sessionManager: SessionBackend;
   private readonly metadataStore: SessionMetadataStore;
   private readonly projectsRoot: string;
   private readonly writer: LineWriter;
@@ -22,7 +22,7 @@ export class RemoteQuestionMonitor {
   private loopTask: Promise<void> | null = null;
 
   constructor(options: {
-    sessionManager: TmuxSessionManager;
+    sessionManager: SessionBackend;
     metadataStore: SessionMetadataStore;
     projectsRoot: string;
     writer: LineWriter;

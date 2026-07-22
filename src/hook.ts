@@ -52,7 +52,8 @@ import { parsePermissionMode } from "./permissionMode.js";
 import { resolveHubSocketPath, resolveSocketPath } from "./socketPath.js";
 import { attachedSessions } from "./reaper.js";
 import { sleep } from "./sleep.js";
-import { processTmuxCommandRunner, TmuxSessionManager, type TmuxCommandRunner } from "./tmux.js";
+import { makeBackendForSession } from "./sessionBackend.js";
+import { processTmuxCommandRunner, type TmuxCommandRunner } from "./tmux.js";
 import {
   PROTOCOL_V1,
   decodeControlMessage,
@@ -361,9 +362,10 @@ async function currentPermissionMode(
 }
 
 /**
- * tmux pane 表示から permission mode を判定する本番 provider を作る（claude 専用）。
- * capture-pane が timeLimitMs 内に返らない・失敗する場合は null（判定不能 → 従来ゲート）。
+ * pane 表示から permission mode を判定する本番 provider を作る（claude 専用）。
+ * capture が timeLimitMs 内に返らない・失敗する場合は null（判定不能 → 従来ゲート）。
  * 本番の hook CLI は Claude 専用なので、この provider も Claude にだけ配線する。
+ * セッションの属するバックエンド（tmux / herdr）はメタデータで解決する。
  */
 export function makeTmuxPermissionModeProvider(
   session: string,
@@ -371,7 +373,7 @@ export function makeTmuxPermissionModeProvider(
 ): () => Promise<string | null> {
   return async () => {
     try {
-      const manager = new TmuxSessionManager();
+      const manager = makeBackendForSession(session);
       const pane = await Promise.race([
         manager.capturePane(session),
         sleep(timeLimitMs).then(() => null),

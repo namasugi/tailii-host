@@ -3,7 +3,7 @@
 
 import type { QuestionAnswer } from "./protocol.js";
 import { sleep } from "./sleep.js";
-import type { TmuxSessionManager } from "./tmux.js";
+import type { SessionBackend } from "./sessionBackend.js";
 
 const KEY_STEP_MS = 150;
 
@@ -18,7 +18,7 @@ const KEY_STEP_MS = 150;
  *   otherText があるときは最大 index を Other 行とみなす。
  */
 export async function injectQuestionAnswers(
-  answers: QuestionAnswer[], session: string, sessionManager: TmuxSessionManager,
+  answers: QuestionAnswer[], session: string, sessionManager: SessionBackend,
 ): Promise<void> {
   const sorted = answers.slice().sort((a, b) => a.questionIndex - b.questionIndex);
   // 2 問以上では、最後の設問が単一選択でも回答レビュー画面を経由する。

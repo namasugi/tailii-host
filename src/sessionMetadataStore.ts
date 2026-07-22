@@ -21,6 +21,10 @@ export interface SessionMeta {
   providerSessionId?: string;
   /** runtime を収容する tmux pane の安定 ID（`%N`）。未記録時は session 名へフォールバック。 */
   tmuxPaneId?: string;
+  /** セッションを収容する端末バックエンド。未記録は tmux 相当（後方互換）。 */
+  backend?: "tmux" | "herdr";
+  /** herdr backend のときの pane ID（`w<N>:p<id>`）。herdr への入出力 target。 */
+  herdrPaneId?: string;
 }
 
 /** session 名が安全でないときに投げる型付きエラー。 */
@@ -63,9 +67,11 @@ export class SessionMetadataStore {
       // sortedKeys 相当。任意キーは指定時のみ書く（後方互換: 未指定は従来どおりのキー構成）。
       {
         ...(meta.agent !== undefined ? { agent: meta.agent } : {}),
+        ...(meta.backend !== undefined ? { backend: meta.backend } : {}),
         ...(meta.claudeSessionId !== undefined ? { claudeSessionId: meta.claudeSessionId } : {}),
         createdAt: meta.createdAt,
         cwd: meta.cwd,
+        ...(meta.herdrPaneId !== undefined ? { herdrPaneId: meta.herdrPaneId } : {}),
         name: meta.name,
         ...(meta.providerSessionId !== undefined ? { providerSessionId: meta.providerSessionId } : {}),
         ...(meta.tmuxPaneId !== undefined ? { tmuxPaneId: meta.tmuxPaneId } : {}),
@@ -149,6 +155,11 @@ function decodeMeta(raw: unknown): SessionMeta | null {
     typeof obj["tmuxPaneId"] === "string" && /^%\d+$/.test(obj["tmuxPaneId"])
       ? obj["tmuxPaneId"]
       : undefined;
+  const backend = obj["backend"] === "herdr" || obj["backend"] === "tmux" ? obj["backend"] : undefined;
+  const herdrPaneId =
+    typeof obj["herdrPaneId"] === "string" && HERDR_PANE_ID_PATTERN.test(obj["herdrPaneId"])
+      ? obj["herdrPaneId"]
+      : undefined;
   return {
     name: obj["name"],
     cwd: obj["cwd"],
@@ -157,5 +168,10 @@ function decodeMeta(raw: unknown): SessionMeta | null {
     ...(claudeSessionId !== undefined ? { claudeSessionId } : {}),
     ...(providerSessionId !== undefined ? { providerSessionId } : {}),
     ...(tmuxPaneId !== undefined ? { tmuxPaneId } : {}),
+    ...(backend !== undefined ? { backend } : {}),
+    ...(herdrPaneId !== undefined ? { herdrPaneId } : {}),
   };
 }
+
+/** herdr pane ID の形式（例 `w4:p2`。実測で英数字混在の pane 連番あり）。 */
+export const HERDR_PANE_ID_PATTERN = /^w\d+:p[A-Za-z0-9]+$/;
