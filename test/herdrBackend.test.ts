@@ -226,9 +226,31 @@ describe("HerdrSessionManager", () => {
     const result = await manager.reattach("s-a");
     expect(result).toEqual({
       kind: "attached",
-      info: { name: "s-a", cwd: "/work", alive: true },
+      info: { name: "s-a", cwd: "/work", alive: true, backend: "herdr" },
       recentOutput: "recent output",
     });
+  });
+
+  test("stopServerIfEmpty: pane ゼロなら server stop、pane ありや server 不通は何もしない", async () => {
+    const cases: { panes: { pane_id: string }[] | null; expectStop: boolean }[] = [
+      { panes: [], expectStop: true },
+      { panes: [{ pane_id: "w1:p1" }], expectStop: false },
+      { panes: null, expectStop: false }, // server 不通(list 非0)
+    ];
+    for (const c of cases) {
+      const runner = new MockHerdrRunner((args) => {
+        if (args[1] === "list") {
+          return c.panes === null
+            ? { exitCode: 1, stdout: "", stderr: "connect error" }
+            : herdrOk(paneListJson(c.panes));
+        }
+        return herdrOk("");
+      });
+      const manager = new HerdrSessionManager({ runner: runner.runner, store: makeStore() });
+      await manager.stopServerIfEmpty();
+      const stops = runner.recorded.filter((args) => args[0] === "server" && args[1] === "stop");
+      expect(stops.length, JSON.stringify(c)).toBe(c.expectStop ? 1 : 0);
+    }
   });
 
   test("kill: 記録済み pane を閉じる。pane 不在は HerdrFailedError", async () => {
@@ -279,10 +301,23 @@ describe("CompositeSessionBackend", () => {
     expect(herdrRunner.recorded).toContainEqual(["pane", "send-text", "w4:p2", "x"]);
   });
 
-  test("makeSessionBackend: tmux 設定は素の TmuxSessionManager、herdr 設定は Composite", () => {
+  test("makeSessionBackend は常に Composite（設定に依らず per-session ルーティング）", () => {
     const store = makeStore();
-    expect(makeSessionBackend({ kind: "tmux", store })).toBeInstanceOf(TmuxSessionManager);
-    expect(makeSessionBackend({ kind: "herdr", store })).toBeInstanceOf(CompositeSessionBackend);
+    expect(makeSessionBackend({ store })).toBeInstanceOf(CompositeSessionBackend);
+  });
+
+  test("herdr list はメタ皆無なら CLI を呼ばず空を返す（純 tmux 環境の副作用ゼロ）", async () => {
+    const store = makeStore();
+    const calls: string[][] = [];
+    const manager = new HerdrSessionManager({
+      store,
+      runner: (args) => {
+        calls.push(args);
+        return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+      },
+    });
+    expect(await manager.list()).toEqual([]);
+    expect(calls).toEqual([]);
   });
 
   test("makeBackendForSession はメタの backend 欄で実装を選ぶ", () => {
@@ -309,27 +344,27 @@ describe("TmuxSessionManager と herdr メタの分離", () => {
 });
 
 describe("launchCore herdr backend", () => {
-  /** herdr 呼び出しを記録するモック ProcessRunner。 */
+  /**
+   * herdr 呼び出しを記録するモック ProcessRunner。
+   * 実装は全コマンドに `--session tailii` を前置する。ここで前置を検証しつつ剥がし、
+   * `recorded` にはコア引数（pane/agent/...）だけを積んで各テストの検証を単純に保つ。
+   */
   function herdrProcessRunner(overrides?: {
     panes?: { pane_id: string; label?: string }[];
     processName?: string;
   }): { runner: ProcessRunner; recorded: { exe: string; args: string[] }[] } {
     const recorded: { exe: string; args: string[] }[] = [];
-    const runner: ProcessRunner = async (exe, args) => {
+    const runner: ProcessRunner = async (exe, rawArgs) => {
+      if (rawArgs[0] !== "--session" || rawArgs[1] !== "tailii") {
+        return { exitCode: 9, stdout: "" }; // --session tailii 前置漏れを失敗として顕在化
+      }
+      const args = rawArgs.slice(2);
       recorded.push({ exe, args });
       if (args[0] === "pane" && args[1] === "list") {
         return { exitCode: 0, stdout: paneListJson(overrides?.panes ?? []) };
       }
       if (args[0] === "pane" && args[1] === "process-info") {
         return { exitCode: 0, stdout: processInfoJson(overrides?.processName ?? "claude") };
-      }
-      if (args[0] === "workspace" && args[1] === "list") {
-        return {
-          exitCode: 0,
-          stdout: JSON.stringify({
-            result: { type: "workspace_list", workspaces: [{ workspace_id: "w9", label: "tailii" }] },
-          }),
-        };
       }
       if (args[0] === "agent" && args[1] === "start") {
         return {
@@ -357,6 +392,7 @@ describe("launchCore herdr backend", () => {
       now: () => 42,
       errorSink: () => {},
       runner,
+      ensurePollMs: 0,
       claudeJsonPath: path.join(makeTempDir("herdr-launch-claudejson"), ".claude.json"),
       hookGlobalMarkerPath: path.join(dir, "no-such-marker"),
     };
@@ -379,8 +415,10 @@ describe("launchCore herdr backend", () => {
     const dashDash = start!.args.indexOf("--");
     expect(start!.args.slice(dashDash + 1, dashDash + 3)).toEqual(["/bin/zsh", "-lc"]);
     expect(start!.args[dashDash + 3]).toMatch(/^sleep 300 --settings /);
-    // 専用タブへ分離。
-    expect(recorded.some((call) => call.args[0] === "pane" && call.args[1] === "move")).toBe(true);
+    // 専用タブへ分離（named session 内。workspace 指定は不要）。
+    expect(recorded).toContainEqual(expect.objectContaining({
+      args: ["pane", "move", "w9:p7", "--new-tab", "--label", "s-h", "--no-focus"],
+    }));
 
     expect(store.get("s-h")).toEqual({
       name: "s-h",
@@ -422,45 +460,46 @@ describe("launchCore herdr backend", () => {
     expect(store.get("s-h")?.herdrPaneId).toBe("w9:p7");
   });
 
-  test("workspace 不在なら作成してから起動する", async () => {
-    const dir = makeTempDir("herdr-launch-ws");
+  test("tailii セッションサーバー不在なら detached 起動して待つ", async () => {
+    const dir = makeTempDir("herdr-launch-ensure");
     const store = makeStore();
-    const recorded: { exe: string; args: string[] }[] = [];
-    const runner: ProcessRunner = async (exe, args) => {
-      recorded.push({ exe, args });
-      if (args[0] === "pane" && args[1] === "list") return { exitCode: 0, stdout: paneListJson([]) };
-      if (args[0] === "workspace" && args[1] === "list") {
-        return { exitCode: 0, stdout: JSON.stringify({ result: { workspaces: [] } }) };
-      }
-      if (args[0] === "workspace" && args[1] === "create") {
-        return {
-          exitCode: 0,
-          stdout: JSON.stringify({ result: { workspace: { workspace_id: "w10" } } }),
-        };
+    const spawned: { exe: string; args: string[] }[] = [];
+    let serverUp = false;
+    const runner: ProcessRunner = async (_exe, rawArgs) => {
+      const args = rawArgs[0] === "--session" ? rawArgs.slice(2) : rawArgs;
+      if (args[0] === "pane" && args[1] === "list") {
+        return serverUp
+          ? { exitCode: 0, stdout: paneListJson([]) }
+          : { exitCode: 1, stdout: "" };
       }
       if (args[0] === "agent" && args[1] === "start") {
         return {
           exitCode: 0,
-          stdout: JSON.stringify({ result: { agent: { pane_id: "w10:p2" } } }),
+          stdout: JSON.stringify({ result: { agent: { pane_id: "w1:p1" } } }),
         };
       }
       return { exitCode: 0, stdout: "" };
     };
 
-    expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
-    const createIdx = recorded.findIndex((call) => call.args[1] === "create");
-    const startIdx = recorded.findIndex((call) => call.args[1] === "start");
-    expect(createIdx).toBeGreaterThanOrEqual(0);
-    expect(startIdx).toBeGreaterThan(createIdx);
-    const start = recorded[startIdx]!;
-    expect(start.args).toContain("--workspace");
-    expect(start.args[start.args.indexOf("--workspace") + 1]).toBe("w10");
+    const options = {
+      ...launchOptions(dir, store, runner),
+      spawnDetached: (exe: string, args: string[]) => {
+        spawned.push({ exe, args });
+        serverUp = true;
+      },
+    };
+    expect(await launchCore(options)).toBe(0);
+    expect(spawned).toEqual([
+      { exe: "/Users/x/.local/bin/herdr", args: ["--session", "tailii", "server"] },
+    ]);
+    expect(store.get("s-h")?.herdrPaneId).toBe("w1:p1");
   });
 
   test("agent start 失敗は非0で返しメタを書かない", async () => {
     const dir = makeTempDir("herdr-launch-fail");
     const store = makeStore();
-    const runner: ProcessRunner = async (_exe, args) => {
+    const runner: ProcessRunner = async (_exe, rawArgs) => {
+      const args = rawArgs[0] === "--session" ? rawArgs.slice(2) : rawArgs;
       if (args[0] === "pane" && args[1] === "list") return { exitCode: 0, stdout: paneListJson([]) };
       if (args[0] === "agent" && args[1] === "start") return { exitCode: 1, stdout: "" };
       return { exitCode: 0, stdout: "{}" };

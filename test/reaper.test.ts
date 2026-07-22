@@ -259,3 +259,135 @@ describe("reaperTick", () => {
     expect(readHeartbeat(dir, "cs-old")).toBeNull();
   });
 });
+
+describe("reaperTick herdr backend", () => {
+  /** herdr 操作面のモック（kill 記録つき）。 */
+  function herdrOpsWith(options: {
+    names: string[];
+    agentAlive?: boolean;
+  }): { ops: import("../src/reaper.js").HerdrReaperOps; killedNames: string[] } {
+    const killedNames: string[] = [];
+    return {
+      killedNames,
+      ops: {
+        list: async () =>
+          options.names.map((name) => ({ name, cwd: "/w", alive: true, backend: "herdr" as const })),
+        agentProcessAlive: async () => options.agentAlive ?? true,
+        kill: async (name) => {
+          killedNames.push(name);
+        },
+      },
+    };
+  }
+
+  test("herdr セッションも idle timeout 超過で pane close(kill) される", async () => {
+    const dir = makeTempDir("reaper-herdr");
+    const tmux = runnerWithSessions([]);
+    const { ops, killedNames } = herdrOpsWith({ names: ["s-hold", "s-hfresh"] });
+    writeHeartbeat(dir, "s-hold", { ts: NOW - TIMEOUT, state: "idle" });
+    writeHeartbeat(dir, "s-hfresh", { ts: NOW - 10, state: "idle" });
+
+    const result = await reaperTick({
+      runner: tmux.runner,
+      heartbeatDir: dir,
+      metadataStore: makeTempStore(),
+      timeoutSeconds: TIMEOUT,
+      now: NOW,
+      herdrOps: ops,
+    });
+
+    expect(result.killed).toEqual(["s-hold"]);
+    expect(killedNames).toEqual(["s-hold"]);
+    expect(readHeartbeat(dir, "s-hold")).toBeNull();
+    expect(readHeartbeat(dir, "s-hfresh")).not.toBeNull();
+    expect(result.liveCount).toBe(2);
+  });
+
+  test("herdr claude active はプロセス生存で bump 代行され kill されない", async () => {
+    const dir = makeTempDir("reaper-herdr-active");
+    const tmux = runnerWithSessions([]);
+    const { ops, killedNames } = herdrOpsWith({ names: ["s-hbusy"], agentAlive: true });
+    writeHeartbeat(dir, "s-hbusy", { ts: NOW - TIMEOUT * 2, state: "active" });
+
+    const result = await reaperTick({
+      runner: tmux.runner,
+      heartbeatDir: dir,
+      metadataStore: makeTempStore(),
+      timeoutSeconds: TIMEOUT,
+      now: NOW,
+      herdrOps: ops,
+    });
+
+    expect(result.killed).toEqual([]);
+    expect(killedNames).toEqual([]);
+    expect(readHeartbeat(dir, "s-hbusy")?.ts).toBe(NOW);
+  });
+
+  test("生存中の herdr セッションの heartbeat は残骸回収されない（tmux 生存集合との和）", async () => {
+    const dir = makeTempDir("reaper-herdr-reclaim");
+    const tmux = runnerWithSessions([]);
+    const { ops } = herdrOpsWith({ names: ["s-halive"] });
+    writeHeartbeat(dir, "s-halive", { ts: NOW - 10, state: "idle" });
+    writeHeartbeat(dir, "s-gone", { ts: NOW - 10, state: "idle" });
+
+    const result = await reaperTick({
+      runner: tmux.runner,
+      heartbeatDir: dir,
+      metadataStore: makeTempStore(),
+      timeoutSeconds: TIMEOUT,
+      now: NOW,
+      herdrOps: ops,
+    });
+
+    expect(result.reclaimed).toEqual(["s-gone"]);
+    expect(readHeartbeat(dir, "s-halive")).not.toBeNull();
+  });
+
+  test("生存 herdr セッション 0 なら空 server を回収し、生存中は停止しない", async () => {
+    const dir = makeTempDir("reaper-herdr-server");
+    const tmux = runnerWithSessions([]);
+    let stopped = 0;
+    const makeOps = (names: string[]): import("../src/reaper.js").HerdrReaperOps => ({
+      list: async () =>
+        names.map((name) => ({ name, cwd: "/w", alive: true, backend: "herdr" as const })),
+      agentProcessAlive: async () => true,
+      kill: async () => {},
+      stopServerIfEmpty: async () => {
+        stopped += 1;
+      },
+    });
+    const base = {
+      runner: tmux.runner,
+      heartbeatDir: dir,
+      metadataStore: makeTempStore(),
+      timeoutSeconds: TIMEOUT,
+      now: NOW,
+    };
+
+    await reaperTick({ ...base, herdrOps: makeOps(["s-h1"]) });
+    expect(stopped).toBe(0);
+
+    await reaperTick({ ...base, herdrOps: makeOps([]) });
+    expect(stopped).toBe(1);
+  });
+
+  test("herdr メタ皆無の既定では herdr 巡回を行わない（純 tmux 環境）", async () => {
+    const dir = makeTempDir("reaper-herdr-none");
+    const tmux = runnerWithSessions(["cs-t"]);
+    writeHeartbeat(dir, "cs-t", { ts: NOW - 10, state: "idle" });
+
+    // herdrOps を省略 = 既定解決。メタに herdr が無いので herdr CLI は組み立てられない
+    //（実 HerdrSessionManager が構築されると ENOENT throw で fail-soft だが、ここでは
+    //  既定 null になることを liveCount が tmux 分のみである事実で確認する）。
+    const result = await reaperTick({
+      runner: tmux.runner,
+      heartbeatDir: dir,
+      metadataStore: makeTempStore(),
+      timeoutSeconds: TIMEOUT,
+      now: NOW,
+    });
+
+    expect(result.liveCount).toBe(1);
+    expect(result.killed).toEqual([]);
+  });
+});

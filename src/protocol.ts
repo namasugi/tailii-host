@@ -86,6 +86,8 @@ export interface SessionInfo {
   agent?: "claude" | "codex";
   /** provider 共通の論理会話 ID。live runtime の再利用キー。 */
   providerSessionId?: string;
+  /** セッションを収容する端末バックエンド。未指定は後方互換で tmux 相当（session-backend）。 */
+  backend?: TerminalBackendKind;
 }
 
 /** マシン内会話 1 件（claude=jsonl / codex=rollout）。 */
@@ -318,7 +320,28 @@ export type ControlMessage =
   | { type: "serve_list_request"; v: number; id: string }
   | { type: "serve_list_response"; v: number; id: string; servers: ServeProcessInfo[] }
   | { type: "serve_stop_request"; v: number; id: string; pid: number; port: number }
-  | { type: "serve_stop_response"; v: number; id: string; ok: boolean; error: string | null };
+  | { type: "serve_stop_response"; v: number; id: string; ok: boolean; error: string | null }
+  | { type: "backend_get_request"; v: number; id: string }
+  | {
+      type: "backend_get_response";
+      v: number;
+      id: string;
+      backend: TerminalBackendKind;
+      /** herdr バイナリが host に導入済みか（切替 UI の可用性表示）。 */
+      herdrInstalled: boolean;
+    }
+  | { type: "backend_set_request"; v: number; id: string; backend: TerminalBackendKind }
+  | {
+      type: "backend_set_response";
+      v: number;
+      id: string;
+      ok: boolean;
+      backend: TerminalBackendKind;
+      error: string | null;
+    };
+
+/** セッションを収容する端末バックエンド種別（backend_get/set, session-backend）。 */
+export type TerminalBackendKind = "tmux" | "herdr";
 
 export type ControlMessageType = ControlMessage["type"];
 
@@ -515,6 +538,8 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
                   ? "claude"
                   : undefined,
             providerSessionId: optionalString(obj, "providerSessionId"),
+            // 未知値は未指定（= tmux 相当）へ倒す（後方互換）。
+            backend: optionalString(obj, "backend") === "herdr" ? "herdr" : undefined,
           });
         }),
         nextCursor: optionalString(raw, "nextCursor"),
@@ -1160,9 +1185,44 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         error: optionalNullableString(raw, "error") ?? null,
       };
 
+    case "backend_get_request":
+      return { type, v, id: requireString(raw, "id") };
+
+    case "backend_get_response":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        backend: requireBackendKind(raw),
+        herdrInstalled: requireBoolean(raw, "herdrInstalled"),
+      };
+
+    case "backend_set_request":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        backend: requireBackendKind(raw),
+      };
+
+    case "backend_set_response":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        ok: requireBoolean(raw, "ok"),
+        backend: requireBackendKind(raw),
+        error: optionalNullableString(raw, "error") ?? null,
+      };
+
     default:
       throw new ProtocolDecodeError("unknown-type", type);
   }
+}
+
+function requireBackendKind(raw: Raw): TerminalBackendKind {
+  const backend = requireString(raw, "backend");
+  if (backend !== "tmux" && backend !== "herdr") {
+    throw new ProtocolDecodeError("missing-field", "backend");
+  }
+  return backend;
 }
 
 function requireRemotePendingKind(raw: Raw): RemotePendingKind {

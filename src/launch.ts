@@ -5,24 +5,23 @@
 // この起動プロセス限定に渡し（settings.json は書かない）、SessionMetadataStore に cwd を権威記録
 // する。SSH exec は非ログインシェルのため PATH を明示注入する。
 
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { CodexAppServerManager, type CodexThreadStartOptions } from "./codexAppServer.js";
 import {
-  HERDR_TAILII_WORKSPACE_LABEL,
+  HERDR_TAILII_SESSION,
   defaultHerdrPath,
-  parseHerdrCreatedWorkspaceId,
   parseHerdrForegroundCommand,
   parseHerdrPaneList,
   parseHerdrStartedPaneId,
-  parseHerdrWorkspaceId,
 } from "./herdr.js";
 import { claudeHookLaunchSettings, removeCodexHookSettings } from "./hookSettings.js";
 import { isInsideBase, standardize, expandTilde } from "./paths.js";
 import { resolveSessionBackendKind, type SessionBackendKind } from "./sessionBackend.js";
 import { SessionMetadataStore } from "./sessionMetadataStore.js";
+import { sleep } from "./sleep.js";
 import { DEFAULT_TMUX_PATH, paneCommandLooksLikeAgent } from "./tmux.js";
 
 /** tmux 内で起動する既定コマンド（claude TUI）。テストでは無害な値に差し替える。 */
@@ -219,8 +218,12 @@ export function makeSessionLauncher(options: {
   codexAppServer?: CodexAppServerRuntime;
   /** 起動対象エージェント（既定 claude）。codex は claude 固有処理を行わない。 */
   agent?: LaunchAgent;
-  /** 新規セッションの端末バックエンド（既定 tmux。テスト決定性のためここでは設定ファイルを読まない）。 */
-  backend?: SessionBackendKind;
+  /**
+   * 新規セッションの端末バックエンド（既定 tmux。テスト決定性のためここでは設定ファイルを読まない）。
+   * 関数を渡すと launch 毎に解決する（engine は resolveSessionBackendKind を渡し、
+   * アプリの backend_set が engine 再起動なしで次の起動から反映される）。
+   */
+  backend?: SessionBackendKind | (() => SessionBackendKind);
   herdrPath?: string | null;
 } = {}): EngineLauncher {
   const store = options.store ?? new SessionMetadataStore();
@@ -228,7 +231,7 @@ export function makeSessionLauncher(options: {
   const inner =
     options.innerCommand ?? (agent === "codex" ? DEFAULT_CODEX_COMMAND : DEFAULT_INNER_COMMAND);
   const tmux = options.tmuxPath ?? DEFAULT_TMUX_PATH;
-  const backend: SessionBackendKind = options.backend ?? "tmux";
+  const backendOption = options.backend ?? "tmux";
   const herdr = options.herdrPath ?? defaultHerdrPath();
   const binary = currentBinaryPath();
   const runner = options.runner ?? defaultProcessRunner();
@@ -303,7 +306,7 @@ export function makeSessionLauncher(options: {
       baseDir: effectiveBaseDir,
       binaryPath: binary,
       tmuxPath: tmux,
-      backend,
+      backend: typeof backendOption === "function" ? backendOption() : backendOption,
       herdrPath: herdr,
       innerCommand: effectiveInner,
       path: defaultInjectedPath(),
@@ -372,6 +375,10 @@ export async function launchCore(options: {
   backend?: SessionBackendKind;
   /** herdr 実行ファイルの絶対パス（backend=herdr のときのみ使用）。 */
   herdrPath?: string | null;
+  /** detached プロセス起動の注入点（herdr tailii セッションサーバーの ensure 用, テスト注入可）。 */
+  spawnDetached?: (executable: string, args: string[]) => void;
+  /** herdr ensure のポーリング待機 ms（テストは 0 に差し替え可能）。 */
+  ensurePollMs?: number;
   /** 起動対象エージェント（既定 claude）。codex は claude 固有の事前信頼/フック注入を行わない。 */
   agent?: LaunchAgent;
   /** host が `--session-id` で固定した Claude 会話 id。新規 claude 起動だけに記録する。 */
@@ -447,6 +454,8 @@ export async function launchCore(options: {
       ...(options.providerSessionId !== undefined
         ? { providerSessionId: options.providerSessionId }
         : {}),
+      ...(options.spawnDetached !== undefined ? { spawnDetached: options.spawnDetached } : {}),
+      ...(options.ensurePollMs !== undefined ? { ensurePollMs: options.ensurePollMs } : {}),
     });
   }
 
@@ -529,9 +538,12 @@ export async function launchCore(options: {
 
 /**
  * herdr backend の起動実体。tmux の「死んだ同名セッション掃除 → デタッチ起動 → pane ID 記録」に
- * 対応する herdr 版: 1. stale pane 掃除（claude が終了してシェル化した pane）→
- * 2. `tailii` workspace 確保 → 3. `agent start -- /bin/zsh -lc '<inner>'` →
- * 4. pane を専用タブへ移動（ベストエフォート）→ 5. backend/herdrPaneId 込みでメタ権威記録。
+ * 対応する herdr 版。ユーザーの default セッションを汚さないよう、専用 named session
+ * `tailii`（`--session` を全コマンドに前置）へ収容する:
+ * 1. tailii セッションサーバーの ensure（不在ならヘッドレス起動）→
+ * 2. stale pane 掃除（claude が終了してシェル化した pane）→
+ * 3. `agent start -- /bin/zsh -lc '<inner>'` → 4. pane を session 名のタブへ分離
+ * （ベストエフォート）→ 5. backend/herdrPaneId 込みでメタ権威記録。
  */
 async function launchHerdrPane(options: {
   session: string;
@@ -547,22 +559,51 @@ async function launchHerdrPane(options: {
   errorSink: (message: string) => void;
   claudeSessionId?: string | null;
   providerSessionId?: string | null;
+  /** detached プロセス起動の注入点（tailii セッションサーバーのヘッドレス起動用）。 */
+  spawnDetached?: (executable: string, args: string[]) => void;
+  /** ensure のポーリング待機（テストは 0ms に差し替え可能）。 */
+  ensurePollMs?: number;
 }): Promise<number> {
   const { session, dir, agent, store, now, errorSink } = options;
   const runHerdr = async (args: string[]): Promise<{ code: number; out: string }> => {
     try {
-      const result = await options.runner(options.herdrPath, args, { env: options.env });
+      const result = await options.runner(
+        options.herdrPath,
+        ["--session", HERDR_TAILII_SESSION, ...args],
+        { env: options.env },
+      );
       return { code: result.exitCode, out: result.stdout };
     } catch (error) {
       errorSink(`tailii launch: herdr 起動失敗 (${options.herdrPath}): ${String(error)}\n`);
       return { code: 127, out: "" };
     }
   };
+  const spawnDetached =
+    options.spawnDetached ??
+    ((executable: string, args: string[]) => {
+      const child = spawn(executable, args, { detached: true, stdio: "ignore" });
+      child.unref();
+    });
 
-  // --- 既存 pane の解決と stale 掃除（tmux の dead-session 掃除に対応） ---
-  const paneList = await runHerdr(["pane", "list"]);
-  if (paneList.code === 127) return 1;
-  const panes = paneList.code === 0 ? parseHerdrPaneList(paneList.out) : [];
+  // --- 1. tailii セッションサーバーの ensure（`pane list` が通れば稼働中） ---
+  let paneList = await runHerdr(["pane", "list"]);
+  if (paneList.code !== 0) {
+    spawnDetached(options.herdrPath, ["--session", HERDR_TAILII_SESSION, "server"]);
+    const deadline = Date.now() + 5000;
+    const pollMs = options.ensurePollMs ?? 150;
+    while (Date.now() <= deadline) {
+      await sleep(pollMs);
+      paneList = await runHerdr(["pane", "list"]);
+      if (paneList.code === 0) break;
+    }
+    if (paneList.code !== 0) {
+      errorSink(`tailii launch: herdr セッション '${HERDR_TAILII_SESSION}' を起動できませんでした\n`);
+      return 1;
+    }
+  }
+
+  // --- 2. 既存 pane の解決と stale 掃除（tmux の dead-session 掃除に対応） ---
+  const panes = parseHerdrPaneList(paneList.out);
   const recordedPaneId = store.get(session)?.herdrPaneId;
   let existing =
     (recordedPaneId !== undefined ? panes.find((pane) => pane.paneId === recordedPaneId) : undefined) ??
@@ -581,39 +622,24 @@ async function launchHerdrPane(options: {
 
   let herdrPaneId: string | null = existing?.paneId ?? null;
   if (existing === null) {
-    // --- Tailii 専用 workspace を確保（不在なら作成。ユーザーの作業 workspace を汚さない） ---
-    const wsList = await runHerdr(["workspace", "list"]);
-    let workspaceId =
-      wsList.code === 0 ? parseHerdrWorkspaceId(wsList.out, HERDR_TAILII_WORKSPACE_LABEL) : null;
-    if (workspaceId === null) {
-      const created = await runHerdr([
-        "workspace", "create", "--label", HERDR_TAILII_WORKSPACE_LABEL, "--no-focus",
-      ]);
-      if (created.code === 0) workspaceId = parseHerdrCreatedWorkspaceId(created.out);
-    }
-
-    // --- agent start でデタッチ起動（zsh -lc: inner の env 前置/クォートを tmux と同義に保つ） ---
-    const startArgs = [
+    // --- 3. agent start でデタッチ起動（zsh -lc: inner の env 前置/クォートを tmux と同義に保つ） ---
+    const started = await runHerdr([
       "agent", "start", session,
       "--cwd", dir,
       "--no-focus",
       "--env", `PATH=${options.injectedPath}`,
-    ];
-    if (workspaceId !== null) startArgs.push("--workspace", workspaceId);
-    startArgs.push("--", "/bin/zsh", "-lc", options.innerCommand);
-    const started = await runHerdr(startArgs);
+      "--", "/bin/zsh", "-lc", options.innerCommand,
+    ]);
     if (started.code !== 0) {
       errorSink(`tailii launch: herdr が非0終了 (${started.code})\n`);
       return started.code === 0 ? 1 : started.code;
     }
     herdrPaneId = parseHerdrStartedPaneId(started.out);
 
-    // --- pane を session 名のタブへ分離（表示整理のみ。失敗しても起動は成立） ---
-    if (herdrPaneId !== null && workspaceId !== null) {
+    // --- 4. pane を session 名のタブへ分離（表示整理のみ。失敗しても起動は成立） ---
+    if (herdrPaneId !== null) {
       await runHerdr([
-        "pane", "move", herdrPaneId,
-        "--new-tab", "--workspace", workspaceId,
-        "--label", session, "--no-focus",
+        "pane", "move", herdrPaneId, "--new-tab", "--label", session, "--no-focus",
       ]);
     }
   }

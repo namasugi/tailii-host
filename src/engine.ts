@@ -81,9 +81,11 @@ import { HISTORY_DONE_STREAM_ID, TranscriptTailer } from "./transcriptTailer.js"
 import {
   makeSessionBackend,
   resolveSessionBackendKind,
+  writeSessionBackendKind,
   type SessionBackend,
   type SessionBackendKind,
 } from "./sessionBackend.js";
+import { herdrInstalled } from "./herdr.js";
 import { aggregateUsage, emptyUsageTotals } from "./usageAggregator.js";
 import { aggregateCodexUsage, type CodexUsage } from "./codexUsage.js";
 import { createStaleDistGuard, isStaleDist, readPackageVersion, type StaleDistGuard } from "./version.js";
@@ -180,10 +182,11 @@ export async function runEngineCommand(args: string[]): Promise<number> {
 
   // 一覧整形（session-list-lifecycle）: updatedAt 付与・整列・ページング。
   // updatedAt の権威はセッション自身の会話 transcript（会話が無ければ最下位）。
-  // 端末バックエンド（tmux / herdr）は host 側設定ファイルで切替可能（iOS 改修不要のトグル）。
-  // herdr 設定時も既存 tmux セッションは Composite 経由で引き続き操作できる。
-  const backendKind = resolveSessionBackendKind();
-  const sessionManager = makeSessionBackend({ kind: backendKind, store });
+  // 端末バックエンド（tmux / herdr）は設定ファイル or アプリ（backend_set）で切替可能。
+  // 稼働系は常時 Composite（per-session ルーティング）なので、切替は再起動なしで
+  // 「次に起動するセッション」から反映され、既存セッションは元のバックエンドで操作し続ける。
+  const backendKind = resolveSessionBackendKind;
+  const sessionManager = makeSessionBackend({ store });
   const claudeSessionStore = new ClaudeSessionStore(claudeProjectsRoot);
   const codexSessionStore = new CodexSessionStore();
   const sessionListService = new SessionListService(
@@ -263,8 +266,12 @@ export interface RunEngineOptions {
   /** "stdout" 側（Mac→iOS の応答を流す）。 */
   output: Writable;
   sessionManager: SessionBackend;
-  /** 新規セッションの端末バックエンド種別（既定 tmux。per-session launcher 組立に使う）。 */
-  backendKind?: SessionBackendKind;
+  /** 新規セッションの端末バックエンド解決子（既定 tmux 固定。per-session launcher 組立と backend_get/set に使う）。 */
+  backendKind?: () => SessionBackendKind;
+  /** backend_set の永続化先（テスト注入用。既定は `~/.tailii/backend` への書き込み）。 */
+  backendWriter?: (kind: SessionBackendKind) => void;
+  /** herdr 導入済み判定（テスト注入用。既定は実バイナリの存在検査）。 */
+  herdrInstalledProbe?: () => boolean;
   /** 画像通知/取得の橋渡し（省略時は画像処理なし = 後方互換）。 */
   imageService?: ImageService | null;
   /** 会話出力キャプチャ（省略時は chat_output なし = 後方互換）。 */
@@ -338,7 +345,9 @@ const DEFAULT_MODE_TIMING: ModeTiming = {
 export async function runEngine(options: RunEngineOptions): Promise<void> {
   const {
     sessionManager,
-    backendKind = "tmux",
+    backendKind = () => "tmux" as SessionBackendKind,
+    backendWriter = writeSessionBackendKind,
+    herdrInstalledProbe = herdrInstalled,
     imageService = null,
     transcriptTailer = null,
     transcriptPath = null,
@@ -807,6 +816,8 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           state,
           sessionManager,
           backendKind,
+          backendWriter,
+          herdrInstalledProbe,
           imageService,
           launcher,
           codexLauncher,
@@ -867,8 +878,12 @@ interface HandlerContext {
   writer: LineWriter;
   state: EngineState;
   sessionManager: SessionBackend;
-  /** 新規セッションの端末バックエンド種別。 */
-  backendKind: SessionBackendKind;
+  /** 新規セッションの端末バックエンド解決子（launch 毎に読む）。 */
+  backendKind: () => SessionBackendKind;
+  /** backend_set の永続化先。 */
+  backendWriter: (kind: SessionBackendKind) => void;
+  /** herdr 導入済み判定。 */
+  herdrInstalledProbe: () => boolean;
   imageService: ImageService | null;
   launcher: EngineLauncher | null;
   /** codex セッション用 launcher（session_start の agentType=codex 時に使用）。 */
@@ -2008,6 +2023,58 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
       } catch (error) {
         engineDiag(`serve_stop_response 失敗 id=${message.id}: ${String(error)}`);
         writer.write({ type: "serve_stop_response", v, id: message.id, ok: false, error: String(error) });
+      }
+      break;
+    }
+
+    case "backend_get_request": {
+      // 端末バックエンド設定の読み取り（アプリ設定画面, session-backend）。
+      engineDiag(`backend_get_request id=${message.id}`);
+      writer.write({
+        type: "backend_get_response",
+        v,
+        id: message.id,
+        backend: ctx.backendKind(),
+        herdrInstalled: ctx.herdrInstalledProbe(),
+      });
+      break;
+    }
+
+    case "backend_set_request": {
+      // 端末バックエンド設定の書き込み。稼働系は常時 Composite なので再起動不要、
+      // 「次に起動するセッション」から反映される。herdr 未導入時は書かずに失敗を返す。
+      engineDiag(`backend_set_request id=${message.id} backend=${message.backend}`);
+      if (message.backend === "herdr" && !ctx.herdrInstalledProbe()) {
+        writer.write({
+          type: "backend_set_response",
+          v,
+          id: message.id,
+          ok: false,
+          backend: ctx.backendKind(),
+          error: "herdr が見つかりません（~/.local/bin/herdr）。導入後に切り替えてください。",
+        });
+        break;
+      }
+      try {
+        ctx.backendWriter(message.backend);
+        writer.write({
+          type: "backend_set_response",
+          v,
+          id: message.id,
+          ok: true,
+          backend: message.backend,
+          error: null,
+        });
+      } catch (error) {
+        engineDiag(`backend_set_response 失敗 id=${message.id}: ${String(error)}`);
+        writer.write({
+          type: "backend_set_response",
+          v,
+          id: message.id,
+          ok: false,
+          backend: ctx.backendKind(),
+          error: String(error),
+        });
       }
       break;
     }

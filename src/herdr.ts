@@ -12,6 +12,7 @@
 // - `pane process-info` の foreground_processes[0].name が tmux `#{pane_current_command}` 相当。
 
 import { execFile } from "node:child_process";
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { PROTOCOL_V1, type ControlMessage, type SessionInfo } from "./protocol.js";
@@ -37,22 +38,49 @@ export function defaultHerdrPath(): string {
   return path.join(os.homedir(), ".local", "bin", "herdr");
 }
 
-/** Tailii セッション pane を収容する herdr workspace のラベル。 */
-export const HERDR_TAILII_WORKSPACE_LABEL = "tailii";
+/**
+ * Tailii セッション pane を収容する herdr named session。
+ * ユーザーの default セッション（普段使いの herdr）を汚さないよう、Tailii は専用の
+ * named session（別サーバー・別ソケット `~/.config/herdr/sessions/tailii/`）に全 pane を
+ * 収容する。CLI は全操作に `--session tailii` を前置する（runner レベルで一元付与）。
+ * まとめて消すときは `herdr session stop tailii` → `herdr session delete tailii`。
+ */
+export const HERDR_TAILII_SESSION = "tailii";
 
-/** 実 herdr を起動する既定ランナー。herdr 非0 exit は throw せず結果で表現する。 */
-export function processHerdrCommandRunner(herdrPath: string = defaultHerdrPath()): HerdrCommandRunner {
+/** herdr が導入済みか（backend_get の可用性表示・backend_set の検証に使う）。 */
+export function herdrInstalled(herdrPath: string = defaultHerdrPath()): boolean {
+  try {
+    fs.accessSync(herdrPath, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 実 herdr を起動する既定ランナー。herdr 非0 exit は throw せず結果で表現する。
+ * `sessionName`（既定 tailii）を `--session` として全コマンドに前置する。
+ */
+export function processHerdrCommandRunner(
+  herdrPath: string = defaultHerdrPath(),
+  sessionName: string = HERDR_TAILII_SESSION,
+): HerdrCommandRunner {
   return (args) =>
     new Promise((resolve, reject) => {
-      execFile(herdrPath, args, { maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
-        if (error && typeof (error as NodeJS.ErrnoException).code === "string") {
-          // 実行ファイル起動自体の失敗（ENOENT 等）のみ throw（tmux ランナーと同じ境界）。
-          reject(error);
-          return;
-        }
-        const exitCode = error && typeof error.code === "number" ? error.code : error ? 1 : 0;
-        resolve({ exitCode, stdout: String(stdout), stderr: String(stderr) });
-      });
+      execFile(
+        herdrPath,
+        ["--session", sessionName, ...args],
+        { maxBuffer: 16 * 1024 * 1024 },
+        (error, stdout, stderr) => {
+          if (error && typeof (error as NodeJS.ErrnoException).code === "string") {
+            // 実行ファイル起動自体の失敗（ENOENT 等）のみ throw（tmux ランナーと同じ境界）。
+            reject(error);
+            return;
+          }
+          const exitCode = error && typeof error.code === "number" ? error.code : error ? 1 : 0;
+          resolve({ exitCode, stdout: String(stdout), stderr: String(stderr) });
+        },
+      );
     });
 }
 
@@ -191,6 +219,8 @@ export class HerdrSessionManager {
    * 生存は「記録済み pane ID が現存」または「pane label が session 名に一致」。
    */
   async list(): Promise<SessionInfo[]> {
+    // herdr メタが皆無なら CLI を呼ばない（常時 Composite 構成でも純 tmux 環境に副作用ゼロ）。
+    if (!this.store.all().some((meta) => meta.backend === "herdr")) return [];
     const panes = await this.livePanes();
     const paneIds = new Set(panes.map((pane) => pane.paneId));
     const labels = new Set(panes.map((pane) => pane.label).filter((label) => label !== null));
@@ -207,6 +237,7 @@ export class HerdrSessionManager {
         name: meta.name,
         cwd: meta.cwd,
         alive,
+        backend: "herdr",
         ...(meta.claudeSessionId !== undefined ? { claudeSessionId: meta.claudeSessionId } : {}),
         ...(meta.agent !== undefined ? { agent: meta.agent } : {}),
         ...(providerSessionId !== undefined ? { providerSessionId } : {}),
@@ -247,7 +278,7 @@ export class HerdrSessionManager {
     }
     const cwd = this.store.get(name)?.cwd ?? "";
     const recent = await this.capturePane(name);
-    return { kind: "attached", info: { name, cwd, alive: true }, recentOutput: recent };
+    return { kind: "attached", info: { name, cwd, alive: true, backend: "herdr" }, recentOutput: recent };
   }
 
   /** pane 内のエージェント生存判定。herdr エラーや空出力は二重起動を避けて true に倒す。 */
@@ -342,6 +373,23 @@ export class HerdrSessionManager {
       lines.pop();
     }
     return lines.join("\n");
+  }
+
+  /**
+   * tailii セッションの server を pane ゼロのときだけ停止する（reaper の空サーバー回収）。
+   * tmux server の「セッションゼロで自動終了」に対応する挙動。launch 側に ensure（不在なら
+   * detached 起動）があるため、停止しても次のセッション起動で自動復帰する。
+   * ユーザーが tailii セッション内に手動 pane を作っていた場合は停止しない（pane 総数で判定）。
+   */
+  async stopServerIfEmpty(): Promise<void> {
+    try {
+      const result = await this.runner(["pane", "list"]);
+      if (result.exitCode !== 0) return; // server 不在/不通 = 何もしない
+      if (parseHerdrPaneList(result.stdout).length > 0) return;
+      await this.runner(["server", "stop"]);
+    } catch {
+      // ENOENT 等（未導入環境）は無視。
+    }
   }
 
   /** 生存 pane の一覧。herdr server 未起動などの失敗は空集合として扱う（tmux `ls` と同じ流儀）。 */

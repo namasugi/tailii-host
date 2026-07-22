@@ -30,7 +30,7 @@ import { ChatTailController } from "./chatTailController.js";
 import { TranscriptTailer } from "./transcriptTailer.js";
 import { LineWriter } from "./lineWriter.js";
 import { PanePreviewPump } from "./panePreviewPump.js";
-import { makeSessionBackend, resolveSessionBackendKind } from "./sessionBackend.js";
+import { makeSessionBackend } from "./sessionBackend.js";
 import { Writable } from "node:stream";
 import {
   decodeControlMessage,
@@ -338,12 +338,10 @@ export async function runHubCommand(args: string[]): Promise<number> {
   process.on("SIGINT", onSignal);
   const runner = processTmuxCommandRunner();
   const metadataStore = new SessionMetadataStore();
-  // 端末バックエンド（tmux / herdr）。herdr 設定時は Composite で両バックエンドへルーティング。
+  // 端末バックエンド（tmux / herdr）。常時 Composite（メタの backend 欄で per-session ルーティング）
+  // なので、アプリの backend_set による切替後も hub 再起動なしで両方のセッションへ届く。
   // reaper（SessionHub の tick）は tmux runner 直結のまま = herdr セッションは reaper 対象外。
-  const sessionBackend = makeSessionBackend({
-    kind: resolveSessionBackendKind(),
-    store: metadataStore,
-  });
+  const sessionBackend = makeSessionBackend({ store: metadataStore });
   // Session Hub 導入後は Hub 所有の ChatTailController が会話を配信する。
   // ここで ImageService を渡さないと engine 側のサービスは tail を通らず、
   // user 添付の image_available が消失する。index は engine と共通の既定パスへ書く。

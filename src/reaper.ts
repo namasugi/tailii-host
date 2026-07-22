@@ -25,6 +25,8 @@ import {
   removeHeartbeat,
   writeHeartbeat,
 } from "./heartbeat.js";
+import { HerdrSessionManager } from "./herdr.js";
+import type { SessionInfo } from "./protocol.js";
 import { SessionMetadataStore } from "./sessionMetadataStore.js";
 import { paneCommandLooksLikeAgent, type TmuxCommandRunner } from "./tmux.js";
 
@@ -37,6 +39,15 @@ export const REAPER_CHECK_INTERVAL_SECONDS = 60;
 /** tailii が管理する tmux セッション名(これ以外は絶対に触らない)。 */
 export const TAILII_SESSION_PATTERN = /^(cs|s)-/;
 
+/** herdr backend セッションの reaper 操作面（テストはモックを注入する）。 */
+export interface HerdrReaperOps {
+  list(): Promise<SessionInfo[]>;
+  agentProcessAlive(name: string): Promise<boolean>;
+  kill(name: string): Promise<void>;
+  /** 生存 Tailii セッションが 0 のとき、pane ゼロの専用 server を停止する（任意実装）。 */
+  stopServerIfEmpty?(): Promise<void>;
+}
+
 export interface ReaperTickOptions {
   runner: TmuxCommandRunner;
   heartbeatDir: string;
@@ -44,6 +55,11 @@ export interface ReaperTickOptions {
   timeoutSeconds: number;
   now: number;
   log?: (message: string) => void;
+  /**
+   * herdr backend の操作面。省略時は herdr メタが存在するときだけ実 HerdrSessionManager を使う
+   * （純 tmux 環境では herdr CLI を一切呼ばない）。null で herdr 巡回を無効化。
+   */
+  herdrOps?: HerdrReaperOps | null;
 }
 
 export interface ReaperTickResult {
@@ -106,6 +122,15 @@ export async function agentProcessAlive(
   }
 }
 
+/**
+ * herdr 巡回の既定 ops。herdr メタが 1 つも無ければ null（herdr CLI を呼ばない）。
+ * kill は pane close 相当（HerdrSessionManager.kill）。
+ */
+function defaultHerdrReaperOps(metadataStore: SessionMetadataStore): HerdrReaperOps | null {
+  if (!metadataStore.all().some((meta) => meta.backend === "herdr")) return null;
+  return new HerdrSessionManager({ store: metadataStore });
+}
+
 /** 巡回 1 回分。判定表は docs/architecture.md「セッション自動掃除」を参照。 */
 export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTickResult> {
   const { runner, heartbeatDir, metadataStore, timeoutSeconds, now } = options;
@@ -116,22 +141,32 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
   const demoted: string[] = [];
   const reclaimed: string[] = [];
 
-  for (const name of live) {
+  /**
+   * 1 セッション分の判定（tmux / herdr 共通）。heartbeat のルールは backend に依らない:
+   * 未採番=adopt / attach 中=bump / claude active+alive=bump 代行 / active+dead=idle 降格 /
+   * idle・codex active の timeout 超過=kill。
+   */
+  const judge = async (
+    name: string,
+    isAttached: boolean,
+    agentAlive: () => Promise<boolean>,
+    kill: () => Promise<void>,
+  ): Promise<void> => {
     const heartbeat = readHeartbeat(heartbeatDir, name);
     if (heartbeat === null) {
       // 未採番(engine 再起動をまたいだ残骸等)。今を idle 起点として採番し次周期から計時。
       writeHeartbeat(heartbeatDir, name, { ts: now, state: "idle", event: "adopted" });
       log(`adopt ${name}`);
-      continue;
+      return;
     }
-    if (attached.has(name)) {
+    if (isAttached) {
       // ターミナルから attach 中 = 人間が使用中。hook/engine を経由しない利用でも殺さない。
       bumpHeartbeat(heartbeatDir, name, now, "daemon-client-attached");
-      continue;
+      return;
     }
     const agent = metadataStore.get(name)?.agent ?? "claude";
     if (heartbeat.state === "active" && agent === "claude") {
-      if (await agentProcessAlive(runner, name, metadataStore)) {
+      if (await agentAlive()) {
         // 処理中(ツール実行中は hook が沈黙する)。デーモンが ts を bump 代行して保護。
         bumpHeartbeat(heartbeatDir, name, now, "daemon-agent-alive", "active");
       } else {
@@ -140,25 +175,73 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
         demoted.push(name);
         log(`demote ${name} (agent process dead)`);
       }
-      continue;
+      return;
     }
     // idle、および codex の active(bump 停止=ターン死亡)は一律 timeout で kill。
-    if (now - heartbeat.ts < timeoutSeconds) continue;
+    if (now - heartbeat.ts < timeoutSeconds) return;
     // kill 直前に再読取して再判定する: tick 中に会話が再オープンされ engine が bump した
     // 直後のセッションを殺さない(読取→kill 間の競合窓を閉じる)。
     const recheck = readHeartbeat(heartbeatDir, name);
-    if (recheck !== null && recheck.ts !== heartbeat.ts) continue;
-    const result = await runner(["kill-session", "-t", name]);
-    if (result.exitCode !== 0) {
-      log(`kill 失敗(掃除して継続): ${name}: ${result.stderr.trim()}`);
-    }
+    if (recheck !== null && recheck.ts !== heartbeat.ts) return;
+    await kill();
     removeHeartbeat(heartbeatDir, name);
     killed.push(name);
     log(`kill ${name} (state=${heartbeat.state} idle=${now - heartbeat.ts}s)`);
+  };
+
+  for (const name of live) {
+    await judge(
+      name,
+      attached.has(name),
+      () => agentProcessAlive(runner, name, metadataStore),
+      async () => {
+        const result = await runner(["kill-session", "-t", name]);
+        if (result.exitCode !== 0) {
+          log(`kill 失敗(掃除して継続): ${name}: ${result.stderr.trim()}`);
+        }
+      },
+    );
+  }
+
+  // --- herdr backend の巡回（tailii named session の pane）---
+  // attach 保護は無し（herdr API にクライアント attach 情報が無い）。claude の
+  // agent-alive bump 代行と heartbeat 計時は tmux と同一ルール。
+  const herdrOps =
+    options.herdrOps !== undefined ? options.herdrOps : defaultHerdrReaperOps(metadataStore);
+  let herdrLive: string[] = [];
+  if (herdrOps !== null) {
+    try {
+      herdrLive = (await herdrOps.list())
+        .filter((info) => info.alive && TAILII_SESSION_PATTERN.test(info.name))
+        .map((info) => info.name)
+        .sort();
+    } catch {
+      herdrLive = [];
+    }
+    for (const name of herdrLive) {
+      await judge(
+        name,
+        false,
+        () => herdrOps.agentProcessAlive(name),
+        async () => {
+          try {
+            await herdrOps.kill(name);
+          } catch (error) {
+            log(`kill 失敗(掃除して継続): ${name}: ${String(error)}`);
+          }
+        },
+      );
+    }
+    // 生存 Tailii セッションが 0 なら空 server を回収する（tmux server の自動終了に対応）。
+    // 判定は ops 側で pane 総数 0 のときだけ停止する（手動 pane があれば停止しない）。
+    if (herdrLive.length === 0) {
+      await herdrOps.stopServerIfEmpty?.();
+    }
   }
 
   // 生存セッションの無い heartbeat は残骸 → 掃除(メタデータ = cwd 権威記録は消さない)。
-  const liveSet = new Set(live);
+  // herdr 生存分も和に含める(含めないと herdr セッションの heartbeat を毎周期誤回収する)。
+  const liveSet = new Set([...live, ...herdrLive]);
   for (const name of listHeartbeatSessions(heartbeatDir)) {
     if (!liveSet.has(name)) {
       removeHeartbeat(heartbeatDir, name);
@@ -166,5 +249,5 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
     }
   }
 
-  return { liveCount: live.length, killed, demoted, reclaimed };
+  return { liveCount: live.length + herdrLive.length, killed, demoted, reclaimed };
 }

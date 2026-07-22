@@ -1,0 +1,7 @@
+{"id":"bk1","type":"backend_get_request","v":1}
+{"backend":"tmux","herdrInstalled":true,"id":"bk1","type":"backend_get_response","v":1}
+{"backend":"herdr","herdrInstalled":false,"id":"bk2","type":"backend_get_response","v":1}
+{"backend":"herdr","id":"bk3","type":"backend_set_request","v":1}
+{"backend":"herdr","error":null,"id":"bk3","ok":true,"type":"backend_set_response","v":1}
+{"backend":"tmux","error":"herdr が見つかりません（~/.local/bin/herdr）。導入後に切り替えてください。","id":"bk4","ok":false,"type":"backend_set_response","v":1}
+{"id":"bk5","sessions":[{"alive":true,"backend":"herdr","cwd":"/Users/alice/project","name":"s-abc123"}],"type":"session_list_response","v":1}

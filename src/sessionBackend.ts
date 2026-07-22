@@ -10,7 +10,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { HerdrSessionManager } from "./herdr.js";
-import type { SessionInfo } from "./protocol.js";
+import type { SessionInfo, TerminalBackendKind } from "./protocol.js";
 import { SessionMetadataStore } from "./sessionMetadataStore.js";
 import {
   TmuxSessionManager,
@@ -18,8 +18,8 @@ import {
   type ReattachResult,
 } from "./tmux.js";
 
-/** セッションを収容する端末バックエンド種別。 */
-export type SessionBackendKind = "tmux" | "herdr";
+/** セッションを収容する端末バックエンド種別（ワイヤーの TerminalBackendKind と同一）。 */
+export type SessionBackendKind = TerminalBackendKind;
 
 /**
  * セッション端末バックエンドの共通面。TmuxSessionManager の公開面をそのまま interface 化した。
@@ -43,7 +43,7 @@ export function defaultBackendFilePath(): string {
 /**
  * 新規セッションを起動するバックエンドを host 側設定から解決する。
  * ファイル内容が `herdr` なら herdr、それ以外/不在は tmux（完全後方互換）。
- * iOS 改修不要（ワイヤーは無変更）で切替できる。
+ * launch 毎に呼び直すことで、アプリ（backend_set）からの切替が engine 再起動なしで反映される。
  */
 export function resolveSessionBackendKind(
   backendFilePath: string = defaultBackendFilePath(),
@@ -55,6 +55,20 @@ export function resolveSessionBackendKind(
     // 不在/読取失敗は既定 tmux。
   }
   return "tmux";
+}
+
+/**
+ * backend 設定を永続化する（backend_set の実体）。tmp+rename の atomic 書き込み。
+ * `tmux` の明示書き込みも許す（不在と等価だが、切替 UI の状態を素直に映す）。
+ */
+export function writeSessionBackendKind(
+  kind: SessionBackendKind,
+  backendFilePath: string = defaultBackendFilePath(),
+): void {
+  fs.mkdirSync(path.dirname(backendFilePath), { recursive: true, mode: 0o700 });
+  const tmp = backendFilePath + ".tmp";
+  fs.writeFileSync(tmp, `${kind}\n`);
+  fs.renameSync(tmp, backendFilePath);
 }
 
 /**
@@ -112,18 +126,15 @@ export class CompositeSessionBackend implements SessionBackend {
 }
 
 /**
- * 設定に応じた稼働バックエンドを構築する。
- * tmux 設定なら従来どおり素の TmuxSessionManager（挙動無変更）。
- * herdr 設定なら Composite（新規は herdr、既存 tmux セッションも引き続き操作可能）。
+ * 稼働バックエンドを構築する。常に Composite（per-session ルーティング）。
+ * 設定が tmux でも herdr メタのセッションを操作でき、稼働中にアプリから backend_set で
+ * 切り替えても engine/hub の再起動なしに両方のセッションへ届く。
+ * herdr メタが 1 つも無ければ herdr 側 list は CLI を呼ばず空を返すため、
+ * 純 tmux 環境（herdr 未導入含む）では従来と同じ挙動・コストになる。
  */
-export function makeSessionBackend(options: {
-  kind: SessionBackendKind;
-  store: SessionMetadataStore;
-}): SessionBackend {
-  const tmux = new TmuxSessionManager({ store: options.store });
-  if (options.kind !== "herdr") return tmux;
+export function makeSessionBackend(options: { store: SessionMetadataStore }): SessionBackend {
   return new CompositeSessionBackend({
-    tmux,
+    tmux: new TmuxSessionManager({ store: options.store }),
     herdr: new HerdrSessionManager({ store: options.store }),
     store: options.store,
   });
