@@ -1236,11 +1236,12 @@ describe("SessionHub Codex App Server live stream", () => {
       makeCodexStreamingHub({ liveSubscribed: false });
     const client = {}, received: any[] = [];
     subscribe(hub, client, received);
-    await vi.waitFor(() => expect(writes).toHaveLength(1));
 
-    // resume 不成立の接続から一部 item だけ届いても、rollout と二重化しない。
+    // liveSubscribed:false の解決前に届いて buffer された item も、fallback 確定時に
+    // rollout と別 streamId で再放出しない。
     getCallbacks().onChatItem?.({ session: "work", itemId: "partial-live",
       payload: chat("assistant", "初回ターンの新着", "codex-item-partial-live") });
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
     writes[0]!(chat("assistant", "初期履歴", "codex-turn-1"));
     writes[0]!(chat("system", "", HISTORY_DONE_STREAM_ID));
     writes[0]!(chat("assistant", "初回ターンの新着", "codex-turn-2"));

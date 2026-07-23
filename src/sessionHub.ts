@@ -903,10 +903,14 @@ export class SessionHub {
       this.publishConversationEvent(session, actor, payload);
       if (contentKey !== null) incrementCount(state.publishedContentCounts, contentKey);
       if (!isHistoryDone) return;
-      this.flushCodexBuffer(session, actor, state);
       if (state.disconnected) {
+        // fallback 確定前に届いた App Server item は、この継続 rollout と同じ内容を
+        // 別 streamId で持ち得る。rollout を唯一の一次ソースにした時点で破棄し、
+        // history 完了時に flush して会話全体を二重表示しない。
+        state.buffered.length = 0;
         state.phase = "fallback-live"; // この tail は既に同じ EOF 境界にいるので継続利用する。
       } else {
+        this.flushCodexBuffer(session, actor, state);
         state.phase = "live";
         if (stopAtHistoryDone) {
           tail?.stop();
@@ -992,6 +996,7 @@ export class SessionHub {
     actor.tail?.stop();
     state.phase = rescan ? "fallback-scan" : "backfill";
     state.disconnected = true;
+    state.buffered.length = 0;
     state.scanContentCounts.clear();
     state.fallbackBaselineCounts = new Map(state.publishedContentCounts);
     this.openCodexRollout(session, actor, cwd, threadId, newerThanMs, false);
