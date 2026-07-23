@@ -230,6 +230,29 @@ export interface SubagentTranscriptEntry {
 }
 export type Decision = "allow" | "deny";
 export type RemotePendingKind = "approval" | "question";
+export type OfficialAppProvider = "claude" | "codex";
+export type OfficialAppAction = "open" | "repair" | "stop";
+export type OfficialAppState = "active" | "inactive" | "unavailable";
+export type OfficialAppOutcome = "open" | "pair" | "stopped" | "unavailable";
+
+export interface OfficialAppStatus {
+  provider: OfficialAppProvider;
+  version?: string;
+  state: OfficialAppState;
+  canOpen: boolean;
+  canStart: boolean;
+  launchUrl?: string;
+  unavailableReason?: string;
+}
+
+export interface OfficialAppActionResult {
+  provider: OfficialAppProvider;
+  outcome: OfficialAppOutcome;
+  launchUrl?: string;
+  manualPairingCode?: string;
+  expiresAt?: number;
+  unavailableReason?: string;
+}
 
 export type ControlMessage =
   | { type: "channel_hello"; v: number; maxVersion: number; serverVersion?: string }
@@ -245,6 +268,13 @@ export type ControlMessage =
   | { type: "session_idle_hint"; v: number; id: string; name: string }
   | { type: "codex_model_list_request"; v: number; id: string }
   | { type: "codex_model_list_response"; v: number; id: string; models: CodexModelInfo[] }
+  | { type: "official_app_status_request"; v: number; id: string; session: string; provider: OfficialAppProvider }
+  | ({ type: "official_app_status_response"; v: number; id: string } & OfficialAppStatus)
+  | {
+      type: "official_app_action_request"; v: number; id: string; session: string;
+      provider: OfficialAppProvider; action: OfficialAppAction; automaticEnable: boolean; paired: boolean;
+    }
+  | ({ type: "official_app_action_response"; v: number; id: string } & OfficialAppActionResult)
   | { type: "codex_turn_start"; v: number; id: string; session: string; text: string; clientUserMessageId?: string; effort?: string; approvalPolicy?: "untrusted" | "on-request" | "never"; sandbox?: "read-only" | "workspace-write" | "danger-full-access"; explicitRetry?: boolean }
   | { type: "codex_turn_start_result"; v: number; id: string; status: "started" | "duplicate" | "failed"; error?: string }
   | { type: "codex_turn_interrupt"; v: number; id: string; session: string }
@@ -619,6 +649,70 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
           });
         }),
       };
+
+    case "official_app_status_request":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        session: requireString(raw, "session"),
+        provider: decodeOfficialAppProvider(raw, "provider"),
+      };
+
+    case "official_app_status_response": {
+      const state = requireString(raw, "state");
+      if (state !== "active" && state !== "inactive" && state !== "unavailable") {
+        throw new ProtocolDecodeError("missing-field", "state");
+      }
+      return compact({
+        type, v,
+        id: requireString(raw, "id"),
+        provider: decodeOfficialAppProvider(raw, "provider"),
+        version: optionalString(raw, "version"),
+        state,
+        canOpen: requireBoolean(raw, "canOpen"),
+        canStart: requireBoolean(raw, "canStart"),
+        launchUrl: optionalString(raw, "launchUrl"),
+        unavailableReason: optionalString(raw, "unavailableReason"),
+      });
+    }
+
+    case "official_app_action_request": {
+      const action = requireString(raw, "action");
+      if (action !== "open" && action !== "repair" && action !== "stop") {
+        throw new ProtocolDecodeError("missing-field", "action");
+      }
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        session: requireString(raw, "session"),
+        provider: decodeOfficialAppProvider(raw, "provider"),
+        action,
+        automaticEnable: requireBoolean(raw, "automaticEnable"),
+        paired: requireBoolean(raw, "paired"),
+      };
+    }
+
+    case "official_app_action_response": {
+      const outcome = requireString(raw, "outcome");
+      if (
+        outcome !== "open" &&
+        outcome !== "pair" &&
+        outcome !== "stopped" &&
+        outcome !== "unavailable"
+      ) {
+        throw new ProtocolDecodeError("missing-field", "outcome");
+      }
+      return compact({
+        type, v,
+        id: requireString(raw, "id"),
+        provider: decodeOfficialAppProvider(raw, "provider"),
+        outcome,
+        launchUrl: optionalString(raw, "launchUrl"),
+        manualPairingCode: optionalString(raw, "manualPairingCode"),
+        expiresAt: optionalNumber(raw, "expiresAt"),
+        unavailableReason: optionalString(raw, "unavailableReason"),
+      });
+    }
 
     case "codex_turn_start":
       const rawTurnSandbox = optionalString(raw, "sandbox");
@@ -1321,6 +1415,14 @@ function decodeSubagentNode(raw: Raw): SubagentNode {
     currentActivity: optionalNullableString(raw, "currentActivity"),
     ts: requireNumber(raw, "ts"),
   });
+}
+
+function decodeOfficialAppProvider(raw: Raw, key: string): OfficialAppProvider {
+  const provider = requireString(raw, key);
+  if (provider !== "claude" && provider !== "codex") {
+    throw new ProtocolDecodeError("missing-field", key);
+  }
+  return provider;
 }
 
 // MARK: - encode

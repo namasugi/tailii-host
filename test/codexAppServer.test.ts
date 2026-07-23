@@ -129,6 +129,68 @@ describe("CodexAppServerManager", () => {
     expect(connection.closed).toBe(1);
   });
 
+  test("共有 App Server の固定 Remote Control RPC を検証して返す", async () => {
+    const requests: { method: string; params: unknown }[] = [];
+    const connections: FakeConnection[] = [];
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-remote-control-rpc"),
+      connect: async () => {
+        const connection = new FakeConnection();
+        connection.request = async (method, params) => {
+          requests.push({ method, params });
+          if (method === "remoteControl/status/read") {
+            return { status: "disabled", serverName: "Mac", environmentId: null };
+          }
+          if (method === "remoteControl/enable") {
+            return { status: "connecting", serverName: "Mac", environmentId: "env_1" };
+          }
+          if (method === "remoteControl/disable") {
+            return { status: "disabled", serverName: "Mac", environmentId: "env_1" };
+          }
+          if (method === "remoteControl/pairing/start") {
+            return {
+              pairingCode: "opaque-secret",
+              manualPairingCode: "ABCD-EFGH",
+              environmentId: "env_1",
+              expiresAt: 1_900_000_300,
+            };
+          }
+          return {};
+        };
+        connections.push(connection);
+        return connection;
+      },
+      launch: () => {
+        throw new Error("must not spawn");
+      },
+    });
+
+    await expect(manager.remoteControlStatus()).resolves.toEqual({
+      status: "disabled",
+      hasEnvironment: false,
+    });
+    await expect(manager.enableRemoteControl()).resolves.toEqual({
+      status: "connecting",
+      hasEnvironment: true,
+    });
+    await expect(manager.disableRemoteControl()).resolves.toEqual({
+      status: "disabled",
+      hasEnvironment: true,
+    });
+    await expect(manager.startRemoteControlPairing()).resolves.toEqual({
+      pairingCode: "opaque-secret",
+      manualPairingCode: "ABCD-EFGH",
+      expiresAt: 1_900_000_300,
+    });
+    expect(requests).toEqual([
+      { method: "remoteControl/status/read", params: {} },
+      { method: "remoteControl/enable", params: {} },
+      { method: "remoteControl/disable", params: {} },
+      { method: "remoteControl/pairing/start", params: { manualCode: true } },
+    ]);
+    expect(connections.every((connection) => connection.closed === 1)).toBe(true);
+  });
+
   test("server が停止中なら1回だけ起動し、thread/start の thread ID を返す", async () => {
     const home = makeTempDir("codex-app-server");
     let ready = false;

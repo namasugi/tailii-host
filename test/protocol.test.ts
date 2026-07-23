@@ -76,6 +76,46 @@ describe("golden roundtrip", () => {
 });
 
 describe("decode 詳細", () => {
+  it("official app の状態・操作を型付きでラウンドトリップする", () => {
+    const status = decodeControlMessage(
+      '{"canOpen":true,"canStart":false,"id":"s","launchUrl":"https://claude.ai/code/abc","provider":"claude","state":"active","type":"official_app_status_response","v":2,"version":"2.1.218"}',
+    );
+    expect(status).toMatchObject({
+      type: "official_app_status_response",
+      provider: "claude",
+      state: "active",
+    });
+    expect(encodeControlMessage(status)).toBe(
+      '{"canOpen":true,"canStart":false,"id":"s","launchUrl":"https://claude.ai/code/abc","provider":"claude","state":"active","type":"official_app_status_response","v":2,"version":"2.1.218"}',
+    );
+
+    const action = decodeControlMessage(
+      '{"action":"repair","automaticEnable":true,"id":"a","paired":false,"provider":"codex","session":"tailii-1","type":"official_app_action_request","v":2}',
+    );
+    expect(action).toMatchObject({
+      type: "official_app_action_request",
+      provider: "codex",
+      action: "repair",
+      paired: false,
+    });
+    expect(encodeControlMessage(action)).toBe(
+      '{"action":"repair","automaticEnable":true,"id":"a","paired":false,"provider":"codex","session":"tailii-1","type":"official_app_action_request","v":2}',
+    );
+  });
+
+  it("official app の未知 provider/action/outcome を拒否する", () => {
+    expect(() =>
+      decodeControlMessage(
+        '{"id":"x","provider":"other","session":"s","type":"official_app_status_request","v":2}',
+      ),
+    ).toThrow(ProtocolDecodeError);
+    expect(() =>
+      decodeControlMessage(
+        '{"action":"shell","automaticEnable":true,"id":"x","paired":false,"provider":"codex","session":"s","type":"official_app_action_request","v":2}',
+      ),
+    ).toThrow(ProtocolDecodeError);
+  });
+
   it("v 欠落のセッション制御型は破棄される（v0 は承認 2 型のみ）", () => {
     expect(() => decodeControlMessage('{"id":"x","type":"session_list_request"}')).toThrow(
       ProtocolDecodeError,

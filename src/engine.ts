@@ -76,6 +76,11 @@ import { ownTranscriptActivityProvider } from "./sessionActivityProvider.js";
 import { SessionListService } from "./sessionListService.js";
 import { searchClaudeSessions } from "./sessionSearch.js";
 import { SessionMetadataStore } from "./sessionMetadataStore.js";
+import {
+  OfficialAppsService,
+  type OfficialAppProvider,
+  type OfficialAppRuntimeContext,
+} from "./officialApps.js";
 import { abortableSleep, sleep } from "./sleep.js";
 import { HISTORY_DONE_STREAM_ID, TranscriptTailer } from "./transcriptTailer.js";
 import {
@@ -249,6 +254,7 @@ export async function runEngineCommand(args: string[]): Promise<number> {
       claudeSessionStore,
       codexSessionStore,
       codexAppServer,
+      officialApps: new OfficialAppsService({ codexRemoteControl: codexAppServer }),
       agent: agentArg,
     });
     return 0;
@@ -298,6 +304,8 @@ export interface RunEngineOptions {
   agent?: ChatAgent;
   /** Codex turn/approval を同一 App Server 接続で扱う共有 runtime。 */
   codexAppServer?: CodexAppServerManager | null;
+  /** Claude / ChatGPT 公式アプリ連携。null は機能無効、未指定は固定コマンド実装。 */
+  officialApps?: OfficialAppsService | null;
   /** テスト注入用の native turn controller。指定時は codexAppServer より優先する。 */
   codexTurnController?: CodexTurnControllerRuntime | null;
   /** 自分がサポートする最大版（既定 PROTOCOL_MAX_SUPPORTED）。 */
@@ -361,6 +369,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     codexSessionStore = null,
     agent = "claude",
     codexAppServer = null,
+    officialApps = new OfficialAppsService(),
     codexTurnController: injectedCodexTurnController = null,
     maxVersion = PROTOCOL_MAX_SUPPORTED,
     planUsage = () => fetchPlanUsage(),
@@ -842,6 +851,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           lastServerSeq,
           codexAppServer,
           codexTurnController,
+          officialApps,
           previewServer,
         });
         if (didProcessMessage && isStaleDist(staleDistGuard)) {
@@ -917,6 +927,8 @@ interface HandlerContext {
   codexAppServer: CodexAppServerManager | null;
   /** Codex native turn/approval 接続。 */
   codexTurnController: CodexTurnControllerRuntime | null;
+  /** Claude / ChatGPT 公式アプリ連携。 */
+  officialApps: OfficialAppsService | null;
   /** Web プレビュー用 loopback 静的ファイルサーバー。 */
   previewServer: PreviewServer;
 }
@@ -1013,6 +1025,61 @@ async function waitForLiveSession(
     await sleep(500);
   }
   return null;
+}
+
+async function officialAppRuntimeContext(
+  ctx: HandlerContext,
+  session: string,
+  provider: OfficialAppProvider,
+): Promise<{ context: OfficialAppRuntimeContext } | { reason: string }> {
+  if (ctx.activeChatSession.name !== session) return { reason: "official_app_focus_changed" };
+  const meta = ctx.metadataStore?.get(session) ?? null;
+  if ((meta?.agent ?? ctx.defaultAgent) !== provider) {
+    return { reason: "official_app_provider_mismatch" };
+  }
+  try {
+    if (!(await ctx.sessionManager.agentProcessAlive(session))) {
+      return { reason: "official_app_session_not_live" };
+    }
+  } catch {
+    return { reason: "official_app_session_not_live" };
+  }
+  let pending: { id: string; questions: QuestionPromptQuestion[] } | null;
+  try {
+    const id = randomUUID();
+    const response = await ctx.hubRpc<Extract<HubServerMessage, { type: "hub_state_response" }>>(
+      { type: "hub_state_request", id, session },
+      id,
+      1_500,
+    );
+    pending = response.pendingQuestion;
+    if (response.processing) {
+      ctx.processingSessions.set(session, Math.floor(Date.now() / 1_000));
+    } else {
+      ctx.processingSessions.delete(session);
+    }
+  } catch {
+    return { reason: "official_hub_state_unavailable" };
+  }
+  if (ctx.activeChatSession.name !== session) return { reason: "official_app_focus_changed" };
+
+  let codexTurnActive = false;
+  for (const processingSession of ctx.processingSessions.keys()) {
+    const processingMeta = ctx.metadataStore?.get(processingSession) ?? null;
+    if ((processingMeta?.agent ?? ctx.defaultAgent) === "codex") {
+      codexTurnActive = true;
+      break;
+    }
+  }
+  return {
+    context: {
+      session,
+      provider,
+      sessionManager: ctx.sessionManager,
+      canInjectClaudeCommand: !ctx.processingSessions.has(session) && pending === null,
+      canMutateCodexDaemon: !codexTurnActive,
+    },
+  };
 }
 
 /** 1行（改行なし）をデコードし、メッセージ種別ごとに処理する。decode 失敗は破棄。 */
@@ -1216,6 +1283,87 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
       } catch (error) {
         writeError(writer, v, message.id, "codex_model_list_failed", String(error));
       }
+      break;
+    }
+
+    case "official_app_status_request": {
+      if (ctx.officialApps === null) {
+        writer.write({
+          type: "official_app_status_response",
+          v,
+          id: message.id,
+          provider: message.provider,
+          state: "unavailable",
+          canOpen: false,
+          canStart: false,
+          unavailableReason: "official_feature_unavailable",
+        });
+        break;
+      }
+      const resolved = await officialAppRuntimeContext(
+        ctx,
+        message.session,
+        message.provider,
+      );
+      const status =
+        "reason" in resolved
+          ? {
+              provider: message.provider,
+              state: "unavailable" as const,
+              canOpen: false,
+              canStart: false,
+              unavailableReason: resolved.reason,
+            }
+          : await ctx.officialApps.status(resolved.context);
+      writer.write({ type: "official_app_status_response", v, id: message.id, ...status });
+      break;
+    }
+
+    case "official_app_action_request": {
+      if (ctx.officialApps === null) {
+        writer.write({
+          type: "official_app_action_response",
+          v,
+          id: message.id,
+          provider: message.provider,
+          outcome: "unavailable",
+          unavailableReason: "official_feature_unavailable",
+        });
+        break;
+      }
+      const before = await officialAppRuntimeContext(ctx, message.session, message.provider);
+      if ("reason" in before) {
+        writer.write({
+          type: "official_app_action_response",
+          v,
+          id: message.id,
+          provider: message.provider,
+          outcome: "unavailable",
+          unavailableReason: before.reason,
+        });
+        break;
+      }
+      const result = await ctx.officialApps.perform(
+        before.context,
+        message.action,
+        message.automaticEnable,
+        message.paired,
+      );
+      // 外部 CLI / pane 操作の間に対象が失われた場合、別セッションへ URL や
+      // pairing material を返さない。再フォーカス後の再試行だけを許す。
+      const after = await officialAppRuntimeContext(ctx, message.session, message.provider);
+      if ("reason" in after) {
+        writer.write({
+          type: "official_app_action_response",
+          v,
+          id: message.id,
+          provider: message.provider,
+          outcome: "unavailable",
+          unavailableReason: after.reason,
+        });
+        break;
+      }
+      writer.write({ type: "official_app_action_response", v, id: message.id, ...result });
       break;
     }
 

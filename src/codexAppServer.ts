@@ -364,6 +364,19 @@ export interface CodexAppServerThreadInfo {
   parentThreadId: string | null;
 }
 
+export type CodexRemoteControlState = "disabled" | "connecting" | "connected" | "errored";
+
+export interface CodexRemoteControlStatus {
+  status: CodexRemoteControlState;
+  hasEnvironment: boolean;
+}
+
+export interface CodexRemoteControlPairing {
+  pairingCode: string;
+  manualPairingCode: string | null;
+  expiresAt: number;
+}
+
 /** 1 CODEX_HOMEにつき1つのApp Serverを共有し、論理threadを作成する。 */
 export class CodexAppServerManager {
   readonly socketPath: string;
@@ -475,6 +488,30 @@ export class CodexAppServerManager {
     } finally {
       connection.close();
     }
+  }
+
+  /** 現在共有中の App Server から Remote Control 状態を読む。 */
+  async remoteControlStatus(): Promise<CodexRemoteControlStatus | null> {
+    return this.remoteControlRequest("remoteControl/status/read", {}, parseRemoteControlStatus);
+  }
+
+  /** 現在共有中の App Server 自体で Remote Control を有効化する。 */
+  async enableRemoteControl(): Promise<CodexRemoteControlStatus | null> {
+    return this.remoteControlRequest("remoteControl/enable", {}, parseRemoteControlStatus);
+  }
+
+  /** 現在共有中の App Server 自体で Remote Control を無効化する。 */
+  async disableRemoteControl(): Promise<CodexRemoteControlStatus | null> {
+    return this.remoteControlRequest("remoteControl/disable", {}, parseRemoteControlStatus);
+  }
+
+  /** 短命なペアリングコードを発行する。呼び出し側は URL 化後も永続化しない。 */
+  async startRemoteControlPairing(): Promise<CodexRemoteControlPairing | null> {
+    return this.remoteControlRequest(
+      "remoteControl/pairing/start",
+      { manualCode: true },
+      parseRemoteControlPairing,
+    );
   }
 
   /** 新規threadをApp Serverで作り、TUI起動前に安定IDを返す。 */
@@ -631,6 +668,25 @@ export class CodexAppServerManager {
     return true;
   }
 
+  private async remoteControlRequest<T>(
+    method: string,
+    params: Record<string, unknown>,
+    parse: (value: unknown) => T | null,
+  ): Promise<T | null> {
+    try {
+      await this.ensureRunning();
+      const connection = await this.connectIfRunning(22_000);
+      if (connection === null) return null;
+      try {
+        return parse(await connection.request(method, params));
+      } finally {
+        connection.close();
+      }
+    } catch {
+      return null;
+    }
+  }
+
   private async waitUntilReady(): Promise<boolean> {
     const deadline = Date.now() + this.startupTimeoutMs;
     do {
@@ -665,6 +721,54 @@ export class CodexAppServerManager {
 function isUnmaterializedThreadError(error: unknown, threadId: string): boolean {
   return error instanceof Error &&
     error.message === `no rollout found for thread id ${threadId}`;
+}
+
+function parseRemoteControlStatus(value: unknown): CodexRemoteControlStatus | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const status = record["status"];
+  if (
+    status !== "disabled" &&
+    status !== "connecting" &&
+    status !== "connected" &&
+    status !== "errored"
+  ) {
+    return null;
+  }
+  const environmentId = record["environmentId"];
+  if (environmentId !== null && environmentId !== undefined && typeof environmentId !== "string") {
+    return null;
+  }
+  return {
+    status,
+    hasEnvironment: typeof environmentId === "string" && environmentId.length > 0,
+  };
+}
+
+function parseRemoteControlPairing(value: unknown): CodexRemoteControlPairing | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const pairingCode = record["pairingCode"];
+  const manualPairingCode = record["manualPairingCode"];
+  const environmentId = record["environmentId"];
+  const expiresAt = record["expiresAt"];
+  if (
+    typeof pairingCode !== "string" ||
+    pairingCode.length === 0 ||
+    Buffer.byteLength(pairingCode, "utf8") > 2_048 ||
+    (manualPairingCode !== null && typeof manualPairingCode !== "string") ||
+    typeof environmentId !== "string" ||
+    environmentId.length === 0 ||
+    !Number.isSafeInteger(expiresAt) ||
+    (expiresAt as number) <= 0
+  ) {
+    return null;
+  }
+  return {
+    pairingCode,
+    manualPairingCode,
+    expiresAt: expiresAt as number,
+  };
 }
 
 function extractThreadItems(response: unknown): Record<string, unknown>[] {
