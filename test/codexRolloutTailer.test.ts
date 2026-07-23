@@ -157,6 +157,42 @@ describe("CodexRolloutTailer.streamForCwd（有限 tail）", () => {
     expect(new Set(chats.map((c) => c.streamId)).size).toBe(3);
   });
 
+  test("response_item / patch_apply_end を tool_activity カードへ写像する（codex-tool-cards）", async () => {
+    const root = makeTempDir("codex-stream-tools");
+    const cwd = makeTempDir("codex-stream-tools-cwd");
+    writeRollout(root, "2026/07/23", "r.jsonl", cwd, [
+      JSON.stringify({ type: "response_item", payload: {
+        type: "custom_tool_call", id: "ctc_1", status: "completed", call_id: "call_a", name: "exec",
+        input: 'const r = await tools.exec_command({"cmd":"echo hi","workdir":"/w"});\ntext(r);\n',
+      } }),
+      // apply_patch の exec は patch_apply_end 側で表示するためカードを出さない。
+      JSON.stringify({ type: "response_item", payload: {
+        type: "custom_tool_call", id: "ctc_2", status: "completed", call_id: "call_b", name: "exec",
+        input: 'const patch = "*** Begin Patch";\ntext(await tools.apply_patch(patch));\n',
+      } }),
+      JSON.stringify({ type: "event_msg", payload: {
+        type: "patch_apply_end", call_id: "exec-p1", success: true, status: "completed",
+        changes: { "/w/probe.txt": { type: "add", content: "alpha\n" } },
+      } }),
+      JSON.stringify({ type: "response_item", payload: {
+        type: "function_call", name: "update_plan", call_id: "call_c",
+        arguments: JSON.stringify({ plan: [{ step: "直す", status: "in_progress" }] }),
+      } }),
+      // 対象外の function_call はスキップ。
+      JSON.stringify({ type: "response_item", payload: {
+        type: "function_call", name: "wait", call_id: "call_d", arguments: "{}",
+      } }),
+    ]);
+    const tailer = new CodexRolloutTailer({ sessionsRoot: root, tailDeadlineMs: 0 });
+    const msgs = await collect(tailer, cwd);
+    const tools = msgs.flatMap((m) => (m.type === "tool_activity" ? [m.activity] : []));
+    expect(tools.map((a) => [a.id, a.name, a.label])).toEqual([
+      ["call_a", "Bash", "実行済み echo hi"],
+      ["exec-p1", "Write", "作成済み probe.txt"],
+      ["call_c", "TodoWrite", "プランを更新しました"],
+    ]);
+  });
+
   test("turn_context は利用中モデルマーカーを変化時だけ流す", async () => {
     const root = makeTempDir("codex-model");
     const cwd = makeTempDir("codex-model-cwd");

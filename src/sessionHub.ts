@@ -918,6 +918,11 @@ export class SessionHub {
     if (state.seenItemIds.has(itemId)) return;
     state.seenItemIds.add(itemId);
     if (state.phase === "starting" || state.phase === "backfill") {
+      // tool_activity は buffer せず捨てる。履歴は rollout（backfill）側が同じカードを
+      // 供給するのが正で、live 由来と rollout 由来のカードは id が一致しないため
+      // snapshot occurrence 照合に混ぜると開くたびに重複しうる。backfill 中に完了した
+      // カードが落ちても、次回オープンの rollout 履歴で必ず表示される。
+      if (payload.type === "tool_activity") return;
       state.buffered.push({ itemId, payload });
       return;
     }

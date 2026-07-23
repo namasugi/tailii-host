@@ -18,6 +18,12 @@ import {
 import type { ControlMessage } from "./protocol.js";
 import { resolveSocketPath } from "./socketPath.js";
 import { sleep } from "./sleep.js";
+import {
+  codexItemToolActivities,
+  codexPlanUpdateActivity,
+  toolActivityContentKey,
+  toolActivityMessage,
+} from "./codexToolActivity.js";
 
 export interface CodexNativeApproval {
   id: string;
@@ -101,6 +107,8 @@ interface OpenThread {
   thread: CodexThreadClient;
   items: Map<string, Record<string, unknown>>;
   activeTurnId: string | null;
+  /** turn/plan/updated へ振る連番（通知に item id が無いため dedup 用 id を合成する）。 */
+  planSeq: number;
 }
 
 interface PendingUserInput {
@@ -278,6 +286,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       thread,
       items,
       activeTurnId: thread.initialActiveTurnId ?? null,
+      planSeq: 0,
     };
     this.open.set(session, opened);
     notificationTargetReady = true;
@@ -302,6 +311,27 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       if (notification.method === "item/completed" && item !== null && typeof id === "string") {
         const payload = codexItemToChatOutput(item);
         if (payload !== null) this.onChatItem({ session, itemId: id, payload });
+        // コマンド実行 / ファイル変更は tool_activity カードとして別 itemId で流す
+        // （同一 item から chat 本文と tool カードの両方が出ることは無いが、dedup 集合を分ける）。
+        codexItemToolActivities(item).forEach((activity, index) => {
+          this.onChatItem({
+            session,
+            itemId: `${id}#tool-${index}`,
+            payload: toolActivityMessage(activity),
+          });
+        });
+      }
+    }
+    if (notification.method === "turn/plan/updated" && params !== null) {
+      const current = this.open.get(session);
+      if (current?.threadId === threadId) {
+        const turnId = typeof params["turnId"] === "string" ? params["turnId"] : "turn";
+        const itemId = `plan:${turnId}:${current.planSeq}`;
+        const activity = codexPlanUpdateActivity(itemId, params);
+        if (activity !== null) {
+          current.planSeq += 1;
+          this.onChatItem({ session, itemId, payload: toolActivityMessage(activity) });
+        }
       }
     }
     if (notification.method === "turn/started") {
@@ -455,6 +485,11 @@ export function codexItemToChatOutput(item: Record<string, unknown>): ControlMes
 }
 
 export function chatContentKey(payload: ControlMessage): string | null {
+  // tool_activity は live（App Server item）と rollout（response_item / patch_apply_end）の
+  // 両系統から同じ内容で生成される。id は系統間で一致しないため内容キーで照合する。
+  if (payload.type === "tool_activity") {
+    return toolActivityContentKey(payload.activity);
+  }
   if (payload.type !== "chat_output" || (payload.role !== "user" && payload.role !== "assistant")) {
     return null;
   }

@@ -68,6 +68,68 @@ describe("CodexNativeTurnController", () => {
     ]);
   });
 
+  test("commandExecution / fileChange completed を tool_activity として流す（codex-tool-cards）", async () => {
+    const thread = new FakeThread();
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const chats: { session: string; itemId: string; payload: unknown }[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return thread; } },
+      onChatItem: (event) => chats.push(event),
+    });
+    await controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" });
+
+    // inProgress（item/started 相当）はカードにしない。completed で 1 カード。
+    openOptions?.onNotification?.({ method: "item/started", params: { item: {
+      id: "exec-1", type: "commandExecution", command: "/bin/zsh -lc 'ls'", status: "inProgress",
+    } } });
+    openOptions?.onNotification?.({ method: "item/completed", params: { item: {
+      id: "exec-1", type: "commandExecution", command: "/bin/zsh -lc 'ls'", status: "completed",
+      exitCode: 0, aggregatedOutput: "a.txt\n",
+    } } });
+    openOptions?.onNotification?.({ method: "item/completed", params: { item: {
+      id: "exec-2", type: "fileChange", status: "completed", changes: [
+        { path: "/tmp/work/a.txt", kind: { type: "update", move_path: null },
+          diff: "@@ -1 +1 @@\n-old\n+new\n" },
+      ],
+    } } });
+
+    expect(chats).toEqual([
+      { session: "work", itemId: "exec-1#tool-0", payload: { type: "tool_activity", v: 1,
+        activity: expect.objectContaining({ id: "exec-1", name: "Bash", command: "ls" }) } },
+      { session: "work", itemId: "exec-2#tool-0", payload: { type: "tool_activity", v: 1,
+        activity: expect.objectContaining({ id: "exec-2", name: "Edit",
+          label: "編集済み a.txt", addedLines: 1, removedLines: 1 }) } },
+    ]);
+  });
+
+  test("turn/plan/updated をプラン tool_activity として流す", async () => {
+    const thread = new FakeThread();
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const chats: { session: string; itemId: string; payload: unknown }[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return thread; } },
+      onChatItem: (event) => chats.push(event),
+    });
+    await controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" });
+
+    openOptions?.onNotification?.({ method: "turn/plan/updated", params: {
+      threadId: "thread-1", turnId: "turn-9",
+      plan: [{ step: "実装", status: "inProgress" }, { step: "検証", status: "pending" }],
+    } });
+    // plan が空の更新はカードにしない。
+    openOptions?.onNotification?.({ method: "turn/plan/updated", params: {
+      threadId: "thread-1", turnId: "turn-9", plan: [],
+    } });
+
+    expect(chats).toEqual([
+      { session: "work", itemId: "plan:turn-9:0", payload: { type: "tool_activity", v: 1,
+        activity: expect.objectContaining({ name: "TodoWrite", todos: [
+          { content: "実装", status: "in_progress" },
+          { content: "検証", status: "pending" },
+        ] }) } },
+    ]);
+  });
+
   test("同一 thread を購読して turn/start し、turn lifecycle を処理中状態へ反映する", async () => {
     const thread = new FakeThread();
     let openOptions: CodexAppServerThreadOptions | null = null;

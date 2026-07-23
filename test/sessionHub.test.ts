@@ -7,6 +7,7 @@ import * as path from "node:path";
 import { readHeartbeat, writeHeartbeat } from "../src/heartbeat.js";
 import { SessionHub, type HubTail } from "../src/sessionHub.js";
 import { HISTORY_DONE_STREAM_ID } from "../src/transcriptTailer.js";
+import { codexCommandActivity, toolActivityMessage } from "../src/codexToolActivity.js";
 import type { ControlMessage } from "../src/protocol.js";
 import type {
   CodexNativeTurnControllerOptions,
@@ -1224,6 +1225,39 @@ describe("SessionHub Codex App Server live stream", () => {
     expect(tails[0]!.stopped).toBe(false);
     expect(received.filter((message) => message?.payload?.text === "fallback live")).toHaveLength(1);
     expect(received.filter((message) => message?.payload?.text === "gpt-duplicate")).toHaveLength(0);
+  });
+
+  test("tool_activity は backfill 中の live 側を捨て、live 配信後の再走査で重複しない", async () => {
+    const toolCard = (id: string, command: string): ControlMessage =>
+      toolActivityMessage(codexCommandActivity(id, command));
+    const { hub, writes, getCallbacks } = makeCodexStreamingHub();
+    const client = {}, received: any[] = [];
+    subscribe(hub, client, received);
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+
+    // backfill 中: rollout 由来のカードは配信、live item 由来は捨てる（rollout が履歴の正）。
+    writes[0]!(toolCard("call_a", "ls"));
+    getCallbacks().onChatItem?.({ session: "work", itemId: "exec-a#tool-0",
+      payload: toolCard("exec-a", "ls") });
+    writes[0]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+    const toolsOf = (messages: any[]) => messages.flatMap((message) =>
+      message?.payload?.type === "tool_activity" ? [message.payload.activity.id] : []);
+    expect(toolsOf(received)).toEqual(["call_a"]);
+
+    // live: 新しい item のカードは配信する。
+    getCallbacks().onChatItem?.({ session: "work", itemId: "exec-b#tool-0",
+      payload: toolCard("exec-b", "pwd") });
+    expect(toolsOf(received)).toEqual(["call_a", "exec-b"]);
+
+    // 接続断 fallback の再走査: 既配信カード（backfill 分 + live 分）は同一キーの
+    // occurrence として除外し、切断中の新カードだけ配信する。
+    getCallbacks().onDisconnect?.("work", new Error("closed"));
+    expect(writes).toHaveLength(2);
+    writes[1]!(toolCard("call_a", "ls"));
+    writes[1]!(toolCard("call_b", "pwd"));
+    writes[1]!(toolCard("call_c", "npm test"));
+    writes[1]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+    expect(toolsOf(received)).toEqual(["call_a", "exec-b", "call_c"]);
   });
 
   test("接続断 fallback の再走査は既配信本文を occurrence 単位で除外する", async () => {

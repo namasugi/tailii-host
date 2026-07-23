@@ -7,8 +7,9 @@
 // claude との差:
 //   - 解決キーが「claude projects slug」ではなく「session_meta.payload.cwd == 実 cwd」。
 //     rollout は日付ディレクトリに散らばるため、cwd 一致の最新 rollout を走査で選ぶ。
-//   - 抽出は event_msg に限定する（response_item は同内容の重複なので使わない）。
-//   - tool 実行 / reasoning / 承認は本スライスでは扱わない（後続 Milestone）。
+//   - 本文は event_msg から、tool 実行（コマンド/ファイル変更/プラン）は response_item と
+//     patch_apply_end から tool_activity カードへ写像する（codex-tool-cards）。
+//   - reasoning / 承認は扱わない。
 
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -16,6 +17,11 @@ import * as path from "node:path";
 import { PROTOCOL_V1, type ChatRole, type ControlMessage } from "./protocol.js";
 import { canonicalPath } from "./paths.js";
 import { abortableSleep } from "./sleep.js";
+import {
+  rolloutPatchApplyActivities,
+  rolloutResponseItemToolActivities,
+  toolActivityMessage,
+} from "./codexToolActivity.js";
 
 /** 履歴再生完了マーカーの streamId（claude 側と共通。iOS `ChatLogModel` と対で解釈）。 */
 export const HISTORY_DONE_STREAM_ID = "pc:history-done";
@@ -316,6 +322,10 @@ function readRolloutMeta(rolloutPath: string): { id: string | null; cwd: string 
  *     - user_message  → user ロールの chat_output
  *     - agent_message（commentary / final_answer）→ assistant ロールの chat_output
  *     - token_count   → コンテキストトークン数／窓マーカー
+ *     - patch_apply_end → ファイル変更カード（tool_activity, codex-tool-cards）
+ *   - `response_item`:
+ *     - custom_tool_call "exec" / function_call "exec_command" → コマンド実行カード
+ *     - function_call "update_plan" → プラン更新カード
  * 解釈できない行・対象外イベントはスキップ。
  */
 export function* emitLine(line: Buffer, state: TailState): Generator<ControlMessage, void, void> {
@@ -338,10 +348,25 @@ export function* emitLine(line: Buffer, state: TailState): Generator<ControlMess
     }
     return;
   }
+  if (record.type === "response_item") {
+    const payload = asRecord(record.payload);
+    if (payload === null) return;
+    for (const activity of rolloutResponseItemToolActivities(payload)) {
+      yield toolActivityMessage(activity);
+    }
+    return;
+  }
   if (record.type !== "event_msg") return;
   const payload = record.payload;
   if (typeof payload !== "object" || payload === null) return;
   const kind = (payload as { type?: unknown }).type;
+
+  if (kind === "patch_apply_end") {
+    for (const activity of rolloutPatchApplyActivities(payload as Record<string, unknown>)) {
+      yield toolActivityMessage(activity);
+    }
+    return;
+  }
 
   if (kind === "user_message" || kind === "agent_message") {
     // commentary は長時間ターンの途中経過、final_answer は最終回答としてどちらも表示する。
