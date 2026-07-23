@@ -80,6 +80,8 @@ export interface CodexTurnControllerRuntime {
 export interface CodexThreadClient {
   readonly initialItems?: readonly Record<string, unknown>[];
   readonly initialActiveTurnId?: string | null;
+  /** false は rollout 未生成で thread/resume が成立せず、live 通知を保証できない接続。 */
+  readonly liveSubscriptionReady?: boolean;
   startTurn(
     text: string,
     clientUserMessageId?: string | null,
@@ -95,6 +97,8 @@ export interface CodexThreadClient {
 export interface CodexSubscriptionSnapshot {
   itemIds: ReadonlySet<string>;
   contentCounts: ReadonlyMap<string, number>;
+  /** false の場合、Hub は初回 turn を rollout の継続 tail で表示する。 */
+  liveSubscribed: boolean;
 }
 
 export interface CodexAppServerThreadRuntime {
@@ -166,7 +170,11 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       const key = payload === null ? null : chatContentKey(payload);
       if (key !== null) contentCounts.set(key, (contentCounts.get(key) ?? 0) + 1);
     }
-    return { itemIds, contentCounts };
+    return {
+      itemIds,
+      contentCounts,
+      liveSubscribed: opened.thread.liveSubscriptionReady !== false,
+    };
   }
 
   async startTurn(options: {

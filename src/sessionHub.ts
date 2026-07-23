@@ -841,6 +841,13 @@ export class SessionHub {
         if (actor.codexLive !== state || actor.subscribers.size === 0) return;
         state.initialItemIds = snapshot.itemIds;
         state.initialContentCounts = snapshot.contentCounts;
+        if (!snapshot.liveSubscribed) {
+          this.options.log?.(
+            "Codex App Server は未materialize threadをlive購読できないため、rollout fallbackへ移行",
+          );
+          this.startCodexFallback(session, actor, cwd, threadId, newerThanMs, false);
+          return;
+        }
         state.phase = "backfill";
         this.openCodexRollout(session, actor, cwd, threadId, newerThanMs, true);
       },
@@ -917,6 +924,10 @@ export class SessionHub {
     if (actor === undefined || state == null || actor.subscribers.size === 0) return;
     if (state.seenItemIds.has(itemId)) return;
     state.seenItemIds.add(itemId);
+    // subscribe 自体は接続を保持していても、未materialize thread は thread/resume が
+    // 成立しておらず live 通知の完全性を保証できない。fallback 選択後は rollout だけを
+    // 一次ソースにし、運良く届いた App Server item を backfill buffer へ混ぜて重複させない。
+    if (state.disconnected) return;
     if (state.phase === "starting" || state.phase === "backfill") {
       // tool_activity は buffer せず捨てる。履歴は rollout（backfill）側が同じカードを
       // 供給するのが正で、live 由来と rollout 由来のカードは id が一致しないため
@@ -927,7 +938,7 @@ export class SessionHub {
       return;
     }
     if (state.phase === "live") this.publishCodexContent(session, actor, state, payload);
-    // fallback 中は rollout が唯一の一次ソース。遅着した旧接続通知は破棄する。
+    // fallback 中は上の disconnected guard で、遅着した旧接続通知を破棄する。
   }
 
   private flushCodexBuffer(session: string, actor: SessionActor, state: CodexLiveState): void {

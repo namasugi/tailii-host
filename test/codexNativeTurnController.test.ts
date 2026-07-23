@@ -49,7 +49,7 @@ describe("CodexNativeTurnController", () => {
     });
 
     await expect(controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" }))
-      .resolves.toMatchObject({ itemIds: new Set(["old"]) });
+      .resolves.toMatchObject({ itemIds: new Set(["old"]), liveSubscribed: true });
     openOptions?.onNotification?.({ method: "item/completed", params: {
       item: { id: "u1", type: "userMessage", content: [{ type: "text", text: "質問" }] },
     } });

@@ -421,6 +421,7 @@ describe("CodexAppServerManager", () => {
     const thread = await manager.openThread({ threadId: "thread-fresh" });
     expect(thread.initialItems).toEqual([]);
     expect(thread.initialActiveTurnId).toBeNull();
+    expect(thread.liveSubscriptionReady).toBe(false);
     await expect(thread.startTurn("first", "client-first")).resolves.toBe("turn-first");
     expect(connection.requests.map((request) => request.method)).toEqual([
       "thread/resume",
@@ -451,6 +452,7 @@ describe("CodexAppServerManager", () => {
     const thread = await manager.openThread({ threadId: "thread-running" });
 
     expect(thread.initialActiveTurnId).toBe("turn-live");
+    expect(thread.liveSubscriptionReady).toBe(true);
   });
 
   test("未materialize以外のresume失敗は接続を閉じて伝播する", async () => {

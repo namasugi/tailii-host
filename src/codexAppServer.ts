@@ -219,6 +219,12 @@ export class CodexAppServerThread {
     readonly threadId: string,
     readonly initialItems: readonly Record<string, unknown>[],
     readonly initialActiveTurnId: string | null,
+    /**
+     * この接続で thread/resume（または作成元 bootstrap）が成功し、live 通知を受け取れるか。
+     * rollout 未生成の新規 thread は resume に失敗するため false。呼び出し側は初回 turn の
+     * 表示を rollout tail へフォールバックし、通知が来ない接続を live 権威にしない。
+     */
+    readonly liveSubscriptionReady: boolean,
     private readonly connection: CodexAppServerConnection,
     private readonly cwd: string | null,
   ) {}
@@ -580,6 +586,7 @@ export class CodexAppServerManager {
     try {
       let initialItems: Record<string, unknown>[] = [];
       let initialActiveTurnId: string | null = null;
+      let liveSubscriptionReady = bootstrap !== null;
       if (bootstrap === null) {
         await connection.initialize();
         try {
@@ -590,6 +597,7 @@ export class CodexAppServerManager {
           });
           initialItems = extractThreadItems(response);
           initialActiveTurnId = extractActiveTurnId(response);
+          liveSubscriptionReady = true;
         } catch (error) {
           // thread/start から最初の user turn まで rollout は未作成で、別接続からの
           // thread/resume は "no rollout found" になる。ただし共有 App Server 内の
@@ -603,6 +611,7 @@ export class CodexAppServerManager {
         options.threadId,
         initialItems,
         initialActiveTurnId,
+        liveSubscriptionReady,
         connection,
         options.cwd ?? null,
       );

@@ -1152,7 +1152,10 @@ describe("SessionHub conversation stream", () => {
   });
 });
 
-function makeCodexStreamingHub(options: { subscribeFails?: boolean } = {}) {
+function makeCodexStreamingHub(options: {
+  subscribeFails?: boolean;
+  liveSubscribed?: boolean;
+} = {}) {
   const metadataStore = makeTempStore();
   metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0,
     agent: "codex", providerSessionId: "thread-1" });
@@ -1163,7 +1166,8 @@ function makeCodexStreamingHub(options: { subscribeFails?: boolean } = {}) {
     subscribeSession: options.subscribeFails
       ? async () => { throw new Error("app server unavailable"); }
       : async () => ({ itemIds: new Set(["history-item"]),
-          contentCounts: new Map([["assistant\u0000履歴", 1]]) }),
+          contentCounts: new Map([["assistant\u0000履歴", 1]]),
+          liveSubscribed: options.liveSubscribed ?? true }),
     startTurn: async () => "turn-1",
     closeSession: vi.fn(),
     close: vi.fn(),
@@ -1225,6 +1229,25 @@ describe("SessionHub Codex App Server live stream", () => {
     expect(tails[0]!.stopped).toBe(false);
     expect(received.filter((message) => message?.payload?.text === "fallback live")).toHaveLength(1);
     expect(received.filter((message) => message?.payload?.text === "gpt-duplicate")).toHaveLength(0);
+  });
+
+  test("未materialize threadは rollout を history 後も tail して初回turnをライブ反映する", async () => {
+    const { hub, writes, tails, getCallbacks } =
+      makeCodexStreamingHub({ liveSubscribed: false });
+    const client = {}, received: any[] = [];
+    subscribe(hub, client, received);
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+
+    // resume 不成立の接続から一部 item だけ届いても、rollout と二重化しない。
+    getCallbacks().onChatItem?.({ session: "work", itemId: "partial-live",
+      payload: chat("assistant", "初回ターンの新着", "codex-item-partial-live") });
+    writes[0]!(chat("assistant", "初期履歴", "codex-turn-1"));
+    writes[0]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+    writes[0]!(chat("assistant", "初回ターンの新着", "codex-turn-2"));
+
+    expect(tails[0]!.stopped).toBe(false);
+    expect(received.filter((message) => message?.payload?.text === "初回ターンの新着"))
+      .toHaveLength(1);
   });
 
   test("tool_activity は backfill 中の live 側を捨て、live 配信後の再走査で重複しない", async () => {
