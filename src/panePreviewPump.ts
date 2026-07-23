@@ -99,12 +99,23 @@ export class PanePreviewPump {
   }
 
   private async run(session: string, mode: PanePreviewMode, signal: AbortSignal): Promise<void> {
+    // pane 消滅（reaper kill 等）後も購読が残る間はポーリングが失敗し続けるため、
+    // 連続失敗は初回と約1分ごとだけログする（250ms 間隔の連打でログを埋めない）。
+    let consecutiveFailures = 0;
     while (!signal.aborted) {
       let text: string | null = null;
       try {
         text = await this.capture(session);
+        consecutiveFailures = 0;
       } catch (error) {
-        process.stderr.write(`[tailii-host engine] pane_preview capture 失敗: ${String(error)}\n`);
+        consecutiveFailures += 1;
+        if (consecutiveFailures === 1 || consecutiveFailures % 240 === 0) {
+          process.stderr.write(
+            `[tailii-host engine] pane_preview capture 失敗` +
+              (consecutiveFailures > 1 ? `（連続${consecutiveFailures}回目）` : "") +
+              `: ${String(error)}\n`,
+          );
+        }
       }
 
       if (text !== null && mode === "claude_status" && this.onPermissionMode !== null) {
