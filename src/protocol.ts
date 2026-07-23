@@ -121,6 +121,8 @@ export interface ServeProcessInfo {
   commandLine?: string;
   /** プロセスの作業ディレクトリ（会話 workdir とのグルーピング判定に使う）。 */
   cwd?: string;
+  /** 配信中ページの HTML `<title>`（host が HTTP GET で取得。HTML でない/応答なしは省略）。 */
+  title?: string;
 }
 
 /** slash_list_response の 1 コマンド候補。 */
@@ -1165,6 +1167,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
             command: requireString(obj, "command"),
             commandLine: optionalString(obj, "commandLine"),
             cwd: optionalString(obj, "cwd"),
+            title: optionalString(obj, "title"),
           });
         }),
       };

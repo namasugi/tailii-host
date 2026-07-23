@@ -2005,7 +2005,7 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
       // （previewServer の loopback 静的サーバー含む）は除外する。
       engineDiag(`serve_list_request id=${message.id}`);
       try {
-        const servers = await listServeProcesses({ excludePids: [process.pid] });
+        const servers = await listServeProcesses({ excludePids: [process.pid], withTitles: true });
         writer.write({ type: "serve_list_response", v, id: message.id, servers });
       } catch (error) {
         engineDiag(`serve_list_response 失敗 id=${message.id}: ${String(error)}`);

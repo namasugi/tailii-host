@@ -24,6 +24,11 @@ const TERM_GRACE_MS = 1_500;
 const KILL_GRACE_MS = 700;
 const POLL_INTERVAL_MS = 100;
 const COMMAND_LINE_LIMIT = 160;
+/** title 取得の HTTP GET 全体タイムアウト。非 HTTP リスナーはここで切れる。 */
+const TITLE_FETCH_TIMEOUT_MS = 1_200;
+/** title 探索で読む HTML 先頭バイト数の上限。 */
+const TITLE_BODY_LIMIT = 64 * 1024;
+const TITLE_LIMIT = 80;
 
 interface ExecResult {
   ok: boolean;
@@ -134,11 +139,93 @@ async function fetchCommandLines(pids: number[]): Promise<Map<number, string>> {
 }
 
 /**
+ * HTML 断片から `<title>` の中身を取り出す。空・見つからない場合は null。
+ * 表示用に空白を畳み、基本的な文字参照を復号して TITLE_LIMIT で切り詰める。
+ */
+export function parseHtmlTitle(html: string): string | null {
+  const match = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html);
+  if (match === null) return null;
+  const title = match[1]!
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec: string) => String.fromCodePoint(Number(dec)))
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (title.length === 0) return null;
+  // サロゲートペア（絵文字等）を割らないようコードポイント単位で切り詰める。
+  const points = [...title];
+  return points.length > TITLE_LIMIT ? `${points.slice(0, TITLE_LIMIT).join("")}…` : title;
+}
+
+/**
+ * loopback の HTTP GET でページ title を 1 ポートぶん取得する。失敗は null。
+ * `[::1]` のみで LISTEN するサーバーにも当たるよう IPv4/IPv6 両 loopback を並行試行する。
+ */
+async function probeTitle(port: number): Promise<string | null> {
+  const results = await Promise.all([
+    probeTitleAt(`http://127.0.0.1:${port}/`),
+    probeTitleAt(`http://[::1]:${port}/`),
+  ]);
+  return results.find((title) => title !== null) ?? null;
+}
+
+async function probeTitleAt(url: string): Promise<string | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TITLE_FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: { accept: "text/html" },
+    });
+    const contentType = response.headers.get("content-type") ?? "";
+    // content-type 未設定の簡易サーバーは HTML の可能性を残して読む。
+    if (contentType !== "" && !contentType.toLowerCase().includes("html")) {
+      await response.body?.cancel().catch(() => {});
+      return null;
+    }
+    if (response.body === null) return null;
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let html = "";
+    while (html.length < TITLE_BODY_LIMIT) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      html += decoder.decode(value, { stream: true });
+      if (/<\/title>/i.test(html)) break;
+    }
+    await reader.cancel().catch(() => {});
+    return parseHtmlTitle(html);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** 各ポートの HTML title を並列取得する（全体は TITLE_FETCH_TIMEOUT_MS で頭打ち）。 */
+async function fetchTitles(ports: number[]): Promise<Map<number, string>> {
+  const titles = new Map<number, string>();
+  await Promise.all(
+    ports.map(async (port) => {
+      const title = await probeTitle(port);
+      if (title !== null) titles.set(port, title);
+    }),
+  );
+  return titles;
+}
+
+/**
  * 自ユーザーが loopback/wildcard で LISTEN している TCP サーバーを列挙する。
  * `excludePids` は engine 自身など一覧に出さない pid。
+ * `withTitles` で各ポートへ HTTP GET し HTML の `<title>` を付与する
+ * （一覧表示用。停止前照合など内部利用では省く）。
  */
 export async function listServeProcesses(
-  options: { excludePids?: number[] } = {},
+  options: { excludePids?: number[]; withTitles?: boolean } = {},
 ): Promise<ServeProcessInfo[]> {
   const excluded = new Set(options.excludePids ?? []);
   const listen = await run("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcn"]);
@@ -148,7 +235,7 @@ export async function listServeProcesses(
   const pids = [...new Set(entries.map((entry) => entry.pid))];
   const [cwds, commandLines] = await Promise.all([fetchCwds(pids), fetchCommandLines(pids)]);
 
-  return entries
+  const servers: ServeProcessInfo[] = entries
     .map((entry) => {
       const cwd = cwds.get(entry.pid);
       return {
@@ -163,6 +250,15 @@ export async function listServeProcesses(
     // cwd 不明（取得失敗）は残す — 情報不足を理由に隠さない。
     .filter((entry) => entry.cwd !== "/")
     .sort((lhs, rhs) => lhs.port - rhs.port);
+
+  if (options.withTitles === true && servers.length > 0) {
+    const titles = await fetchTitles([...new Set(servers.map((server) => server.port))]);
+    for (const server of servers) {
+      const title = titles.get(server.port);
+      if (title !== undefined) server.title = title;
+    }
+  }
+  return servers;
 }
 
 function isAlive(pid: number): boolean {
