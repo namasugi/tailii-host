@@ -1,0 +1,4 @@
+{"id":"pc1","key":"2","session":"s-1a2b3c4d","type":"pane_choice_send","v":1}
+{"error":null,"id":"pc1","ok":true,"type":"pane_choice_send_result","v":1}
+{"id":"pc2","key":"1","session":"s-1a2b3c4d","type":"pane_choice_send","v":1}
+{"error":"pane not found","id":"pc2","ok":false,"type":"pane_choice_send_result","v":1}

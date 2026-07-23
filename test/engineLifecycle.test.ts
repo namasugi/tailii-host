@@ -551,6 +551,43 @@ describe("Engine — アイドルライフサイクル/ページング", () => {
     await engine.teardown();
   });
 
+  // MARK: 追加: pane_choice_send（Codex TUI 番号ダイアログの選択返送）
+
+  test("pane_choice_send は番号キー（literal）と Enter を pane へ注入し ok を返す", async () => {
+    const runner = new MockTmuxRunner(() => ok(""));
+    const mgr = new TmuxSessionManager({ runner: runner.runner, store: makeTempStore() });
+    const engine = startEngine({ sessionManager: mgr });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"id":"PC1","key":"2","session":"work","type":"pane_choice_send","v":1}');
+    const resp = await engine.lines.nextOfType("pane_choice_send_result");
+    expect(resp).toContain('"id":"PC1"');
+    expect(resp).toContain('"ok":true');
+    const recorded = runner.recorded.map((cmd) => JSON.stringify(cmd));
+    expect(recorded).toContain(JSON.stringify(["send-keys", "-t", "work", "-l", "2"]));
+    expect(recorded).toContain(JSON.stringify(["send-keys", "-t", "work", "Enter"]));
+
+    await engine.teardown();
+  });
+
+  test("pane_choice_send は数字以外の key を拒否し注入しない", async () => {
+    const runner = new MockTmuxRunner(() => ok(""));
+    const mgr = new TmuxSessionManager({ runner: runner.runner, store: makeTempStore() });
+    const engine = startEngine({ sessionManager: mgr });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine(
+      '{"id":"PC2","key":"rm -rf","session":"work","type":"pane_choice_send","v":1}',
+    );
+    const resp = await engine.lines.nextOfType("pane_choice_send_result");
+    expect(resp).toContain('"id":"PC2"');
+    expect(resp).toContain('"ok":false');
+    const sendKeyCalls = runner.recorded.filter((cmd) => cmd[0] === "send-keys");
+    expect(sendKeyCalls).toEqual([]);
+
+    await engine.teardown();
+  });
+
   test("mode_set は BTab 後の再描画中を default と誤認せず明示マーカーまで待つ", async () => {
     const panes = [
       "⏸ manual mode on · ? for shortcuts\n",
