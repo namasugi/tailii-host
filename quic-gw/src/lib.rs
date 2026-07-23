@@ -37,7 +37,11 @@ pub const ALPN: &[u8] = b"tailii/1";
 pub const DEFAULT_PORT: u16 = 46853;
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 pub const KEEPALIVE: Duration = Duration::from_secs(20);
-pub const HEADER_CAP: usize = 4096;
+/// ヘッダ 1 行の上限バイト数。exec の `cmd` には iOS の添付アップロード
+/// （ImageUploadPlan: 原データ 96,000 bytes → base64 128,000 字）がそのまま乗るため、
+/// SSH exec のパケット上限と同じ 256 KiB を確保する（4096 だとチャンクコマンドが
+/// 「header line too long」で全滅し、QUIC 接続時だけ画像・ファイル添付が失敗する）。
+pub const HEADER_CAP: usize = 256 * 1024;
 const SOURCE_CAP: u64 = 512 * 1024 * 1024;
 const CHUNK: usize = 64 * 1024;
 
@@ -963,6 +967,35 @@ pub async fn run_selfcheck(host: &str, port: u16, cert_pin_b64: &str, token_b64:
         let fin = read_line(&mut recv, HEADER_CAP).await?;
         anyhow::ensure!(fin.is_none(), "expected FIN after stdin EOF, got: {fin:?}");
         println!("exec (cat) echo + FIN: ok");
+    }
+
+    // 1b) exec: 添付アップロードと同型の巨大ヘッダ（cmd に base64 128,000 字）
+    {
+        let payload = vec![0xA5u8; 96_000];
+        let b64 = B64.encode(&payload);
+        let cmd = format!("printf '%s' '{b64}' | base64 -D | wc -c");
+        let (mut send, mut recv) = conn.open_bi().await?;
+        let header = format!(
+            "{{\"t\":\"exec\",\"v\":1,\"token\":\"{token_b64}\",\"cmd\":{}}}\n",
+            serde_json::to_string(&cmd)?
+        );
+        send.write_all(header.as_bytes()).await?;
+        let ok = read_line(&mut recv, HEADER_CAP)
+            .await?
+            .context("no big-header exec response")?;
+        anyhow::ensure!(ok.contains("\"ok\":true"), "big-header exec rejected: {ok}");
+        send.finish()?;
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; CHUNK];
+        while let Some(n) = recv.read(&mut buf).await? {
+            out.extend_from_slice(&buf[..n]);
+        }
+        let count = String::from_utf8_lossy(&out);
+        anyhow::ensure!(
+            count.trim() == "96000",
+            "big-header exec byte count mismatch: {count:?}"
+        );
+        println!("exec (upload-chunk sized header): ok");
     }
 
     // 2) exec + pty

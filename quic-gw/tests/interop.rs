@@ -138,6 +138,39 @@ async fn exec_stdin_eof_reaches_process() {
 }
 
 #[tokio::test]
+async fn exec_accepts_upload_chunk_sized_header() {
+    // iOS の添付アップロード（ImageUploadPlan）は 1 チャンク = 原データ 96,000 bytes を
+    // base64（128,000 字）で exec の cmd に埋め込む。ヘッダ行上限が小さいと
+    // 「header line too long」で QUIC 接続時だけ添付が全滅する回帰の固定。
+    let gw = start_gateway("bigcmd").await;
+    let (_endpoint, conn) = connect(&gw).await;
+
+    let payload = vec![0xA5u8; 96_000];
+    let b64 = B64.encode(&payload);
+    assert_eq!(b64.len(), 128_000);
+    let cmd = format!("printf '%s' '{b64}' | base64 -D | wc -c");
+
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let header = format!(
+        "{{\"t\":\"exec\",\"v\":1,\"token\":\"{}\",\"cmd\":{}}}\n",
+        gw.token_b64,
+        serde_json::to_string(&cmd).unwrap()
+    );
+    send.write_all(header.as_bytes()).await.unwrap();
+    let ok = read_line(&mut recv, HEADER_CAP).await.unwrap().unwrap();
+    assert!(ok.contains("\"ok\":true"), "unexpected response: {ok}");
+    send.finish().unwrap();
+
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    while let Some(n) = recv.read(&mut buf).await.unwrap() {
+        out.extend_from_slice(&buf[..n]);
+    }
+    let count = String::from_utf8_lossy(&out);
+    assert_eq!(count.trim(), "96000", "decoded byte count mismatch: {count:?}");
+}
+
+#[tokio::test]
 async fn exec_pty_runs_command_on_terminal() {
     let gw = start_gateway("pty").await;
     let (_endpoint, conn) = connect(&gw).await;
