@@ -267,6 +267,8 @@ export type ControlMessage =
       /** 省略時は従来の Claude ステータス表示。Codex のみ terminal capture を指定する。 */
       mode?: "codex_terminal";
     }
+  | { type: "pane_choice_send"; v: number; id: string; session: string; key: string }
+  | { type: "pane_choice_send_result"; v: number; id: string; ok: boolean; error: string | null }
   | { type: "question_prompt"; v: number; id: string; questions: QuestionPromptQuestion[] }
   | { type: "question_answer"; v: number; id: string; session: string; answers: QuestionAnswer[] }
   | { type: "question_dismiss"; v: number; id: string }
@@ -803,6 +805,22 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         mode,
       });
     }
+
+    case "pane_choice_send":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        session: requireString(raw, "session"),
+        key: requireString(raw, "key"),
+      };
+
+    case "pane_choice_send_result":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        ok: requireBoolean(raw, "ok"),
+        error: optionalNullableString(raw, "error") ?? null,
+      };
 
     case "question_prompt":
       return {

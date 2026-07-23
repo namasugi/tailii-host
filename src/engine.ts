@@ -2027,6 +2027,35 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
       break;
     }
 
+    case "pane_choice_send": {
+      // Codex TUI の番号付きダイアログ（CLI 更新確認・フック信頼確認など）への選択返送。
+      // iOS の PTY(tmux attach) 束縛は herdr セッションでは効かないため、SessionBackend
+      // 経由で pane へ番号キー + Enter を注入する（tmux / herdr 両対応）。
+      engineDiag(`pane_choice_send id=${message.id} session=${message.session} key=${message.key}`);
+      if (!/^\d{1,3}$/.test(message.key)) {
+        writer.write({
+          type: "pane_choice_send_result", v, id: message.id,
+          ok: false, error: `不正な選択キーです: ${message.key}`,
+        });
+        break;
+      }
+      try {
+        await sessionManager.sendKeys(message.session, [message.key], true);
+        // ダイアログの再描画を待ってから確定する（連続注入の取りこぼし防止。
+        // 番号キーだけで確定するダイアログでは、遅れて届く Enter は入力欄への
+        // 空 submit となり no-op）。
+        await sleep(120);
+        await sessionManager.sendKeys(message.session, ["Enter"]);
+        writer.write({ type: "pane_choice_send_result", v, id: message.id, ok: true, error: null });
+      } catch (error) {
+        engineDiag(`pane_choice_send 失敗 id=${message.id}: ${String(error)}`);
+        writer.write({
+          type: "pane_choice_send_result", v, id: message.id, ok: false, error: String(error),
+        });
+      }
+      break;
+    }
+
     case "backend_get_request": {
       // 端末バックエンド設定の読み取り（アプリ設定画面, session-backend）。
       engineDiag(`backend_get_request id=${message.id}`);
