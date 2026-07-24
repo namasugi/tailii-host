@@ -379,10 +379,19 @@ export function* emitLine(line: Buffer, state: TailState): Generator<ControlMess
     if (typeof message !== "string" || message.length === 0) return;
     const role: ChatRole = kind === "user_message" ? "user" : "assistant";
     state.seq += 1;
+    const clientId = kind === "user_message"
+      ? (payload as { client_id?: unknown }).client_id
+      : undefined;
+    // Tailii が turn/start に渡した clientUserMessageId は rollout の client_id として
+    // 保存される。ユーザー発話だけはこの安定IDを streamId に使い、アプリ再起動や
+    // 上書きインストール後の履歴再生でもローカル楽観バブルと厳密に同一視できるようにする。
+    const streamId = typeof clientId === "string" && clientId.length > 0
+      ? `codex-user-${clientId}`
+      : `codex-turn-${state.seq}`;
     yield {
       type: "chat_output",
       v: PROTOCOL_V1,
-      streamId: `codex-turn-${state.seq}`,
+      streamId,
       role,
       text: message,
       eof: true,

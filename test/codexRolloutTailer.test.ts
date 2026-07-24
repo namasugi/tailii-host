@@ -33,8 +33,9 @@ function writeRollout(
   return p;
 }
 
-function userMsg(text: string): string {
-  return JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: text } });
+function userMsg(text: string, clientId?: string): string {
+  return JSON.stringify({ type: "event_msg",
+    payload: { type: "user_message", message: text, ...(clientId ? { client_id: clientId } : {}) } });
 }
 function agentMsg(text: string, phase = "final_answer"): string {
   return JSON.stringify({ type: "event_msg", payload: { type: "agent_message", message: text, phase } });
@@ -136,7 +137,7 @@ describe("CodexRolloutTailer.streamForCwd（有限 tail）", () => {
     const root = makeTempDir("codex-stream");
     const cwd = makeTempDir("codex-stream-cwd");
     writeRollout(root, "2026/07/06", "r.jsonl", cwd, [
-      userMsg("質問です"),
+      userMsg("質問です", "client-user-1"),
       agentMsg("途中経過", "commentary"),
       agentMsg("未知の phase", "answer"),
       agentMsg("最終回答"),
@@ -152,6 +153,7 @@ describe("CodexRolloutTailer.streamForCwd（有限 tail）", () => {
       ["assistant", "途中経過"],
       ["assistant", "最終回答"],
     ]);
+    expect(chats[0]?.streamId).toBe("codex-user-client-user-1");
     expect(chats.every((c) => c.eof)).toBe(true);
     // streamId はターンごとに一意。
     expect(new Set(chats.map((c) => c.streamId)).size).toBe(3);

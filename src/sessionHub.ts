@@ -947,10 +947,14 @@ export class SessionHub {
 
   private flushCodexBuffer(session: string, actor: SessionActor, state: CodexLiveState): void {
     const remainingSnapshotCounts = new Map(state.initialContentCounts);
+    const rolloutPostSnapshotCounts = new Map<string, number>();
     for (const [key, rolloutCount] of state.publishedContentCounts) {
-      const remaining = Math.max(0, (remainingSnapshotCounts.get(key) ?? 0) - rolloutCount);
+      const snapshotCount = remainingSnapshotCounts.get(key) ?? 0;
+      const remaining = Math.max(0, snapshotCount - rolloutCount);
       if (remaining === 0) remainingSnapshotCounts.delete(key);
       else remainingSnapshotCounts.set(key, remaining);
+      const postSnapshotCount = Math.max(0, rolloutCount - snapshotCount);
+      if (postSnapshotCount > 0) rolloutPostSnapshotCounts.set(key, postSnapshotCount);
     }
     for (const item of state.buffered) {
       const key = chatContentKey(item.payload);
@@ -962,6 +966,17 @@ export class SessionHub {
         const remaining = (remainingSnapshotCounts.get(key) ?? 0) - 1;
         if (remaining <= 0) remainingSnapshotCounts.delete(key);
         else remainingSnapshotCounts.set(key, remaining);
+      }
+      // resume snapshot の後に App Server から届いた item も、rollout が EOF までに
+      // 同じ occurrence を取り込んでいれば既に配信済み。snapshot 以前の同文だけでは
+      // 新着を消さないよう、rolloutCount - snapshotCount の超過分だけを消費する。
+      if (!isSnapshotItem && key !== null) {
+        const covered = rolloutPostSnapshotCounts.get(key) ?? 0;
+        if (covered > 0) {
+          if (covered === 1) rolloutPostSnapshotCounts.delete(key);
+          else rolloutPostSnapshotCounts.set(key, covered - 1);
+          continue;
+        }
       }
       this.publishCodexContent(session, actor, state, item.payload);
     }

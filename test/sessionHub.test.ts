@@ -1201,6 +1201,8 @@ describe("SessionHub Codex App Server live stream", () => {
     getCallbacks().onChatItem?.({ session: "work", itemId: "live-item",
       payload: chat("assistant", "境界の新着", "codex-item-live-item") });
     writes[0]!(chat("assistant", "履歴", "codex-turn-1"));
+    // snapshot 後の新着を rollout も EOF 前に取り込んだ場合は occurrence が重なる。
+    writes[0]!(chat("assistant", "境界の新着", "codex-turn-2"));
     writes[0]!(chat("system", "", HISTORY_DONE_STREAM_ID));
 
     const texts = received.flatMap((message) => message?.payload?.role === "assistant"
@@ -1214,6 +1216,20 @@ describe("SessionHub Codex App Server live stream", () => {
     writes[0]!(chat("system", "gpt-one-source", "pc:model")); // stop と競合しても rollout marker は無視。
     expect(received.filter((message) => message?.payload?.text === "TUI からの turn")).toHaveLength(1);
     expect(received.filter((message) => message?.payload?.text === "gpt-one-source")).toHaveLength(1);
+  });
+
+  test("snapshot 前の同文履歴だけでは snapshot 後の正当な再投稿を除外しない", async () => {
+    const { hub, writes, getCallbacks } = makeCodexStreamingHub();
+    const client = {}, received: any[] = [];
+    subscribe(hub, client, received);
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+
+    getCallbacks().onChatItem?.({ session: "work", itemId: "live-same-text",
+      payload: chat("assistant", "履歴", "codex-item-live-same-text") });
+    writes[0]!(chat("assistant", "履歴", "codex-turn-history"));
+    writes[0]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+
+    expect(received.filter((message) => message?.payload?.text === "履歴")).toHaveLength(2);
   });
 
   test("App Server 不達時は rollout を history 後も tail し、live marker は抑止する", async () => {
