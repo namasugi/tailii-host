@@ -92,7 +92,7 @@ const MAX_IDENTIFIER_BYTES = 128;
 const MAX_PAIRING_CODE_BYTES = 2_048;
 const PROVIDER_COMMAND_TIMEOUT_MS = 22_000;
 const CLAUDE_AUTH_TIMEOUT_MS = 5_000;
-const SUPPORTED_CLAUDE_VERSIONS = new Set(["2.1.215", "2.1.218"]);
+const SUPPORTED_CLAUDE_VERSIONS = new Set(["2.1.215", "2.1.218", "2.1.220"]);
 const SUPPORTED_CODEX_VERSIONS = new Set(["0.144.5", "0.145.0"]);
 
 const CLAUDE_ACTIVE_MARKERS = [
@@ -100,6 +100,12 @@ const CLAUDE_ACTIVE_MARKERS = [
   "/remote-control is active",
   "/rc active",
 ] as const;
+// Remote Control が active と CLI が認識している最中に /remote-control を再実行すると、
+// 2.1.220 はバナーではなく modal dialog（Disconnect / Show QR / Continue）を開き、
+// Enter/Esc を受けるまで pane を塞ぎ続ける（自動では閉じない）。iPhone からは不可視の
+// ため、検出したら Esc で閉じて dialog 内の URL を採用する。
+const CLAUDE_DIALOG_URL_PREFIX = "This session is available in the Claude mobile app and at ";
+const CLAUDE_DIALOG_DISCONNECT_LABEL = "Disconnect this session";
 const CLAUDE_INACTIVE_MARKERS = [
   "Remote Control disconnected",
   "Remote Control is inactive",
@@ -170,7 +176,8 @@ export class OfficialAppsService {
     this.actionLockPath =
       options.actionLockPath ?? path.join(os.homedir(), ".tailii", "official-app-action.lock");
     this.claudePollIntervalMs = options.claudePollIntervalMs ?? 250;
-    this.claudeStartTimeoutMs = options.claudeStartTimeoutMs ?? 12_000;
+    // アーカイブ後の再接続はバナー再表示まで 10-15 秒かかることを実測済み。
+    this.claudeStartTimeoutMs = options.claudeStartTimeoutMs ?? 20_000;
     this.codexRemoteControl = options.codexRemoteControl ?? null;
   }
 
@@ -290,7 +297,10 @@ export class OfficialAppsService {
     version: string,
   ): Promise<OfficialAppStatus> {
     const paneText = await captureOfficialPane(context.sessionManager, context.session);
-    const launchUrl = paneText === null ? null : extractActiveClaudeUrl(paneText);
+    const launchUrl =
+      paneText === null
+        ? null
+        : extractActiveClaudeUrl(paneText) ?? extractClaudeRemoteDialogUrl(paneText);
     if (launchUrl !== null) {
       return {
         provider: "claude",
@@ -319,6 +329,11 @@ export class OfficialAppsService {
     const before = await captureOfficialPane(context.sessionManager, context.session);
     const active = before === null ? null : extractActiveClaudeUrl(before);
     if (active !== null) return openResult("claude", active);
+    const staleDialog = before === null ? null : extractClaudeRemoteDialogUrl(before);
+    if (staleDialog !== null) {
+      await this.dismissClaudeRemoteDialog(context);
+      return openResult("claude", staleDialog);
+    }
     if (!context.canInjectClaudeCommand) {
       return unavailableResult("claude", "claude_agent_busy");
     }
@@ -337,6 +352,13 @@ export class OfficialAppsService {
         latestText = paneText;
         const url = extractActiveClaudeUrl(paneText);
         if (url !== null) return openResult("claude", url);
+        // 会話がアーカイブされた直後は CLI がまだ active 扱いのため、注入した
+        // /remote-control が dialog になる。閉じて URL を返す（再接続は CLI 側が担う）。
+        const dialogUrl = extractClaudeRemoteDialogUrl(paneText);
+        if (dialogUrl !== null) {
+          await this.dismissClaudeRemoteDialog(context);
+          return openResult("claude", dialogUrl);
+        }
         const reason = classifyClaudeFailure(paneText);
         if (reason !== null) return unavailableResult("claude", reason);
       }
@@ -345,6 +367,14 @@ export class OfficialAppsService {
       "claude",
       classifyClaudeFailure(latestText) ?? "claude_start_failed",
     );
+  }
+
+  private async dismissClaudeRemoteDialog(context: OfficialAppRuntimeContext): Promise<void> {
+    try {
+      await context.sessionManager.sendKeys(context.session, ["Escape"]);
+    } catch {
+      // 閉じられなくても open は返す。次回 perform 時に再検出して再試行する。
+    }
   }
 
   private async performCodex(
@@ -493,14 +523,25 @@ async function captureOfficialPane(
   session: string,
 ): Promise<string | null> {
   try {
+    // 再接続時のバナーは新規行ではなく「初回 activation の位置」に復元される
+    // （実測）。長い会話でも拾えるよう窓を広めに取る（MAX_OUTPUT_BYTES 内）。
     const text = await sessionManager.capturePane(session, {
-      lines: 200,
+      lines: 600,
       joinWrappedLines: true,
     });
     return Buffer.byteLength(text, "utf8") <= MAX_OUTPUT_BYTES ? text : null;
   } catch {
     return null;
   }
+}
+
+export function extractClaudeRemoteDialogUrl(text: string): string | null {
+  if (!text.includes(CLAUDE_DIALOG_DISCONNECT_LABEL)) return null;
+  const prefixAt = text.lastIndexOf(CLAUDE_DIALOG_URL_PREFIX);
+  if (prefixAt < 0) return null;
+  const raw = text.slice(prefixAt + CLAUDE_DIALOG_URL_PREFIX.length).split(/\s/u, 1)[0] ?? "";
+  const candidate = raw.endsWith(".") ? raw.slice(0, -1) : raw;
+  return validClaudeUrl(candidate) ? candidate : null;
 }
 
 export function extractActiveClaudeUrl(text: string): string | null {

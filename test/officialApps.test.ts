@@ -6,6 +6,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import {
   OfficialAppsService,
   extractActiveClaudeUrl,
+  extractClaudeRemoteDialogUrl,
   parseCodexPairing,
   parseCodexStart,
   validClaudeUrl,
@@ -17,7 +18,10 @@ import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
 class FakeBackend implements SessionBackend {
   readonly store: SessionMetadataStore;
   pane = "";
+  paneAfterSubmit =
+    "Remote Control is active\nhttps://claude.ai/code/session_123\n";
   readonly submitted: string[] = [];
+  readonly sentKeys: string[][] = [];
 
   constructor(base: string) {
     this.store = new SessionMetadataStore(join(base, "sessions"));
@@ -33,12 +37,13 @@ class FakeBackend implements SessionBackend {
 
   async kill() {}
 
-  async sendKeys() {}
+  async sendKeys(_name: string, keys: string[]) {
+    this.sentKeys.push(keys);
+  }
 
   async sendTextSubmit(_name: string, text: string) {
     this.submitted.push(text);
-    this.pane =
-      "Remote Control is active\nhttps://claude.ai/code/session_123\n";
+    this.pane = this.paneAfterSubmit;
   }
 
   async capturePane() {
@@ -49,6 +54,17 @@ class FakeBackend implements SessionBackend {
     return true;
   }
 }
+
+// claude 2.1.220 実機採取: active 中の /remote-control 再実行が開く modal dialog。
+const CLAUDE_REMOTE_DIALOG = [
+  "❯ /remote-control",
+  "   Remote Control",
+  "   This session is available in the Claude mobile app and at https://claude.ai/code/session_01Ufxtxn.",
+  "     Disconnect this session",
+  "     Show QR code  Scan with your phone to open this session",
+  "   ❯ Continue",
+  "   Enter to select · Esc to continue",
+].join("\n");
 
 const temporaryDirectories: string[] = [];
 
@@ -145,6 +161,19 @@ describe("Claude 公式アプリ URL", () => {
     ).toBeNull();
   });
 
+  test("Remote Control dialog から末尾ピリオドを除いた URL を抽出する", () => {
+    expect(extractClaudeRemoteDialogUrl(CLAUDE_REMOTE_DIALOG)).toBe(
+      "https://claude.ai/code/session_01Ufxtxn",
+    );
+    // Disconnect ラベルが無い（dialog が開いていない）テキストからは抽出しない。
+    expect(
+      extractClaudeRemoteDialogUrl(
+        "This session is available in the Claude mobile app and at https://claude.ai/code/session_x.",
+      ),
+    ).toBeNull();
+    expect(extractClaudeRemoteDialogUrl("Disconnect this session")).toBeNull();
+  });
+
   test("host・path・query の別名を許さない", () => {
     expect(validClaudeUrl("https://claude.ai/code/abc-_123")).toBe(true);
     expect(validClaudeUrl("https://evil.example/code/abc")).toBe(false);
@@ -186,6 +215,78 @@ describe("OfficialAppsService", () => {
       provider: "claude",
       outcome: "open",
       launchUrl: "https://claude.ai/code/session_123",
+    });
+  });
+
+  test("Claude dialog が既に開いていれば Esc で閉じて URL を返し、注入しない", async () => {
+    const base = temporaryDirectory();
+    const backend = new FakeBackend(base);
+    backend.pane = CLAUDE_REMOTE_DIALOG;
+    const service = new OfficialAppsService({
+      commandRunner: commandRunner({
+        "claude --version": { success: true, stdout: "2.1.220 (Claude Code)\n" },
+        "claude auth status --json": { success: true, stdout: claudeAuth() },
+      }),
+      actionLockPath: join(base, "action.lock"),
+      claudePollIntervalMs: 1,
+      claudeStartTimeoutMs: 20,
+    });
+
+    const result = await service.perform(
+      {
+        session: "s",
+        provider: "claude",
+        sessionManager: backend,
+        canInjectClaudeCommand: true,
+        canMutateCodexDaemon: true,
+      },
+      "open",
+      true,
+      false,
+    );
+
+    expect(backend.submitted).toEqual([]);
+    expect(backend.sentKeys).toEqual([["Escape"]]);
+    expect(result).toMatchObject({
+      provider: "claude",
+      outcome: "open",
+      launchUrl: "https://claude.ai/code/session_01Ufxtxn",
+    });
+  });
+
+  test("アーカイブ直後: 注入後に dialog が開いたら Esc で閉じて URL を返す", async () => {
+    const base = temporaryDirectory();
+    const backend = new FakeBackend(base);
+    backend.paneAfterSubmit = CLAUDE_REMOTE_DIALOG;
+    const service = new OfficialAppsService({
+      commandRunner: commandRunner({
+        "claude --version": { success: true, stdout: "2.1.220 (Claude Code)\n" },
+        "claude auth status --json": { success: true, stdout: claudeAuth() },
+      }),
+      actionLockPath: join(base, "action.lock"),
+      claudePollIntervalMs: 1,
+      claudeStartTimeoutMs: 20,
+    });
+
+    const result = await service.perform(
+      {
+        session: "s",
+        provider: "claude",
+        sessionManager: backend,
+        canInjectClaudeCommand: true,
+        canMutateCodexDaemon: true,
+      },
+      "open",
+      true,
+      false,
+    );
+
+    expect(backend.submitted).toEqual(["/remote-control"]);
+    expect(backend.sentKeys).toEqual([["Escape"]]);
+    expect(result).toMatchObject({
+      provider: "claude",
+      outcome: "open",
+      launchUrl: "https://claude.ai/code/session_01Ufxtxn",
     });
   });
 
