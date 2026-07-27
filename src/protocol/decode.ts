@@ -470,6 +470,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
     }
 
     case "pane_choice_send":
+    case "pane_key_send":
       return {
         type, v,
         id: requireString(raw, "id"),
@@ -478,6 +479,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
       };
 
     case "pane_choice_send_result":
+    case "pane_key_send_result":
       return {
         type, v,
         id: requireString(raw, "id"),

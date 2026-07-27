@@ -94,7 +94,34 @@ export const modeHandlers: HandlerRegistry = {
     }
   },
 
+  pane_key_send: async (message, ctx) => {
+    const { writer, state, sessionManager } = ctx;
+    const v = state.negotiatedVersion;
+    // 制御キー（中断 C-c 等）の pane 注入。iOS の PTY(tmux attach) 束縛は herdr
+    // セッションでは attach 失敗後の生シェルに吸われて claude へ届かないため、
+    // pane_choice_send と同じく SessionBackend 経由で注入する（tmux / herdr 両対応）。
+    engineDiag(`pane_key_send id=${message.id} session=${message.session} key=${message.key}`);
+    if (!PANE_KEY_ALLOWLIST.has(message.key)) {
+      writer.write({
+        type: "pane_key_send_result", v, id: message.id,
+        ok: false, error: `不正なキーです: ${message.key}`,
+      });
+      return;
+    }
+    try {
+      await sessionManager.sendKeys(message.session, [message.key]);
+      writer.write({ type: "pane_key_send_result", v, id: message.id, ok: true, error: null });
+    } catch (error) {
+      engineDiag(`pane_key_send 失敗 id=${message.id}: ${String(error)}`);
+      writer.write({
+        type: "pane_key_send_result", v, id: message.id, ok: false, error: String(error),
+      });
+    }
+  },
 };
+
+/** pane_key_send が受理する制御キー（tmux 互換キー名）。テキスト注入経路には使わせない。 */
+const PANE_KEY_ALLOWLIST = new Set(["C-c", "Escape"]);
 
 /** pane から mode が判定できるまで、指定回数だけ短く待つ。 */
 async function waitForPermissionMode(

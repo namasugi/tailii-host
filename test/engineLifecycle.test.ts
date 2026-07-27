@@ -588,6 +588,42 @@ describe("Engine — アイドルライフサイクル/ページング", () => {
     await engine.teardown();
   });
 
+  // MARK: 追加: pane_key_send（制御キー注入 — herdr で PTY が効かない中断経路の host 経由化）
+
+  test("pane_key_send は C-c を pane へ注入し ok を返す", async () => {
+    const runner = new MockTmuxRunner(() => ok(""));
+    const mgr = new TmuxSessionManager({ runner: runner.runner, store: makeTempStore() });
+    const engine = startEngine({ sessionManager: mgr });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"id":"PK1","key":"C-c","session":"work","type":"pane_key_send","v":1}');
+    const resp = await engine.lines.nextOfType("pane_key_send_result");
+    expect(resp).toContain('"id":"PK1"');
+    expect(resp).toContain('"ok":true');
+    const recorded = runner.recorded.map((cmd) => JSON.stringify(cmd));
+    expect(recorded).toContain(JSON.stringify(["send-keys", "-t", "work", "C-c"]));
+
+    await engine.teardown();
+  });
+
+  test("pane_key_send は allowlist 外の key を拒否し注入しない", async () => {
+    const runner = new MockTmuxRunner(() => ok(""));
+    const mgr = new TmuxSessionManager({ runner: runner.runner, store: makeTempStore() });
+    const engine = startEngine({ sessionManager: mgr });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine(
+      '{"id":"PK2","key":"rm -rf","session":"work","type":"pane_key_send","v":1}',
+    );
+    const resp = await engine.lines.nextOfType("pane_key_send_result");
+    expect(resp).toContain('"id":"PK2"');
+    expect(resp).toContain('"ok":false');
+    const sendKeyCalls = runner.recorded.filter((cmd) => cmd[0] === "send-keys");
+    expect(sendKeyCalls).toEqual([]);
+
+    await engine.teardown();
+  });
+
   test("mode_set は BTab 後の再描画中を default と誤認せず明示マーカーまで待つ", async () => {
     const panes = [
       "⏸ manual mode on · ? for shortcuts\n",

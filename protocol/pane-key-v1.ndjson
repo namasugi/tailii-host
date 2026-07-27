@@ -1,0 +1,4 @@
+{"id":"pk1","key":"C-c","session":"s-1a2b3c4d","type":"pane_key_send","v":1}
+{"error":null,"id":"pk1","ok":true,"type":"pane_key_send_result","v":1}
+{"id":"pk2","key":"Escape","session":"s-1a2b3c4d","type":"pane_key_send","v":1}
+{"error":"pane not found","id":"pk2","ok":false,"type":"pane_key_send_result","v":1}

@@ -288,6 +288,8 @@ export type ControlMessage =
     }
   | { type: "pane_choice_send"; v: number; id: string; session: string; key: string }
   | { type: "pane_choice_send_result"; v: number; id: string; ok: boolean; error: string | null }
+  | { type: "pane_key_send"; v: number; id: string; session: string; key: string }
+  | { type: "pane_key_send_result"; v: number; id: string; ok: boolean; error: string | null }
   | { type: "question_prompt"; v: number; id: string; questions: QuestionPromptQuestion[] }
   | { type: "question_answer"; v: number; id: string; session: string; answers: QuestionAnswer[] }
   | { type: "question_dismiss"; v: number; id: string }
