@@ -30,7 +30,9 @@ Tailii is an iPhone app for controlling Claude Code and Codex sessions running o
 npx tailii-host setup
 ```
 
-表示された QR コードを Tailii アプリで読み取るか、表示されたコードをアプリに入力してペアリングします。
+表示された QR コードを Tailii アプリで読み取るか、表示された `host:port` と 6 桁コードをアプリに入力してペアリングします。
+
+SSH 鍵は **iPhone 側で生成され、その公開鍵だけがホストの `~/.ssh/authorized_keys` に登録されます**（秘密鍵はネットワークにも QR にも載りません）。QR には接続先とワンタイムの共有鍵だけが入っており、**`setup` の実行中のみ有効**で 1 回のペアリングで失効します。うまくいかなかったときは `setup` をやり直してください。
 
 `setup` は、アプリが SSH 経由で実行するランチャー(`~/.local/bin/tailii-host`)を自動生成し、あわせて環境診断(tmux / claude CLI / SSH サーバー)を表示します。診断だけを再実行するには:
 
@@ -52,7 +54,7 @@ Tailii はサーバーレス構成で動作し、リレーサーバーは使い�
 
 ## Commands
 
-- `setup`: メインのユーザー向けコマンドです。ホストと Tailii iPhone アプリをペアリングします。
+- `setup`: メインのユーザー向けコマンドです。ホストと Tailii iPhone アプリをペアリングし、アプリが生成した公開鍵を `authorized_keys` に登録します。
 - `doctor`: 環境診断(tmux / claude CLI / SSH サーバー / ランチャー)を実行します。
 - `engine`: Tailii が利用する実行エンジン関連の処理を行います。
 - `serve`: ホスト側のローカルサーバーを起動します。
