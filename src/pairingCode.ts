@@ -8,8 +8,11 @@ const PROTOCOL_VERSION = 1;
 const INFO_SAS = "pocketclaude-pair-v1 sas";
 const INFO_CONFIRM = "pocketclaude-pair-v1 confirm";
 const INFO_DATA = "pocketclaude-pair-v1 data";
+const INFO_CLIENT_KEY = "pocketclaude-pair-v1 client-key";
 const INITIATOR_CONFIRM_MESSAGE = "pocketclaude-pair-v1 initiator-confirm";
 const DEFAULT_STEP_TIMEOUT_MS = 30_000;
+/** client_key 平文（authorized_keys 1 行）の上限（spec v1.1）。 */
+const CLIENT_KEY_LINE_MAX_BYTES = 1024;
 
 export interface PairingStream {
   readable: NodeJS.ReadableStream;
@@ -17,26 +20,41 @@ export interface PairingStream {
 }
 
 export interface PairingResponderDeps {
-  payloadJSON: string;
+  /**
+   * legacy（key あり）payload。enrollment 不成立のときだけ送る。
+   * 関数を渡すと**その時にだけ**評価される（ホスト側鍵の生成・登録を遅延させ、
+   * 新アプリだけを使う環境にホスト生成の秘密鍵を残さないため）。
+   */
+  payloadJSON: string | (() => string);
   displaySAS: (code: string) => void;
+  /** v1.1: enrollment 成立時に送る key なし payload（v4）。registerClientKey と揃って指定で enrollment 有効。 */
+  payloadJSONNoKey?: string;
+  /** v1.1: QR ブートストラップのワンタイム PSK（32B）。hello.psk==1 の接続で鍵導出に混合する。 */
+  psk?: Buffer;
+  /** v1.1: 検証済みクライアント公開鍵行を authorized_keys へ登録する副作用。 */
+  registerClientKey?: (publicKeyLine: string) => void;
   randomBytes?: (size: number) => Buffer;
   timeoutMs?: number;
 }
 
-export type PairingResult = { status: "paired" } | { status: "aborted"; reason: string };
+export type PairingResult =
+  | { status: "paired"; clientKeyLine?: string }
+  | { status: "aborted"; reason: string };
 
 export interface DerivedPairingKeys {
   salt: Buffer;
   sasCode: string;
   confirmKey: Buffer;
   dataKey: Buffer;
+  clientKey: Buffer;
 }
 
 export type PairingMessage =
-  | { t: "hello"; v: 1; commit: string }
-  | { t: "server_key"; v: 1; epk: string }
+  | { t: "hello"; v: 1; commit: string; cpk?: 1; psk?: 1 }
+  | { t: "server_key"; v: 1; epk: string; ck?: 1 }
   | { t: "reveal"; epk: string }
   | { t: "confirm"; mac: string }
+  | { t: "client_key"; iv: string; ct: string; tag: string }
   | { t: "payload"; iv: string; ct: string; tag: string };
 
 export function rawX25519PublicKeyToKeyObject(raw32: Buffer): crypto.KeyObject {
@@ -75,15 +93,20 @@ export function derivePairingKeys(
   commit32: Buffer,
   responderPubRaw32: Buffer,
   initiatorPubRaw32: Buffer,
+  psk32?: Buffer,
 ): DerivedPairingKeys {
   if (sharedSecret32.length !== 32) throw new Error("x25519 shared secret must be 32 bytes");
+  if (psk32 !== undefined && psk32.length !== 32) throw new Error("pairing psk must be 32 bytes");
+  // v1.1 PSK モード: ikm を Z から Z || psk に置き換える（salt・info は不変）。
+  const ikm = psk32 === undefined ? sharedSecret32 : Buffer.concat([sharedSecret32, psk32]);
   const salt = pairingTranscriptSalt(commit32, responderPubRaw32, initiatorPubRaw32);
-  const kSas = hkdfSha256(sharedSecret32, salt, INFO_SAS, 4);
+  const kSas = hkdfSha256(ikm, salt, INFO_SAS, 4);
   return {
     salt,
     sasCode: deriveSASCode(kSas),
-    confirmKey: hkdfSha256(sharedSecret32, salt, INFO_CONFIRM, 32),
-    dataKey: hkdfSha256(sharedSecret32, salt, INFO_DATA, 32),
+    confirmKey: hkdfSha256(ikm, salt, INFO_CONFIRM, 32),
+    dataKey: hkdfSha256(ikm, salt, INFO_DATA, 32),
+    clientKey: hkdfSha256(ikm, salt, INFO_CLIENT_KEY, 32),
   };
 }
 
@@ -107,16 +130,30 @@ export function parsePairingMessage(line: string): PairingMessage | null {
   switch (value.t) {
     case "hello":
       if (value.v !== PROTOCOL_VERSION || typeof value.commit !== "string") return null;
-      return { t: "hello", v: PROTOCOL_VERSION, commit: value.commit };
+      return {
+        t: "hello",
+        v: PROTOCOL_VERSION,
+        commit: value.commit,
+        ...(value.cpk === 1 ? { cpk: 1 as const } : {}),
+        ...(value.psk === 1 ? { psk: 1 as const } : {}),
+      };
     case "server_key":
       if (value.v !== PROTOCOL_VERSION || typeof value.epk !== "string") return null;
-      return { t: "server_key", v: PROTOCOL_VERSION, epk: value.epk };
+      return {
+        t: "server_key",
+        v: PROTOCOL_VERSION,
+        epk: value.epk,
+        ...(value.ck === 1 ? { ck: 1 as const } : {}),
+      };
     case "reveal":
       if (typeof value.epk !== "string") return null;
       return { t: "reveal", epk: value.epk };
     case "confirm":
       if (typeof value.mac !== "string") return null;
       return { t: "confirm", mac: value.mac };
+    case "client_key":
+      if (typeof value.iv !== "string" || typeof value.ct !== "string" || typeof value.tag !== "string") return null;
+      return { t: "client_key", iv: value.iv, ct: value.ct, tag: value.tag };
     case "payload":
       if (typeof value.iv !== "string" || typeof value.ct !== "string" || typeof value.tag !== "string") return null;
       return { t: "payload", iv: value.iv, ct: value.ct, tag: value.tag };
@@ -155,6 +192,38 @@ export function decryptPayload(dataKey32: Buffer, iv12: Buffer, ciphertext: Buff
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
 }
 
+/**
+ * client_key 平文（authorized_keys 1 行）を検証して公開鍵行を返す（spec v1.1）。
+ * `ssh-ed25519 <base64 blob> [comment]` 形式・blob が SSH wire 形式（string "ssh-ed25519" +
+ * string 32B 公開鍵・末尾余剰なし）・制御文字なし・1024B 以下のみ受理。不正は null。
+ */
+export function parseClientPublicKeyLine(plaintext: Buffer): string | null {
+  if (plaintext.length === 0 || plaintext.length > CLIENT_KEY_LINE_MAX_BYTES) return null;
+  const line = plaintext.toString("utf8");
+  if (Buffer.byteLength(line, "utf8") !== plaintext.length) return null;
+  // 改行・制御文字を含む行は authorized_keys を汚染し得るため拒否する。
+  if (/[\u0000-\u001f\u007f]/.test(line)) return null;
+  const parts = line.split(" ");
+  if (parts.length < 2 || parts.length > 3 || parts[0] !== "ssh-ed25519") return null;
+  const blob = decodeBase64Loose(parts[1]!);
+  if (blob === null) return null;
+  // SSH wire: string "ssh-ed25519" + string pubkey(32B)、末尾に余剰バイトなし。
+  const typeName = Buffer.from("ssh-ed25519", "utf8");
+  if (blob.length !== 4 + typeName.length + 4 + 32) return null;
+  if (blob.readUInt32BE(0) !== typeName.length) return null;
+  if (!blob.subarray(4, 4 + typeName.length).equals(typeName)) return null;
+  if (blob.readUInt32BE(4 + typeName.length) !== 32) return null;
+  return line;
+}
+
+/** 長さ不定の base64（std, padding あり）をデコードする。往復一致しないものは null。 */
+function decodeBase64Loose(value: string): Buffer | null {
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) return null;
+  const decoded = Buffer.from(value, "base64");
+  if (decoded.toString("base64") !== value) return null;
+  return decoded;
+}
+
 export async function runPairingResponder(stream: PairingStream, deps: PairingResponderDeps): Promise<PairingResult> {
   const timeoutMs = deps.timeoutMs ?? DEFAULT_STEP_TIMEOUT_MS;
   const randomBytes = deps.randomBytes ?? crypto.randomBytes;
@@ -167,9 +236,20 @@ export async function runPairingResponder(stream: PairingStream, deps: PairingRe
     const commit = decodeBase64Field(hello.commit, 32);
     if (commit === null) return abort(stream, reader, "invalid commit");
 
+    // v1.1: PSK モード（QR ブートストラップ）と enrollment の成立判定。
+    const pskMode = hello.psk === 1;
+    if (pskMode && deps.psk === undefined) return abort(stream, reader, "psk unavailable");
+    const enroll =
+      hello.cpk === 1 && deps.registerClientKey !== undefined && deps.payloadJSONNoKey !== undefined;
+
     const responderKeypair = crypto.generateKeyPairSync("x25519");
     const responderPubRaw = x25519PublicKeyObjectToRaw(responderKeypair.publicKey);
-    writeMessage(stream.writable, { t: "server_key", v: PROTOCOL_VERSION, epk: responderPubRaw.toString("base64") });
+    writeMessage(stream.writable, {
+      t: "server_key",
+      v: PROTOCOL_VERSION,
+      epk: responderPubRaw.toString("base64"),
+      ...(enroll ? { ck: 1 as const } : {}),
+    });
 
     const revealLine = await reader.readLine(timeoutMs);
     if (revealLine === null) return abort(stream, reader, "timeout");
@@ -182,8 +262,15 @@ export async function runPairingResponder(stream: PairingStream, deps: PairingRe
 
     const initiatorPub = rawX25519PublicKeyToKeyObject(initiatorPubRaw);
     const sharedSecret = crypto.diffieHellman({ privateKey: responderKeypair.privateKey, publicKey: initiatorPub });
-    const keys = derivePairingKeys(sharedSecret, commit, responderPubRaw, initiatorPubRaw);
-    deps.displaySAS(keys.sasCode);
+    const keys = derivePairingKeys(
+      sharedSecret,
+      commit,
+      responderPubRaw,
+      initiatorPubRaw,
+      pskMode ? deps.psk : undefined,
+    );
+    // PSK モードでは SAS の人間照合を省略する（QR の psk 所持が相互認証を担う）。
+    if (!pskMode) deps.displaySAS(keys.sasCode);
 
     const confirmLine = await reader.readLine(timeoutMs);
     if (confirmLine === null) return abort(stream, reader, "timeout");
@@ -194,7 +281,36 @@ export async function runPairingResponder(stream: PairingStream, deps: PairingRe
     const expectedMac = computeInitiatorConfirmMac(keys.confirmKey);
     if (!safeEqual32(receivedMac, expectedMac)) return abort(stream, reader, "confirm mac mismatch");
 
-    const encrypted = encryptPayload(keys.dataKey, Buffer.from(deps.payloadJSON, "utf8"), randomBytes);
+    // v1.1: enrollment 成立時は payload の前に client_key を受理・登録し、key なし payload を送る。
+    let clientKeyLine: string | undefined;
+    if (enroll) {
+      const clientKeyMsgLine = await reader.readLine(timeoutMs);
+      if (clientKeyMsgLine === null) return abort(stream, reader, "timeout");
+      const clientKeyMsg = parsePairingMessage(clientKeyMsgLine);
+      if (clientKeyMsg?.t !== "client_key") return abort(stream, reader, "invalid client_key");
+      const iv = decodeBase64Field(clientKeyMsg.iv, 12);
+      const tag = decodeBase64Field(clientKeyMsg.tag, 16);
+      const ct = decodeBase64Loose(clientKeyMsg.ct);
+      if (iv === null || tag === null || ct === null) return abort(stream, reader, "invalid client_key");
+      let plaintext: Buffer;
+      try {
+        plaintext = decryptPayload(keys.clientKey, iv, ct, tag);
+      } catch {
+        return abort(stream, reader, "client_key decrypt failed");
+      }
+      const line = parseClientPublicKeyLine(plaintext);
+      if (line === null) return abort(stream, reader, "invalid client public key");
+      deps.registerClientKey!(line);
+      clientKeyLine = line;
+    }
+
+    // legacy payload は enrollment 不成立のときだけ評価する（遅延 keygen の契約）。
+    const payloadJSON = enroll
+      ? deps.payloadJSONNoKey!
+      : typeof deps.payloadJSON === "function"
+        ? deps.payloadJSON()
+        : deps.payloadJSON;
+    const encrypted = encryptPayload(keys.dataKey, Buffer.from(payloadJSON, "utf8"), randomBytes);
     writeMessage(stream.writable, {
       t: "payload",
       iv: encrypted.iv.toString("base64"),
@@ -203,7 +319,7 @@ export async function runPairingResponder(stream: PairingStream, deps: PairingRe
     });
     endWritable(stream.writable);
     reader.dispose();
-    return { status: "paired" };
+    return { status: "paired", ...(clientKeyLine !== undefined ? { clientKeyLine } : {}) };
   } catch {
     return abort(stream, reader, "aborted");
   }

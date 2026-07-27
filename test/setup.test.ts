@@ -107,6 +107,34 @@ describe("encodePairingPayload", () => {
     ]);
   });
 
+  it("v4（key なし）が golden pairing-payload-v4.json と byte 一致する", () => {
+    const golden = fs.readFileSync(path.join(REPO_ROOT, "protocol", "pairing-payload-v4.json"), "utf8");
+    const encoded = encodePairingPayload({
+      host: "192.168.1.2",
+      port: 22,
+      user: "alice",
+      sessionName: "work",
+      sessionCwd: "/Users/alice/proj",
+      quic: {
+        port: 46853,
+        pin: "m5nX2gT9m0hZ8bK1fJc3vR7wQp4sU6yD0aE/LkNhOiA=",
+        token: "dGFpbGlpLXF1aWMtdG9rZW4tcGxhY2Vob2xkZXItMDE=",
+      },
+    });
+    expect(encoded + "\n").toBe(golden);
+    expect(encoded).not.toContain('"key"');
+  });
+
+  it("key 省略なら session/quic の有無に関わらず常に v4 で key を含まない", () => {
+    const plain = JSON.parse(encodePairingPayload({ host: "h", port: 22, user: "u" }));
+    expect(plain.v).toBe(4);
+    expect(Object.keys(plain).sort()).toEqual(["host", "port", "user", "v"]);
+    const withSession = JSON.parse(encodePairingPayload({ host: "h", port: 22, user: "u", sessionName: "s" }));
+    expect(withSession.v).toBe(4);
+    expect(withSession.sessionName).toBe("s");
+    expect(withSession.key).toBeUndefined();
+  });
+
   it("quic 未指定なら従来どおり v1/v2 のまま（後方互換）", () => {
     expect(JSON.parse(encodePairingPayload({ host: "h", port: 22, user: "u", key: "k" })).v).toBe(1);
     expect(

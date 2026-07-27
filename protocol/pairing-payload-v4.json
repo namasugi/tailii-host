@@ -1,0 +1,11 @@
+{
+  "host" : "192.168.1.2",
+  "port" : 22,
+  "quicPin" : "m5nX2gT9m0hZ8bK1fJc3vR7wQp4sU6yD0aE\/LkNhOiA=",
+  "quicPort" : 46853,
+  "quicToken" : "dGFpbGlpLXF1aWMtdG9rZW4tcGxhY2Vob2xkZXItMDE=",
+  "sessionCwd" : "\/Users\/alice\/proj",
+  "sessionName" : "work",
+  "user" : "alice",
+  "v" : 4
+}

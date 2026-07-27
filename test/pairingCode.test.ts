@@ -10,18 +10,35 @@ import {
   derivePairingKeys,
   deriveSASCode,
   encodePairingMessage,
+  encryptPayload,
   hkdfSha256,
   pairingTranscriptSalt,
+  parseClientPublicKeyLine,
   parsePairingMessage,
   rawX25519PublicKeyToKeyObject,
   runPairingResponder,
   x25519PublicKeyObjectToRaw,
   type PairingMessage,
+  type PairingResponderDeps,
   type PairingResult,
   type PairingStream,
 } from "../src/pairingCode.js";
 
 const PAYLOAD_JSON = '{\n  "host" : "192.168.1.2",\n  "key" : "PRIVATE",\n  "port" : 22,\n  "user" : "alice",\n  "v" : 1\n}';
+const NOKEY_PAYLOAD_JSON = '{\n  "host" : "192.168.1.2",\n  "port" : 22,\n  "user" : "alice",\n  "v" : 4\n}';
+
+/** SSH wire 形式の妥当な ed25519 公開鍵行を組み立てる（テスト用）。 */
+function makeClientKeyLine(comment?: string, pubByte = 0x2a): string {
+  const type = Buffer.from("ssh-ed25519", "utf8");
+  const blob = Buffer.concat([u32(type.length), type, u32(32), Buffer.alloc(32, pubByte)]);
+  return `ssh-ed25519 ${blob.toString("base64")}${comment !== undefined ? ` ${comment}` : ""}`;
+}
+
+function u32(value: number): Buffer {
+  const b = Buffer.alloc(4);
+  b.writeUInt32BE(value);
+  return b;
+}
 
 interface MemoryPeer {
   stream: PairingStream;
@@ -32,6 +49,8 @@ interface MemoryPeer {
 interface InitiatorResult {
   payloadJSON?: string;
   sasCode?: string;
+  /** responder が server_key で ck:1 を返したか（enrollment 受理）。 */
+  ckAcked?: boolean;
 }
 
 function createMemoryPair(): { responder: MemoryPeer; initiator: MemoryPeer; responderWire: Buffer[] } {
@@ -79,6 +98,14 @@ async function runInitiator(
     skipConfirm?: boolean;
     commitFrom?: Buffer;
     timeoutMs?: number;
+    /** v1.1: hello に cpk:1 を付ける（enrollment 希望）。 */
+    cpk?: boolean;
+    /** v1.1: hello に psk:1 を付け、鍵導出に混合する PSK。 */
+    psk?: Buffer;
+    /** v1.1: ck 受理時に client_key で送る公開鍵行。 */
+    clientKeyLine?: string;
+    /** v1.1: client_key の平文を差し替える（不正入力テスト用。clientKeyLine より優先）。 */
+    rawClientKeyPlaintext?: Buffer;
   } = {},
 ): Promise<InitiatorResult> {
   const reader = new TestLineReader(peer.stream.readable);
@@ -88,7 +115,13 @@ async function runInitiator(
   const derivePub = pubRaw(deriveKeypair);
   const commit = options.commitFrom ?? sha256(wirePub);
 
-  writeMessage(peer.stream.writable, { t: "hello", v: 1, commit: commit.toString("base64") });
+  writeMessage(peer.stream.writable, {
+    t: "hello",
+    v: 1,
+    commit: commit.toString("base64"),
+    ...(options.cpk === true ? { cpk: 1 as const } : {}),
+    ...(options.psk !== undefined ? { psk: 1 as const } : {}),
+  });
 
   const serverKeyLine = await reader.readLine(options.timeoutMs);
   if (serverKeyLine === null) return {};
@@ -96,6 +129,7 @@ async function runInitiator(
   if (serverKey?.t !== "server_key") throw new Error("expected server_key");
   const responderPub = decodeBase64Field(serverKey.epk, 32);
   if (responderPub === null) throw new Error("invalid server key");
+  const ckAcked = serverKey.ck === 1;
 
   writeMessage(peer.stream.writable, { t: "reveal", epk: wirePub.toString("base64") });
 
@@ -103,21 +137,34 @@ async function runInitiator(
     privateKey: deriveKeypair.privateKey,
     publicKey: rawX25519PublicKeyToKeyObject(responderPub),
   });
-  const keys = derivePairingKeys(sharedSecret, sha256(derivePub), responderPub, derivePub);
-  if (options.skipConfirm) return { sasCode: keys.sasCode };
+  const keys = derivePairingKeys(sharedSecret, sha256(derivePub), responderPub, derivePub, options.psk);
+  if (options.skipConfirm) return { sasCode: keys.sasCode, ckAcked };
 
   const mac = options.badConfirmMac ? Buffer.alloc(32, 0xa5) : computeInitiatorConfirmMac(keys.confirmKey);
   writeMessage(peer.stream.writable, { t: "confirm", mac: mac.toString("base64") });
 
+  const clientKeyPlaintext =
+    options.rawClientKeyPlaintext ??
+    (options.clientKeyLine !== undefined ? Buffer.from(options.clientKeyLine, "utf8") : undefined);
+  if (ckAcked && clientKeyPlaintext !== undefined) {
+    const sealed = encryptPayload(keys.clientKey, clientKeyPlaintext, (size) => Buffer.alloc(size, 3));
+    writeMessage(peer.stream.writable, {
+      t: "client_key",
+      iv: sealed.iv.toString("base64"),
+      ct: sealed.ciphertext.toString("base64"),
+      tag: sealed.tag.toString("base64"),
+    });
+  }
+
   const payloadLine = await reader.readLine(options.timeoutMs);
-  if (payloadLine === null) return { sasCode: keys.sasCode };
+  if (payloadLine === null) return { sasCode: keys.sasCode, ckAcked };
   const payload = parsePairingMessage(payloadLine);
-  if (payload?.t !== "payload") return { sasCode: keys.sasCode };
+  if (payload?.t !== "payload") return { sasCode: keys.sasCode, ckAcked };
   const iv = decodeBase64Field(payload.iv, 12);
   const tag = decodeBase64Field(payload.tag, 16);
   if (iv === null || tag === null) throw new Error("invalid payload fields");
   const plaintext = decryptPayload(keys.dataKey, iv, Buffer.from(payload.ct, "base64"), tag);
-  return { sasCode: keys.sasCode, payloadJSON: plaintext.toString("utf8") };
+  return { sasCode: keys.sasCode, ckAcked, payloadJSON: plaintext.toString("utf8") };
 }
 
 class TestLineReader {
@@ -176,6 +223,8 @@ class TestLineReader {
 async function runResponderHarness(options: {
   initiator: (peer: MemoryPeer) => Promise<InitiatorResult>;
   timeoutMs?: number;
+  /** v1.1: responder deps の上書き（enrollment/psk の注入）。 */
+  deps?: Partial<PairingResponderDeps>;
 }): Promise<{ responderResult: PairingResult; initiatorResult: InitiatorResult; displayedSAS: string[]; wire: string }> {
   const pair = createMemoryPair();
   const displayedSAS: string[] = [];
@@ -184,6 +233,7 @@ async function runResponderHarness(options: {
     displaySAS: (code) => displayedSAS.push(code),
     timeoutMs: options.timeoutMs ?? 1000,
     randomBytes: (size) => Buffer.alloc(size, 7),
+    ...options.deps,
   });
   const initiatorResult = await options.initiator(pair.initiator);
   const responderResult = await responderDone;
@@ -287,5 +337,198 @@ describe("runPairingResponder", () => {
     expect(responderResult).toEqual({ status: "aborted", reason: "timeout" });
     expect(displayedSAS).toEqual([]);
     expectNoPayloadOnWire(Buffer.concat(pair.responderWire).toString("utf8"));
+  });
+});
+
+// MARK: - v1.1 導出テストベクトル（spec pairing-code-v1.md と両実装で一致させる）
+
+describe("v1.1 spec derivation vectors", () => {
+  const Z = Buffer.alloc(32, 0x11);
+  const PSK = Buffer.alloc(32, 0x22);
+  const COMMIT = Buffer.alloc(32, 0x33);
+  const EPK_R = Buffer.alloc(32, 0x44);
+  const EPK_I = Buffer.alloc(32, 0x55);
+
+  it("legacy（ikm=Z）が spec の値と一致する", () => {
+    const keys = derivePairingKeys(Z, COMMIT, EPK_R, EPK_I);
+    expect(keys.salt.toString("hex")).toBe("9b406c08deb9f44c7453882855aeb01b437e659c9a64943472f8f0de510c9230");
+    expect(keys.sasCode).toBe("411019");
+    expect(keys.confirmKey.toString("hex")).toBe("297e4dcd5fbd588bb08ca702814a7fa19c1133c46d280c50dbd27745c5f7faeb");
+    expect(keys.dataKey.toString("hex")).toBe("d6e714003cf18591fcad92750c2f7455a3c57270417cc41b3a5401b48c450dd8");
+    expect(keys.clientKey.toString("hex")).toBe("a3e9b7e0364f777b4a8b3edeb4b7ab3d80bad2883bcea3b6b369b6f3f4b6596a");
+    expect(computeInitiatorConfirmMac(keys.confirmKey).toString("hex")).toBe(
+      "fec134edfaf8fdf8ef980660a940444b8ebbc24c5fe1f458c58f6012fb4aebde",
+    );
+  });
+
+  it("PSK モード（ikm=Z||psk）が spec の値と一致する", () => {
+    const keys = derivePairingKeys(Z, COMMIT, EPK_R, EPK_I, PSK);
+    expect(keys.sasCode).toBe("191386");
+    expect(keys.confirmKey.toString("hex")).toBe("f5c8068a44a00c9724003efde0f0088b379018f25f76c2172408fd625722ae41");
+    expect(keys.dataKey.toString("hex")).toBe("812f726503c54289604e04d1f8594fc266d60c6ad3a2e9493e760d6e83802428");
+    expect(keys.clientKey.toString("hex")).toBe("44b4d6342363a2f3ed2b05c968bfda3699cb4e9e50bfc24c1867fd3485afd186");
+    expect(computeInitiatorConfirmMac(keys.confirmKey).toString("hex")).toBe(
+      "147a8792e5cdea6206d35827d2d586956fa2930067f242fb3fe8a14587590dc2",
+    );
+  });
+});
+
+// MARK: - v1.1 client-key enrollment / PSK モード
+
+describe("runPairingResponder v1.1 (client-key enrollment + PSK)", () => {
+  const CLIENT_LINE = makeClientKeyLine("tailii-ios");
+  const PSK = Buffer.alloc(32, 0x22);
+
+  function enrollmentDeps(registered: string[]): Partial<PairingResponderDeps> {
+    return {
+      payloadJSONNoKey: NOKEY_PAYLOAD_JSON,
+      psk: PSK,
+      registerClientKey: (line) => registered.push(line),
+    };
+  }
+
+  it("cpk+ck 成立時は client_key を登録して key なし payload を送る（秘密鍵はワイヤに載らない）", async () => {
+    const registered: string[] = [];
+    const result = await runResponderHarness({
+      deps: enrollmentDeps(registered),
+      initiator: (peer) => runInitiator(peer, { cpk: true, clientKeyLine: CLIENT_LINE }),
+    });
+    expect(result.responderResult).toEqual({ status: "paired", clientKeyLine: CLIENT_LINE });
+    expect(registered).toEqual([CLIENT_LINE]);
+    expect(result.initiatorResult.ckAcked).toBe(true);
+    expect(result.initiatorResult.payloadJSON).toBe(NOKEY_PAYLOAD_JSON);
+    // 秘密鍵入り legacy payload はワイヤに現れない（AEAD 平文比較）。
+    expect(result.wire).not.toContain("PRIVATE");
+  });
+
+  it("enrollment 成立時は legacy payload ビルダを一度も評価しない（ホスト側 keygen を起こさない）", async () => {
+    const registered: string[] = [];
+    let legacyBuilds = 0;
+    const result = await runResponderHarness({
+      deps: {
+        ...enrollmentDeps(registered),
+        payloadJSON: () => {
+          legacyBuilds += 1;
+          return PAYLOAD_JSON;
+        },
+      },
+      initiator: (peer) => runInitiator(peer, { cpk: true, clientKeyLine: CLIENT_LINE }),
+    });
+    expect(result.responderResult.status).toBe("paired");
+    expect(legacyBuilds).toBe(0);
+    expect(result.initiatorResult.payloadJSON).toBe(NOKEY_PAYLOAD_JSON);
+  });
+
+  it("legacy フォールバック時のみビルダを 1 回評価して key あり payload を送る", async () => {
+    const registered: string[] = [];
+    let legacyBuilds = 0;
+    const result = await runResponderHarness({
+      deps: {
+        ...enrollmentDeps(registered),
+        payloadJSON: () => {
+          legacyBuilds += 1;
+          return PAYLOAD_JSON;
+        },
+      },
+      initiator: (peer) => runInitiator(peer),
+    });
+    expect(result.responderResult.status).toBe("paired");
+    expect(legacyBuilds).toBe(1);
+    expect(result.initiatorResult.payloadJSON).toBe(PAYLOAD_JSON);
+  });
+
+  it("旧アプリ（cpk なし）には ck を付けず legacy payload を送る", async () => {
+    const registered: string[] = [];
+    const result = await runResponderHarness({
+      deps: enrollmentDeps(registered),
+      initiator: (peer) => runInitiator(peer),
+    });
+    expect(result.responderResult).toEqual({ status: "paired" });
+    expect(registered).toEqual([]);
+    expect(result.initiatorResult.ckAcked).toBe(false);
+    expect(result.initiatorResult.payloadJSON).toBe(PAYLOAD_JSON);
+    expect(result.wire).not.toContain('"ck":1');
+  });
+
+  it("responder が enrollment 非対応（deps 欠落）なら cpk が来ても legacy にフォールバックする", async () => {
+    const result = await runResponderHarness({
+      initiator: (peer) => runInitiator(peer, { cpk: true, clientKeyLine: CLIENT_LINE }),
+    });
+    expect(result.responderResult).toEqual({ status: "paired" });
+    expect(result.initiatorResult.ckAcked).toBe(false);
+    expect(result.initiatorResult.payloadJSON).toBe(PAYLOAD_JSON);
+  });
+
+  it("PSK モードでは SAS を表示せず自動確認で成立する（QR ブートストラップ）", async () => {
+    const registered: string[] = [];
+    const result = await runResponderHarness({
+      deps: enrollmentDeps(registered),
+      initiator: (peer) => runInitiator(peer, { cpk: true, psk: PSK, clientKeyLine: CLIENT_LINE }),
+    });
+    expect(result.responderResult).toEqual({ status: "paired", clientKeyLine: CLIENT_LINE });
+    expect(result.displayedSAS).toEqual([]);
+    expect(result.initiatorResult.payloadJSON).toBe(NOKEY_PAYLOAD_JSON);
+  });
+
+  it("hello.psk=1 なのに responder が psk を持たなければ即 abort する", async () => {
+    const result = await runResponderHarness({
+      initiator: (peer) => runInitiator(peer, { psk: PSK, timeoutMs: 200 }),
+    });
+    expect(result.responderResult).toEqual({ status: "aborted", reason: "psk unavailable" });
+    expectNoPayloadOnWire(result.wire);
+  });
+
+  it("PSK 不一致（能動 MITM 相当）は confirm mac mismatch で abort・payload 非送出", async () => {
+    const registered: string[] = [];
+    const result = await runResponderHarness({
+      deps: enrollmentDeps(registered),
+      initiator: (peer) => runInitiator(peer, { cpk: true, psk: Buffer.alloc(32, 0x99), clientKeyLine: CLIENT_LINE }),
+    });
+    expect(result.responderResult).toEqual({ status: "aborted", reason: "confirm mac mismatch" });
+    expect(registered).toEqual([]);
+    expectNoPayloadOnWire(result.wire);
+  });
+
+  it("不正な client_key 平文は abort し、登録も payload 送出もしない", async () => {
+    const registered: string[] = [];
+    const result = await runResponderHarness({
+      deps: enrollmentDeps(registered),
+      initiator: (peer) =>
+        runInitiator(peer, { cpk: true, rawClientKeyPlaintext: Buffer.from("ssh-rsa AAAA evil", "utf8") }),
+    });
+    expect(result.responderResult).toEqual({ status: "aborted", reason: "invalid client public key" });
+    expect(registered).toEqual([]);
+    expectNoPayloadOnWire(result.wire);
+  });
+});
+
+// MARK: - parseClientPublicKeyLine
+
+describe("parseClientPublicKeyLine", () => {
+  it("妥当な ed25519 公開鍵行（comment あり/なし）を受理する", () => {
+    const withComment = makeClientKeyLine("tailii-ios");
+    const withoutComment = makeClientKeyLine();
+    expect(parseClientPublicKeyLine(Buffer.from(withComment, "utf8"))).toBe(withComment);
+    expect(parseClientPublicKeyLine(Buffer.from(withoutComment, "utf8"))).toBe(withoutComment);
+  });
+
+  it("型不一致・blob 破損・制御文字・過大入力を拒否する", () => {
+    const valid = makeClientKeyLine();
+    expect(parseClientPublicKeyLine(Buffer.from("ssh-rsa AAAA x", "utf8"))).toBeNull();
+    expect(parseClientPublicKeyLine(Buffer.from("", "utf8"))).toBeNull();
+    // blob 内の型名が一致しない（ssh-ed25519 ラベルの blob 差し替え）。
+    const type = Buffer.from("ssh-rsa0000", "utf8");
+    const bogusBlob = Buffer.concat([u32(type.length), type, u32(32), Buffer.alloc(32, 1)]);
+    expect(parseClientPublicKeyLine(Buffer.from(`ssh-ed25519 ${bogusBlob.toString("base64")}`, "utf8"))).toBeNull();
+    // 末尾に余剰バイトのある blob。
+    const goodType = Buffer.from("ssh-ed25519", "utf8");
+    const oversized = Buffer.concat([u32(goodType.length), goodType, u32(32), Buffer.alloc(33, 1)]);
+    expect(parseClientPublicKeyLine(Buffer.from(`ssh-ed25519 ${oversized.toString("base64")}`, "utf8"))).toBeNull();
+    // 改行注入（authorized_keys 汚染）を拒否。
+    expect(parseClientPublicKeyLine(Buffer.from(`${valid}\nssh-ed25519 evil`, "utf8"))).toBeNull();
+    // 1024B 超。
+    expect(parseClientPublicKeyLine(Buffer.from(`${valid} ${"x".repeat(1100)}`, "utf8"))).toBeNull();
+    // 空白 3 分割超（余計なフィールド）。
+    expect(parseClientPublicKeyLine(Buffer.from(`${valid} a b`, "utf8"))).toBeNull();
   });
 });

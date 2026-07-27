@@ -2,9 +2,10 @@
 // tailii (TS host) — setup サブコマンド実装
 // Swift スクリプト scripts/poc-host-setup.swift の移植（Moshi `host setup` 相当）。
 //
-// このホストでペアごとの ed25519 鍵を生成し、公開鍵を authorized_keys に登録、
-// {host, port, user, 秘密鍵PEM}（+ v2 では sessionName/sessionCwd）を
-// ペアリング payload として発行する。iPhone アプリはこれを QR スキャン / クリップボード貼付で取り込む。
+// ペアリングの提供コマンド。QR には「接続先 + ワンタイム PSK」だけを載せ（spec v1.1 ブートストラップ）、
+// スキャン後は pairing-code プロトコル（TCP）で iPhone 生成の公開鍵を authorized_keys へ登録する
+// （client-key enrollment・秘密鍵はワイヤに載せない）。旧アプリの直接入力向けには従来どおり
+// ホスト側 ed25519 鍵を用意し、key あり payload（v1/2/3）へフォールバックする。
 //
 // 使い方:  tailii setup
 //          tailii setup --session <name> [--session-cwd <cwd>]
@@ -21,8 +22,8 @@
 //   --emit-payload        副作用なし検証モード。keygen/QR/ファイル操作を行わず payload JSON を stdout に出すだけ。
 //                         既存の鍵があれば読むが無くても擬似値で継続。
 //
-// 注意: 秘密鍵を payload に載せるため、表示した QR は信頼できる端末でのみスキャンすること。
-//       リモートログイン(ON)が前提。公開鍵の authorized_keys 登録を行う。
+// 注意: リモートログイン(ON)が前提。公開鍵の authorized_keys 登録を行う。
+//       QR は setup 実行中のみ有効（ワンタイム PSK）。--emit-payload の byte 契約は legacy（key あり）のまま。
 //
 // Swift 版との差分:
 //   - QR は macOS 限定の PNG+open ではなく、ゼロ依存 `qrcode-terminal` でターミナルに直接描画する
@@ -32,6 +33,7 @@
 //     （2スペース字下げ・`" : "` 区切り・キー辞書順・`/`→`\/` エスケープ）。golden 契約を維持。
 
 import { execFileSync } from "node:child_process";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
@@ -63,13 +65,13 @@ export interface QuicPayloadFields {
   token: string;
 }
 
-/** ペアリング payload の入力（v は quic > sessionName の順で 3/2/1 が決まる）。 */
+/** ペアリング payload の入力（key あり: v は quic > sessionName の順で 3/2/1。key なし: 常に v4）。 */
 export interface PairingPayloadInput {
   host: string;
   port: number;
   user: string;
-  /** 秘密鍵 PEM 全文。 */
-  key: string;
+  /** 秘密鍵 PEM 全文。省略で payload v4（client-key enrollment 用・鍵転送なし）。 */
+  key?: string;
   /** 指定で v2 以上。 */
   sessionName?: string;
   /** v2 以上のみ。未指定なら JSON から省略される。 */
@@ -80,16 +82,16 @@ export interface PairingPayloadInput {
 
 /**
  * ペアリング payload を Swift `JSONEncoder`（`.prettyPrinted + .sortedKeys`）と byte 一致で符号化する。
- * 末尾改行は含めない（呼び出し側が付与）。golden `protocol/pairing-payload-v{1,2,3}.json` と契約整合。
+ * 末尾改行は含めない（呼び出し側が付与）。golden `protocol/pairing-payload-v{1,2,3,4}.json` と契約整合。
  */
 export function encodePairingPayload(input: PairingPayloadInput): string {
   const obj: Record<string, string | number> = {
     host: input.host,
-    key: input.key,
     port: input.port,
     user: input.user,
-    v: input.quic !== undefined ? 3 : input.sessionName !== undefined ? 2 : 1,
+    v: input.key === undefined ? 4 : input.quic !== undefined ? 3 : input.sessionName !== undefined ? 2 : 1,
   };
+  if (input.key !== undefined) obj["key"] = input.key;
   if (input.sessionName !== undefined) {
     obj["sessionName"] = input.sessionName;
     // v2 でも cwd 未指定なら Swift の optional=nil と同じく JSON から省略する。
@@ -336,33 +338,11 @@ export async function runSetupCommand(argv: string[]): Promise<number> {
     return 0;
   }
 
-  // --- 1) 鍵ペアを用意（無ければ生成） ---
-  let keypair: EnsureKeypairResult;
-  try {
-    keypair = ensureKeypair(base, sshKeygenEd25519);
-  } catch (error) {
-    process.stderr.write(`鍵生成に失敗: ${String(error)}\n`);
-    return 1;
-  }
-  process.stdout.write(
-    keypair.status === "generated"
-      ? "ed25519 鍵を生成しました。\n"
-      : `既存の鍵を再利用: ${path.join(base, "poc_id_ed25519")}\n`,
-  );
-
-  // --- 2) 公開鍵を authorized_keys に登録 ---
-  const sshDir = path.join(os.homedir(), ".ssh");
-  try {
-    const result = registerAuthorizedKey(sshDir, keypair.publicKeyLine);
-    process.stdout.write(
-      result === "added" ? "公開鍵を authorized_keys に登録しました。\n" : "公開鍵は登録済みです。\n",
-    );
-  } catch (error) {
-    process.stderr.write(`authorized_keys 登録に失敗: ${String(error)}\n`);
-    return 1;
-  }
-
-  // --- 2.5) ホストシムを生成 + 環境診断 ---
+  // --- 1) ホストシムを生成 + 環境診断 ---
+  // 注: ホスト側 ed25519 鍵の生成・authorized_keys 登録はここでは行わない。
+  //     新アプリは自分で鍵を作り公開鍵だけを登録させる（spec v1.1）ので、ホスト生成の秘密鍵は
+  //     旧アプリが直接入力で来たときだけ必要になる。使わない秘密鍵をディスクに残さないため、
+  //     生成・登録は legacy フォールバックが実際に発生する瞬間まで遅延させる（下記 ensureLegacyPayload）。
   // iPhone は SSH 非対話シェルから ~/.local/bin/tailii-host を exec する。
   // node が PATH に無い環境でも動くよう、node 絶対パス固定のシムを自動生成する。
   try {
@@ -393,51 +373,108 @@ export async function runSetupCommand(argv: string[]): Promise<number> {
   // 失敗しても SSH-only でペアリングを続行する（QUIC は優先経路であって必須ではない）。
   const quic = await setupQuicGateway();
 
-  // --- 3) ペアリング payload を構築（v1/v2/v3） ---
+  // --- 3) ペアリング payload を構築 ---
   // 接続先は自動選定（Tailscale があれば優先・無ければ LAN）。--host で明示上書きも可。
   // ユーザーは経路（Tailscale か LAN か）を意識しなくてよい。
+  // legacy（key あり v1/2/3）は旧アプリの直接入力フォールバック用。
+  // enrollment（key なし v4）は新アプリ用 — 秘密鍵はワイヤに載せない（spec v1.1）。
   const lanIP = args.host ?? detectPreferredIP();
   if (lanIP === "") {
     process.stderr.write("接続先 IP を取得できません（ネットワーク未接続?）\n");
   }
-  const json = encodePairingPayload({
+  const commonPayloadFields = {
     host: lanIP,
     port: 22,
     user: username,
-    key: keypair.privateKeyPem,
     ...(args.sessionName !== undefined ? { sessionName: args.sessionName } : {}),
     ...(args.sessionCwd !== undefined ? { sessionCwd: args.sessionCwd } : {}),
     ...(quic !== null ? { quic } : {}),
-  });
+  };
+  const noKeyPayloadJSON = encodePairingPayload(commonPayloadFields);
+  /**
+   * legacy（key あり）payload を必要になった瞬間に用意する。
+   * ホスト側 ed25519 鍵の生成と authorized_keys 登録もここで初めて行うので、
+   * 新アプリだけを使う環境にはホスト生成の秘密鍵が一切残らない。
+   */
+  const ensureLegacyPayload = (): string => {
+    const keypair = ensureKeypair(base, sshKeygenEd25519);
+    process.stdout.write(
+      keypair.status === "generated"
+        ? "旧アプリ向けにホスト側 ed25519 鍵を生成しました。\n"
+        : `旧アプリ向けに既存のホスト側鍵を再利用: ${path.join(base, "poc_id_ed25519")}\n`,
+    );
+    const registered = registerAuthorizedKey(path.join(os.homedir(), ".ssh"), keypair.publicKeyLine);
+    process.stdout.write(
+      registered === "added"
+        ? "ホスト側公開鍵を authorized_keys に登録しました。\n"
+        : "ホスト側公開鍵は登録済みです。\n",
+    );
+    return encodePairingPayload({ ...commonPayloadFields, key: keypair.privateKeyPem });
+  };
 
-  // --- 4) QR（スキャン用）を表示 ---
-  const qr = await renderTerminalQR(json);
-  const baseVersionLine =
+  // --- 4) ペアリング待受サーバを先に bind（QR に bind 後の port を載せるため順序が必要） ---
+  const server = net.createServer();
+  server.maxConnections = 1;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "0.0.0.0", () => {
+        server.removeListener("error", reject);
+        resolve();
+      });
+    });
+  } catch (error) {
+    process.stderr.write(`ペアリング待受サーバの起動に失敗: ${String(error)}\n`);
+    return 1;
+  }
+  const address = server.address();
+  const boundPort = typeof address === "object" && address !== null ? address.port : 0;
+
+  // --- 5) QR（ブートストラップ）を表示 ---
+  // QR には秘密を含む payload ではなく「接続先 + ワンタイム PSK」だけを載せる（spec v1.1）。
+  // スキャン後、アプリは下記サーバへ TCP 接続して公開鍵登録（enrollment）まで自動で行う。
+  const psk = crypto.randomBytes(32);
+  const bootstrapJSON = JSON.stringify({
+    pair: "code-v1",
+    host: lanIP,
+    port: boundPort,
+    psk: psk.toString("base64"),
+  });
+  const qr = await renderTerminalQR(bootstrapJSON);
+  const sessionLine =
     args.sessionName !== undefined
-      ? `  version : v${quic !== null ? 3 : 2} (session)\n  session : ${args.sessionName}\n  cwd     : ${args.sessionCwd ?? "(未指定)"}`
-      : `  version : v${quic !== null ? 3 : 1}`;
-  const versionLine =
-    quic !== null ? `${baseVersionLine}\n  quic    : udp/${quic.port}（SSH フォールバック付き）` : baseVersionLine;
+      ? `  session : ${args.sessionName}\n  cwd     : ${args.sessionCwd ?? "(未指定)"}\n`
+      : "";
+  const quicLine = quic !== null ? `  quic    : udp/${quic.port}（SSH フォールバック付き）\n` : "";
   process.stdout.write(
     "\n================ ① QR でペアリング ================\n" +
-      `${versionLine}\n` +
       `  host : ${lanIP}\n` +
       `  user : ${username}\n` +
-      `  port : 22\n` +
-      "  iPhone の TailiiPoC →「ペアリング」→「QR をスキャン」で下の QR を読む\n" +
-      "  ※ 秘密鍵が含まれます。信頼できる端末でのみ取り込んでください\n" +
+      sessionLine +
+      quicLine +
+      "  iPhone の Tailii →「ペアリング」→「QR をスキャン」で下の QR を読む\n" +
+      "  ※ QR はこのコマンドの実行中のみ有効です（秘密鍵は含まれません。\n" +
+      "     iPhone 側で生成した公開鍵をこの Mac に登録します）\n" +
       "==================================================\n\n" +
       `${qr}\n`,
   );
 
-  // --- 5) 直接入力（host:port + 6桁コード）用サーバを起動して待受 ---
-  // 同じ setup で QR と直接入力の両方を提供する（コマンドを分けない）。
-  // QR を使った場合はこの待受は不要なので Ctrl-C で終了してよい。
-  return runCodePairingServer({
-    payloadJSON: json,
+  // --- 6) 直接入力（host:port + 6桁コード）の案内を出し、同じサーバで両モードを待受 ---
+  // QR スキャン客は psk 付き hello、直接入力客は psk なし hello（SAS 照合）で到着する。
+  return runCodePairingServer(server, {
+    payloadJSON: ensureLegacyPayload,
+    payloadJSONNoKey: noKeyPayloadJSON,
+    psk,
+    registerClientKey: (line) => {
+      const result = registerAuthorizedKey(path.join(os.homedir(), ".ssh"), line);
+      process.stdout.write(
+        result === "added"
+          ? "iPhone の公開鍵を authorized_keys に登録しました。\n"
+          : "iPhone の公開鍵は登録済みです。\n",
+      );
+    },
     lanIP,
-    sessionName: args.sessionName,
-    sessionCwd: args.sessionCwd,
+    port: boundPort,
   });
 }
 
@@ -476,46 +513,34 @@ function renderTerminalQR(text: string): Promise<string> {
 }
 
 interface CodePairingServerOptions {
-  payloadJSON: string;
+  /** legacy（key あり）payload の遅延ビルダ。旧アプリ・enrollment 不成立時にだけ評価される。 */
+  payloadJSON: () => string;
+  /** enrollment 成立時に送る key なし payload（v4）。 */
+  payloadJSONNoKey: string;
+  /** QR ブートストラップのワンタイム PSK（32B）。 */
+  psk: Buffer;
+  /** 検証済みクライアント公開鍵行の登録副作用。 */
+  registerClientKey: (publicKeyLine: string) => void;
   lanIP: string;
-  sessionName?: string;
-  sessionCwd?: string;
+  port: number;
 }
 
-async function runCodePairingServer(options: CodePairingServerOptions): Promise<number> {
-  const server = net.createServer();
-  server.maxConnections = 1;
-
-  try {
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(0, "0.0.0.0", () => {
-        server.removeListener("error", reject);
-        resolve();
-      });
-    });
-  } catch (error) {
-    process.stderr.write(`直接入力サーバの起動に失敗: ${String(error)}\n`);
-    return 1;
-  }
-
-  const address = server.address();
-  const port = typeof address === "object" && address !== null ? address.port : 0;
+/** bind 済みサーバで QR（psk）/ 直接入力（SAS）両モードのペアリングを 1 接続だけ受理する。 */
+async function runCodePairingServer(server: net.Server, options: CodePairingServerOptions): Promise<number> {
   const host = options.lanIP === "" ? "0.0.0.0" : options.lanIP;
   process.stdout.write(
     "\n============ ② 直接入力でペアリング ============\n" +
-      `  接続先 : ${host}:${port}\n` +
-      "  iPhone の TailiiPoC →「ペアリング」→「直接入力」に上の host:port を入力\n" +
+      `  接続先 : ${host}:${options.port}\n` +
+      "  iPhone の Tailii →「ペアリング」→「直接入力」に上の host:port を入力\n" +
       "  → 接続すると両側に 6桁コードが出るので、一致を確認して承認\n" +
-      "  （QR で済ませた場合はこの待受は不要 — Ctrl-C で終了してください）\n" +
+      "  （QR をスキャンした場合は何もしなくてよい — 自動で完了します）\n" +
       "================================================\n",
   );
 
   try {
-    const socket = await acceptOneConnection(server, 300_000);
+    const socket = await acceptOneConnection(server, 600_000);
     if (socket === null) {
-      // QR で完了済みのことも多いので、時間切れはエラー扱いにしない。
-      process.stdout.write("直接入力の待受を終了しました（QR を使った場合は問題ありません）。\n");
+      process.stdout.write("ペアリングの待受を終了しました（時間切れ）。再実行してください。\n");
       return 0;
     }
 
@@ -524,12 +549,19 @@ async function runCodePairingServer(options: CodePairingServerOptions): Promise<
       { readable: socket, writable: socket },
       {
         payloadJSON: options.payloadJSON,
+        payloadJSONNoKey: options.payloadJSONNoKey,
+        psk: options.psk,
+        registerClientKey: options.registerClientKey,
         displaySAS: (code) => process.stdout.write(`ペアリングコード: ${code}\n`),
       },
     );
 
     if (result.status === "paired") {
-      process.stdout.write("ペアリングが完了しました。\n");
+      process.stdout.write(
+        result.clientKeyLine !== undefined
+          ? "ペアリングが完了しました（iPhone 生成の鍵を登録・秘密鍵転送なし）。\n"
+          : "ペアリングが完了しました。\n",
+      );
       return 0;
     }
     process.stderr.write(`ペアリングを中止しました: ${result.reason}\n`);

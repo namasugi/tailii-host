@@ -159,6 +159,121 @@ in-test の「iPhone」= initiator ピアを同じ暗号で実装し、in-memory
 - タイムアウト: 各ステップ無応答で `aborted`（短い timeoutMs 注入で決定化）。
 - 変換ユーティリティ（raw↔pub, SAS 導出, KDF）の単体。
 
+## v1.1 拡張 — クライアント鍵登録（client-key enrollment）+ QR ブートストラップ（PSK モード）
+
+v1 は「Mac 生成の秘密鍵を iPhone へ転送する」方式だった。v1.1 は方向を反転し、
+**iPhone が鍵ペアを生成して公開鍵だけを Mac へ登録**する（秘密鍵はいかなる経路でも転送しない）。
+併せて QR も「秘密鍵入り payload の静的表示」をやめ、**接続先 + ワンタイム PSK だけを載せた
+ブートストラップ**にして、スキャン後は本プロトコル（TCP）で公開鍵登録を行う。
+
+v1.1 は v1 と同一のメッセージ列・暗号・凍結 info プレフィックス（`pocketclaude-pair-v1`）の上に
+**additive** に定義する。旧アプリ・旧ホストとの相互運用は下記「互換マトリクス」のとおり。
+
+### 能力フラグ（hello / server_key の追加フィールド）
+
+両実装のパーサは未知フィールドを無視する（v1 実装済みの性質）。これを利用し、
+フラグは既存メッセージへの追加フィールドで運ぶ。値は数値 `1` のみ（欠落 = 非対応）。
+
+1. initiator → responder `hello`:
+   `{ "t":"hello", "v":1, "commit":"...", "cpk":1, "psk":1 }`
+   - `cpk:1` — client-key enrollment を希望（新アプリは常に付与）。
+   - `psk:1` — QR ブートストラップ由来の PSK で鍵導出を混合する（QR 経路のみ。直接入力では付けない）。
+2. responder → initiator `server_key`:
+   `{ "t":"server_key", "v":1, "epk":"...", "ck":1 }`
+   - `ck:1` — enrollment を受理する（`hello.cpk==1` かつ responder が対応するときのみ付与）。
+   - 旧ホストは `ck` を付けないため、新アプリは **legacy フォールバック**（v1 どおり秘密鍵入り
+     payload を受領・保存）する。
+
+ダウングレード注記: フラグは transcript（salt）に束縛しない（旧実装との salt 互換のため）。
+能動 MITM が `ck` を剥がしても、退行するのは「秘密鍵転送（v1 挙動）」までであり、その転送自体は
+従来どおり SAS / PSK で認証された AEAD の下にある（機密性は破れない）。
+
+### PSK 混合鍵導出（QR ブートストラップモード）
+
+- QR には payload ではなく **ブートストラップ JSON** を載せる（`setup` 実行中のみ有効・単回使用）:
+  `{ "pair":"code-v1", "host":"<IP>", "port":<TCPポート>, "psk":"<base64 32B>" }`
+  - `port` は `setup` が bind した pairing TCP ポート（payload の SSH port 22 とは別物）。
+  - `psk` は `setup` 起動ごとに `randomBytes(32)` で生成。1 接続受理で失効（v1 の単発試行と同じ）。
+- `hello.psk==1` のとき、両者は HKDF の ikm を `Z` から **`Z || psk`** に置き換えて
+  K_sas / K_confirm / K_data / K_client を導出する（salt・info 文字列は不変）。
+  - responder が psk を持たないのに `hello.psk==1` → abort。
+- **SAS の表示・人間照合は省略**する（QR の psk 所持が相互認証を担う）。initiator は照合なしで
+  即 `confirm` を送り、responder は従来どおり MAC を検証する（psk 知識証明を兼ねる）。
+  能動 MITM は psk を知らないため K_confirm / K_data が両側で食い違い、confirm / AEAD が成立しない。
+- 直接入力経路（`hello.psk` なし）は従来どおり SAS 6 桁の人間照合。同一の待受サーバが
+  両モードを受ける（QR スキャン客は psk 付き hello、直接入力客は psk なし hello で到着する）。
+
+### client_key メッセージ（enrollment 成立時のみ）
+
+`confirm` 検証成功後、`payload` の**前**に initiator が送る:
+
+```
+{ "t":"client_key", "iv":"<base64 12B>", "ct":"<base64>", "tag":"<base64 16B>" }
+```
+
+- AEAD: AES-256-GCM、鍵は `K_client = HKDF(ikm, salt, "pocketclaude-pair-v1 client-key", 32)`
+  （ikm は上記のとおり `Z` または `Z || psk`。payload の K_data と鍵を分離し nonce 空間を分ける）。
+- 平文: OpenSSH authorized_keys 形式の公開鍵 1 行 UTF-8
+  （`ssh-ed25519 <base64 blob> <comment>`、平文長 ≤ 1024B）。
+- responder の検証: `ssh-ed25519 ` 前置・blob が SSH wire 形式（string `"ssh-ed25519"` + string 32B 公開鍵）で
+  デコード可能・改行/制御文字を含まない。不正 → abort（payload を送らない）。
+- 検証成功 → `~/.ssh/authorized_keys` に登録（既存 `registerAuthorizedKey`、重複行は no-op）→
+  **payload v4** を送る。
+
+### payload v4（key なし）
+
+enrollment 成立時に responder が送る payload は v4 とする。形は v3 と同じで **`key` フィールドを
+含まない**（golden `pairing-payload-v4.json`、byte-exact 契約は v1〜3 と同じ Swift JSONEncoder 規則）。
+`sessionName`/`sessionCwd`/`quicPort`/`quicPin`/`quicToken` は v3 と同じ規則で任意。
+enrollment 不成立（legacy）のセッションでは従来どおり v1〜3（key あり）を送る。
+
+initiator（iOS）は v4 受領後、**自分が生成した秘密鍵**（OpenSSH PEM へ自前シリアライズ）を
+payload に合成してから保存する（Keychain 内の保存形は従来と同じ「key あり JSON」。
+ワイヤ上に秘密鍵は現れない）。
+
+### 互換マトリクス
+
+| initiator \ responder | 新ホスト | 旧ホスト |
+|---|---|---|
+| 新アプリ・QR | ブートストラップ QR → PSK モード + enrollment（鍵転送なし） | 旧 QR（秘密鍵入り payload）を従来どおり受理・保存 |
+| 新アプリ・直接入力 | SAS 照合 + enrollment（鍵転送なし） | `ck` なし → legacy フォールバック（v1 挙動） |
+| 旧アプリ・QR | **不可**（ブートストラップ JSON は旧アプリの payload デコードで nil） | v1 どおり |
+| 旧アプリ・直接入力 | `cpk` なし → responder は v1 挙動（key あり payload） | v1 どおり |
+
+### 導出テストベクトル（両実装のテストが同一値を assert する）
+
+入力（すべて 32B の固定値）:
+
+```
+Z      = 0x11 * 32
+psk    = 0x22 * 32
+commit = 0x33 * 32
+E_m_pub(responder) = 0x44 * 32
+E_i_pub(initiator) = 0x55 * 32
+salt = SHA256(commit || E_m_pub || E_i_pub)
+     = 9b406c08deb9f44c7453882855aeb01b437e659c9a64943472f8f0de510c9230
+```
+
+legacy（ikm = Z）:
+
+```
+SAS        = 411019
+K_confirm  = 297e4dcd5fbd588bb08ca702814a7fa19c1133c46d280c50dbd27745c5f7faeb
+K_data     = d6e714003cf18591fcad92750c2f7455a3c57270417cc41b3a5401b48c450dd8
+K_client   = a3e9b7e0364f777b4a8b3edeb4b7ab3d80bad2883bcea3b6b369b6f3f4b6596a
+confirmMAC = fec134edfaf8fdf8ef980660a940444b8ebbc24c5fe1f458c58f6012fb4aebde
+```
+
+PSK モード（ikm = Z || psk）:
+
+```
+SAS        = 191386
+K_confirm  = f5c8068a44a00c9724003efde0f0088b379018f25f76c2172408fd625722ae41
+K_data     = 812f726503c54289604e04d1f8594fc266d60c6ad3a2e9493e760d6e83802428
+K_client   = 44b4d6342363a2f3ed2b05c968bfda3699cb4e9e50bfc24c1867fd3485afd186
+confirmMAC = 147a8792e5cdea6206d35827d2d586956fa2930067f242fb3fe8a14587590dc2
+```
+
 ## codex 実装時の制約（必読）
 
 - **テストは必ず直列**（`vitest.config.ts` の fileParallelism 無効を変えない）。
