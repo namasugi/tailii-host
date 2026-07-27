@@ -16,14 +16,14 @@ import {
   autoAllowReasonForMode,
   runHookCore,
   type ApprovalPushRequest,
-} from "../src/hook.js";
+} from "../src/approval/hook.js";
 import {
   HOOK_EXTERNAL_TIMEOUT_SECONDS,
   claudeHookLaunchSettings,
   removeCodexHookSettings,
-} from "../src/hookSettings.js";
+} from "../src/commands/hookSettings.js";
 import { decodeControlMessage, type ControlMessage } from "../src/protocol.js";
-import { startEngineRelaySocket, type EngineRelayMessage } from "../src/engineRelaySocket.js";
+import { startEngineRelaySocket, type EngineRelayMessage } from "../src/hub/engineRelaySocket.js";
 import {
   SocketLineReader,
   canListenUnixSocket,

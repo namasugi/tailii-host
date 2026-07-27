@@ -6,8 +6,8 @@
 
 import { describe, expect, test } from "vitest";
 import { decodeControlMessage } from "../src/protocol.js";
-import type { SessionBackendKind } from "../src/sessionBackend.js";
-import { TmuxSessionManager } from "../src/tmux.js";
+import type { SessionBackendKind } from "../src/backend/sessionBackend.js";
+import { TmuxSessionManager } from "../src/backend/tmux.js";
 import { MockTmuxRunner, startEngine } from "./helpers.js";
 
 function makeManager(): TmuxSessionManager {

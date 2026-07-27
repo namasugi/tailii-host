@@ -9,7 +9,7 @@ import {
   type CodexAppServerNotification,
   type CodexAppServerRequest,
   type CodexAppServerRequestId,
-} from "../src/codexAppServer.js";
+} from "../src/codex/codexAppServer.js";
 import { makeTempDir } from "./helpers.js";
 
 class FakeConnection implements CodexAppServerConnection {

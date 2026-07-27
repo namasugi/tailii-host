@@ -2,8 +2,8 @@
 
 import { Writable } from "node:stream";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { LineWriter } from "../src/lineWriter.js";
-import { PanePreviewPump } from "../src/panePreviewPump.js";
+import { LineWriter } from "../src/shared/lineWriter.js";
+import { PanePreviewPump } from "../src/hub/panePreviewPump.js";
 import { decodeControlMessage, type ControlMessage } from "../src/protocol.js";
 
 function memoryWriter(): { writer: LineWriter; messages: () => ControlMessage[] } {

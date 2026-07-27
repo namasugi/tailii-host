@@ -11,7 +11,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
-import { SocketPathError, resolveSocketPath } from "../src/socketPath.js";
+import { SocketPathError, resolveSocketPath } from "../src/shared/socketPath.js";
 
 function makeTempBase(): string {
   return path.join(os.tmpdir(), "tailii-socketpath-tests", randomUUID());

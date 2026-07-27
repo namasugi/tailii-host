@@ -5,7 +5,7 @@ import {
   encodeHubMessage,
   type HubClientMessage,
   type HubServerMessage,
-} from "../src/hubProtocol.js";
+} from "../src/hub/hubProtocol.js";
 
 describe("hubProtocol hello compatibility", () => {
   test("旧 Hub の hello ack は snapshot 非対応として空 snapshot と区別する", () => {

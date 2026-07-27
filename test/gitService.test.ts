@@ -18,7 +18,7 @@ import {
   gitWorktreeRemove,
   isTailiiWorktreePath,
   parsePorcelainV2,
-} from "../src/gitService.js";
+} from "../src/services/gitService.js";
 import { makeTempDir } from "./helpers.js";
 
 function git(root: string, args: string[]): string {

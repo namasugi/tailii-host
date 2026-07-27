@@ -11,7 +11,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import * as fs from "node:fs";
 import type * as net from "node:net";
 import { PassThrough } from "node:stream";
-import { runBroker } from "../src/broker.js";
+import { runBroker } from "../src/approval/broker.js";
 import {
   connectUnixClient,
   ensureRegistered,

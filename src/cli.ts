@@ -14,17 +14,17 @@
 // 移植は protocol → engine → serve/hook → launch/setup の順に段階的に行う。
 // 未移植サブコマンドは明示エラーで落ちる（黙って別挙動をしない）。
 
-import { runEngineCommand } from "./engine.js";
-import { runLaunchCommand } from "./launch.js";
-import { runServeCommand } from "./broker.js";
-import { runHookCommand } from "./hook.js";
-import { runKickCommand } from "./kick.js";
-import { runPushTokenCommand } from "./pushTokenCommand.js";
-import { runSetupCommand } from "./setup.js";
-import { runDoctorCommand } from "./doctor.js";
-import { runHubCommand } from "./hubDaemon.js";
-import { runQuicInfoCommand } from "./quicGateway.js";
-import { migrateLegacyHome } from "./legacyHomeMigration.js";
+import { runEngineCommand } from "./engine/engine.js";
+import { runLaunchCommand } from "./commands/launch.js";
+import { runServeCommand } from "./approval/broker.js";
+import { runHookCommand } from "./approval/hook.js";
+import { runKickCommand } from "./commands/kick.js";
+import { runPushTokenCommand } from "./commands/pushTokenCommand.js";
+import { runSetupCommand } from "./commands/setup.js";
+import { runDoctorCommand } from "./commands/doctor.js";
+import { runHubCommand } from "./hub/hubDaemon.js";
+import { runQuicInfoCommand } from "./services/quicGateway.js";
+import { migrateLegacyHome } from "./commands/legacyHomeMigration.js";
 
 const PORTED: Record<string, (args: string[]) => Promise<number>> = {
   engine: runEngineCommand,

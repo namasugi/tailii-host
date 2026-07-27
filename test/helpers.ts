@@ -6,16 +6,16 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import { PassThrough } from "node:stream";
-import { runEngine, type RunEngineOptions } from "../src/engine.js";
-import { connectInProcessHub } from "../src/hubClient.js";
-import { startEngineRelaySocket } from "../src/engineRelaySocket.js";
-import { SessionHub } from "../src/sessionHub.js";
-import { injectQuestionAnswers } from "../src/questionInjection.js";
-import { SessionMetadataStore } from "../src/sessionMetadataStore.js";
-import type { TmuxCommandResult, TmuxCommandRunner } from "../src/tmux.js";
-import { ChatTailController } from "../src/chatTailController.js";
-import { TranscriptTailer } from "../src/transcriptTailer.js";
-import { LineWriter } from "../src/lineWriter.js";
+import { runEngine, type RunEngineOptions } from "../src/engine/engine.js";
+import { connectInProcessHub } from "../src/hub/hubClient.js";
+import { startEngineRelaySocket } from "../src/hub/engineRelaySocket.js";
+import { SessionHub } from "../src/hub/sessionHub.js";
+import { injectQuestionAnswers } from "../src/hub/questionInjection.js";
+import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
+import type { TmuxCommandResult, TmuxCommandRunner } from "../src/backend/tmux.js";
+import { ChatTailController } from "../src/chat/chatTailController.js";
+import { TranscriptTailer } from "../src/chat/transcriptTailer.js";
+import { LineWriter } from "../src/shared/lineWriter.js";
 import { decodeControlMessage, type ControlMessage } from "../src/protocol.js";
 
 /** 出力行の非同期キュー（タイムアウト付き読み出し）。 */

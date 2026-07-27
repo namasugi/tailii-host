@@ -12,7 +12,7 @@ import {
   MODEL_STREAM_ID,
   TranscriptTailer,
   questionsFromToolInput,
-} from "../src/transcriptTailer.js";
+} from "../src/chat/transcriptTailer.js";
 import { makeTempDir } from "./helpers.js";
 
 async function collect(

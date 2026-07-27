@@ -12,12 +12,12 @@ import {
   readHubLock,
   startHubSocket,
   writeHubSocketLine,
-} from "../src/hubDaemon.js";
-import { encodeHubMessage } from "../src/hubProtocol.js";
+} from "../src/hub/hubDaemon.js";
+import { encodeHubMessage } from "../src/hub/hubProtocol.js";
 import type { ControlMessage } from "../src/protocol.js";
-import { SessionHub } from "../src/sessionHub.js";
-import { sendQuestionEventToEngine, startEngineRelaySocket } from "../src/engineRelaySocket.js";
-import { readPackageVersion } from "../src/version.js";
+import { SessionHub } from "../src/hub/sessionHub.js";
+import { sendQuestionEventToEngine, startEngineRelaySocket } from "../src/hub/engineRelaySocket.js";
+import { readPackageVersion } from "../src/shared/version.js";
 import { makeTempDir, makeTempStore, MockTmuxRunner, ok } from "./helpers.js";
 import {
   canListenUnixSocket,

@@ -7,12 +7,12 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, test } from "vitest";
-import { ClaudeSessionStore } from "../src/claudeSessionStore.js";
-import { CodexSessionStore } from "../src/codexSessionStore.js";
-import { activitySlugForCwd, ownTranscriptActivityProvider } from "../src/sessionActivityProvider.js";
-import { SessionListService } from "../src/sessionListService.js";
-import { claudeProjectSlug } from "../src/paths.js";
-import { TmuxSessionManager } from "../src/tmux.js";
+import { ClaudeSessionStore } from "../src/sessions/claudeSessionStore.js";
+import { CodexSessionStore } from "../src/codex/codexSessionStore.js";
+import { activitySlugForCwd, ownTranscriptActivityProvider } from "../src/sessions/sessionActivityProvider.js";
+import { SessionListService } from "../src/sessions/sessionListService.js";
+import { claudeProjectSlug } from "../src/shared/paths.js";
+import { TmuxSessionManager } from "../src/backend/tmux.js";
 import { MockTmuxRunner, makeTempDir, makeTempStore, ok } from "./helpers.js";
 
 /**

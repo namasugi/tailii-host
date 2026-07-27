@@ -3,7 +3,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, test } from "vitest";
-import { CodexSessionStore } from "../src/codexSessionStore.js";
+import { CodexSessionStore } from "../src/codex/codexSessionStore.js";
 import { makeTempDir } from "./helpers.js";
 
 /** `<home>/sessions/<relDir>/<file>` に session_meta 先頭行 + 任意行の rollout を書く。 */

@@ -4,12 +4,12 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
 import { describe, expect, test, vi } from "vitest";
-import { connectHubSocket, type HubLink } from "../src/hubClient.js";
-import type { HubServerMessage } from "../src/hubProtocol.js";
-import { startHubSocket, type HubSocketServer } from "../src/hubDaemon.js";
-import { readHeartbeat, writeHeartbeat } from "../src/heartbeat.js";
+import { connectHubSocket, type HubLink } from "../src/hub/hubClient.js";
+import type { HubServerMessage } from "../src/hub/hubProtocol.js";
+import { startHubSocket, type HubSocketServer } from "../src/hub/hubDaemon.js";
+import { readHeartbeat, writeHeartbeat } from "../src/sessions/heartbeat.js";
 import type { ControlMessage } from "../src/protocol.js";
-import { SessionHub, type HubTail } from "../src/sessionHub.js";
+import { SessionHub, type HubTail } from "../src/hub/sessionHub.js";
 import { makeTempDir, makeTempStore, MockTmuxRunner, ok } from "./helpers.js";
 import { canListenUnixSocket, tempSocketPath } from "./socketHelpers.js";
 

@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, test } from "vitest";
 import type { ControlMessage } from "../src/protocol.js";
-import { SubagentTailer } from "../src/subagentTailer.js";
+import { SubagentTailer } from "../src/chat/subagentTailer.js";
 import { makeTempDir } from "./helpers.js";
 
 async function nextOfType(

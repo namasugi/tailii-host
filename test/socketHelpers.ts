@@ -6,7 +6,7 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as readline from "node:readline";
 import { PassThrough } from "node:stream";
-import { runBroker } from "../src/broker.js";
+import { runBroker } from "../src/approval/broker.js";
 import { LineQueue } from "./helpers.js";
 
 /** テスト用の一時 socket パスを生成する（sun_path 長制限内・テスト毎に一意）。 */

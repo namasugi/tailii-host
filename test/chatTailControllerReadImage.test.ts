@@ -6,9 +6,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Writable } from "node:stream";
 import { describe, expect, test } from "vitest";
-import { ChatTailController } from "../src/chatTailController.js";
-import { ImageService } from "../src/imageService.js";
-import { LineWriter } from "../src/lineWriter.js";
+import { ChatTailController } from "../src/chat/chatTailController.js";
+import { ImageService } from "../src/chat/imageService.js";
+import { LineWriter } from "../src/shared/lineWriter.js";
 import { decodeControlMessage, type ControlMessage } from "../src/protocol.js";
 import { makeTempDir } from "./helpers.js";
 

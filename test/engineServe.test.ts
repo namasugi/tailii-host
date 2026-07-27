@@ -8,7 +8,7 @@ import { spawn } from "node:child_process";
 import net from "node:net";
 import { describe, expect, test } from "vitest";
 import { decodeControlMessage } from "../src/protocol.js";
-import { TmuxSessionManager } from "../src/tmux.js";
+import { TmuxSessionManager } from "../src/backend/tmux.js";
 import { MockTmuxRunner, startEngine } from "./helpers.js";
 
 describe("EngineControl — serve-list", () => {

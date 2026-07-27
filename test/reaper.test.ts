@@ -3,11 +3,11 @@
 // codex active は bump 停止(ts stale)= 死んだターンとして kill / 未採番は adopt。
 
 import { describe, expect, test } from "vitest";
-import { readHeartbeat, writeHeartbeat, listHeartbeatSessions } from "../src/heartbeat.js";
+import { readHeartbeat, writeHeartbeat, listHeartbeatSessions } from "../src/sessions/heartbeat.js";
 import {
   REAPER_IDLE_TIMEOUT_SECONDS,
   reaperTick,
-} from "../src/reaper.js";
+} from "../src/hub/reaper.js";
 import { MockTmuxRunner, makeTempDir, makeTempStore, ok } from "./helpers.js";
 
 const TIMEOUT = REAPER_IDLE_TIMEOUT_SECONDS;
@@ -265,7 +265,7 @@ describe("reaperTick herdr backend", () => {
   function herdrOpsWith(options: {
     names: string[];
     agentAlive?: boolean;
-  }): { ops: import("../src/reaper.js").HerdrReaperOps; killedNames: string[] } {
+  }): { ops: import("../src/hub/reaper.js").HerdrReaperOps; killedNames: string[] } {
     const killedNames: string[] = [];
     return {
       killedNames,
@@ -347,7 +347,7 @@ describe("reaperTick herdr backend", () => {
     const dir = makeTempDir("reaper-herdr-server");
     const tmux = runnerWithSessions([]);
     let stopped = 0;
-    const makeOps = (names: string[]): import("../src/reaper.js").HerdrReaperOps => ({
+    const makeOps = (names: string[]): import("../src/hub/reaper.js").HerdrReaperOps => ({
       list: async () =>
         names.map((name) => ({ name, cwd: "/w", alive: true, backend: "herdr" as const })),
       agentProcessAlive: async () => true,

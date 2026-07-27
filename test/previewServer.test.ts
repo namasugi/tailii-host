@@ -8,7 +8,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { PreviewError, PreviewServer } from "../src/previewServer.js";
+import { PreviewError, PreviewServer } from "../src/services/previewServer.js";
 
 let dir: string;
 let server: PreviewServer;

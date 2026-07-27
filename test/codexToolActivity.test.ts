@@ -15,7 +15,7 @@ import {
   rolloutPatchApplyActivities,
   rolloutResponseItemToolActivities,
   toolActivityContentKey,
-} from "../src/codexToolActivity.js";
+} from "../src/codex/codexToolActivity.js";
 
 describe("normalizeShellCommand", () => {
   test("unifiedExecStartup の shell ラッパーを剥がす", () => {

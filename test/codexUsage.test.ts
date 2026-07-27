@@ -3,7 +3,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, test } from "vitest";
-import { aggregateCodexUsage } from "../src/codexUsage.js";
+import { aggregateCodexUsage } from "../src/codex/codexUsage.js";
 import { makeTempDir } from "./helpers.js";
 
 function tokenCountLine(opts: {

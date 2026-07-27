@@ -1,18 +1,18 @@
 // sessionHub.test.ts — SessionActor 状態・fan-out・heartbeat のテスト
 
 import { describe, expect, test, vi } from "vitest";
-import { decodeHubServerLine } from "../src/hubProtocol.js";
+import { decodeHubServerLine } from "../src/hub/hubProtocol.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { readHeartbeat, writeHeartbeat } from "../src/heartbeat.js";
-import { SessionHub, type HubTail } from "../src/sessionHub.js";
-import { HISTORY_DONE_STREAM_ID } from "../src/transcriptTailer.js";
-import { codexCommandActivity, toolActivityMessage } from "../src/codexToolActivity.js";
+import { readHeartbeat, writeHeartbeat } from "../src/sessions/heartbeat.js";
+import { SessionHub, type HubTail } from "../src/hub/sessionHub.js";
+import { HISTORY_DONE_STREAM_ID } from "../src/chat/transcriptTailer.js";
+import { codexCommandActivity, toolActivityMessage } from "../src/codex/codexToolActivity.js";
 import type { ControlMessage } from "../src/protocol.js";
 import type {
   CodexNativeTurnControllerOptions,
   CodexTurnControllerRuntime,
-} from "../src/codexNativeTurnController.js";
+} from "../src/codex/codexNativeTurnController.js";
 import { makeTempDir, makeTempStore, ok } from "./helpers.js";
 
 function makeHub(now = 100) {

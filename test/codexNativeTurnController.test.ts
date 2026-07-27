@@ -1,12 +1,12 @@
 // Codex App Server native turn / approval bridge の単体テスト。
 
 import { describe, expect, test } from "vitest";
-import type { CodexAppServerThreadOptions } from "../src/codexAppServer.js";
+import type { CodexAppServerThreadOptions } from "../src/codex/codexAppServer.js";
 import {
   CodexNativeTurnController,
   type CodexNativeApproval,
   type CodexThreadClient,
-} from "../src/codexNativeTurnController.js";
+} from "../src/codex/codexNativeTurnController.js";
 
 class FakeThread implements CodexThreadClient {
   readonly starts: { text: string; clientId?: string | null; effort?: string | null }[] = [];

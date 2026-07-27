@@ -10,27 +10,27 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { ApnsConfigStore } from "../src/apnsConfigStore.js";
-import { APNsJWTProvider } from "../src/apnsJwtProvider.js";
+import { ApnsConfigStore } from "../src/push/apnsConfigStore.js";
+import { APNsJWTProvider } from "../src/push/apnsJwtProvider.js";
 import {
   APNsSender,
   type ApnsRequest,
   type ApnsSendResult,
   type HttpPostResult,
   type HTTPPosting,
-} from "../src/apnsSender.js";
+} from "../src/push/apnsSender.js";
 import {
   ApprovalPushNotifier,
   type ApprovalPushRequest,
   makeProductionPushNotifier,
   type PushObserving,
-} from "../src/approvalPushNotifier.js";
-import { DeviceTokenStore, type DeviceTokenRecord, type DeviceTokenStoring } from "../src/deviceTokenStore.js";
-import { kickCore } from "../src/kick.js";
-import { pushTokenCore } from "../src/pushTokenCommand.js";
-import type { APNsJWTProviding } from "../src/apnsJwtProvider.js";
-import type { PushError } from "../src/pushTypes.js";
-import { SendLog } from "../src/sendLog.js";
+} from "../src/push/approvalPushNotifier.js";
+import { DeviceTokenStore, type DeviceTokenRecord, type DeviceTokenStoring } from "../src/push/deviceTokenStore.js";
+import { kickCore } from "../src/commands/kick.js";
+import { pushTokenCore } from "../src/commands/pushTokenCommand.js";
+import type { APNsJWTProviding } from "../src/push/apnsJwtProvider.js";
+import type { PushError } from "../src/push/pushTypes.js";
+import { SendLog } from "../src/push/sendLog.js";
 
 // MARK: - 共通ユーティリティ
 

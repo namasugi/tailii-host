@@ -5,7 +5,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, test } from "vitest";
-import { claudeHookLaunchSettings } from "../src/hookSettings.js";
+import { claudeHookLaunchSettings } from "../src/commands/hookSettings.js";
 import {
   DEFAULT_CODEX_COMMAND,
   claudeInnerCommand,
@@ -15,8 +15,8 @@ import {
   resolveWorkdir,
   shellSingleQuote,
   type ProcessRunner,
-} from "../src/launch.js";
-import { SessionMetadataStore } from "../src/sessionMetadataStore.js";
+} from "../src/commands/launch.js";
+import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
 import { makeTempDir } from "./helpers.js";
 
 /** tmux 呼び出しを記録するモックランナー。 */

@@ -14,7 +14,7 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 import * as fs from "node:fs";
-import { runHookCore, type HookRunResult } from "../src/hook.js";
+import { runHookCore, type HookRunResult } from "../src/approval/hook.js";
 import { decodeControlMessage, encodeControlMessage } from "../src/protocol.js";
 import { startBroker, waitForFile, type BrokerHarness } from "./socketHelpers.js";
 

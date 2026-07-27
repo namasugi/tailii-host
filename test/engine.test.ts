@@ -7,24 +7,24 @@ import { describe, expect, test, vi } from "vitest";
 import {
   CodexAppServerManager,
   type CodexAppServerThreadOptions,
-} from "../src/codexAppServer.js";
-import { ImageService } from "../src/imageService.js";
+} from "../src/codex/codexAppServer.js";
+import { ImageService } from "../src/chat/imageService.js";
 import {
   sendQuestionEventToEngine,
   sendRemotePendingToEngine,
   sendSessionProcessingToEngine,
-} from "../src/engineRelaySocket.js";
-import type { EngineLauncher } from "../src/launch.js";
-import type { CodexTurnControllerRuntime } from "../src/codexNativeTurnController.js";
-import type { HubLink } from "../src/hubClient.js";
-import { ClaudeSessionStore } from "../src/claudeSessionStore.js";
+} from "../src/hub/engineRelaySocket.js";
+import type { EngineLauncher } from "../src/commands/launch.js";
+import type { CodexTurnControllerRuntime } from "../src/codex/codexNativeTurnController.js";
+import type { HubLink } from "../src/hub/hubClient.js";
+import { ClaudeSessionStore } from "../src/sessions/claudeSessionStore.js";
 import { decodeControlMessage } from "../src/protocol.js";
-import { readHeartbeat } from "../src/heartbeat.js";
-import { TranscriptTailer } from "../src/transcriptTailer.js";
-import { TmuxSessionManager } from "../src/tmux.js";
-import { SessionHub } from "../src/sessionHub.js";
-import { injectQuestionAnswers } from "../src/questionInjection.js";
-import { readPackageVersion } from "../src/version.js";
+import { readHeartbeat } from "../src/sessions/heartbeat.js";
+import { TranscriptTailer } from "../src/chat/transcriptTailer.js";
+import { TmuxSessionManager } from "../src/backend/tmux.js";
+import { SessionHub } from "../src/hub/sessionHub.js";
+import { injectQuestionAnswers } from "../src/hub/questionInjection.js";
+import { readPackageVersion } from "../src/shared/version.js";
 import {
   MockTmuxRunner,
   makeTempDir,
@@ -209,7 +209,7 @@ describe("EngineControl — 横断制御チャネル", () => {
       ],
       omitted: 3,
     }));
-    const tail: import("../src/sessionHub.js").HubTail = {
+    const tail: import("../src/hub/sessionHub.js").HubTail = {
       open: vi.fn(),
       stop: vi.fn(),
       subagentTranscript: transcript,

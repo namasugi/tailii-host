@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseSubagentTranscript } from "../src/subagentTranscript.js";
+import { parseSubagentTranscript } from "../src/chat/subagentTranscript.js";
 
 describe("parseSubagentTranscript", () => {
   it("user/assistant/tool_use/tool_result を表示行へ変換する", () => {

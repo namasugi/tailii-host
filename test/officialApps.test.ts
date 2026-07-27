@@ -10,9 +10,9 @@ import {
   parseCodexStart,
   validClaudeUrl,
   type OfficialCommandRunner,
-} from "../src/officialApps.js";
-import type { SessionBackend } from "../src/sessionBackend.js";
-import { SessionMetadataStore } from "../src/sessionMetadataStore.js";
+} from "../src/services/officialApps.js";
+import type { SessionBackend } from "../src/backend/sessionBackend.js";
+import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
 
 class FakeBackend implements SessionBackend {
   readonly store: SessionMetadataStore;

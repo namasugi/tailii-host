@@ -22,7 +22,7 @@ import {
   type PairingResponderDeps,
   type PairingResult,
   type PairingStream,
-} from "../src/pairingCode.js";
+} from "../src/commands/pairingCode.js";
 
 const PAYLOAD_JSON = '{\n  "host" : "192.168.1.2",\n  "key" : "PRIVATE",\n  "port" : 22,\n  "user" : "alice",\n  "v" : 1\n}';
 const NOKEY_PAYLOAD_JSON = '{\n  "host" : "192.168.1.2",\n  "port" : 22,\n  "user" : "alice",\n  "v" : 4\n}';

@@ -3,7 +3,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, test, vi } from "vitest";
-import { fileList, fileRead } from "../src/fileService.js";
+import { fileList, fileRead } from "../src/services/fileService.js";
 import { makeTempDir } from "./helpers.js";
 
 describe("fileService", () => {

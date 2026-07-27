@@ -3,13 +3,13 @@
 
 import * as fs from "node:fs";
 import { describe, expect, test } from "vitest";
-import { sendSessionProcessingToEngine } from "../src/engineRelaySocket.js";
-import { readHeartbeat, writeHeartbeat, type Heartbeat } from "../src/heartbeat.js";
-import type { EngineLauncher } from "../src/launch.js";
+import { sendSessionProcessingToEngine } from "../src/hub/engineRelaySocket.js";
+import { readHeartbeat, writeHeartbeat, type Heartbeat } from "../src/sessions/heartbeat.js";
+import type { EngineLauncher } from "../src/commands/launch.js";
 import { decodeControlMessage } from "../src/protocol.js";
-import { SessionListService } from "../src/sessionListService.js";
-import { SessionHub } from "../src/sessionHub.js";
-import { TmuxSessionManager } from "../src/tmux.js";
+import { SessionListService } from "../src/sessions/sessionListService.js";
+import { SessionHub } from "../src/hub/sessionHub.js";
+import { TmuxSessionManager } from "../src/backend/tmux.js";
 import {
   MockTmuxRunner,
   makeTempDir,

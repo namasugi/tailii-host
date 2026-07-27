@@ -12,16 +12,16 @@ import {
   parseHerdrStartedPaneId,
   type HerdrCommandResult,
   type HerdrCommandRunner,
-} from "../src/herdr.js";
-import { launchCore, type ProcessRunner } from "../src/launch.js";
+} from "../src/backend/herdr.js";
+import { launchCore, type ProcessRunner } from "../src/commands/launch.js";
 import {
   CompositeSessionBackend,
   makeBackendForSession,
   makeSessionBackend,
   resolveSessionBackendKind,
-} from "../src/sessionBackend.js";
-import { SessionMetadataStore } from "../src/sessionMetadataStore.js";
-import { TmuxSessionManager } from "../src/tmux.js";
+} from "../src/backend/sessionBackend.js";
+import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
+import { TmuxSessionManager } from "../src/backend/tmux.js";
 import { makeTempDir, ok } from "./helpers.js";
 
 /** 記録付きモック herdr ランナー。 */

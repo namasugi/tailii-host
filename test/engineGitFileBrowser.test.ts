@@ -4,10 +4,10 @@ import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, test } from "vitest";
-import { gitWorktreeCreate } from "../src/gitService.js";
+import { gitWorktreeCreate } from "../src/services/gitService.js";
 import { decodeControlMessage } from "../src/protocol.js";
-import { SessionMetadataStore } from "../src/sessionMetadataStore.js";
-import { TmuxSessionManager } from "../src/tmux.js";
+import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
+import { TmuxSessionManager } from "../src/backend/tmux.js";
 import { MockTmuxRunner, makeTempDir, startEngine } from "./helpers.js";
 
 function git(root: string, args: string[]): string {

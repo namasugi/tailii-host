@@ -15,7 +15,7 @@ import {
   encodePairingPayload,
   ensureKeypair,
   registerAuthorizedKey,
-} from "../src/setup.js";
+} from "../src/commands/setup.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 

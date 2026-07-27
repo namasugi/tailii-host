@@ -8,7 +8,7 @@ import {
   CONTEXT_STREAM_ID,
   CONTEXT_WINDOW_STREAM_ID,
   MODEL_STREAM_ID,
-} from "../src/codexRolloutTailer.js";
+} from "../src/codex/codexRolloutTailer.js";
 import type { ControlMessage } from "../src/protocol.js";
 import { makeTempDir } from "./helpers.js";
 

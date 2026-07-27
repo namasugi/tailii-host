@@ -6,28 +6,28 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, test } from "vitest";
-import { ChatTailController } from "../src/chatTailController.js";
-import { ClaudeSessionStore, cwdFromSlug } from "../src/claudeSessionStore.js";
-import { dirChildren, dirCreate, dirList } from "../src/dirLister.js";
-import { parsePermissionMode } from "../src/permissionMode.js";
-import { extractCredential, orderCandidates, parsePlanUsage } from "../src/planUsageFetcher.js";
+import { ChatTailController } from "../src/chat/chatTailController.js";
+import { ClaudeSessionStore, cwdFromSlug } from "../src/sessions/claudeSessionStore.js";
+import { dirChildren, dirCreate, dirList } from "../src/services/dirLister.js";
+import { parsePermissionMode } from "../src/shared/permissionMode.js";
+import { extractCredential, orderCandidates, parsePlanUsage } from "../src/services/planUsageFetcher.js";
 import {
   bumpHeartbeat,
   listHeartbeatSessions,
   readHeartbeat,
   removeHeartbeat,
   writeHeartbeat,
-} from "../src/heartbeat.js";
-import { searchClaudeSessions } from "../src/sessionSearch.js";
+} from "../src/sessions/heartbeat.js";
+import { searchClaudeSessions } from "../src/sessions/sessionSearch.js";
 import {
   SessionListService,
   decodeSessionListCursor,
   encodeSessionListCursor,
-} from "../src/sessionListService.js";
-import { SessionMetadataStore } from "../src/sessionMetadataStore.js";
-import { resolveDefaultAgent } from "../src/engine.js";
-import { TmuxFailedError, TmuxSessionManager } from "../src/tmux.js";
-import { aggregateUsage } from "../src/usageAggregator.js";
+} from "../src/sessions/sessionListService.js";
+import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
+import { resolveDefaultAgent } from "../src/engine/engine.js";
+import { TmuxFailedError, TmuxSessionManager } from "../src/backend/tmux.js";
+import { aggregateUsage } from "../src/services/usageAggregator.js";
 import { MockTmuxRunner, makeTempDir, makeTempStore, ok } from "./helpers.js";
 
 // MARK: - resolveDefaultAgent（host 側エージェント切替）

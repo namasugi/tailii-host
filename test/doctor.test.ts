@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { checkTcpPort, ensureHostShim, findCommand, shimContent } from "../src/doctor.js";
+import { checkTcpPort, ensureHostShim, findCommand, shimContent } from "../src/commands/doctor.js";
 
 function tempDir(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `tailii-${prefix}-`));

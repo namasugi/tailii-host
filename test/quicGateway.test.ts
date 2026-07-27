@@ -18,7 +18,7 @@ import {
   resolveQuicGatewayBinary,
   QUIC_GW_DEFAULT_PORT,
   QUIC_GW_LAUNCHD_LABEL,
-} from "../src/quicGateway.js";
+} from "../src/services/quicGateway.js";
 
 function tempDir(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `tailii-${prefix}-`));
@@ -170,7 +170,7 @@ describe("installQuicLaunchAgent", () => {
 describe("installQuicGatewayBinary", () => {
   it("バイナリを設置先へコピーし実行ビットを立てる・冪等", async () => {
     const { installQuicGatewayBinary, quicGatewayInstalledBinaryPath } = await import(
-      "../src/quicGateway.js"
+      "../src/services/quicGateway.js"
     );
     // 実 HOME を汚さないよう一時 HOME を差す。
     const fakeHome = tempDir("home");

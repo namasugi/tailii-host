@@ -15,7 +15,7 @@ import {
   parseLsofCwdOutput,
   parseLsofListenOutput,
   stopServeProcess,
-} from "../src/serveService.js";
+} from "../src/services/serveService.js";
 
 describe("parseListenPort", () => {
   it("loopback / wildcard の bind を受け付ける", () => {
