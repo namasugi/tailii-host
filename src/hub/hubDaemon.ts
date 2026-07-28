@@ -365,6 +365,7 @@ export async function runHubCommand(args: string[]): Promise<number> {
       writer: controlMessageCallbackWriter(write),
       capture: (session) => sessionBackend.capturePane(session, { lines: 60, joinWrappedLines: true }),
       onPermissionMode,
+      log,
     }),
     questionInjector: (answers, session) => injectQuestionAnswers(answers, session, sessionBackend),
     // 本文+送信確定は backend 側の 1 操作に委ねる（herdr は本文+CR 単一コール必須。

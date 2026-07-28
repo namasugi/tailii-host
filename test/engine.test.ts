@@ -265,6 +265,7 @@ describe("EngineControl — 横断制御チャネル", () => {
           type: "hub_state_response", id: message.id, session: message.session,
           pendingQuestion: null, processing: false,
         }));
+        return true;
       },
       close: vi.fn(),
     };
@@ -322,6 +323,7 @@ describe("EngineControl — 横断制御チャネル", () => {
           type: "hub_state_response", id: message.id, session: message.session,
           pendingQuestion: null, processing: false,
         }));
+        return true;
       },
       close: vi.fn(),
     };
@@ -431,6 +433,7 @@ describe("EngineControl — 横断制御チャネル", () => {
             type: "chat_send_result", id: message.id, status: "accepted",
           }));
         }
+        return true;
       },
       close: vi.fn(),
     };
@@ -473,14 +476,34 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
-  test("chat_send は設問待ち相当で固定timeoutせず、Hub切断時だけ結果不明を返す", async () => {
+  test("chat_send はリンク不調（送出破棄）で即時失敗する（無限 pending 防止）", async () => {
     const runner = new MockTmuxRunner(() => ok(""));
-    const unavailableHub: HubLink = { onMessage: null, onReconnect: null, send: vi.fn(), close: vi.fn() };
-    const engine = startEngine({ sessionManager: makeManager(runner), hubLink: unavailableHub });
+    // send=false は「リンク不調で RPC が破棄された」通知。黙って待つとバブルが
+    // 永遠に pending のまま固まる（実障害）ため、即時に chat_send_failed を返す。
+    const downHub: HubLink = {
+      onMessage: null, onReconnect: null, send: vi.fn(() => false), close: vi.fn(),
+    };
+    const engine = startEngine({ sessionManager: makeManager(runner), hubLink: downHub });
     await engine.lines.nextOfType("channel_hello");
     engine.writeLine('{"clientMessageId":"client-1","id":"send-1","session":"work","text":"hello","type":"chat_send","v":2}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("error"))).toMatchObject({
+      type: "error", id: "send-1", code: "chat_send_failed",
+    });
+    expect(runner.recorded.filter(([command]) => command === "send-keys")).toEqual([]);
+    await engine.teardown();
+  });
+
+  test("chat_send は送出成立後の応答待ち中に固定 timeout せず、Hub 切断時に結果不明を返す", async () => {
+    const runner = new MockTmuxRunner(() => ok(""));
+    const silentHub: HubLink = {
+      onMessage: null, onReconnect: null, send: vi.fn(() => true), close: vi.fn(),
+    };
+    const engine = startEngine({ sessionManager: makeManager(runner), hubLink: silentHub });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine('{"clientMessageId":"client-1","id":"send-1","session":"work","text":"hello","type":"chat_send","v":2}');
+    // 設問待ち相当（hub が ACK を保留）では短時間で timeout しない。
     await expect(engine.lines.nextOfType("error", 100)).rejects.toThrow("timeout");
-    unavailableHub.onReconnect?.({ bootId: "reconnected", disconnectedAtMs: Date.now() });
+    silentHub.onReconnect?.({ bootId: "reconnected", disconnectedAtMs: Date.now() });
     expect(decodeControlMessage(await engine.lines.nextOfType("error"))).toMatchObject({
       type: "error", id: "send-1", code: "chat_send_failed",
     });

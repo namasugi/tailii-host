@@ -227,7 +227,10 @@ export async function runEngineCommand(args: string[]): Promise<number> {
       claudeSessionStore,
       codexSessionStore,
       codexAppServer,
-      officialApps: new OfficialAppsService({ codexRemoteControl: codexAppServer }),
+      officialApps: new OfficialAppsService({
+        codexRemoteControl: codexAppServer,
+        diagnosticLogPath: path.join(os.homedir(), ".tailii", "official-app.log"),
+      }),
       agent: agentArg,
     });
     return 0;
@@ -642,7 +645,14 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           rpcWaiters.delete(id);
           reject(new Error("Session Hub disconnected during RPC"));
         });
-        hubLink.send(request);
+        // リンク不調で RPC が破棄された場合は待たずに即時失敗させる（chat_send が
+        // 黙って消えて応答が永遠に返らず、アプリのバブルが pending のまま固まる実障害）。
+        if (!hubLink.send(request)) {
+          if (timer !== null) clearTimeout(timer);
+          rpcWaiters.delete(id);
+          rpcDisconnectFailures.delete(id);
+          reject(new Error("Session Hub link unavailable"));
+        }
       });
     hubLink.onReconnect = ({ bootId, disconnectedAtMs, processingSessions: processingSnapshot }) => {
       if (disconnectedAtMs !== null) {

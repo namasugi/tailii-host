@@ -17,7 +17,13 @@ export interface HubLink {
   onMessage: ((message: HubServerMessage) => void) | null;
   /** hello 完了時に購読を再送する。切断時刻は Hub 世代変更時の差分 backfill 境界。 */
   onReconnect: ((info: HubReconnectInfo) => void) | null;
-  send(message: HubClientMessage): void;
+  /**
+   * hub へ送出する。戻り値は「確立済み socket へ直接 write した（またはオフライン
+   * 再生 queue に合流した）」か。false = 非再生対象メッセージ（id 相関 RPC 等）が
+   * リンク不調で破棄されたことを示す。RPC 呼び出し側はこれを即時失敗にすること
+   * （chat_send が黙って消えて永遠に pending になる実障害の再発防止）。
+   */
+  send(message: HubClientMessage): boolean;
   close(): void;
 }
 
@@ -72,10 +78,17 @@ export function connectHubSocket(options: {
       // net.Socket は connect 中でも writable=true になり、接続失敗した候補へ write すると
       // 再接続 queue を経ずに消える。確立済み socket だけを直接配送対象にする。
       if (socket?.writable === true && socket.connecting === false && socket.destroyed === false) {
-        if (isReplayableState(message) && !helloCompletedSockets.has(socket)) enqueueOfflineState(message);
-        else socket.write(encodeHubMessage(message));
+        if (isReplayableState(message) && !helloCompletedSockets.has(socket)) {
+          enqueueOfflineState(message);
+          return true;
+        }
+        socket.write(encodeHubMessage(message));
+        return true;
       }
-      else enqueueOfflineState(message);
+      enqueueOfflineState(message);
+      // 非再生対象（id 相関 RPC 等）はここで破棄される。呼び出し側が即時失敗できるよう
+      // false を返す（オフライン再生対象は queue に合流済みなので true）。
+      return isReplayableState(message);
     },
     close() {
       closed = true;
@@ -176,7 +189,10 @@ export function connectInProcessHub(hub: SessionHub): HubLink {
   const link: HubLink = {
     onMessage: null,
     onReconnect: null,
-    send(message) { hub.handleClientMessage(client, JSON.stringify(message)); },
+    send(message) {
+      hub.handleClientMessage(client, JSON.stringify(message));
+      return true;
+    },
     close() { hub.unregisterClient(client); },
   };
   hub.registerClient(client, (line) => {

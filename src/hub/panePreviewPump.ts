@@ -24,6 +24,8 @@ export interface PanePreviewPumpOptions {
    * claude_status モードのときだけ判定する（codex に permission mode は無い）。
    */
   onPermissionMode?: (mode: string) => void;
+  /** 診断ログ（選択ダイアログフレームの emit 遷移など。既定は無効）。 */
+  log?: (message: string) => void;
 }
 
 /** tmux pane の画面内容が変化したときだけ pane_preview を流す。 */
@@ -46,7 +48,9 @@ export class PanePreviewPump {
   private session: string | null = null;
   private mode: PanePreviewMode = "claude_status";
   private readonly onPermissionMode: ((mode: string) => void) | null;
+  private readonly log: ((message: string) => void) | null;
   private lastPermissionMode: string | null = null;
+  private lastEmittedDialog = false;
   private static readonly minEmitIntervalMs = 500;
 
   constructor(options: PanePreviewPumpOptions) {
@@ -56,6 +60,7 @@ export class PanePreviewPump {
     this.quietThresholdMs = options.quietThresholdMs ?? 2500;
     this.protocolVersion = options.protocolVersion ?? (() => PROTOCOL_V2);
     this.onPermissionMode = options.onPermissionMode ?? null;
+    this.log = options.log ?? null;
   }
 
   /** 対象セッションの preview を開始/切替する。同一セッションの二重 start は無視する。 */
@@ -182,6 +187,14 @@ export class PanePreviewPump {
     this.lastEmitAt = now;
     this.active = true;
     this.inactiveSent = false;
+    // 選択ダイアログ（転写カード対象）のフレームが実際に流れたかを追える遷移ログ。
+    const dialogFrame = text.includes("Enter to select");
+    if (dialogFrame !== this.lastEmittedDialog) {
+      this.lastEmittedDialog = dialogFrame;
+      this.log?.(
+        `pane_preview dialog-frame ${dialogFrame ? "開始" : "終了"} session=${session} bytes=${Buffer.byteLength(text, "utf8")}`,
+      );
+    }
     this.emit(session, true, text, mode);
   }
 

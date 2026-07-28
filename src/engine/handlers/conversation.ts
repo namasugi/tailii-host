@@ -3,10 +3,25 @@
 // 会話一覧（claude+codex マージ）・本文検索・画像オンデマンド配信。
 
 import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { HubServerMessage } from "../../hub/hubProtocol.js";
 import { PROTOCOL_V2, type ControlMessage } from "../../protocol.js";
 import { searchClaudeSessions } from "../../sessions/sessionSearch.js";
 import { engineDiag, writeError, type HandlerRegistry } from "../context.js";
+
+/** chat_send 経路の常時診断ログ（pending 固まり事案の事後解析用）。失敗しても本処理を妨げない。 */
+function chatSendDiag(message: string): void {
+  try {
+    fs.appendFileSync(
+      path.join(os.homedir(), ".tailii", "chat-send.log"),
+      `[${new Date().toISOString()} pid=${process.pid}] ${message}\n`,
+    );
+  } catch {
+    // 診断ログは best-effort。
+  }
+}
 
 export const conversationHandlers: HandlerRegistry = {
   chat_send: (message, ctx) => {
@@ -20,16 +35,24 @@ export const conversationHandlers: HandlerRegistry = {
     // Hub は設問表示中、durable queue を保持したまま pane 注入可能になるまで応答を
     // 保留する。read loop 自体がこの RPC を await すると、後続 question_answer を読めず
     // 循環待ちになるため相関処理だけを非同期化する。ACK は注入完了の意味を維持する。
+    // timeout は無限にしない: hub 側で応答が失われた場合にバブルが永遠に pending の
+    // まま固まる（実障害）。アプリは durable Outbox + 同一 clientMessageId 再送で
+    // 冪等に回復するため、長めの上限で失敗を返す方が安全。
     void (async () => {
+      chatSendDiag(
+        `recv id=${message.id} session=${message.session} cmid=${message.clientMessageId}`,
+      );
       try {
         const result = await ctx.hubRpc<Extract<HubServerMessage, { type: "chat_send_result" }>>(
           { type: "chat_send", id: message.id, session: message.session,
             clientMessageId: message.clientMessageId, text: message.text,
-            ...(message.explicitRetry === true ? { explicitRetry: true } : {}) }, message.id, 0,
+            ...(message.explicitRetry === true ? { explicitRetry: true } : {}) }, message.id, 90_000,
         );
+        chatSendDiag(`result id=${result.id} status=${result.status}`);
         writer.write({ type: "chat_send_result", v, id: result.id, status: result.status,
           ...(result.error !== undefined ? { error: result.error } : {}) });
       } catch (error) {
+        chatSendDiag(`failed id=${message.id} error=${String(error).slice(0, 120)}`);
         writeError(writer, v, message.id, "chat_send_failed", String(error));
       }
     })();
