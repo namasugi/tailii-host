@@ -129,6 +129,12 @@ export class ChatTailController {
       ChatTailController.diag(
         `tail task started for dir=${dir} newerThan=${newerThanMs === null ? "nil" : String(newerThanMs)}`,
       );
+      // この tail で image_available を発行済みの原本パス（chat-image-dedupe）。
+      // 添付（att-）で表示済みの画像を Claude が Read すると read-<toolUseId> でも
+      // 再発行され、iOS の imageId 冪等ガードを素通りして同一画像のサムネが2枚並ぶ。
+      // transcript 上は必ず user 行（att-）が Read（read-）より先に現れるため、
+      // pump ローカルの集合で read- 側だけを抑止すれば replay でも決定的に働く。
+      const emittedImagePaths = new Set<string>();
       let count = 0;
       try {
         for await (const message of tailer.streamProjectDir(
@@ -163,20 +169,27 @@ export class ChatTailController {
                   paths[n]!,
                   `att-${message.streamId}-${n}`,
                 );
-                if (available !== null) writer.write(available);
+                if (available !== null) {
+                  emittedImagePaths.add(paths[n]!);
+                  writer.write(available);
+                }
               }
             }
             // Read ツールで画像ファイルを読んだら、そのサムネ（image_available）を後続で発行し
             // iOS にインライン表示させる（既存 chat-attachments と同じ描画経路を再利用）。
             // id は tool_use id 由来で決定的（read-<id>）→ 再 tail/再オープンでも二重挿入されない。
+            // 添付等で発行済みのパスは再発行しない（同一画像のサムネ二重表示防止）。
             if (imageService !== null && message.type === "tool_activity") {
               const readPath = ChatTailController.readImagePath(message.activity);
-              if (readPath !== null) {
+              if (readPath !== null && !emittedImagePaths.has(readPath)) {
                 const available = await imageService.makeAvailable(
                   readPath,
                   `read-${message.activity.id}`,
                 );
-                if (available !== null) writer.write(available);
+                if (available !== null) {
+                  emittedImagePaths.add(readPath);
+                  writer.write(available);
+                }
               }
             }
           } catch (error) {

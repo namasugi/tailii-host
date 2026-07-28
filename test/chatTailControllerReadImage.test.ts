@@ -184,4 +184,74 @@ describe("ChatTailController — Tailii 添付画像のインライン化", () =
       height: 6,
     });
   });
+
+  test("添付発行済みパスの Read では read- を再発行しない（別パスの Read は発行する）", async () => {
+    const cwd = makeTempDir("cc-dedupe-cwd");
+    const uploadDir = path.join(makeTempDir("cc-dedupe-home"), ".tailii", "uploads");
+    fs.mkdirSync(uploadDir, { recursive: true });
+    const attachedPath = path.join(uploadDir, "img-DEDUPE01.jpg");
+    fs.writeFileSync(attachedPath, Buffer.from([0xff, 0xd8, 0xff]));
+    const otherPath = path.join(makeTempDir("cc-dedupe-img"), "other.png");
+    fs.writeFileSync(otherPath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+
+    const { writer, messages } = capturingWriter();
+    const controller = new ChatTailController({
+      writer,
+      tailer: fakeTailer([
+        {
+          type: "chat_output",
+          v: 1,
+          streamId: "user-dedupe",
+          role: "user",
+          text: `${attachedPath} この画像を見て`,
+          eof: true,
+        },
+        {
+          type: "tool_activity",
+          v: 1,
+          activity: {
+            id: "toolu_read_attached",
+            name: "Read",
+            label: `既読 ${attachedPath}`,
+            file: attachedPath,
+            commandTruncated: false,
+            descriptionTruncated: false,
+          },
+        },
+        {
+          type: "tool_activity",
+          v: 1,
+          activity: {
+            id: "toolu_read_other",
+            name: "Read",
+            label: `既読 ${otherPath}`,
+            file: otherPath,
+            commandTruncated: false,
+            descriptionTruncated: false,
+          },
+        },
+      ]) as never,
+      subagentTailer: fakeTailer([]) as never,
+      projectsRoot: makeTempDir("cc-dedupe-projects"),
+      imageService: stubImageService(makeTempDir("cc-dedupe-index")),
+    });
+
+    controller.open(cwd, null);
+    const c = controller as unknown as {
+      currentPump: Promise<void> | null;
+      currentSubagentPump: Promise<void> | null;
+    };
+    await c.currentPump;
+    await c.currentSubagentPump;
+
+    const available = messages().filter(
+      (message): message is Extract<ControlMessage, { type: "image_available" }> =>
+        message.type === "image_available",
+    );
+    // 添付済みパスは att- の1回のみ（read- 抑止）、未発行の別パスは read- で発行される。
+    expect(available.map((m) => m.id)).toEqual([
+      "att-user-dedupe-0",
+      "read-toolu_read_other",
+    ]);
+  });
 });
