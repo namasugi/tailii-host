@@ -16,6 +16,7 @@ import { bumpHeartbeat } from "../sessions/heartbeat.js";
 import type { ImageService } from "../chat/imageService.js";
 import type { EngineLauncher } from "../commands/launch.js";
 import type { LineWriter } from "../shared/lineWriter.js";
+import type { ClaudeModelListProvider } from "../services/claudeModelCatalog.js";
 import type { PlanUsageProvider } from "../services/planUsageFetcher.js";
 import type { PreviewServer } from "../services/previewServer.js";
 import {
@@ -91,6 +92,8 @@ export interface HandlerContext {
   /** codex 会話一覧の導出（agent-tag）。 */
   codexSessionStore: CodexSessionStore | null;
   planUsage: PlanUsageProvider;
+  /** Claude モデル一覧の取得（Models API, ベストエフォート。テストは固定値/null を注入）。 */
+  claudeModelList: ClaudeModelListProvider;
   homeDir: string;
   modeTiming: ModeTiming;
   /** host 側の既定エージェント（session_start が agentType を指定しないときのフォールバック）。 */

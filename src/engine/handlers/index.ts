@@ -4,6 +4,7 @@
 // （重複キーは後勝ちになるため、追加時は既存ドメインとの重複に注意）。
 
 import type { HandlerRegistry } from "../context.js";
+import { claudeModelHandlers } from "./claudeModels.js";
 import { codexHandlers } from "./codex.js";
 import { conversationHandlers } from "./conversation.js";
 import { coreHandlers } from "./core.js";
@@ -20,6 +21,7 @@ export const ENGINE_HANDLERS: HandlerRegistry = {
   ...sessionHandlers,
   ...conversationHandlers,
   ...codexHandlers,
+  ...claudeModelHandlers,
   ...officialAppHandlers,
   ...modeHandlers,
   ...usageHandlers,

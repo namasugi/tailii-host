@@ -41,6 +41,7 @@ import { ImageService } from "../chat/imageService.js";
 import type { QuestionEventMessage, SessionProcessingMessage } from "../hub/engineRelaySocket.js";
 import { makeSessionLauncher, type EngineLauncher } from "../commands/launch.js";
 import { LineWriter } from "../shared/lineWriter.js";
+import { fetchClaudeModelList, type ClaudeModelListProvider } from "../services/claudeModelCatalog.js";
 import { fetchPlanUsage, type PlanUsageProvider } from "../services/planUsageFetcher.js";
 import { PreviewServer } from "../services/previewServer.js";
 import {
@@ -290,6 +291,8 @@ export interface RunEngineOptions {
   maxVersion?: number;
   /** プラン使用状況の取得（既定は実 OAuth 使用量 API。テストは () => null を注入する）。 */
   planUsage?: PlanUsageProvider;
+  /** Claude モデル一覧の取得（既定は実 Models API。テストは固定値/null を注入する）。 */
+  claudeModelList?: ClaudeModelListProvider;
   /** slash_list のユーザーレベル探索ルート（既定は os.homedir()）。 */
   homeDir?: string;
   /** mode_get/mode_set の待機間隔（テストは短縮値を注入する）。 */
@@ -333,6 +336,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     codexTurnController: injectedCodexTurnController = null,
     maxVersion = PROTOCOL_MAX_SUPPORTED,
     planUsage = () => fetchPlanUsage(),
+    claudeModelList = () => fetchClaudeModelList(),
     homeDir = os.homedir(),
     modeTiming = {},
     staleDistGuard = createStaleDistGuard(),
@@ -809,6 +813,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           claudeSessionStore,
           codexSessionStore,
           planUsage,
+          claudeModelList,
           homeDir,
           modeTiming: resolvedModeTiming,
           defaultAgent: agent,

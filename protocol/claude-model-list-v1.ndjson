@@ -1,0 +1,4 @@
+{"id":"cm1","type":"claude_model_list_request","v":1}
+{"id":"cm1","models":[{"displayName":"Claude Fable 5","id":"claude-fable-5"},{"displayName":"Claude Opus 5","id":"claude-opus-5"},{"displayName":"Claude Sonnet 5","id":"claude-sonnet-5"},{"displayName":"Claude Haiku 4.5","id":"claude-haiku-4-5-20251001"}],"type":"claude_model_list_response","v":1}
+{"id":"cm2","models":[],"type":"claude_model_list_response","v":1}
+{"code":"claude_model_list_unavailable","id":"cm3","message":"モデル一覧を取得できませんでした（OAuth トークン無効またはオフライン）。","type":"error","v":1}

@@ -1611,6 +1611,69 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
+  test("claude_model_list_request は注入フェッチャのキュレーション済み一覧を返す", async () => {
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({
+      sessionManager: makeManager(runner),
+      claudeModelList: async () => [
+        { id: "claude-fable-5", displayName: "Claude Fable 5" },
+        { id: "claude-haiku-4-5-20251001", displayName: "Claude Haiku 4.5" },
+      ],
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"id":"cm-1","type":"claude_model_list_request","v":2}');
+
+    expect(await engine.lines.nextOfType("claude_model_list_response")).toBe(
+      '{"id":"cm-1","models":[{"displayName":"Claude Fable 5","id":"claude-fable-5"},{"displayName":"Claude Haiku 4.5","id":"claude-haiku-4-5-20251001"}],"type":"claude_model_list_response","v":2}',
+    );
+    await engine.teardown();
+  });
+
+  test("claude_model_list_request の取得不能（null）は unavailable error を返す", async () => {
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({
+      sessionManager: makeManager(runner),
+      claudeModelList: async () => null,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"id":"cm-2","type":"claude_model_list_request","v":2}');
+
+    const error = await engine.lines.nextOfType("error");
+    expect(decodeControlMessage(error)).toEqual({
+      type: "error",
+      v: 2,
+      id: "cm-2",
+      code: "claude_model_list_unavailable",
+      message: "モデル一覧を取得できませんでした（OAuth トークン無効またはオフライン）。",
+    });
+    await engine.teardown();
+  });
+
+  test("claude_model_list_request のフェッチャ例外は failed error を返す", async () => {
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({
+      sessionManager: makeManager(runner),
+      claudeModelList: async () => {
+        throw new Error("network down");
+      },
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"id":"cm-3","type":"claude_model_list_request","v":2}');
+
+    const error = await engine.lines.nextOfType("error");
+    expect(decodeControlMessage(error)).toEqual({
+      type: "error",
+      v: 2,
+      id: "cm-3",
+      code: "claude_model_list_failed",
+      message: "Error: network down",
+    });
+    await engine.teardown();
+  });
+
   // MARK: 6. decode 失敗行は破棄（クラッシュしない）
 
   test("decode 不能な行は破棄され、以降のメッセージは処理される", async () => {

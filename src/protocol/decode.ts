@@ -6,6 +6,7 @@ import {
   PROTOCOL_LEGACY,
   PROTOCOL_MAX_SUPPORTED,
   type ClaudeSessionInfo,
+  type ClaudeModelInfo,
   type CodexModelInfo,
   type ControlMessage,
   type FileEntry,
@@ -216,6 +217,22 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
                 : requireStringArray(obj, "supportedReasoningEfforts"),
             isDefault: requireBoolean(obj, "isDefault"),
           });
+        }),
+      };
+
+    case "claude_model_list_request":
+      return { type, v, id: requireString(raw, "id") };
+
+    case "claude_model_list_response":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        models: requireArray(raw, "models").map((element): ClaudeModelInfo => {
+          const obj = requireObject(element, "models");
+          return {
+            id: requireString(obj, "id"),
+            displayName: requireString(obj, "displayName"),
+          };
         }),
       };
 

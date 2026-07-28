@@ -183,6 +183,14 @@ export interface CodexModelInfo {
   isDefault: boolean;
 }
 
+/** Anthropic Models API `/v1/models` を iOS のモデル選択へ渡すための 1 要素。 */
+export interface ClaudeModelInfo {
+  /** `/model <id>` / `--model` に渡す値（例: claude-sonnet-5）。 */
+  id: string;
+  /** API の display_name（例: "Claude Sonnet 5"。表示整形は iOS 側）。 */
+  displayName: string;
+}
+
 /** AskUserQuestion の選択肢。 */
 export interface QuestionOption {
   label: string;
@@ -257,6 +265,8 @@ export type ControlMessage =
   | { type: "session_idle_hint"; v: number; id: string; name: string }
   | { type: "codex_model_list_request"; v: number; id: string }
   | { type: "codex_model_list_response"; v: number; id: string; models: CodexModelInfo[] }
+  | { type: "claude_model_list_request"; v: number; id: string }
+  | { type: "claude_model_list_response"; v: number; id: string; models: ClaudeModelInfo[] }
   | { type: "official_app_status_request"; v: number; id: string; session: string; provider: OfficialAppProvider }
   | ({ type: "official_app_status_response"; v: number; id: string } & OfficialAppStatus)
   | {
