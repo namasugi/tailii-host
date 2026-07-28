@@ -9,6 +9,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
 import type { SessionBackend } from "../backend/sessionBackend.js";
+import { defaultInjectedPath } from "../commands/launch.js";
 
 export type OfficialAppProvider = "claude" | "codex";
 export type OfficialAppAction = "open" | "repair" | "stop";
@@ -42,6 +43,12 @@ export interface OfficialAppRuntimeContext {
   canInjectClaudeCommand: boolean;
   /** daemon 再起動で他会話の turn を切らないため、全 Codex turn が idle のときだけ true。 */
   canMutateCodexDaemon: boolean;
+  /**
+   * この会話の Claude transcript（`~/.claude/projects/<slug>/<uuid>.jsonl`）。
+   * Remote Control の URL は pane 文面ではなく transcript の bridge_status 行を
+   * 権威とする（チャット本文が activation 文言を引用しても誤検出しないため）。
+   */
+  claudeTranscriptPath: string | null;
 }
 
 export interface OfficialCommandOutput {
@@ -64,6 +71,11 @@ export interface OfficialAppsOptions {
   actionLockPath?: string;
   claudePollIntervalMs?: number;
   claudeStartTimeoutMs?: number;
+  claudeReconnectGraceMs?: number;
+  /** 実行証跡ゼロが続いたときの再注入間隔（RC 切断直後の limbo 対策）。 */
+  claudeReinjectAfterMs?: number;
+  /** 公式アプリ経路の常時診断ログ（null で無効。engine は ~/.tailii/official-app.log を渡す）。 */
+  diagnosticLogPath?: string | null;
   codexRemoteControl?: CodexRemoteControlClient;
 }
 
@@ -88,6 +100,8 @@ interface CodexRemoteControlPairing {
 const CLAUDE_SESSION_PREFIX = "https://claude.ai/code/";
 const CHATGPT_CODEX_PAIR_URL = "https://chatgpt.com/codex/pair";
 const MAX_OUTPUT_BYTES = 256 * 1024;
+const TRANSCRIPT_TAIL_BYTES = 8 * 1024 * 1024;
+const TRANSCRIPT_FRESH_SKEW_MS = 5_000;
 const MAX_IDENTIFIER_BYTES = 128;
 const MAX_PAIRING_CODE_BYTES = 2_048;
 const PROVIDER_COMMAND_TIMEOUT_MS = 22_000;
@@ -95,38 +109,12 @@ const CLAUDE_AUTH_TIMEOUT_MS = 5_000;
 const SUPPORTED_CLAUDE_VERSIONS = new Set(["2.1.215", "2.1.218", "2.1.220"]);
 const SUPPORTED_CODEX_VERSIONS = new Set(["0.144.5", "0.145.0"]);
 
-const CLAUDE_ACTIVE_MARKERS = [
-  "Remote Control is active",
-  "/remote-control is active",
-  "/rc active",
-] as const;
 // Remote Control が active と CLI が認識している最中に /remote-control を再実行すると、
 // 2.1.220 はバナーではなく modal dialog（Disconnect / Show QR / Continue）を開き、
 // Enter/Esc を受けるまで pane を塞ぎ続ける（自動では閉じない）。iPhone からは不可視の
 // ため、検出したら Esc で閉じて dialog 内の URL を採用する。
 const CLAUDE_DIALOG_URL_PREFIX = "This session is available in the Claude mobile app and at ";
 const CLAUDE_DIALOG_DISCONNECT_LABEL = "Disconnect this session";
-const CLAUDE_INACTIVE_MARKERS = [
-  "Remote Control disconnected",
-  "Remote Control is inactive",
-  "Remote Control stopped",
-  "Remote Control session ended",
-  "Remote Control connection failed",
-  "Remote Control requires a claude.ai subscription",
-  "Remote Control requires a full-scope login token",
-  "Unable to determine your organization for Remote Control eligibility",
-  "Remote Control is not yet enabled for your account",
-  "Couldn’t verify Remote Control eligibility",
-  "Couldn't verify Remote Control eligibility",
-  "Couldn’t verify your organization’s Remote Control policy",
-  "Remote Control is only available when using Claude via api.anthropic.com",
-  "Remote Control is disabled by your organization",
-  "disableRemoteControl",
-  "Remote credentials fetch failed",
-  "Couldn’t reconnect to your Remote Control session",
-  "Your organization requires Trusted Devices for Remote Control, but this device is not enrolled",
-  "session expired for trusted-device check",
-] as const;
 
 const CLAUDE_FAILURES: readonly [string, string][] = [
   ["Remote Control requires a claude.ai subscription", "claude_subscription_required"],
@@ -166,6 +154,9 @@ export class OfficialAppsService {
   private readonly actionLockPath: string;
   private readonly claudePollIntervalMs: number;
   private readonly claudeStartTimeoutMs: number;
+  private readonly claudeReconnectGraceMs: number;
+  private readonly claudeReinjectAfterMs: number;
+  private readonly diagnosticLogPath: string | null;
   private readonly codexRemoteControl: CodexRemoteControlClient | null;
 
   constructor(options: OfficialAppsOptions = {}) {
@@ -178,7 +169,23 @@ export class OfficialAppsService {
     this.claudePollIntervalMs = options.claudePollIntervalMs ?? 250;
     // アーカイブ後の再接続はバナー再表示まで 10-15 秒かかることを実測済み。
     this.claudeStartTimeoutMs = options.claudeStartTimeoutMs ?? 20_000;
+    this.claudeReconnectGraceMs = options.claudeReconnectGraceMs ?? 5_000;
+    this.claudeReinjectAfterMs = options.claudeReinjectAfterMs ?? 6_000;
+    this.diagnosticLogPath = options.diagnosticLogPath ?? null;
     this.codexRemoteControl = options.codexRemoteControl ?? null;
+  }
+
+  /** 障害調査用の常時ログ。失敗時にどの分岐で落ちたかを事後特定できるようにする。 */
+  private diag(message: string): void {
+    if (this.diagnosticLogPath === null) return;
+    try {
+      fs.appendFileSync(
+        this.diagnosticLogPath,
+        `[${new Date().toISOString()}] ${message}\n`,
+      );
+    } catch {
+      // 診断ログは本処理を妨げない。
+    }
   }
 
   async status(context: OfficialAppRuntimeContext): Promise<OfficialAppStatus> {
@@ -242,14 +249,18 @@ export class OfficialAppsService {
     try {
       const version = await this.providerVersion(context.provider);
       if (version === null) {
+        this.diag(`perform cli unavailable provider=${context.provider}`);
         return unavailableResult(context.provider, "official_cli_unavailable");
       }
       if (context.provider === "claude") {
         if (action === "stop") {
-          return unavailableResult("claude", "official_action_unsupported");
+          return this.stopClaude(context);
         }
         const authReason = await this.claudeAuthReason();
-        if (authReason !== null) return unavailableResult("claude", authReason);
+        if (authReason !== null) {
+          this.diag(`perform auth reason=${authReason}`);
+          return unavailableResult("claude", authReason);
+        }
         return this.performClaude(context);
       }
       if (!context.canMutateCodexDaemon) {
@@ -297,18 +308,21 @@ export class OfficialAppsService {
     version: string,
   ): Promise<OfficialAppStatus> {
     const paneText = await captureOfficialPane(context.sessionManager, context.session);
-    const launchUrl =
-      paneText === null
-        ? null
-        : extractActiveClaudeUrl(paneText) ?? extractClaudeRemoteDialogUrl(paneText);
-    if (launchUrl !== null) {
+    const dialogUrl = paneText === null ? null : extractClaudeRemoteDialogUrl(paneText);
+    const active =
+      dialogUrl !== null || (paneText !== null && statusBarShowsRemoteControl(paneText));
+    if (active) {
+      const launchUrl =
+        lastTranscriptRemoteControlEntry(context.claudeTranscriptPath)?.url ??
+        dialogUrl ??
+        (paneText === null ? null : extractBannerClaudeUrl(paneText));
       return {
         provider: "claude",
         version,
         state: "active",
         canOpen: true,
         canStart: false,
-        launchUrl,
+        ...(launchUrl !== null ? { launchUrl } : {}),
       };
     }
     if (context.canInjectClaudeCommand) {
@@ -327,46 +341,231 @@ export class OfficialAppsService {
     context: OfficialAppRuntimeContext,
   ): Promise<OfficialAppActionResult> {
     const before = await captureOfficialPane(context.sessionManager, context.session);
-    const active = before === null ? null : extractActiveClaudeUrl(before);
-    if (active !== null) return openResult("claude", active);
+    this.diag(
+      `perform start session=${context.session} paneBytes=${
+        before === null ? "null" : Buffer.byteLength(before, "utf8")
+      } transcript=${context.claudeTranscriptPath ?? "none"} canInject=${context.canInjectClaudeCommand}`,
+    );
     const staleDialog = before === null ? null : extractClaudeRemoteDialogUrl(before);
     if (staleDialog !== null) {
       await this.dismissClaudeRemoteDialog(context);
+      this.diag(`perform open via stale dialog session=${context.session}`);
       return openResult("claude", staleDialog);
     }
+    if (before !== null && statusBarShowsRemoteControl(before)) {
+      const url =
+        lastTranscriptRemoteControlEntry(context.claudeTranscriptPath)?.url ??
+        extractBannerClaudeUrl(before);
+      if (url !== null) {
+        this.diag(`perform open via pre-check /rc session=${context.session}`);
+        return openResult("claude", url);
+      }
+      // active なのに URL 不明（transcript 欠落・バナー窓外）: 注入すると CLI は
+      // dialog を開くので、poll 側の dialog 経路で URL を回収できる。
+      this.diag(`perform /rc lit but url unknown session=${context.session}`);
+    }
     if (!context.canInjectClaudeCommand) {
+      this.diag(`perform busy session=${context.session}`);
       return unavailableResult("claude", "claude_agent_busy");
     }
     try {
       await context.sessionManager.sendTextSubmit(context.session, "/remote-control");
-    } catch {
+    } catch (error) {
+      this.diag(`perform inject failed session=${context.session} error=${String(error).slice(0, 120)}`);
       return unavailableResult("claude", "claude_start_failed");
     }
+    this.diag(`perform injected session=${context.session}`);
 
-    const deadline = Date.now() + this.claudeStartTimeoutMs;
+    const injectedAtMs = Date.now();
+    const deadline = injectedAtMs + this.claudeStartTimeoutMs;
+    let injectionAttempts = 1;
+    // transcript は stat(size/mtime) が変わったときだけ読み直す（8MiB 窓を 250ms
+    // 毎に全読みしない）。実行証跡（local_command 記録）の有無も同じ stat ゲートで
+    // 更新し、一度 true になったら固定する（記録は消えない）。
+    let cachedEntry: TranscriptRemoteControlEntry | null = null;
+    let cachedStamp = "";
+    let commandRecordSeen = false;
+    const currentTranscriptEntry = (): TranscriptRemoteControlEntry | null => {
+      if (context.claudeTranscriptPath === null) return null;
+      let stamp: string;
+      try {
+        const stat = fs.statSync(context.claudeTranscriptPath);
+        stamp = `${stat.size}:${stat.mtimeMs}`;
+      } catch {
+        return null;
+      }
+      if (stamp !== cachedStamp) {
+        cachedEntry = lastTranscriptRemoteControlEntry(context.claudeTranscriptPath);
+        if (!commandRecordSeen) {
+          commandRecordSeen = transcriptHasRemoteControlCommandSince(
+            context.claudeTranscriptPath,
+            injectedAtMs - TRANSCRIPT_FRESH_SKEW_MS,
+          );
+        }
+        cachedStamp = stamp;
+      }
+      return cachedEntry;
+    };
     let latestText = "";
+    let paneMisses = 0;
     do {
       await delay(this.claudePollIntervalMs);
       const paneText = await captureOfficialPane(context.sessionManager, context.session);
-      if (paneText !== null) {
-        latestText = paneText;
-        const url = extractActiveClaudeUrl(paneText);
-        if (url !== null) return openResult("claude", url);
-        // 会話がアーカイブされた直後は CLI がまだ active 扱いのため、注入した
-        // /remote-control が dialog になる。閉じて URL を返す（再接続は CLI 側が担う）。
-        const dialogUrl = extractClaudeRemoteDialogUrl(paneText);
-        if (dialogUrl !== null) {
-          await this.dismissClaudeRemoteDialog(context);
-          return openResult("claude", dialogUrl);
+      // transcript の bridge_status は pane 取得の成否と独立に判定する（pane が
+      // 一時的に読めない状態が続いても activation 成功を取りこぼさない）。
+      const entry = currentTranscriptEntry();
+      // 新規 activation は bridge_status を追記する。注入以降の行だけを新規成功と
+      // みなす（TRANSCRIPT_FRESH_SKEW_MS は書込タイムスタンプとの許容ずれ）。
+      if (
+        entry !== null &&
+        entry.atMs !== null &&
+        entry.atMs >= injectedAtMs - TRANSCRIPT_FRESH_SKEW_MS
+      ) {
+        this.diag(`perform open via fresh bridge_status session=${context.session}`);
+        return openResult("claude", entry.url);
+      }
+      if (paneText === null) {
+        paneMisses += 1;
+        // pane が読めないまま grace を超えたら、既知 URL を最善手として返す
+        // （capture 障害で 20 秒待って失敗にするより回復性を優先）。
+        if (entry !== null && Date.now() - injectedAtMs > this.claudeReconnectGraceMs) {
+          this.diag(
+            `perform open via known URL (pane unreadable x${paneMisses}) session=${context.session}`,
+          );
+          return openResult("claude", entry.url);
         }
-        const reason = classifyClaudeFailure(paneText);
-        if (reason !== null) return unavailableResult("claude", reason);
+        continue;
+      }
+      latestText = paneText;
+      // 会話がアーカイブされた直後は CLI がまだ active 扱いのため、注入した
+      // /remote-control が dialog になる。閉じて URL を返す（再接続は CLI 側が担う）。
+      const dialogUrl = extractClaudeRemoteDialogUrl(paneText);
+      if (dialogUrl !== null) {
+        await this.dismissClaudeRemoteDialog(context);
+        this.diag(`perform open via dialog session=${context.session}`);
+        return openResult("claude", dialogUrl);
+      }
+      // 同一プロセスの再接続は bridge_status を追記しない（実測）。/rc 点灯を
+      // 確認できたら既知 URL（同一プロセスで不変）を返す。新規行の追記を先に
+      // 拾えるよう、注入直後の grace 期間は entry 追記待ちを優先する。
+      if (
+        entry !== null &&
+        statusBarShowsRemoteControl(paneText) &&
+        Date.now() - injectedAtMs > this.claudeReconnectGraceMs
+      ) {
+        this.diag(`perform open via /rc + known URL session=${context.session}`);
+        return openResult("claude", entry.url);
+      }
+      if (entry === null) {
+        const bannerUrl = extractBannerClaudeUrl(paneText);
+        if (bannerUrl !== null) {
+          this.diag(`perform open via banner session=${context.session}`);
+          return openResult("claude", bannerUrl);
+        }
+      }
+      const reason = classifyClaudeFailure(paneText);
+      if (reason !== null) {
+        this.diag(`perform failure marker=${reason} session=${context.session}`);
+        return unavailableResult("claude", reason);
+      }
+      // RC 切断直後の limbo では注入テキストが入力欄エコーごと黙殺される（実測:
+      // record も pane 変化も残らない）。実行証跡（local_command 記録）が出ないまま
+      // 時間が経ったら、limbo が明けた前提で再注入する（少し待てば成功する挙動を
+      // 手動の押し直しからホスト内リトライへ移す）。claude が処理中（ユーザーが
+      // 並行してメッセージを送った等）の再注入は、queued 化してターン後に意図せず
+      // 実行されるため見送る。
+      if (
+        injectionAttempts < 3 &&
+        Date.now() - injectedAtMs > this.claudeReinjectAfterMs * injectionAttempts &&
+        !commandRecordSeen &&
+        !statusBarShowsProcessing(paneText)
+      ) {
+        injectionAttempts += 1;
+        this.diag(`perform reinject attempt=${injectionAttempts} session=${context.session}`);
+        try {
+          await context.sessionManager.sendTextSubmit(context.session, "/remote-control");
+        } catch {
+          // 再注入失敗は poll 継続（最終的に timeout で報告する）。
+        }
       }
     } while (Date.now() <= deadline);
+    this.diag(
+      `perform timeout session=${context.session} paneMisses=${paneMisses} ` +
+        `transcript=${context.claudeTranscriptPath ?? "none"} lastPaneBytes=${Buffer.byteLength(latestText, "utf8")}`,
+    );
     return unavailableResult(
       "claude",
       classifyClaudeFailure(latestText) ?? "claude_start_failed",
     );
+  }
+
+  /**
+   * Remote Control の切断。2.1.220 の `/remote-control` はトグルではなく、active 中の
+   * 再実行で dialog（Disconnect / Show QR / Continue, カーソルは Continue）を開く。
+   * dialog を出して Up Up + Enter で「Disconnect this session」を選択し、ステータス
+   * バーの `/rc` 消灯で成功を検証する（実測 2026-07-27）。
+   */
+  private async stopClaude(
+    context: OfficialAppRuntimeContext,
+  ): Promise<OfficialAppActionResult> {
+    const before = await captureOfficialPane(context.sessionManager, context.session);
+    this.diag(
+      `stop start session=${context.session} paneBytes=${
+        before === null ? "null" : Buffer.byteLength(before, "utf8")
+      }`,
+    );
+    let dialogVisible = before !== null && extractClaudeRemoteDialogUrl(before) !== null;
+    if (!dialogVisible) {
+      if (before === null || !statusBarShowsRemoteControl(before)) {
+        this.diag(`stop already off session=${context.session}`);
+        return { provider: "claude", outcome: "stopped" };
+      }
+      if (!context.canInjectClaudeCommand) {
+        return unavailableResult("claude", "claude_agent_busy");
+      }
+      try {
+        await context.sessionManager.sendTextSubmit(context.session, "/remote-control");
+      } catch {
+        return unavailableResult("claude", "claude_stop_failed");
+      }
+      // dialog が開くのを待つ。
+      const dialogDeadline = Date.now() + Math.min(8_000, this.claudeStartTimeoutMs);
+      while (Date.now() <= dialogDeadline) {
+        await delay(this.claudePollIntervalMs);
+        const paneText = await captureOfficialPane(context.sessionManager, context.session);
+        if (paneText !== null && extractClaudeRemoteDialogUrl(paneText) !== null) {
+          dialogVisible = true;
+          break;
+        }
+      }
+      if (!dialogVisible) {
+        this.diag(`stop dialog never appeared session=${context.session}`);
+        return unavailableResult("claude", "claude_stop_failed");
+      }
+    }
+    try {
+      await context.sessionManager.sendKeys(context.session, ["Up", "Up", "Enter"]);
+    } catch {
+      await this.dismissClaudeRemoteDialog(context);
+      return unavailableResult("claude", "claude_stop_failed");
+    }
+    const offDeadline = Date.now() + Math.min(8_000, this.claudeStartTimeoutMs);
+    while (Date.now() <= offDeadline) {
+      await delay(this.claudePollIntervalMs);
+      const paneText = await captureOfficialPane(context.sessionManager, context.session);
+      if (
+        paneText !== null &&
+        !statusBarShowsRemoteControl(paneText) &&
+        extractClaudeRemoteDialogUrl(paneText) === null
+      ) {
+        this.diag(`stop confirmed session=${context.session}`);
+        return { provider: "claude", outcome: "stopped" };
+      }
+    }
+    // dialog が残っている可能性に備えて閉じ、失敗として報告する。
+    await this.dismissClaudeRemoteDialog(context);
+    this.diag(`stop verify timeout session=${context.session}`);
+    return unavailableResult("claude", "claude_stop_failed");
   }
 
   private async dismissClaudeRemoteDialog(context: OfficialAppRuntimeContext): Promise<void> {
@@ -535,36 +734,170 @@ async function captureOfficialPane(
   }
 }
 
-export function extractClaudeRemoteDialogUrl(text: string): string | null {
-  if (!text.includes(CLAUDE_DIALOG_DISCONNECT_LABEL)) return null;
-  const prefixAt = text.lastIndexOf(CLAUDE_DIALOG_URL_PREFIX);
-  if (prefixAt < 0) return null;
-  const raw = text.slice(prefixAt + CLAUDE_DIALOG_URL_PREFIX.length).split(/\s/u, 1)[0] ?? "";
-  const candidate = raw.endsWith(".") ? raw.slice(0, -1) : raw;
-  return validClaudeUrl(candidate) ? candidate : null;
+/**
+ * pane 最下部のステータスバーに `/rc` インジケータが点灯しているか。
+ * バナー文言はチャット本文の引用（デバッグ表示・ユーザーの貼り付け）で偽陽性に
+ * なり得るのに対し、末尾行の TUI クロームは本文が占有できないため活性判定の権威。
+ */
+export function statusBarShowsRemoteControl(text: string): boolean {
+  const lines = text
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim() !== "");
+  // 入力プロンプト行（❯ で始まる）は下書きに `/rc` と打たれ得るため除外する。
+  return lines
+    .slice(-3)
+    .some((line) => !line.trim().startsWith("❯") && /(^|\s)\/rc$/u.test(line));
 }
 
-export function extractActiveClaudeUrl(text: string): string | null {
-  const candidate = extractClaudeUrlCandidate(text);
-  if (candidate === null) return null;
-  // URL より後の status bar（例: `/rc active`）を activation marker として採ると、
-  // その marker 以降だけを再検索して同じ行より前の URL を取りこぼす。URL 以前の
-  // activation announcement と対応付け、後続の inactive marker がない場合だけ返す。
-  const activeAt = latestIndex(text.slice(0, candidate.offset + 1), CLAUDE_ACTIVE_MARKERS);
-  if (activeAt < 0) return null;
-  const inactiveAt = latestIndex(text, CLAUDE_INACTIVE_MARKERS);
-  if (inactiveAt > activeAt) return null;
-  return candidate.url;
+/**
+ * pane 最下部のステータスバーが処理中（`esc to interrupt`）を示しているか。
+ * アイドル時のバー（`? for shortcuts`）には現れない実測差分を使う。
+ * 本文引用対策として末尾 3 行だけを見る。
+ */
+export function statusBarShowsProcessing(text: string): boolean {
+  const lines = text
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim() !== "");
+  return lines
+    .slice(-3)
+    .some((line) => !line.trim().startsWith("❯") && line.includes("esc to interrupt"));
 }
 
-function extractClaudeUrlCandidate(text: string): { url: string; offset: number } | null {
-  let offset = text.lastIndexOf(CLAUDE_SESSION_PREFIX);
-  while (offset >= 0) {
-    const candidate = text.slice(offset).split(/\s/u, 1)[0] ?? "";
-    if (validClaudeUrl(candidate)) return { url: candidate, offset };
-    offset = text.lastIndexOf(CLAUDE_SESSION_PREFIX, offset - 1);
+export interface TranscriptRemoteControlEntry {
+  url: string;
+  atMs: number | null;
+}
+
+/**
+ * transcript 末尾から最新の bridge_status（Remote Control activation）行を読む。
+ * CLI 自身が書く構造化行なので、pane と違い本文引用による偽陽性がない。
+ * URL は同一 CLI プロセス内の再接続で不変（実測）のため、最後の 1 件が現在値。
+ */
+function readTranscriptTail(transcriptPath: string): string | null {
+  try {
+    const size = fs.statSync(transcriptPath).size;
+    // activation は会話冒頭側にあり得る。巨大 tool 出力で末尾から遠のくため
+    // 窓は広めに取る（この取りこぼしを 256KiB で実際に踏んだ）。
+    const start = Math.max(0, size - TRANSCRIPT_TAIL_BYTES);
+    const fd = fs.openSync(transcriptPath, "r");
+    try {
+      const buffer = Buffer.alloc(size - start);
+      fs.readSync(fd, buffer, 0, buffer.length, start);
+      return buffer.toString("utf8");
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 注入以降に /remote-control の実行記録（local_command）が書かれたか。
+ * RC 切断直後の limbo では typed 入力が入力欄エコーごと黙殺される（実測）ため、
+ * 「注入したのに実行証跡が無い」ことの検出に使う（再注入の判断材料）。
+ */
+export function transcriptHasRemoteControlCommandSince(
+  transcriptPath: string | null,
+  sinceMs: number,
+): boolean {
+  if (transcriptPath === null) return false;
+  const tail = readTranscriptTail(transcriptPath);
+  if (tail === null) return false;
+  for (const line of tail.split("\n").reverse()) {
+    if (!line.includes('"local_command"') || !line.includes("/remote-control")) continue;
+    let entry: unknown;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!isRecord(entry) || entry["subtype"] !== "local_command") continue;
+    const content = typeof entry["content"] === "string" ? entry["content"] : "";
+    if (!content.includes("<command-name>/remote-control</command-name>")) continue;
+    const timestamp = typeof entry["timestamp"] === "string" ? Date.parse(entry["timestamp"]) : NaN;
+    if (!Number.isNaN(timestamp) && timestamp >= sinceMs) return true;
+  }
+  return false;
+}
+
+export function lastTranscriptRemoteControlEntry(
+  transcriptPath: string | null,
+): TranscriptRemoteControlEntry | null {
+  if (transcriptPath === null) return null;
+  const tail = readTranscriptTail(transcriptPath);
+  if (tail === null) return null;
+  const lines = tail.split("\n");
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index] ?? "";
+    if (!line.includes('"bridge_status"')) continue;
+    let entry: unknown;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!isRecord(entry) || entry["subtype"] !== "bridge_status") continue;
+    const content = typeof entry["content"] === "string" ? entry["content"] : "";
+    if (!content.includes("/remote-control is active")) continue;
+    const at = content.indexOf(CLAUDE_SESSION_PREFIX);
+    if (at < 0) continue;
+    const raw = content.slice(at).split(/\s/u, 1)[0] ?? "";
+    const candidate = raw.endsWith(".") ? raw.slice(0, -1) : raw;
+    if (!validClaudeUrl(candidate)) continue;
+    const timestamp = typeof entry["timestamp"] === "string" ? Date.parse(entry["timestamp"]) : NaN;
+    return { url: candidate, atMs: Number.isNaN(timestamp) ? null : timestamp };
   }
   return null;
+}
+
+/**
+ * pane から activation バナーの URL を拾う最終フォールバック。行頭（trim 後）が
+ * activation 文言で始まる行だけを banner とみなし、同一行 or 直後行の URL を採る。
+ * 本文引用への完全な耐性はないため、transcript(bridge_status) が引けない場合のみ使う。
+ */
+export function extractBannerClaudeUrl(text: string): string | null {
+  const lines = text.split("\n");
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const trimmed = (lines[index] ?? "").trim();
+    if (
+      !trimmed.startsWith("/remote-control is active") &&
+      !trimmed.startsWith("Remote Control is active")
+    ) {
+      continue;
+    }
+    const sameLineAt = trimmed.indexOf(CLAUDE_SESSION_PREFIX);
+    if (sameLineAt >= 0) {
+      const candidate = trimmed.slice(sameLineAt).split(/\s/u, 1)[0] ?? "";
+      if (validClaudeUrl(candidate)) return candidate;
+    }
+    for (let next = index + 1; next < Math.min(lines.length, index + 3); next += 1) {
+      const nextTrimmed = (lines[next] ?? "").trim();
+      if (nextTrimmed === "") continue;
+      if (!nextTrimmed.startsWith(CLAUDE_SESSION_PREFIX)) break;
+      const candidate = nextTrimmed.split(/\s/u, 1)[0] ?? "";
+      if (validClaudeUrl(candidate)) return candidate;
+      break;
+    }
+  }
+  return null;
+}
+
+export function extractClaudeRemoteDialogUrl(text: string): string | null {
+  // チャット本文がダイアログ文言を引用しただけの偽陽性を避けるため、substring では
+  // なく trim 後の行単位で照合する（実ダイアログは各要素が行頭に独立して並ぶ）。
+  const lines = text.split("\n").map((line) => line.trim());
+  if (!lines.some((line) => line === CLAUDE_DIALOG_DISCONNECT_LABEL)) return null;
+  if (!lines.some((line) => line.startsWith("Enter to select"))) return null;
+  const urlLine = [...lines]
+    .reverse()
+    .find((line) => line.startsWith(CLAUDE_DIALOG_URL_PREFIX));
+  if (urlLine === undefined) return null;
+  const raw = urlLine.slice(CLAUDE_DIALOG_URL_PREFIX.length).split(/\s/u, 1)[0] ?? "";
+  const candidate = raw.endsWith(".") ? raw.slice(0, -1) : raw;
+  return validClaudeUrl(candidate) ? candidate : null;
 }
 
 export function validClaudeUrl(value: string): boolean {
@@ -840,10 +1173,6 @@ function boundedSecret(value: unknown, maximum: number): value is string {
   );
 }
 
-function latestIndex(text: string, markers: readonly string[]): number {
-  return markers.reduce((latest, marker) => Math.max(latest, text.lastIndexOf(marker)), -1);
-}
-
 function classifySpawnSuccess(code: number | null, signal: NodeJS.Signals | null): boolean {
   return code === 0 && signal === null;
 }
@@ -862,7 +1191,14 @@ async function runFixedCommand(
     let stderrBytes = 0;
     const child = spawn(executable, [...args], {
       cwd: os.homedir(),
-      env: process.env,
+      // SSH 経由で spawn された engine は非ログインシェルの PATH（~/.local/bin 等を
+      // 含まない）を継承し、`claude` 解決に失敗して official_cli_unavailable になる
+      // （QUIC gw 経由は --path 注入済みで成功する、という transport 依存の実障害）。
+      // launch と同じ既知ディレクトリを前置して両 transport で解決を揃える。
+      env: {
+        ...process.env,
+        PATH: [defaultInjectedPath(), process.env["PATH"] ?? ""].filter(Boolean).join(":"),
+      },
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
     });

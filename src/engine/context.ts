@@ -3,6 +3,8 @@
 // handleLine のドメイン別ハンドラ（handlers/）は全てここ経由で状態に触る。
 
 import { randomUUID } from "node:crypto";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { ChatAgent } from "../chat/chatTailController.js";
 import type { CodexAppServerManager } from "../codex/codexAppServer.js";
 import type { CodexTurnControllerRuntime } from "../codex/codexNativeTurnController.js";
@@ -29,6 +31,7 @@ import type {
   OfficialAppRuntimeContext,
   OfficialAppsService,
 } from "../services/officialApps.js";
+import { claudeProjectSlug } from "../shared/paths.js";
 import { sleep } from "../shared/sleep.js";
 import type { SessionBackend, SessionBackendKind } from "../backend/sessionBackend.js";
 
@@ -255,6 +258,21 @@ export async function officialAppRuntimeContext(
       break;
     }
   }
+  // Remote Control URL の権威は transcript の bridge_status 行（pane 引用に汚染されない）。
+  const claudeSessionId = meta?.claudeSessionId;
+  const claudeTranscriptPath =
+    provider === "claude" &&
+    meta !== null &&
+    typeof claudeSessionId === "string" &&
+    /^[A-Za-z0-9-]+$/u.test(claudeSessionId)
+      ? path.join(
+          os.homedir(),
+          ".claude",
+          "projects",
+          claudeProjectSlug(meta.cwd),
+          `${claudeSessionId}.jsonl`,
+        )
+      : null;
   return {
     context: {
       session,
@@ -262,6 +280,7 @@ export async function officialAppRuntimeContext(
       sessionManager: ctx.sessionManager,
       canInjectClaudeCommand: !ctx.processingSessions.has(session) && pending === null,
       canMutateCodexDaemon: !codexTurnActive,
+      claudeTranscriptPath,
     },
   };
 }
