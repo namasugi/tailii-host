@@ -131,6 +131,56 @@ describe("TranscriptTailer", () => {
     ]);
   });
 
+  test("system/local_command の実行・出力記録を user 行として流す（iOS 側でタグ整形）", async () => {
+    const p = writeTranscript([
+      '{"type":"system","subtype":"local_command","content":"<command-name>/remote-control</command-name>","uuid":"lc1"}',
+      '{"type":"system","subtype":"local_command","content":"<local-command-stdout>Remote Control disconnected.</local-command-stdout>","uuid":"lc2"}',
+      // タグを含まない system 行は流さない。
+      '{"type":"system","subtype":"local_command","content":"plain","uuid":"lc3"}',
+    ]);
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
+    const chats = (await collect(tailer.streamTranscript(p))).filter((m) => m.type === "chat_output");
+    expect(chats).toEqual([
+      {
+        type: "chat_output",
+        v: 1,
+        streamId: "lc1",
+        role: "user",
+        text: "<command-name>/remote-control</command-name>",
+        eof: true,
+      },
+      {
+        type: "chat_output",
+        v: 1,
+        streamId: "lc2",
+        role: "user",
+        text: "<local-command-stdout>Remote Control disconnected.</local-command-stdout>",
+        eof: true,
+      },
+    ]);
+  });
+
+  test("bridge_status の Remote Control activation を system 通知行として流す", async () => {
+    const p = writeTranscript([
+      '{"type":"system","subtype":"bridge_status","content":"/remote-control is active · Continue here, on your phone, or at https://claude.ai/code/session_x","uuid":"rc1"}',
+      // activation 以外の bridge_status / 他の system 行は流さない。
+      '{"type":"system","subtype":"bridge_status","content":"何か別の通知","uuid":"rc2"}',
+      '{"type":"system","subtype":"turn_duration","content":"5s","uuid":"rc3"}',
+    ]);
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
+    const chats = (await collect(tailer.streamTranscript(p))).filter((m) => m.type === "chat_output");
+    expect(chats).toEqual([
+      {
+        type: "chat_output",
+        v: 1,
+        streamId: "rc1",
+        role: "system",
+        text: "📱 /remote-control is active · Continue here, on your phone, or at https://claude.ai/code/session_x",
+        eof: true,
+      },
+    ]);
+  });
+
   test("uuid が無いターンは連番 streamId（turn-N）を振る", async () => {
     const p = writeTranscript(['{"type":"user","message":{"role":"user","content":"x"}}']);
     const tailer = new TranscriptTailer({ pollIntervalMs: 10 });

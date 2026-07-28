@@ -360,6 +360,30 @@ export function extractTurn(line: string): Turn | null {
     };
   }
 
+  if (rec["type"] === "system") {
+    const content = typeof rec["content"] === "string" ? rec["content"] : "";
+    const emptyTurn = {
+      id: typeof rec["uuid"] === "string" ? rec["uuid"] : null,
+      toolActivities: [],
+      questionPrompts: [],
+      toolResultIds: [],
+      model: null,
+      contextTokens: null,
+    };
+    // Remote Control の activation 通知（bridge_status）。未接続から /remote-control で
+    // 有効化したとき、可視信号はこの行だけ（TUI バナーは通常ターンに残らない）。
+    if (rec["subtype"] === "bridge_status" && content.includes("/remote-control is active")) {
+      return { ...emptyTurn, role: "system", text: `📱 ${content}` };
+    }
+    // ローカルコマンドの実行/出力記録（<command-name> / <local-command-stdout> タグ）。
+    // claude 2.1.220 は type=system で書く。iOS 側 present() がタグを
+    // 「▶ /cmd」「出力の system 行」へ整形する（空出力は iOS 側で破棄）。
+    if (rec["subtype"] === "local_command" && content.includes("<")) {
+      return { ...emptyTurn, role: "user", text: content };
+    }
+    return null;
+  }
+
   const message =
     typeof rec["message"] === "object" && rec["message"] !== null
       ? (rec["message"] as Record<string, unknown>)
