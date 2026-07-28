@@ -121,6 +121,26 @@ const SHIFT_TAB_SEQUENCE = "\u001b[Z";
  */
 const ENTER_SEQUENCE = "\r";
 
+/**
+ * 画面に選択ダイアログのフッター行があるか。チャット本文が「Enter to select」を
+ * 引用しただけの偽陽性（誤 Esc・再送スキップの実害）を避けるため、substring では
+ * なく trim 後にフッター文言で始まる行だけをダイアログとみなす。
+ */
+export function screenHasSelectionFooter(screen: string): boolean {
+  return screen
+    .split("\n")
+    .some((line) => line.trim().startsWith("Enter to select"));
+}
+
+/**
+ * 入力反映検証に使う probe（本文 1 行目の先頭部分）。検証不能な本文（空など）は null。
+ */
+export function typedTextProbe(text: string): string | null {
+  const firstLine = (text.split("\n")[0] ?? "").trim();
+  if (firstLine.length === 0) return null;
+  return firstLine.slice(0, 24);
+}
+
 /** herdr CLI の JSON stdout から `result` を取り出す。JSON でない/エラー封筒は null。 */
 export function parseHerdrResult(stdout: string): Record<string, unknown> | null {
   try {
@@ -223,6 +243,8 @@ export class HerdrSessionManager {
   private readonly submitDelayMs: number;
   /** sendTextSubmit の CR→残留確認 間隔 ms（テスト注入用）。 */
   private readonly submitVerifyDelayMs: number;
+  /** 入力欄へ本文が反映されなかったときの再投入間隔 ms（RC 切断 limbo 対策）。 */
+  private readonly inputRetryDelayMs: number;
   /** 注入前の claude 検出待ちの上限/間隔 ms（テスト注入用）。 */
   private readonly readyTimeoutMs: number;
   private readonly readyPollMs: number;
@@ -234,6 +256,7 @@ export class HerdrSessionManager {
     protocolVersion?: number;
     submitDelayMs?: number;
     submitVerifyDelayMs?: number;
+    inputRetryDelayMs?: number;
     readyTimeoutMs?: number;
     readyPollMs?: number;
   } = {}) {
@@ -243,6 +266,7 @@ export class HerdrSessionManager {
     this.protocolVersion = options.protocolVersion ?? PROTOCOL_V1;
     this.submitDelayMs = options.submitDelayMs ?? 600;
     this.submitVerifyDelayMs = options.submitVerifyDelayMs ?? 700;
+    this.inputRetryDelayMs = options.inputRetryDelayMs ?? 1_500;
     this.readyTimeoutMs = options.readyTimeoutMs ?? 10_000;
     this.readyPollMs = options.readyPollMs ?? 300;
   }
@@ -359,12 +383,85 @@ export class HerdrSessionManager {
     // 残らない）。herdr の claude 検出（agent_status が unknown を抜けるまで）を注入の
     // 準備完了ゲートにする。working（処理中の queue 入力）も注入可。判定不能は fail-open。
     await this.waitForAgentReady(name);
-    await this.sendKeys(name, [text], true);
+    // 選択ダイアログ（/remote-control 等）が開いたままだと本文がダイアログに食われる。
+    // 注入前に Esc で閉じてから入力欄へ流す（Mac 側で手動 Esc するのと同じ操作）。
+    if (await this.selectionDialogVisible(name)) {
+      await this.sendKeys(name, ["Escape"]);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+    // Remote Control 切断直後の limbo では typed 入力が入力欄に一切入らず破棄される
+    // （実測 2026-07-28: 通常メッセージが本文ごと消失し、旧実装は「入力欄に残っていない
+    // = 送信成立」と誤判定して配送済みレシートを発行 → silent loss）。本文が入力欄へ
+    // 反映されたことを検証し、反映されなければ間隔を置いて再投入、最終的に throw して
+    // chat_send を uncertain（アプリの明示再送）へ倒す。
+    const probe = typedTextProbe(text);
+    let typed = probe === null;
+    for (let attempt = 0; attempt < 3 && !typed; attempt += 1) {
+      if (attempt > 0) {
+        await new Promise((resolve) => setTimeout(resolve, this.inputRetryDelayMs));
+      }
+      await this.sendKeys(name, [text], true);
+      await new Promise((resolve) => setTimeout(resolve, this.submitDelayMs));
+      if (await this.inputBoxContainsText(name, probe as string)) {
+        typed = true;
+        break;
+      }
+      // 描画遅延での誤判定 → 再投入で本文が二重になるのを避けるため、少し待って再確認。
+      await new Promise((resolve) => setTimeout(resolve, this.submitVerifyDelayMs));
+      if (await this.inputBoxContainsText(name, probe as string)) {
+        typed = true;
+        break;
+      }
+    }
+    if (!typed) {
+      throw new HerdrFailedError(
+        ["pane", "send-text", name],
+        1,
+        "typed text did not reach the input box (Remote Control 切断直後の limbo の可能性)",
+      );
+    }
     for (let attempt = 0; attempt < 4; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, this.submitDelayMs));
       await this.sendKeys(name, ["Enter"]);
       await new Promise((resolve) => setTimeout(resolve, this.submitVerifyDelayMs));
+      // 送出した本文が選択ダイアログを開いた場合（RC active 中の /remote-control 等）、
+      // ダイアログのカーソル行（❯ Continue）を未送信テキストと誤認して Enter を再送すると
+      // 選択肢を誤操作してダイアログを閉じてしまう（実障害: 転写カードが一瞬で消える）。
+      // ダイアログ表示中は送信成立として扱い、以降の操作は転写カード側に任せる。
+      if (await this.selectionDialogVisible(name)) return;
       if (!(await this.inputBoxHasPendingText(name))) return;
+    }
+  }
+
+  /**
+   * 入力欄（最後の `❯` 行から下）に probe テキストが反映されているか。
+   * ペイン履歴の同文エコー（同一メッセージの再送時など）を誤って「入力済み」と
+   * 判定しないよう、走査範囲を最後の `❯` 行以降に限定する。判定不能は false。
+   */
+  private async inputBoxContainsText(name: string, probe: string): Promise<boolean> {
+    try {
+      const screen = await this.capturePane(name, { lines: 30 });
+      const lines = screen.split("\n");
+      let lastPromptIndex = -1;
+      for (let index = lines.length - 1; index >= 0; index -= 1) {
+        if ((lines[index] ?? "").trim().startsWith("❯")) {
+          lastPromptIndex = index;
+          break;
+        }
+      }
+      if (lastPromptIndex < 0) return false;
+      return lines.slice(lastPromptIndex).join("\n").includes(probe);
+    } catch {
+      return false;
+    }
+  }
+
+  /** claude TUI の選択ダイアログ（`Enter to select` フッター）が表示中か。判定不能は false。 */
+  private async selectionDialogVisible(name: string): Promise<boolean> {
+    try {
+      return screenHasSelectionFooter(await this.capturePane(name, { lines: 30 }));
+    } catch {
+      return false;
     }
   }
 

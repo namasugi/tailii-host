@@ -10,6 +10,7 @@ import {
   parseHerdrForegroundCommand,
   parseHerdrPaneList,
   parseHerdrStartedPaneId,
+  screenHasSelectionFooter,
   type HerdrCommandResult,
   type HerdrCommandRunner,
 } from "../src/backend/herdr.js";
@@ -157,42 +158,174 @@ describe("HerdrSessionManager", () => {
     ]);
   });
 
-  test("sendTextSubmit: 本文→CR→残留確認。入力欄が空になれば終了、残留していれば CR を再送する", async () => {
-    const store = makeStore();
-    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
-    // 1回目の CR は飲まれた想定: 1度目の read は本文残留、2度目で空。
-    let reads = 0;
-    const screenWith = (input: string) => `❯ 古いメッセージのエコー\n──\n${input}\n──\n  ⏸ manual mode on`;
-    let agentGets = 0;
+  /** sendTextSubmit 検証用の pane 状態機械（send 内容で画面を遷移させ、read は現在画面を返す）。 */
+  function makeSubmitHarness(options: {
+    agentStatuses?: string[];
+    /** send-text（本文）を反映しない回数（RC 切断 limbo の黙殺挙動）。 */
+    swallowTextInputs?: number;
+    /** 最初の CR を飲む回数（実測: 300ms 未満で CR が飲まれる挙動）。 */
+    swallowEnters?: number;
+    /** CR の結果ダイアログを開く（RC active 中の /remote-control）。 */
+    openDialogOnEnter?: boolean;
+    /** 初期状態でダイアログが開いている。 */
+    dialogInitiallyOpen?: boolean;
+  } = {}) {
+    const state = {
+      input: "",
+      dialogOpen: options.dialogInitiallyOpen ?? false,
+      swallowTextInputs: options.swallowTextInputs ?? 0,
+      swallowEnters: options.swallowEnters ?? 0,
+      agentGets: 0,
+    };
+    const dialogScreen = [
+      "   Remote Control",
+      "     Disconnect this session",
+      "   ❯ Continue",
+      "   Enter to select · Esc to continue",
+    ].join("\n");
     const runner = new MockHerdrRunner((args) => {
       if (args[0] === "pane" && args[1] === "list") return herdrOk(paneListJson([{ pane_id: "w4:p2" }]));
       if (args[0] === "agent" && args[1] === "get") {
-        agentGets += 1;
-        // 1回目は boot 中(unknown) → 2回目で idle（準備完了ゲートの検証）。
+        const statuses = options.agentStatuses ?? ["idle"];
+        const status = statuses[Math.min(state.agentGets, statuses.length - 1)];
+        state.agentGets += 1;
         return herdrOk(JSON.stringify({
-          result: { agent: { pane_id: "w4:p2", agent_status: agentGets === 1 ? "unknown" : "idle" } },
+          result: { agent: { pane_id: "w4:p2", agent_status: status } },
         }));
       }
+      if (args[0] === "pane" && args[1] === "send-keys" && args[3] === "Escape") {
+        state.dialogOpen = false;
+        return herdrOk("");
+      }
+      if (args[0] === "pane" && args[1] === "send-text" && args[3] === "\r") {
+        if (state.swallowEnters > 0) {
+          state.swallowEnters -= 1;
+        } else if (options.openDialogOnEnter) {
+          state.dialogOpen = true;
+          state.input = "";
+        } else {
+          state.input = "";
+        }
+        return herdrOk("");
+      }
+      if (args[0] === "pane" && args[1] === "send-text") {
+        if (state.dialogOpen || state.swallowTextInputs > 0) {
+          if (state.swallowTextInputs > 0) state.swallowTextInputs -= 1;
+          // ダイアログ/limbo は本文を反映しない。
+        } else {
+          state.input = String(args[3]);
+        }
+        return herdrOk("");
+      }
       if (args[0] === "pane" && args[1] === "read") {
-        reads += 1;
-        return herdrOk(screenWith(reads === 1 ? "❯ こんにちは" : "❯"));
+        if (state.dialogOpen) return herdrOk(dialogScreen);
+        return herdrOk(`❯ 古いメッセージのエコー\n──\n❯ ${state.input}\n──\n  ⏸ manual mode on`);
       }
       return herdrOk("");
     });
+    return { runner, state };
+  }
+
+  const submitSends = (runner: MockHerdrRunner) =>
+    runner.recorded.filter((args) => args[1]?.startsWith("send-"));
+
+  test("sendTextSubmit: 本文反映を検証し、CR が飲まれたら CR を再送する", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const { runner, state } = makeSubmitHarness({
+      agentStatuses: ["unknown", "idle"],
+      swallowEnters: 1,
+    });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, readyTimeoutMs: 5000, readyPollMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
     });
     await manager.sendTextSubmit("s-a", "こんにちは");
-    const sends = runner.recorded.filter((args) => args[1]?.startsWith("send-"));
-    // agent 検出待ち(unknown→idle) → 本文 → CR → (残留検知) → CR 再送 → (空検知で終了)。
-    expect(agentGets).toBe(2);
-    expect(sends).toEqual([
+    // agent 検出待ち(unknown→idle) → 本文 → CR（飲まれる） → CR 再送 → 空検知で終了。
+    expect(state.agentGets).toBe(2);
+    expect(submitSends(runner)).toEqual([
       ["pane", "send-text", "w4:p2", "こんにちは"],
       ["pane", "send-text", "w4:p2", "\r"],
       ["pane", "send-text", "w4:p2", "\r"],
     ]);
-    expect(reads).toBe(2);
+  });
+
+  test("sendTextSubmit: limbo 黙殺（本文が入力欄に入らない）は再投入し、回復しなければ throw する", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const { runner } = makeSubmitHarness({ swallowTextInputs: 99 });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    // 3 回とも反映されず throw（chat_send は uncertain となり silent loss を防ぐ）。
+    await expect(manager.sendTextSubmit("s-a", "重要なメッセージ")).rejects.toThrow();
+    expect(submitSends(runner)).toEqual([
+      ["pane", "send-text", "w4:p2", "重要なメッセージ"],
+      ["pane", "send-text", "w4:p2", "重要なメッセージ"],
+      ["pane", "send-text", "w4:p2", "重要なメッセージ"],
+    ]);
+  });
+
+  test("sendTextSubmit: limbo が明けたら再投入で回復し送信を完了する", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const { runner } = makeSubmitHarness({ swallowTextInputs: 1 });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    await manager.sendTextSubmit("s-a", "重要なメッセージ");
+    expect(submitSends(runner)).toEqual([
+      ["pane", "send-text", "w4:p2", "重要なメッセージ"],
+      ["pane", "send-text", "w4:p2", "重要なメッセージ"],
+      ["pane", "send-text", "w4:p2", "\r"],
+    ]);
+  });
+
+  test("sendTextSubmit: 送出が選択ダイアログを開いたら Enter を再送しない（誤 Continue 防止）", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const { runner } = makeSubmitHarness({ openDialogOnEnter: true });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    await manager.sendTextSubmit("s-a", "/remote-control");
+    // ダイアログのカーソル行（❯ Continue）を未送信テキスト扱いして CR を再送しない。
+    expect(submitSends(runner)).toEqual([
+      ["pane", "send-text", "w4:p2", "/remote-control"],
+      ["pane", "send-text", "w4:p2", "\r"],
+    ]);
+  });
+
+  test("selectionDialogVisible: 本文が「Enter to select」を引用しても偽陽性にしない（行頭照合）", () => {
+    // 実フッター（行頭）は検出する。
+    expect(screenHasSelectionFooter("   ❯ Continue\n   Enter to select · Esc to continue")).toBe(true);
+    // チャット本文の引用（文中・箇条書き・かぎ括弧）は検出しない。
+    expect(screenHasSelectionFooter("  - ダイアログ表示中（\"Enter to select\"）は再送しない")).toBe(false);
+    expect(screenHasSelectionFooter("フッターに「Enter to select」が出ます")).toBe(false);
+  });
+
+  test("sendTextSubmit: 注入前にダイアログが開いていたら Esc で閉じてから本文を流す", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const { runner } = makeSubmitHarness({ dialogInitiallyOpen: true });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    await manager.sendTextSubmit("s-a", "こんにちは");
+    expect(submitSends(runner)).toEqual([
+      ["pane", "send-keys", "w4:p2", "Escape"],
+      ["pane", "send-text", "w4:p2", "こんにちは"],
+      ["pane", "send-text", "w4:p2", "\r"],
+    ]);
   });
 
   test("capturePane: joinWrappedLines は recent-unwrapped、空なら visible 末尾へフォールバック", async () => {
