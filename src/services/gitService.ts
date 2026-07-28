@@ -584,6 +584,13 @@ export function isTailiiWorktreePath(candidate: string): boolean {
   return candidate.replaceAll("\\", "/").includes("/.claude/worktrees/");
 }
 
+/** worktree パスから repo ルート（`/.claude/worktrees/` の手前）を文字列だけで取り出す純関数。 */
+export function tailiiWorktreeRepoRoot(candidate: string): string | null {
+  const index = candidate.replaceAll("\\", "/").indexOf("/.claude/worktrees/");
+  if (index <= 0) return null;
+  return candidate.slice(0, index);
+}
+
 /** worktree と、安全な自動生成ブランチだけを削除して管理情報を prune する。 */
 export async function gitWorktreeRemove(
   worktreePath: string,

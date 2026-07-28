@@ -185,6 +185,7 @@ export async function runEngineCommand(args: string[]): Promise<number> {
     innerCommand: resumeCommandArg ?? "claude --continue",
     agent: "claude",
     backend: backendKind,
+    claudeProjectsDir: claudeProjectsRoot,
   });
   // per-session: agentType=codex のセッション用に codex launcher / resume launcher を用意する。
   // codex は resume 未対応のため既定コマンドで新規起動する（新しい rollout を tail）。
@@ -217,6 +218,7 @@ export async function runEngineCommand(args: string[]): Promise<number> {
         innerCommand: innerCommandArg,
         agent: "claude",
         backend: backendKind,
+        claudeProjectsDir: claudeProjectsRoot,
       }),
       backendKind,
       codexLauncher,

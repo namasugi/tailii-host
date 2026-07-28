@@ -12,10 +12,12 @@ import {
   codexInnerCommand,
   launchCore,
   makeSessionLauncher,
+  rescueMissingWorktreeCwd,
   resolveWorkdir,
   shellSingleQuote,
   type ProcessRunner,
 } from "../src/commands/launch.js";
+import { claudeProjectSlug } from "../src/shared/paths.js";
 import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
 import { makeTempDir } from "./helpers.js";
 
@@ -61,6 +63,84 @@ describe("resolveWorkdir", () => {
     const errors: string[] = [];
     expect(resolveWorkdir(path.join(base, "f"), null, (m) => errors.push(m))).toBeNull();
     expect(errors.some((m) => m.includes("ファイルです"))).toBe(true);
+  });
+});
+
+describe("rescueMissingWorktreeCwd（deleted-worktree-resume）", () => {
+  const SESSION_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+  test("削除済み worktree は repo ルートへ振り替え、transcript を root slug へ移設する", () => {
+    const root = makeTempDir("rescue-root");
+    const missing = path.join(root, ".claude", "worktrees", "20260728-000000");
+    const projects = makeTempDir("rescue-projects");
+    const srcDir = path.join(projects, "stale-worktree-slug");
+    fs.mkdirSync(srcDir, { recursive: true });
+    const src = path.join(srcDir, `${SESSION_ID}.jsonl`);
+    fs.writeFileSync(src, '{"cwd":"/x"}\n');
+    // /rewind 用のセッション付帯ディレクトリ（jsonl と同名）も一緒に移設される。
+    fs.mkdirSync(path.join(srcDir, SESSION_ID), { recursive: true });
+    fs.writeFileSync(path.join(srcDir, SESSION_ID, "snapshot.txt"), "snap");
+
+    const rescued = rescueMissingWorktreeCwd({
+      cwd: missing,
+      claudeSessionId: SESSION_ID,
+      projectsDir: projects,
+    });
+
+    expect(rescued).toBe(root);
+    const destDir = path.join(projects, claudeProjectSlug(root));
+    expect(fs.readFileSync(path.join(destDir, `${SESSION_ID}.jsonl`), "utf8")).toBe(
+      '{"cwd":"/x"}\n',
+    );
+    expect(fs.readFileSync(path.join(destDir, SESSION_ID, "snapshot.txt"), "utf8")).toBe("snap");
+    expect(fs.existsSync(src)).toBe(false);
+    expect(fs.existsSync(path.join(srcDir, SESSION_ID))).toBe(false);
+  });
+
+  test("cwd が存在するなら振り替えない", () => {
+    const root = makeTempDir("rescue-live");
+    const wt = path.join(root, ".claude", "worktrees", "x");
+    fs.mkdirSync(wt, { recursive: true });
+    expect(rescueMissingWorktreeCwd({ cwd: wt, claudeSessionId: null })).toBeNull();
+  });
+
+  test("worktree 以外・repo ルート不在・相対パスは救済しない", () => {
+    expect(rescueMissingWorktreeCwd({ cwd: "/nope-not-exist", claudeSessionId: null })).toBeNull();
+    expect(
+      rescueMissingWorktreeCwd({
+        cwd: "/nope-not-exist/.claude/worktrees/x",
+        claudeSessionId: null,
+      }),
+    ).toBeNull();
+    expect(rescueMissingWorktreeCwd({ cwd: "relative/path", claudeSessionId: null })).toBeNull();
+  });
+
+  test("transcript 未発見でも振り替え自体は行う", () => {
+    const root = makeTempDir("rescue-notranscript");
+    const missing = path.join(root, ".claude", "worktrees", "gone");
+    const projects = makeTempDir("rescue-empty-projects");
+    expect(
+      rescueMissingWorktreeCwd({ cwd: missing, claudeSessionId: SESSION_ID, projectsDir: projects }),
+    ).toBe(root);
+  });
+
+  test("移設先に同名 transcript が既にあれば上書きしない", () => {
+    const root = makeTempDir("rescue-dest-exists");
+    const missing = path.join(root, ".claude", "worktrees", "gone");
+    const projects = makeTempDir("rescue-dest-projects");
+    const destDir = path.join(projects, claudeProjectSlug(root));
+    fs.mkdirSync(destDir, { recursive: true });
+    const dest = path.join(destDir, `${SESSION_ID}.jsonl`);
+    fs.writeFileSync(dest, "dest\n");
+    const srcDir = path.join(projects, "old-slug");
+    fs.mkdirSync(srcDir, { recursive: true });
+    fs.writeFileSync(path.join(srcDir, `${SESSION_ID}.jsonl`), "src\n");
+
+    expect(
+      rescueMissingWorktreeCwd({ cwd: missing, claudeSessionId: SESSION_ID, projectsDir: projects }),
+    ).toBe(root);
+    expect(fs.readFileSync(dest, "utf8")).toBe("dest\n");
+    expect(fs.existsSync(path.join(srcDir, `${SESSION_ID}.jsonl`))).toBe(true);
   });
 });
 
@@ -499,6 +579,37 @@ describe("makeSessionLauncher: claude --session-id / --name の合成（lazy-ses
       expect(inner).not.toContain("--session-id");
       // resume でも実効会話 id を権威記録する（以後の reattach が厳密束縛できる）。
       expect(store.get("s-3")?.claudeSessionId).toBe("resume-id");
+    });
+  });
+
+  test("resume: 削除済み worktree は repo ルートで起動し transcript を移設する（deleted-worktree-resume）", async () => {
+    await withClaudeJsonRestored(async () => {
+      const root = makeTempDir("launcher-rescue-root");
+      const missing = path.join(root, ".claude", "worktrees", "20260728-000000");
+      const projects = makeTempDir("launcher-rescue-projects");
+      const srcDir = path.join(projects, "stale-worktree-slug");
+      fs.mkdirSync(srcDir, { recursive: true });
+      fs.writeFileSync(path.join(srcDir, "resume-id.jsonl"), '{"cwd":"/x"}\n');
+      const store = new SessionMetadataStore(makeTempDir("launcher-rescue-store"));
+      const { runner, recorded } = mockRunner();
+      const launcher = makeSessionLauncher({
+        store,
+        innerCommand: "claude",
+        runner,
+        claudeProjectsDir: projects,
+      });
+
+      const res = await launcher(missing, "s-rescue", null, "resume-id", null, null);
+
+      expect(res.exitCode).toBe(0);
+      const newCall = recorded.find((c) => c.args[0] === "new");
+      expect(newCall?.cwd).toBe(root);
+      expect(newCall?.args[4]).toContain("claude --resume resume-id");
+      // 権威記録も repo ルート（以後の tail 束縛・reattach が root slug を見る）。
+      expect(store.get("s-rescue")?.cwd).toBe(root);
+      expect(
+        fs.existsSync(path.join(projects, claudeProjectSlug(root), "resume-id.jsonl")),
+      ).toBe(true);
     });
   });
 

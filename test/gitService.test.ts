@@ -18,6 +18,7 @@ import {
   gitWorktreeRemove,
   isTailiiWorktreePath,
   parsePorcelainV2,
+  tailiiWorktreeRepoRoot,
 } from "../src/services/gitService.js";
 import { makeTempDir } from "./helpers.js";
 
@@ -479,5 +480,15 @@ describe("gitService worktree", () => {
     expect(isTailiiWorktreePath("/repo/.claude/worktrees/20260713-120000")).toBe(true);
     expect(isTailiiWorktreePath("/repo/.claude/worktrees")).toBe(false);
     expect(isTailiiWorktreePath("/repo/worktrees/example")).toBe(false);
+  });
+
+  test("tailiiWorktreeRepoRoot は marker の手前を repo ルートとして返す", () => {
+    expect(tailiiWorktreeRepoRoot("/Users/a/repo/.claude/worktrees/20260713-120000")).toBe(
+      "/Users/a/repo",
+    );
+    expect(tailiiWorktreeRepoRoot("/repo/.claude/worktrees/x/nested/dir")).toBe("/repo");
+    expect(tailiiWorktreeRepoRoot("/repo/.claude/worktrees")).toBeNull();
+    expect(tailiiWorktreeRepoRoot("/repo/src")).toBeNull();
+    expect(tailiiWorktreeRepoRoot("/.claude/worktrees/x")).toBeNull();
   });
 });

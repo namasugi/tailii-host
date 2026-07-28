@@ -18,7 +18,9 @@ import {
   parseHerdrStartedPaneId,
 } from "../backend/herdr.js";
 import { claudeHookLaunchSettings, removeCodexHookSettings } from "./hookSettings.js";
-import { isInsideBase, standardize, expandTilde } from "../shared/paths.js";
+import { tailiiWorktreeRepoRoot } from "../services/gitService.js";
+import { ClaudeSessionStore } from "../sessions/claudeSessionStore.js";
+import { claudeProjectSlug, isInsideBase, standardize, expandTilde } from "../shared/paths.js";
 import { resolveSessionBackendKind, type SessionBackendKind } from "../backend/sessionBackend.js";
 import { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
 import { sleep } from "../shared/sleep.js";
@@ -225,6 +227,8 @@ export function makeSessionLauncher(options: {
    */
   backend?: SessionBackendKind | (() => SessionBackendKind);
   herdrPath?: string | null;
+  /** `~/.claude/projects` の場所（deleted-worktree-resume の transcript 移設用）。テスト注入用。 */
+  claudeProjectsDir?: string;
 } = {}): EngineLauncher {
   const store = options.store ?? new SessionMetadataStore();
   const agent: LaunchAgent = options.agent ?? "claude";
@@ -239,6 +243,18 @@ export function makeSessionLauncher(options: {
     agent === "codex" ? (options.codexAppServer ?? new CodexAppServerManager()) : null;
   return async (cwd, name, baseDir, resumeSessionId, newSessionId, title, launchOptions) => {
     let errorText = "";
+    // resume 先の worktree が削除済みなら repo ルートへフォールバック（deleted-worktree-resume）。
+    // session_start(resume) と session_reattach の両経路がこの閉包を通る。
+    if (resumeSessionId !== null && resumeSessionId !== undefined) {
+      const rescued = rescueMissingWorktreeCwd({
+        cwd,
+        claudeSessionId: agent === "claude" ? resumeSessionId : null,
+        ...(options.claudeProjectsDir !== undefined
+          ? { projectsDir: options.claudeProjectsDir }
+          : {}),
+      });
+      if (rescued !== null) cwd = rescued;
+    }
     // resume: claude は `<inner> --resume <id>`。resume でない新規起動は
     // `<inner> --session-id <uuid>` で会話 id を固定し、host が tail 対象 jsonl を
     // 事前に確定できるようにする（同一 cwd の別会話ログの流入を防ぐ）。会話名を付けた
@@ -772,6 +788,64 @@ export function resolveWorkdir(
     );
     return null;
   }
+}
+
+/**
+ * resume 対象の cwd（絶対/`~`）が削除済みの Tailii worktree なら repo ルートへ振り替える。
+ * 公式 Claude Code CLI の「worktree が消えていたら起動元ディレクトリで再開」と同じ挙動
+ * （deleted-worktree-resume）。振り替え不要・不能なら null。
+ * claude の `--resume <id>` はカレントプロジェクトの slug に閉じて検索するため、
+ * transcript jsonl を repo ルート側 slug へ移設してから振り替える。
+ * 移設に失敗しても振り替え自体は行う（claude 側の未検出エラーの方が dir 不在より情報が多い）。
+ */
+export function rescueMissingWorktreeCwd(options: {
+  cwd: string;
+  /** claude の resume 会話 id（transcript 移設用）。codex 等は null。 */
+  claudeSessionId: string | null;
+  /** `~/.claude/projects` の場所。テスト注入用。 */
+  projectsDir?: string;
+}): string | null {
+  const { cwd, claudeSessionId } = options;
+  if (!cwd.startsWith("/") && !cwd.startsWith("~")) return null;
+  const resolved = standardize(cwd);
+  if (fs.existsSync(resolved)) return null;
+  const root = tailiiWorktreeRepoRoot(resolved);
+  if (root === null) return null;
+  let rootStat: fs.Stats;
+  try {
+    rootStat = fs.statSync(root);
+  } catch {
+    return null;
+  }
+  if (!rootStat.isDirectory()) return null;
+
+  if (claudeSessionId !== null) {
+    const projectsDir = options.projectsDir ?? path.join(os.homedir(), ".claude", "projects");
+    const destDir = path.join(projectsDir, claudeProjectSlug(root));
+    const dest = path.join(destDir, `${claudeSessionId}.jsonl`);
+    if (!fs.existsSync(dest)) {
+      const src = new ClaudeSessionStore(projectsDir).transcriptPath(claudeSessionId);
+      if (src !== null && src !== dest) {
+        try {
+          fs.mkdirSync(destDir, { recursive: true });
+          fs.renameSync(src, dest);
+        } catch {
+          // 移設失敗は claude の resume エラーに委ねる（上のコメント参照）。
+        }
+        // セッション付帯ディレクトリ（`<slug>/<id>/`、/rewind のファイルスナップショット等）も同居させる。
+        const srcAssets = src.slice(0, -".jsonl".length);
+        const destAssets = path.join(destDir, claudeSessionId);
+        try {
+          if (fs.existsSync(srcAssets) && !fs.existsSync(destAssets)) {
+            fs.renameSync(srcAssets, destAssets);
+          }
+        } catch {
+          // 付帯ディレクトリの移設失敗は無視する（transcript 本体が正）。
+        }
+      }
+    }
+  }
+  return root;
 }
 
 /** THIS 実行中エントリスクリプトの絶対パスを解決する（フック command 埋め込み用）。 */

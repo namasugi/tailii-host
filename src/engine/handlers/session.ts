@@ -93,9 +93,12 @@ export const sessionHandlers: HandlerRegistry = {
             ctx.hubLink.send({ type: "runtime_claim_release", session: message.name });
           }
           if (res.exitCode === 0) {
+            // launcher は worktree 削除済み resume で cwd を repo ルートへ振り替え得る
+            // （deleted-worktree-resume）ため、応答は起動後の権威記録 cwd を返す。
+            const launchedCwd = metadataStore?.get(message.name)?.cwd ?? meta.cwd;
             const info: SessionInfo = {
               name: message.name,
-              cwd: meta.cwd,
+              cwd: launchedCwd,
               alive: true,
               ...(meta.agent !== undefined ? { agent: meta.agent } : {}),
               ...(providerSessionId !== null ? { providerSessionId } : {}),
