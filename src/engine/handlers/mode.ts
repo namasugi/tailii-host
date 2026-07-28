@@ -120,8 +120,12 @@ export const modeHandlers: HandlerRegistry = {
   },
 };
 
-/** pane_key_send が受理する制御キー（tmux 互換キー名）。テキスト注入経路には使わせない。 */
-const PANE_KEY_ALLOWLIST = new Set(["C-c", "Escape"]);
+/**
+ * pane_key_send が受理する制御キー（tmux 互換キー名）。テキスト注入経路には使わせない。
+ * Up/Down/Enter は Claude TUI の選択ダイアログ（/remote-control 等）の転写カードから
+ * カーソル移動 + 確定を返すために使う（pane-menu 転写, 2026-07-28）。
+ */
+const PANE_KEY_ALLOWLIST = new Set(["C-c", "Escape", "Up", "Down", "Enter"]);
 
 /** pane から mode が判定できるまで、指定回数だけ短く待つ。 */
 async function waitForPermissionMode(

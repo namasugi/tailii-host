@@ -606,6 +606,25 @@ describe("Engine — アイドルライフサイクル/ページング", () => {
     await engine.teardown();
   });
 
+  test("pane_key_send は選択ダイアログ操作キー（Up/Enter）も受理する", async () => {
+    const runner = new MockTmuxRunner(() => ok(""));
+    const mgr = new TmuxSessionManager({ runner: runner.runner, store: makeTempStore() });
+    const engine = startEngine({ sessionManager: mgr });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"id":"PK3","key":"Up","session":"work","type":"pane_key_send","v":1}');
+    const upResp = await engine.lines.nextOfType("pane_key_send_result");
+    expect(upResp).toContain('"ok":true');
+    engine.writeLine('{"id":"PK4","key":"Enter","session":"work","type":"pane_key_send","v":1}');
+    const enterResp = await engine.lines.nextOfType("pane_key_send_result");
+    expect(enterResp).toContain('"ok":true');
+    const recorded = runner.recorded.map((cmd) => JSON.stringify(cmd));
+    expect(recorded).toContain(JSON.stringify(["send-keys", "-t", "work", "Up"]));
+    expect(recorded).toContain(JSON.stringify(["send-keys", "-t", "work", "Enter"]));
+
+    await engine.teardown();
+  });
+
   test("pane_key_send は allowlist 外の key を拒否し注入しない", async () => {
     const runner = new MockTmuxRunner(() => ok(""));
     const mgr = new TmuxSessionManager({ runner: runner.runner, store: makeTempStore() });
