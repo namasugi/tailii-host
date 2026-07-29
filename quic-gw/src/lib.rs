@@ -750,15 +750,25 @@ async fn handle_tcp(
     mut recv: quinn::RecvStream,
     port: u16,
 ) -> Result<()> {
-    // 接続先は 127.0.0.1 固定（PreviewServer はループバック限定 bind。任意ホスト転送は提供しない）。
+    // 接続先はループバック限定（任意ホスト転送は提供しない）。dev サーバは IPv6 の
+    // `[::1]` のみで LISTEN することがある（Node の localhost 解決）ため、v4 → v6 の順で試す。
     let stream = match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
         Ok(stream) => stream,
-        Err(e) => {
-            log_line(&format!("conn {conn_id} tcp connect 127.0.0.1:{port} failed: {e}"));
-            return reject(&mut send, "connect").await;
-        }
+        Err(e4) => match tokio::net::TcpStream::connect(("::1", port)).await {
+            Ok(stream) => stream,
+            Err(e6) => {
+                log_line(&format!(
+                    "conn {conn_id} tcp connect loopback:{port} failed: v4={e4} v6={e6}"
+                ));
+                return reject(&mut send, "connect").await;
+            }
+        },
     };
-    log_line(&format!("conn {conn_id} tcp connect 127.0.0.1:{port}"));
+    let peer = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| format!("loopback:{port}"));
+    log_line(&format!("conn {conn_id} tcp connect {peer}"));
     send.write_all(b"{\"ok\":true}\n").await?;
 
     let (mut tcp_read, mut tcp_write) = stream.into_split();
@@ -796,7 +806,7 @@ async fn handle_tcp(
     }
     let _ = send.finish();
     upstream.await.ok();
-    log_line(&format!("conn {conn_id} tcp done 127.0.0.1:{port}"));
+    log_line(&format!("conn {conn_id} tcp done loopback:{port}"));
     Ok(())
 }
 

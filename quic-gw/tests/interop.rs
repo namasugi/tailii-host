@@ -342,6 +342,44 @@ async fn tcp_pipes_to_loopback_and_half_closes() {
 }
 
 #[tokio::test]
+async fn tcp_falls_back_to_ipv6_loopback() {
+    let gw = start_gateway("tcp6").await;
+    let (_endpoint, conn) = connect(&gw).await;
+
+    // `[::1]` のみで LISTEN するサーバ（Node が localhost を ::1 に解決するケースの再現）。
+    let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+    let tcp_port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        if let Ok((mut socket, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 1024];
+            loop {
+                match socket.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if socket.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let header = format!(
+        "{{\"t\":\"tcp\",\"v\":1,\"token\":\"{}\",\"port\":{tcp_port}}}\n",
+        gw.token_b64
+    );
+    send.write_all(header.as_bytes()).await.unwrap();
+    let ok = read_line(&mut recv, HEADER_CAP).await.unwrap().unwrap();
+    assert!(ok.contains("\"ok\":true"), "unexpected response: {ok}");
+
+    send.write_all(b"v6-roundtrip\n").await.unwrap();
+    let echoed = read_line(&mut recv, HEADER_CAP).await.unwrap().unwrap();
+    assert_eq!(echoed, "v6-roundtrip");
+}
+
+#[tokio::test]
 async fn tcp_connect_failure_reports_connect_error() {
     let gw = start_gateway("tcpfail").await;
     let (_endpoint, conn) = connect(&gw).await;
