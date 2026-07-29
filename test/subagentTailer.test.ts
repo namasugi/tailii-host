@@ -560,4 +560,66 @@ describe("SubagentTailer", () => {
     });
     ac.abort();
   });
+
+  test("TaskStop で停止されたバックグラウンドコマンドは通知なしでも完了へ落とす", async () => {
+    const project = makeTempDir("subagent-tailer-bg-stop");
+    const sessionId = "77777777-8888-9999-aaaa-bbbbbbbbbbbb";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    fs.mkdirSync(path.join(project, sessionId, "subagents"), { recursive: true });
+
+    fs.writeFileSync(
+      main,
+      [
+        JSON.stringify({
+          message: {
+            role: "assistant",
+            content: [{
+              type: "tool_use",
+              id: "toolu_bg_stop",
+              name: "Bash",
+              input: { command: "sleep 9999", run_in_background: true, description: "復帰待ちループ" },
+            }],
+          },
+          timestamp: "2026-07-29T01:00:00.000Z",
+        }),
+        JSON.stringify({
+          message: {
+            role: "user",
+            content: [{
+              type: "tool_result",
+              tool_use_id: "toolu_bg_stop",
+              content: "Command running in background with ID: bstop1. Output is being written to: /tmp/bstop1.output.",
+            }],
+          },
+          timestamp: "2026-07-29T01:00:01.000Z",
+        }),
+        JSON.stringify({
+          message: {
+            role: "user",
+            content: [{
+              type: "tool_result",
+              tool_use_id: "toolu_taskstop",
+              content: "{\"message\":\"Successfully stopped task: bstop1 (sleep 9999)\",\"task_id\":\"bstop1\"}",
+            }],
+          },
+          timestamp: "2026-07-29T01:05:00.000Z",
+        }),
+      ].join("\n") + "\n",
+    );
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ pollIntervalMs: 10 });
+    const gen = tailer.streamSession(main, ac.signal);
+
+    const finished = await nextOfType(gen, "subagent_node");
+    expect(finished).toMatchObject({
+      node: {
+        nodeId: "bstop1",
+        status: "completed",
+        kind: "command",
+        ts: Date.parse("2026-07-29T01:05:00.000Z"),
+      },
+    });
+    ac.abort();
+  });
 });

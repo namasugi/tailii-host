@@ -183,6 +183,15 @@ export class SubagentTailer {
                 outputPath: launch.outputPath,
               });
             }
+            // TaskStop で停止されたタスクは task-notification を残さない。
+            // 停止 ack を「静かな完了」として通知と同列に扱う。
+            if (hit.stoppedTaskId !== null) {
+              read.state.notificationByTaskId.set(hit.stoppedTaskId, {
+                status: "completed",
+                exitCode: null,
+                ts: hit.ts ?? lineTs,
+              });
+            }
           }
           const notification = extractTaskNotification(line);
           if (notification !== null) {
@@ -471,6 +480,8 @@ interface ToolResultExtract {
   ts: number | null;
   asyncLaunch: boolean;
   backgroundLaunch: { taskId: string; outputPath: string | null } | null;
+  /** TaskStop の停止 ack。停止されたタスクは task-notification を残さないため、これが終了信号。 */
+  stoppedTaskId: string | null;
 }
 
 function extractToolResults(line: string): ToolResultExtract[] {
@@ -486,6 +497,7 @@ function extractToolResults(line: string): ToolResultExtract[] {
     const text = toolResultPlainText(rec["content"]);
     const bgMatch = /Command running in background with ID: (\S+?)\.?(?:\s|$)/.exec(text);
     const outputMatch = /Output is being written to: (\S+?)\.?(?:\s|$)/.exec(text);
+    const stopMatch = /Successfully stopped task: ([A-Za-z0-9_-]+)/.exec(text);
     out.push({
       id: rec["tool_use_id"],
       isError: rec["is_error"] === true,
@@ -494,6 +506,7 @@ function extractToolResults(line: string): ToolResultExtract[] {
       backgroundLaunch: bgMatch === null
         ? null
         : { taskId: bgMatch[1]!, outputPath: outputMatch?.[1] ?? null },
+      stoppedTaskId: stopMatch?.[1] ?? null,
     });
   }
   return out;
