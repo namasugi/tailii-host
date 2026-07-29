@@ -448,6 +448,42 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
+  test("chat_send は前面購読が無ければ preview=true で自己修復subscribeする", async () => {
+    // engine 再生成/Hub 再起動の狭間で前面購読が失われると、本文は background 購読で
+    // 進むのにライブビューだけ消灯する（2026-07-29 実障害）。チャット画面からしか
+    // 届かない chat_send を前面の証拠として購読を張り直す。
+    const sent: unknown[] = [];
+    const hubLink: HubLink = {
+      onMessage: null, onReconnect: null,
+      send(message) {
+        sent.push(message);
+        if (message.type === "chat_send") {
+          queueMicrotask(() => hubLink.onMessage?.({
+            type: "chat_send_result", id: message.id, status: "accepted",
+          }));
+        }
+        return true;
+      },
+      close: vi.fn(),
+    };
+    const engine = startEngine({ sessionManager: makeManager(new MockTmuxRunner(() => ok(""))), hubLink });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine('{"clientMessageId":"client-1","id":"send-1","session":"work","text":"hello","type":"chat_send","v":2}');
+    await engine.lines.nextOfType("chat_send_result");
+    expect(sent).toContainEqual({ type: "conversation_subscribe", session: "work", preview: true });
+    // 2通目は既に前面購読済みなので、重複subscribeを送らない。
+    const subscribesBefore = sent.filter(
+      (m) => (m as { type?: string }).type === "conversation_subscribe",
+    ).length;
+    engine.writeLine('{"clientMessageId":"client-2","id":"send-2","session":"work","text":"again","type":"chat_send","v":2}');
+    await engine.lines.nextOfType("chat_send_result");
+    const subscribesAfter = sent.filter(
+      (m) => (m as { type?: string }).type === "conversation_subscribe",
+    ).length;
+    expect(subscribesAfter).toBe(subscribesBefore);
+    await engine.teardown();
+  });
+
   test("設問中chat_sendのACK待ちと並行して同じread loopでquestion_answerを処理できる", async () => {
     const chatInjector = vi.fn(async () => {});
     const hub = new SessionHub({

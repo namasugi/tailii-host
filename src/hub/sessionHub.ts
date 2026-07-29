@@ -697,6 +697,12 @@ export class SessionHub {
   private subscribe(client: object, session: string, afterSeq: number | undefined,
     newerThanMs: number | undefined, preview: boolean): void {
     const actor = this.actor(session);
+    // ライブビュー消灯（preview 購読者不在）の事後解析用: 誰がどのフラグで購読したかを残す。
+    this.options.log?.(
+      `audit subscribe session=${session} preview=${preview}` +
+        ` afterSeq=${afterSeq ?? "-"} newerThanMs=${newerThanMs ?? "-"}` +
+        ` existing=${actor.subscribers.has(client)} subscribers=${actor.subscribers.size}`,
+    );
     const existing = actor.subscribers.get(client);
     if (existing !== undefined) {
       const wasPreview = existing.preview;
@@ -1098,11 +1104,13 @@ export class SessionHub {
   private syncPreview(session: string, actor: SessionActor): void {
     const wantsPreview = [...actor.subscribers.values()].some((state) => state.preview);
     if (!wantsPreview) {
+      if (actor.previewPump !== null) this.options.log?.(`audit preview-pump stop session=${session}`);
       actor.previewPump?.stop();
       actor.previewPump = null;
       return;
     }
     if (actor.previewPump !== null || this.options.previewPumpFactory === undefined) return;
+    this.options.log?.(`audit preview-pump start session=${session}`);
     const pump = this.options.previewPumpFactory(
       (payload) => {
         for (const [client, state] of actor.subscribers) {

@@ -9,7 +9,7 @@ import * as path from "node:path";
 import type { HubServerMessage } from "../../hub/hubProtocol.js";
 import { PROTOCOL_V2, type ControlMessage } from "../../protocol.js";
 import { searchClaudeSessions } from "../../sessions/sessionSearch.js";
-import { engineDiag, writeError, type HandlerRegistry } from "../context.js";
+import { engineDiag, subscribeConversation, writeError, type HandlerRegistry } from "../context.js";
 
 /** chat_send 経路の常時診断ログ（pending 固まり事案の事後解析用）。失敗しても本処理を妨げない。 */
 function chatSendDiag(message: string): void {
@@ -31,6 +31,15 @@ export const conversationHandlers: HandlerRegistry = {
     if (meta?.agent === "codex") {
       writeError(writer, v, message.id, "chat_send_unsupported", "Codex セッションは codex_turn_start を使用してください。");
       return;
+    }
+    // chat_send はチャット画面を前面表示した状態でしか届かない。engine 再生成や Hub 再起動の
+    // 狭間で前面購読（preview=true）が失われたままだと、本文は background 購読の押し込みで
+    // 進むのにライブビュー（pane_preview）だけ消灯し続ける。ここで前面購読を自己修復する。
+    if (ctx.activeChatSession.name !== message.session) {
+      chatSendDiag(
+        `heal subscribe session=${message.session} previousActive=${ctx.activeChatSession.name ?? "nil"}`,
+      );
+      subscribeConversation(ctx, message.session);
     }
     // Hub は設問表示中、durable queue を保持したまま pane 注入可能になるまで応答を
     // 保留する。read loop 自体がこの RPC を await すると、後続 question_answer を読めず
