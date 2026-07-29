@@ -85,6 +85,18 @@ describe("TranscriptTailer", () => {
         },
         uuid: "expanded-skill",
       }),
+      // Skill ツール起動（Claude 自身の呼び出し）は "Base directory…" 前置なしの本文が
+      // isMeta + sourceToolUseID 付き user 行として注入される（claude 2.1.220 実測）。
+      JSON.stringify({
+        type: "user",
+        isMeta: true,
+        sourceToolUseID: "toolu_01",
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "Approach this as the design lead…（前置なしスキル本文）" }],
+        },
+        uuid: "tool-launched-skill",
+      }),
       JSON.stringify({
         type: "user",
         message: { role: "user", content: "通常のユーザー発話" },
@@ -114,6 +126,55 @@ describe("TranscriptTailer", () => {
         eof: true,
       },
     ]);
+  });
+
+  test("Skill ツールカードはスキル名ラベル+注入本文の後付け再送（同 id 更新）", async () => {
+    const p = writeTranscript([
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{
+            type: "tool_use",
+            id: "toolu_skill1",
+            name: "Skill",
+            input: { skill: "artifact-design", args: "デザイン調整" },
+          }],
+        },
+        uuid: "a-skill",
+      }),
+      // 展開済みスキル本文の注入行（isMeta + sourceToolUseID, "Base directory…" 前置なし）。
+      JSON.stringify({
+        type: "user",
+        isMeta: true,
+        sourceToolUseID: "toolu_skill1",
+        message: { role: "user", content: [{ type: "text", text: "# デザインの手引き\n\nスキル本文全文" }] },
+        uuid: "skill-body",
+      }),
+    ]);
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
+    const messages = await collect(tailer.streamTranscript(p));
+
+    // 本文はチャットへ流れない。
+    expect(messages.filter((message) => message.type === "chat_output")).toEqual([]);
+    // カードは 2 回届く: 起動時（名前+args）→ 本文後付け（同 id, command 付き）。
+    const activities = messages.flatMap((message) =>
+      message.type === "tool_activity" ? [message.activity] : [],
+    );
+    expect(activities).toHaveLength(2);
+    expect(activities[0]).toMatchObject({
+      id: "toolu_skill1",
+      name: "Skill",
+      label: "実行済み スキル artifact-design",
+      description: "デザイン調整",
+    });
+    expect(activities[0]?.command).toBeUndefined();
+    expect(activities[1]).toMatchObject({
+      id: "toolu_skill1",
+      label: "実行済み スキル artifact-design",
+      command: "# デザインの手引き\n\nスキル本文全文",
+      commandTruncated: false,
+    });
   });
 
   test("ターン処理中に送信された queued_command attachment を user ターンとして流す", async () => {

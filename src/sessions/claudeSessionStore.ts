@@ -9,6 +9,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ClaudeSessionInfo } from "../protocol.js";
 import { isInsideBase } from "../shared/paths.js";
+import { isInjectedSkillContent } from "../shared/skillInjection.js";
 
 /** タイトル抽出の最大長（先頭 ~60 字）。 */
 const TITLE_MAX_LENGTH = 60;
@@ -271,6 +272,8 @@ function extractMessageText(obj: Record<string, unknown>, maxLength: number): st
   if (!text) return null;
   // slash コマンドのメタ包み（`<command-…>` で始まる）は提示に向かないので除外。
   if (text.startsWith("<command-") || text.startsWith("<local-command")) return null;
+  // スキル実行時に注入される展開済み SKILL.md 本文も提示しない（前の実発話へ遡る）。
+  if (isInjectedSkillContent(obj, raw)) return null;
   if (text.length > maxLength) text = text.slice(0, maxLength);
   return text;
 }

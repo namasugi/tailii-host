@@ -575,6 +575,24 @@ describe("ClaudeSessionStore", () => {
     expect(list[0]?.updatedAt).toBe(Math.floor(Date.parse("2026-01-01T00:02:00Z") / 1000));
   });
 
+  test("注入されたスキル本文は lastMessage/title に採用せず前後の実発話へ遡る", () => {
+    const root = makeTempDir("claude-sessions-skill");
+    const slugDir = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slugDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(slugDir, "hhhhhhhh-8888.jsonl"),
+      // 先頭: slash 起動形式（"Base directory…" 前置）→ title に採用しない。
+      '{"type":"user","cwd":"/tmp/proj","timestamp":"2026-01-01T00:00:00Z","isMeta":true,"message":{"content":[{"type":"text","text":"Base directory for this skill: /tmp/s\\n\\n# S\\n\\nスキル本文"}]}}\n' +
+        '{"type":"user","timestamp":"2026-01-01T00:01:00Z","message":{"content":"実際の質問"}}\n' +
+        '{"type":"assistant","timestamp":"2026-01-01T00:02:00Z","message":{"content":[{"type":"text","text":"最後の実応答"}]}}\n' +
+        // 末尾: Skill ツール起動形式（前置なし, isMeta+sourceToolUseID）→ lastMessage に採用しない。
+        '{"type":"user","timestamp":"2026-01-01T00:03:00Z","isMeta":true,"sourceToolUseID":"toolu_01","message":{"content":[{"type":"text","text":"前置なしのスキル本文"}]}}\n',
+    );
+    const list = new ClaudeSessionStore(root).list();
+    expect(list[0]?.lastMessage).toBe("最後の実応答");
+    expect(list[0]?.title).toBe("実際の質問");
+  });
+
   test("lastMessage が無い（状態行のみ）transcript では省略される", () => {
     const root = makeTempDir("claude-sessions-preview-none");
     const slugDir = path.join(root, "-tmp-proj");

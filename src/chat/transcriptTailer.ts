@@ -19,6 +19,7 @@ import {
   type ToolActivityDiff,
   type ToolActivityTodo,
 } from "../protocol.js";
+import { isInjectedSkillContent } from "../shared/skillInjection.js";
 import { abortableSleep } from "../shared/sleep.js";
 
 /** 履歴再生完了マーカーの streamId（iOS 側 `ChatLogModel` と対で解釈する）。 */
@@ -35,6 +36,8 @@ const MAX_DIFF_FIELD_CHARACTERS = 24_000;
 const MAX_TODO_ITEMS = 50;
 /** TodoWrite 項目本文の最大文字数。 */
 const MAX_TODO_CONTENT_CHARACTERS = 300;
+/** スキル本文の後付けを待つ Skill カードの最大保持数。 */
+const MAX_PENDING_SKILL_ACTIVITIES = 16;
 
 export interface TranscriptTailerOptions {
   /** 追記ポーリング間隔（ms）。既定 50ms。 */
@@ -57,6 +60,8 @@ interface Turn {
   toolResultIds: string[];
   model: string | null;
   contextTokens: number | null;
+  /** Skill ツール起動で注入されたスキル本文（該当ツールカードへ後付けする）。 */
+  skillInjection?: { toolUseId: string; text: string };
 }
 
 /** tail 中の可変状態（1 ストリームぶん）。 */
@@ -65,6 +70,8 @@ interface TailState {
   lastModel: string | null;
   lastContextTokens: number | null;
   activeQuestionIds: Set<string>;
+  /** 本文待ちの Skill ツールカード（tool_use id → 発行済み activity）。 */
+  pendingSkillActivities: Map<string, ToolActivity>;
 }
 
 /** claude セッショントランスクリプト（JSONL）の tail 実装。 */
@@ -175,6 +182,7 @@ export class TranscriptTailer {
         lastModel: null,
         lastContextTokens: null,
         activeQuestionIds: new Set(),
+        pendingSkillActivities: new Map(),
       };
       const start = Date.now();
       let announcedReplayDone = false;
@@ -274,7 +282,29 @@ function* emitLine(line: Buffer, state: TailState): Generator<ControlMessage, vo
   }
 
   for (const activity of turn.toolActivities) {
+    // Skill ツールカードは注入されるスキル本文（後続の isMeta 行）を詳細へ後付けする
+    // ため保持する。本文が届かないまま溜まらないよう上限で最古から破棄。
+    if (activity.name === "Skill") {
+      state.pendingSkillActivities.set(activity.id, activity);
+      if (state.pendingSkillActivities.size > MAX_PENDING_SKILL_ACTIVITIES) {
+        const oldest = state.pendingSkillActivities.keys().next().value;
+        if (oldest !== undefined) state.pendingSkillActivities.delete(oldest);
+      }
+    }
     yield { type: "tool_activity", v: PROTOCOL_V1, activity };
+  }
+
+  // 注入されたスキル本文が届いたら、該当 Skill カードを本文付きで再送する
+  // （iOS は同一 id の tool_activity を既存カードの更新として扱う）。
+  if (turn.skillInjection !== undefined) {
+    const pending = state.pendingSkillActivities.get(turn.skillInjection.toolUseId);
+    if (pending !== undefined) {
+      state.pendingSkillActivities.delete(turn.skillInjection.toolUseId);
+      const bodyCap = cap(turn.skillInjection.text, MAX_COMMAND_CHARACTERS);
+      const enriched: ToolActivity = { ...pending, commandTruncated: bodyCap.truncated };
+      if (bodyCap.value !== null) enriched.command = bodyCap.value;
+      yield { type: "tool_activity", v: PROTOCOL_V1, activity: enriched };
+    }
   }
 
   for (const id of turn.toolResultIds) {
@@ -403,22 +433,23 @@ export function extractTurn(line: string): Turn | null {
   // AskUserQuestion の回答行は text ブロックではなく tool_result +
   // top-level toolUseResult.answers に記録される。通常の tool_result は会話ログへ
   // 流さず、設問と回答の構造を持つ行だけ user バブル用の要約へ変換する。
-  // Claude Code はスキル実行時、<command-name> 行の直後に展開済み SKILL.md 全文を
-  // user の text ブロックとして transcript へ注入する。これはユーザー発話ではなく
-  // エージェント内部コンテキストなので、会話画面へ転送しない。
-  const visiblePlainText = isExpandedSkillPrompt(role, plainText) ? "" : plainText;
+  // Claude Code はスキル実行時、展開済み SKILL.md 全文を user の text ブロックとして
+  // transcript へ注入する。これはユーザー発話ではなくエージェント内部コンテキスト
+  // なので会話画面へは転送せず、Skill ツール起動（sourceToolUseID あり）の場合だけ
+  // 該当ツールカードの詳細本文として紐づける。
+  const injectedSkill = role === "user" && isInjectedSkillContent(rec, plainText);
+  const visiblePlainText = injectedSkill ? "" : plainText;
   const text = visiblePlainText || extractQuestionAnswerText(rec["toolUseResult"]);
   const toolActivities = extractToolActivities(rawContent);
   const questionPrompts = extractQuestionPrompts(rawContent, id);
   const toolResultIds = extractToolResultIds(rawContent);
   const model = typeof message?.["model"] === "string" ? (message["model"] as string) : null;
   const contextTokens = role === "assistant" ? extractContextTokens(message?.["usage"]) : null;
-  return { id, role, text, toolActivities, questionPrompts, toolResultIds, model, contextTokens };
-}
-
-/** Claude Code が user ターンへ注入した展開済みスキル本文か。 */
-function isExpandedSkillPrompt(role: ChatRole, text: string): boolean {
-  return role === "user" && text.trimStart().startsWith("Base directory for this skill:");
+  const turn: Turn = { id, role, text, toolActivities, questionPrompts, toolResultIds, model, contextTokens };
+  if (injectedSkill && typeof rec["sourceToolUseID"] === "string" && plainText.length > 0) {
+    turn.skillInjection = { toolUseId: rec["sourceToolUseID"], text: plainText };
+  }
+  return turn;
 }
 
 /** usage から現在コンテキスト相当のトークン数を合算する（未知フィールドは 0 扱い）。 */
@@ -586,6 +617,21 @@ function makeToolActivity(id: string, name: string, input: Record<string, unknow
         descriptionTruncated: false,
       };
       if (file !== null) activity.file = file;
+      return activity;
+    }
+    case "Skill": {
+      // input = { skill: "name", args?: "..." }（claude 2.1.220 実測）。
+      // 展開済みスキル本文は後続の isMeta 行から command として後付けされる。
+      const skill = nonEmpty(str(input["skill"]));
+      const argsCap = cap(str(input["args"]), MAX_DESCRIPTION_CHARACTERS);
+      const activity: ToolActivity = {
+        id,
+        name,
+        label: skill === null ? "実行済み Skill" : `実行済み スキル ${skill}`,
+        commandTruncated: false,
+        descriptionTruncated: argsCap.truncated,
+      };
+      if (argsCap.value !== null) activity.description = argsCap.value;
       return activity;
     }
     case "TodoWrite": {
