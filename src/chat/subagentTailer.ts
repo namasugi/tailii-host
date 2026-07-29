@@ -30,6 +30,7 @@ interface TrackedNode {
   metaPath: string;
   jsonlPath: string | null;
   firstJsonlTimestampMs: number | null;
+  lastJsonlTimestampMs: number | null;
   currentActivity: string | null;
   lastKey: string | null;
 }
@@ -37,6 +38,30 @@ interface TrackedNode {
 interface ToolResultHit {
   isError: boolean;
   ts: number | null;
+  /** バックグラウンド起動の即時 ack（"Async agent launched…"）。終了扱いにしない。 */
+  asyncLaunch: boolean;
+}
+
+/** 親 transcript の `<task-notification>` 行（バックグラウンド作業の真の完了信号）。 */
+interface TaskNotification {
+  status: string;
+  exitCode: number | null;
+  ts: number | null;
+}
+
+/** バックグラウンドコマンド（Bash run_in_background）の spawn 観測。 */
+interface BackgroundSpawn {
+  label: string;
+  ts: number | null;
+}
+
+interface BackgroundCommand {
+  taskId: string;
+  toolUseId: string;
+  owner: string;
+  label: string;
+  startTs: number | null;
+  outputPath: string | null;
 }
 
 interface FileTailState {
@@ -44,6 +69,9 @@ interface FileTailState {
   lineBuf: Buffer;
   ownerByToolUseId: Map<string, string>;
   resultByToolUseId: Map<string, ToolResultHit>;
+  notificationByTaskId: Map<string, TaskNotification>;
+  bgSpawnByToolUseId: Map<string, BackgroundSpawn>;
+  bgCommandByTaskId: Map<string, BackgroundCommand>;
   firstTimestampMs: number | null;
 }
 
@@ -52,6 +80,7 @@ export class SubagentTailer {
   private readonly pollIntervalMs: number;
   private readonly tailIndefinitely: boolean;
   private readonly jsonlPaths = new Map<string, string>();
+  private readonly outputPaths = new Map<string, string>();
 
   constructor(options: SubagentTailerOptions = {}) {
     this.pollIntervalMs = options.pollIntervalMs ?? 50;
@@ -63,6 +92,11 @@ export class SubagentTailer {
     return this.jsonlPaths.get(nodeId) ?? null;
   }
 
+  /** バックグラウンドコマンドの nodeId(taskId) から出力ファイルを引く。 */
+  outputPath(nodeId: string): string | null {
+    return this.outputPaths.get(nodeId) ?? null;
+  }
+
   async *streamProjectDir(
     projectDir: string,
     preferredSessionId: string | null,
@@ -70,6 +104,7 @@ export class SubagentTailer {
     signal?: AbortSignal,
   ): AsyncGenerator<ControlMessage, void, void> {
     this.jsonlPaths.clear();
+    this.outputPaths.clear();
     const start = Date.now();
     let mainTranscript: string | null = null;
     while (!signal?.aborted) {
@@ -93,6 +128,9 @@ export class SubagentTailer {
     const fileStates = new Map<string, FileTailState>();
     const ownerByToolUseId = new Map<string, string>();
     const resultByToolUseId = new Map<string, ToolResultHit>();
+    const notificationByTaskId = new Map<string, TaskNotification>();
+    const bgCommandByTaskId = new Map<string, BackgroundCommand>();
+    const bgLastKeyByTaskId = new Map<string, string>();
     let aggregateDirty = true;
 
     while (!signal?.aborted) {
@@ -107,19 +145,52 @@ export class SubagentTailer {
         const node = transcript.nodeId === null ? null : (tracked.get(transcript.nodeId) ?? null);
         if (read.reset) {
           aggregateDirty = true;
-          if (node !== null) node.currentActivity = null;
+          if (node !== null) {
+            node.currentActivity = null;
+            node.lastJsonlTimestampMs = null;
+          }
         }
         if (node !== null) node.firstJsonlTimestampMs = read.state.firstTimestampMs;
         if (read.lines.length > 0) aggregateDirty = true;
         for (const line of read.lines) {
-          if (read.state.firstTimestampMs === null) {
-            const ts = timestampMs(line);
-            if (ts !== null) read.state.firstTimestampMs = ts;
+          const lineTs = timestampMs(line);
+          if (read.state.firstTimestampMs === null && lineTs !== null) {
+            read.state.firstTimestampMs = lineTs;
           }
-          if (node !== null) node.firstJsonlTimestampMs = read.state.firstTimestampMs;
+          if (node !== null) {
+            node.firstJsonlTimestampMs = read.state.firstTimestampMs;
+            if (lineTs !== null) node.lastJsonlTimestampMs = lineTs;
+          }
           for (const id of extractSpawnToolUseIds(line)) read.state.ownerByToolUseId.set(id, transcript.owner);
+          for (const spawn of extractBackgroundSpawns(line)) {
+            read.state.bgSpawnByToolUseId.set(spawn.id, { label: spawn.label, ts: lineTs });
+          }
           for (const hit of extractToolResults(line)) {
-            read.state.resultByToolUseId.set(hit.id, { isError: hit.isError, ts: hit.ts });
+            read.state.resultByToolUseId.set(hit.id, {
+              isError: hit.isError,
+              ts: hit.ts,
+              asyncLaunch: hit.asyncLaunch,
+            });
+            const launch = hit.backgroundLaunch;
+            const spawn = read.state.bgSpawnByToolUseId.get(hit.id);
+            if (launch !== null && spawn !== undefined) {
+              read.state.bgCommandByTaskId.set(launch.taskId, {
+                taskId: launch.taskId,
+                toolUseId: hit.id,
+                owner: transcript.owner,
+                label: spawn.label,
+                startTs: spawn.ts ?? hit.ts,
+                outputPath: launch.outputPath,
+              });
+            }
+          }
+          const notification = extractTaskNotification(line);
+          if (notification !== null) {
+            read.state.notificationByTaskId.set(notification.taskId, {
+              status: notification.status,
+              exitCode: notification.exitCode,
+              ts: notification.ts ?? lineTs,
+            });
           }
           if (node !== null) {
             const activity = latestActivitySummary(line);
@@ -130,19 +201,46 @@ export class SubagentTailer {
       if (aggregateDirty) {
         ownerByToolUseId.clear();
         resultByToolUseId.clear();
+        notificationByTaskId.clear();
+        bgCommandByTaskId.clear();
         for (const transcript of transcriptOwners) {
           const state = fileStates.get(transcript.path);
           if (state === undefined) continue;
           for (const [id, owner] of state.ownerByToolUseId) ownerByToolUseId.set(id, owner);
           for (const [id, result] of state.resultByToolUseId) resultByToolUseId.set(id, result);
+          for (const [id, notification] of state.notificationByTaskId) {
+            const existing = notificationByTaskId.get(id);
+            if (existing === undefined || (notification.ts ?? 0) >= (existing.ts ?? 0)) {
+              notificationByTaskId.set(id, notification);
+            }
+          }
+          for (const [id, command] of state.bgCommandByTaskId) bgCommandByTaskId.set(id, command);
         }
         aggregateDirty = false;
       }
 
       for (const node of tracked.values()) {
         const result = resultByToolUseId.get(node.meta.toolUseId) ?? null;
-        const status: SubagentNodeStatus = result === null ? "running" : (result.isError ? "error" : "completed");
-        const ts = result?.ts ?? node.firstJsonlTimestampMs ?? mtimeMs(node.metaPath);
+        let status: SubagentNodeStatus;
+        let ts: number;
+        if (result !== null && !result.asyncLaunch) {
+          // 同期実行: 親 transcript の tool_result が終了信号。
+          status = result.isError ? "error" : "completed";
+          ts = result.ts ?? node.firstJsonlTimestampMs ?? mtimeMs(node.metaPath);
+        } else {
+          // バックグラウンド実行（または結果未着）: task-notification が終了信号。
+          // 通知後に自分の transcript が伸びたら resume とみなし running へ戻す。
+          const notification = notificationByTaskId.get(node.nodeId) ?? null;
+          const resumedAfter = notification !== null && notification.ts !== null
+            && (node.lastJsonlTimestampMs ?? 0) > notification.ts;
+          if (notification !== null && !resumedAfter) {
+            status = notification.status === "completed" ? "completed" : "error";
+            ts = notification.ts ?? node.lastJsonlTimestampMs ?? mtimeMs(node.metaPath);
+          } else {
+            status = "running";
+            ts = node.firstJsonlTimestampMs ?? mtimeMs(node.metaPath);
+          }
+        }
         const parentNodeId = ownerByToolUseId.get(node.meta.toolUseId) ?? fallbackParent(node.meta.spawnDepth);
         const messageNode: SubagentNode = {
           nodeId: node.nodeId,
@@ -158,6 +256,31 @@ export class SubagentTailer {
         const key = stableNodeKey(messageNode);
         if (key === node.lastKey) continue;
         node.lastKey = key;
+        yield { type: "subagent_node", v: PROTOCOL_V2, node: messageNode };
+      }
+
+      for (const command of bgCommandByTaskId.values()) {
+        if (command.outputPath !== null) this.outputPaths.set(command.taskId, command.outputPath);
+        const notification = notificationByTaskId.get(command.taskId) ?? null;
+        const failed = notification !== null
+          && (notification.status !== "completed" || (notification.exitCode ?? 0) !== 0);
+        const status: SubagentNodeStatus = notification === null ? "running" : (failed ? "error" : "completed");
+        const ownerNode = tracked.get(command.owner) ?? null;
+        const messageNode: SubagentNode = {
+          nodeId: command.taskId,
+          toolUseId: command.toolUseId,
+          parentNodeId: command.owner,
+          agentType: "Bash",
+          label: command.label,
+          depth: ownerNode === null ? 1 : ownerNode.meta.spawnDepth + 1,
+          status,
+          currentActivity: null,
+          ts: notification?.ts ?? command.startTs ?? 0,
+          kind: "command",
+        };
+        const key = stableNodeKey(messageNode);
+        if (key === bgLastKeyByTaskId.get(command.taskId)) continue;
+        bgLastKeyByTaskId.set(command.taskId, key);
         yield { type: "subagent_node", v: PROTOCOL_V2, node: messageNode };
       }
 
@@ -197,6 +320,7 @@ function discoverMetaFiles(dir: string, tracked: Map<string, TrackedNode>): bool
       metaPath,
       jsonlPath: siblingJsonl(metaPath),
       firstJsonlTimestampMs: null,
+      lastJsonlTimestampMs: null,
       currentActivity: null,
       lastKey: null,
     });
@@ -264,6 +388,9 @@ function readNewLines(
     state.lineBuf = Buffer.alloc(0);
     state.ownerByToolUseId.clear();
     state.resultByToolUseId.clear();
+    state.notificationByTaskId.clear();
+    state.bgSpawnByToolUseId.clear();
+    state.bgCommandByTaskId.clear();
     state.firstTimestampMs = null;
     reset = true;
   }
@@ -313,6 +440,9 @@ function ensureFileState(file: string, states: Map<string, FileTailState>): File
       lineBuf: Buffer.alloc(0),
       ownerByToolUseId: new Map(),
       resultByToolUseId: new Map(),
+      notificationByTaskId: new Map(),
+      bgSpawnByToolUseId: new Map(),
+      bgCommandByTaskId: new Map(),
       firstTimestampMs: null,
     };
     states.set(file, state);
@@ -335,20 +465,95 @@ function extractSpawnToolUseIds(line: string): string[] {
   return ids;
 }
 
-function extractToolResults(line: string): { id: string; isError: boolean; ts: number | null }[] {
+interface ToolResultExtract {
+  id: string;
+  isError: boolean;
+  ts: number | null;
+  asyncLaunch: boolean;
+  backgroundLaunch: { taskId: string; outputPath: string | null } | null;
+}
+
+function extractToolResults(line: string): ToolResultExtract[] {
   const content = messageContent(line);
   const ts = timestampMs(line);
   if (!Array.isArray(content)) return [];
-  const out: { id: string; isError: boolean; ts: number | null }[] = [];
+  const out: ToolResultExtract[] = [];
   for (const block of content) {
     if (typeof block !== "object" || block === null) continue;
     const rec = block as Record<string, unknown>;
     if (rec["type"] !== "tool_result") continue;
-    if (typeof rec["tool_use_id"] === "string") {
-      out.push({ id: rec["tool_use_id"], isError: rec["is_error"] === true, ts });
-    }
+    if (typeof rec["tool_use_id"] !== "string") continue;
+    const text = toolResultPlainText(rec["content"]);
+    const bgMatch = /Command running in background with ID: (\S+?)\.?(?:\s|$)/.exec(text);
+    const outputMatch = /Output is being written to: (\S+?)\.?(?:\s|$)/.exec(text);
+    out.push({
+      id: rec["tool_use_id"],
+      isError: rec["is_error"] === true,
+      ts,
+      asyncLaunch: text.startsWith("Async agent launched successfully"),
+      backgroundLaunch: bgMatch === null
+        ? null
+        : { taskId: bgMatch[1]!, outputPath: outputMatch?.[1] ?? null },
+    });
   }
   return out;
+}
+
+function toolResultPlainText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const block of content) {
+    if (typeof block !== "object" || block === null) continue;
+    const rec = block as Record<string, unknown>;
+    if (rec["type"] === "text" && typeof rec["text"] === "string") parts.push(rec["text"]);
+  }
+  return parts.join("\n");
+}
+
+/** Bash の run_in_background 起動（バックグラウンドコマンド）の tool_use を抽出する。 */
+function extractBackgroundSpawns(line: string): { id: string; label: string }[] {
+  const content = messageContent(line);
+  if (!Array.isArray(content)) return [];
+  const out: { id: string; label: string }[] = [];
+  for (const block of content) {
+    if (typeof block !== "object" || block === null) continue;
+    const rec = block as Record<string, unknown>;
+    if (rec["type"] !== "tool_use" || rec["name"] !== "Bash") continue;
+    if (typeof rec["id"] !== "string") continue;
+    const input = typeof rec["input"] === "object" && rec["input"] !== null
+      ? rec["input"] as Record<string, unknown>
+      : null;
+    if (input?.["run_in_background"] !== true) continue;
+    const description = typeof input["description"] === "string" ? input["description"] : "";
+    const command = typeof input["command"] === "string" ? input["command"] : "";
+    const label = description.length > 0 ? description : truncateActivityLabel(command);
+    out.push({ id: rec["id"], label: label.length > 0 ? label : "background command" });
+  }
+  return out;
+}
+
+/**
+ * 親 transcript の `<task-notification>` 行（user メッセージの文字列 content）を解析する。
+ * バックグラウンドのエージェント/コマンド共通の完了信号で、task-id はエージェントの
+ * nodeId またはコマンドの taskId に一致する。
+ */
+function extractTaskNotification(
+  line: string,
+): { taskId: string; status: string; exitCode: number | null; ts: number | null } | null {
+  const content = messageContent(line);
+  if (typeof content !== "string" || !content.includes("<task-notification>")) return null;
+  const taskId = /<task-id>([^<]+)<\/task-id>/.exec(content)?.[1];
+  if (taskId === undefined) return null;
+  const status = /<status>([^<]+)<\/status>/.exec(content)?.[1] ?? "completed";
+  const summary = /<summary>([^<]*)<\/summary>/.exec(content)?.[1] ?? "";
+  const exitCode = /exit code (\d+)/.exec(summary)?.[1];
+  return {
+    taskId,
+    status,
+    exitCode: exitCode === undefined ? null : Number(exitCode),
+    ts: timestampMs(line),
+  };
 }
 
 function latestActivitySummary(line: string): string | null {
@@ -446,5 +651,6 @@ function stableNodeKey(node: SubagentNode): string {
     node.status,
     node.currentActivity ?? null,
     node.ts,
+    node.kind ?? null,
   ]);
 }

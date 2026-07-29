@@ -305,4 +305,259 @@ describe("SubagentTailer", () => {
     });
     ac.abort();
   });
+
+  test("バックグラウンド起動の即時 ack では完了させず task-notification で完了する", async () => {
+    const project = makeTempDir("subagent-tailer-async");
+    const sessionId = "44444444-5555-6666-7777-888888888888";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    const subagents = path.join(project, sessionId, "subagents");
+    const childJsonl = path.join(subagents, "agent-bg1.jsonl");
+    fs.mkdirSync(subagents, { recursive: true });
+
+    fs.writeFileSync(
+      main,
+      [
+        JSON.stringify({
+          message: {
+            role: "assistant",
+            content: [
+              { type: "tool_use", id: "toolu_async", name: "Agent", input: { description: "BG agent" } },
+            ],
+          },
+          timestamp: "2026-07-28T07:12:07.088Z",
+        }),
+        // バックグラウンド起動: spawn 直後に届く ack。終了信号ではない。
+        JSON.stringify({
+          message: {
+            role: "user",
+            content: [{
+              type: "tool_result",
+              tool_use_id: "toolu_async",
+              content: "Async agent launched successfully. agentId: bg1 …",
+            }],
+          },
+          timestamp: "2026-07-28T07:12:07.328Z",
+        }),
+      ].join("\n") + "\n",
+    );
+    fs.writeFileSync(
+      path.join(subagents, "agent-bg1.meta.json"),
+      JSON.stringify({
+        agentType: "Explore",
+        description: "BG agent",
+        toolUseId: "toolu_async",
+        spawnDepth: 1,
+      }),
+    );
+    fs.writeFileSync(
+      childJsonl,
+      JSON.stringify({
+        agentId: "bg1",
+        isSidechain: true,
+        message: { role: "user", content: "start" },
+        timestamp: "2026-07-28T07:12:08.000Z",
+      }) + "\n",
+    );
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ pollIntervalMs: 10 });
+    const gen = tailer.streamSession(main, ac.signal);
+
+    const running = await nextOfType(gen, "subagent_node");
+    expect(running).toMatchObject({
+      node: { nodeId: "bg1", status: "running" },
+    });
+    // ack を読み終えた後も completed が湧かないこと（nextWithin は孤児 next() が
+    // 後続 emission を飲むため、テスト末尾でのみ使える）。
+    expect(await nextWithin(gen, 50)).toBeNull();
+    ac.abort();
+  });
+
+  test("task-notification で完了し resume 追記で running へ戻り再通知で再完了する", async () => {
+    const project = makeTempDir("subagent-tailer-async-notify");
+    const sessionId = "66666666-7777-8888-9999-aaaaaaaaaaaa";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    const subagents = path.join(project, sessionId, "subagents");
+    const childJsonl = path.join(subagents, "agent-bg2.jsonl");
+    fs.mkdirSync(subagents, { recursive: true });
+
+    fs.writeFileSync(
+      main,
+      [
+        JSON.stringify({
+          message: {
+            role: "assistant",
+            content: [
+              { type: "tool_use", id: "toolu_async2", name: "Agent", input: { description: "BG agent" } },
+            ],
+          },
+          timestamp: "2026-07-28T07:12:07.088Z",
+        }),
+        JSON.stringify({
+          message: {
+            role: "user",
+            content: [{
+              type: "tool_result",
+              tool_use_id: "toolu_async2",
+              content: "Async agent launched successfully. agentId: bg2 …",
+            }],
+          },
+          timestamp: "2026-07-28T07:12:07.328Z",
+        }),
+        JSON.stringify({
+          type: "user",
+          message: {
+            role: "user",
+            content: "<task-notification>\n<task-id>bg2</task-id>\n<status>completed</status>\n<summary>Agent \"BG agent\" finished</summary>\n</task-notification>",
+          },
+          timestamp: "2026-07-28T07:18:38.435Z",
+        }),
+      ].join("\n") + "\n",
+    );
+    fs.writeFileSync(
+      path.join(subagents, "agent-bg2.meta.json"),
+      JSON.stringify({
+        agentType: "Explore",
+        description: "BG agent",
+        toolUseId: "toolu_async2",
+        spawnDepth: 1,
+      }),
+    );
+    fs.writeFileSync(
+      childJsonl,
+      JSON.stringify({
+        agentId: "bg2",
+        isSidechain: true,
+        message: { role: "user", content: "start" },
+        timestamp: "2026-07-28T07:12:08.000Z",
+      }) + "\n",
+    );
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ pollIntervalMs: 10 });
+    const gen = tailer.streamSession(main, ac.signal);
+
+    const completed = await nextOfType(gen, "subagent_node");
+    expect(completed).toMatchObject({
+      node: {
+        nodeId: "bg2",
+        status: "completed",
+        ts: Date.parse("2026-07-28T07:18:38.435Z"),
+      },
+    });
+
+    // SendMessage による resume: 通知より新しい行が subagent transcript に追記されたら running へ戻る。
+    fs.appendFileSync(
+      childJsonl,
+      JSON.stringify({
+        agentId: "bg2",
+        isSidechain: true,
+        message: { role: "user", content: "follow-up" },
+        timestamp: "2026-07-28T07:20:00.000Z",
+      }) + "\n",
+    );
+    const resumed = await nextOfType(gen, "subagent_node");
+    expect(resumed).toMatchObject({ node: { nodeId: "bg2", status: "running" } });
+
+    fs.appendFileSync(
+      main,
+      JSON.stringify({
+        type: "user",
+        message: {
+          role: "user",
+          content: "<task-notification>\n<task-id>bg2</task-id>\n<status>completed</status>\n<summary>Agent \"BG agent\" finished</summary>\n</task-notification>",
+        },
+        timestamp: "2026-07-28T07:21:00.000Z",
+      }) + "\n",
+    );
+    const completedAgain = await nextOfType(gen, "subagent_node");
+    expect(completedAgain).toMatchObject({
+      node: {
+        nodeId: "bg2",
+        status: "completed",
+        ts: Date.parse("2026-07-28T07:21:00.000Z"),
+      },
+    });
+    ac.abort();
+  });
+
+  test("バックグラウンドコマンドを kind=command ノードとして送出し exit code で完了/エラーを分ける", async () => {
+    const project = makeTempDir("subagent-tailer-bg-command");
+    const sessionId = "55555555-6666-7777-8888-999999999999";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    fs.mkdirSync(path.join(project, sessionId, "subagents"), { recursive: true });
+
+    const outputPath = path.join(project, "tasks", "btask1.output");
+    fs.writeFileSync(
+      main,
+      [
+        JSON.stringify({
+          message: {
+            role: "assistant",
+            content: [{
+              type: "tool_use",
+              id: "toolu_bg_cmd",
+              name: "Bash",
+              input: { command: "npm test", run_in_background: true, description: "host 全テスト実行" },
+            }],
+          },
+          timestamp: "2026-07-28T07:41:51.866Z",
+        }),
+        JSON.stringify({
+          message: {
+            role: "user",
+            content: [{
+              type: "tool_result",
+              tool_use_id: "toolu_bg_cmd",
+              content: `Command running in background with ID: btask1. Output is being written to: ${outputPath}. You will be notified when it completes.`,
+            }],
+          },
+          timestamp: "2026-07-28T07:41:52.000Z",
+        }),
+      ].join("\n") + "\n",
+    );
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ pollIntervalMs: 10 });
+    const gen = tailer.streamSession(main, ac.signal);
+
+    const running = await nextOfType(gen, "subagent_node");
+    expect(running).toMatchObject({
+      node: {
+        nodeId: "btask1",
+        toolUseId: "toolu_bg_cmd",
+        parentNodeId: "root",
+        agentType: "Bash",
+        label: "host 全テスト実行",
+        depth: 1,
+        status: "running",
+        kind: "command",
+        ts: Date.parse("2026-07-28T07:41:51.866Z"),
+      },
+    });
+    expect(tailer.outputPath("btask1")).toBe(outputPath);
+
+    fs.appendFileSync(
+      main,
+      JSON.stringify({
+        type: "user",
+        message: {
+          role: "user",
+          content: "<task-notification>\n<task-id>btask1</task-id>\n<status>completed</status>\n<summary>Background command \"host 全テスト実行\" completed (exit code 2)</summary>\n</task-notification>",
+        },
+        timestamp: "2026-07-28T07:45:00.000Z",
+      }) + "\n",
+    );
+
+    const finished = await nextOfType(gen, "subagent_node");
+    expect(finished).toMatchObject({
+      node: {
+        nodeId: "btask1",
+        status: "error",
+        kind: "command",
+        ts: Date.parse("2026-07-28T07:45:00.000Z"),
+      },
+    });
+    ac.abort();
+  });
 });

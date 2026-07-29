@@ -57,6 +57,7 @@ function wireObject(message: ControlMessage): Raw {
     out["status"] = node.status;
     out["toolUseId"] = node.toolUseId;
     out["ts"] = node.ts;
+    if (node.kind !== undefined) out["kind"] = node.kind;
   }
 
   return out;

@@ -22,3 +22,5 @@
 {"id":"pv11aa22-0000-0000-0000-000000001101","type":"preview_ready","url":"http://127.0.0.1:52341/t/0123456789abcdef0123456789abcdef/index.html","v":2}
 {"id":"pv11aa22-0000-0000-0000-000000001102","message":"not-found: /Users/alice/missing.html","type":"preview_error","v":2}
 {"id":"pv11aa22-0000-0000-0000-000000001101","type":"preview_close","v":2}
+{"agentType":"Bash","depth":1,"kind":"command","label":"host 全テスト実行","nodeId":"b2b5uvze5","parentNodeId":"root","status":"running","toolUseId":"toolu_01975fevFoNfyxbkpfoGMbx5","ts":1783016361453,"type":"subagent_node","v":2}
+{"agentType":"Bash","depth":1,"kind":"command","label":"host 全テスト実行","nodeId":"b2b5uvze5","parentNodeId":"root","status":"completed","toolUseId":"toolu_01975fevFoNfyxbkpfoGMbx5","ts":1783016460000,"type":"subagent_node","v":2}

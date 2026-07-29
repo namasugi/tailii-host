@@ -13,6 +13,7 @@ import type { ImageService } from "./imageService.js";
 import { TranscriptTailer } from "./transcriptTailer.js";
 import { SubagentTailer } from "./subagentTailer.js";
 import {
+  readBackgroundOutput,
   readSubagentTranscript,
   type SubagentTranscriptResult,
 } from "./subagentTranscript.js";
@@ -78,7 +79,10 @@ export class ChatTailController {
 
   /** Hub からのオンデマンド要求に、現在 tail 中のノード全文を返す。 */
   subagentTranscript(nodeId: string): SubagentTranscriptResult {
-    return readSubagentTranscript(this.subagentTranscriptPath(nodeId));
+    const jsonl = this.subagentTranscriptPath(nodeId);
+    if (jsonl !== null) return readSubagentTranscript(jsonl);
+    // バックグラウンドコマンドは jsonl を持たないので、出力ファイルの末尾を返す。
+    return readBackgroundOutput(this.subagentTailer.outputPath(nodeId));
   }
 
   /**

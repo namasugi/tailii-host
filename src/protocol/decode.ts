@@ -992,6 +992,10 @@ function decodeSubagentNode(raw: Raw): SubagentNode {
   if (status !== "running" && status !== "completed" && status !== "error") {
     throw new ProtocolDecodeError("missing-field", "status");
   }
+  const kind = optionalString(raw, "kind");
+  if (kind !== undefined && kind !== "command") {
+    throw new ProtocolDecodeError("missing-field", "kind");
+  }
   return compact<SubagentNode>({
     nodeId: requireString(raw, "nodeId"),
     toolUseId: requireString(raw, "toolUseId"),
@@ -1002,6 +1006,7 @@ function decodeSubagentNode(raw: Raw): SubagentNode {
     status,
     currentActivity: optionalNullableString(raw, "currentActivity"),
     ts: requireNumber(raw, "ts"),
+    kind,
   });
 }
 

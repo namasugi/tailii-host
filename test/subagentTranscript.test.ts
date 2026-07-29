@@ -1,5 +1,8 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { parseSubagentTranscript } from "../src/chat/subagentTranscript.js";
+import { parseSubagentTranscript, readBackgroundOutput } from "../src/chat/subagentTranscript.js";
+import { makeTempDir } from "./helpers.js";
 
 describe("parseSubagentTranscript", () => {
   it("user/assistant/tool_use/tool_result を表示行へ変換する", () => {
@@ -58,5 +61,35 @@ describe("parseSubagentTranscript", () => {
       role: "tool", text: "Read: {\"index\":5}", ts: 1_700_000_005_000, kind: "tool_use",
     });
     expect(result.entries.at(-1)?.kind).toBe("tool_use");
+  });
+});
+
+describe("readBackgroundOutput", () => {
+  it("プレーンテキスト出力を tool_result 1 entry で返す", () => {
+    const dir = makeTempDir("bg-output");
+    const file = path.join(dir, "btask.output");
+    fs.writeFileSync(file, "line1\nline2\n");
+
+    const result = readBackgroundOutput(file);
+    expect(result.omitted).toBe(0);
+    expect(result.entries).toHaveLength(1);
+    expect(result.entries[0]).toMatchObject({ role: "tool", text: "line1\nline2\n", kind: "tool_result" });
+    expect(typeof result.entries[0]!.ts).toBe("number");
+  });
+
+  it("長大出力は末尾へクランプし omitted で省略を明示する", () => {
+    const dir = makeTempDir("bg-output-clamp");
+    const file = path.join(dir, "btask.output");
+    fs.writeFileSync(file, "x".repeat(9_000) + "TAIL");
+
+    const result = readBackgroundOutput(file);
+    expect(result.omitted).toBe(1);
+    expect(result.entries[0]!.text.length).toBe(8_000);
+    expect(result.entries[0]!.text.endsWith("TAIL")).toBe(true);
+  });
+
+  it("不在ファイル・null は空応答", () => {
+    expect(readBackgroundOutput(null)).toEqual({ entries: [], omitted: 0 });
+    expect(readBackgroundOutput("/nonexistent/bg.output")).toEqual({ entries: [], omitted: 0 });
   });
 });

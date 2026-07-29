@@ -23,6 +23,37 @@ export function readSubagentTranscript(file: string | null): SubagentTranscriptR
   }
 }
 
+const MAX_OUTPUT_TAIL = 8_000;
+
+/**
+ * バックグラウンドコマンドの出力ファイル（プレーンテキスト）を末尾クランプで返す。
+ * 先頭切り捨て時は omitted=1 で「省略あり」を明示する（行数は数えない）。
+ */
+export function readBackgroundOutput(file: string | null): SubagentTranscriptResult {
+  if (file === null) return { entries: [], omitted: 0 };
+  let text: string;
+  let ts: number | undefined;
+  try {
+    text = fs.readFileSync(file, "utf8");
+    const mtime = fs.statSync(file).mtimeMs;
+    ts = Number.isFinite(mtime) ? Math.floor(mtime) : undefined;
+  } catch {
+    return { entries: [], omitted: 0 };
+  }
+  const clamped = text.length > MAX_OUTPUT_TAIL;
+  const tail = clamped ? text.slice(text.length - MAX_OUTPUT_TAIL) : text;
+  if (tail.length === 0) return { entries: [], omitted: 0 };
+  return {
+    entries: [{
+      role: "tool",
+      text: tail,
+      ...(ts === undefined ? {} : { ts }),
+      kind: "tool_result",
+    }],
+    omitted: clamped ? 1 : 0,
+  };
+}
+
 export function parseSubagentTranscript(jsonl: string): SubagentTranscriptResult {
   const all: SubagentTranscriptEntry[] = [];
   for (const line of jsonl.split(/\r?\n/)) {

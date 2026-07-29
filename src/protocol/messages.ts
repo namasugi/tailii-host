@@ -61,6 +61,8 @@ export interface SubagentNode {
   status: SubagentNodeStatus;
   currentActivity?: string | null;
   ts: number;
+  /** "command" = バックグラウンドコマンド（Bash run_in_background）。省略時はエージェント。 */
+  kind?: "command";
 }
 
 /** セッション一覧応答の 1 要素。 */
