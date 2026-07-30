@@ -40,6 +40,18 @@ function userMsg(text: string, clientId?: string): string {
 function agentMsg(text: string, phase = "final_answer"): string {
   return JSON.stringify({ type: "event_msg", payload: { type: "agent_message", message: text, phase } });
 }
+function agentItem(id: string, text: string, phase = "final_answer"): string {
+  return JSON.stringify({
+    type: "response_item",
+    payload: {
+      type: "message",
+      id,
+      role: "assistant",
+      content: [{ type: "output_text", text }],
+      phase,
+    },
+  });
+}
 function turnContext(model: string): string {
   return JSON.stringify({ type: "turn_context", payload: { model } });
 }
@@ -157,6 +169,67 @@ describe("CodexRolloutTailer.streamForCwd（有限 tail）", () => {
     expect(chats.every((c) => c.eof)).toBe(true);
     // streamId はターンごとに一意。
     expect(new Set(chats.map((c) => c.streamId)).size).toBe(3);
+  });
+
+  test("assistant の rollout/live ID を alias で結び再接続時の二重表示を防ぐ", async () => {
+    const root = makeTempDir("codex-stream-alias");
+    const cwd = makeTempDir("codex-stream-alias-cwd");
+    writeRollout(root, "2026/07/31", "r.jsonl", cwd, [
+      agentMsg("途中経過", "commentary"),
+      agentItem("msg-commentary", "途中経過", "commentary"),
+      agentMsg("同じ本文", "final_answer"),
+      agentItem("msg-final-1", "同じ本文", "final_answer"),
+      // 同文の正当な再投稿は別 item ID / occurrence として残す。
+      agentMsg("同じ本文", "final_answer"),
+      agentItem("msg-final-2", "同じ本文", "final_answer"),
+    ]);
+    const tailer = new CodexRolloutTailer({ sessionsRoot: root, tailDeadlineMs: 0 });
+    const msgs = await collect(tailer, cwd);
+
+    expect(msgs).toEqual([
+      {
+        type: "chat_stream_alias",
+        v: 1,
+        streamId: "codex-turn-1",
+        aliasStreamIds: ["codex-item-msg-commentary"],
+      },
+      {
+        type: "chat_output",
+        v: 1,
+        streamId: "codex-turn-1",
+        role: "assistant",
+        text: "途中経過",
+        eof: true,
+      },
+      {
+        type: "chat_stream_alias",
+        v: 1,
+        streamId: "codex-turn-2",
+        aliasStreamIds: ["codex-item-msg-final-1"],
+      },
+      {
+        type: "chat_output",
+        v: 1,
+        streamId: "codex-turn-2",
+        role: "assistant",
+        text: "同じ本文",
+        eof: true,
+      },
+      {
+        type: "chat_stream_alias",
+        v: 1,
+        streamId: "codex-turn-3",
+        aliasStreamIds: ["codex-item-msg-final-2"],
+      },
+      {
+        type: "chat_output",
+        v: 1,
+        streamId: "codex-turn-3",
+        role: "assistant",
+        text: "同じ本文",
+        eof: true,
+      },
+    ]);
   });
 
   test("response_item / patch_apply_end を tool_activity カードへ写像する（codex-tool-cards）", async () => {

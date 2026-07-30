@@ -14,7 +14,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { PROTOCOL_V1, type ChatRole, type ControlMessage } from "../protocol.js";
+import { PROTOCOL_V1, type ControlMessage } from "../protocol.js";
 import { canonicalPath } from "../shared/paths.js";
 import { abortableSleep } from "../shared/sleep.js";
 import {
@@ -58,6 +58,18 @@ interface TailState {
   lastModel: string | null;
   lastContextTokens: number | null;
   lastContextWindow: number | null;
+  /**
+   * Codex は assistant 本文を event_msg と response_item の 2 行へ同時に保存する。
+   * response_item の id は App Server live item と共通なので、1 行だけ先読みして
+   * rollout / live の streamId を一致させる。旧 rollout で mirror が無い場合は
+   * 次の行または EOF で従来の codex-turn-N へフォールバックする。
+   */
+  pendingAssistantEvent: {
+    text: string;
+    phase: string | undefined;
+    legacyStreamId: string;
+  } | null;
+  pendingAssistantEOFPolls: number;
 }
 
 export class CodexRolloutTailer {
@@ -159,6 +171,8 @@ export class CodexRolloutTailer {
         lastModel: null,
         lastContextTokens: null,
         lastContextWindow: null,
+        pendingAssistantEvent: null,
+        pendingAssistantEOFPolls: 0,
       };
       const start = Date.now();
       let announcedReplayDone = false;
@@ -173,6 +187,16 @@ export class CodexRolloutTailer {
         }
 
         if (bytesRead === 0) {
+          // event_msg と response_item は通常同じ write burst に入る。ちょうど 2 行の間で
+          // EOF を観測した場合だけ 1 poll 待ち、live と共通の item id を取りこぼさない。
+          if (state.pendingAssistantEvent !== null) {
+            state.pendingAssistantEOFPolls += 1;
+            if (state.pendingAssistantEOFPolls === 1) {
+              await abortableSleep(this.pollIntervalMs, signal);
+              continue;
+            }
+            yield* flushPendingAssistantEvent(state);
+          }
           // 初回 EOF = 既存内容の再生完了。マーカー有効時は完了シグナルを 1 通流す。
           if (this.emitReplayDoneMarker && !announcedReplayDone) {
             announcedReplayDone = true;
@@ -339,6 +363,48 @@ export function* emitLine(line: Buffer, state: TailState): Generator<ControlMess
   }
   if (typeof parsed !== "object" || parsed === null) return;
   const record = parsed as { type?: unknown; payload?: unknown };
+
+  const mirroredAssistant = responseItemAssistant(record);
+  if (mirroredAssistant !== null) {
+    const pending = state.pendingAssistantEvent;
+    if (pending !== null &&
+        pending.text === mirroredAssistant.text &&
+        phasesMatch(pending.phase, mirroredAssistant.phase)) {
+      state.pendingAssistantEvent = null;
+      state.pendingAssistantEOFPolls = 0;
+      yield {
+        type: "chat_stream_alias",
+        v: PROTOCOL_V1,
+        streamId: pending.legacyStreamId,
+        aliasStreamIds: [`codex-item-${mirroredAssistant.id}`],
+      };
+      yield {
+        type: "chat_output",
+        v: PROTOCOL_V1,
+        streamId: pending.legacyStreamId,
+        role: "assistant",
+        text: mirroredAssistant.text,
+        eof: true,
+      };
+      return;
+    } else {
+      yield* flushPendingAssistantEvent(state);
+    }
+    // event_msg が newerThanMs で落ちた境界ケースでは canonical item ID をそのまま使う。
+    yield {
+      type: "chat_output",
+      v: PROTOCOL_V1,
+      streamId: `codex-item-${mirroredAssistant.id}`,
+      role: "assistant",
+      text: mirroredAssistant.text,
+      eof: true,
+    };
+    return;
+  }
+
+  // mirror ではない次行まで来たら、旧 rollout 形式として従来 ID で確定する。
+  yield* flushPendingAssistantEvent(state);
+
   if (record.type === "turn_context") {
     const context = asRecord(record.payload);
     const model = context?.["model"];
@@ -368,20 +434,28 @@ export function* emitLine(line: Buffer, state: TailState): Generator<ControlMess
     return;
   }
 
-  if (kind === "user_message" || kind === "agent_message") {
-    // commentary は長時間ターンの途中経過、final_answer は最終回答としてどちらも表示する。
-    // 未知 phase は将来形式を誤表示しないよう破棄する。phase 欠落は旧版互換で採用する。
-    if (kind === "agent_message") {
-      const phase = (payload as { phase?: unknown }).phase;
-      if (phase !== undefined && phase !== "commentary" && phase !== "final_answer") return;
-    }
+  if (kind === "agent_message") {
+    // 現行 Codex は直後の response_item/message に App Server と共通の安定 item id を持つ。
+    // ここでは 1 行だけ保留し、mirror が無い旧 rollout は次行/EOF で従来 ID へ戻す。
     const message = (payload as { message?: unknown }).message;
     if (typeof message !== "string" || message.length === 0) return;
-    const role: ChatRole = kind === "user_message" ? "user" : "assistant";
+    const phase = (payload as { phase?: unknown }).phase;
+    if (phase !== undefined && phase !== "commentary" && phase !== "final_answer") return;
     state.seq += 1;
-    const clientId = kind === "user_message"
-      ? (payload as { client_id?: unknown }).client_id
-      : undefined;
+    state.pendingAssistantEvent = {
+      text: message,
+      phase,
+      legacyStreamId: `codex-turn-${state.seq}`,
+    };
+    state.pendingAssistantEOFPolls = 0;
+    return;
+  }
+
+  if (kind === "user_message") {
+    const message = (payload as { message?: unknown }).message;
+    if (typeof message !== "string" || message.length === 0) return;
+    state.seq += 1;
+    const clientId = (payload as { client_id?: unknown }).client_id;
     // Tailii が turn/start に渡した clientUserMessageId は rollout の client_id として
     // 保存される。ユーザー発話だけはこの安定IDを streamId に使い、アプリ再起動や
     // 上書きインストール後の履歴再生でもローカル楽観バブルと厳密に同一視できるようにする。
@@ -392,7 +466,7 @@ export function* emitLine(line: Buffer, state: TailState): Generator<ControlMess
       type: "chat_output",
       v: PROTOCOL_V1,
       streamId,
-      role,
+      role: "user",
       text: message,
       eof: true,
     };
@@ -420,6 +494,49 @@ export function* emitLine(line: Buffer, state: TailState): Generator<ControlMess
     }
     return;
   }
+}
+
+function* flushPendingAssistantEvent(
+  state: TailState,
+): Generator<ControlMessage, void, void> {
+  const pending = state.pendingAssistantEvent;
+  if (pending === null) return;
+  state.pendingAssistantEvent = null;
+  state.pendingAssistantEOFPolls = 0;
+  yield {
+    type: "chat_output",
+    v: PROTOCOL_V1,
+    streamId: pending.legacyStreamId,
+    role: "assistant",
+    text: pending.text,
+    eof: true,
+  };
+}
+
+function responseItemAssistant(
+  record: { type?: unknown; payload?: unknown },
+): { id: string; text: string; phase: string | undefined } | null {
+  if (record.type !== "response_item") return null;
+  const payload = asRecord(record.payload);
+  if (payload?.["type"] !== "message" || payload["role"] !== "assistant") return null;
+  const id = payload["id"];
+  if (typeof id !== "string" || id.length === 0) return null;
+  const phase = payload["phase"];
+  if (phase !== undefined && phase !== "commentary" && phase !== "final_answer") return null;
+  const content = payload["content"];
+  if (!Array.isArray(content)) return null;
+  const text = content.flatMap((part) => {
+    const item = asRecord(part);
+    return item?.["type"] === "output_text" && typeof item["text"] === "string"
+      ? [item["text"] as string]
+      : [];
+  }).join("\n");
+  if (text.length === 0) return null;
+  return { id, text, phase };
+}
+
+function phasesMatch(left: string | undefined, right: string | undefined): boolean {
+  return left === right || left === undefined || right === undefined;
 }
 
 function marker(streamId: string, text: string): ControlMessage {

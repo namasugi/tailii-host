@@ -359,6 +359,8 @@ export type ControlMessage =
   | { type: "image_fetch_response"; v: number; id: string; seq: number; data: string; eof: boolean; mime: string }
   | { type: "subagent_transcript_request"; v: number; id: string; nodeId: string }
   | { type: "subagent_transcript_response"; v: number; id: string; nodeId: string; entries: SubagentTranscriptEntry[]; omitted: number }
+  /** 同一 chat item の履歴/live stream ID 対応。直後の chat_output より先に配送する。 */
+  | { type: "chat_stream_alias"; v: number; streamId: string; aliasStreamIds: string[] }
   | { type: "chat_output"; v: number; streamId: string; role: ChatRole; text: string; eof: boolean }
   | { type: "tool_activity"; v: number; activity: ToolActivity }
   | { type: "session_chat_output"; v: number; session: string; serverSeq: number; streamId: string; role: ChatRole; text: string; eof: boolean }

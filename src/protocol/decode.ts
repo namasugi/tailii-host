@@ -432,6 +432,13 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         omitted: requireNumber(raw, "omitted"),
       };
 
+    case "chat_stream_alias":
+      return {
+        type, v,
+        streamId: requireString(raw, "streamId"),
+        aliasStreamIds: requireStringArray(raw, "aliasStreamIds"),
+      };
+
     case "chat_output": {
       const role = requireString(raw, "role");
       if (role !== "assistant" && role !== "user" && role !== "system") {
