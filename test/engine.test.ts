@@ -84,6 +84,56 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
+  test("一覧 watch 有効中だけ非前面会話の pane_preview を iOS へリレーする", async () => {
+    const store = makeTempStore();
+    store.put({ name: "bg-work", cwd: "/tmp/bg-work", createdAt: 1, agent: "claude" });
+    let pumpWrite: ((payload: import("../src/protocol.js").ControlMessage) => void) | null = null;
+    const hub = new SessionHub({
+      runner: async () => ok(""),
+      heartbeatDir: makeTempDir("watch-relay-hub"),
+      metadataStore: store,
+      timeoutSeconds: 1_800,
+      previewPumpFactory: (write) => {
+        pumpWrite = write;
+        return { start: vi.fn(), stop: vi.fn() };
+      },
+    });
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("bg-work\n") : ok(""));
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store), metadataStore: store, hub,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    // watch 有効化（probe の error 応答で input 処理完了を同期する）。
+    engine.writeLine('{"enabled":true,"type":"session_preview_watch","v":2}');
+    engine.writeLine('{"id":"probe1","type":"image_fetch_request","v":2}');
+    await engine.lines.nextOfType("error");
+    hub.handleRelayMessage({ type: "session_processing", session: "bg-work", state: "active" });
+    await engine.lines.nextOfType("session_processing_state");
+    expect(pumpWrite).not.toBeNull();
+    pumpWrite?.({
+      type: "pane_preview", v: 2, session: "bg-work", seq: 1, active: true, text: "✻ Thinking…",
+    });
+    expect(decodeControlMessage(await engine.lines.nextOfType("pane_preview"))).toEqual({
+      type: "pane_preview", v: 2, session: "bg-work", seq: 1, active: true, text: "✻ Thinking…",
+    });
+
+    // watch 無効化後は同じ会話のフレームが届かない（probe2 の応答まで pane_preview 不在）。
+    engine.writeLine('{"enabled":false,"type":"session_preview_watch","v":2}');
+    engine.writeLine('{"id":"probe2","type":"image_fetch_request","v":2}');
+    await engine.lines.nextOfType("error");
+    pumpWrite?.({
+      type: "pane_preview", v: 2, session: "bg-work", seq: 2, active: true, text: "✻ More…",
+    });
+    engine.writeLine('{"id":"probe3","type":"image_fetch_request","v":2}');
+    for (;;) {
+      const line = await engine.lines.next();
+      expect(line).not.toContain('"type":"pane_preview"');
+      if (line.includes('"id":"probe3"')) break;
+    }
+    await engine.teardown();
+  });
+
   test("フォーカス外の処理中会話を購読し session 付き差分として配信する", async () => {
     const store = makeTempStore();
     store.put({

@@ -99,6 +99,8 @@ export interface HandlerContext {
   /** host 側の既定エージェント（session_start が agentType を指定しないときのフォールバック）。 */
   defaultAgent: ChatAgent;
   activeChatSession: { name: string | null };
+  /** 一覧 Mission Control の watch 状態（有効中は非前面会話の pane_preview もリレーする）。 */
+  listPreviewWatch: { enabled: boolean };
   /** 処理中セッションの最終ハートビート（Unix 秒）。明示 kill 時に掃除する。 */
   processingSessions: Map<string, number>;
   /** 一覧・別画面でも差分同期を続けるフォーカス外会話。 */

@@ -486,6 +486,9 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
       });
     }
 
+    case "session_preview_watch":
+      return { type, v, enabled: requireBoolean(raw, "enabled") };
+
     case "pane_choice_send":
     case "pane_key_send":
       return {

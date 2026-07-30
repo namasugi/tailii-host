@@ -37,6 +37,7 @@ export type HubClientMessage =
   | { type: "chat_send"; id: string; session: string; clientMessageId: string; text: string; explicitRetry?: boolean }
   | { type: "runtime_claim"; id: string; session: string }
   | { type: "runtime_claim_release"; session: string }
+  | { type: "session_preview_watch"; enabled: boolean }
   | SessionProcessingMessage;
 
 export type HubServerMessage =
@@ -185,6 +186,10 @@ export function decodeHubClientLine(line: string): HubClientMessage | null {
   if (record["type"] === "runtime_claim_release") {
     const session = record["session"];
     return typeof session === "string" && session.length > 0 ? { type: "runtime_claim_release", session } : null;
+  }
+  if (record["type"] === "session_preview_watch") {
+    const enabled = record["enabled"];
+    return typeof enabled === "boolean" ? { type: "session_preview_watch", enabled } : null;
   }
   return decodeProcessing(record);
 }

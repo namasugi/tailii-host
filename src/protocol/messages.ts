@@ -298,6 +298,8 @@ export type ControlMessage =
       /** 省略時は従来の Claude ステータス表示。Codex のみ terminal capture を指定する。 */
       mode?: "codex_terminal";
     }
+  /** 一覧 Mission Control: 有効な間、処理中会話すべての pane_preview を配信する（iOS→host）。 */
+  | { type: "session_preview_watch"; v: number; enabled: boolean }
   | { type: "pane_choice_send"; v: number; id: string; session: string; key: string }
   | { type: "pane_choice_send_result"; v: number; id: string; ok: boolean; error: string | null }
   | { type: "pane_key_send"; v: number; id: string; session: string; key: string }

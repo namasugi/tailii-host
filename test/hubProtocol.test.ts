@@ -40,6 +40,17 @@ describe("hubProtocol session lifecycle", () => {
   });
 });
 
+describe("hubProtocol session preview watch", () => {
+  test("session_preview_watch を往復し enabled 非 boolean を拒否する", () => {
+    for (const enabled of [true, false]) {
+      const message: HubClientMessage = { type: "session_preview_watch", enabled };
+      expect(decodeHubClientLine(encodeHubMessage(message))).toEqual(message);
+    }
+    expect(decodeHubClientLine('{"type":"session_preview_watch","enabled":"yes"}')).toBeNull();
+    expect(decodeHubClientLine('{"type":"session_preview_watch"}')).toBeNull();
+  });
+});
+
 describe("hubProtocol presence RPC", () => {
   test("presence_request を encode/decode 往復する", () => {
     const message: HubClientMessage = { type: "presence_request", id: "req-1", session: "work" };

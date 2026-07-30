@@ -362,6 +362,8 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
   const lifecycleAbort = new AbortController();
   const background: Promise<unknown>[] = [];
   const activeChatSession: { name: string | null } = { name: null };
+  // 一覧 Mission Control の watch 状態。hub 再接続を跨いで再送するため engine 側でも保持する。
+  const listPreviewWatch = { enabled: false };
   const lastServerSeq = new Map<string, number>();
   // socket close 時刻ではなく、engine channel へ最後に書き切った会話 event の時刻。
   // Hub 世代変更時の transcript backfill 境界として session ごとに保持する。
@@ -605,7 +607,9 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
         return;
       }
       if (message.type === "conversation_pane_preview") {
-        if (message.session !== activeChatSession.name) return;
+        // 前面会話は常時。他会話は一覧 Mission Control の watch 有効中のみ（iOS は
+        // payload の session フィールドで一覧カードへルーティングする）。
+        if (message.session !== activeChatSession.name && !listPreviewWatch.enabled) return;
         try { writer.write(message.payload); }
         catch (error) { process.stderr.write(`[tailii-host engine] pane_preview 書込失敗: ${String(error)}\n`); }
         return;
@@ -708,6 +712,10 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
             active: true,
           });
         }
+      }
+      // 一覧 watch は hub 側 client 状態なので、再接続（hub 再起動含む）ごとに再送する。
+      if (listPreviewWatch.enabled) {
+        hubLink.send({ type: "session_preview_watch", enabled: true });
       }
       const sessions = new Set(backgroundChatSessions);
       if (activeChatSession.name !== null) sessions.add(activeChatSession.name);
@@ -818,6 +826,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           modeTiming: resolvedModeTiming,
           defaultAgent: agent,
           activeChatSession,
+          listPreviewWatch,
           processingSessions,
           backgroundChatSessions,
           lastServerSeq,

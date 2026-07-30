@@ -65,6 +65,60 @@ describe("PanePreviewPump", () => {
     pump.stop();
   });
 
+  test("emitInitial 指定時は初回 capture から emit する（処理中会話の一覧 watch 開始）", async () => {
+    vi.useFakeTimers();
+    const { writer, messages } = memoryWriter();
+    const pump = new PanePreviewPump({
+      writer,
+      capture: async () => "✻ Baking… (12s)",
+      pollIntervalMs: 10,
+      quietThresholdMs: 1000,
+      protocolVersion: () => 2,
+    });
+
+    pump.start("work", "claude_status", { emitInitial: true });
+    await flushMicrotasks();
+    expect(messages()).toEqual([
+      { type: "pane_preview", v: 2, session: "work", seq: 1, active: true, text: "✻ Baking… (12s)" },
+    ]);
+
+    pump.stop();
+  });
+
+  test("pollIntervalMs 関数は毎周期評価される（前面 250ms / 一覧 watch 1s の動的切替）", async () => {
+    vi.useFakeTimers();
+    let interval = 10;
+    let paneText = "first";
+    const captured: number[] = [];
+    const { writer } = memoryWriter();
+    const pump = new PanePreviewPump({
+      writer,
+      capture: async () => {
+        captured.push(Date.now());
+        return paneText;
+      },
+      pollIntervalMs: () => interval,
+      quietThresholdMs: 10_000,
+      protocolVersion: () => 2,
+    });
+
+    pump.start("work");
+    await flushMicrotasks();
+    expect(captured).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(captured).toHaveLength(2);
+    interval = 40;
+    paneText = "second";
+    await vi.advanceTimersByTimeAsync(10); // 旧間隔の残り: この周期で新間隔を読み直す
+    expect(captured).toHaveLength(3);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(captured).toHaveLength(3); // 40ms へ切替済みなので 10ms では発火しない
+    await vi.advanceTimersByTimeAsync(30);
+    expect(captured).toHaveLength(4);
+
+    pump.stop();
+  });
+
   test("permission mode を初回と変化時だけ onPermissionMode で通知し、判定不能中は保持する", async () => {
     vi.useFakeTimers();
     const { writer } = memoryWriter();

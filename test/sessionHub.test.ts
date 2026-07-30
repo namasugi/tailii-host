@@ -1150,6 +1150,110 @@ describe("SessionHub conversation stream", () => {
     hub.handleClientMessage(b, JSON.stringify({ type: "conversation_unsubscribe", session: "work" }));
     expect(stops).toBe(1);
   });
+
+  test("一覧 watch は処理中会話の pump を前面購読なしで起動し、処理完了で停止する", () => {
+    const metadataStore = makeTempStore();
+    metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0 });
+    let starts = 0, stops = 0;
+    const startOpts: unknown[] = [];
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-watch"),
+      metadataStore, timeoutSeconds: 1800,
+      previewPumpFactory: () => ({
+        start(_session: string, _mode?: unknown, opts?: unknown) { starts += 1; startOpts.push(opts); },
+        stop() { stops += 1; },
+      }) });
+    const watcher = {};
+    hub.registerClient(watcher, () => {});
+    hub.handleClientMessage(watcher, JSON.stringify({ type: "session_preview_watch", enabled: true }));
+    expect(starts).toBe(0);
+    hub.handleClientMessage(watcher, JSON.stringify({
+      type: "session_processing", session: "work", state: "active",
+    }));
+    expect(starts).toBe(1);
+    // 静止 pane（承認ダイアログ等）でカードが空にならないよう初回フレームから送る。
+    expect(startOpts[0]).toEqual({ emitInitial: true });
+    hub.handleClientMessage(watcher, JSON.stringify({
+      type: "session_processing", session: "work", state: "done",
+    }));
+    expect(stops).toBe(1);
+  });
+
+  test("処理中会話がある状態での watch 有効化/無効化で pump を起動/停止する", () => {
+    const metadataStore = makeTempStore();
+    metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0 });
+    let starts = 0, stops = 0;
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-watch-late"),
+      metadataStore, timeoutSeconds: 1800,
+      previewPumpFactory: () => ({ start() { starts += 1; }, stop() { stops += 1; } }) });
+    const watcher = {};
+    hub.registerClient(watcher, () => {});
+    hub.handleClientMessage(watcher, JSON.stringify({
+      type: "session_processing", session: "work", state: "active",
+    }));
+    expect(starts).toBe(0);
+    hub.handleClientMessage(watcher, JSON.stringify({ type: "session_preview_watch", enabled: true }));
+    expect(starts).toBe(1);
+    hub.handleClientMessage(watcher, JSON.stringify({ type: "session_preview_watch", enabled: false }));
+    expect(stops).toBe(1);
+    // watcher の切断でも同様に停止する（再有効化→切断）。
+    hub.handleClientMessage(watcher, JSON.stringify({ type: "session_preview_watch", enabled: true }));
+    expect(starts).toBe(2);
+    hub.unregisterClient(watcher);
+    expect(stops).toBe(2);
+  });
+
+  test("watcher は処理中会話の pane_preview を購読なしで受け取り、前面購読との重複配信はしない", () => {
+    const metadataStore = makeTempStore();
+    metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0 });
+    let pumpWrite: ((payload: ControlMessage) => void) | undefined;
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-watch-fanout"),
+      metadataStore, timeoutSeconds: 1800,
+      previewPumpFactory: (write) => { pumpWrite = write; return { start() {}, stop() {} }; } });
+    const watcher = {}, wr: unknown[] = [];
+    hub.registerClient(watcher, (line) => wr.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(watcher, JSON.stringify({ type: "session_preview_watch", enabled: true }));
+    hub.handleClientMessage(watcher, JSON.stringify({
+      type: "session_processing", session: "work", state: "active",
+    }));
+    const frame: ControlMessage = {
+      type: "pane_preview", v: 2, session: "work", seq: 1, active: true, text: "✻ Baking…",
+    };
+    const framesOf = (received: unknown[]) =>
+      received.filter((m) => (m as { type?: string }).type === "conversation_pane_preview");
+    pumpWrite?.(frame);
+    expect(framesOf(wr)).toEqual([{ type: "conversation_pane_preview", session: "work", payload: frame }]);
+    // watcher 自身が同じ会話の前面購読者になってもフレームは 1 通のまま。
+    hub.handleClientMessage(watcher, JSON.stringify({
+      type: "conversation_subscribe", session: "work", afterSeq: 0, preview: true,
+    }));
+    wr.length = 0;
+    pumpWrite?.({ ...frame, seq: 2 });
+    expect(framesOf(wr)).toHaveLength(1);
+  });
+
+  test("処理完了後の watcher 配信は消灯フレームのみ通す", () => {
+    const metadataStore = makeTempStore();
+    metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0 });
+    let pumpWrite: ((payload: ControlMessage) => void) | undefined;
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-watch-off"),
+      metadataStore, timeoutSeconds: 1800,
+      previewPumpFactory: (write) => { pumpWrite = write; return { start() {}, stop() {} }; } });
+    // 前面購読者が別にいる（pump が処理完了後も生き続ける）状況を作る。
+    const fg = {};
+    subscribe(hub, fg, [], { afterSeq: 0, preview: true });
+    const watcher = {}, wr: unknown[] = [];
+    hub.registerClient(watcher, (line) => wr.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(watcher, JSON.stringify({ type: "session_preview_watch", enabled: true }));
+    hub.handleClientMessage(watcher, JSON.stringify({
+      type: "session_processing", session: "work", state: "done",
+    }));
+    const framesOf = (received: unknown[]) =>
+      received.filter((m) => (m as { type?: string }).type === "conversation_pane_preview");
+    pumpWrite?.({ type: "pane_preview", v: 2, session: "work", seq: 3, active: true, text: "idle 画面" });
+    expect(framesOf(wr)).toEqual([]);
+    pumpWrite?.({ type: "pane_preview", v: 2, session: "work", seq: 4, active: false, text: "" });
+    expect(framesOf(wr)).toHaveLength(1);
+  });
 });
 
 function makeCodexStreamingHub(options: {

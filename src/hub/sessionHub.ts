@@ -49,7 +49,7 @@ export interface HubTail {
 }
 
 export interface HubPreviewPump {
-  start(session: string, mode?: PanePreviewMode): void;
+  start(session: string, mode?: PanePreviewMode, opts?: { emitInitial?: boolean }): void;
   stop(): void;
 }
 
@@ -57,6 +57,8 @@ export type HubTailFactory = (write: (payload: ControlMessage) => void) => HubTa
 export type HubPreviewPumpFactory = (
   write: (payload: ControlMessage) => void,
   onPermissionMode?: (mode: string) => void,
+  /** 毎周期評価するポーリング間隔（ms）。前面購読あり=高頻度 / 一覧 watch のみ=低頻度。 */
+  pollIntervalMs?: () => number,
 ) => HubPreviewPump;
 
 export type SessionHubOptions = Omit<ReaperTickOptions, "now"> & {
@@ -142,6 +144,8 @@ interface SessionActor {
 
 export class SessionHub {
   private readonly clients = new Map<object, (line: string) => void>();
+  /** 一覧 Mission Control の watcher（処理中会話全体の pane_preview 配信先）。 */
+  private readonly previewWatchers = new Set<object>();
   readonly actors = new Map<string, SessionActor>();
   private readonly now: () => number;
   private readonly replayLimit: number;
@@ -288,11 +292,14 @@ export class SessionHub {
 
   unregisterClient(client: object): void {
     this.clients.delete(client);
+    const wasWatcher = this.previewWatchers.delete(client);
     for (const [session, actor] of this.actors) {
       actor.focusedBy.delete(client);
       if (actor.runtimeClaim?.client === client) actor.runtimeClaim = null;
       if (actor.subscribers.has(client)) this.unsubscribe(client, session, actor);
     }
+    // 最後の watcher の切断で、watch 起因の pump を止める。
+    if (wasWatcher) this.syncAllPreviews();
   }
 
   broadcast(message: HubServerMessage): void {
@@ -331,6 +338,19 @@ export class SessionHub {
     }
     if (message.type === "session_retire") {
       this.retireSession(message.session);
+      return;
+    }
+    if (message.type === "session_preview_watch") {
+      // 一覧 Mission Control: watch 中は処理中会話すべての pane_preview をこの client へ流す。
+      const changed = message.enabled
+        ? !this.previewWatchers.has(client) && (this.previewWatchers.add(client), true)
+        : this.previewWatchers.delete(client);
+      if (changed) {
+        this.options.log?.(
+          `audit preview-watch ${message.enabled ? "start" : "stop"} watchers=${this.previewWatchers.size}`,
+        );
+        this.syncAllPreviews();
+      }
       return;
     }
     if (message.type === "conversation_subagent_transcript_request") {
@@ -1101,9 +1121,16 @@ export class SessionHub {
     return afterSeq >= first - 1 && afterSeq <= last;
   }
 
+  /** watch 状態・処理中遷移で全 actor の pump 要否を見直す（対象は疎なので全走査で足りる）。 */
+  private syncAllPreviews(): void {
+    for (const [session, actor] of this.actors) this.syncPreview(session, actor);
+  }
+
   private syncPreview(session: string, actor: SessionActor): void {
-    const wantsPreview = [...actor.subscribers.values()].some((state) => state.preview);
-    if (!wantsPreview) {
+    const wantsForeground = [...actor.subscribers.values()].some((state) => state.preview);
+    // 一覧 Mission Control: watcher がいる間、処理中会話は前面購読が無くても pump する。
+    const wantsWatch = this.previewWatchers.size > 0 && actor.processingSince !== null;
+    if (!wantsForeground && !wantsWatch) {
       if (actor.previewPump !== null) this.options.log?.(`audit preview-pump stop session=${session}`);
       actor.previewPump?.stop();
       actor.previewPump = null;
@@ -1113,8 +1140,22 @@ export class SessionHub {
     this.options.log?.(`audit preview-pump start session=${session}`);
     const pump = this.options.previewPumpFactory(
       (payload) => {
+        const delivered = new Set<object>();
         for (const [client, state] of actor.subscribers) {
-          if (state.preview) this.sendTo(client, { type: "conversation_pane_preview", session, payload });
+          if (state.preview) {
+            this.sendTo(client, { type: "conversation_pane_preview", session, payload });
+            delivered.add(client);
+          }
+        }
+        // watcher へは処理中の会話だけ流す（前面都合で動く pump のアイドル画面は一覧に不要）。
+        // 消灯フレーム（active=false）だけは処理完了直後でも届け、一覧側の表示を確実に落とす。
+        const inactiveFrame = payload.type === "pane_preview" && !payload.active;
+        if (actor.processingSince !== null || inactiveFrame) {
+          for (const watcher of this.previewWatchers) {
+            if (!delivered.has(watcher)) {
+              this.sendTo(watcher, { type: "conversation_pane_preview", session, payload });
+            }
+          }
         }
       },
       (mode) => {
@@ -1128,9 +1169,17 @@ export class SessionHub {
           if (state.preview) this.sendTo(client, { type: "conversation_mode", session, payload });
         }
       },
+      // 前面購読が無い（一覧 watch だけの）間は低頻度で capture し、多重 pump のコストを抑える。
+      () => ([...actor.subscribers.values()].some((state) => state.preview) ? 250 : 1000),
     );
     actor.previewPump = pump;
-    pump.start(session, this.options.metadataStore.get(session)?.agent === "codex" ? "codex_terminal" : "claude_status");
+    pump.start(
+      session,
+      this.options.metadataStore.get(session)?.agent === "codex" ? "codex_terminal" : "claude_status",
+      // 処理中の pump 起動（=一覧 watch 起因が典型）は初回フレームから送る。静止 pane
+      //（承認ダイアログ等）で一覧カードが空のままになるのを防ぐ。
+      { emitInitial: actor.processingSince !== null },
+    );
   }
 
   private actor(session: string): SessionActor {
@@ -1379,6 +1428,8 @@ export class SessionHub {
   private applyProcessing(session: string, state: "active" | "done"): void {
     const actor = this.actor(session);
     actor.processingSince = state === "active" ? this.now() : null;
+    // 一覧 watch 中は処理開始/完了で pump を起動/停止する（前面購読とは独立）。
+    this.syncPreview(session, actor);
     try {
       writeHeartbeat(this.options.heartbeatDir, session, { ts: this.now(), state: state === "active" ? "active" : "idle",
         event: state === "active" ? "hub-processing" : "hub-processing-done" });

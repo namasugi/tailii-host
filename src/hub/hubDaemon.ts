@@ -361,10 +361,11 @@ export async function runHubCommand(args: string[]): Promise<number> {
       imageService,
       protocolVersion: () => PROTOCOL_MAX_SUPPORTED,
     }),
-    previewPumpFactory: (write, onPermissionMode) => new PanePreviewPump({
+    previewPumpFactory: (write, onPermissionMode, pollIntervalMs) => new PanePreviewPump({
       writer: controlMessageCallbackWriter(write),
       capture: (session) => sessionBackend.capturePane(session, { lines: 60, joinWrappedLines: true }),
       onPermissionMode,
+      ...(pollIntervalMs !== undefined ? { pollIntervalMs } : {}),
       log,
     }),
     questionInjector: (answers, session) => injectQuestionAnswers(answers, session, sessionBackend),

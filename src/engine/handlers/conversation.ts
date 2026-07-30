@@ -24,6 +24,13 @@ function chatSendDiag(message: string): void {
 }
 
 export const conversationHandlers: HandlerRegistry = {
+  session_preview_watch: (message, ctx) => {
+    // 一覧 Mission Control: 一覧表示中だけ有効化される。応答不要（冪等・再入場で再送）。
+    ctx.listPreviewWatch.enabled = message.enabled;
+    engineDiag(`session_preview_watch enabled=${message.enabled}`);
+    ctx.hubLink.send({ type: "session_preview_watch", enabled: message.enabled });
+  },
+
   chat_send: (message, ctx) => {
     const { writer, state, metadataStore } = ctx;
     const v = state.negotiatedVersion;

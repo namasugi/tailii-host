@@ -12,8 +12,11 @@ export type PanePreviewMode = "claude_status" | "codex_terminal";
 export interface PanePreviewPumpOptions {
   writer: LineWriter;
   capture: PanePreviewCapture;
-  /** pane capture のポーリング間隔（ms）。既定 250ms。 */
-  pollIntervalMs?: number;
+  /**
+   * pane capture のポーリング間隔（ms）。既定 250ms。
+   * 関数を渡すと毎周期評価する（前面購読あり=250ms / 一覧 watch のみ=低頻度、の動的切替用）。
+   */
+  pollIntervalMs?: number | (() => number);
   /** 変化停止後に inactive を送るまでの閾値（ms）。既定 2.5s。 */
   quietThresholdMs?: number;
   /** negotiated protocol version。未指定は v2。 */
@@ -32,7 +35,7 @@ export interface PanePreviewPumpOptions {
 export class PanePreviewPump {
   private readonly writer: LineWriter;
   private readonly capture: PanePreviewCapture;
-  private readonly pollIntervalMs: number;
+  private readonly pollIntervalMs: () => number;
   private readonly quietThresholdMs: number;
   private readonly protocolVersion: () => number;
   private abortController: AbortController | null = null;
@@ -51,24 +54,35 @@ export class PanePreviewPump {
   private readonly log: ((message: string) => void) | null;
   private lastPermissionMode: string | null = null;
   private lastEmittedDialog = false;
+  private emitInitial = false;
   private static readonly minEmitIntervalMs = 500;
 
   constructor(options: PanePreviewPumpOptions) {
     this.writer = options.writer;
     this.capture = options.capture;
-    this.pollIntervalMs = options.pollIntervalMs ?? 250;
+    const pollIntervalMs = options.pollIntervalMs ?? 250;
+    this.pollIntervalMs = typeof pollIntervalMs === "function" ? pollIntervalMs : () => pollIntervalMs;
     this.quietThresholdMs = options.quietThresholdMs ?? 2500;
     this.protocolVersion = options.protocolVersion ?? (() => PROTOCOL_V2);
     this.onPermissionMode = options.onPermissionMode ?? null;
     this.log = options.log ?? null;
   }
 
-  /** 対象セッションの preview を開始/切替する。同一セッションの二重 start は無視する。 */
-  start(session: string, mode: PanePreviewMode = "claude_status"): void {
+  /**
+   * 対象セッションの preview を開始/切替する。同一セッションの二重 start は無視する。
+   * emitInitial=true は初回 capture も active フレームとして送る（処理中会話を一覧 watch で
+   * 開いた直後、pane が静止していてもカードを空にしないため）。
+   */
+  start(
+    session: string,
+    mode: PanePreviewMode = "claude_status",
+    opts?: { emitInitial?: boolean },
+  ): void {
     if (this.session === session && this.mode === mode && this.task !== null) return;
     this.stop();
     this.session = session;
     this.mode = mode;
+    this.emitInitial = opts?.emitInitial ?? false;
     this.lastPermissionMode = null;
     this.lastText = null;
     this.lastChangeAt = 0;
@@ -93,6 +107,7 @@ export class PanePreviewPump {
     }
     this.session = null;
     this.mode = "claude_status";
+    this.emitInitial = false;
     this.lastPermissionMode = null;
     this.lastText = null;
     this.lastChangeAt = 0;
@@ -139,7 +154,8 @@ export class PanePreviewPump {
           // Claude は従来どおり初回を基準フレームとして黙って保持する。
           // Codex は接続時点ですでに turn が進行中の場合があるため、初回 capture も送り、
           // iOS 側で現在の処理中ステータスだけを抽出する。
-          if (mode === "codex_terminal" && text.trim().length > 0) {
+          // emitInitial 指定時（処理中会話の watch 開始）は Claude も初回から送る。
+          if ((mode === "codex_terminal" || this.emitInitial) && text.trim().length > 0) {
             this.lastChangeAt = now;
             this.inactiveSent = false;
             this.queueActive(session, text, now, mode);
@@ -170,7 +186,7 @@ export class PanePreviewPump {
         this.active = false;
       }
 
-      await abortableSleep(this.pollIntervalMs, signal);
+      await abortableSleep(this.pollIntervalMs(), signal);
     }
   }
 
