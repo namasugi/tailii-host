@@ -288,9 +288,14 @@ describe("reaperTick herdr backend", () => {
     store.put({ name: "s-empty", cwd: "/w", createdAt: 1, backend: "herdr", claudeSessionId: "conv-4" });
     store.put({ name: "s-default", cwd: "/w", createdAt: 1, backend: "herdr", claudeSessionId: "conv-5" });
     store.put({ name: "s-named", cwd: "/w", createdAt: 1, backend: "herdr", claudeSessionId: "conv-2" });
+    // ラベル==前回の自動適用値 → ai-title の更新に追随して再リネームする（stale 追随）。
+    store.put({
+      name: "s-stale", cwd: "/w", createdAt: 1, backend: "herdr",
+      claudeSessionId: "conv-6", autoTabTitle: "旧AIタイトル",
+    });
     store.put({ name: "s-codex", cwd: "/w", createdAt: 1, backend: "herdr", agent: "codex", providerSessionId: "th-1" });
     store.put({ name: "s-notitle", cwd: "/w", createdAt: 1, backend: "herdr", claudeSessionId: "conv-3" });
-    const names = ["s-codex", "s-default", "s-empty", "s-named", "s-notitle", "s-unnamed"];
+    const names = ["s-codex", "s-default", "s-empty", "s-named", "s-notitle", "s-stale", "s-unnamed"];
     for (const name of names) writeHeartbeat(dir, name, { ts: NOW - 10, state: "idle" });
     const renamed: [string, string | null][] = [];
     const ops: import("../src/hub/reaper.js").HerdrReaperOps = {
@@ -305,6 +310,7 @@ describe("reaperTick herdr backend", () => {
           ["s-empty", { tabId: "w1:t5", label: "" }],
           ["s-default", { tabId: "w1:t6", label: "12" }],
           ["s-named", { tabId: "w1:t2", label: "認証バグの調査" }],
+          ["s-stale", { tabId: "w1:t7", label: "旧AIタイトル" }],
           ["s-codex", { tabId: "w1:t3", label: "s-codex" }],
           ["s-notitle", { tabId: "w1:t4", label: "s-notitle" }],
         ]),
@@ -323,15 +329,22 @@ describe("reaperTick herdr backend", () => {
       deriveClaudeTitle: (sessionId) =>
         sessionId === "conv-1" ? "最初の発話タイトル"
           : sessionId === "conv-4" ? "空ラベル側"
-          : sessionId === "conv-5" ? "連番ラベル側" : null,
+          : sessionId === "conv-5" ? "連番ラベル側"
+          : sessionId === "conv-6" ? "新AIタイトル" : null,
     });
 
-    // 未命名（ラベル==セッション名 / 空 / 既定連番）かつ claude かつタイトル導出可のものだけ反映される。
+    // 未命名（ラベル==セッション名 / 空 / 既定連番 / 前回の自動適用値）かつ claude かつ
+    // タイトル導出可のものだけ反映される。人為リネーム（s-named）は触らない。
     expect(renamed).toEqual([
       ["s-default", "連番ラベル側"],
       ["s-empty", "空ラベル側"],
+      ["s-stale", "新AIタイトル"],
       ["s-unnamed", "最初の発話タイトル"],
     ]);
+    // 自動適用値はメタデータへ記録され、次周期の追随判定の権威になる。
+    expect(store.get("s-unnamed")?.autoTabTitle).toBe("最初の発話タイトル");
+    expect(store.get("s-stale")?.autoTabTitle).toBe("新AIタイトル");
+    expect(store.get("s-named")?.autoTabTitle).toBeUndefined();
   });
 
   test("herdr セッションも idle timeout 超過で pane close(kill) される", async () => {

@@ -25,6 +25,12 @@ export interface SessionMeta {
   backend?: "tmux" | "herdr";
   /** herdr backend のときの pane ID（`w<N>:p<id>`）。herdr への入出力 target。 */
   herdrPaneId?: string;
+  /**
+   * hub tick がタブへ自動適用した会話タイトル（session-title）。
+   * 「ラベル==この値」のタブは自動命名のままとみなし、ai-title の更新へ追随して
+   * 再リネームする。人為リネーム（それ以外のラベル）とを区別する権威。
+   */
+  autoTabTitle?: string;
 }
 
 /** session 名が安全でないときに投げる型付きエラー。 */
@@ -67,6 +73,7 @@ export class SessionMetadataStore {
       // sortedKeys 相当。任意キーは指定時のみ書く（後方互換: 未指定は従来どおりのキー構成）。
       {
         ...(meta.agent !== undefined ? { agent: meta.agent } : {}),
+        ...(meta.autoTabTitle !== undefined ? { autoTabTitle: meta.autoTabTitle } : {}),
         ...(meta.backend !== undefined ? { backend: meta.backend } : {}),
         ...(meta.claudeSessionId !== undefined ? { claudeSessionId: meta.claudeSessionId } : {}),
         createdAt: meta.createdAt,
@@ -160,6 +167,10 @@ function decodeMeta(raw: unknown): SessionMeta | null {
     typeof obj["herdrPaneId"] === "string" && HERDR_PANE_ID_PATTERN.test(obj["herdrPaneId"])
       ? obj["herdrPaneId"]
       : undefined;
+  const autoTabTitle =
+    typeof obj["autoTabTitle"] === "string" && obj["autoTabTitle"].length > 0
+      ? obj["autoTabTitle"]
+      : undefined;
   return {
     name: obj["name"],
     cwd: obj["cwd"],
@@ -170,6 +181,7 @@ function decodeMeta(raw: unknown): SessionMeta | null {
     ...(tmuxPaneId !== undefined ? { tmuxPaneId } : {}),
     ...(backend !== undefined ? { backend } : {}),
     ...(herdrPaneId !== undefined ? { herdrPaneId } : {}),
+    ...(autoTabTitle !== undefined ? { autoTabTitle } : {}),
   };
 }
 

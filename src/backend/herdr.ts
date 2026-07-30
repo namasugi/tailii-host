@@ -344,9 +344,11 @@ export class HerdrSessionManager {
           ? panes.find((candidate) => candidate.paneId === meta.herdrPaneId)
           : undefined) ?? panes.find((candidate) => candidate.label === meta.name);
       const tabLabel = pane?.tabId != null ? tabLabels.get(pane.tabId) : undefined;
+      // 自動適用ラベル（hub tick が書いた値 = meta.autoTabTitle）と既定連番は人為リネーム
+      // ではないため displayTitle に載せない（iOS が override として誤取り込みしないため）。
       const displayTitle =
         alive && tabLabel !== undefined && tabLabel !== meta.name && tabLabel.length > 0 &&
-        !isDefaultHerdrTabLabel(tabLabel)
+        !isDefaultHerdrTabLabel(tabLabel) && tabLabel !== meta.autoTabTitle
           ? tabLabel
           : undefined;
       infos.push({

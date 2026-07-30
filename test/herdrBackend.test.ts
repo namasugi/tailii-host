@@ -183,11 +183,16 @@ describe("HerdrSessionManager", () => {
     ]);
   });
 
-  test("list はタブラベルがセッション名/既定連番と異なるときだけ displayTitle を載せる（逆方向同期）", async () => {
+  test("list はタブラベルがセッション名/既定連番/自動適用値と異なるときだけ displayTitle を載せる（逆方向同期）", async () => {
     const store = makeStore();
     store.put({ name: "s-titled", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
     store.put({ name: "s-plain", cwd: "/b", createdAt: 2, backend: "herdr", herdrPaneId: "w4:p3" });
     store.put({ name: "s-default", cwd: "/c", createdAt: 3, backend: "herdr", herdrPaneId: "w4:p4" });
+    // hub tick が自動適用したタイトル（meta.autoTabTitle と一致）は人為リネームではない。
+    store.put({
+      name: "s-auto", cwd: "/e", createdAt: 5, backend: "herdr", herdrPaneId: "w4:p5",
+      autoTabTitle: "自動タイトル",
+    });
     store.put({ name: "s-dead", cwd: "/d", createdAt: 4, backend: "herdr", herdrPaneId: "w4:p9" });
     const runner = new MockHerdrRunner((args) => {
       if (args[0] === "pane" && args[1] === "list") {
@@ -195,6 +200,7 @@ describe("HerdrSessionManager", () => {
           { pane_id: "w4:p2", label: "s-titled", tab_id: "w4:t2" },
           { pane_id: "w4:p3", label: "s-plain", tab_id: "w4:t3" },
           { pane_id: "w4:p4", label: "s-default", tab_id: "w4:t4" },
+          { pane_id: "w4:p5", label: "s-auto", tab_id: "w4:t5" },
         ]));
       }
       if (args[0] === "tab" && args[1] === "list") {
@@ -203,6 +209,7 @@ describe("HerdrSessionManager", () => {
           { tab_id: "w4:t3", label: "s-plain" },
           // 0.7.5 tab create の既定連番ラベル → 人為リネームではないので載せない。
           { tab_id: "w4:t4", label: "7" },
+          { tab_id: "w4:t5", label: "自動タイトル" },
         ]));
       }
       return herdrOk("");
@@ -212,6 +219,7 @@ describe("HerdrSessionManager", () => {
     expect(infos.find((info) => info.name === "s-titled")?.displayTitle).toBe("認証バグの調査");
     expect(infos.find((info) => info.name === "s-plain")?.displayTitle).toBeUndefined();
     expect(infos.find((info) => info.name === "s-default")?.displayTitle).toBeUndefined();
+    expect(infos.find((info) => info.name === "s-auto")?.displayTitle).toBeUndefined();
     expect(infos.find((info) => info.name === "s-dead")?.displayTitle).toBeUndefined();
   });
 

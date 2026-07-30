@@ -272,14 +272,29 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
           if (meta.claudeSessionId === undefined) continue;
           const info = tabInfo.get(name);
           if (info === undefined) continue;
+          // 「ラベル==前回の自動適用値」も未命名扱い = ai-title の更新へ追随して再リネーム
+          // する（追随しないと旧 ai-title がタブに固定され、iOS の逆方向取り込みが人為
+          // リネームと誤認して override 化する）。
           const unnamed =
             info.label === null || info.label === "" || info.label === name ||
-            isDefaultHerdrTabLabel(info.label);
-          if (!unnamed) continue; // 命名済みは触らない
+            isDefaultHerdrTabLabel(info.label) || info.label === meta.autoTabTitle;
+          if (!unnamed) continue; // 命名済み（人為リネーム）は触らない
           const title = deriveTitle(meta.claudeSessionId);
           if (title === null || title.length === 0) continue;
+          if (info.label === title) {
+            // ラベルは最新。自動適用の記録だけ追いつかせる（旧版からの移行時）。
+            if (meta.autoTabTitle !== title) {
+              try {
+                metadataStore.put({ ...meta, autoTabTitle: title });
+              } catch (error) {
+                log(`session-title 記録失敗(継続): ${name}: ${String(error)}`);
+              }
+            }
+            continue;
+          }
           try {
             await herdrOps.setDisplayTitle(name, title);
+            metadataStore.put({ ...meta, autoTabTitle: title });
             log(`session-title 自動反映: ${name} → ${title.slice(0, 30)}`);
           } catch (error) {
             log(`session-title 反映失敗(継続): ${name}: ${String(error)}`);
