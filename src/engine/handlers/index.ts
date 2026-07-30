@@ -4,6 +4,7 @@
 // （重複キーは後勝ちになるため、追加時は既存ドメインとの重複に注意）。
 
 import type { HandlerRegistry } from "../context.js";
+import { createAccountUsageHandlers } from "./accountUsage.js";
 import { claudeModelHandlers } from "./claudeModels.js";
 import { codexHandlers } from "./codex.js";
 import { conversationHandlers } from "./conversation.js";
@@ -25,6 +26,8 @@ export const ENGINE_HANDLERS: HandlerRegistry = {
   ...officialAppHandlers,
   ...modeHandlers,
   ...usageHandlers,
+  // TTL メモを閉包に持つため、registry 合成時に 1 インスタンスだけ作る（プロセス内で共有）。
+  ...createAccountUsageHandlers(),
   ...workspaceHandlers,
   ...gitHandlers,
   ...previewHandlers,

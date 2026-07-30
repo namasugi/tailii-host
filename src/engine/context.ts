@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ChatAgent } from "../chat/chatTailController.js";
+import type { CodexAccountUsageProvider } from "../codex/codexAccountUsage.js";
 import type { CodexAppServerManager } from "../codex/codexAppServer.js";
 import type { CodexTurnControllerRuntime } from "../codex/codexNativeTurnController.js";
 import type { ClaudeSessionStore } from "../sessions/claudeSessionStore.js";
@@ -16,7 +17,9 @@ import { bumpHeartbeat } from "../sessions/heartbeat.js";
 import type { ImageService } from "../chat/imageService.js";
 import type { EngineLauncher } from "../commands/launch.js";
 import type { LineWriter } from "../shared/lineWriter.js";
+import type { AccountIdentityProvider } from "../services/accountIdentity.js";
 import type { ClaudeModelListProvider } from "../services/claudeModelCatalog.js";
+import type { HostVersionsProvider } from "../services/hostVersions.js";
 import type { PlanUsageProvider } from "../services/planUsageFetcher.js";
 import type { PreviewServer } from "../services/previewServer.js";
 import {
@@ -94,6 +97,21 @@ export interface HandlerContext {
   planUsage: PlanUsageProvider;
   /** Claude モデル一覧の取得（Models API, ベストエフォート。テストは固定値/null を注入）。 */
   claudeModelList: ClaudeModelListProvider;
+  /**
+   * Codex アカウント使用量の取得（App Server `account/rateLimits/read`, ベストエフォート,
+   * account-usage）。テストは固定値/null を注入する。
+   */
+  codexAccountUsage: CodexAccountUsageProvider;
+  /**
+   * ホスト環境のバージョン情報（tailii host / claude / codex, account-usage）。
+   * プロセス内キャッシュは provider 側が持つ。テストは固定値/null を注入する。
+   */
+  hostVersions: HostVersionsProvider;
+  /**
+   * ログイン中アカウントのマスク済み表示（account-usage）。
+   * 生 email は provider の内側で捨てる（ここへ来るのは既にマスク済みの文字列だけ）。
+   */
+  accountIdentity: AccountIdentityProvider;
   homeDir: string;
   modeTiming: ModeTiming;
   /** host 側の既定エージェント（session_start が agentType を指定しないときのフォールバック）。 */

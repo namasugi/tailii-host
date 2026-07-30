@@ -266,6 +266,64 @@ export interface OfficialAppActionResult {
   unavailableReason?: string;
 }
 
+/**
+ * アカウント全体の使用量（`account_usage_response`）の Claude 側（account-usage）。
+ *
+ * 全フィールド optional（取得できた枠だけ載せ、欠落は「その枠は不明」を意味する）。
+ * `premium*` は上位モデルの週次枠（`PlanUsage.sevenDayFable*` 相当）。percent は 0..100 の丸め済み、
+ * `*ResetsAt` は ISO 8601 文字列。
+ *
+ * `plan` / `rateLimitTier` は credentials JSON 由来の**生値**（表示整形は iOS 側の責務）。
+ */
+export interface ClaudeAccountUsage {
+  fiveHourPercent?: number;
+  fiveHourResetsAt?: string;
+  sevenDayPercent?: number;
+  sevenDayResetsAt?: string;
+  premiumPercent?: number;
+  premiumResetsAt?: string;
+  /** 契約種別の生値（"max" / "pro" 等。credentials の `subscriptionType`）。 */
+  plan?: string;
+  /** レート制限ティアの生値（"default_claude_max_20x" 等）。`plan` の細分（Max 20x/5x）に使う。 */
+  rateLimitTier?: string;
+  /**
+   * ログイン中アカウントの**マスク済み**表示（"a***@example.com"）。
+   * 生 email は host 内で捨て、ワイヤーへはマスク済み文字列しか載せない。
+   */
+  account?: string;
+}
+
+/**
+ * アカウント全体の使用量（`account_usage_response`）の Codex 側（account-usage）。
+ *
+ * App Server `account/rateLimits/read` の `primary`（5時間枠）/`secondary`（週次枠）に対応する。
+ * `planType` はプラン識別子（"plus" 等の生値。表示整形は iOS 側の責務）。
+ */
+export interface CodexAccountUsage {
+  planType?: string;
+  fiveHourPercent?: number;
+  fiveHourResetsAt?: string;
+  weeklyPercent?: number;
+  weeklyResetsAt?: string;
+  /** ログイン中アカウントの**マスク済み**表示（`ClaudeAccountUsage.account` と同じ規約）。 */
+  account?: string;
+}
+
+/**
+ * ホスト環境のバージョン情報（`account_usage_response.host`, account-usage）。
+ *
+ * 全フィールド optional — 取得できたものだけ載せる（取れなかった行は iOS でも出さない）。
+ * 値はバージョン文字列そのもの（"2.1.220" 等。飾りは host 側で落とし済み）。
+ */
+export interface HostVersions {
+  /** tailii host（package.json version）。 */
+  hostVersion?: string;
+  /** `claude --version` 由来。 */
+  claudeCliVersion?: string;
+  /** `codex --version` 由来。 */
+  codexCliVersion?: string;
+}
+
 export type ControlMessage =
   | { type: "channel_hello"; v: number; maxVersion: number; serverVersion?: string }
   | { type: "approval_request"; v: number; id: string; tool: string; summary: string; cwd: string; diff?: ToolDiff }
@@ -335,6 +393,23 @@ export type ControlMessage =
       fiveHourUtilization?: number; fiveHourResetsAt?: string;
       sevenDayUtilization?: number; sevenDayResetsAt?: string;
       sevenDayFableUtilization?: number; sevenDayFableResetsAt?: string;
+    }
+  /** アカウント使用量の要求（iOS→Mac, account-usage）。session 非依存 — 一覧からも呼べる。 */
+  | { type: "account_usage_request"; v: number; id: string }
+  /**
+   * アカウント使用量の応答（Mac→iOS, account-usage）。
+   *
+   * agent ごとに独立: 取得できた側だけ `claude`/`codex` を載せ、失敗した側は
+   * オブジェクトを省略して `claudeError`/`codexError` に理由文を入れる（片側失敗でも
+   * もう片側は表示できる）。`fetchedAt` は載せた値のうち最も古い取得時刻（ISO 8601）。
+   * `host` は agent と独立したホスト環境のバージョン情報（取れなければ省略）。
+   */
+  | {
+      type: "account_usage_response"; v: number; id: string;
+      claude?: ClaudeAccountUsage; codex?: CodexAccountUsage;
+      claudeError?: string; codexError?: string;
+      host?: HostVersions;
+      fetchedAt?: string;
     }
   | { type: "mode_get"; v: number; id: string; session: string }
   | { type: "mode_set"; v: number; id: string; session: string; mode: string }

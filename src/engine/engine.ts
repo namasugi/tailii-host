@@ -26,6 +26,10 @@ import {
   CONTEXT_WINDOW_STREAM_ID as CODEX_CONTEXT_WINDOW_STREAM_ID,
   MODEL_STREAM_ID as CODEX_MODEL_STREAM_ID,
 } from "../codex/codexRolloutTailer.js";
+import {
+  fetchCodexAccountUsage,
+  type CodexAccountUsageProvider,
+} from "../codex/codexAccountUsage.js";
 import { CodexAppServerManager } from "../codex/codexAppServer.js";
 import {
   CodexNativeTurnController,
@@ -42,6 +46,11 @@ import type { QuestionEventMessage, SessionProcessingMessage } from "../hub/engi
 import { makeSessionLauncher, type EngineLauncher } from "../commands/launch.js";
 import { LineWriter } from "../shared/lineWriter.js";
 import { fetchClaudeModelList, type ClaudeModelListProvider } from "../services/claudeModelCatalog.js";
+import {
+  fetchAccountIdentities,
+  type AccountIdentityProvider,
+} from "../services/accountIdentity.js";
+import { fetchHostVersions, type HostVersionsProvider } from "../services/hostVersions.js";
 import { fetchPlanUsage, type PlanUsageProvider } from "../services/planUsageFetcher.js";
 import { PreviewServer } from "../services/previewServer.js";
 import {
@@ -293,6 +302,21 @@ export interface RunEngineOptions {
   planUsage?: PlanUsageProvider;
   /** Claude モデル一覧の取得（既定は実 Models API。テストは固定値/null を注入する）。 */
   claudeModelList?: ClaudeModelListProvider;
+  /**
+   * Codex アカウント使用量の取得（既定は `codexAppServer` 経由の実 App Server 呼び出し。
+   * テストは固定値/null を注入する, account-usage）。
+   */
+  codexAccountUsage?: CodexAccountUsageProvider;
+  /**
+   * ホスト環境のバージョン情報（既定は package.json + `claude/codex --version`。
+   * プロセス内キャッシュ付き。テストは固定値/null を注入する, account-usage）。
+   */
+  hostVersions?: HostVersionsProvider;
+  /**
+   * ログイン中アカウントのマスク済み表示（既定は `claude auth status` + `~/.codex/auth.json`。
+   * プロセス内キャッシュ付き。テストは固定値を注入する, account-usage）。
+   */
+  accountIdentity?: AccountIdentityProvider;
   /** slash_list のユーザーレベル探索ルート（既定は os.homedir()）。 */
   homeDir?: string;
   /** mode_get/mode_set の待機間隔（テストは短縮値を注入する）。 */
@@ -337,6 +361,9 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     maxVersion = PROTOCOL_MAX_SUPPORTED,
     planUsage = () => fetchPlanUsage(),
     claudeModelList = () => fetchClaudeModelList(),
+    codexAccountUsage: injectedCodexAccountUsage = undefined,
+    hostVersions = fetchHostVersions,
+    accountIdentity = fetchAccountIdentities,
     homeDir = os.homedir(),
     modeTiming = {},
     staleDistGuard = createStaleDistGuard(),
@@ -345,6 +372,10 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     codexHubRpcTimeoutMs = 15_000,
     heartbeatDir = defaultHeartbeatDir(),
   } = options;
+  // 既定の Codex 使用量フェッチャは共有 App Server 経由（未接続・停止中は null を返す）。
+  // 分割代入の中では codexAppServer をまだ参照できないため、確定後にここで束ねる。
+  const codexAccountUsage: CodexAccountUsageProvider =
+    injectedCodexAccountUsage ?? (() => fetchCodexAccountUsage(codexAppServer));
   const resolvedModeTiming: ModeTiming = { ...DEFAULT_MODE_TIMING, ...modeTiming };
   const resolvedHeartbeatDir = heartbeatDir ?? defaultHeartbeatDir();
   const hubLink = injectedHubLink ?? connectHubSocket();
@@ -836,6 +867,9 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           codexSessionStore,
           planUsage,
           claudeModelList,
+          codexAccountUsage,
+          hostVersions,
+          accountIdentity,
           homeDir,
           modeTiming: resolvedModeTiming,
           defaultAgent: agent,

@@ -241,6 +241,9 @@ describe("PlanUsageFetcher", () => {
       sevenDayResetsAt: "2026-07-09T00:00:00Z",
       sevenDayFableUtilization: null,
       sevenDayFableResetsAt: null,
+      // プラン情報は使用量 API 応答には無い（credentials 由来で後付けされる）。
+      subscriptionType: null,
+      rateLimitTier: null,
     });
   });
 
@@ -283,6 +286,24 @@ describe("PlanUsageFetcher", () => {
     expect(cred).toEqual({ token: "tok-1", expiresAtMs: 123456 });
     expect(extractCredential('{"claudeAiOauth":{"accessToken":""}}')).toBeNull();
     expect(extractCredential("not json")).toBeNull();
+  });
+
+  test("extractCredential は subscriptionType / rateLimitTier も拾う（無ければ省略）", () => {
+    expect(
+      extractCredential(
+        '{"claudeAiOauth":{"accessToken":"tok-1","expiresAt":1,' +
+          '"subscriptionType":"max","rateLimitTier":"default_claude_max_20x"}}',
+      ),
+    ).toEqual({
+      token: "tok-1",
+      expiresAtMs: 1,
+      subscriptionType: "max",
+      rateLimitTier: "default_claude_max_20x",
+    });
+    // 空文字は「無い」と同じ扱い（キーごと省略する）。
+    expect(
+      extractCredential('{"claudeAiOauth":{"accessToken":"tok-2","subscriptionType":""}}'),
+    ).toEqual({ token: "tok-2", expiresAtMs: null });
   });
 });
 

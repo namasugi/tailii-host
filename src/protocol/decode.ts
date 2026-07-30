@@ -5,6 +5,8 @@
 import {
   PROTOCOL_LEGACY,
   PROTOCOL_MAX_SUPPORTED,
+  type ClaudeAccountUsage,
+  type CodexAccountUsage,
   type ClaudeSessionInfo,
   type ClaudeModelInfo,
   type CodexModelInfo,
@@ -13,6 +15,7 @@ import {
   type GitBranchInfo,
   type GitCommitInfo,
   type GitStatusFile,
+  type HostVersions,
   type OfficialAppProvider,
   type QuestionAnswer,
   type RemotePendingKind,
@@ -387,6 +390,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
 
     case "image_fetch_request":
     case "usage_request":
+    case "account_usage_request":
     case "question_dismiss":
     case "claude_session_list_request":
       return { type, v, id: requireString(raw, "id") };
@@ -579,6 +583,18 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         sevenDayResetsAt: optionalString(raw, "sevenDayResetsAt"),
         sevenDayFableUtilization: optionalNumber(raw, "sevenDayFableUtilization"),
         sevenDayFableResetsAt: optionalString(raw, "sevenDayFableResetsAt"),
+      });
+
+    case "account_usage_response":
+      return compact({
+        type, v,
+        id: requireString(raw, "id"),
+        claude: decodeClaudeAccountUsage(raw["claude"]),
+        codex: decodeCodexAccountUsage(raw["codex"]),
+        claudeError: optionalString(raw, "claudeError"),
+        codexError: optionalString(raw, "codexError"),
+        host: decodeHostVersions(raw["host"]),
+        fetchedAt: optionalString(raw, "fetchedAt"),
       });
 
     case "mode_get":
@@ -948,6 +964,48 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
     default:
       throw new ProtocolDecodeError("unknown-type", type);
   }
+}
+
+/** `account_usage_response.claude` を読む（欠落は undefined = 「Claude 側は載っていない」）。 */
+function decodeClaudeAccountUsage(value: unknown): ClaudeAccountUsage | undefined {
+  if (value === undefined || value === null) return undefined;
+  const obj = requireObject(value, "claude");
+  return compact<ClaudeAccountUsage>({
+    fiveHourPercent: optionalNumber(obj, "fiveHourPercent"),
+    fiveHourResetsAt: optionalString(obj, "fiveHourResetsAt"),
+    sevenDayPercent: optionalNumber(obj, "sevenDayPercent"),
+    sevenDayResetsAt: optionalString(obj, "sevenDayResetsAt"),
+    premiumPercent: optionalNumber(obj, "premiumPercent"),
+    premiumResetsAt: optionalString(obj, "premiumResetsAt"),
+    plan: optionalString(obj, "plan"),
+    rateLimitTier: optionalString(obj, "rateLimitTier"),
+    account: optionalString(obj, "account"),
+  });
+}
+
+/** `account_usage_response.host` を読む（欠落は undefined = 「ホスト情報は載っていない」）。 */
+function decodeHostVersions(value: unknown): HostVersions | undefined {
+  if (value === undefined || value === null) return undefined;
+  const obj = requireObject(value, "host");
+  return compact<HostVersions>({
+    hostVersion: optionalString(obj, "hostVersion"),
+    claudeCliVersion: optionalString(obj, "claudeCliVersion"),
+    codexCliVersion: optionalString(obj, "codexCliVersion"),
+  });
+}
+
+/** `account_usage_response.codex` を読む（欠落は undefined = 「Codex 側は載っていない」）。 */
+function decodeCodexAccountUsage(value: unknown): CodexAccountUsage | undefined {
+  if (value === undefined || value === null) return undefined;
+  const obj = requireObject(value, "codex");
+  return compact<CodexAccountUsage>({
+    planType: optionalString(obj, "planType"),
+    fiveHourPercent: optionalNumber(obj, "fiveHourPercent"),
+    fiveHourResetsAt: optionalString(obj, "fiveHourResetsAt"),
+    weeklyPercent: optionalNumber(obj, "weeklyPercent"),
+    weeklyResetsAt: optionalString(obj, "weeklyResetsAt"),
+    account: optionalString(obj, "account"),
+  });
 }
 
 function requireBackendKind(raw: Raw): TerminalBackendKind {

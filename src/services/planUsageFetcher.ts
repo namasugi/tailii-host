@@ -10,7 +10,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-/** プラン使用状況（5時間枠/7日枠/上位モデル週間枠の使用率とリセット時刻）。 */
+/**
+ * プラン使用状況（5時間枠/7日枠/上位モデル週間枠の使用率とリセット時刻）。
+ *
+ * `subscriptionType` / `rateLimitTier` は使用量 API 応答ではなく **credentials JSON 由来**
+ * （`claudeAiOauth.subscriptionType` / `.rateLimitTier`）。実際に使用量取得へ成功した
+ * トークン候補のものを載せる（プランバッジ表示用の生値。整形は iOS 側の責務）。
+ */
 export interface PlanUsage {
   fiveHourUtilization: number | null;
   fiveHourResetsAt: string | null;
@@ -18,25 +24,50 @@ export interface PlanUsage {
   sevenDayResetsAt: string | null;
   sevenDayFableUtilization: number | null;
   sevenDayFableResetsAt: string | null;
+  /** 契約種別の生値（"max" / "pro" 等）。credentials に無ければ null。 */
+  subscriptionType: string | null;
+  /** レート制限ティアの生値（"default_claude_max_20x" 等）。credentials に無ければ null。 */
+  rateLimitTier: string | null;
 }
 
 /** 使用量 API のエンドポイント（Claude Code 本体・statusline ツールと同じ）。 */
 export const PLAN_USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage";
 
-/** トークン候補（値と有効期限 ms epoch）。 */
+/**
+ * トークン候補（値と有効期限 ms epoch、および同じ credentials に載っていたプラン情報）。
+ *
+ * 秘密の扱い: `token` は本プロセス内でのみ使う。ログ・ワイヤーへは決して載せない
+ * （ワイヤーへ出るのは `subscriptionType` / `rateLimitTier` だけ）。
+ */
 export interface Credential {
   token: string;
   expiresAtMs: number | null;
+  /** credentials JSON の `subscriptionType`（無ければ省略）。 */
+  subscriptionType?: string;
+  /** credentials JSON の `rateLimitTier`（無ければ省略）。 */
+  rateLimitTier?: string;
 }
 
 /** engine へ注入するフェッチャの型（テストは () => null を注入する）。 */
 export type PlanUsageProvider = () => Promise<PlanUsage | null>;
 
-/** プラン使用状況を取得する（ベストエフォート・timeout 付き）。 */
+/**
+ * プラン使用状況を取得する（ベストエフォート・timeout 付き）。
+ *
+ * プラン情報（subscriptionType / rateLimitTier）は使用量 API ではなく、
+ * **実際に取得へ成功した候補の credentials JSON** から採る（どのアカウントの使用量かと
+ * バッジ表示が一致する）。
+ */
 export async function fetchPlanUsage(timeoutSeconds = 5): Promise<PlanUsage | null> {
-  for (const token of await loadAccessTokenCandidates()) {
-    const usage = await fetchOnce(token, timeoutSeconds);
-    if (usage !== null) return usage;
+  for (const credential of await loadCredentialCandidates()) {
+    const usage = await fetchOnce(credential.token, timeoutSeconds);
+    if (usage !== null) {
+      return {
+        ...usage,
+        subscriptionType: credential.subscriptionType ?? null,
+        rateLimitTier: credential.rateLimitTier ?? null,
+      };
+    }
   }
   return null;
 }
@@ -109,6 +140,9 @@ export function parsePlanUsage(raw: unknown): PlanUsage | null {
     sevenDayResetsAt: seven[1],
     sevenDayFableUtilization: fable[0],
     sevenDayFableResetsAt: fable[1],
+    // プラン情報は使用量 API 応答には無い（credentials 由来。fetchPlanUsage が後付けする）。
+    subscriptionType: null,
+    rateLimitTier: null,
   };
 }
 
@@ -117,31 +151,44 @@ function roundedPercent(raw: unknown): number | null {
 }
 
 /**
- * Claude Code が保存した OAuth アクセストークンの候補を試行順に返す。
- * Keychain → file の順に集め、期限内のものを先に試す（全滅時は期限切れも最後に試す）。
+ * Claude Code が保存した OAuth 認証情報の候補を試行順に返す（Keychain → file）。
+ * プラン情報も一緒に運ぶので、成功した候補の subscriptionType / rateLimitTier を採れる。
  */
-export async function loadAccessTokenCandidates(now: Date = new Date()): Promise<string[]> {
+export async function loadCredentialCandidates(now: Date = new Date()): Promise<Credential[]> {
   const candidates: Credential[] = [];
   const keychain = await credentialFromKeychain();
   if (keychain) candidates.push(keychain);
   const file = credentialFromFile();
   if (file) candidates.push(file);
-  return orderCandidates(candidates, now.getTime());
+  return orderCredentials(candidates, now.getTime());
+}
+
+/**
+ * Claude Code が保存した OAuth アクセストークンの候補を試行順に返す。
+ * Keychain → file の順に集め、期限内のものを先に試す（全滅時は期限切れも最後に試す）。
+ */
+export async function loadAccessTokenCandidates(now: Date = new Date()): Promise<string[]> {
+  return (await loadCredentialCandidates(now)).map((c) => c.token);
 }
 
 /** 候補の試行順を決める（純ロジック, TESTABLE）。期限内を元の順で先に、期限切れを後に、重複除去。 */
-export function orderCandidates(candidates: Credential[], nowMs: number): string[] {
+export function orderCredentials(candidates: Credential[], nowMs: number): Credential[] {
   const valid = candidates.filter((c) => (c.expiresAtMs ?? Number.POSITIVE_INFINITY) > nowMs);
   const expired = candidates.filter((c) => (c.expiresAtMs ?? Number.POSITIVE_INFINITY) <= nowMs);
   const seen = new Set<string>();
-  const result: string[] = [];
+  const result: Credential[] = [];
   for (const c of [...valid, ...expired]) {
     if (!seen.has(c.token)) {
       seen.add(c.token);
-      result.push(c.token);
+      result.push(c);
     }
   }
   return result;
+}
+
+/** `orderCredentials` のトークンだけの版（既存呼び出し互換）。 */
+export function orderCandidates(candidates: Credential[], nowMs: number): string[] {
+  return orderCredentials(candidates, nowMs).map((c) => c.token);
 }
 
 /** `~/.claude/.credentials.json` から候補を読む。 */
@@ -171,7 +218,11 @@ function credentialFromKeychain(): Promise<Credential | null> {
   });
 }
 
-/** 認証情報 JSON（`{"claudeAiOauth":{"accessToken":…,"expiresAt":<ms>}}`）から候補を取り出す。 */
+/**
+ * 認証情報 JSON（`{"claudeAiOauth":{"accessToken":…,"expiresAt":<ms>,…}}`）から候補を取り出す。
+ * Keychain 版・ファイル版どちらも同じ形なので、この 1 関数で両経路をまかなう。
+ * `subscriptionType` / `rateLimitTier` は在れば拾い、無ければ省略する。
+ */
 export function extractCredential(json: string): Credential | null {
   let raw: unknown;
   try {
@@ -186,8 +237,14 @@ export function extractCredential(json: string): Credential | null {
   const token = rec["accessToken"];
   if (typeof token !== "string" || token.length === 0) return null;
   const expiresAt = rec["expiresAt"];
+  const subscriptionType = rec["subscriptionType"];
+  const rateLimitTier = rec["rateLimitTier"];
   return {
     token,
     expiresAtMs: typeof expiresAt === "number" && Number.isFinite(expiresAt) ? expiresAt : null,
+    ...(typeof subscriptionType === "string" && subscriptionType.length > 0
+      ? { subscriptionType }
+      : {}),
+    ...(typeof rateLimitTier === "string" && rateLimitTier.length > 0 ? { rateLimitTier } : {}),
   };
 }
