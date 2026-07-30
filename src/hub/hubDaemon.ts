@@ -354,12 +354,13 @@ export async function runHubCommand(args: string[]): Promise<number> {
     pendingQuestionsPath: defaultPendingQuestionsPath(),
     chatReceiptsPath: defaultChatReceiptsPath(),
     log,
-    tailFactory: (write) => new ChatTailController({
+    tailFactory: (write, onCodexTurnLifecycle) => new ChatTailController({
       writer: controlMessageCallbackWriter(write),
       tailer: new TranscriptTailer({ tailIndefinitely: true, emitReplayDoneMarker: true }),
       projectsRoot: path.join(os.homedir(), ".claude", "projects"),
       imageService,
       protocolVersion: () => PROTOCOL_MAX_SUPPORTED,
+      onCodexTurnLifecycle,
     }),
     previewPumpFactory: (write, onPermissionMode, pollIntervalMs) => new PanePreviewPump({
       writer: controlMessageCallbackWriter(write),

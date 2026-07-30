@@ -17,7 +17,10 @@ import {
   readSubagentTranscript,
   type SubagentTranscriptResult,
 } from "./subagentTranscript.js";
-import { CodexRolloutTailer } from "../codex/codexRolloutTailer.js";
+import {
+  CodexRolloutTailer,
+  type CodexTurnLifecycleEvent,
+} from "../codex/codexRolloutTailer.js";
 import { canonicalPath, claudeProjectSlug } from "../shared/paths.js";
 
 /** tail 対象エージェント種別（claude=既定 / codex=Codex CLI）。 */
@@ -59,6 +62,7 @@ export class ChatTailController {
     protocolVersion?: () => number;
     agent?: ChatAgent;
     codexTailer?: CodexRolloutTailer;
+    onCodexTurnLifecycle?: (event: CodexTurnLifecycleEvent) => void;
   }) {
     this.writer = options.writer;
     this.tailer = options.tailer;
@@ -70,6 +74,9 @@ export class ChatTailController {
     this.openAgent = this.agent;
     this.codexTailer =
       options.codexTailer ?? new CodexRolloutTailer({ tailIndefinitely: true, emitReplayDoneMarker: true });
+    if (options.onCodexTurnLifecycle !== undefined) {
+      this.codexTailer.setTurnLifecycleObserver(options.onCodexTurnLifecycle);
+    }
   }
 
   /** 全文取得要求向けに、現在の subagent transcript パスを解決する。 */

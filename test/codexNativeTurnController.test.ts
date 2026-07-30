@@ -240,6 +240,29 @@ describe("CodexNativeTurnController", () => {
     expect(thread.interrupts).toEqual(["turn-1"]);
   });
 
+  test("rollout task_completeは現在のturnIdと一致する場合だけ処理完了へ補完する", async () => {
+    const thread = new FakeThread();
+    const processing: string[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => thread },
+      onProcessing: (session, state) => processing.push(`${session}:${state}`),
+    });
+    await controller.startTurn({
+      session: "work", threadId: "thread-1", cwd: "/tmp/work", text: "run",
+    });
+
+    expect(controller.reconcileCompletedTurn("work", "turn-old")).toBe(false);
+    await controller.interruptTurn("work");
+    expect(thread.interrupts).toEqual(["turn-1"]);
+    expect(processing).toEqual(["work:active"]);
+
+    expect(controller.reconcileCompletedTurn("work", "turn-1")).toBe(true);
+    await controller.interruptTurn("work");
+    expect(thread.interrupts).toEqual(["turn-1"]);
+    expect(processing).toEqual(["work:active", "work:done"]);
+    expect(controller.reconcileCompletedTurn("work", "turn-1")).toBe(false);
+  });
+
   test("別 client の turn/started 通知から turnId を追跡して中断する", async () => {
     const thread = new FakeThread();
     let openOptions: CodexAppServerThreadOptions | null = null;

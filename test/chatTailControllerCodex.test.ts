@@ -44,7 +44,16 @@ function writeRollout(root: string, cwd: string, sessionId = "x", suffix = ""): 
     type: "event_msg",
     payload: { type: "agent_message", message: "完了しました", phase: "final_answer" },
   });
-  fs.writeFileSync(path.join(dir, `rollout${suffix}.jsonl`), [meta, user, agent].join("\n") + "\n");
+  const started = JSON.stringify({
+    type: "event_msg", payload: { type: "task_started", turn_id: `turn-${sessionId}` },
+  });
+  const completed = JSON.stringify({
+    type: "event_msg", payload: { type: "task_complete", turn_id: `turn-${sessionId}` },
+  });
+  fs.writeFileSync(
+    path.join(dir, `rollout${suffix}.jsonl`),
+    [meta, started, user, agent, completed].join("\n") + "\n",
+  );
 }
 
 describe("ChatTailController — codex モード", () => {
@@ -59,6 +68,7 @@ describe("ChatTailController — codex モード", () => {
       tailDeadlineMs: 0, // 有限 tail（EOF で終了）
       emitReplayDoneMarker: true,
     });
+    const lifecycle: Array<{ state: "active" | "done"; turnId: string }> = [];
     const controller = new ChatTailController({
       writer,
       // claude 用 tailer は codex モードでは使われないため既定でよい。
@@ -66,6 +76,7 @@ describe("ChatTailController — codex モード", () => {
       projectsRoot: makeTempDir("cc-codex-projects"),
       agent: "codex",
       codexTailer,
+      onCodexTurnLifecycle: (event) => lifecycle.push(event),
     });
 
     controller.open(cwd, null);
@@ -80,6 +91,7 @@ describe("ChatTailController — codex モード", () => {
       ["assistant", "完了しました"],
       ["system", ""], // pc:history-done
     ]);
+    expect(lifecycle).toEqual([{ state: "done", turnId: "turn-x" }]);
     // codex モードでは usage 集計対象パスは返さない。
     expect(controller.currentTranscriptPath()).toBeNull();
   });

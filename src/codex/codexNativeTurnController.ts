@@ -72,6 +72,11 @@ export interface CodexTurnControllerRuntime {
     approvalPolicy?: CodexAppServerApprovalPolicy | null;
   }): Promise<string>;
   interruptTurn?(session: string): Promise<void>;
+  /**
+   * rollout の task_complete を、現在追跡中の同一 turn に限って完了へ反映する。
+   * App Server の turn/completed 通知欠落を補う副経路。
+   */
+  reconcileCompletedTurn?(session: string, turnId: string): boolean;
   closeSession(session: string): void;
   close(): void;
   answerQuestion?(id: string, answers: QuestionAnswer[]): boolean;
@@ -218,6 +223,15 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     const opened = this.open.get(session);
     if (opened === undefined || opened.activeTurnId === null) return;
     await opened.thread.interruptTurn(opened.activeTurnId);
+  }
+
+  reconcileCompletedTurn(session: string, turnId: string): boolean {
+    const opened = this.open.get(session);
+    if (opened === undefined || opened.activeTurnId !== turnId) return false;
+    opened.activeTurnId = null;
+    this.onProcessing(session, "done");
+    this.resolvePendingQuestionsForSession(session);
+    return true;
   }
 
   closeSession(session: string): void {

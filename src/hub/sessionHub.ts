@@ -36,6 +36,7 @@ import {
   CONTEXT_STREAM_ID as CODEX_CONTEXT_STREAM_ID,
   CONTEXT_WINDOW_STREAM_ID as CODEX_CONTEXT_WINDOW_STREAM_ID,
   MODEL_STREAM_ID as CODEX_MODEL_STREAM_ID,
+  type CodexTurnLifecycleEvent,
 } from "../codex/codexRolloutTailer.js";
 import type { SessionMeta } from "../sessions/sessionMetadataStore.js";
 
@@ -53,7 +54,10 @@ export interface HubPreviewPump {
   stop(): void;
 }
 
-export type HubTailFactory = (write: (payload: ControlMessage) => void) => HubTail;
+export type HubTailFactory = (
+  write: (payload: ControlMessage) => void,
+  onCodexTurnLifecycle?: (event: CodexTurnLifecycleEvent) => void,
+) => HubTail;
 export type HubPreviewPumpFactory = (
   write: (payload: ControlMessage) => void,
   onPermissionMode?: (mode: string) => void,
@@ -914,7 +918,7 @@ export class SessionHub {
           return;
         }
         state.phase = "backfill";
-        this.openCodexRollout(session, actor, cwd, threadId, newerThanMs, true);
+        this.openCodexRollout(session, actor, cwd, threadId, newerThanMs);
       },
       (error) => {
         if (actor.codexLive !== state || actor.subscribers.size === 0) return;
@@ -930,59 +934,67 @@ export class SessionHub {
     cwd: string,
     threadId: string | null,
     newerThanMs: number | null,
-    stopAtHistoryDone: boolean,
   ): void {
     if (this.options.tailFactory === undefined) return;
     const state = actor.codexLive;
     if (state === null) return;
     let tail: HubTail | null = null;
-    tail = this.options.tailFactory((payload) => {
-      if (actor.codexLive !== state) return;
-      const isHistoryDone = payload.type === "chat_output" && payload.streamId === HISTORY_DONE_STREAM_ID;
-      const contentKey = chatContentKey(payload);
+    tail = this.options.tailFactory(
+      (payload) => {
+        if (actor.codexLive !== state) return;
+        const isHistoryDone = payload.type === "chat_output" && payload.streamId === HISTORY_DONE_STREAM_ID;
+        const contentKey = chatContentKey(payload);
 
-      if (state.phase === "live") return; // 正常時の live 本文は App Server のみ。
+        if (state.phase === "live") return; // 正常時の live 本文は App Server のみ。
 
-      if (state.phase === "fallback-scan") {
-        if (isHistoryDone) {
-          state.phase = "fallback-live";
-          return; // 通常 backfill の pc:history-done を再送しない。
+        if (state.phase === "fallback-scan") {
+          if (isHistoryDone) {
+            state.phase = "fallback-live";
+            return; // 通常 backfill の pc:history-done を再送しない。
+          }
+          if (contentKey === null) return; // fallback の model/token marker は controller 系統と混ぜない。
+          const occurrence = (state.scanContentCounts.get(contentKey) ?? 0) + 1;
+          state.scanContentCounts.set(contentKey, occurrence);
+          if (occurrence <= (state.fallbackBaselineCounts.get(contentKey) ?? 0)) return;
+          this.publishCodexContent(session, actor, state, payload);
+          return;
         }
-        if (contentKey === null) return; // fallback の model/token marker は controller 系統と混ぜない。
-        const occurrence = (state.scanContentCounts.get(contentKey) ?? 0) + 1;
-        state.scanContentCounts.set(contentKey, occurrence);
-        if (occurrence <= (state.fallbackBaselineCounts.get(contentKey) ?? 0)) return;
-        this.publishCodexContent(session, actor, state, payload);
-        return;
-      }
 
-      if (state.phase === "fallback-live") {
-        if (contentKey !== null) this.publishCodexContent(session, actor, state, payload);
-        return;
-      }
-
-      // App Server 購読を先に確立して通知を buffer し、その後 rollout を EOF まで読む。
-      // resume 応答の item ID / content occurrence を境界スナップショットとして使い、
-      // EOF 後は rollout にまだ無い buffered item だけを flush する。event_msg 自体には
-      // item ID が無いため、同文は Set ではなく occurrence count で照合する。
-      this.publishConversationEvent(session, actor, payload);
-      if (contentKey !== null) incrementCount(state.publishedContentCounts, contentKey);
-      if (!isHistoryDone) return;
-      if (state.disconnected) {
-        // fallback 確定前に届いた App Server item は、この継続 rollout と同じ内容を
-        // 別 streamId で持ち得る。rollout を唯一の一次ソースにした時点で破棄し、
-        // history 完了時に flush して会話全体を二重表示しない。
-        state.buffered.length = 0;
-        state.phase = "fallback-live"; // この tail は既に同じ EOF 境界にいるので継続利用する。
-      } else {
-        this.flushCodexBuffer(session, actor, state);
-        state.phase = "live";
-        if (stopAtHistoryDone) {
-          tail?.stop();
-          if (actor.tail === tail) actor.tail = null;
+        if (state.phase === "fallback-live") {
+          if (contentKey !== null) this.publishCodexContent(session, actor, state, payload);
+          return;
         }
-      }
-    });
+
+        // App Server 購読を先に確立して通知を buffer し、その後 rollout を EOF まで読む。
+        // resume 応答の item ID / content occurrence を境界スナップショットとして使い、
+        // EOF 後は rollout にまだ無い buffered item だけを flush する。event_msg 自体には
+        // item ID が無いため、同文は Set ではなく occurrence count で照合する。
+        this.publishConversationEvent(session, actor, payload);
+        if (contentKey !== null) incrementCount(state.publishedContentCounts, contentKey);
+        if (!isHistoryDone) return;
+        if (state.disconnected) {
+          // fallback 確定前に届いた App Server item は、この継続 rollout と同じ内容を
+          // 別 streamId で持ち得る。rollout を唯一の一次ソースにした時点で破棄し、
+          // history 完了時に flush して会話全体を二重表示しない。
+          state.buffered.length = 0;
+          state.phase = "fallback-live"; // この tail は既に同じ EOF 境界にいるので継続利用する。
+        } else {
+          this.flushCodexBuffer(session, actor, state);
+          state.phase = "live";
+          // 本文は以後 App Server のみを採用するが、rollout tail 自体は lifecycle の
+          // 副監視として残す。ここで止めると、後続 turn の App Server `turn/completed`
+          // 欠落時に `task_complete` を観測できず、処理中状態を自己修復できない。
+        }
+      },
+      (event) => {
+        if (actor.codexLive !== state || event.state !== "done") return;
+        if (this.codexTurnController?.reconcileCompletedTurn?.(session, event.turnId) === true) {
+          this.options.log?.(
+            `Codex rollout task_complete で処理完了を補完 session=${session} turn=${event.turnId}`,
+          );
+        }
+      },
+    );
     actor.tail = tail;
     tail.open(cwd, threadId, newerThanMs, "codex");
   }
@@ -1079,7 +1091,7 @@ export class SessionHub {
     state.buffered.length = 0;
     state.scanContentCounts.clear();
     state.fallbackBaselineCounts = new Map(state.publishedContentCounts);
-    this.openCodexRollout(session, actor, cwd, threadId, newerThanMs, false);
+    this.openCodexRollout(session, actor, cwd, threadId, newerThanMs);
   }
 
   private publishCodexContent(

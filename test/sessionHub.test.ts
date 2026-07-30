@@ -1321,8 +1321,16 @@ function makeCodexStreamingHub(options: {
   metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0,
     agent: "codex", providerSessionId: "thread-1" });
   const writes: Array<(payload: ControlMessage) => void> = [];
+  const lifecycleWrites: Array<((event: {
+    state: "active" | "done";
+    turnId: string;
+  }) => void) | undefined> = [];
   const tails: Array<HubTail & { stopped: boolean }> = [];
   let callbacks!: CodexNativeTurnControllerOptions;
+  const reconcileCompletedTurn = vi.fn((session: string, _turnId: string) => {
+    callbacks.onProcessing?.(session, "done");
+    return true;
+  });
   const controller: CodexTurnControllerRuntime = {
     subscribeSession: options.subscribeFails
       ? async () => { throw new Error("app server unavailable"); }
@@ -1330,13 +1338,15 @@ function makeCodexStreamingHub(options: {
           contentCounts: new Map([["assistant\u0000履歴", 1]]),
           liveSubscribed: options.liveSubscribed ?? true }),
     startTurn: async () => "turn-1",
+    reconcileCompletedTurn,
     closeSession: vi.fn(),
     close: vi.fn(),
   };
   const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-codex-live"),
     metadataStore, timeoutSeconds: 1800,
-    tailFactory: (write) => {
+    tailFactory: (write, onCodexTurnLifecycle) => {
       writes.push(write);
+      lifecycleWrites.push(onCodexTurnLifecycle);
       const tail = { stopped: false, open() {}, stop() { tail.stopped = true; } };
       tails.push(tail);
       return tail;
@@ -1344,7 +1354,14 @@ function makeCodexStreamingHub(options: {
     codexAppServerFactory: () => ({ openThread: async () => { throw new Error("unused"); } }),
     codexTurnControllerFactory: (value) => { callbacks = value; return controller; },
   });
-  return { hub, writes, tails, getCallbacks: () => callbacks };
+  return {
+    hub,
+    writes,
+    lifecycleWrites,
+    tails,
+    reconcileCompletedTurn,
+    getCallbacks: () => callbacks,
+  };
 }
 
 describe("SessionHub Codex App Server live stream", () => {
@@ -1369,7 +1386,8 @@ describe("SessionHub Codex App Server live stream", () => {
     const texts = received.flatMap((message) => message?.payload?.role === "assistant"
       ? [message.payload.text] : []);
     expect(texts).toEqual(["履歴", "境界の新着"]);
-    expect(tails[0]!.stopped).toBe(true);
+    // 本文は App Server へ切り替えるが、rollout は lifecycle の副監視として残す。
+    expect(tails[0]!.stopped).toBe(false);
 
     getCallbacks().onChatItem?.({ session: "work", itemId: "live-2",
       payload: chat("assistant", "TUI からの turn", "codex-item-live-2") });
@@ -1426,6 +1444,30 @@ describe("SessionHub Codex App Server live stream", () => {
     expect(tails[0]!.stopped).toBe(false);
     expect(received.filter((message) => message?.payload?.text === "初回ターンの新着"))
       .toHaveLength(1);
+  });
+
+  test("通常live移行後もrollout task_completeでApp Server完了通知の欠落を自己修復する", async () => {
+    const {
+      hub,
+      writes,
+      lifecycleWrites,
+      tails,
+      reconcileCompletedTurn,
+      getCallbacks,
+    } = makeCodexStreamingHub();
+    const client = {};
+    subscribe(hub, client, []);
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+    writes[0]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+    expect(tails[0]!.stopped).toBe(false);
+
+    getCallbacks().onProcessing?.("work", "active");
+    expect(hub.processingSessionNames).toEqual(["work"]);
+
+    lifecycleWrites[0]?.({ state: "done", turnId: "turn-1" });
+
+    expect(reconcileCompletedTurn).toHaveBeenCalledWith("work", "turn-1");
+    expect(hub.processingSessionNames).toEqual([]);
   });
 
   test("tool_activity は backfill 中の live 側を捨て、live 配信後の再走査で重複しない", async () => {
