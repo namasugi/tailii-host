@@ -388,8 +388,16 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         relatedApprovalId: optionalString(raw, "relatedApprovalId"),
       });
 
+    case "usage_request": {
+      const rawAgent = optionalString(raw, "agentType");
+      return compact({
+        type, v,
+        id: requireString(raw, "id"),
+        agentType: rawAgent === "claude" || rawAgent === "codex" ? rawAgent : undefined,
+      });
+    }
+
     case "image_fetch_request":
-    case "usage_request":
     case "account_usage_request":
     case "question_dismiss":
     case "claude_session_list_request":

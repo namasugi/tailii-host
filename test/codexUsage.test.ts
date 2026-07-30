@@ -14,8 +14,10 @@ function tokenCountLine(opts: {
   window?: number;
   primaryPct?: number;
   primaryResets?: number;
+  primaryWindow?: number;
   secondaryPct?: number;
   secondaryResets?: number;
+  secondaryWindow?: number;
 }): string {
   return JSON.stringify({
     type: "event_msg",
@@ -33,10 +35,18 @@ function tokenCountLine(opts: {
       ...((opts.primaryPct !== undefined || opts.secondaryPct !== undefined) && {
         rate_limits: {
           ...(opts.primaryPct !== undefined && {
-            primary: { used_percent: opts.primaryPct, window_minutes: 300, resets_at: opts.primaryResets },
+            primary: {
+              used_percent: opts.primaryPct,
+              window_minutes: opts.primaryWindow ?? 300,
+              resets_at: opts.primaryResets,
+            },
           }),
           ...(opts.secondaryPct !== undefined && {
-            secondary: { used_percent: opts.secondaryPct, window_minutes: 10080, resets_at: opts.secondaryResets },
+            secondary: {
+              used_percent: opts.secondaryPct,
+              window_minutes: opts.secondaryWindow ?? 10080,
+              resets_at: opts.secondaryResets,
+            },
           }),
         },
       }),
@@ -91,6 +101,26 @@ describe("aggregateCodexUsage", () => {
     const u = aggregateCodexUsage(p);
     expect(u).toMatchObject({ inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, turns: 0 });
     expect(u.fiveHourUtilization).toBeUndefined();
+  });
+
+  test("primary が週次枠なら 5時間枠へ誤分類しない", () => {
+    const p = writeRolloutFile([
+      tokenCountLine({
+        input: 10,
+        output: 2,
+        cached: 3,
+        total: 12,
+        primaryPct: 17,
+        primaryWindow: 10080,
+        primaryResets: 1_785_000_000,
+      }),
+    ]);
+
+    const u = aggregateCodexUsage(p);
+    expect(u.fiveHourUtilization).toBeUndefined();
+    expect(u.fiveHourResetsAt).toBeUndefined();
+    expect(u.sevenDayUtilization).toBe(17);
+    expect(u.sevenDayResetsAt).toBe(new Date(1_785_000_000_000).toISOString());
   });
 
   test("読めないパスは空集計", () => {

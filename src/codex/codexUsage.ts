@@ -11,10 +11,12 @@
 //   - cacheReadTokens    = total_token_usage.cached_input_tokens
 //   - cacheCreationTokens= 0（codex は区別を持たない）
 //   - turns              = 0（codex は assistant ターン数を token_count に持たない）
-//   - fiveHour*(5h窓=primary) / sevenDay*(週窓=secondary) の used_percent(0–100)・resets_at(Unix秒)
+//   - fiveHour* / sevenDay* = rate limit の window_minutes で短期/週次を分類
+//     （primary/secondary の位置は固定ではない）
 
 import * as fs from "node:fs";
 import { emptyUsageTotals, type UsageTotals } from "../services/usageAggregator.js";
+import { parseCodexAccountUsage } from "./codexAccountUsage.js";
 
 /** token_count から読める使用量 + レート制限（plan 相当）。 */
 export interface CodexUsage extends UsageTotals {
@@ -67,34 +69,24 @@ export function aggregateCodexUsage(rolloutPath: string): CodexUsage {
 
   const rate = p["rate_limits"];
   if (typeof rate === "object" && rate !== null) {
-    const r = rate as Record<string, unknown>;
-    applyWindow(r["primary"], (util, resets) => {
-      if (util !== undefined) result.fiveHourUtilization = util;
-      if (resets !== undefined) result.fiveHourResetsAt = resets;
-    });
-    applyWindow(r["secondary"], (util, resets) => {
-      if (util !== undefined) result.sevenDayUtilization = util;
-      if (resets !== undefined) result.sevenDayResetsAt = resets;
-    });
+    // rollout と App Server の rate limit は同じ分類器を通す。primary が週次だけを
+    // 持つプランもあるため、位置固定で primary=5時間 と解釈してはいけない。
+    const accountUsage = parseCodexAccountUsage(rate);
+    if (accountUsage?.fiveHourPercent !== undefined) {
+      result.fiveHourUtilization = accountUsage.fiveHourPercent;
+    }
+    if (accountUsage?.fiveHourResetsAt !== undefined) {
+      result.fiveHourResetsAt = accountUsage.fiveHourResetsAt;
+    }
+    if (accountUsage?.weeklyPercent !== undefined) {
+      result.sevenDayUtilization = accountUsage.weeklyPercent;
+    }
+    if (accountUsage?.weeklyResetsAt !== undefined) {
+      result.sevenDayResetsAt = accountUsage.weeklyResetsAt;
+    }
   }
 
   return result;
-}
-
-/** rate_limits の 1 窓（primary/secondary）から used_percent(丸め) と resets_at(ISO) を取り出す。 */
-function applyWindow(
-  raw: unknown,
-  set: (util: number | undefined, resets: string | undefined) => void,
-): void {
-  if (typeof raw !== "object" || raw === null) return;
-  const w = raw as Record<string, unknown>;
-  const used = w["used_percent"];
-  const resets = w["resets_at"];
-  set(
-    typeof used === "number" ? Math.round(used) : undefined,
-    // resets_at は Unix 秒。usage_response は ISO 文字列で運ぶため変換する。
-    typeof resets === "number" ? new Date(Math.floor(resets) * 1000).toISOString() : undefined,
-  );
 }
 
 /** ファイル末尾チャンクを読み、最後の `type=="event_msg"` かつ `payload.type=="token_count"` 行を返す。 */

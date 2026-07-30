@@ -19,9 +19,12 @@ export const usageHandlers: HandlerRegistry = {
     // 分岐は「rollout が解決済みか」ではなく「tail 中の会話が codex か」で行う。rollout 未解決でも
     // Claude の OAuth プラン使用量 API へは絶対に落とさない（codex 会話に Claude の状態が出る不具合
     // の防止, 2026-07-07 ユーザー指摘）。codex は OAuth プラン使用量非対応なので planUsage は使わない。
-    const tailAgent = ctx.activeChatSession.name === null
-      ? ctx.defaultAgent
-      : metadataStore?.get(ctx.activeChatSession.name)?.agent ?? ctx.defaultAgent;
+    // ドラフトは activeChatSession をまだ持たないため、iOS が画面上の agentType を明示する。
+    // 旧クライアント（agentType 欠落）は従来どおり tail metadata / host 既定へフォールバックする。
+    const tailAgent = message.agentType
+      ?? (ctx.activeChatSession.name === null
+        ? ctx.defaultAgent
+        : metadataStore?.get(ctx.activeChatSession.name)?.agent ?? ctx.defaultAgent);
     if (tailAgent === "codex") {
       const currentMeta = ctx.activeChatSession.name === null ? null : metadataStore?.get(ctx.activeChatSession.name) ?? null;
       const codexRollout = currentMeta === null ? null : new CodexRolloutTailer().resolve(
@@ -30,6 +33,18 @@ export const usageHandlers: HandlerRegistry = {
       // rollout 未解決（起動直後等）は空集計で返す。Claude 分岐へは落とさない。
       const cu: CodexUsage =
         codexRollout !== null ? aggregateCodexUsage(codexRollout) : { ...emptyUsageTotals() };
+      // レート制限は rollout の最終イベントより App Server のアカウント値を優先する。
+      // ドラフトにも値を返せ、primary/secondary の位置が固定でないプランも正しく分類できる。
+      let accountUsage: Awaited<ReturnType<typeof ctx.codexAccountUsage>> = null;
+      try {
+        accountUsage = await ctx.codexAccountUsage();
+      } catch {
+        accountUsage = null;
+      }
+      const fiveHourUtilization = accountUsage?.fiveHourPercent ?? cu.fiveHourUtilization;
+      const fiveHourResetsAt = accountUsage?.fiveHourResetsAt ?? cu.fiveHourResetsAt;
+      const sevenDayUtilization = accountUsage?.weeklyPercent ?? cu.sevenDayUtilization;
+      const sevenDayResetsAt = accountUsage?.weeklyResetsAt ?? cu.sevenDayResetsAt;
       try {
         writer.write({
           type: "usage_response",
@@ -40,10 +55,10 @@ export const usageHandlers: HandlerRegistry = {
           cacheReadTokens: cu.cacheReadTokens,
           cacheCreationTokens: cu.cacheCreationTokens,
           turns: cu.turns,
-          ...(cu.fiveHourUtilization !== undefined && { fiveHourUtilization: cu.fiveHourUtilization }),
-          ...(cu.fiveHourResetsAt !== undefined && { fiveHourResetsAt: cu.fiveHourResetsAt }),
-          ...(cu.sevenDayUtilization !== undefined && { sevenDayUtilization: cu.sevenDayUtilization }),
-          ...(cu.sevenDayResetsAt !== undefined && { sevenDayResetsAt: cu.sevenDayResetsAt }),
+          ...(fiveHourUtilization !== undefined && { fiveHourUtilization }),
+          ...(fiveHourResetsAt !== undefined && { fiveHourResetsAt }),
+          ...(sevenDayUtilization !== undefined && { sevenDayUtilization }),
+          ...(sevenDayResetsAt !== undefined && { sevenDayResetsAt }),
         });
       } catch {
         // 書込失敗は握り潰す。

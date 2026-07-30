@@ -389,7 +389,11 @@ export type ControlMessage =
   | { type: "question_prompt"; v: number; id: string; questions: QuestionPromptQuestion[] }
   | { type: "question_answer"; v: number; id: string; session: string; answers: QuestionAnswer[] }
   | { type: "question_dismiss"; v: number; id: string }
-  | { type: "usage_request"; v: number; id: string }
+  | {
+      type: "usage_request"; v: number; id: string;
+      /** ドラフト等、active session が無い画面の取得先。欠落は host が現行 session から解決する。 */
+      agentType?: "claude" | "codex";
+    }
   | {
       type: "usage_response"; v: number; id: string;
       inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; turns: number;

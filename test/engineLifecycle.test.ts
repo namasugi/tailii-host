@@ -472,6 +472,39 @@ describe("Engine — アイドルライフサイクル/ページング", () => {
     await engine.teardown();
   });
 
+  test("ドラフトの usage_request は明示 agentType=codex を host 既定より優先する", async () => {
+    const runner = new MockTmuxRunner(() => ok(""));
+    const mgr = new TmuxSessionManager({ runner: runner.runner, store: makeTempStore() });
+    const engine = startEngine({
+      sessionManager: mgr,
+      agent: "claude",
+      planUsage: async () => ({
+        fiveHourUtilization: 23,
+        fiveHourResetsAt: "2026-07-06T12:00:00Z",
+        sevenDayUtilization: 65,
+        sevenDayResetsAt: null,
+        sevenDayFableUtilization: null,
+        sevenDayFableResetsAt: null,
+      }),
+      codexAccountUsage: async () => ({
+        weeklyPercent: 17,
+        weeklyResetsAt: "2026-08-07T00:00:00Z",
+      }),
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"agentType":"codex","id":"U3","type":"usage_request","v":1}');
+    const line = await engine.lines.nextOfType("usage_response");
+    const msg = decodeControlMessage(line);
+    if (msg.type !== "usage_response") throw new Error(`応答型不一致: ${msg.type}`);
+    expect(msg.fiveHourUtilization).toBeUndefined();
+    expect(msg.sevenDayUtilization).toBe(17);
+    expect(msg.sevenDayResetsAt).toBe("2026-08-07T00:00:00Z");
+    expect(msg.sevenDayFableUtilization).toBeUndefined();
+
+    await engine.teardown();
+  });
+
   // MARK: 追加: mode_get / mode_set（pane 表示判定 + BTab 注入）
 
   test("mode_get は pane 末尾のモードマーカーから現在モードを返す", async () => {
