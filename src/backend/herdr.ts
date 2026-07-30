@@ -2,9 +2,13 @@
 // tailii (TS host) — herdr backend のセッション操作（list / reattach / kill / send / read）。
 // TmuxSessionManager と同じ面（SessionBackend）を herdr CLI（socket API のフロント）で実装する。
 //
-// 実測済みの herdr 0.7.4 挙動（protocol 16。設計正本は docs/herdr-backend.md）:
+// 実測済みの herdr 0.7.5 挙動（設計正本は docs/herdr-backend.md）:
 // - 全 pane は専用 named session `tailii` に収容（全コマンドに `--session tailii` 前置）。
-//   `agent start <name> --no-focus -- /bin/zsh -lc '<cmd>'` で pane 起動 → session 名タブへ分離。
+//   起動は `tab create --cwd --env --no-focus`（root_pane.pane_id が新 pane）→ `pane rename`
+//   → `pane run <id> "exec /bin/zsh -lc '<cmd>'"`。0.7.5 で `agent start` から pane 生成
+//   /cwd/env 指定が廃止されたため（旧: agent start 一発で pane 起動）。
+//   `pane run` はタイプ注入で argv のクォートを保持しない → コマンドは単一文字列で渡す。
+//   exec 前置によりコマンド終了と同時に pane が閉じる（旧 agent start と同義・stale shell なし）。
 // - `pane read --source recent-unwrapped --lines N` は tmux `capture-pane -J -S -N` 相当。
 //   ただし出力リングが空の新規 pane では空文字を返すため visible へフォールバックする。
 //   `--source visible` は viewport 全行を返し `--lines` を無視する（自前で末尾を切る）。
@@ -230,12 +234,25 @@ export function parseHerdrStartedPaneId(stdout: string): string | null {
   return typeof id === "string" && HERDR_PANE_ID_PATTERN.test(id) ? id : null;
 }
 
-/** `agent get` stdout から agent_status を取り出す（判定不能は null）。 */
-export function parseHerdrAgentStatus(stdout: string): string | null {
+/** `tab create` stdout から root pane の pane_id を取り出す（失敗は null）。 */
+export function parseHerdrCreatedTabPaneId(stdout: string): string | null {
   const result = parseHerdrResult(stdout);
-  const agent = result?.["agent"];
-  if (typeof agent !== "object" || agent === null) return null;
-  const status = (agent as Record<string, unknown>)["agent_status"];
+  const rootPane = result?.["root_pane"];
+  if (typeof rootPane !== "object" || rootPane === null) return null;
+  const id = (rootPane as Record<string, unknown>)["pane_id"];
+  return typeof id === "string" && HERDR_PANE_ID_PATTERN.test(id) ? id : null;
+}
+
+/**
+ * `pane get` stdout から agent_status を取り出す（判定不能は null）。
+ * 0.7.5 では `agent get <name>` が使えない（agent レジストリは herdr の自動検出のみで
+ * Tailii のセッション名を知らず agent_not_found になる）ため、pane 単位の status を読む。
+ */
+export function parseHerdrPaneAgentStatus(stdout: string): string | null {
+  const result = parseHerdrResult(stdout);
+  const pane = result?.["pane"];
+  if (typeof pane !== "object" || pane === null) return null;
+  const status = (pane as Record<string, unknown>)["agent_status"];
   return typeof status === "string" ? status : null;
 }
 
@@ -338,7 +355,7 @@ export class HerdrSessionManager {
 
   /**
    * 生存 pane の session 名 → { tabId, tabLabel } を返す（session-title の自動タイトル同期用）。
-   * pane label（= agent start のセッション名）が無い pane・タブ不明の pane は含めない。
+   * pane label（= セッション解決の権威）が無い pane・タブ不明の pane は含めない。
    */
   async tabInfoByName(): Promise<Map<string, { tabId: string; label: string | null }>> {
     const panes = await this.livePanes();
@@ -416,7 +433,8 @@ export class HerdrSessionManager {
   /**
    * 会話カスタムタイトルの端末表示追随（session-title）: pane を収容するタブのラベルを
    * 書き換える（`tab rename`）。pane の label はセッション解決の権威（findPane の
-   * fallback / list の生存判定）なので触らない。title 空/null は解除=セッション名へ戻す。
+   * fallback / list の生存判定）なので触らない。title 空/null は解除=セッション名へ戻す
+   * （未命名扱いになり hub tick の自動タイトルが再適用される）。
    */
   async setDisplayTitle(name: string, title: string | null): Promise<void> {
     validateSessionName(name);
@@ -555,14 +573,23 @@ export class HerdrSessionManager {
     }
   }
 
-  /** claude TUI の入力準備完了（herdr の agent 検出が unknown を抜ける）を待つ。 */
+  /**
+   * claude TUI の入力準備完了（herdr の agent 検出が unknown を抜ける）を待つ。
+   * 0.7.5 で `agent get <name>` は常に agent_not_found（レジストリが herdr 自動検出のみで
+   * セッション名を知らない）になり、旧実装は毎送信 10s のタイムアウト空回りになっていた
+   * （実機FB 2026-07-30: 送信後の pending / ライブビュー点灯が遅い）。pane を解決して
+   * `pane get` の agent_status を読む。pane 不在は即 fail-open（後続 sendKeys が
+   * pane not found で正しく失敗する）。
+   */
   private async waitForAgentReady(name: string): Promise<void> {
     const deadline = Date.now() + this.readyTimeoutMs;
     for (;;) {
       try {
-        const result = await this.runner(["agent", "get", name]);
+        const target = await this.paneTarget(name);
+        if (target === null) return;
+        const result = await this.runner(["pane", "get", target]);
         if (result.exitCode === 0) {
-          const status = parseHerdrAgentStatus(result.stdout);
+          const status = parseHerdrPaneAgentStatus(result.stdout);
           if (status !== null && status !== "unknown") return;
         }
       } catch {

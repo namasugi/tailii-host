@@ -15,7 +15,7 @@ import {
   defaultHerdrPath,
   parseHerdrForegroundCommand,
   parseHerdrPaneList,
-  parseHerdrStartedPaneId,
+  parseHerdrCreatedTabPaneId,
 } from "../backend/herdr.js";
 import { claudeHookLaunchSettings, removeCodexHookSettings } from "./hookSettings.js";
 import { tailiiWorktreeRepoRoot } from "../services/gitService.js";
@@ -562,8 +562,9 @@ export async function launchCore(options: {
  * `tailii`（`--session` を全コマンドに前置）へ収容する:
  * 1. tailii セッションサーバーの ensure（不在ならヘッドレス起動）→
  * 2. stale pane 掃除（claude が終了してシェル化した pane）→
- * 3. `agent start -- /bin/zsh -lc '<inner>'` → 4. pane を session 名のタブへ分離
- * （ベストエフォート）→ 5. backend/herdrPaneId 込みでメタ権威記録。
+ * 3. `tab create --cwd --env` で新タブ+pane 生成 → 4. `pane rename` で label=session 名 →
+ * 5. `pane run "exec /bin/zsh -lc '<inner>'"` で起動 → 6. backend/herdrPaneId 込みでメタ権威記録。
+ * （herdr 0.7.5 で `agent start` の pane 生成/cwd/env 指定が廃止されたため tab create 方式）
  */
 async function launchHerdrPane(options: {
   session: string;
@@ -644,28 +645,45 @@ async function launchHerdrPane(options: {
 
   let herdrPaneId: string | null = existing?.paneId ?? null;
   if (existing === null) {
-    // --- 3. agent start でデタッチ起動（zsh -lc: inner の env 前置/クォートを tmux と同義に保つ） ---
-    const started = await runHerdr([
-      "agent", "start", session,
+    // --- 3. tab create で新タブ+pane を生成（0.7.5 で agent start の pane 生成/cwd/env 指定が
+    //     廃止されたため。anchor pane 不要なので pane ゼロの空セッションでも成立する）。
+    //     タブラベルは付けず herdr 既定表示（連番）に任せる（session-title のタブ反映は
+    //     2026-07-30 撤去）。 ---
+    const created = await runHerdr([
+      "tab", "create",
       "--cwd", dir,
-      "--no-focus",
       "--env", `PATH=${options.injectedPath}`,
-      "--", "/bin/zsh", "-lc", options.innerCommand,
+      "--no-focus",
     ]);
-    if (started.code !== 0) {
-      errorSink(`tailii launch: herdr が非0終了 (${started.code})\n`);
-      return started.code === 0 ? 1 : started.code;
+    if (created.code !== 0) {
+      errorSink(`tailii launch: herdr が非0終了 (${created.code})\n`);
+      return created.code === 0 ? 1 : created.code;
     }
-    herdrPaneId = parseHerdrStartedPaneId(started.out);
+    herdrPaneId = parseHerdrCreatedTabPaneId(created.out);
+    if (herdrPaneId === null) {
+      errorSink("tailii launch: herdr tab create の pane_id を解決できませんでした\n");
+      return 1;
+    }
 
-    // --- 4. pane を専用タブへ分離（表示整理のみ。失敗しても起動は成立） ---
-    // タブラベルは会話の表示タイトル（未命名は session 名）。pane label は agent start の
-    // session 名のまま（セッション解決の権威）で、タブラベルだけ表示用に使う（session-title）。
-    if (herdrPaneId !== null) {
-      const tabLabel = options.displayTitle?.trim() || session;
-      await runHerdr([
-        "pane", "move", herdrPaneId, "--new-tab", "--label", tabLabel, "--no-focus",
-      ]);
+    // --- 4. pane label = session 名（セッション解決の権威: findPane fallback / list 生存判定） ---
+    const renamed = await runHerdr(["pane", "rename", herdrPaneId, session]);
+    if (renamed.code !== 0) {
+      await runHerdr(["pane", "close", herdrPaneId]);
+      errorSink(`tailii launch: herdr pane rename が非0終了 (${renamed.code})\n`);
+      return renamed.code;
+    }
+
+    // --- 5. innerCommand を起動。pane run はタイプ注入で argv のクォートを保持しないため
+    //     単一文字列で渡す。exec 前置で claude 終了と同時に pane が閉じる
+    //     （旧 agent start の「コマンド終了 = pane close」と同義。stale shell を残さない）。 ---
+    const ran = await runHerdr([
+      "pane", "run", herdrPaneId,
+      `exec /bin/zsh -lc ${shellSingleQuote(options.innerCommand)}`,
+    ]);
+    if (ran.code !== 0) {
+      await runHerdr(["pane", "close", herdrPaneId]);
+      errorSink(`tailii launch: herdr pane run が非0終了 (${ran.code})\n`);
+      return ran.code;
     }
   }
 

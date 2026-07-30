@@ -7,6 +7,7 @@ import { describe, expect, test } from "vitest";
 import {
   HerdrFailedError,
   HerdrSessionManager,
+  parseHerdrCreatedTabPaneId,
   parseHerdrForegroundCommand,
   parseHerdrPaneList,
   parseHerdrStartedPaneId,
@@ -114,6 +115,19 @@ describe("herdr JSON パーサ", () => {
         JSON.stringify({ result: { type: "agent_started", agent: { pane_id: "w4:p2" } } }),
       ),
     ).toBe("w4:p2");
+    expect(
+      parseHerdrCreatedTabPaneId(
+        JSON.stringify({
+          result: {
+            type: "tab_created",
+            root_pane: { pane_id: "w4:p9", tab_id: "w4:t3" },
+            tab: { tab_id: "w4:t3", label: "8" },
+          },
+        }),
+      ),
+    ).toBe("w4:p9");
+    expect(parseHerdrCreatedTabPaneId(JSON.stringify({ result: { type: "tab_created" } }))).toBeNull();
+    expect(parseHerdrCreatedTabPaneId("not json")).toBeNull();
     expect(parseHerdrForegroundCommand(processInfoJson("claude"))).toBe("claude");
     expect(parseHerdrForegroundCommand("{}")).toBe("");
   });
@@ -285,7 +299,7 @@ describe("HerdrSessionManager", () => {
       dialogOpen: options.dialogInitiallyOpen ?? false,
       swallowTextInputs: options.swallowTextInputs ?? 0,
       swallowEnters: options.swallowEnters ?? 0,
-      agentGets: 0,
+      statusReads: 0,
     };
     const dialogScreen = [
       "   Remote Control",
@@ -295,13 +309,18 @@ describe("HerdrSessionManager", () => {
     ].join("\n");
     const runner = new MockHerdrRunner((args) => {
       if (args[0] === "pane" && args[1] === "list") return herdrOk(paneListJson([{ pane_id: "w4:p2" }]));
-      if (args[0] === "agent" && args[1] === "get") {
+      // 0.7.5: 準備ゲートは `agent get <name>`（agent_not_found になる）ではなく
+      // pane 解決 → `pane get` の agent_status を読む。
+      if (args[0] === "pane" && args[1] === "get") {
         const statuses = options.agentStatuses ?? ["idle"];
-        const status = statuses[Math.min(state.agentGets, statuses.length - 1)];
-        state.agentGets += 1;
+        const status = statuses[Math.min(state.statusReads, statuses.length - 1)];
+        state.statusReads += 1;
         return herdrOk(JSON.stringify({
-          result: { agent: { pane_id: "w4:p2", agent_status: status } },
+          result: { pane: { pane_id: "w4:p2", agent_status: status } },
         }));
+      }
+      if (args[0] === "agent" && args[1] === "get") {
+        return { exitCode: 1, stdout: "", stderr: "agent target not found" };
       }
       if (args[0] === "pane" && args[1] === "send-keys" && args[3] === "Escape") {
         state.dialogOpen = false;
@@ -372,7 +391,7 @@ describe("HerdrSessionManager", () => {
     });
     await manager.sendTextSubmit("s-a", "こんにちは");
     // agent 検出待ち(unknown→idle) → 本文 → CR（飲まれる） → CR 再送 → 空検知で終了。
-    expect(state.agentGets).toBe(2);
+    expect(state.statusReads).toBe(2);
     expect(submitSends(runner)).toEqual([
       ["pane", "send-text", "w4:p2", "こんにちは"],
       ["pane", "send-text", "w4:p2", "\r"],
@@ -669,15 +688,23 @@ describe("launchCore herdr backend", () => {
       if (args[0] === "pane" && args[1] === "process-info") {
         return { exitCode: 0, stdout: processInfoJson(overrides?.processName ?? "claude") };
       }
-      if (args[0] === "agent" && args[1] === "start") {
-        return {
-          exitCode: 0,
-          stdout: JSON.stringify({ result: { type: "agent_started", agent: { pane_id: "w9:p7" } } }),
-        };
+      if (args[0] === "tab" && args[1] === "create") {
+        return { exitCode: 0, stdout: tabCreatedJson("w9:p7") };
       }
       return { exitCode: 0, stdout: "" };
     };
     return { runner, recorded };
+  }
+
+  /** herdr `tab create` の JSON stdout を組み立てる（0.7.5 実測形の要約）。 */
+  function tabCreatedJson(paneId: string): string {
+    return JSON.stringify({
+      result: {
+        type: "tab_created",
+        root_pane: { pane_id: paneId, tab_id: "w9:t9" },
+        tab: { tab_id: "w9:t9", label: "8", pane_count: 1 },
+      },
+    });
   }
 
   function launchOptions(dir: string, store: SessionMetadataStore, runner: ProcessRunner) {
@@ -701,7 +728,7 @@ describe("launchCore herdr backend", () => {
     };
   }
 
-  test("agent start で起動し backend/herdrPaneId をメタへ権威記録する", async () => {
+  test("tab create → rename → pane run で起動し backend/herdrPaneId をメタへ権威記録する", async () => {
     const dir = makeTempDir("herdr-launch");
     const store = makeStore();
     const { runner, recorded } = herdrProcessRunner();
@@ -710,18 +737,21 @@ describe("launchCore herdr backend", () => {
 
     // tmux は一切呼ばない（すべて herdrPath 宛て）。
     expect(recorded.every((call) => call.exe === "/Users/x/.local/bin/herdr")).toBe(true);
-    const start = recorded.find((call) => call.args[0] === "agent" && call.args[1] === "start");
-    expect(start?.args.slice(2, 5)).toEqual(["s-h", "--cwd", dir]);
-    expect(start?.args).toContain("--no-focus");
-    expect(start?.args.join(" ")).toContain("--env PATH=/usr/bin:/bin");
-    // inner は zsh -lc へそのまま渡す（--settings 合成込み）。
-    const dashDash = start!.args.indexOf("--");
-    expect(start!.args.slice(dashDash + 1, dashDash + 3)).toEqual(["/bin/zsh", "-lc"]);
-    expect(start!.args[dashDash + 3]).toMatch(/^sleep 300 --settings /);
-    // 専用タブへ分離（named session 内。workspace 指定は不要）。
+    // tab create が cwd/PATH を運ぶ（0.7.5: agent start の pane 生成/cwd/env 指定は廃止）。
+    const create = recorded.find((call) => call.args[0] === "tab" && call.args[1] === "create");
+    expect(create?.args.slice(2)).toEqual([
+      "--cwd", dir, "--env", "PATH=/usr/bin:/bin", "--no-focus",
+    ]);
+    // pane label = session 名（セッション解決の権威）。
     expect(recorded).toContainEqual(expect.objectContaining({
-      args: ["pane", "move", "w9:p7", "--new-tab", "--label", "s-h", "--no-focus"],
+      args: ["pane", "rename", "w9:p7", "s-h"],
     }));
+    // inner は単一文字列 + exec 前置（pane run はタイプ注入でクォート非保持のため。
+    // --settings 合成込みで shell single-quote 包み）。
+    const run = recorded.find((call) => call.args[0] === "pane" && call.args[1] === "run");
+    expect(run?.args[2]).toBe("w9:p7");
+    expect(run?.args[3]).toMatch(/^exec \/bin\/zsh -lc 'sleep 300 --settings /);
+    expect(run?.args).toHaveLength(4);
 
     expect(store.get("s-h")).toEqual({
       name: "s-h",
@@ -732,7 +762,7 @@ describe("launchCore herdr backend", () => {
     });
   });
 
-  test("displayTitle 指定時は新規タブのラベルにタイトルを使う（session-title）", async () => {
+  test("displayTitle 指定でもタブへラベルは付けない（タブ名同期撤去）", async () => {
     const dir = makeTempDir("herdr-launch-title");
     const store = makeStore();
     const { runner, recorded } = herdrProcessRunner();
@@ -740,12 +770,11 @@ describe("launchCore herdr backend", () => {
     expect(
       await launchCore({ ...launchOptions(dir, store, runner), displayTitle: "認証バグの調査" }),
     ).toBe(0);
+    expect(recorded.some((call) => call.args.includes("--label"))).toBe(false);
+    // pane label（=セッション解決の権威）は session 名のまま。
     expect(recorded).toContainEqual(expect.objectContaining({
-      args: ["pane", "move", "w9:p7", "--new-tab", "--label", "認証バグの調査", "--no-focus"],
+      args: ["pane", "rename", "w9:p7", "s-h"],
     }));
-    // agent start の pane label（=セッション解決の権威）は session 名のまま。
-    const start = recorded.find((call) => call.args[0] === "agent" && call.args[1] === "start");
-    expect(start?.args[2]).toBe("s-h");
   });
 
   test("生存 pane があれば再起動せずメタだけ更新する", async () => {
@@ -758,7 +787,7 @@ describe("launchCore herdr backend", () => {
     });
 
     expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
-    expect(recorded.some((call) => call.args[1] === "start")).toBe(false);
+    expect(recorded.some((call) => call.args[0] === "tab" && call.args[1] === "create")).toBe(false);
     expect(store.get("s-h")?.herdrPaneId).toBe("w9:p7");
   });
 
@@ -775,7 +804,7 @@ describe("launchCore herdr backend", () => {
     expect(recorded).toContainEqual(
       expect.objectContaining({ args: ["pane", "close", "w9:p1"] }),
     );
-    expect(recorded.some((call) => call.args[1] === "start")).toBe(true);
+    expect(recorded.some((call) => call.args[0] === "tab" && call.args[1] === "create")).toBe(true);
     expect(store.get("s-h")?.herdrPaneId).toBe("w9:p7");
   });
 
@@ -791,10 +820,10 @@ describe("launchCore herdr backend", () => {
           ? { exitCode: 0, stdout: paneListJson([]) }
           : { exitCode: 1, stdout: "" };
       }
-      if (args[0] === "agent" && args[1] === "start") {
+      if (args[0] === "tab" && args[1] === "create") {
         return {
           exitCode: 0,
-          stdout: JSON.stringify({ result: { agent: { pane_id: "w1:p1" } } }),
+          stdout: JSON.stringify({ result: { root_pane: { pane_id: "w1:p1" } } }),
         };
       }
       return { exitCode: 0, stdout: "" };
@@ -814,16 +843,38 @@ describe("launchCore herdr backend", () => {
     expect(store.get("s-h")?.herdrPaneId).toBe("w1:p1");
   });
 
-  test("agent start 失敗は非0で返しメタを書かない", async () => {
+  test("tab create 失敗は非0で返しメタを書かない", async () => {
     const dir = makeTempDir("herdr-launch-fail");
     const store = makeStore();
     const runner: ProcessRunner = async (_exe, rawArgs) => {
       const args = rawArgs[0] === "--session" ? rawArgs.slice(2) : rawArgs;
       if (args[0] === "pane" && args[1] === "list") return { exitCode: 0, stdout: paneListJson([]) };
-      if (args[0] === "agent" && args[1] === "start") return { exitCode: 1, stdout: "" };
+      if (args[0] === "tab" && args[1] === "create") return { exitCode: 1, stdout: "" };
       return { exitCode: 0, stdout: "{}" };
     };
     expect(await launchCore(launchOptions(dir, store, runner))).toBe(1);
+    expect(store.get("s-h")).toBeNull();
+  });
+
+  test("pane run 失敗は作った pane を閉じ、非0で返しメタを書かない", async () => {
+    const dir = makeTempDir("herdr-launch-run-fail");
+    const store = makeStore();
+    const recorded: string[][] = [];
+    const runner: ProcessRunner = async (_exe, rawArgs) => {
+      const args = rawArgs[0] === "--session" ? rawArgs.slice(2) : rawArgs;
+      recorded.push(args);
+      if (args[0] === "pane" && args[1] === "list") return { exitCode: 0, stdout: paneListJson([]) };
+      if (args[0] === "tab" && args[1] === "create") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ result: { root_pane: { pane_id: "w9:p7" } } }),
+        };
+      }
+      if (args[0] === "pane" && args[1] === "run") return { exitCode: 1, stdout: "" };
+      return { exitCode: 0, stdout: "{}" };
+    };
+    expect(await launchCore(launchOptions(dir, store, runner))).toBe(1);
+    expect(recorded).toContainEqual(["pane", "close", "w9:p7"]);
     expect(store.get("s-h")).toBeNull();
   });
 });
