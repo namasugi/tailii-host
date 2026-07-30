@@ -2321,4 +2321,47 @@ describe("EngineControl — 横断制御チャネル", () => {
 
     await engine.teardown();
   });
+
+  test("slash_list_request は marketplace ソース dir を優先し、キャッシュ未反映の skill も拾う", async () => {
+    const home = makeTempDir("tailii-slash-market-home");
+    const cache = makeTempDir("tailii-slash-market-cache");
+    const market = makeTempDir("tailii-slash-market-src");
+    // インストール時キャッシュ（古い）: run のみ
+    writeMd(path.join(cache, "alpha", "skills", "run", "SKILL.md"), "cached skill");
+    // marketplace ソース（live）: run 更新 + digest 追加
+    writeMd(path.join(market, "plugins", "alpha", "skills", "run", "SKILL.md"), "live skill");
+    writeMd(path.join(market, "plugins", "alpha", "skills", "digest", "SKILL.md"), "live only");
+    fs.mkdirSync(path.join(market, ".claude-plugin"), { recursive: true });
+    fs.writeFileSync(
+      path.join(market, ".claude-plugin", "marketplace.json"),
+      JSON.stringify({ name: "market", plugins: [{ name: "alpha", source: "./plugins/alpha" }] }),
+    );
+    fs.mkdirSync(path.join(home, ".claude", "plugins"), { recursive: true });
+    fs.writeFileSync(
+      path.join(home, ".claude", "plugins", "installed_plugins.json"),
+      JSON.stringify({
+        version: 2,
+        plugins: { "alpha@market": [{ scope: "user", installPath: path.join(cache, "alpha") }] },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(home, ".claude", "plugins", "known_marketplaces.json"),
+      JSON.stringify({ market: { installLocation: market } }),
+    );
+
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner), homeDir: home });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"id":"SL4","type":"slash_list_request","v":1}');
+    const line = await engine.lines.nextOfType("slash_list_response");
+    const msg = decodeControlMessage(line);
+    if (msg.type !== "slash_list_response") throw new Error(`応答型不一致: ${msg.type}`);
+    expect(msg.commands).toEqual([
+      { name: "/alpha:digest", summary: "live only" },
+      { name: "/alpha:run", summary: "live skill" },
+    ]);
+
+    await engine.teardown();
+  });
 });

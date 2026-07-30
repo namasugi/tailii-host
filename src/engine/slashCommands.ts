@@ -1,6 +1,9 @@
 // engine/slashCommands.ts
 // slash_list_request 用のコマンド候補収集。ユーザー/プロジェクトの skills・commands と
 // installed_plugins.json 登録プラグイン（enabledPlugins で無効化されたものは除外）を走査する。
+// プラグインは marketplace ソース dir（Claude Code 本体が live で読む場所）を優先し、
+// installPath のバージョン固定キャッシュはフォールバック（更新後にキャッシュへ未反映の
+// skills/commands が欠けるのを防ぐ）。
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -42,17 +45,64 @@ function scanPluginCommands(claudeDir: string, byName: Map<string, SlashCandidat
   const plugins = (parsed as { plugins?: unknown } | null)?.plugins;
   if (typeof plugins !== "object" || plugins === null) return;
   const disabled = readDisabledPlugins(claudeDir);
+  const liveDirs = readMarketplacePluginDirs(claudeDir);
   for (const [key, installs] of Object.entries(plugins)) {
     if (disabled.has(key)) continue;
     const pluginName = key.split("@")[0] ?? "";
     if (pluginName === "" || !Array.isArray(installs)) continue;
+    const roots: string[] = [];
+    const liveDir = liveDirs.get(key);
+    if (liveDir !== undefined) roots.push(liveDir);
     for (const install of installs) {
       const installPath = (install as { installPath?: unknown } | null)?.installPath;
-      if (typeof installPath !== "string") continue;
-      scanSkillCommands(path.join(installPath, "skills"), 0, byName, `${pluginName}:`);
-      scanMarkdownCommands(path.join(installPath, "commands"), 0, byName, `${pluginName}:`);
+      if (typeof installPath === "string") roots.push(installPath);
+    }
+    for (const root of roots) {
+      scanSkillCommands(path.join(root, "skills"), 0, byName, `${pluginName}:`);
+      scanMarkdownCommands(path.join(root, "commands"), 0, byName, `${pluginName}:`);
     }
   }
+}
+
+/**
+ * known_marketplaces.json の各 marketplace.json を読み、`plugin@marketplace` →
+ * marketplace 内ソース dir の対応を作る（source が相対/絶対パス文字列のときのみ）。
+ */
+function readMarketplacePluginDirs(claudeDir: string): Map<string, string> {
+  const dirs = new Map<string, string>();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(
+      fs.readFileSync(path.join(claudeDir, "plugins", "known_marketplaces.json"), "utf8"),
+    );
+  } catch {
+    return dirs;
+  }
+  if (typeof parsed !== "object" || parsed === null) return dirs;
+  for (const [marketName, info] of Object.entries(parsed)) {
+    const installLocation = (info as { installLocation?: unknown } | null)?.installLocation;
+    if (typeof installLocation !== "string") continue;
+    let manifest: unknown;
+    try {
+      manifest = JSON.parse(
+        fs.readFileSync(
+          path.join(installLocation, ".claude-plugin", "marketplace.json"),
+          "utf8",
+        ),
+      );
+    } catch {
+      continue;
+    }
+    const pluginList = (manifest as { plugins?: unknown } | null)?.plugins;
+    if (!Array.isArray(pluginList)) continue;
+    for (const entry of pluginList) {
+      const name = (entry as { name?: unknown } | null)?.name;
+      const source = (entry as { source?: unknown } | null)?.source;
+      if (typeof name !== "string" || typeof source !== "string") continue;
+      dirs.set(`${name}@${marketName}`, path.resolve(installLocation, source));
+    }
+  }
+  return dirs;
 }
 
 /** ~/.claude/settings.json の enabledPlugins で明示的に false のプラグインキー集合。 */
