@@ -185,6 +185,15 @@ export function parseHerdrPaneList(stdout: string): HerdrPane[] {
   return out;
 }
 
+/**
+ * herdr 0.7.5 の `tab create` が自動付与する既定タブラベル（連番文字列 "1"/"2"…）か。
+ * 既定ラベルは「未命名」として扱う: hub tick の自動タイトルは上書きしてよく、
+ * 逆方向同期（displayTitle）は人為リネームと誤認して会話タイトルへ取り込んではならない。
+ */
+export function isDefaultHerdrTabLabel(label: string): boolean {
+  return /^\d+$/.test(label);
+}
+
 /** `tab list` stdout を tab_id → label のマップにパースする（形式不明は空マップ）。 */
 export function parseHerdrTabLabels(stdout: string): Map<string, string> {
   const result = parseHerdrResult(stdout);
@@ -336,7 +345,8 @@ export class HerdrSessionManager {
           : undefined) ?? panes.find((candidate) => candidate.label === meta.name);
       const tabLabel = pane?.tabId != null ? tabLabels.get(pane.tabId) : undefined;
       const displayTitle =
-        alive && tabLabel !== undefined && tabLabel !== meta.name && tabLabel.length > 0
+        alive && tabLabel !== undefined && tabLabel !== meta.name && tabLabel.length > 0 &&
+        !isDefaultHerdrTabLabel(tabLabel)
           ? tabLabel
           : undefined;
       infos.push({

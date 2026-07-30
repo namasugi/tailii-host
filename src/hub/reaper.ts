@@ -25,7 +25,7 @@ import {
   removeHeartbeat,
   writeHeartbeat,
 } from "../sessions/heartbeat.js";
-import { HerdrSessionManager } from "../backend/herdr.js";
+import { HerdrSessionManager, isDefaultHerdrTabLabel } from "../backend/herdr.js";
 import type { SessionInfo } from "../protocol.js";
 import { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
 import { ClaudeSessionStore, transcriptTitle } from "../sessions/claudeSessionStore.js";
@@ -256,10 +256,10 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
     }
 
     // --- 未命名タブへ会話タイトルを自動反映（session-title, claude のみ）---
-    // タブラベルが未命名（null / 空 / セッション名のまま）の生存セッションだけを対象に、
-    // transcript の会話タイトル（明示タイトル custom-title/ai-title 優先 = 一覧と同じ導出
-    // transcriptTitle）をタブへ書く。命名済み（ラベル ≠ セッション名）は手動を優先して
-    // 触らない。空ラベルも未命名扱い（herdr 既定表示のタブを取り込むため）。
+    // タブラベルが未命名（null / 空 / セッション名 / 0.7.5 tab create の既定連番 "1"…）の
+    // 生存セッションだけを対象に、transcript の会話タイトル（明示タイトル custom-title/
+    // ai-title 優先 = 一覧と同じ導出 transcriptTitle）をタブへ書く。
+    // 命名済み（それ以外のラベル）は手動を優先して触らない。
     if (herdrLive.length > 0 &&
         herdrOps.tabInfoByName !== undefined && herdrOps.setDisplayTitle !== undefined) {
       const deriveTitle = options.deriveClaudeTitle ?? defaultDeriveClaudeTitle;
@@ -272,7 +272,9 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
           if (meta.claudeSessionId === undefined) continue;
           const info = tabInfo.get(name);
           if (info === undefined) continue;
-          const unnamed = info.label === null || info.label === "" || info.label === name;
+          const unnamed =
+            info.label === null || info.label === "" || info.label === name ||
+            isDefaultHerdrTabLabel(info.label);
           if (!unnamed) continue; // 命名済みは触らない
           const title = deriveTitle(meta.claudeSessionId);
           if (title === null || title.length === 0) continue;

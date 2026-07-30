@@ -183,22 +183,26 @@ describe("HerdrSessionManager", () => {
     ]);
   });
 
-  test("list はタブラベルがセッション名と異なるときだけ displayTitle を載せる（逆方向同期）", async () => {
+  test("list はタブラベルがセッション名/既定連番と異なるときだけ displayTitle を載せる（逆方向同期）", async () => {
     const store = makeStore();
     store.put({ name: "s-titled", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
     store.put({ name: "s-plain", cwd: "/b", createdAt: 2, backend: "herdr", herdrPaneId: "w4:p3" });
-    store.put({ name: "s-dead", cwd: "/c", createdAt: 3, backend: "herdr", herdrPaneId: "w4:p9" });
+    store.put({ name: "s-default", cwd: "/c", createdAt: 3, backend: "herdr", herdrPaneId: "w4:p4" });
+    store.put({ name: "s-dead", cwd: "/d", createdAt: 4, backend: "herdr", herdrPaneId: "w4:p9" });
     const runner = new MockHerdrRunner((args) => {
       if (args[0] === "pane" && args[1] === "list") {
         return herdrOk(paneListJson([
           { pane_id: "w4:p2", label: "s-titled", tab_id: "w4:t2" },
           { pane_id: "w4:p3", label: "s-plain", tab_id: "w4:t3" },
+          { pane_id: "w4:p4", label: "s-default", tab_id: "w4:t4" },
         ]));
       }
       if (args[0] === "tab" && args[1] === "list") {
         return herdrOk(tabListJson([
           { tab_id: "w4:t2", label: "認証バグの調査" },
           { tab_id: "w4:t3", label: "s-plain" },
+          // 0.7.5 tab create の既定連番ラベル → 人為リネームではないので載せない。
+          { tab_id: "w4:t4", label: "7" },
         ]));
       }
       return herdrOk("");
@@ -207,6 +211,7 @@ describe("HerdrSessionManager", () => {
     const infos = await manager.list();
     expect(infos.find((info) => info.name === "s-titled")?.displayTitle).toBe("認証バグの調査");
     expect(infos.find((info) => info.name === "s-plain")?.displayTitle).toBeUndefined();
+    expect(infos.find((info) => info.name === "s-default")?.displayTitle).toBeUndefined();
     expect(infos.find((info) => info.name === "s-dead")?.displayTitle).toBeUndefined();
   });
 

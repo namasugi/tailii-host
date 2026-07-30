@@ -286,10 +286,11 @@ describe("reaperTick herdr backend", () => {
     const store = makeTempStore();
     store.put({ name: "s-unnamed", cwd: "/w", createdAt: 1, backend: "herdr", claudeSessionId: "conv-1" });
     store.put({ name: "s-empty", cwd: "/w", createdAt: 1, backend: "herdr", claudeSessionId: "conv-4" });
+    store.put({ name: "s-default", cwd: "/w", createdAt: 1, backend: "herdr", claudeSessionId: "conv-5" });
     store.put({ name: "s-named", cwd: "/w", createdAt: 1, backend: "herdr", claudeSessionId: "conv-2" });
     store.put({ name: "s-codex", cwd: "/w", createdAt: 1, backend: "herdr", agent: "codex", providerSessionId: "th-1" });
     store.put({ name: "s-notitle", cwd: "/w", createdAt: 1, backend: "herdr", claudeSessionId: "conv-3" });
-    const names = ["s-codex", "s-empty", "s-named", "s-notitle", "s-unnamed"];
+    const names = ["s-codex", "s-default", "s-empty", "s-named", "s-notitle", "s-unnamed"];
     for (const name of names) writeHeartbeat(dir, name, { ts: NOW - 10, state: "idle" });
     const renamed: [string, string | null][] = [];
     const ops: import("../src/hub/reaper.js").HerdrReaperOps = {
@@ -300,8 +301,9 @@ describe("reaperTick herdr backend", () => {
       tabInfoByName: async () =>
         new Map([
           ["s-unnamed", { tabId: "w1:t1", label: "s-unnamed" }],
-          // 空ラベル（herdr 既定表示のタブ）も未命名として取り込む。
+          // 空ラベル・0.7.5 tab create の既定連番ラベルも未命名として取り込む。
           ["s-empty", { tabId: "w1:t5", label: "" }],
+          ["s-default", { tabId: "w1:t6", label: "12" }],
           ["s-named", { tabId: "w1:t2", label: "認証バグの調査" }],
           ["s-codex", { tabId: "w1:t3", label: "s-codex" }],
           ["s-notitle", { tabId: "w1:t4", label: "s-notitle" }],
@@ -319,11 +321,17 @@ describe("reaperTick herdr backend", () => {
       now: NOW,
       herdrOps: ops,
       deriveClaudeTitle: (sessionId) =>
-        sessionId === "conv-1" ? "最初の発話タイトル" : sessionId === "conv-4" ? "空ラベル側" : null,
+        sessionId === "conv-1" ? "最初の発話タイトル"
+          : sessionId === "conv-4" ? "空ラベル側"
+          : sessionId === "conv-5" ? "連番ラベル側" : null,
     });
 
-    // 未命名（ラベル==セッション名 or 空）かつ claude かつタイトル導出可のものだけ反映される。
-    expect(renamed).toEqual([["s-empty", "空ラベル側"], ["s-unnamed", "最初の発話タイトル"]]);
+    // 未命名（ラベル==セッション名 / 空 / 既定連番）かつ claude かつタイトル導出可のものだけ反映される。
+    expect(renamed).toEqual([
+      ["s-default", "連番ラベル側"],
+      ["s-empty", "空ラベル側"],
+      ["s-unnamed", "最初の発話タイトル"],
+    ]);
   });
 
   test("herdr セッションも idle timeout 超過で pane close(kill) される", async () => {
