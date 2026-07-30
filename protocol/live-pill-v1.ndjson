@@ -1,0 +1,5 @@
+{"id":"lp11aa00-0000-0000-0000-0000000000e1","type":"claude_session_list_request","v":2}
+{"claudeSessions":[{"cwd":"/Users/alice/Documents/ClaudeCode/code0630","lastMessage":"テストは全件緑です。次はデプロイに進みます。","liveSessionBackend":"tmux","liveSessionName":"cs-11111111","sessionId":"11111111-2222-3333-4444-555555555555","title":"最初の会話","updatedAt":1720100000},{"agent":"codex","cwd":"/Users/alice/other","liveSessionBackend":"herdr","liveSessionName":"s-d835de40","sessionId":"22222222-3333-4444-5555-666666666666","title":"3f2a1b0c","updatedAt":1720099000},{"cwd":"/Users/alice/archive","sessionId":"33333333-4444-5555-6666-777777777777","title":"停止中の会話","updatedAt":1720098000}],"id":"lp11aa00-0000-0000-0000-0000000000e1","liveSessionsResolved":true,"type":"claude_session_list_response","v":2}
+{"claudeSessions":[{"cwd":"/Users/alice/archive","sessionId":"33333333-4444-5555-6666-777777777777","title":"停止中の会話","updatedAt":1720098000}],"id":"lp11aa00-0000-0000-0000-0000000000e2","type":"claude_session_list_response","v":2}
+{"alive":false,"session":"cs-11111111","type":"session_liveness_event","v":2}
+{"alive":false,"session":"s-d835de40","type":"session_liveness_event","v":2}

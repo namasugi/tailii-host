@@ -657,6 +657,13 @@ export class SessionHub {
 
   /** tmux セッションの確定 kill に追従し、同名で将来作られる会話へ状態を持ち越さない。 */
   private retireSession(session: string, reason = "Session was retired"): void {
+    // live-pill Phase 2: 一覧 watcher へ死亡を push する（iOS は「一覧を取り直せ」の合図として使う）。
+    // ここは tick の killed/demoted/reclaimed と engine 発 kill が集まる全死亡経路の合流点。
+    // actor 不在（購読も処理もされないまま外部で死んだ会話）でも一覧の表示は古くなるため、
+    // 下の early return より前で送る。誕生イベントは出さない（一覧は起動時に自分で取り直す）。
+    for (const watcher of this.previewWatchers) {
+      this.sendTo(watcher, { type: "conversation_liveness", session, alive: false });
+    }
     const actor = this.actors.get(session);
     if (actor === undefined) return;
 

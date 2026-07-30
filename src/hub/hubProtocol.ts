@@ -59,6 +59,12 @@ export type HubServerMessage =
     }
   | { type: "conversation_pane_preview"; session: string; payload: ControlMessage }
   | { type: "conversation_mode"; session: string; payload: ControlMessage }
+  /**
+   * セッションの死亡通知（hub→engine, live-pill Phase 2）。retireSession（tick の
+   * killed/demoted/reclaimed と engine 発 kill の集約点）から一覧 watcher へだけ送る。
+   * 誕生イベントは出さない割り切りのため `alive` は常に false。
+   */
+  | { type: "conversation_liveness"; session: string; alive: false }
   | { type: "question_answer_result"; id: string; status: "accepted" | "already_resolved" | "unknown" }
   | { type: "input_claim_result"; id: string; status: "granted" | "duplicate" }
   | { type: "codex_turn_result"; id: string; status: "started" | "duplicate" | "failed"; error?: string }
@@ -272,6 +278,13 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
     if (payload === null) return null;
     return payload.type === "subagent_transcript_response" && payload.id === id
       ? { type: record["type"], id, session, payload }
+      : null;
+  }
+  if (record["type"] === "conversation_liveness") {
+    // live-pill Phase 2: 死亡だけを配る（alive:true は送らない設計上の割り切り）。
+    const session = record["session"];
+    return typeof session === "string" && session.length > 0 && record["alive"] === false
+      ? { type: "conversation_liveness", session, alive: false }
       : null;
   }
   if (record["type"] === "conversation_event" || record["type"] === "conversation_pane_preview" ||

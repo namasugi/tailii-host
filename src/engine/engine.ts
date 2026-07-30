@@ -614,6 +614,20 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
         catch (error) { process.stderr.write(`[tailii-host engine] pane_preview 書込失敗: ${String(error)}\n`); }
         return;
       }
+      if (message.type === "conversation_liveness") {
+        // live-pill Phase 2: 一覧 watch 中のみ「稼働中ピルを外して一覧を取り直せ」を送る。
+        // 前面会話の例外は要らない（チャット面は自身の生存を別経路で知る）。
+        if (!listPreviewWatch.enabled) return;
+        try {
+          writer.write({
+            type: "session_liveness_event", v: state.negotiatedVersion,
+            session: message.session, alive: message.alive,
+          });
+        } catch (error) {
+          process.stderr.write(`[tailii-host engine] session_liveness_event 書込失敗: ${String(error)}\n`);
+        }
+        return;
+      }
       if (message.type === "conversation_mode") {
         // tmux 側で切り替わった permission mode の現況通知（mode_set_response 形式）。
         if (message.session !== activeChatSession.name) return;

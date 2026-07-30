@@ -8,6 +8,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { HubServerMessage } from "../../hub/hubProtocol.js";
 import { PROTOCOL_V2, type ControlMessage } from "../../protocol.js";
+import {
+  annotateLiveSessions,
+  buildLiveSessionIndex,
+} from "../../sessions/liveSessionJoin.js";
 import { searchClaudeSessions } from "../../sessions/sessionSearch.js";
 import { engineDiag, subscribeConversation, writeError, type HandlerRegistry } from "../context.js";
 
@@ -149,12 +153,28 @@ export const conversationHandlers: HandlerRegistry = {
       if (l !== r) return r - l;
       return lhs.sessionId < rhs.sessionId ? -1 : lhs.sessionId > rhs.sessionId ? 1 : 0;
     });
+    // live-pill: 生存セッションを 1 回だけ列挙し、会話 id + agent で各行へ join する。
+    // 失敗時は annotate なしで返し、`liveSessionsResolved` も載せない（嘘の「全停止」を出さない）。
+    let annotated = sessions;
+    let liveResolved = false;
+    try {
+      const live = await ctx.sessionManager.list();
+      const index = buildLiveSessionIndex(
+        live, (name) => ctx.metadataStore?.get(name)?.createdAt ?? null,
+      );
+      annotated = annotateLiveSessions(sessions, index);
+      liveResolved = true;
+      engineDiag(`claude_session_list live join count=${index.size}`);
+    } catch (error) {
+      engineDiag(`claude_session_list live join 失敗: ${String(error)}`);
+    }
     engineDiag(
-      `claude_session_list_response id=${message.id} count=${sessions.length}`,
+      `claude_session_list_response id=${message.id} count=${sessions.length} liveResolved=${liveResolved}`,
     );
     try {
       writer.write({
-        type: "claude_session_list_response", v, id: message.id, claudeSessions: sessions,
+        type: "claude_session_list_response", v, id: message.id, claudeSessions: annotated,
+        ...(liveResolved ? { liveSessionsResolved: true } : {}),
       });
     } catch (error) {
       process.stderr.write(

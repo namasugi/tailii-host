@@ -86,6 +86,13 @@ describe("golden roundtrip", () => {
     }
   });
 
+  it("live-pill v1 golden 全行が byte-exact でラウンドトリップする", () => {
+    for (const line of goldenLines("live-pill-v1.ndjson")) {
+      const decoded = decodeControlMessage(line);
+      expect(encodeControlMessage(decoded)).toBe(line);
+    }
+  });
+
   it("v2 golden 全行が byte-exact でラウンドトリップする", () => {
     for (const line of goldenLines("approval-protocol-v2.ndjson")) {
       const decoded = decodeControlMessage(line);
@@ -103,6 +110,57 @@ describe("golden roundtrip", () => {
 });
 
 describe("decode 詳細", () => {
+  it("live-pill: annotate 入り一覧応答の生存セッション欄と resolved マーカーを復元する", () => {
+    const resolved = decodeControlMessage(
+      '{"claudeSessions":[{"cwd":"/w","liveSessionBackend":"herdr","liveSessionName":"s-d835de40","sessionId":"c1","title":"t"},{"cwd":"/w","sessionId":"c2","title":"t"}],"id":"r1","liveSessionsResolved":true,"type":"claude_session_list_response","v":2}',
+    );
+    expect(resolved).toMatchObject({
+      type: "claude_session_list_response",
+      liveSessionsResolved: true,
+      claudeSessions: [
+        { sessionId: "c1", liveSessionName: "s-d835de40", liveSessionBackend: "herdr" },
+        { sessionId: "c2" },
+      ],
+    });
+    // 停止中の行には生存セッション欄が生えない（キー自体が存在しない）。
+    const rows = (resolved as Extract<typeof resolved, { type: "claude_session_list_response" }>).claudeSessions;
+    expect(Object.hasOwn(rows[1]!, "liveSessionName")).toBe(false);
+
+    // 旧 host 相当（マーカーなし）は undefined のまま = iOS は従来 join へフォールバックする。
+    const legacy = decodeControlMessage(
+      '{"claudeSessions":[{"cwd":"/w","sessionId":"c1","title":"t"}],"id":"r2","type":"claude_session_list_response","v":2}',
+    );
+    expect(Object.hasOwn(legacy, "liveSessionsResolved")).toBe(false);
+  });
+
+  it("live-pill: liveSessionName の無い backend 欄と不正な backend 値は捨てる", () => {
+    const orphanBackend = decodeControlMessage(
+      '{"claudeSessions":[{"cwd":"/w","liveSessionBackend":"herdr","sessionId":"c1","title":"t"}],"id":"r3","type":"claude_session_list_response","v":2}',
+    );
+    const orphanRows = (orphanBackend as Extract<typeof orphanBackend, {
+      type: "claude_session_list_response";
+    }>).claudeSessions;
+    expect(Object.hasOwn(orphanRows[0]!, "liveSessionBackend")).toBe(false);
+
+    const bogusBackend = decodeControlMessage(
+      '{"claudeSessions":[{"cwd":"/w","liveSessionBackend":"screen","liveSessionName":"s-1","sessionId":"c1","title":"t"}],"id":"r4","type":"claude_session_list_response","v":2}',
+    );
+    const bogusRows = (bogusBackend as Extract<typeof bogusBackend, {
+      type: "claude_session_list_response";
+    }>).claudeSessions;
+    expect(bogusRows[0]).toMatchObject({ liveSessionName: "s-1" });
+    expect(Object.hasOwn(bogusRows[0]!, "liveSessionBackend")).toBe(false);
+  });
+
+  it("live-pill: session_liveness_event をラウンドトリップし、alive 欠落は拒否する", () => {
+    const line = '{"alive":false,"session":"cs-11111111","type":"session_liveness_event","v":2}';
+    const decoded = decodeControlMessage(line);
+    expect(decoded).toMatchObject({ type: "session_liveness_event", session: "cs-11111111", alive: false });
+    expect(encodeControlMessage(decoded)).toBe(line);
+    expect(() => decodeControlMessage('{"session":"cs-1","type":"session_liveness_event","v":2}'))
+      .toThrow(ProtocolDecodeError);
+  });
+
   it("official app の状態・操作を型付きでラウンドトリップする", () => {
     const status = decodeControlMessage(
       '{"canOpen":true,"canStart":false,"id":"s","launchUrl":"https://claude.ai/code/abc","provider":"claude","state":"active","type":"official_app_status_response","v":2,"version":"2.1.218"}',

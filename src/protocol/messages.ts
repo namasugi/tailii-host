@@ -96,6 +96,14 @@ export interface ClaudeSessionInfo {
   agent?: "claude" | "codex";
   /** 最終 user/assistant メッセージの 1 行スニペット（一覧プレビュー, list-preview）。 */
   lastMessage?: string;
+  /**
+   * この会話を収容している生存セッション名（live-pill）。生存セッションが在るときのみ載る。
+   * `liveSessionsResolved` が true の応答では **不在 = 停止中の確定** を意味する。
+   * 複数 pane が同じ会話を掴んでいる場合の選択規則は docs/resilient-chat-sync.md §7.4。
+   */
+  liveSessionName?: string;
+  /** `liveSessionName` を収容する端末バックエンド（live-pill）。liveSessionName と同時にのみ載る。 */
+  liveSessionBackend?: TerminalBackendKind;
 }
 
 /** session_search_response の 1 検索結果。 */
@@ -305,6 +313,11 @@ export type ControlMessage =
     }
   /** 一覧 Mission Control: 有効な間、処理中会話すべての pane_preview を配信する（iOS→host）。 */
   | { type: "session_preview_watch"; v: number; enabled: boolean }
+  /**
+   * セッションの死亡通知（host→iOS, live-pill Phase 2）。一覧 watch 有効中のクライアントにだけ
+   * 送る「一覧を取り直せ」の合図。誕生イベントは出さない（`alive` は常に false）。
+   */
+  | { type: "session_liveness_event"; v: number; session: string; alive: boolean }
   | { type: "pane_choice_send"; v: number; id: string; session: string; key: string }
   | { type: "pane_choice_send_result"; v: number; id: string; ok: boolean; error: string | null }
   | { type: "pane_key_send"; v: number; id: string; session: string; key: string }
@@ -355,7 +368,16 @@ export type ControlMessage =
   | { type: "git_worktree_remove_request"; v: number; id: string; path: string; force: boolean }
   | { type: "git_worktree_remove_response"; v: number; id: string; ok: boolean; error: string | null }
   | { type: "claude_session_list_request"; v: number; id: string }
-  | { type: "claude_session_list_response"; v: number; id: string; claudeSessions: ClaudeSessionInfo[] }
+  | {
+      type: "claude_session_list_response"; v: number; id: string; claudeSessions: ClaudeSessionInfo[];
+      /**
+       * 生存セッションの join 済みを表す新旧判別マーカー（live-pill, additive）。
+       * 新 host は join できたときだけ常に true を載せ、旧 host は載せない。
+       * true のとき各行の `liveSessionName` 不在は「停止中の確定」を意味し、
+       * 不在のとき iOS は従来の `session_list_request` との join へフォールバックする。
+       */
+      liveSessionsResolved?: boolean;
+    }
   | { type: "dir_create_request"; v: number; id: string; baseDir: string; relative: string }
   | { type: "dir_create_response"; v: number; id: string; path: string; ok: boolean }
   | { type: "session_search_request"; v: number; id: string; query: string; limit?: number }

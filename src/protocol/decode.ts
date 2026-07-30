@@ -490,6 +490,13 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
     case "session_preview_watch":
       return { type, v, enabled: requireBoolean(raw, "enabled") };
 
+    case "session_liveness_event":
+      return {
+        type, v,
+        session: requireString(raw, "session"),
+        alive: requireBoolean(raw, "alive"),
+      };
+
     case "pane_choice_send":
     case "pane_key_send":
       return {
@@ -779,7 +786,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
       };
 
     case "claude_session_list_response":
-      return {
+      return compact({
         type, v,
         id: requireString(raw, "id"),
         claudeSessions: requireArray(raw, "claudeSessions").map((element) => {
@@ -787,6 +794,13 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
           const rawSessionAgent = optionalString(obj, "agent");
           const sessionAgent =
             rawSessionAgent === "codex" || rawSessionAgent === "claude" ? rawSessionAgent : undefined;
+          // live-pill: 生存セッション名が権威。バックエンドは名前があるときの enum のみ採る。
+          const liveSessionName = optionalString(obj, "liveSessionName");
+          const rawLiveBackend = optionalString(obj, "liveSessionBackend");
+          const liveSessionBackend =
+            liveSessionName !== undefined && (rawLiveBackend === "tmux" || rawLiveBackend === "herdr")
+              ? rawLiveBackend
+              : undefined;
           return compact<ClaudeSessionInfo>({
             sessionId: requireString(obj, "sessionId"),
             cwd: requireString(obj, "cwd"),
@@ -794,9 +808,12 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
             updatedAt: optionalNumber(obj, "updatedAt"),
             agent: sessionAgent,
             lastMessage: optionalString(obj, "lastMessage"),
+            liveSessionName,
+            liveSessionBackend,
           });
         }),
-      };
+        liveSessionsResolved: optionalBoolean(raw, "liveSessionsResolved"),
+      });
 
     case "dir_create_request":
       return {
