@@ -722,6 +722,63 @@ describe("SessionHub actor", () => {
     await vi.waitFor(() => expect(hub.hasInjectionsInFlight).toBe(false));
   });
 
+  test("設問注入が失敗したら pendingQuestion を復元し prompt を再配信する（詰み防止）", async () => {
+    let reject!: (error: Error) => void;
+    const injectionGate = new Promise<void>((_resolve, doReject) => { reject = doReject; });
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-question-restore"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800,
+      questionInjector: async () => { await injectionGate; } });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    const questions = [{ header: "h", question: "q", options: [], multiSelect: false }];
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q1", questions });
+    hub.handleClientMessage(client, JSON.stringify({ type: "question_answer_submit", id: "a",
+      session: "work", questionId: "q1",
+      answers: [{ questionIndex: 0, selectedOptionIndexes: [0], multiSelect: false }] }));
+    // 受理時点で pending は clear（first-wins）。
+    expect(hub.actors.get("work")?.pendingQuestion).toBeNull();
+    reject(new Error("AskUserQuestion dialog still visible after key injection"));
+    // 注入失敗 → pending 復元 + prompt 再配信（アプリはシートを再提示し再回答できる）。
+    await vi.waitFor(() => expect(hub.actors.get("work")?.pendingQuestion?.id).toBe("q1"));
+    const prompts = received.filter((message) =>
+      (message as { type?: string; event?: string }).type === "question_event" &&
+      (message as { event?: string }).event === "prompt");
+    expect(prompts).toHaveLength(2);
+    expect(prompts.at(-1)).toMatchObject({ id: "q1", session: "work", questions });
+  });
+
+  test("設問の再提示は1回まで・以降は保持+会話内エラー通知", async () => {
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-question-restore-once"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800,
+      questionInjector: async () => { throw new Error("AskUserQuestion dialog still visible after key injection"); } });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "conversation_subscribe", session: "work" }));
+    const countPrompts = () => received.filter((message) =>
+      (message as { type?: string; event?: string }).type === "question_event" &&
+      (message as { event?: string }).event === "prompt").length;
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q1",
+      questions: [{ header: "h", question: "q", options: [], multiSelect: false }] });
+    const answer = [{ questionIndex: 0, selectedOptionIndexes: [0], multiSelect: false }];
+    hub.handleClientMessage(client, JSON.stringify({ type: "question_answer_submit", id: "a",
+      session: "work", questionId: "q1", answers: answer }));
+    // 1回目の失敗 → 復元 + prompt 再配信。
+    await vi.waitFor(() => expect(hub.actors.get("work")?.pendingQuestion?.id).toBe("q1"));
+    expect(countPrompts()).toBe(2);
+    // 復元済み設問への再回答が再び失敗しても、prompt の再配信はしない（再提示ループ防止）。
+    // ただし pendingQuestion は保持し続ける（会話を開き直せば設問が再提示される権威）。
+    hub.handleClientMessage(client, JSON.stringify({ type: "question_answer_submit", id: "b",
+      session: "work", questionId: "q1", answers: answer }));
+    await vi.waitFor(() => expect(hub.hasInjectionsInFlight).toBe(false));
+    await vi.waitFor(() => expect(hub.actors.get("work")?.pendingQuestion?.id).toBe("q1"));
+    expect(countPrompts()).toBe(2);
+    // 2回目以降は会話内 system メッセージで状況を伝える。
+    await vi.waitFor(() => expect(received).toContainEqual(expect.objectContaining({
+      type: "conversation_event", session: "work",
+      payload: expect.objectContaining({ streamId: "question-inject-error-q1", role: "system" }),
+    })));
+  });
+
   test("input_claim は重複を拒否し200件を超えると古いIDを捨てる", () => {
     const { hub } = makeHub();
     const client = {}, received: unknown[] = [];

@@ -6,6 +6,26 @@ import { sleep } from "../shared/sleep.js";
 import type { SessionBackend } from "../backend/sessionBackend.js";
 
 const KEY_STEP_MS = 150;
+/** 注入完了からダイアログ消滅検証までの猶予（TUI の再描画待ち）。 */
+const VERIFY_DELAY_MS = 600;
+/** 1回目の検証でダイアログ残存だったときの再検証までの猶予。 */
+const VERIFY_RETRY_DELAY_MS = 1_500;
+
+/**
+ * AskUserQuestion ダイアログのフレームか。`Enter to select` は /remote-control 等の
+ * ❯ メニューにも出るため、設問 TUI 固有の要素（質問タブ・回答レビュー・notes 等）との
+ * AND で判定する（承認ダイアログは Enter to select を含まないので対象外）。
+ */
+export function isQuestionDialogFrame(text: string): boolean {
+  if (!text.includes("Enter to select")) return false;
+  return (
+    text.includes("Tab to switch questions") ||
+    text.includes("Ready to submit your answers?") ||
+    text.includes("Chat about this") ||
+    text.includes("Type something.") ||
+    text.includes("to add notes")
+  );
+}
 
 /**
  * question_answer → Claude AskUserQuestion TUI のキー操作。
@@ -79,5 +99,25 @@ export async function injectQuestionAnswers(
     // 複数設問または複数選択では、最後に必ず回答レビュー画面を経由する。
     // 「Ready to submit your answers?」で 1. Submit answers を確定する。
     await sessionManager.sendKeys(session, ["1"]);
+  }
+  // 注入は TUI への open-loop キー操作で、キーが取りこぼされても各コマンドは exit 0 のまま
+  // 静かに失敗する。ダイアログが閉じたかを pane で検証し、残存なら throw して呼び出し側
+  // （hub）に pendingQuestion の復元と prompt 再配信をさせる（詰み防止, question-answer-retry）。
+  await sleep(VERIFY_DELAY_MS);
+  if (!(await questionDialogStillVisible(session, sessionManager))) return;
+  await sleep(VERIFY_RETRY_DELAY_MS);
+  if (await questionDialogStillVisible(session, sessionManager)) {
+    throw new Error("AskUserQuestion dialog still visible after key injection");
+  }
+}
+
+/** pane 読取失敗は「検証不能」= 残存扱いにしない（誤復元でユーザーを二重回答に誘導しない）。 */
+async function questionDialogStillVisible(
+  session: string, sessionManager: SessionBackend,
+): Promise<boolean> {
+  try {
+    return isQuestionDialogFrame(await sessionManager.capturePane(session, { lines: 40 }));
+  } catch {
+    return false;
   }
 }

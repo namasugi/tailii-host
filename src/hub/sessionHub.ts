@@ -111,6 +111,8 @@ interface SessionActor {
     id: string;
     questions: QuestionPromptQuestion[];
     answerRoute: "tui" | "codex_native";
+    /** 注入失敗の自己修復で復元済みか。復元は毎回だが prompt 再配信は1回まで（再提示ループ防止）。 */
+    restoredAfterInjectionFailure?: boolean;
   } | null;
   processingSince: number | null;
   focusedBy: Set<object>;
@@ -401,6 +403,8 @@ export class SessionHub {
       } else {
         // first-wins の判定と clear は await を挟まず同期的に行い、勝者だけが注入する。
         const answerRoute = actor.pendingQuestion.answerRoute;
+        // 注入失敗時の復元用スナップショット（clear 前に取る）。
+        const restoreSnapshot: PendingQuestion = actor.pendingQuestion;
         this.setPendingQuestion(message.session, actor, null);
         this.broadcast({ type: "question_event", session: message.session, event: "dismiss", id: message.questionId });
         this.sendTo(client, { type: "question_answer_result", id: message.id, status: "accepted" });
@@ -414,7 +418,35 @@ export class SessionHub {
         } else {
           this.injectionsInFlight += 1;
           void (this.options.questionInjector?.(message.answers, message.session) ?? Promise.resolve())
-            .catch((error) => this.options.log?.(`設問回答注入失敗: ${String(error)}`))
+            .catch((error) => {
+              this.options.log?.(`設問回答注入失敗: ${String(error)}`);
+              // 自己修復（question-answer-retry）: pendingQuestion を失ったまま TUI ダイアログが
+              // 残ると、アプリから再回答する手段が無く会話が詰む。失敗の度に必ず復元し、
+              // 「host が設問で止まっている」の権威を保つ（会話を開き直せば emitPendingQuestion が
+              // question_prompt を再送し、設問シートが再提示される）。新しい設問が既に来ていれば触らない。
+              // prompt の再配信（能動的な再提示）は設問ごとに1回まで: 構造的に注入が通らない
+              // ダイアログで「再提示→失敗」を無限に繰り返さない。2回目以降は会話内に
+              // system メッセージで状況を伝え、TUI/Mac 側での解消へ倒す。
+              if (this.actors.get(message.session) === actor && actor.pendingQuestion === null) {
+                const firstFailure = restoreSnapshot.restoredAfterInjectionFailure !== true;
+                this.setPendingQuestion(message.session, actor,
+                  { ...restoreSnapshot, restoredAfterInjectionFailure: true });
+                if (firstFailure) {
+                  this.broadcast({
+                    type: "question_event", session: message.session, event: "prompt",
+                    id: restoreSnapshot.id, questions: restoreSnapshot.questions,
+                  });
+                } else {
+                  // publishCodexMarker は名前こそ codex 由来だが、実体は汎用の
+                  // chat_output(system) マーカー発行なのでそのまま使う。
+                  this.publishCodexMarker(
+                    message.session,
+                    `question-inject-error-${restoreSnapshot.id}`,
+                    "⚠️ 設問回答の反映に失敗しました。会話を開き直して再回答するか、Mac 側の画面で回答してください。",
+                  );
+                }
+              }
+            })
             .finally(() => {
               this.injectionsInFlight -= 1;
               void this.drainChatQueue(message.session, actor);

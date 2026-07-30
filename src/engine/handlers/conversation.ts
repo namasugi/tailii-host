@@ -90,8 +90,13 @@ export const conversationHandlers: HandlerRegistry = {
       if (result.status === "accepted") {
         writer.write({ type: "remote_pending_cleared", v, id: message.id,
           session: message.session, kind: "question" });
+      } else if (result.status === "already_resolved") {
+        // 送信失敗（要リトライ）と区別できるコードで返す。iOS はこのコードでは
+        // 設問シートを復元しない（他所で回答済みの正常系, question-answer-retry）。
+        writeError(writer, v, message.id, "question_already_answered", "この設問は既に回答済みです。");
       } else {
-        writeError(writer, v, message.id, "question_answer_failed", "この設問は既に回答済みです。");
+        writeError(writer, v, message.id, "question_answer_failed",
+          "設問が見つかりませんでした。時間をおいて再試行してください。");
       }
     } catch (error) {
       writeError(writer, v, message.id, "question_answer_failed", String(error));

@@ -1778,7 +1778,7 @@ describe("EngineControl — 横断制御チャネル", () => {
 
   // MARK: question_answer → tmux send-keys 変換
 
-  test("question_answer の already_resolved は既存 error 封筒で返す", async () => {
+  test("question_answer の already_resolved は復元不要を示す専用コードで返す", async () => {
     const runner = new MockTmuxRunner(() => ok(""));
     const manager = makeManager(runner);
     const hub = makeQuestionHub(manager, "answered");
@@ -1789,8 +1789,9 @@ describe("EngineControl — 横断制御チャネル", () => {
     const engine = startEngine({ sessionManager: manager, hub });
     await engine.lines.nextOfType("channel_hello");
     engine.writeLine('{"answers":[],"id":"answered","session":"work","type":"question_answer","v":1}');
+    // 送信失敗（question_answer_failed = iOS がシートを復元して再回答を促す）と区別する。
     expect(decodeControlMessage(await engine.lines.nextOfType("error"))).toMatchObject({
-      id: "answered", code: "question_answer_failed", message: "この設問は既に回答済みです。",
+      id: "answered", code: "question_already_answered", message: "この設問は既に回答済みです。",
     });
     await engine.teardown();
   });
