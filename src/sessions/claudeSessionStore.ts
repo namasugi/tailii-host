@@ -13,6 +13,8 @@ import { isInjectedSkillContent } from "../shared/skillInjection.js";
 
 /** タイトル抽出の最大長（先頭 ~60 字）。 */
 const TITLE_MAX_LENGTH = 60;
+/** 明示タイトル（custom-title / ai-title）の受け入れ上限（コードポイント数）。 */
+const EXPLICIT_TITLE_MAX_LENGTH = 100;
 /** 最終メッセージプレビューの最大長（一覧行の 1 行スニペット, list-preview）。 */
 const LAST_MESSAGE_MAX_LENGTH = 80;
 /** cwd/title を探すためにスキャンする最大行数。 */
@@ -119,8 +121,19 @@ export function lastConversationTimestamp(filePath: string): number | null {
   return scanTranscriptTail(filePath).updatedAt;
 }
 
-/** 末尾後方スキャンの結果（最終会話時刻 + 最終メッセージのスニペット）。 */
-export interface TranscriptTailSummary {
+/**
+ * transcript 内の明示タイトルエントリの観測結果。
+ * `custom-title` は CLI の `/rename` / hook の sessionTitle 出力、`ai-title` は
+ * CLI 内蔵の AI タイトル生成（公式アプリ/IDE 接続時に発火）が書く。
+ * undefined = 未出現 / null = 解除（空文字エントリ）/ string = 設定値。
+ */
+export interface TranscriptTitleEntries {
+  customTitle?: string | null;
+  aiTitle?: string | null;
+}
+
+/** 末尾後方スキャンの結果（最終会話時刻 + 最終メッセージのスニペット + 明示タイトル）。 */
+export interface TranscriptTailSummary extends TranscriptTitleEntries {
   updatedAt: number | null;
   lastMessage: string | null;
 }
@@ -141,11 +154,15 @@ export function scanTranscriptTail(filePath: string): TranscriptTailSummary {
   }
   let updatedAt: number | null = null;
   let lastMessage: string | null = null;
+  const titles: TranscriptTitleEntries = {};
+  const summary = (): TranscriptTailSummary => ({ updatedAt, lastMessage, ...titles });
   try {
     const size = fs.fstatSync(fd).size;
     const maxSpan = Math.min(size, TAIL_BYTES_CAP);
     let span = 0;
-    while (span < maxSpan) {
+    let scannedAll = false;
+    let done = false;
+    while (!done && span < maxSpan) {
       span = Math.min(span + TAIL_CHUNK_BYTES, maxSpan);
       const buf = Buffer.alloc(span);
       const bytesRead = fs.readSync(fd, buf, 0, span, size - span);
@@ -155,24 +172,77 @@ export function scanTranscriptTail(filePath: string): TranscriptTailSummary {
       for (let i = lines.length - 1; i >= first; i--) {
         const rec = parseEntry(lines[i] ?? "");
         if (rec === null) continue;
+        // 後方スキャンなので最初に出会ったタイトルエントリ = ファイル内で最新。
+        if (titles.customTitle === undefined && rec["type"] === "custom-title") {
+          titles.customTitle = normalizeExplicitTitle(rec["customTitle"]);
+        }
+        if (titles.aiTitle === undefined && rec["type"] === "ai-title") {
+          titles.aiTitle = normalizeExplicitTitle(rec["aiTitle"]);
+        }
         if (updatedAt === null) updatedAt = entryTimestamp(rec);
         if (lastMessage === null && (rec["type"] === "user" || rec["type"] === "assistant")) {
           lastMessage = extractMessageText(rec, LAST_MESSAGE_MAX_LENGTH);
         }
         if (updatedAt !== null && lastMessage !== null) {
-          return { updatedAt, lastMessage };
+          done = true;
+          break;
         }
       }
       // 全読みして timestamp 無し = 会話エントリなし（状態行のみ）。
-      if (span >= size) return { updatedAt, lastMessage };
+      if (span >= size) {
+        scannedAll = true;
+        break;
+      }
     }
-    // 上限到達: timestamp 不明だが中身はある。mtime で近似する。
-    if (updatedAt === null) updatedAt = Math.floor(fs.fstatSync(fd).mtimeMs / 1000);
-    return { updatedAt, lastMessage };
+    // 上限到達（未 done）: timestamp 不明だが中身はある。mtime で近似する。
+    if (!done && !scannedAll && updatedAt === null) {
+      updatedAt = Math.floor(fs.fstatSync(fd).mtimeMs / 1000);
+    }
+    // タイトル専用の深掘り: updatedAt/lastMessage は末尾数行で即確定して打ち切るため、
+    // CLI が定期再フラッシュするタイトルエントリ（custom-title/ai-title）がその少し上に
+    // あると取りこぼす。窓内（TAIL_BYTES_CAP）全体を substring 前置フィルタで走査して補完する。
+    if (!scannedAll && (titles.customTitle === undefined || titles.aiTitle === undefined)) {
+      scanTailTitleCheckpoints(fd, size, titles);
+    }
+    return summary();
   } catch {
-    return { updatedAt, lastMessage };
+    return summary();
   } finally {
     fs.closeSync(fd);
+  }
+}
+
+/**
+ * 末尾窓（TAIL_BYTES_CAP）全体からタイトルエントリだけを後方走査で補完する。
+ * JSON.parse は候補行（substring 一致）に限定し、走査コストを読み取り + split に抑える。
+ * 既に確定している種別（undefined でない）は上書きしない = 最新優先を保つ。
+ */
+function scanTailTitleCheckpoints(fd: number, size: number, titles: TranscriptTitleEntries): void {
+  const span = Math.min(size, TAIL_BYTES_CAP);
+  if (span <= 0) return;
+  let bytesRead: number;
+  const buf = Buffer.alloc(span);
+  try {
+    bytesRead = fs.readSync(fd, buf, 0, span, size - span);
+  } catch {
+    return;
+  }
+  const lines = buf.subarray(0, bytesRead).toString("utf8").split("\n");
+  const first = span < size ? 1 : 0;
+  for (let i = lines.length - 1; i >= first; i--) {
+    if (titles.customTitle !== undefined && titles.aiTitle !== undefined) return;
+    const line = lines[i] ?? "";
+    const wantsCustom = titles.customTitle === undefined && line.includes('"type":"custom-title"');
+    const wantsAi = titles.aiTitle === undefined && line.includes('"type":"ai-title"');
+    if (!wantsCustom && !wantsAi) continue;
+    const rec = parseEntry(line);
+    if (rec === null) continue;
+    if (titles.customTitle === undefined && rec["type"] === "custom-title") {
+      titles.customTitle = normalizeExplicitTitle(rec["customTitle"]);
+    }
+    if (titles.aiTitle === undefined && rec["type"] === "ai-title") {
+      titles.aiTitle = normalizeExplicitTitle(rec["aiTitle"]);
+    }
   }
 }
 
@@ -198,8 +268,8 @@ function entryTimestamp(rec: Record<string, unknown>): number | null {
   return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
 }
 
-/** 先頭チャンクスキャンの結果（cwd と会話タイトル）。 */
-export interface TranscriptHeadSummary {
+/** 先頭チャンクスキャンの結果（cwd と会話タイトル + 明示タイトル）。 */
+export interface TranscriptHeadSummary extends TranscriptTitleEntries {
   cwd: string | null;
   title: string | null;
 }
@@ -211,6 +281,7 @@ export interface TranscriptHeadSummary {
 export function scanTranscriptHead(filePath: string): TranscriptHeadSummary {
   let cwd: string | null = null;
   let title: string | null = null;
+  const titles: TranscriptTitleEntries = {};
   try {
     const fd = fs.openSync(filePath, "r");
     try {
@@ -234,11 +305,18 @@ export function scanTranscriptHead(filePath: string): TranscriptHeadSummary {
         if (cwd === null && typeof rec["cwd"] === "string" && rec["cwd"].length > 0) {
           cwd = rec["cwd"];
         }
+        // 前方スキャンなので後勝ち = チャンク内で最新のタイトルエントリを採る。
+        // resume 時は CLI が復元メタデータとして新ファイル先頭へ書き直すためここで拾える。
+        if (rec["type"] === "custom-title") {
+          titles.customTitle = normalizeExplicitTitle(rec["customTitle"]);
+        }
+        if (rec["type"] === "ai-title") {
+          titles.aiTitle = normalizeExplicitTitle(rec["aiTitle"]);
+        }
         if (title === null && rec["type"] === "user") {
           const t = extractUserText(rec);
           if (t !== null) title = t;
         }
-        if (cwd !== null && title !== null) break;
       }
     } finally {
       fs.closeSync(fd);
@@ -246,7 +324,7 @@ export function scanTranscriptHead(filePath: string): TranscriptHeadSummary {
   } catch {
     // 読めないファイルは null/null を返す（呼び出し側がフォールバック）。
   }
-  return { cwd, title };
+  return { cwd, title, ...titles };
 }
 
 /** 1 つの jsonl から ClaudeSessionInfo を導出する（先頭 + 末尾チャンクのみ読む）。 */
@@ -258,11 +336,50 @@ function deriveInfo(filePath: string, sessionId: string, slug: string): ClaudeSe
   const info: ClaudeSessionInfo = {
     sessionId,
     cwd: head.cwd ?? cwdFromSlug(slug),
-    title: head.title ?? sessionId.slice(0, 8),
+    title: resolveExplicitTitle(head, tail) ?? head.title ?? sessionId.slice(0, 8),
   };
   if (updatedAt !== undefined) info.updatedAt = updatedAt;
   if (tail.lastMessage !== null) info.lastMessage = tail.lastMessage;
   return info;
+}
+
+/**
+ * 明示タイトル（custom-title / ai-title エントリ）を解決する。
+ * 末尾チャンクの観測はファイル内でより新しいため先頭チャンクより優先し、
+ * custom-title（/rename・hook 由来）を ai-title より優先する。
+ * custom-title が解除（null）の場合は ai-title へフォールバックする。
+ * どちらの窓にも無ければ null（呼び出し側が従来の導出へフォールバック）。
+ */
+export function resolveExplicitTitle(
+  head: TranscriptTitleEntries,
+  tail: TranscriptTitleEntries,
+): string | null {
+  const custom = tail.customTitle !== undefined ? tail.customTitle : head.customTitle;
+  if (typeof custom === "string") return custom;
+  const ai = tail.aiTitle !== undefined ? tail.aiTitle : head.aiTitle;
+  return typeof ai === "string" ? ai : null;
+}
+
+/**
+ * 会話タイトルを 1 発で解決する（明示タイトル優先 → 最初のユーザー発話 → null）。
+ * herdr タブ名の自動タイトル同期など、一覧以外の呼び出し側が使う。
+ */
+export function transcriptTitle(filePath: string): string | null {
+  const head = scanTranscriptHead(filePath);
+  const tail = scanTranscriptTail(filePath);
+  return resolveExplicitTitle(head, tail) ?? head.title;
+}
+
+/**
+ * タイトルエントリの値を正規化する: 制御文字除去 + trim + 上限。
+ * 空になったら null（= タイトル解除エントリ）。文字列以外も null。
+ */
+function normalizeExplicitTitle(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  // eslint-disable-next-line no-control-regex
+  const text = raw.replace(/[\x00-\x1f\x7f]/g, "").trim();
+  if (!text) return null;
+  return [...text].slice(0, EXPLICIT_TITLE_MAX_LENGTH).join("");
 }
 
 /** `type=="user"` 行のメッセージ本文を取り出し、先頭 ~60 字へ整形する（タイトル用）。 */

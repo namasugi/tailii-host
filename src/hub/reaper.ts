@@ -28,7 +28,7 @@ import {
 import { HerdrSessionManager } from "../backend/herdr.js";
 import type { SessionInfo } from "../protocol.js";
 import { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
-import { ClaudeSessionStore, scanTranscriptHead } from "../sessions/claudeSessionStore.js";
+import { ClaudeSessionStore, transcriptTitle } from "../sessions/claudeSessionStore.js";
 import { paneCommandLooksLikeAgent, type TmuxCommandRunner } from "../backend/tmux.js";
 
 /** 一律のアイドル timeout(秒)。idle/active(bump 停止)の両方に同じ値を使う。 */
@@ -141,11 +141,11 @@ function defaultHerdrReaperOps(metadataStore: SessionMetadataStore): HerdrReaper
   return new HerdrSessionManager({ store: metadataStore });
 }
 
-/** 既定の claude 会話タイトル導出（transcript 先頭の最初のユーザー発話, 一覧と同じ規則）。 */
+/** 既定の claude 会話タイトル導出（明示タイトル優先 → 最初のユーザー発話, 一覧と同じ規則）。 */
 function defaultDeriveClaudeTitle(claudeSessionId: string): string | null {
   const transcript = new ClaudeSessionStore().transcriptPath(claudeSessionId);
   if (transcript === null) return null;
-  return scanTranscriptHead(transcript).title;
+  return transcriptTitle(transcript);
 }
 
 /** 巡回 1 回分。判定表は docs/architecture.md「セッション自動掃除」を参照。 */

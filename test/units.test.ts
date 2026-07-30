@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, test } from "vitest";
 import { ChatTailController } from "../src/chat/chatTailController.js";
-import { ClaudeSessionStore, cwdFromSlug } from "../src/sessions/claudeSessionStore.js";
+import { ClaudeSessionStore, cwdFromSlug, transcriptTitle } from "../src/sessions/claudeSessionStore.js";
 import { dirChildren, dirCreate, dirList } from "../src/services/dirLister.js";
 import { parsePermissionMode } from "../src/shared/permissionMode.js";
 import { extractCredential, orderCandidates, parsePlanUsage } from "../src/services/planUsageFetcher.js";
@@ -591,6 +591,81 @@ describe("ClaudeSessionStore", () => {
     const list = new ClaudeSessionStore(root).list();
     expect(list[0]?.lastMessage).toBe("最後の実応答");
     expect(list[0]?.title).toBe("実際の質問");
+  });
+
+  test("custom-title エントリ（/rename・hook 由来）が導出タイトルより優先される", () => {
+    const root = makeTempDir("claude-sessions-custom-title");
+    const slugDir = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slugDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(slugDir, "iiiiiiii-9999.jsonl"),
+      '{"type":"user","cwd":"/tmp/proj","timestamp":"2026-01-01T00:00:00Z","message":{"content":"長い最初の発話がそのままタイトルになってしまう従来挙動の確認用テキスト"}}\n' +
+        '{"type":"custom-title","customTitle":"短い名前","sessionId":"iiiiiiii-9999"}\n',
+    );
+    expect(new ClaudeSessionStore(root).list()[0]?.title).toBe("短い名前");
+  });
+
+  test("custom-title は後勝ちで、解除（空文字）なら ai-title → 導出タイトルへ戻る", () => {
+    const root = makeTempDir("claude-sessions-title-order");
+    const slugDir = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slugDir, { recursive: true });
+    const renamed = path.join(slugDir, "jjjjjjjj-9999.jsonl");
+    fs.writeFileSync(
+      renamed,
+      '{"type":"user","cwd":"/tmp/proj","timestamp":"2026-01-01T00:00:00Z","message":{"content":"最初の発話"}}\n' +
+        '{"type":"custom-title","customTitle":"旧名","sessionId":"jjjjjjjj-9999"}\n' +
+        '{"type":"custom-title","customTitle":"新名","sessionId":"jjjjjjjj-9999"}\n',
+    );
+    expect(new ClaudeSessionStore(root).list()[0]?.title).toBe("新名");
+
+    // 解除エントリ: ai-title があればそちら、無ければ従来導出へ。
+    fs.appendFileSync(renamed, '{"type":"custom-title","customTitle":"","sessionId":"jjjjjjjj-9999"}\n');
+    expect(new ClaudeSessionStore(root).list()[0]?.title).toBe("最初の発話");
+    fs.appendFileSync(renamed, '{"type":"ai-title","aiTitle":"AI生成タイトル","sessionId":"jjjjjjjj-9999"}\n');
+    expect(new ClaudeSessionStore(root).list()[0]?.title).toBe("AI生成タイトル");
+  });
+
+  test("ai-title は custom-title が無いときのフォールバックとして使われる", () => {
+    const root = makeTempDir("claude-sessions-ai-title");
+    const slugDir = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slugDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(slugDir, "kkkkkkkk-9999.jsonl"),
+      '{"type":"ai-title","aiTitle":"要約タイトル","sessionId":"kkkkkkkk-9999"}\n' +
+        '{"type":"user","cwd":"/tmp/proj","timestamp":"2026-01-01T00:00:00Z","message":{"content":"最初の発話"}}\n' +
+        '{"type":"custom-title","customTitle":"ユーザー命名","sessionId":"kkkkkkkk-9999"}\n',
+    );
+    // custom-title があれば ai-title より優先。
+    expect(new ClaudeSessionStore(root).list()[0]?.title).toBe("ユーザー命名");
+  });
+
+  test("末尾直近数行より上に埋まった custom-title も深掘りで拾う（早期打ち切りの補完）", () => {
+    const root = makeTempDir("claude-sessions-title-deep");
+    const slugDir = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slugDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(slugDir, "mmmmmmmm-9999.jsonl"),
+      '{"type":"user","cwd":"/tmp/proj","timestamp":"2026-01-01T00:00:00Z","message":{"content":"最初の発話"}}\n' +
+        '{"type":"custom-title","customTitle":"埋まった命名","sessionId":"mmmmmmmm-9999"}\n' +
+        // この2行で updatedAt/lastMessage が即確定し後方スキャンが打ち切られる。
+        '{"type":"user","timestamp":"2026-01-01T00:01:00Z","message":{"content":"続きの質問"}}\n' +
+        '{"type":"assistant","timestamp":"2026-01-01T00:02:00Z","message":{"content":[{"type":"text","text":"応答"}]}}\n',
+    );
+    expect(new ClaudeSessionStore(root).list()[0]?.title).toBe("埋まった命名");
+  });
+
+  test("transcriptTitle は明示タイトル優先で 1 発解決する（herdr タブ同期用）", () => {
+    const root = makeTempDir("claude-sessions-title-helper");
+    const slugDir = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slugDir, { recursive: true });
+    const file = path.join(slugDir, "llllllll-9999.jsonl");
+    fs.writeFileSync(
+      file,
+      '{"type":"user","cwd":"/tmp/proj","timestamp":"2026-01-01T00:00:00Z","message":{"content":"最初の発話"}}\n',
+    );
+    expect(transcriptTitle(file)).toBe("最初の発話");
+    fs.appendFileSync(file, '{"type":"custom-title","customTitle":"命名済み","sessionId":"llllllll-9999"}\n');
+    expect(transcriptTitle(file)).toBe("命名済み");
   });
 
   test("lastMessage が無い（状態行のみ）transcript では省略される", () => {
