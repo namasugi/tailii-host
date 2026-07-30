@@ -259,7 +259,8 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
     // タブラベルがセッション名のまま（アプリ/Mac どちらでも未命名）の生存セッションだけを
     // 対象に、transcript の会話タイトル（最初のユーザー発話 先頭 ~60 字 = 一覧と同じ導出）を
     // タブへ書く。命名済み（ラベル ≠ セッション名）は手動を優先して触らない。
-    if (herdrOps.tabInfoByName !== undefined && herdrOps.setDisplayTitle !== undefined) {
+    if (herdrLive.length > 0 &&
+        herdrOps.tabInfoByName !== undefined && herdrOps.setDisplayTitle !== undefined) {
       const deriveTitle = options.deriveClaudeTitle ?? defaultDeriveClaudeTitle;
       try {
         const tabInfo = await herdrOps.tabInfoByName();
