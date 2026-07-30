@@ -162,6 +162,104 @@ describe("CodexNativeTurnController", () => {
     expect(thread.closed).toBe(1);
   });
 
+  test("最初の user turn 成功後だけタイトル生成を非同期起動する", async () => {
+    const thread = new FakeThread();
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const generations: { threadId: string; cwd: string; prompt: string }[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: {
+        openThread: async (options) => {
+          openOptions = options;
+          return thread;
+        },
+        generateThreadTitle: async (options) => {
+          generations.push(options);
+          return "短いタイトル";
+        },
+      },
+    });
+
+    await controller.startTurn({
+      session: "work",
+      threadId: "thread-1",
+      cwd: "/tmp/work",
+      text: "最初の質問",
+    });
+    expect(generations).toEqual([{
+      threadId: "thread-1",
+      cwd: "/tmp/work",
+      prompt: "最初の質問",
+    }]);
+
+    openOptions?.onNotification?.({
+      method: "turn/completed",
+      params: { threadId: "thread-1", turn: { id: "turn-1" } },
+    });
+    thread.nextTurnId = "turn-2";
+    await controller.startTurn({
+      session: "work",
+      threadId: "thread-1",
+      cwd: "/tmp/work",
+      text: "二番目の質問",
+    });
+    expect(generations).toHaveLength(1);
+  });
+
+  test("履歴の有無に依存せずApp Serverへ一度だけ命名判定を委ねる", async () => {
+    const thread = Object.assign(new FakeThread(), {
+      initialItems: [{ id: "old-user", type: "userMessage", content: [] }],
+    });
+    const generations: unknown[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: {
+        openThread: async () => thread,
+        generateThreadTitle: async (options) => {
+          generations.push(options);
+          return "上書き禁止";
+        },
+      },
+    });
+
+    await controller.startTurn({
+      session: "work",
+      threadId: "thread-1",
+      cwd: "/tmp/work",
+      text: "続きの質問",
+    });
+    expect(generations).toEqual([{
+      threadId: "thread-1",
+      cwd: "/tmp/work",
+      prompt: "続きの質問",
+    }]);
+  });
+
+  test("既存active turnへのsteerが最初の入力ならタイトル生成も起動する", async () => {
+    const thread = new FakeThread();
+    thread.initialActiveTurnId = "turn-active";
+    const generations: { threadId: string; cwd: string; prompt: string }[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: {
+        openThread: async () => thread,
+        generateThreadTitle: async (options) => {
+          generations.push(options);
+          return "steerのタイトル";
+        },
+      },
+    });
+
+    await expect(controller.startTurn({
+      session: "work",
+      threadId: "thread-1",
+      cwd: "/tmp/work",
+      text: "実行中ターンへの追加入力",
+    })).resolves.toBe("turn-active");
+    expect(generations).toEqual([{
+      threadId: "thread-1",
+      cwd: "/tmp/work",
+      prompt: "実行中ターンへの追加入力",
+    }]);
+  });
+
   test("実行中の startTurn は既存 turn へ steer し、同じ turnId を返す", async () => {
     const thread = new FakeThread();
     const controller = new CodexNativeTurnController({

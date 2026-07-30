@@ -54,6 +54,34 @@ class FakeConnection implements CodexAppServerConnection {
   }
 }
 
+function emitTitleTurn(
+  connection: FakeConnection,
+  text: string,
+  status = "completed",
+): void {
+  queueMicrotask(() => {
+    connection.notificationHandler?.({
+      method: "turn/started",
+      params: { threadId: "thread-title-ephemeral", turn: { id: "turn-title" } },
+    });
+    connection.notificationHandler?.({
+      method: "item/completed",
+      params: {
+        threadId: "thread-title-ephemeral",
+        turnId: "turn-title",
+        item: { id: "title-answer", type: "agentMessage", text },
+      },
+    });
+    connection.notificationHandler?.({
+      method: "turn/completed",
+      params: {
+        threadId: "thread-title-ephemeral",
+        turn: { id: "turn-title", status },
+      },
+    });
+  });
+}
+
 describe("CodexAppServerManager", () => {
   test("connectIfRunning は停止中なら起動せず null を返す", async () => {
     let launches = 0;
@@ -260,6 +288,282 @@ describe("CodexAppServerManager", () => {
     expect(connections).toHaveLength(2); // readiness probe + thread/start client
     expect(connections[0]?.closed).toBe(1); // readiness probe
     expect(connections[1]?.closed).toBe(0); // bootstrap subscriber
+  });
+
+  test("gpt-5.6-luna の read-only ephemeral turn で短いタイトルを生成して保存する", async () => {
+    const probe = new FakeConnection();
+    const generation = new FakeConnection("thread-title-ephemeral");
+    generation.request = async (method, params) => {
+      generation.requests.push({ method, params });
+      if (method === "thread/read") {
+        return {
+          thread: {
+            id: "thread-target",
+            name: null,
+            turns: [{
+              items: [{
+                id: "first-user",
+                type: "userMessage",
+                content: [{ type: "text", text: "generateTitleが何をしているか調べられない？" }],
+              }],
+            }],
+          },
+        };
+      }
+      if (method === "thread/start") {
+        return { thread: { id: "thread-title-ephemeral" } };
+      }
+      if (method === "turn/start") {
+        emitTitleTurn(generation, JSON.stringify({
+          title: "generateTitleの仕組みを調査",
+          description: "Codex Desktopのタイトル生成処理を確認",
+        }));
+        return { turn: { id: "turn-title" } };
+      }
+      return {};
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-thread-title"),
+      connect: async () => probe.closed === 0 ? probe : generation,
+      launch: () => {
+        throw new Error("must not spawn");
+      },
+    });
+
+    await expect(manager.generateThreadTitle({
+      threadId: "thread-target",
+      cwd: "/tmp/project",
+      prompt: "これは後続メッセージなのでタイトルには使わない",
+    })).resolves.toBe("generateTitleの仕組みを調査");
+
+    expect(generation.requests).toContainEqual({
+      method: "thread/start",
+      params: expect.objectContaining({
+        model: "gpt-5.6-luna",
+        allowProviderModelFallback: true,
+        cwd: "/tmp/project",
+        approvalPolicy: "never",
+        permissions: ":read-only",
+        ephemeral: true,
+        threadSource: "system",
+        config: expect.objectContaining({
+          model_reasoning_effort: "low",
+          "features.hooks": false,
+          "features.plugins": false,
+          web_search: "disabled",
+        }),
+      }),
+    });
+    expect(generation.requests).toContainEqual({
+      method: "turn/start",
+      params: expect.objectContaining({
+        threadId: "thread-title-ephemeral",
+        permissions: ":read-only",
+        outputSchema: expect.objectContaining({
+          required: ["title", "description"],
+          properties: expect.objectContaining({
+            title: { type: "string", minLength: 1, maxLength: 36 },
+          }),
+        }),
+      }),
+    });
+    const titleTurn = generation.requests.find((request) => request.method === "turn/start");
+    expect(titleTurn?.params).toEqual(expect.objectContaining({
+      input: [expect.objectContaining({
+        text: expect.stringContaining("generateTitleが何をしているか調べられない？"),
+      })],
+    }));
+    expect(JSON.stringify(titleTurn?.params)).toContain(
+      "title and description MUST be written in natural Japanese",
+    );
+    expect(JSON.stringify(titleTurn?.params)).not.toContain("これは後続メッセージ");
+    expect(generation.requests).toContainEqual({
+      method: "thread/name/set",
+      params: { threadId: "thread-target", name: "generateTitleの仕組みを調査" },
+    });
+    expect(generation.requests.at(-1)).toEqual({
+      method: "thread/unsubscribe",
+      params: { threadId: "thread-title-ephemeral" },
+    });
+    expect(generation.closed).toBe(1);
+  });
+
+  test("タイトル生成結果が不正なら初回入力の先頭60文字を保存する", async () => {
+    const probe = new FakeConnection();
+    const generation = new FakeConnection("thread-title-ephemeral");
+    generation.request = async (method, params) => {
+      generation.requests.push({ method, params });
+      if (method === "thread/read") {
+        return { thread: { id: "thread-target", name: null } };
+      }
+      if (method === "thread/start") {
+        return { thread: { id: "thread-title-ephemeral" } };
+      }
+      if (method === "turn/start") {
+        emitTitleTurn(generation, "not-json");
+        return { turn: { id: "turn-title" } };
+      }
+      return {};
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-thread-title-fallback"),
+      connect: async () => probe.closed === 0 ? probe : generation,
+      launch: () => {
+        throw new Error("must not spawn");
+      },
+    });
+    const prompt = `${"あ".repeat(70)}\nignored`;
+
+    await expect(manager.generateThreadTitle({
+      threadId: "thread-target",
+      cwd: "/tmp/project",
+      prompt,
+    })).resolves.toBe("あ".repeat(60));
+    expect(generation.requests).toContainEqual({
+      method: "thread/name/set",
+      params: { threadId: "thread-target", name: "あ".repeat(60) },
+    });
+  });
+
+  test("日本語入力に対する英語タイトルは採用せず日本語入力へフォールバックする", async () => {
+    const probe = new FakeConnection();
+    const generation = new FakeConnection("thread-title-ephemeral");
+    generation.request = async (method, params) => {
+      generation.requests.push({ method, params });
+      if (method === "thread/read") {
+        return { thread: { id: "thread-target", name: null } };
+      }
+      if (method === "thread/start") {
+        return { thread: { id: "thread-title-ephemeral" } };
+      }
+      if (method === "turn/start") {
+        emitTitleTurn(generation, JSON.stringify({
+          title: "Fix Codex usage display",
+          description: "Correct usage and status presentation",
+        }));
+        return { turn: { id: "turn-title" } };
+      }
+      return {};
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-thread-title-language"),
+      connect: async () => probe.closed === 0 ? probe : generation,
+      launch: () => {
+        throw new Error("must not spawn");
+      },
+    });
+    const prompt = "Codexの使用量表示を修正する";
+
+    await expect(manager.generateThreadTitle({
+      threadId: "thread-target",
+      cwd: "/tmp/project",
+      prompt,
+    })).resolves.toBe(prompt);
+    expect(generation.requests).toContainEqual({
+      method: "thread/name/set",
+      params: { threadId: "thread-target", name: prompt },
+    });
+  });
+
+  test("初回turn直後の空rolloutではthread/listで既存名を保護してタイトルを保存する", async () => {
+    const probe = new FakeConnection();
+    const generation = new FakeConnection("thread-title-ephemeral");
+    generation.request = async (method, params) => {
+      generation.requests.push({ method, params });
+      if (method === "thread/read") {
+        throw new Error(
+          "failed to read thread: thread-store internal error: failed to read session metadata " +
+          "/tmp/rollout-thread-target.jsonl: rollout at /tmp/rollout-thread-target.jsonl is empty",
+        );
+      }
+      if (method === "thread/list") {
+        return {
+          data: [{
+            id: "thread-target",
+            name: null,
+            preview: null,
+            updatedAt: 123,
+            cwd: "/tmp/project",
+            source: "vscode",
+            parentThreadId: null,
+          }],
+          nextCursor: null,
+        };
+      }
+      if (method === "thread/start") {
+        return { thread: { id: "thread-title-ephemeral" } };
+      }
+      if (method === "turn/start") {
+        emitTitleTurn(generation, JSON.stringify({
+          title: "Codex使用量表示を修正",
+          description: "使用量と状態表示の不一致を直す",
+        }));
+        return { turn: { id: "turn-title" } };
+      }
+      return {};
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-thread-title-empty-rollout"),
+      connect: async () => probe.closed === 0 ? probe : generation,
+      launch: () => {
+        throw new Error("must not spawn");
+      },
+    });
+
+    await expect(manager.generateThreadTitle({
+      threadId: "thread-target",
+      cwd: "/tmp/project",
+      prompt: "codexのスラッシュコマンドの使用量・状態を修正したい",
+    })).resolves.toBe("Codex使用量表示を修正");
+    expect(generation.requests.filter((request) => request.method === "thread/list"))
+      .toHaveLength(2);
+    expect(generation.requests).toContainEqual({
+      method: "thread/name/set",
+      params: { threadId: "thread-target", name: "Codex使用量表示を修正" },
+    });
+  });
+
+  test("生成中に別 client が命名したら既存タイトルを上書きしない", async () => {
+    const probe = new FakeConnection();
+    const generation = new FakeConnection("thread-title-ephemeral");
+    let readCount = 0;
+    generation.request = async (method, params) => {
+      generation.requests.push({ method, params });
+      if (method === "thread/read") {
+        readCount += 1;
+        return {
+          thread: {
+            id: "thread-target",
+            name: readCount === 1 ? null : "ユーザー指定タイトル",
+          },
+        };
+      }
+      if (method === "thread/start") {
+        return { thread: { id: "thread-title-ephemeral" } };
+      }
+      if (method === "turn/start") {
+        emitTitleTurn(generation, JSON.stringify({
+          title: "自動生成タイトル",
+          description: "生成中に手動命名されたケース",
+        }));
+        return { turn: { id: "turn-title" } };
+      }
+      return {};
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-thread-title-race"),
+      connect: async () => probe.closed === 0 ? probe : generation,
+      launch: () => {
+        throw new Error("must not spawn");
+      },
+    });
+
+    await expect(manager.generateThreadTitle({
+      threadId: "thread-target",
+      cwd: "/tmp/project",
+      prompt: "タイトルを自動生成する",
+    })).resolves.toBeNull();
+    expect(generation.requests.some((request) => request.method === "thread/name/set")).toBe(false);
   });
 
   test("thread/start 応答に thread.id が無ければ失敗する", async () => {
@@ -489,6 +793,32 @@ describe("CodexAppServerManager", () => {
       "thread/resume",
       "turn/start",
     ]);
+    expect(connection.closed).toBe(0);
+  });
+
+  test("作成直後の空rolloutも未materializeとして最初のturnへ進む", async () => {
+    const probe = new FakeConnection();
+    const connection = new FakeConnection("thread-empty");
+    connection.request = async (method, params) => {
+      connection.requests.push({ method, params });
+      if (method === "thread/resume") {
+        throw new Error(
+          "failed to read thread: thread-store internal error: failed to read session metadata " +
+          "/tmp/rollout-thread-empty.jsonl: rollout at /tmp/rollout-thread-empty.jsonl is empty",
+        );
+      }
+      if (method === "turn/start") return { turn: { id: "turn-first" } };
+      return {};
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-empty-rollout"),
+      connect: async () => probe.closed === 0 ? probe : connection,
+      launch: () => {},
+    });
+
+    const thread = await manager.openThread({ threadId: "thread-empty" });
+    expect(thread.liveSubscriptionReady).toBe(false);
+    await expect(thread.startTurn("first", "client-first")).resolves.toBe("turn-first");
     expect(connection.closed).toBe(0);
   });
 

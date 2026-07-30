@@ -53,6 +53,12 @@ export interface CodexNativeTurnControllerOptions {
   onQuestionDismiss?: (session: string, id: string) => void;
   onChatItem?: (event: { session: string; itemId: string; payload: ControlMessage }) => void;
   onDisconnect?: (session: string, error: Error) => void;
+  onThreadTitle?: (event: {
+    session: string;
+    threadId: string;
+    title: string | null;
+    error: string | null;
+  }) => void;
 }
 
 export interface CodexTurnControllerRuntime {
@@ -108,6 +114,11 @@ export interface CodexSubscriptionSnapshot {
 
 export interface CodexAppServerThreadRuntime {
   openThread(options: CodexAppServerThreadOptions): Promise<CodexThreadClient>;
+  generateThreadTitle?(options: {
+    threadId: string;
+    cwd: string;
+    prompt: string;
+  }): Promise<string | null>;
 }
 
 interface OpenThread {
@@ -116,6 +127,8 @@ interface OpenThread {
   thread: CodexThreadClient;
   items: Map<string, Record<string, unknown>>;
   activeTurnId: string | null;
+  /** この controller の最初のユーザー入力成功後に一度だけ命名を試す。既存名はApp Server側で保護する。 */
+  titleGenerationPending: boolean;
   /** turn/plan/updated へ振る連番（通知に item id が無いため dedup 用 id を合成する）。 */
   planSeq: number;
 }
@@ -145,6 +158,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
   >;
   private readonly onChatItem: NonNullable<CodexNativeTurnControllerOptions["onChatItem"]>;
   private readonly onDisconnect: NonNullable<CodexNativeTurnControllerOptions["onDisconnect"]>;
+  private readonly onThreadTitle: NonNullable<CodexNativeTurnControllerOptions["onThreadTitle"]>;
   private readonly open = new Map<string, OpenThread>();
   private readonly pendingUserInput = new Map<string, PendingUserInput>();
 
@@ -158,6 +172,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     this.onQuestionDismiss = options.onQuestionDismiss ?? (() => {});
     this.onChatItem = options.onChatItem ?? (() => {});
     this.onDisconnect = options.onDisconnect ?? (() => {});
+    this.onThreadTitle = options.onThreadTitle ?? (() => {});
   }
 
   async subscribeSession(options: {
@@ -199,6 +214,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       if (activeTurnId !== null) {
         try {
           await opened.thread.steerTurn(activeTurnId, options.text);
+          this.generateThreadTitle(opened, options.session, options.text);
           return activeTurnId;
         } catch {
           // turn 完了直後など steer と競合した場合は、新しい turn を開始する。
@@ -212,11 +228,35 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
         options.approvalPolicy,
       );
       opened.activeTurnId = turnId;
+      this.generateThreadTitle(opened, options.session, options.text);
       return turnId;
     } catch (error) {
       this.onProcessing(options.session, "done");
       throw error;
     }
+  }
+
+  private generateThreadTitle(opened: OpenThread, session: string, prompt: string): void {
+    if (!opened.titleGenerationPending || this.appServer.generateThreadTitle === undefined) return;
+    opened.titleGenerationPending = false;
+    void this.appServer.generateThreadTitle({
+      threadId: opened.threadId,
+      cwd: opened.cwd,
+      prompt,
+    }).then(
+      (title) => this.onThreadTitle({
+        session,
+        threadId: opened.threadId,
+        title,
+        error: null,
+      }),
+      (error) => this.onThreadTitle({
+        session,
+        threadId: opened.threadId,
+        title: null,
+        error: String(error),
+      }),
+    );
   }
 
   async interruptTurn(session: string): Promise<void> {
@@ -308,6 +348,9 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       thread,
       items,
       activeTurnId: thread.initialActiveTurnId ?? null,
+      // 名前と最初の user prompt は生成直前の thread/read を権威にする。これにより
+      // TUI attach / resume の競合で initialItems が先に埋まっても、新規会話の命名を落とさない。
+      titleGenerationPending: true,
       planSeq: 0,
     };
     this.open.set(session, opened);

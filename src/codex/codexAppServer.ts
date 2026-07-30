@@ -2,6 +2,7 @@
 // Tailii host が共有 Codex App Server を再利用・起動し、thread ID を先に確定する最小クライアント。
 
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
@@ -10,6 +11,39 @@ import WebSocket, { type RawData } from "ws";
 import { ensureDirectory0700 } from "../shared/paths.js";
 import type { CodexModelInfo } from "../protocol.js";
 
+const THREAD_TITLE_MODEL = "gpt-5.6-luna";
+const THREAD_TITLE_PROMPT_MAX_LENGTH = 2_000;
+const THREAD_TITLE_MAX_LENGTH = 36;
+const THREAD_TITLE_FALLBACK_MAX_LENGTH = 60;
+const DEFAULT_TITLE_GENERATION_TIMEOUT_MS = 30_000;
+const THREAD_TITLE_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    title: { type: "string", minLength: 1, maxLength: THREAD_TITLE_MAX_LENGTH },
+    description: { type: "string", minLength: 1 },
+  },
+  required: ["title", "description"],
+  additionalProperties: false,
+} as const;
+const THREAD_TITLE_CONFIG = {
+  model_reasoning_effort: "low",
+  "features.enable_fanout": false,
+  "features.hooks": false,
+  "features.multi_agent": false,
+  "features.multi_agent_v2": false,
+  "features.plugins": false,
+  "features.tool_suggest": false,
+  "features.apps": false,
+  apps: {
+    _default: {
+      enabled: false,
+      destructive_enabled: false,
+      open_world_enabled: false,
+    },
+  },
+  web_search: "disabled",
+} as const;
+
 export type CodexAppServerSandbox = "read-only" | "workspace-write" | "danger-full-access";
 export type CodexAppServerApprovalPolicy = "untrusted" | "on-request" | "never";
 
@@ -17,6 +51,12 @@ export interface CodexThreadStartOptions {
   cwd: string;
   model?: string | null;
   sandbox?: CodexAppServerSandbox | null;
+}
+
+export interface CodexThreadTitleGenerationOptions {
+  threadId: string;
+  cwd: string;
+  prompt: string;
 }
 
 export type CodexAppServerRequestId = number | string;
@@ -351,6 +391,7 @@ export interface CodexAppServerManagerOptions {
   launch?: CodexAppServerLaunch;
   pollIntervalMs?: number;
   startupTimeoutMs?: number;
+  titleGenerationTimeoutMs?: number;
 }
 
 /** thread/list の公開スキーマから一覧表示に必要なフィールドだけを保持する。 */
@@ -388,6 +429,7 @@ export class CodexAppServerManager {
   private readonly launch: CodexAppServerLaunch;
   private readonly pollIntervalMs: number;
   private readonly startupTimeoutMs: number;
+  private readonly titleGenerationTimeoutMs: number;
   private readonly startupLockPath: string;
   /** 最初の turn 前（rollout 未作成）の thread を生存させる作成元購読。openThread が引き継ぐ。 */
   private readonly bootstrapConnections = new Map<string, CodexAppServerConnection>();
@@ -404,6 +446,8 @@ export class CodexAppServerManager {
     this.launch = options.launch ?? defaultLaunch;
     this.pollIntervalMs = options.pollIntervalMs ?? 100;
     this.startupTimeoutMs = options.startupTimeoutMs ?? 10_000;
+    this.titleGenerationTimeoutMs =
+      options.titleGenerationTimeoutMs ?? DEFAULT_TITLE_GENERATION_TIMEOUT_MS;
     this.startupLockPath = path.join(path.dirname(this.socketPath), "tailii-start.lock");
   }
 
@@ -538,6 +582,82 @@ export class CodexAppServerManager {
       return threadId;
     } finally {
       if (!succeeded) connection.close();
+    }
+  }
+
+  /**
+   * Codex Desktop と同じ短命 thread で初回 prompt の短いタイトルを生成し、対象 thread へ保存する。
+   * `gpt-5.6-luna` を優先し、App Server が利用不能と判断した場合は既定モデルへ委ねる。
+   */
+  async generateThreadTitle(options: CodexThreadTitleGenerationOptions): Promise<string | null> {
+    if (!path.isAbsolute(options.cwd)) throw new Error("Codex thread cwd must be absolute");
+
+    await this.ensureRunning();
+    const connection = await this.connect(this.socketPath);
+    let ephemeralThreadId: string | null = null;
+    try {
+      await connection.initialize();
+      const target = await readThreadTitleTarget(connection, options.threadId, options.prompt);
+      if (target.name !== null) return null;
+      const prompt = target.prompt.trim().slice(0, THREAD_TITLE_PROMPT_MAX_LENGTH);
+      if (prompt.length === 0) return null;
+      const fallbackTitle = normalizeFallbackThreadTitle(prompt);
+
+      let generatedTitle: string | null = null;
+      try {
+        const response = await connection.request("thread/start", {
+          model: THREAD_TITLE_MODEL,
+          modelProvider: null,
+          allowProviderModelFallback: true,
+          cwd: options.cwd,
+          approvalPolicy: "never",
+          permissions: ":read-only",
+          runtimeWorkspaceRoots: [],
+          config: THREAD_TITLE_CONFIG,
+          personality: null,
+          ephemeral: true,
+          threadSource: "system",
+          experimentalRawEvents: false,
+          dynamicTools: null,
+          serviceTier: null,
+        });
+        ephemeralThreadId = extractThreadId(response);
+        if (ephemeralThreadId === null) {
+          throw new Error("Codex title thread/start response omitted thread.id");
+        }
+        generatedTitle = await runThreadTitleTurn(
+          connection,
+          ephemeralThreadId,
+          buildThreadTitlePrompt(prompt),
+          this.titleGenerationTimeoutMs,
+        );
+        if (
+          generatedTitle !== null &&
+          !isGeneratedTitleLanguageCompatible(prompt, generatedTitle)
+        ) {
+          generatedTitle = null;
+        }
+      } catch {
+        // Desktop と同様、生成経路の失敗は初回 prompt の先頭60文字へフォールバックする。
+      }
+
+      const title = generatedTitle ?? fallbackTitle;
+      // 生成中の手動 rename や別 client の命名を上書きしない。
+      if (await readThreadName(connection, options.threadId) !== null) return null;
+      await connection.request("thread/name/set", {
+        threadId: options.threadId,
+        name: title,
+      });
+      return title;
+    } finally {
+      if (ephemeralThreadId !== null) {
+        try {
+          await connection.request("thread/unsubscribe", { threadId: ephemeralThreadId });
+        } catch {
+          // 短命接続を閉じれば通常会話には影響しない。
+        }
+      }
+      connection.close();
     }
   }
 
@@ -718,9 +838,266 @@ export class CodexAppServerManager {
   }
 }
 
+async function readThreadName(
+  connection: CodexAppServerConnection,
+  threadId: string,
+): Promise<string | null> {
+  let response: Record<string, unknown> | null;
+  try {
+    response = objectRecord(await connection.request("thread/read", {
+      threadId,
+      includeTurns: false,
+    }));
+  } catch (error) {
+    // turn/start が成功していても rollout の最初の行が flush されるまでは
+    // thread/read が空ファイルとして失敗する。thread/list のメタデータはこの間も
+    // name を返せるため、手動 rename の上書き防止を維持したまま命名を続行する。
+    if (!isUnmaterializedThreadError(error, threadId)) throw error;
+    return readThreadNameFromList(connection, threadId);
+  }
+  const thread = objectRecord(response?.["thread"]);
+  if (thread === null) throw new Error("Codex App Server thread/read response omitted thread");
+  const name = thread["name"];
+  if (name === null || name === undefined) return null;
+  if (typeof name !== "string") {
+    throw new Error("Codex App Server thread/read returned an invalid thread name");
+  }
+  return name.trim().length > 0 ? name.trim() : null;
+}
+
+async function readThreadTitleTarget(
+  connection: CodexAppServerConnection,
+  threadId: string,
+  fallbackPrompt: string,
+): Promise<{ name: string | null; prompt: string }> {
+  let response: unknown;
+  try {
+    response = await connection.request("thread/read", {
+      threadId,
+      includeTurns: true,
+    });
+  } catch (error) {
+    // 作成直後は初回 turn/start 応答後もしばらく rollout が空の場合がある。
+    // controller から渡された最初の入力を使い、既存 name だけ thread/list で保護する。
+    if (!isUnmaterializedThreadError(error, threadId)) throw error;
+    return {
+      name: await readThreadNameFromList(connection, threadId),
+      prompt: fallbackPrompt,
+    };
+  }
+  const record = objectRecord(response);
+  const thread = objectRecord(record?.["thread"]);
+  if (thread === null) throw new Error("Codex App Server thread/read response omitted thread");
+  const rawName = thread["name"];
+  if (rawName !== null && rawName !== undefined && typeof rawName !== "string") {
+    throw new Error("Codex App Server thread/read returned an invalid thread name");
+  }
+  const name =
+    typeof rawName === "string" && rawName.trim().length > 0 ? rawName.trim() : null;
+  const firstUserPrompt = extractThreadItems(response)
+    .map(extractUserMessageText)
+    .find((value): value is string => value !== null && value.trim().length > 0);
+  return {
+    name,
+    prompt: firstUserPrompt ?? fallbackPrompt,
+  };
+}
+
+async function readThreadNameFromList(
+  connection: CodexAppServerConnection,
+  threadId: string,
+): Promise<string | null> {
+  const page = parseThreadListPage(await connection.request("thread/list", {
+    limit: 100,
+    sortKey: "updated_at",
+    sortDirection: "desc",
+  }));
+  const thread = page.data.find((candidate) => candidate.id === threadId);
+  if (thread === undefined) {
+    throw new Error(`Codex App Server thread/list omitted target thread ${threadId}`);
+  }
+  return thread.name;
+}
+
+function extractUserMessageText(item: Record<string, unknown>): string | null {
+  if (item["type"] !== "userMessage") return null;
+  const content = item["content"];
+  if (!Array.isArray(content)) return null;
+  const text = content.flatMap((part) => {
+    const record = objectRecord(part);
+    if (record === null || record["type"] !== "text") return [];
+    return typeof record["text"] === "string" ? [record["text"]] : [];
+  }).join("\n").trim();
+  return text.length > 0 ? text : null;
+}
+
+async function runThreadTitleTurn(
+  connection: CodexAppServerConnection,
+  threadId: string,
+  prompt: string,
+  timeoutMs: number,
+): Promise<string | null> {
+  let turnId: string | null = null;
+  let responseText = "";
+  let settled = false;
+  let resolveCompletion: (title: string | null) => void = () => {};
+  const completion = new Promise<string | null>((resolve) => {
+    resolveCompletion = resolve;
+  });
+  const finish = (title: string | null): void => {
+    if (settled) return;
+    settled = true;
+    resolveCompletion(title);
+  };
+  const removeNotification = connection.onNotification((notification) => {
+    const params = objectRecord(notification.params);
+    if (params?.["threadId"] !== threadId) return;
+    const notificationTurnId =
+      stringValue(params["turnId"]) ?? stringValue(objectRecord(params["turn"])?.["id"]);
+    if (turnId !== null && notificationTurnId !== null && notificationTurnId !== turnId) return;
+
+    if (notification.method === "turn/started") {
+      if (notificationTurnId !== null) turnId = notificationTurnId;
+      return;
+    }
+    if (notification.method === "item/agentMessage/delta") {
+      const delta = params["delta"];
+      if (typeof delta === "string") responseText += delta;
+      return;
+    }
+    if (notification.method === "item/completed") {
+      const item = objectRecord(params["item"]);
+      if (item?.["type"] === "agentMessage" && typeof item["text"] === "string") {
+        responseText = item["text"];
+      }
+      return;
+    }
+    if (notification.method === "error") {
+      finish(null);
+      return;
+    }
+    if (notification.method === "turn/completed") {
+      const turn = objectRecord(params["turn"]);
+      finish(turn?.["status"] === "completed" ? parseThreadTitleResult(responseText) : null);
+    }
+  });
+  const timer = setTimeout(() => {
+    if (turnId !== null) {
+      void connection.request("turn/interrupt", { threadId, turnId }).catch(() => {});
+    }
+    finish(null);
+  }, Math.max(1, timeoutMs));
+
+  try {
+    const response = await connection.request("turn/start", {
+      threadId,
+      clientUserMessageId: randomUUID(),
+      input: [{ type: "text", text: prompt, text_elements: [] }],
+      cwd: null,
+      approvalPolicy: null,
+      permissions: ":read-only",
+      runtimeWorkspaceRoots: [],
+      model: null,
+      effort: null,
+      serviceTier: null,
+      summary: "none",
+      personality: null,
+      outputSchema: THREAD_TITLE_OUTPUT_SCHEMA,
+      collaborationMode: null,
+    });
+    turnId = extractTurnId(response);
+    if (turnId === null) throw new Error("Codex title turn/start response omitted turn.id");
+    return await completion;
+  } finally {
+    clearTimeout(timer);
+    removeNotification();
+  }
+}
+
+function buildThreadTitlePrompt(prompt: string): string {
+  const languageInstructions = containsJapaneseScript(prompt)
+    ? [
+        "The user prompt is Japanese. The title and description MUST be written in natural Japanese.",
+        "Do not translate the title or description into English. Product names such as Codex may stay in Latin script.",
+        "For change requests, use a precise Japanese action ending such as 追加, 修正, 更新, 整理, or 削除.",
+      ]
+    : [
+        "Write the title and description in the same primary language as the user prompt.",
+        "Start change requests with a precise action verb appropriate to that language.",
+      ];
+  return [
+    "You are a helpful assistant that creates a short UI title for a coding task.",
+    `Return a concise title of at most ${THREAD_TITLE_MAX_LENGTH} characters and a compact, search-oriented description of at most 100 characters.`,
+    ...languageInstructions,
+    "Keep the title under five words when possible.",
+    "Make questions clearly express their intent in the user's language.",
+    "Reuse an explicit short title from the user when one is provided.",
+    "Preserve ticket references such as ABC-123 verbatim.",
+    "Do not use quotes, Markdown, formatting characters, or trailing punctuation.",
+    "Do not answer the prompt or solve the task. Only produce the structured title and description.",
+    "",
+    "User prompt:",
+    prompt,
+  ].join("\n");
+}
+
+function isGeneratedTitleLanguageCompatible(prompt: string, title: string): boolean {
+  return !containsJapaneseScript(prompt) || containsJapaneseScript(title);
+}
+
+function containsJapaneseScript(value: string): boolean {
+  return /[\u3040-\u30ff\u3400-\u9fff]/u.test(value);
+}
+
+function parseThreadTitleResult(raw: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.trim());
+  } catch {
+    return null;
+  }
+  const result = objectRecord(parsed);
+  const title = result?.["title"];
+  const description = result?.["description"];
+  if (
+    typeof title !== "string" ||
+    title.length === 0 ||
+    title.length > THREAD_TITLE_MAX_LENGTH ||
+    typeof description !== "string" ||
+    description.trim().length === 0
+  ) {
+    return null;
+  }
+  return sanitizeGeneratedThreadTitle(title);
+}
+
+function sanitizeGeneratedThreadTitle(raw: string): string | null {
+  let title = raw
+    .replaceAll("\r\n", "\n")
+    .split("\n")
+    .find((line) => line.trim().length > 0)
+    ?.trim() ?? "";
+  title = title.replace(/^title[:\s]+/i, "");
+  title = title.replace(/^[`"'“”‘’]+|[`"'“”‘’]+$/g, "");
+  title = title.replace(/\s+/g, " ").trim();
+  title = title.replace(/[.?!]+$/, "").trim();
+  if (title.length === 0) return null;
+  return title.length > THREAD_TITLE_MAX_LENGTH
+    ? `${title.slice(0, THREAD_TITLE_MAX_LENGTH - 1).trimEnd()}…`
+    : title;
+}
+
+function normalizeFallbackThreadTitle(raw: string): string {
+  const title = raw.replaceAll("\n", " ").replaceAll("\r", " ").trim();
+  return title.slice(0, THREAD_TITLE_FALLBACK_MAX_LENGTH);
+}
+
 function isUnmaterializedThreadError(error: unknown, threadId: string): boolean {
-  return error instanceof Error &&
-    error.message === `no rollout found for thread id ${threadId}`;
+  if (!(error instanceof Error)) return false;
+  if (error.message === `no rollout found for thread id ${threadId}`) return true;
+  return error.message.includes(threadId) &&
+    error.message.includes("failed to read session metadata") &&
+    error.message.endsWith("is empty");
 }
 
 function parseRemoteControlStatus(value: unknown): CodexRemoteControlStatus | null {
