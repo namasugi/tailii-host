@@ -158,6 +158,8 @@ export function parseHerdrResult(stdout: string): Record<string, unknown> | null
 export interface HerdrPane {
   paneId: string;
   label: string | null;
+  /** pane を収容するタブ ID（タブラベル書換=session-title に使う。旧形式は null）。 */
+  tabId: string | null;
 }
 
 /** `pane list` stdout をパースする（形式不明は空配列）。 */
@@ -173,7 +175,24 @@ export function parseHerdrPaneList(stdout: string): HerdrPane[] {
     out.push({
       paneId: obj["pane_id"],
       label: typeof obj["label"] === "string" ? obj["label"] : null,
+      tabId: typeof obj["tab_id"] === "string" ? obj["tab_id"] : null,
     });
+  }
+  return out;
+}
+
+/** `tab list` stdout を tab_id → label のマップにパースする（形式不明は空マップ）。 */
+export function parseHerdrTabLabels(stdout: string): Map<string, string> {
+  const result = parseHerdrResult(stdout);
+  const tabs = result?.["tabs"];
+  const out = new Map<string, string>();
+  if (!Array.isArray(tabs)) return out;
+  for (const raw of tabs) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const obj = raw as Record<string, unknown>;
+    if (typeof obj["tab_id"] === "string" && typeof obj["label"] === "string") {
+      out.set(obj["tab_id"], obj["label"]);
+    }
   }
   return out;
 }
@@ -282,6 +301,9 @@ export class HerdrSessionManager {
     const panes = await this.livePanes();
     const paneIds = new Set(panes.map((pane) => pane.paneId));
     const labels = new Set(panes.map((pane) => pane.label).filter((label) => label !== null));
+    // タブラベル（Mac 側リネーム含む会話タイトル表示）を name→label で引けるようにする
+    // （session-title 逆方向同期: セッション名と異なるラベルを displayTitle として載せる）。
+    const tabLabels = await this.tabLabels();
 
     const infos: SessionInfo[] = [];
     for (const meta of this.store.all()) {
@@ -291,6 +313,15 @@ export class HerdrSessionManager {
         meta.providerSessionId ?? (agent === "claude" ? meta.claudeSessionId : undefined);
       const alive =
         (meta.herdrPaneId !== undefined && paneIds.has(meta.herdrPaneId)) || labels.has(meta.name);
+      const pane =
+        (meta.herdrPaneId !== undefined
+          ? panes.find((candidate) => candidate.paneId === meta.herdrPaneId)
+          : undefined) ?? panes.find((candidate) => candidate.label === meta.name);
+      const tabLabel = pane?.tabId != null ? tabLabels.get(pane.tabId) : undefined;
+      const displayTitle =
+        alive && tabLabel !== undefined && tabLabel !== meta.name && tabLabel.length > 0
+          ? tabLabel
+          : undefined;
       infos.push({
         name: meta.name,
         cwd: meta.cwd,
@@ -299,9 +330,36 @@ export class HerdrSessionManager {
         ...(meta.claudeSessionId !== undefined ? { claudeSessionId: meta.claudeSessionId } : {}),
         ...(meta.agent !== undefined ? { agent: meta.agent } : {}),
         ...(providerSessionId !== undefined ? { providerSessionId } : {}),
+        ...(displayTitle !== undefined ? { displayTitle } : {}),
       });
     }
     return infos.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  }
+
+  /**
+   * 生存 pane の session 名 → { tabId, tabLabel } を返す（session-title の自動タイトル同期用）。
+   * pane label（= agent start のセッション名）が無い pane・タブ不明の pane は含めない。
+   */
+  async tabInfoByName(): Promise<Map<string, { tabId: string; label: string | null }>> {
+    const panes = await this.livePanes();
+    const tabs = await this.tabLabels();
+    const out = new Map<string, { tabId: string; label: string | null }>();
+    for (const pane of panes) {
+      if (pane.label === null || pane.tabId === null) continue;
+      out.set(pane.label, { tabId: pane.tabId, label: tabs.get(pane.tabId) ?? null });
+    }
+    return out;
+  }
+
+  /** `tab list` を tab_id → label で読む（失敗は空マップ = displayTitle 無しに倒す）。 */
+  private async tabLabels(): Promise<Map<string, string>> {
+    try {
+      const result = await this.runner(["tab", "list"]);
+      if (result.exitCode !== 0) return new Map();
+      return parseHerdrTabLabels(result.stdout);
+    } catch {
+      return new Map();
+    }
   }
 
   /** 既存セッションへ reattach（生存: attached / 不在: session_not_found エラー封筒）。 */
@@ -352,6 +410,29 @@ export class HerdrSessionManager {
       return paneCommandLooksLikeAgent(command);
     } catch {
       return true;
+    }
+  }
+
+  /**
+   * 会話カスタムタイトルの端末表示追随（session-title）: pane を収容するタブのラベルを
+   * 書き換える（`tab rename`）。pane の label はセッション解決の権威（findPane の
+   * fallback / list の生存判定）なので触らない。title 空/null は解除=セッション名へ戻す。
+   */
+  async setDisplayTitle(name: string, title: string | null): Promise<void> {
+    validateSessionName(name);
+    const pane = await this.findPane(name);
+    if (pane === null) {
+      throw new HerdrFailedError(["tab", "rename", name], 1, "pane not found");
+    }
+    if (pane.tabId === null) {
+      throw new HerdrFailedError(["tab", "rename", name], 1, "tab id unavailable");
+    }
+    const trimmed = title?.trim() ?? "";
+    const label = trimmed.length > 0 ? trimmed : name;
+    const args = ["tab", "rename", pane.tabId, label];
+    const result = await this.runner(args);
+    if (result.exitCode !== 0) {
+      throw new HerdrFailedError(args, result.exitCode, result.stderr);
     }
   }
 

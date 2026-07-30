@@ -7,8 +7,10 @@
 import { describe, expect, test } from "vitest";
 import { decodeControlMessage } from "../src/protocol.js";
 import type { SessionBackendKind } from "../src/backend/sessionBackend.js";
+import { HerdrSessionManager } from "../src/backend/herdr.js";
+import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
 import { TmuxSessionManager } from "../src/backend/tmux.js";
-import { MockTmuxRunner, startEngine } from "./helpers.js";
+import { makeTempDir, MockTmuxRunner, startEngine } from "./helpers.js";
 
 function makeManager(): TmuxSessionManager {
   return new TmuxSessionManager({
@@ -58,6 +60,52 @@ describe("EngineControl — backend get/set", () => {
       engine.writeLine(JSON.stringify({ type: "backend_get_request", v: 1, id: "bg2" }));
       expect(decodeControlMessage(await engine.lines.nextOfType("backend_get_response"))).toMatchObject({
         id: "bg2", backend: "herdr",
+      });
+    } finally {
+      await engine.teardown();
+    }
+  }, 15_000);
+
+  test("session_title_set は herdr タブを tab rename し ok を返す（session-title）", async () => {
+    const store = new SessionMetadataStore(makeTempDir("engine-title-store"));
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const recorded: string[][] = [];
+    const manager = new HerdrSessionManager({
+      store,
+      runner: async (args) => {
+        recorded.push(args);
+        if (args[0] === "pane" && args[1] === "list") {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              result: {
+                type: "pane_list",
+                panes: [{ pane_id: "w4:p2", label: "s-a", tab_id: "w4:t2" }],
+              },
+            }),
+            stderr: "",
+          };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+    const engine = startEngine({ sessionManager: manager });
+    await engine.lines.nextOfType("channel_hello");
+    try {
+      engine.writeLine(JSON.stringify({
+        type: "session_title_set", v: 1, id: "st", session: "s-a", title: "認証バグの調査",
+      }));
+      expect(decodeControlMessage(await engine.lines.nextOfType("session_title_set_result"))).toMatchObject({
+        type: "session_title_set_result", id: "st", ok: true, error: null,
+      });
+      expect(recorded).toContainEqual(["tab", "rename", "w4:t2", "認証バグの調査"]);
+
+      // pane 不在は ok=false（best-effort。iOS 側は握り潰す）。
+      engine.writeLine(JSON.stringify({
+        type: "session_title_set", v: 1, id: "st2", session: "s-gone", title: "x",
+      }));
+      expect(decodeControlMessage(await engine.lines.nextOfType("session_title_set_result"))).toMatchObject({
+        id: "st2", ok: false,
       });
     } finally {
       await engine.teardown();

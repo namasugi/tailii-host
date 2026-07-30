@@ -144,6 +144,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
             providerSessionId: optionalString(obj, "providerSessionId"),
             // 未知値は未指定（= tmux 相当）へ倒す（後方互換）。
             backend: optionalString(obj, "backend") === "herdr" ? "herdr" : undefined,
+            displayTitle: optionalString(obj, "displayTitle"),
           });
         }),
         nextCursor: optionalString(raw, "nextCursor"),
@@ -500,11 +501,20 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
 
     case "pane_choice_send_result":
     case "pane_key_send_result":
+    case "session_title_set_result":
       return {
         type, v,
         id: requireString(raw, "id"),
         ok: requireBoolean(raw, "ok"),
         error: optionalNullableString(raw, "error") ?? null,
+      };
+
+    case "session_title_set":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        session: requireString(raw, "session"),
+        title: requireString(raw, "title"),
       };
 
     case "question_prompt":

@@ -39,6 +39,11 @@ export interface SessionBackend {
   sendTextSubmit(name: string, text: string): Promise<void>;
   capturePane(name: string, options?: CapturePaneOptions): Promise<string>;
   agentProcessAlive(name: string): Promise<boolean>;
+  /**
+   * 会話カスタムタイトルの端末表示追随（session-title）。herdr はタブラベルへ反映、
+   * tmux はセッション名自体が識別子のため no-op。title=null/空はセッション名へ戻す。
+   */
+  setDisplayTitle(name: string, title: string | null): Promise<void>;
 }
 
 /** backend 設定ファイルの既定パス（`~/.tailii/backend`。`~/.tailii/agent` と同じ流儀）。 */
@@ -132,6 +137,10 @@ export class CompositeSessionBackend implements SessionBackend {
 
   agentProcessAlive(name: string): Promise<boolean> {
     return this.backendFor(name).agentProcessAlive(name);
+  }
+
+  setDisplayTitle(name: string, title: string | null): Promise<void> {
+    return this.backendFor(name).setDisplayTitle(name, title);
   }
 }
 

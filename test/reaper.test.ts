@@ -280,6 +280,48 @@ describe("reaperTick herdr backend", () => {
     };
   }
 
+  test("未命名タブへ会話タイトルを自動反映し、命名済み/codex/導出不能は触らない（session-title）", async () => {
+    const dir = makeTempDir("reaper-herdr-title");
+    const tmux = runnerWithSessions([]);
+    const store = makeTempStore();
+    store.put({ name: "s-unnamed", cwd: "/w", createdAt: 1, backend: "herdr", claudeSessionId: "conv-1" });
+    store.put({ name: "s-named", cwd: "/w", createdAt: 1, backend: "herdr", claudeSessionId: "conv-2" });
+    store.put({ name: "s-codex", cwd: "/w", createdAt: 1, backend: "herdr", agent: "codex", providerSessionId: "th-1" });
+    store.put({ name: "s-notitle", cwd: "/w", createdAt: 1, backend: "herdr", claudeSessionId: "conv-3" });
+    const names = ["s-codex", "s-named", "s-notitle", "s-unnamed"];
+    for (const name of names) writeHeartbeat(dir, name, { ts: NOW - 10, state: "idle" });
+    const renamed: [string, string | null][] = [];
+    const ops: import("../src/hub/reaper.js").HerdrReaperOps = {
+      list: async () =>
+        names.map((name) => ({ name, cwd: "/w", alive: true, backend: "herdr" as const })),
+      agentProcessAlive: async () => true,
+      kill: async () => {},
+      tabInfoByName: async () =>
+        new Map([
+          ["s-unnamed", { tabId: "w1:t1", label: "s-unnamed" }],
+          ["s-named", { tabId: "w1:t2", label: "認証バグの調査" }],
+          ["s-codex", { tabId: "w1:t3", label: "s-codex" }],
+          ["s-notitle", { tabId: "w1:t4", label: "s-notitle" }],
+        ]),
+      setDisplayTitle: async (name, title) => {
+        renamed.push([name, title]);
+      },
+    };
+
+    await reaperTick({
+      runner: tmux.runner,
+      heartbeatDir: dir,
+      metadataStore: store,
+      timeoutSeconds: TIMEOUT,
+      now: NOW,
+      herdrOps: ops,
+      deriveClaudeTitle: (sessionId) => (sessionId === "conv-1" ? "最初の発話タイトル" : null),
+    });
+
+    // 未命名（ラベル==セッション名）かつ claude かつタイトル導出可のものだけ反映される。
+    expect(renamed).toEqual([["s-unnamed", "最初の発話タイトル"]]);
+  });
+
   test("herdr セッションも idle timeout 超過で pane close(kill) される", async () => {
     const dir = makeTempDir("reaper-herdr");
     const tmux = runnerWithSessions([]);

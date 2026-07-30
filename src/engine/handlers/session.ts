@@ -216,6 +216,23 @@ export const sessionHandlers: HandlerRegistry = {
     ctx.hubLink.send({ type: "conversation_unsubscribe", session: message.name });
   },
 
+  session_title_set: async (message, ctx) => {
+    const { writer, state, sessionManager } = ctx;
+    const v = state.negotiatedVersion;
+    // 会話カスタムタイトルの端末表示追随（session-title）: herdr はタブラベルへ反映、
+    // tmux は no-op（SessionBackend が backend 毎に吸収）。空 title は解除=セッション名へ戻す。
+    engineDiag(`session_title_set id=${message.id} session=${message.session} title=${message.title.slice(0, 40)}`);
+    try {
+      await sessionManager.setDisplayTitle(message.session, message.title);
+      writer.write({ type: "session_title_set_result", v, id: message.id, ok: true, error: null });
+    } catch (error) {
+      engineDiag(`session_title_set 失敗 id=${message.id}: ${String(error)}`);
+      writer.write({
+        type: "session_title_set_result", v, id: message.id, ok: false, error: String(error),
+      });
+    }
+  },
+
   session_start: async (message, ctx) => {
     const { writer, state, sessionManager, metadataStore } = ctx;
     const v = state.negotiatedVersion;

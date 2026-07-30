@@ -43,8 +43,13 @@ function herdrOk(stdout: string): HerdrCommandResult {
 }
 
 /** herdr `pane list` の JSON stdout を組み立てる。 */
-function paneListJson(panes: { pane_id: string; label?: string }[]): string {
+function paneListJson(panes: { pane_id: string; label?: string; tab_id?: string }[]): string {
   return JSON.stringify({ id: "cli:pane:list", result: { type: "pane_list", panes } });
+}
+
+/** herdr `tab list` の JSON stdout を組み立てる。 */
+function tabListJson(tabs: { tab_id: string; label: string }[]): string {
+  return JSON.stringify({ id: "cli:tab:list", result: { type: "tab_list", tabs } });
 }
 
 /** herdr `pane process-info` の JSON stdout を組み立てる。 */
@@ -95,8 +100,14 @@ describe("SessionMetadataStore backend 欄", () => {
 
 describe("herdr JSON パーサ", () => {
   test("pane list / agent start / process-info を読める", () => {
-    expect(parseHerdrPaneList(paneListJson([{ pane_id: "w4:p2", label: "s-a" }, { pane_id: "w4:p3" }])))
-      .toEqual([{ paneId: "w4:p2", label: "s-a" }, { paneId: "w4:p3", label: null }]);
+    expect(
+      parseHerdrPaneList(
+        paneListJson([{ pane_id: "w4:p2", label: "s-a", tab_id: "w4:t2" }, { pane_id: "w4:p3" }]),
+      ),
+    ).toEqual([
+      { paneId: "w4:p2", label: "s-a", tabId: "w4:t2" },
+      { paneId: "w4:p3", label: null, tabId: null },
+    ]);
     expect(parseHerdrPaneList("not json")).toEqual([]);
     expect(
       parseHerdrStartedPaneId(
@@ -156,6 +167,103 @@ describe("HerdrSessionManager", () => {
       ["pane", "send-text", "w4:p2", "\u001b[Z"],
       ["pane", "send-text", "w4:p2", "1"],
     ]);
+  });
+
+  test("list はタブラベルがセッション名と異なるときだけ displayTitle を載せる（逆方向同期）", async () => {
+    const store = makeStore();
+    store.put({ name: "s-titled", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    store.put({ name: "s-plain", cwd: "/b", createdAt: 2, backend: "herdr", herdrPaneId: "w4:p3" });
+    store.put({ name: "s-dead", cwd: "/c", createdAt: 3, backend: "herdr", herdrPaneId: "w4:p9" });
+    const runner = new MockHerdrRunner((args) => {
+      if (args[0] === "pane" && args[1] === "list") {
+        return herdrOk(paneListJson([
+          { pane_id: "w4:p2", label: "s-titled", tab_id: "w4:t2" },
+          { pane_id: "w4:p3", label: "s-plain", tab_id: "w4:t3" },
+        ]));
+      }
+      if (args[0] === "tab" && args[1] === "list") {
+        return herdrOk(tabListJson([
+          { tab_id: "w4:t2", label: "認証バグの調査" },
+          { tab_id: "w4:t3", label: "s-plain" },
+        ]));
+      }
+      return herdrOk("");
+    });
+    const manager = new HerdrSessionManager({ runner: runner.runner, store });
+    const infos = await manager.list();
+    expect(infos.find((info) => info.name === "s-titled")?.displayTitle).toBe("認証バグの調査");
+    expect(infos.find((info) => info.name === "s-plain")?.displayTitle).toBeUndefined();
+    expect(infos.find((info) => info.name === "s-dead")?.displayTitle).toBeUndefined();
+  });
+
+  test("tabInfoByName は生存 pane の name → タブ情報を返す", async () => {
+    const store = makeStore();
+    const runner = new MockHerdrRunner((args) => {
+      if (args[0] === "pane" && args[1] === "list") {
+        return herdrOk(paneListJson([
+          { pane_id: "w4:p2", label: "s-a", tab_id: "w4:t2" },
+          { pane_id: "w4:p3" }, // label 無しは含めない
+        ]));
+      }
+      if (args[0] === "tab" && args[1] === "list") {
+        return herdrOk(tabListJson([{ tab_id: "w4:t2", label: "タイトル" }]));
+      }
+      return herdrOk("");
+    });
+    const manager = new HerdrSessionManager({ runner: runner.runner, store });
+    expect(await manager.tabInfoByName()).toEqual(
+      new Map([["s-a", { tabId: "w4:t2", label: "タイトル" }]]),
+    );
+  });
+
+  test("setDisplayTitle: pane の tab を tab rename で書き換える（pane label は触らない）", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const runner = new MockHerdrRunner((args) =>
+      args[0] === "pane" && args[1] === "list"
+        ? herdrOk(paneListJson([{ pane_id: "w4:p2", label: "s-a", tab_id: "w4:t2" }]))
+        : herdrOk(""),
+    );
+    const manager = new HerdrSessionManager({ runner: runner.runner, store });
+    await manager.setDisplayTitle("s-a", " 認証バグの調査 ");
+    expect(runner.recorded).toContainEqual(["tab", "rename", "w4:t2", "認証バグの調査"]);
+    expect(runner.recorded.some((args) => args[0] === "pane" && args[1] === "rename")).toBe(false);
+  });
+
+  test("setDisplayTitle: 空/null はセッション名へ戻す", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const runner = new MockHerdrRunner((args) =>
+      args[0] === "pane" && args[1] === "list"
+        ? herdrOk(paneListJson([{ pane_id: "w4:p2", label: "s-a", tab_id: "w4:t2" }]))
+        : herdrOk(""),
+    );
+    const manager = new HerdrSessionManager({ runner: runner.runner, store });
+    await manager.setDisplayTitle("s-a", "");
+    await manager.setDisplayTitle("s-a", null);
+    expect(runner.recorded.filter((args) => args[0] === "tab")).toEqual([
+      ["tab", "rename", "w4:t2", "s-a"],
+      ["tab", "rename", "w4:t2", "s-a"],
+    ]);
+  });
+
+  test("setDisplayTitle: pane 不在 / tab_id 不明（旧 herdr）は throw する", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const gone = new HerdrSessionManager({
+      runner: new MockHerdrRunner(() => herdrOk(paneListJson([]))).runner,
+      store,
+    });
+    await expect(gone.setDisplayTitle("s-a", "t")).rejects.toThrow(HerdrFailedError);
+    const noTab = new HerdrSessionManager({
+      runner: new MockHerdrRunner((args) =>
+        args[0] === "pane" && args[1] === "list"
+          ? herdrOk(paneListJson([{ pane_id: "w4:p2", label: "s-a" }]))
+          : herdrOk(""),
+      ).runner,
+      store,
+    });
+    await expect(noTab.setDisplayTitle("s-a", "t")).rejects.toThrow(HerdrFailedError);
   });
 
   /** sendTextSubmit 検証用の pane 状態機械（send 内容で画面を遷移させ、read は現在画面を返す）。 */
@@ -622,6 +730,22 @@ describe("launchCore herdr backend", () => {
       backend: "herdr",
       herdrPaneId: "w9:p7",
     });
+  });
+
+  test("displayTitle 指定時は新規タブのラベルにタイトルを使う（session-title）", async () => {
+    const dir = makeTempDir("herdr-launch-title");
+    const store = makeStore();
+    const { runner, recorded } = herdrProcessRunner();
+
+    expect(
+      await launchCore({ ...launchOptions(dir, store, runner), displayTitle: "認証バグの調査" }),
+    ).toBe(0);
+    expect(recorded).toContainEqual(expect.objectContaining({
+      args: ["pane", "move", "w9:p7", "--new-tab", "--label", "認証バグの調査", "--no-focus"],
+    }));
+    // agent start の pane label（=セッション解決の権威）は session 名のまま。
+    const start = recorded.find((call) => call.args[0] === "agent" && call.args[1] === "start");
+    expect(start?.args[2]).toBe("s-h");
   });
 
   test("生存 pane があれば再起動せずメタだけ更新する", async () => {

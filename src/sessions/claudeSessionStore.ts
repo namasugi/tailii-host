@@ -198,11 +198,17 @@ function entryTimestamp(rec: Record<string, unknown>): number | null {
   return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
 }
 
-/** 1 つの jsonl から ClaudeSessionInfo を導出する（先頭 + 末尾チャンクのみ読む）。 */
-function deriveInfo(filePath: string, sessionId: string, slug: string): ClaudeSessionInfo {
-  const tail = scanTranscriptTail(filePath);
-  const updatedAt = tail.updatedAt ?? undefined;
+/** 先頭チャンクスキャンの結果（cwd と会話タイトル）。 */
+export interface TranscriptHeadSummary {
+  cwd: string | null;
+  title: string | null;
+}
 
+/**
+ * transcript 先頭チャンクから cwd と会話タイトル（最初のユーザー発話 先頭 ~60 字）を読む。
+ * 一覧の title 導出と herdr タブ名の自動タイトル同期（session-title）が共用する。
+ */
+export function scanTranscriptHead(filePath: string): TranscriptHeadSummary {
   let cwd: string | null = null;
   let title: string | null = null;
   try {
@@ -238,13 +244,21 @@ function deriveInfo(filePath: string, sessionId: string, slug: string): ClaudeSe
       fs.closeSync(fd);
     }
   } catch {
-    // 読めないファイルはフォールバックのみで返す。
+    // 読めないファイルは null/null を返す（呼び出し側がフォールバック）。
   }
+  return { cwd, title };
+}
+
+/** 1 つの jsonl から ClaudeSessionInfo を導出する（先頭 + 末尾チャンクのみ読む）。 */
+function deriveInfo(filePath: string, sessionId: string, slug: string): ClaudeSessionInfo {
+  const tail = scanTranscriptTail(filePath);
+  const updatedAt = tail.updatedAt ?? undefined;
+  const head = scanTranscriptHead(filePath);
 
   const info: ClaudeSessionInfo = {
     sessionId,
-    cwd: cwd ?? cwdFromSlug(slug),
-    title: title ?? sessionId.slice(0, 8),
+    cwd: head.cwd ?? cwdFromSlug(slug),
+    title: head.title ?? sessionId.slice(0, 8),
   };
   if (updatedAt !== undefined) info.updatedAt = updatedAt;
   if (tail.lastMessage !== null) info.lastMessage = tail.lastMessage;

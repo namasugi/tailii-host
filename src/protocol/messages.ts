@@ -79,6 +79,11 @@ export interface SessionInfo {
   providerSessionId?: string;
   /** セッションを収容する端末バックエンド。未指定は後方互換で tmux 相当（session-backend）。 */
   backend?: TerminalBackendKind;
+  /**
+   * 端末側の表示タイトル（session-title 逆方向同期）。herdr のタブラベルがセッション名と
+   * 異なるとき（アプリ/Mac どちらかでの命名済み）だけ載る。tmux は常に未指定。
+   */
+  displayTitle?: string;
 }
 
 /** マシン内会話 1 件（claude=jsonl / codex=rollout）。 */
@@ -304,6 +309,9 @@ export type ControlMessage =
   | { type: "pane_choice_send_result"; v: number; id: string; ok: boolean; error: string | null }
   | { type: "pane_key_send"; v: number; id: string; session: string; key: string }
   | { type: "pane_key_send_result"; v: number; id: string; ok: boolean; error: string | null }
+  /** 会話カスタムタイトルの端末表示追随（iOS→host, session-title）。空 title は解除=セッション名へ戻す。 */
+  | { type: "session_title_set"; v: number; id: string; session: string; title: string }
+  | { type: "session_title_set_result"; v: number; id: string; ok: boolean; error: string | null }
   | { type: "question_prompt"; v: number; id: string; questions: QuestionPromptQuestion[] }
   | { type: "question_answer"; v: number; id: string; session: string; answers: QuestionAnswer[] }
   | { type: "question_dismiss"; v: number; id: string }

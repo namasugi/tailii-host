@@ -177,6 +177,14 @@ export class TmuxSessionManager {
     }
   }
 
+  /**
+   * 会話カスタムタイトルの端末表示追随（session-title）。tmux はセッション名自体が
+   * 識別子（rename は全経路の解決を壊す）のため no-op。
+   */
+  async setDisplayTitle(name: string, _title: string | null): Promise<void> {
+    validateSessionName(name);
+  }
+
   /** 指定セッションのみを終了する（tmux kill-session -t <name>）。 */
   async kill(name: string): Promise<void> {
     validateSessionName(name);

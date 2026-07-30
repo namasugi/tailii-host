@@ -337,6 +337,7 @@ export function makeSessionLauncher(options: {
       // resume 起動でも実効会話 id を権威記録し、以後の reattach で厳密束縛できるようにする。
       claudeSessionId: agent === "claude" ? (resumeSessionId ?? newSessionId ?? null) : null,
       providerSessionId: effectiveProviderSessionId,
+      displayTitle: title ?? null,
     });
     return {
       exitCode,
@@ -401,6 +402,8 @@ export async function launchCore(options: {
   claudeSessionId?: string | null;
   /** provider 共通の論理会話 ID（Claude UUID / Codex thread ID）。 */
   providerSessionId?: string | null;
+  /** 会話の表示タイトル（session-title）。herdr 起動時のタブラベルに使う（未命名は session 名）。 */
+  displayTitle?: string | null;
   /** `~/.claude.json`（事前信頼記録）の場所。テスト注入用。省略時は実ホーム。 */
   claudeJsonPath?: string;
   /** フックのグローバル無効化マーカーの場所。テスト注入用（実マシンのマーカーに左右されない密閉性）。 */
@@ -470,6 +473,7 @@ export async function launchCore(options: {
       ...(options.providerSessionId !== undefined
         ? { providerSessionId: options.providerSessionId }
         : {}),
+      ...(options.displayTitle !== undefined ? { displayTitle: options.displayTitle } : {}),
       ...(options.spawnDetached !== undefined ? { spawnDetached: options.spawnDetached } : {}),
       ...(options.ensurePollMs !== undefined ? { ensurePollMs: options.ensurePollMs } : {}),
     });
@@ -575,6 +579,8 @@ async function launchHerdrPane(options: {
   errorSink: (message: string) => void;
   claudeSessionId?: string | null;
   providerSessionId?: string | null;
+  /** 会話の表示タイトル（session-title）。新規タブのラベルに使う（未命名は session 名）。 */
+  displayTitle?: string | null;
   /** detached プロセス起動の注入点（tailii セッションサーバーのヘッドレス起動用）。 */
   spawnDetached?: (executable: string, args: string[]) => void;
   /** ensure のポーリング待機（テストは 0ms に差し替え可能）。 */
@@ -652,10 +658,13 @@ async function launchHerdrPane(options: {
     }
     herdrPaneId = parseHerdrStartedPaneId(started.out);
 
-    // --- 4. pane を session 名のタブへ分離（表示整理のみ。失敗しても起動は成立） ---
+    // --- 4. pane を専用タブへ分離（表示整理のみ。失敗しても起動は成立） ---
+    // タブラベルは会話の表示タイトル（未命名は session 名）。pane label は agent start の
+    // session 名のまま（セッション解決の権威）で、タブラベルだけ表示用に使う（session-title）。
     if (herdrPaneId !== null) {
+      const tabLabel = options.displayTitle?.trim() || session;
       await runHerdr([
-        "pane", "move", herdrPaneId, "--new-tab", "--label", session, "--no-focus",
+        "pane", "move", herdrPaneId, "--new-tab", "--label", tabLabel, "--no-focus",
       ]);
     }
   }

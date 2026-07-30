@@ -28,6 +28,7 @@ import {
 import { HerdrSessionManager } from "../backend/herdr.js";
 import type { SessionInfo } from "../protocol.js";
 import { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
+import { ClaudeSessionStore, scanTranscriptHead } from "../sessions/claudeSessionStore.js";
 import { paneCommandLooksLikeAgent, type TmuxCommandRunner } from "../backend/tmux.js";
 
 /** 一律のアイドル timeout(秒)。idle/active(bump 停止)の両方に同じ値を使う。 */
@@ -46,6 +47,10 @@ export interface HerdrReaperOps {
   kill(name: string): Promise<void>;
   /** 生存 Tailii セッションが 0 のとき、pane ゼロの専用 server を停止する（任意実装）。 */
   stopServerIfEmpty?(): Promise<void>;
+  /** 生存 pane の session 名 → タブ情報（session-title 自動タイトル同期用, 任意実装）。 */
+  tabInfoByName?(): Promise<Map<string, { tabId: string; label: string | null }>>;
+  /** タブラベルの書換（session-title, 任意実装）。 */
+  setDisplayTitle?(name: string, title: string | null): Promise<void>;
 }
 
 export interface ReaperTickOptions {
@@ -60,6 +65,11 @@ export interface ReaperTickOptions {
    * （純 tmux 環境では herdr CLI を一切呼ばない）。null で herdr 巡回を無効化。
    */
   herdrOps?: HerdrReaperOps | null;
+  /**
+   * claude 会話タイトルの導出（session-title 自動タイトル同期用, テスト注入可）。
+   * 省略時は `~/.claude/projects` の transcript 先頭から最初のユーザー発話を読む。
+   */
+  deriveClaudeTitle?: (claudeSessionId: string) => string | null;
 }
 
 export interface ReaperTickResult {
@@ -129,6 +139,13 @@ export async function agentProcessAlive(
 function defaultHerdrReaperOps(metadataStore: SessionMetadataStore): HerdrReaperOps | null {
   if (!metadataStore.all().some((meta) => meta.backend === "herdr")) return null;
   return new HerdrSessionManager({ store: metadataStore });
+}
+
+/** 既定の claude 会話タイトル導出（transcript 先頭の最初のユーザー発話, 一覧と同じ規則）。 */
+function defaultDeriveClaudeTitle(claudeSessionId: string): string | null {
+  const transcript = new ClaudeSessionStore().transcriptPath(claudeSessionId);
+  if (transcript === null) return null;
+  return scanTranscriptHead(transcript).title;
 }
 
 /** 巡回 1 回分。判定表は docs/architecture.md「セッション自動掃除」を参照。 */
@@ -236,6 +253,36 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
     // 判定は ops 側で pane 総数 0 のときだけ停止する（手動 pane があれば停止しない）。
     if (herdrLive.length === 0) {
       await herdrOps.stopServerIfEmpty?.();
+    }
+
+    // --- 未命名タブへ会話タイトルを自動反映（session-title, claude のみ）---
+    // タブラベルがセッション名のまま（アプリ/Mac どちらでも未命名）の生存セッションだけを
+    // 対象に、transcript の会話タイトル（最初のユーザー発話 先頭 ~60 字 = 一覧と同じ導出）を
+    // タブへ書く。命名済み（ラベル ≠ セッション名）は手動を優先して触らない。
+    if (herdrOps.tabInfoByName !== undefined && herdrOps.setDisplayTitle !== undefined) {
+      const deriveTitle = options.deriveClaudeTitle ?? defaultDeriveClaudeTitle;
+      try {
+        const tabInfo = await herdrOps.tabInfoByName();
+        for (const name of herdrLive) {
+          if (killed.includes(name)) continue;
+          const meta = metadataStore.get(name);
+          if (meta === null || (meta.agent ?? "claude") !== "claude") continue;
+          if (meta.claudeSessionId === undefined) continue;
+          const info = tabInfo.get(name);
+          if (info === undefined) continue;
+          if (info.label !== null && info.label !== name) continue; // 命名済みは触らない
+          const title = deriveTitle(meta.claudeSessionId);
+          if (title === null || title.length === 0) continue;
+          try {
+            await herdrOps.setDisplayTitle(name, title);
+            log(`session-title 自動反映: ${name} → ${title.slice(0, 30)}`);
+          } catch (error) {
+            log(`session-title 反映失敗(継続): ${name}: ${String(error)}`);
+          }
+        }
+      } catch (error) {
+        log(`session-title 巡回失敗(継続): ${String(error)}`);
+      }
     }
   }
 
