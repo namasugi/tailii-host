@@ -363,6 +363,7 @@ export type ControlMessage =
   | { type: "chat_stream_alias"; v: number; streamId: string; aliasStreamIds: string[] }
   | { type: "chat_output"; v: number; streamId: string; role: ChatRole; text: string; eof: boolean }
   | { type: "tool_activity"; v: number; activity: ToolActivity }
+  | { type: "session_chat_stream_alias"; v: number; session: string; serverSeq: number; streamId: string; aliasStreamIds: string[] }
   | { type: "session_chat_output"; v: number; session: string; serverSeq: number; streamId: string; role: ChatRole; text: string; eof: boolean }
   | { type: "session_tool_activity"; v: number; session: string; serverSeq: number; activity: ToolActivity }
   | { type: "subagent_node"; v: number; node: SubagentNode }

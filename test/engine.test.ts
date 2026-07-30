@@ -184,6 +184,23 @@ describe("EngineControl — 横断制御チャネル", () => {
       eof: true,
     });
     publish?.({
+      type: "chat_stream_alias",
+      v: 2,
+      streamId: "history-answer-1",
+      aliasStreamIds: ["answer-1"],
+    });
+
+    expect(decodeControlMessage(
+      await engine.lines.nextOfType("session_chat_stream_alias"),
+    )).toEqual({
+      type: "session_chat_stream_alias",
+      v: 2,
+      session: "background-work",
+      serverSeq: 2,
+      streamId: "history-answer-1",
+      aliasStreamIds: ["answer-1"],
+    });
+    publish?.({
       type: "tool_activity",
       v: 2,
       activity: {
@@ -203,7 +220,7 @@ describe("EngineControl — 横断制御チャネル", () => {
       type: "session_tool_activity",
       v: 2,
       session: "background-work",
-      serverSeq: 2,
+      serverSeq: 3,
       activity: {
         id: "tool-background-1",
         name: "Bash",
@@ -232,7 +249,7 @@ describe("EngineControl — 横断制御チャネル", () => {
     });
     await engine.lines.nextOfType("session_chat_output");
 
-    // processing 完了・unsubscribe の有無にかかわらず前面昇格は floor(seq=2)から replay。
+    // processing 完了・unsubscribe の有無にかかわらず前面昇格は floor(seq=3)から replay。
     engine.writeLine('{"id":"open-bg","name":"background-work","type":"session_reattach","v":2}');
     expect(decodeControlMessage(await engine.lines.nextOfType("image_available"))).toMatchObject({
       type: "image_available", id: "image-background-1",

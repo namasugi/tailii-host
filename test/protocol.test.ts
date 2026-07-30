@@ -334,6 +334,25 @@ describe("decode 詳細", () => {
     });
   });
 
+  it("v1 session_chat_stream_alias のセッション情報とID対応を復元する", () => {
+    const decoded = decodeControlMessage(JSON.stringify({
+      type: "session_chat_stream_alias",
+      v: 1,
+      session: "proj-bg",
+      serverSeq: 41,
+      streamId: "codex-turn-1",
+      aliasStreamIds: ["codex-item-msg-1"],
+    }));
+    expect(decoded).toEqual({
+      type: "session_chat_stream_alias",
+      v: 1,
+      session: "proj-bg",
+      serverSeq: 41,
+      streamId: "codex-turn-1",
+      aliasStreamIds: ["codex-item-msg-1"],
+    });
+  });
+
   it("v1 session_tool_activity の activity を flat wire から復元する", () => {
     const line = goldenLines("approval-protocol-v1.ndjson").find((entry) =>
       entry.includes('"type":"session_tool_activity"'),

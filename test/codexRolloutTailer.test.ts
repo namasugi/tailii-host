@@ -2,12 +2,13 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import {
   CodexRolloutTailer,
   CONTEXT_STREAM_ID,
   CONTEXT_WINDOW_STREAM_ID,
   MODEL_STREAM_ID,
+  type CodexTurnLifecycleEvent,
 } from "../src/codex/codexRolloutTailer.js";
 import type { ControlMessage } from "../src/protocol.js";
 import { makeTempDir } from "./helpers.js";
@@ -68,6 +69,10 @@ function tokenCount(contextTokens: number, contextWindow?: number): string {
       },
     },
   });
+}
+
+function taskLifecycle(type: "task_started" | "task_complete", turnId: string): string {
+  return JSON.stringify({ type: "event_msg", payload: { type, turn_id: turnId } });
 }
 
 describe("CodexRolloutTailer.resolveRollout", () => {
@@ -143,6 +148,58 @@ describe("CodexRolloutTailer.streamForCwd（有限 tail）", () => {
       { type: "chat_output", v: 1, streamId: "codex-turn-1", role: "assistant",
         text: "停止中の追記", eof: true },
     ]);
+  });
+
+  test("初回EOFでは履歴中の最新turn状態だけを通知する", async () => {
+    const root = makeTempDir("codex-lifecycle-catchup");
+    const cwd = makeTempDir("codex-lifecycle-catchup-cwd");
+    writeRollout(root, "2026/07/31", "r.jsonl", cwd, [
+      taskLifecycle("task_started", "turn-old"),
+      taskLifecycle("task_complete", "turn-old"),
+      taskLifecycle("task_started", "turn-current"),
+      taskLifecycle("task_complete", "turn-current"),
+    ]);
+    const lifecycle: CodexTurnLifecycleEvent[] = [];
+    const tailer = new CodexRolloutTailer({
+      sessionsRoot: root,
+      tailDeadlineMs: 0,
+      onTurnLifecycle: (event) => lifecycle.push(event),
+    });
+
+    await collect(tailer, cwd);
+
+    expect(lifecycle).toEqual([{ state: "done", turnId: "turn-current" }]);
+  });
+
+  test("初回EOF後に追記されたtask_completeをライブ通知する", async () => {
+    const root = makeTempDir("codex-lifecycle-live");
+    const cwd = makeTempDir("codex-lifecycle-live-cwd");
+    const rollout = writeRollout(root, "2026/07/31", "r.jsonl", cwd, [
+      taskLifecycle("task_started", "turn-live"),
+    ]);
+    const lifecycle: CodexTurnLifecycleEvent[] = [];
+    const abort = new AbortController();
+    const tailer = new CodexRolloutTailer({
+      sessionsRoot: root,
+      pollIntervalMs: 5,
+      tailIndefinitely: true,
+      onTurnLifecycle: (event) => lifecycle.push(event),
+    });
+    const pump = (async () => {
+      for await (const _ of tailer.streamForCwd(cwd, null, abort.signal)) {
+        // lifecycle だけを検証する。
+      }
+    })();
+    await vi.waitFor(() =>
+      expect(lifecycle).toEqual([{ state: "active", turnId: "turn-live" }]));
+
+    fs.appendFileSync(rollout, taskLifecycle("task_complete", "turn-live") + "\n");
+    await vi.waitFor(() => expect(lifecycle).toEqual([
+      { state: "active", turnId: "turn-live" },
+      { state: "done", turnId: "turn-live" },
+    ]));
+    abort.abort();
+    await pump;
   });
 
   test("user_message / agent_message(commentary, final_answer) を chat_output に変換する", async () => {
@@ -227,6 +284,56 @@ describe("CodexRolloutTailer.streamForCwd（有限 tail）", () => {
         streamId: "codex-turn-3",
         role: "assistant",
         text: "同じ本文",
+        eof: true,
+      },
+    ]);
+  });
+
+  test("EOF後に遅れて追記されたassistant mirrorをgrace内ならalias付きで待つ", async () => {
+    const root = makeTempDir("codex-stream-alias-delayed");
+    const cwd = makeTempDir("codex-stream-alias-delayed-cwd");
+    const rollout = writeRollout(root, "2026/07/31", "r.jsonl", cwd, [
+      agentMsg("遅延した本文", "final_answer"),
+    ]);
+    const abort = new AbortController();
+    const msgs: ControlMessage[] = [];
+    const tailer = new CodexRolloutTailer({
+      sessionsRoot: root,
+      pollIntervalMs: 5,
+      assistantMirrorGraceMs: 250,
+      tailIndefinitely: true,
+    });
+    const pump = (async () => {
+      for await (const message of tailer.streamForCwd(cwd, null, abort.signal)) {
+        msgs.push(message);
+      }
+    })();
+
+    // 旧実装の1 poll待機を超えても、legacy IDを先に確定しない。
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(msgs).toEqual([]);
+
+    fs.appendFileSync(
+      rollout,
+      agentItem("msg-delayed", "遅延した本文", "final_answer") + "\n",
+    );
+    await vi.waitFor(() => expect(msgs).toHaveLength(2));
+    abort.abort();
+    await pump;
+
+    expect(msgs).toEqual([
+      {
+        type: "chat_stream_alias",
+        v: 1,
+        streamId: "codex-turn-1",
+        aliasStreamIds: ["codex-item-msg-delayed"],
+      },
+      {
+        type: "chat_output",
+        v: 1,
+        streamId: "codex-turn-1",
+        role: "assistant",
+        text: "遅延した本文",
         eof: true,
       },
     ]);

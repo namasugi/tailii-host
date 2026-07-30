@@ -590,7 +590,16 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
         if (message.session === activeChatSession.name) {
           payload = message.payload;
         } else if (backgroundChatSessions.has(message.session)) {
-          if (message.payload.type === "chat_output") {
+          if (message.payload.type === "chat_stream_alias") {
+            payload = {
+              type: "session_chat_stream_alias",
+              v: state.negotiatedVersion,
+              session: message.session,
+              serverSeq: message.serverSeq,
+              streamId: message.payload.streamId,
+              aliasStreamIds: message.payload.aliasStreamIds,
+            };
+          } else if (message.payload.type === "chat_output") {
             payload = {
               type: "session_chat_output",
               v: state.negotiatedVersion,

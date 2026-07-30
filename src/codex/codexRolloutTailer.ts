@@ -32,6 +32,12 @@ export const CONTEXT_STREAM_ID = "pc:context";
 /** モデルに割り当てられたコンテキスト窓通知マーカーの streamId。 */
 export const CONTEXT_WINDOW_STREAM_ID = "pc:context-window";
 
+/** rollout が持つ Codex turn の権威ライフサイクル。App Server 通知欠落時の照合に使う。 */
+export interface CodexTurnLifecycleEvent {
+  state: "active" | "done";
+  turnId: string;
+}
+
 /** 既定の codex セッションルート（`~/.codex/sessions`）。 */
 export function defaultCodexSessionsRoot(): string {
   return path.join(os.homedir(), ".codex", "sessions");
@@ -49,8 +55,18 @@ export interface CodexRolloutTailerOptions {
   tailIndefinitely?: boolean;
   /** 初回 EOF で履歴再生完了マーカーを流すか。既定 false。 */
   emitReplayDoneMarker?: boolean;
+  /**
+   * agent_message が EOF へ到達した際、安定 item id を持つ response_item を待つ上限。
+   * 現行 Codex の実測最大遅延を超える 3 秒を既定とし、旧 rollout は上限後に従来 ID へ戻す。
+   */
+  assistantMirrorGraceMs?: number;
   /** rollout 走査ルート。テスト注入用。省略時は `~/.codex/sessions`。 */
   sessionsRoot?: string;
+  /**
+   * 初回 EOF では履歴中の最新状態を、その後は追記された状態を通知する。
+   * App Server の `turn/completed` 欠落時だけ、呼び出し側が現在 turn ID と照合して補完する。
+   */
+  onTurnLifecycle?: (event: CodexTurnLifecycleEvent) => void;
 }
 
 interface TailState {
@@ -69,7 +85,7 @@ interface TailState {
     phase: string | undefined;
     legacyStreamId: string;
   } | null;
-  pendingAssistantEOFPolls: number;
+  pendingAssistantEOFStartedAtMs: number | null;
 }
 
 export class CodexRolloutTailer {
@@ -77,14 +93,25 @@ export class CodexRolloutTailer {
   private readonly tailDeadlineMs: number | null;
   private readonly tailIndefinitely: boolean;
   private readonly emitReplayDoneMarker: boolean;
+  private readonly assistantMirrorGraceMs: number;
   private readonly sessionsRoot: string;
+  private onTurnLifecycle: ((event: CodexTurnLifecycleEvent) => void) | null;
 
   constructor(options: CodexRolloutTailerOptions = {}) {
     this.pollIntervalMs = options.pollIntervalMs ?? 50;
     this.tailDeadlineMs = options.tailDeadlineMs ?? null;
     this.tailIndefinitely = options.tailIndefinitely ?? false;
     this.emitReplayDoneMarker = options.emitReplayDoneMarker ?? false;
+    this.assistantMirrorGraceMs = Math.max(0, options.assistantMirrorGraceMs ?? 3_000);
     this.sessionsRoot = options.sessionsRoot ?? defaultCodexSessionsRoot();
+    this.onTurnLifecycle = options.onTurnLifecycle ?? null;
+  }
+
+  /** ChatTailController が注入済み tailer にも lifecycle observer を結線するための設定口。 */
+  setTurnLifecycleObserver(
+    observer: ((event: CodexTurnLifecycleEvent) => void) | null,
+  ): void {
+    this.onTurnLifecycle = observer;
   }
 
   /** この tailer の走査ルートで `cwd` 対応の rollout を解決する（未出現は null）。 */
@@ -172,10 +199,12 @@ export class CodexRolloutTailer {
         lastContextTokens: null,
         lastContextWindow: null,
         pendingAssistantEvent: null,
-        pendingAssistantEOFPolls: 0,
+        pendingAssistantEOFStartedAtMs: null,
       };
       const start = Date.now();
       let announcedReplayDone = false;
+      let lifecycleCaughtUp = false;
+      let latestLifecycle: CodexTurnLifecycleEvent | null = null;
       const chunk = Buffer.alloc(4096);
 
       while (!signal?.aborted) {
@@ -187,23 +216,37 @@ export class CodexRolloutTailer {
         }
 
         if (bytesRead === 0) {
-          // event_msg と response_item は通常同じ write burst に入る。ちょうど 2 行の間で
-          // EOF を観測した場合だけ 1 poll 待ち、live と共通の item id を取りこぼさない。
+          // event_msg と response_item は隣接行だが、別 write で数秒遅れることがある。
+          // 履歴完了を先に出すと Hub が tail を止めて alias を永久に失うため、有限 tail の
+          // deadline または grace 上限まで待ってから旧 rollout として確定する。
           if (state.pendingAssistantEvent !== null) {
-            state.pendingAssistantEOFPolls += 1;
-            if (state.pendingAssistantEOFPolls === 1) {
-              await abortableSleep(this.pollIntervalMs, signal);
+            const now = Date.now();
+            state.pendingAssistantEOFStartedAtMs ??= now;
+            const finiteTailExpired = !this.tailIndefinitely &&
+              (this.tailDeadlineMs === null || now - start >= this.tailDeadlineMs);
+            const mirrorWaitRemaining =
+              this.assistantMirrorGraceMs - (now - state.pendingAssistantEOFStartedAtMs);
+            if (!finiteTailExpired && mirrorWaitRemaining > 0) {
+              await abortableSleep(Math.min(this.pollIntervalMs, mirrorWaitRemaining), signal);
               continue;
             }
             yield* flushPendingAssistantEvent(state);
           }
-          // 初回 EOF = 既存内容の再生完了。マーカー有効時は完了シグナルを 1 通流す。
-          if (this.emitReplayDoneMarker && !announcedReplayDone) {
-            announcedReplayDone = true;
+          // 初回 EOF は rollout の現在状態へ追いついた境界。履歴中の task_complete を
+          // 1件ずつ再通知せず、最後の lifecycle だけを照合候補として渡す。
+          if (!lifecycleCaughtUp) {
             if (lineBuf.length > 0) {
+              const lifecycle = parseTurnLifecycle(lineBuf);
+              if (lifecycle !== null) latestLifecycle = lifecycle;
               yield* emitLineAfter(lineBuf, state, newerThanMs);
               lineBuf = Buffer.alloc(0);
             }
+            lifecycleCaughtUp = true;
+            if (latestLifecycle !== null) this.notifyTurnLifecycle(latestLifecycle);
+          }
+          // 初回 EOF = 既存内容の再生完了。マーカー有効時は完了シグナルを 1 通流す。
+          if (this.emitReplayDoneMarker && !announcedReplayDone) {
+            announcedReplayDone = true;
             yield {
               type: "chat_output",
               v: PROTOCOL_V1,
@@ -229,6 +272,11 @@ export class CodexRolloutTailer {
         while (nl >= 0) {
           const line = lineBuf.subarray(0, nl);
           lineBuf = lineBuf.subarray(nl + 1);
+          const lifecycle = parseTurnLifecycle(line);
+          if (lifecycle !== null) {
+            latestLifecycle = lifecycle;
+            if (lifecycleCaughtUp) this.notifyTurnLifecycle(lifecycle);
+          }
           yield* emitLineAfter(line, state, newerThanMs);
           nl = lineBuf.indexOf(0x0a);
         }
@@ -239,6 +287,14 @@ export class CodexRolloutTailer {
       } catch {
         // 二重 close 等は無視。
       }
+    }
+  }
+
+  private notifyTurnLifecycle(event: CodexTurnLifecycleEvent): void {
+    try {
+      this.onTurnLifecycle?.(event);
+    } catch {
+      // lifecycle 補完は診断的な副経路。本文 tail を observer 例外で止めない。
     }
   }
 }
@@ -265,6 +321,26 @@ function lineTimestampMs(line: Buffer): number {
     }
   } catch { /* emitLine と同様に不正行は破棄する。 */ }
   return Number.NEGATIVE_INFINITY;
+}
+
+function parseTurnLifecycle(line: Buffer): CodexTurnLifecycleEvent | null {
+  try {
+    const parsed = JSON.parse(line.toString("utf8")) as unknown;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+    const record = parsed as { type?: unknown; payload?: unknown };
+    if (record.type !== "event_msg" ||
+      typeof record.payload !== "object" || record.payload === null ||
+      Array.isArray(record.payload)) return null;
+    const payload = record.payload as { type?: unknown; turn_id?: unknown };
+    if (payload.type !== "task_started" && payload.type !== "task_complete") return null;
+    if (typeof payload.turn_id !== "string" || payload.turn_id.length === 0) return null;
+    return {
+      state: payload.type === "task_started" ? "active" : "done",
+      turnId: payload.turn_id,
+    };
+  } catch {
+    return null;
+  }
 }
 
 /** rollout ファイル（mtime 付き）を日付階層から列挙する。 */
@@ -371,7 +447,7 @@ export function* emitLine(line: Buffer, state: TailState): Generator<ControlMess
         pending.text === mirroredAssistant.text &&
         phasesMatch(pending.phase, mirroredAssistant.phase)) {
       state.pendingAssistantEvent = null;
-      state.pendingAssistantEOFPolls = 0;
+      state.pendingAssistantEOFStartedAtMs = null;
       yield {
         type: "chat_stream_alias",
         v: PROTOCOL_V1,
@@ -447,7 +523,7 @@ export function* emitLine(line: Buffer, state: TailState): Generator<ControlMess
       phase,
       legacyStreamId: `codex-turn-${state.seq}`,
     };
-    state.pendingAssistantEOFPolls = 0;
+    state.pendingAssistantEOFStartedAtMs = null;
     return;
   }
 
@@ -502,7 +578,7 @@ function* flushPendingAssistantEvent(
   const pending = state.pendingAssistantEvent;
   if (pending === null) return;
   state.pendingAssistantEvent = null;
-  state.pendingAssistantEOFPolls = 0;
+  state.pendingAssistantEOFStartedAtMs = null;
   yield {
     type: "chat_output",
     v: PROTOCOL_V1,

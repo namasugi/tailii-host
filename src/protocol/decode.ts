@@ -453,6 +453,15 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
       };
     }
 
+    case "session_chat_stream_alias":
+      return {
+        type, v,
+        session: requireString(raw, "session"),
+        serverSeq: requireNumber(raw, "serverSeq"),
+        streamId: requireString(raw, "streamId"),
+        aliasStreamIds: requireStringArray(raw, "aliasStreamIds"),
+      };
+
     case "session_chat_output": {
       const role = requireString(raw, "role");
       if (role !== "assistant" && role !== "user" && role !== "system") {
