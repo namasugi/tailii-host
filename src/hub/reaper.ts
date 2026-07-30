@@ -67,7 +67,7 @@ export interface ReaperTickOptions {
   herdrOps?: HerdrReaperOps | null;
   /**
    * claude 会話タイトルの導出（session-title 自動タイトル同期用, テスト注入可）。
-   * 省略時は `~/.claude/projects` の transcript 先頭から最初のユーザー発話を読む。
+   * 省略時は transcript の明示タイトル（custom-title/ai-title）優先 → 最初のユーザー発話。
    */
   deriveClaudeTitle?: (claudeSessionId: string) => string | null;
 }
@@ -256,9 +256,10 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
     }
 
     // --- 未命名タブへ会話タイトルを自動反映（session-title, claude のみ）---
-    // タブラベルがセッション名のまま（アプリ/Mac どちらでも未命名）の生存セッションだけを
-    // 対象に、transcript の会話タイトル（最初のユーザー発話 先頭 ~60 字 = 一覧と同じ導出）を
-    // タブへ書く。命名済み（ラベル ≠ セッション名）は手動を優先して触らない。
+    // タブラベルが未命名（null / 空 / セッション名のまま）の生存セッションだけを対象に、
+    // transcript の会話タイトル（明示タイトル custom-title/ai-title 優先 = 一覧と同じ導出
+    // transcriptTitle）をタブへ書く。命名済み（ラベル ≠ セッション名）は手動を優先して
+    // 触らない。空ラベルも未命名扱い（herdr 既定表示のタブを取り込むため）。
     if (herdrLive.length > 0 &&
         herdrOps.tabInfoByName !== undefined && herdrOps.setDisplayTitle !== undefined) {
       const deriveTitle = options.deriveClaudeTitle ?? defaultDeriveClaudeTitle;
@@ -271,7 +272,8 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
           if (meta.claudeSessionId === undefined) continue;
           const info = tabInfo.get(name);
           if (info === undefined) continue;
-          if (info.label !== null && info.label !== name) continue; // 命名済みは触らない
+          const unnamed = info.label === null || info.label === "" || info.label === name;
+          if (!unnamed) continue; // 命名済みは触らない
           const title = deriveTitle(meta.claudeSessionId);
           if (title === null || title.length === 0) continue;
           try {
