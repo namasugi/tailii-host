@@ -169,9 +169,11 @@ describe("HerdrSessionManager", () => {
     openDialogOnEnter?: boolean;
     /** 初期状態でダイアログが開いている。 */
     dialogInitiallyOpen?: boolean;
+    /** 初期状態で入力欄に残存テキストがある（中断で queued が書き戻された状態）。 */
+    initialInput?: string;
   } = {}) {
     const state = {
-      input: "",
+      input: options.initialInput ?? "",
       dialogOpen: options.dialogInitiallyOpen ?? false,
       swallowTextInputs: options.swallowTextInputs ?? 0,
       swallowEnters: options.swallowEnters ?? 0,
@@ -228,6 +230,25 @@ describe("HerdrSessionManager", () => {
 
   const submitSends = (runner: MockHerdrRunner) =>
     runner.recorded.filter((args) => args[1]?.startsWith("send-"));
+
+  test("sendTextSubmit: 中断で書き戻された残存テキストは先に Enter で独立送信してから注入する", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const { runner } = makeSubmitHarness({ initialInput: "前回の本文" });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    await manager.sendTextSubmit("s-a", "今回の本文");
+    // 残存 flush（独立メッセージとして送信）→ 本文 → CR。連結（"前回の本文今回の本文"）に
+    // ならないこと（実機FB 2026-07-29: 停止→送信の二重表示）。
+    expect(submitSends(runner)).toEqual([
+      ["pane", "send-text", "w4:p2", "\r"],
+      ["pane", "send-text", "w4:p2", "今回の本文"],
+      ["pane", "send-text", "w4:p2", "\r"],
+    ]);
+  });
 
   test("sendTextSubmit: 本文反映を検証し、CR が飲まれたら CR を再送する", async () => {
     const store = makeStore();

@@ -192,9 +192,32 @@ export class TmuxSessionManager {
    * literal 送出 → 150ms（Ink 再描画待ち）→ Enter。
    */
   async sendTextSubmit(name: string, text: string): Promise<void> {
+    // 中断（停止）直後は claude が queued メッセージを入力欄へ書き戻す。残存したまま
+    // 注入すると今回の本文がその後ろへ連結され 1 メッセージになる（実機FB 2026-07-29）。
+    // 残存は先に Enter で独立メッセージとして送信し切ってから注入する。空入力への
+    // Enter は no-op なので誤検出は無害（herdr 側 sendTextSubmit と同じ防御）。
+    if (await this.inputBoxHasPendingText(name)) {
+      await this.sendKeys(name, ["Enter"]);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
     await this.sendKeys(name, [text], true);
     await new Promise((resolve) => setTimeout(resolve, 150));
     await this.sendKeys(name, ["Enter"]);
+  }
+
+  /** 入力欄（最後の `❯` 行）に未送信テキストが残っているか。判定不能は false。 */
+  private async inputBoxHasPendingText(name: string): Promise<boolean> {
+    try {
+      const screen = await this.capturePane(name, { lines: 30 });
+      const promptLines = screen
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.startsWith("❯"));
+      const last = promptLines[promptLines.length - 1];
+      return last !== undefined && last.slice(1).trim().length > 0;
+    } catch {
+      return false;
+    }
   }
 
   /** 指定セッションの pane へ tmux send-keys を発行する（literal は -l）。 */

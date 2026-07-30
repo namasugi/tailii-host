@@ -389,6 +389,15 @@ export class HerdrSessionManager {
       await this.sendKeys(name, ["Escape"]);
       await new Promise((resolve) => setTimeout(resolve, 300));
     }
+    // 中断（停止）直後は claude が queued メッセージを入力欄へ書き戻す。残存したまま
+    // 注入すると今回の本文がその後ろへ連結され 1 メッセージとして送信される（実機FB
+    // 2026-07-29: 停止→送信で「前回本文+今回本文」の連結バブルが二重表示）。残存は先に
+    // Enter で独立メッセージとして送信し切ってから注入する（アプリの楽観バブルとも一致
+    // する）。空入力への Enter は no-op なので、誤検出しても無害。
+    if (await this.inputBoxHasPendingText(name)) {
+      await this.sendKeys(name, ["Enter"]);
+      await new Promise((resolve) => setTimeout(resolve, this.submitDelayMs));
+    }
     // Remote Control 切断直後の limbo では typed 入力が入力欄に一切入らず破棄される
     // （実測 2026-07-28: 通常メッセージが本文ごと消失し、旧実装は「入力欄に残っていない
     // = 送信成立」と誤判定して配送済みレシートを発行 → silent loss）。本文が入力欄へ
