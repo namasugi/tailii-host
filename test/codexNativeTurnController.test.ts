@@ -174,7 +174,7 @@ describe("CodexNativeTurnController", () => {
         },
         generateThreadTitle: async (options) => {
           generations.push(options);
-          return "短いタイトル";
+          return { title: "短いタイトル", source: "model" };
         },
       },
     });
@@ -215,7 +215,7 @@ describe("CodexNativeTurnController", () => {
         openThread: async () => thread,
         generateThreadTitle: async (options) => {
           generations.push(options);
-          return "上書き禁止";
+          return { title: "上書き禁止", source: "model" };
         },
       },
     });
@@ -242,7 +242,7 @@ describe("CodexNativeTurnController", () => {
         openThread: async () => thread,
         generateThreadTitle: async (options) => {
           generations.push(options);
-          return "steerのタイトル";
+          return { title: "steerのタイトル", source: "model" };
         },
       },
     });
@@ -258,6 +258,51 @@ describe("CodexNativeTurnController", () => {
       cwd: "/tmp/work",
       prompt: "実行中ターンへの追加入力",
     }]);
+  });
+
+  test("タイトル生成の一時エラーは最大3回まで自動再試行する", async () => {
+    const thread = new FakeThread();
+    let attempts = 0;
+    let resolveEvent: ((event: {
+      title: string | null;
+      source: string | null;
+      attempts: number;
+      error: string | null;
+    }) => void) | undefined;
+    const event = new Promise<{
+      title: string | null;
+      source: string | null;
+      attempts: number;
+      error: string | null;
+    }>((resolve) => {
+      resolveEvent = resolve;
+    });
+    const controller = new CodexNativeTurnController({
+      appServer: {
+        openThread: async () => thread,
+        generateThreadTitle: async () => {
+          attempts += 1;
+          if (attempts < 3) throw new Error(`temporary-${attempts}`);
+          return { title: "再試行後タイトル", source: "model" };
+        },
+      },
+      onThreadTitle: (result) => resolveEvent?.(result),
+    });
+
+    await controller.startTurn({
+      session: "work",
+      threadId: "thread-1",
+      cwd: "/tmp/work",
+      text: "再試行を確認",
+    });
+
+    await expect(event).resolves.toMatchObject({
+      title: "再試行後タイトル",
+      source: "model",
+      attempts: 3,
+      error: null,
+    });
+    expect(attempts).toBe(3);
   });
 
   test("実行中の startTurn は既存 turn へ steer し、同じ turnId を返す", async () => {

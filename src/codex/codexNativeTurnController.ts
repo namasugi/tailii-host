@@ -6,6 +6,8 @@ import type {
   CodexAppServerNotification,
   CodexAppServerRequest,
   CodexAppServerThreadOptions,
+  CodexThreadTitleGenerationResult,
+  CodexThreadTitleSource,
 } from "./codexAppServer.js";
 import {
   decodeControlMessage,
@@ -24,6 +26,9 @@ import {
   toolActivityContentKey,
   toolActivityMessage,
 } from "./codexToolActivity.js";
+
+const TITLE_GENERATION_MAX_ATTEMPTS = 3;
+const TITLE_GENERATION_RETRY_BASE_MS = 250;
 
 export interface CodexNativeApproval {
   id: string;
@@ -57,6 +62,8 @@ export interface CodexNativeTurnControllerOptions {
     session: string;
     threadId: string;
     title: string | null;
+    source: CodexThreadTitleSource | null;
+    attempts: number;
     error: string | null;
   }) => void;
 }
@@ -118,7 +125,7 @@ export interface CodexAppServerThreadRuntime {
     threadId: string;
     cwd: string;
     prompt: string;
-  }): Promise<string | null>;
+  }): Promise<CodexThreadTitleGenerationResult>;
 }
 
 interface OpenThread {
@@ -239,23 +246,52 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
   private generateThreadTitle(opened: OpenThread, session: string, prompt: string): void {
     if (!opened.titleGenerationPending || this.appServer.generateThreadTitle === undefined) return;
     opened.titleGenerationPending = false;
-    void this.appServer.generateThreadTitle({
+    void this.generateThreadTitleWithRetry({
       threadId: opened.threadId,
       cwd: opened.cwd,
       prompt,
     }).then(
-      (title) => this.onThreadTitle({
+      ({ result, attempts }) => this.onThreadTitle({
         session,
         threadId: opened.threadId,
-        title,
+        title: result.title,
+        source: result.source,
+        attempts,
         error: null,
       }),
       (error) => this.onThreadTitle({
         session,
         threadId: opened.threadId,
         title: null,
+        source: null,
+        attempts: TITLE_GENERATION_MAX_ATTEMPTS,
         error: String(error),
       }),
+    );
+  }
+
+  private async generateThreadTitleWithRetry(options: {
+    threadId: string;
+    cwd: string;
+    prompt: string;
+  }): Promise<{ result: CodexThreadTitleGenerationResult; attempts: number }> {
+    const generate = this.appServer.generateThreadTitle;
+    if (generate === undefined) {
+      return { result: { title: null, source: null }, attempts: 0 };
+    }
+    let lastError: unknown = new Error("Codex title generation did not run");
+    for (let attempt = 1; attempt <= TITLE_GENERATION_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        return { result: await generate.call(this.appServer, options), attempts: attempt };
+      } catch (error) {
+        lastError = error;
+        if (attempt < TITLE_GENERATION_MAX_ATTEMPTS) {
+          await sleep(TITLE_GENERATION_RETRY_BASE_MS * attempt);
+        }
+      }
+    }
+    throw new Error(
+      `Codex title generation failed after ${TITLE_GENERATION_MAX_ATTEMPTS} attempts: ${String(lastError)}`,
     );
   }
 

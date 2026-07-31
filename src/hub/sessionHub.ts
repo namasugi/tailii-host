@@ -1377,17 +1377,20 @@ export class SessionHub {
       onChatItem: ({ session, itemId, payload }) =>
         this.handleCodexChatItem(session, itemId, payload),
       onDisconnect: (session, error) => this.handleCodexDisconnect(session, error),
-      onThreadTitle: ({ session, threadId, title, error }) => {
+      onThreadTitle: ({ session, threadId, title, source, attempts, error }) => {
         if (error !== null) {
           this.options.log?.(
-            `Codex title 生成失敗 session=${session} thread=${threadId}: ${error}`,
+            `Codex title 生成失敗 session=${session} thread=${threadId} attempts=${attempts}: ${error}`,
           );
           return;
         }
+        const attemptSuffix = attempts > 1 ? ` attempts=${attempts}` : "";
         this.options.log?.(
           title === null
-            ? `Codex title 生成スキップ session=${session} thread=${threadId}`
-            : `Codex title 生成成功 session=${session} thread=${threadId} title=${title}`,
+            ? `Codex title 生成スキップ session=${session} thread=${threadId}${attemptSuffix}`
+            : source === "promptFallback"
+              ? `Codex title 先頭文fallback session=${session} thread=${threadId}${attemptSuffix} title=${title}`
+              : `Codex title AI生成成功 session=${session} thread=${threadId}${attemptSuffix} title=${title}`,
         );
       },
     });

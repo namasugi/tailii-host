@@ -94,6 +94,8 @@ export interface ClaudeSessionInfo {
   updatedAt?: number;
   /** 会話を駆動するエージェント（claude=既定 / codex, agent-tag）。未指定は claude 相当。 */
   agent?: "claude" | "codex";
+  /** Codex App Server の thread.name が設定済みか。Claude/旧hostでは未指定。 */
+  hasProviderTitle?: boolean;
   /** 最終 user/assistant メッセージの 1 行スニペット（一覧プレビュー, list-preview）。 */
   lastMessage?: string;
   /**

@@ -297,6 +297,7 @@ describe("CodexSessionStore.list", () => {
       title: `1行目 ${"x".repeat(56)}`,
       updatedAt: 300,
       agent: "codex",
+      hasProviderTitle: true,
     });
     expect(sessions[0]?.title).toHaveLength(60);
     expect(sessions[1]).toMatchObject({
@@ -306,6 +307,7 @@ describe("CodexSessionStore.list", () => {
       updatedAt: 200,
       lastMessage: "最後の応答",
       agent: "codex",
+      hasProviderTitle: false,
     });
   });
 
@@ -329,6 +331,7 @@ describe("CodexSessionStore.list", () => {
       cwd: "/work/fallback",
       title: "rollout fallback",
       agent: "codex",
+      hasProviderTitle: false,
     });
   });
 });

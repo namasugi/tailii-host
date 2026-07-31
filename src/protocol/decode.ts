@@ -847,6 +847,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
             title: requireString(obj, "title"),
             updatedAt: optionalNumber(obj, "updatedAt"),
             agent: sessionAgent,
+            hasProviderTitle: optionalBoolean(obj, "hasProviderTitle"),
             lastMessage: optionalString(obj, "lastMessage"),
             liveSessionName,
             liveSessionBackend,

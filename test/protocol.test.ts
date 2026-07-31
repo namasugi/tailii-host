@@ -118,13 +118,18 @@ describe("golden roundtrip", () => {
 describe("decode 詳細", () => {
   it("live-pill: annotate 入り一覧応答の生存セッション欄と resolved マーカーを復元する", () => {
     const resolved = decodeControlMessage(
-      '{"claudeSessions":[{"cwd":"/w","liveSessionBackend":"herdr","liveSessionName":"s-d835de40","sessionId":"c1","title":"t"},{"cwd":"/w","sessionId":"c2","title":"t"}],"id":"r1","liveSessionsResolved":true,"type":"claude_session_list_response","v":2}',
+      '{"claudeSessions":[{"cwd":"/w","hasProviderTitle":true,"liveSessionBackend":"herdr","liveSessionName":"s-d835de40","sessionId":"c1","title":"t"},{"cwd":"/w","sessionId":"c2","title":"t"}],"id":"r1","liveSessionsResolved":true,"type":"claude_session_list_response","v":2}',
     );
     expect(resolved).toMatchObject({
       type: "claude_session_list_response",
       liveSessionsResolved: true,
       claudeSessions: [
-        { sessionId: "c1", liveSessionName: "s-d835de40", liveSessionBackend: "herdr" },
+        {
+          sessionId: "c1",
+          hasProviderTitle: true,
+          liveSessionName: "s-d835de40",
+          liveSessionBackend: "herdr",
+        },
         { sessionId: "c2" },
       ],
     });

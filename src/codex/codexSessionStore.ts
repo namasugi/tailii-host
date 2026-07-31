@@ -96,6 +96,7 @@ export class CodexSessionStore {
         cwd: meta.cwd,
         title,
         agent: "codex",
+        hasProviderTitle: idx?.title !== null && idx?.title !== undefined,
       };
       if (updatedAt !== undefined) info.updatedAt = updatedAt;
       if (baseDir && !isInsideBase(info.cwd, baseDir)) continue;
@@ -153,6 +154,7 @@ export class CodexSessionStore {
         title: rawTitle === null ? (fallbackTitle ?? thread.id.slice(0, 8)) : normalizeTitle(rawTitle),
         updatedAt: Math.floor(thread.updatedAt),
         agent: "codex",
+        hasProviderTitle: nonEmptyString(thread.name) !== null,
       };
       if (rollout !== undefined) {
         const lastMessage = readLastRolloutMessage(rollout.path);

@@ -632,11 +632,13 @@ describe("SessionHub actor", () => {
 
   test("Hub controller callback は processing・marker を購読 client 全てへ fan-out する", async () => {
     let callbacks!: CodexNativeTurnControllerOptions;
+    const logs: string[] = [];
     const controller: CodexTurnControllerRuntime = {
       startTurn: vi.fn(async () => "turn-1"), closeSession: vi.fn(), close: vi.fn(),
     };
     const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-codex-fanout"),
       metadataStore: makeTempStore(), timeoutSeconds: 1800,
+      log: (message) => logs.push(message),
       codexAppServerFactory: () => ({ openThread: async () => { throw new Error("unused"); } }),
       codexTurnControllerFactory: (options) => { callbacks = options; return controller; } });
     const clients = [{}, {}], received: unknown[][] = [[], []];
@@ -661,6 +663,20 @@ describe("SessionHub actor", () => {
         payload: expect.objectContaining({ streamId: "pc:context-window", text: "456" }) }));
     }
     expect(hub.hasCodexTurnsInFlight).toBe(true);
+    callbacks.onThreadTitle?.({
+      session: "work", threadId: "thread-1", title: "AIタイトル",
+      source: "model", attempts: 1, error: null,
+    });
+    callbacks.onThreadTitle?.({
+      session: "work", threadId: "thread-2", title: "先頭60文字",
+      source: "promptFallback", attempts: 2, error: null,
+    });
+    expect(logs).toContain(
+      "Codex title AI生成成功 session=work thread=thread-1 title=AIタイトル",
+    );
+    expect(logs).toContain(
+      "Codex title 先頭文fallback session=work thread=thread-2 attempts=2 title=先頭60文字",
+    );
     callbacks.onProcessing?.("work", "done");
     await vi.waitFor(() => expect(hub.hasCodexTurnsInFlight).toBe(false));
   });

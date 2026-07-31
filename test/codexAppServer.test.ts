@@ -334,7 +334,10 @@ describe("CodexAppServerManager", () => {
       threadId: "thread-target",
       cwd: "/tmp/project",
       prompt: "これは後続メッセージなのでタイトルには使わない",
-    })).resolves.toBe("generateTitleの仕組みを調査");
+    })).resolves.toEqual({
+      title: "generateTitleの仕組みを調査",
+      source: "model",
+    });
 
     expect(generation.requests).toContainEqual({
       method: "thread/start",
@@ -374,7 +377,10 @@ describe("CodexAppServerManager", () => {
       })],
     }));
     expect(JSON.stringify(titleTurn?.params)).toContain(
-      "title and description MUST be written in natural Japanese",
+      "same primary language as the user prompt",
+    );
+    expect(JSON.stringify(titleTurn?.params)).toContain(
+      "Do not translate them into another language",
     );
     expect(JSON.stringify(titleTurn?.params)).not.toContain("これは後続メッセージ");
     expect(generation.requests).toContainEqual({
@@ -418,50 +424,13 @@ describe("CodexAppServerManager", () => {
       threadId: "thread-target",
       cwd: "/tmp/project",
       prompt,
-    })).resolves.toBe("あ".repeat(60));
+    })).resolves.toEqual({
+      title: "あ".repeat(60),
+      source: "promptFallback",
+    });
     expect(generation.requests).toContainEqual({
       method: "thread/name/set",
       params: { threadId: "thread-target", name: "あ".repeat(60) },
-    });
-  });
-
-  test("日本語入力に対する英語タイトルは採用せず日本語入力へフォールバックする", async () => {
-    const probe = new FakeConnection();
-    const generation = new FakeConnection("thread-title-ephemeral");
-    generation.request = async (method, params) => {
-      generation.requests.push({ method, params });
-      if (method === "thread/read") {
-        return { thread: { id: "thread-target", name: null } };
-      }
-      if (method === "thread/start") {
-        return { thread: { id: "thread-title-ephemeral" } };
-      }
-      if (method === "turn/start") {
-        emitTitleTurn(generation, JSON.stringify({
-          title: "Fix Codex usage display",
-          description: "Correct usage and status presentation",
-        }));
-        return { turn: { id: "turn-title" } };
-      }
-      return {};
-    };
-    const manager = new CodexAppServerManager({
-      codexHome: makeTempDir("codex-thread-title-language"),
-      connect: async () => probe.closed === 0 ? probe : generation,
-      launch: () => {
-        throw new Error("must not spawn");
-      },
-    });
-    const prompt = "Codexの使用量表示を修正する";
-
-    await expect(manager.generateThreadTitle({
-      threadId: "thread-target",
-      cwd: "/tmp/project",
-      prompt,
-    })).resolves.toBe(prompt);
-    expect(generation.requests).toContainEqual({
-      method: "thread/name/set",
-      params: { threadId: "thread-target", name: prompt },
     });
   });
 
@@ -514,7 +483,10 @@ describe("CodexAppServerManager", () => {
       threadId: "thread-target",
       cwd: "/tmp/project",
       prompt: "codexのスラッシュコマンドの使用量・状態を修正したい",
-    })).resolves.toBe("Codex使用量表示を修正");
+    })).resolves.toEqual({
+      title: "Codex使用量表示を修正",
+      source: "model",
+    });
     expect(generation.requests.filter((request) => request.method === "thread/list"))
       .toHaveLength(2);
     expect(generation.requests).toContainEqual({
@@ -562,7 +534,7 @@ describe("CodexAppServerManager", () => {
       threadId: "thread-target",
       cwd: "/tmp/project",
       prompt: "タイトルを自動生成する",
-    })).resolves.toBeNull();
+    })).resolves.toEqual({ title: null, source: null });
     expect(generation.requests.some((request) => request.method === "thread/name/set")).toBe(false);
   });
 

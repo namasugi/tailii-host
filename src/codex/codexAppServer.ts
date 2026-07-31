@@ -59,6 +59,13 @@ export interface CodexThreadTitleGenerationOptions {
   prompt: string;
 }
 
+export type CodexThreadTitleSource = "model" | "promptFallback";
+
+export interface CodexThreadTitleGenerationResult {
+  title: string | null;
+  source: CodexThreadTitleSource | null;
+}
+
 export type CodexAppServerRequestId = number | string;
 
 export interface CodexAppServerNotification {
@@ -589,7 +596,9 @@ export class CodexAppServerManager {
    * Codex Desktop と同じ短命 thread で初回 prompt の短いタイトルを生成し、対象 thread へ保存する。
    * `gpt-5.6-luna` を優先し、App Server が利用不能と判断した場合は既定モデルへ委ねる。
    */
-  async generateThreadTitle(options: CodexThreadTitleGenerationOptions): Promise<string | null> {
+  async generateThreadTitle(
+    options: CodexThreadTitleGenerationOptions,
+  ): Promise<CodexThreadTitleGenerationResult> {
     if (!path.isAbsolute(options.cwd)) throw new Error("Codex thread cwd must be absolute");
 
     await this.ensureRunning();
@@ -598,9 +607,9 @@ export class CodexAppServerManager {
     try {
       await connection.initialize();
       const target = await readThreadTitleTarget(connection, options.threadId, options.prompt);
-      if (target.name !== null) return null;
+      if (target.name !== null) return { title: null, source: null };
       const prompt = target.prompt.trim().slice(0, THREAD_TITLE_PROMPT_MAX_LENGTH);
-      if (prompt.length === 0) return null;
+      if (prompt.length === 0) return { title: null, source: null };
       const fallbackTitle = normalizeFallbackThreadTitle(prompt);
 
       let generatedTitle: string | null = null;
@@ -631,24 +640,22 @@ export class CodexAppServerManager {
           buildThreadTitlePrompt(prompt),
           this.titleGenerationTimeoutMs,
         );
-        if (
-          generatedTitle !== null &&
-          !isGeneratedTitleLanguageCompatible(prompt, generatedTitle)
-        ) {
-          generatedTitle = null;
-        }
       } catch {
         // Desktop と同様、生成経路の失敗は初回 prompt の先頭60文字へフォールバックする。
       }
 
       const title = generatedTitle ?? fallbackTitle;
+      const source: CodexThreadTitleSource =
+        generatedTitle === null ? "promptFallback" : "model";
       // 生成中の手動 rename や別 client の命名を上書きしない。
-      if (await readThreadName(connection, options.threadId) !== null) return null;
+      if (await readThreadName(connection, options.threadId) !== null) {
+        return { title: null, source: null };
+      }
       await connection.request("thread/name/set", {
         threadId: options.threadId,
         name: title,
       });
-      return title;
+      return { title, source };
     } finally {
       if (ephemeralThreadId !== null) {
         try {
@@ -1015,20 +1022,12 @@ async function runThreadTitleTurn(
 }
 
 function buildThreadTitlePrompt(prompt: string): string {
-  const languageInstructions = containsJapaneseScript(prompt)
-    ? [
-        "The user prompt is Japanese. The title and description MUST be written in natural Japanese.",
-        "Do not translate the title or description into English. Product names such as Codex may stay in Latin script.",
-        "For change requests, use a precise Japanese action ending such as 追加, 修正, 更新, 整理, or 削除.",
-      ]
-    : [
-        "Write the title and description in the same primary language as the user prompt.",
-        "Start change requests with a precise action verb appropriate to that language.",
-      ];
   return [
     "You are a helpful assistant that creates a short UI title for a coding task.",
     `Return a concise title of at most ${THREAD_TITLE_MAX_LENGTH} characters and a compact, search-oriented description of at most 100 characters.`,
-    ...languageInstructions,
+    "Write both the title and description in the same primary language as the user prompt.",
+    "Do not translate them into another language. Preserve product names and identifiers in their original form.",
+    "Start change requests with a precise action word appropriate to the user's language.",
     "Keep the title under five words when possible.",
     "Make questions clearly express their intent in the user's language.",
     "Reuse an explicit short title from the user when one is provided.",
@@ -1039,14 +1038,6 @@ function buildThreadTitlePrompt(prompt: string): string {
     "User prompt:",
     prompt,
   ].join("\n");
-}
-
-function isGeneratedTitleLanguageCompatible(prompt: string, title: string): boolean {
-  return !containsJapaneseScript(prompt) || containsJapaneseScript(title);
-}
-
-function containsJapaneseScript(value: string): boolean {
-  return /[\u3040-\u30ff\u3400-\u9fff]/u.test(value);
 }
 
 function parseThreadTitleResult(raw: string): string | null {
