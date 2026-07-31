@@ -138,6 +138,33 @@ describe("gitService", () => {
     });
   });
 
+  test("diff は untracked ファイルを新規追加として返す", async () => {
+    const root = makeRepository();
+    fs.writeFileSync(path.join(root, "new file.txt"), "first\nsecond\n");
+
+    await expect(gitDiff(root, {
+      file: "new file.txt", staged: false, commit: null,
+    })).resolves.toMatchObject({
+      isRepo: true,
+      diff: expect.stringMatching(/new file mode[\s\S]*\+first[\s\S]*\+second/),
+      truncated: false,
+    });
+  });
+
+  test("diff は status がまとめた untracked ディレクトリ配下も返す", async () => {
+    const root = makeRepository();
+    fs.mkdirSync(path.join(root, "new-dir"));
+    fs.writeFileSync(path.join(root, "new-dir", "inside.txt"), "inside\n");
+
+    await expect(gitDiff(root, {
+      file: "new-dir/", staged: false, commit: null,
+    })).resolves.toMatchObject({
+      isRepo: true,
+      diff: expect.stringMatching(/new file mode[\s\S]*\+inside/),
+      truncated: false,
+    });
+  });
+
   test("branch list は upstream 有無と checkout -b 直後の current branch を返す", async () => {
     const root = makeRepository();
     git(root, ["branch", "without-upstream"]);

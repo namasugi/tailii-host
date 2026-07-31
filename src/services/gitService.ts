@@ -18,6 +18,7 @@ const WORKTREE_LOCK_REASON = "tailii-session";
 
 interface GitRunResult {
   ok: boolean;
+  exitCode: number | null;
   stdout: string;
   stderr: string;
 }
@@ -28,7 +29,9 @@ function validRepositoryPath(candidate: string): boolean {
 
 function runGit(repositoryPath: string, args: string[]): Promise<GitRunResult> {
   if (!validRepositoryPath(repositoryPath)) {
-    return Promise.resolve({ ok: false, stdout: "", stderr: "絶対パスを指定してください。" });
+    return Promise.resolve({
+      ok: false, exitCode: null, stdout: "", stderr: "絶対パスを指定してください。",
+    });
   }
   return new Promise((resolve) => {
     execFile(
@@ -38,6 +41,7 @@ function runGit(repositoryPath: string, args: string[]): Promise<GitRunResult> {
       (error, stdout, stderr) => {
         resolve({
           ok: error === null,
+          exitCode: error !== null && typeof error.code === "number" ? error.code : null,
           stdout: String(stdout),
           stderr: String(stderr).trim() || (error === null ? "" : error.message),
         });
@@ -352,20 +356,74 @@ function parseDiffShortstat(output: string): { additions: number; deletions: num
   };
 }
 
+type UntrackedPathKind = "file" | "directory";
+
+async function untrackedPathKind(
+  repositoryPath: string,
+  file: string,
+): Promise<UntrackedPathKind | null> {
+  const result = await runGit(repositoryPath, [
+    "ls-files", "--others", "--exclude-standard", "-z", "--", file,
+  ]);
+  if (!result.ok) return null;
+  const requested = normalizeGitPath(file);
+  const candidates = parseNulSeparatedPaths(result.stdout).map(normalizeGitPath);
+  if (candidates.includes(requested)) return "file";
+  if (candidates.some((candidate) => candidate.startsWith(`${requested}/`))) return "directory";
+  return null;
+}
+
+async function runUntrackedDiff(
+  repositoryPath: string,
+  file: string,
+  kind: UntrackedPathKind,
+): Promise<GitRunResult> {
+  if (kind === "file") {
+    return runGit(repositoryPath, ["diff", "--no-index", "--", "/dev/null", file]);
+  }
+  const emptyDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "tailii-git-diff-empty-"));
+  try {
+    return await runGit(repositoryPath, [
+      "diff", "--no-index", "--", emptyDirectory, file,
+    ]);
+  } finally {
+    fs.rmSync(emptyDirectory, { recursive: true, force: true });
+  }
+}
+
 export async function gitDiff(
   repositoryPath: string,
   options: { file?: string; staged?: boolean; commit?: string | null } = {},
 ): Promise<{ isRepo: boolean; diff: string; truncated: boolean }> {
   if (!(await isGitRepository(repositoryPath))) return { isRepo: false, diff: "", truncated: false };
-  const args = options.commit
-    ? ["show", options.commit]
-    : ["diff", ...(options.staged ? ["--cached"] : []), ...(options.file ? ["--", options.file] : [])];
-  const result = await runGit(repositoryPath, args);
-  if (!result.ok && result.stdout.length === 0) return { isRepo: true, diff: "", truncated: false };
+  let showUntrackedPath = false;
+  let result: GitRunResult;
+  if (options.commit) {
+    result = await runGit(repositoryPath, ["show", options.commit]);
+  } else if (options.file !== undefined && options.staged !== true) {
+    const kind = await untrackedPathKind(repositoryPath, options.file);
+    if (kind !== null) {
+      showUntrackedPath = true;
+      result = await runUntrackedDiff(repositoryPath, options.file, kind);
+    } else {
+      result = await runGit(repositoryPath, ["diff", "--", options.file]);
+    }
+  } else {
+    result = await runGit(repositoryPath, [
+      "diff",
+      ...(options.staged ? ["--cached"] : []),
+      ...(options.file ? ["--", options.file] : []),
+    ]);
+  }
+  const expectedNoIndexDifference = showUntrackedPath && result.exitCode === 1;
+  if (!result.ok && !expectedNoIndexDifference && result.stdout.length === 0) {
+    return { isRepo: true, diff: "", truncated: false };
+  }
   return {
     isRepo: true,
     diff: result.stdout.slice(0, DIFF_CHARACTER_LIMIT),
-    truncated: !result.ok || result.stdout.length > DIFF_CHARACTER_LIMIT,
+    truncated: (!result.ok && !expectedNoIndexDifference)
+      || result.stdout.length > DIFF_CHARACTER_LIMIT,
   };
 }
 
