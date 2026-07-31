@@ -94,6 +94,27 @@ describe("hubProtocol durable send retry", () => {
   });
 });
 
+describe("hubProtocol pending message delete", () => {
+  test("request/response を往復し、不正 kind/status を拒否する", () => {
+    const request: HubClientMessage = {
+      type: "pending_message_delete",
+      id: "delete-1",
+      session: "work",
+      clientMessageId: "client-1",
+      kind: "codex",
+    };
+    const response: HubServerMessage = {
+      type: "pending_message_delete_result",
+      id: "delete-1",
+      status: "not_found",
+    };
+    expect(decodeHubClientLine(encodeHubMessage(request))).toEqual(request);
+    expect(decodeHubServerLine(encodeHubMessage(response))).toEqual(response);
+    expect(decodeHubClientLine(JSON.stringify({ ...request, kind: "terminal" }))).toBeNull();
+    expect(decodeHubServerLine(JSON.stringify({ ...response, status: "accepted" }))).toBeNull();
+  });
+});
+
 describe("hubProtocol subagent transcript RPC", () => {
   test("request/response を encode/decode 往復する", () => {
     const request: HubClientMessage = {

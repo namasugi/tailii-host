@@ -678,6 +678,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
       if (message.type === "hub_state_response" || message.type === "question_answer_result" ||
         message.type === "input_claim_result" || message.type === "runtime_claim_result" ||
         message.type === "codex_turn_result" || message.type === "chat_send_result" ||
+        message.type === "pending_message_delete_result" ||
         message.type === "presence_response" ||
         message.type === "conversation_subagent_transcript_response") {
         rpcWaiters.get(message.id)?.(message);

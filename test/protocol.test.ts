@@ -514,6 +514,31 @@ describe("decode 詳細", () => {
     )).not.toHaveProperty("explicitRetry");
   });
 
+  it("pending_message_delete / result を往復し、不正値を拒否する", () => {
+    const request = {
+      type: "pending_message_delete" as const,
+      v: 2 as const,
+      id: "delete-1",
+      session: "work",
+      clientMessageId: "client-1",
+      kind: "chat" as const,
+    };
+    const result = {
+      type: "pending_message_delete_result" as const,
+      v: 2 as const,
+      id: "delete-1",
+      status: "deleted" as const,
+    };
+    expect(decodeControlMessage(encodeControlMessage(request))).toEqual(request);
+    expect(decodeControlMessage(encodeControlMessage(result))).toEqual(result);
+    expect(() => decodeControlMessage(
+      '{"clientMessageId":"client-1","id":"delete-1","kind":"terminal","session":"work","type":"pending_message_delete","v":2}',
+    )).toThrow(ProtocolDecodeError);
+    expect(() => decodeControlMessage(
+      '{"id":"delete-1","status":"accepted","type":"pending_message_delete_result","v":2}',
+    )).toThrow(ProtocolDecodeError);
+  });
+
   it("remote_pending / remote_pending_cleared を復元する", () => {
     expect(decodeControlMessage(
       '{"id":"a1","kind":"approval","session":"work","summary":"Run Bash","tool":"Bash","type":"remote_pending","v":1}',

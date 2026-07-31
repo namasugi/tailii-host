@@ -130,6 +130,8 @@ interface SessionActor {
   seenClientMessageIds: Set<string>;
   deliveredChatMessageIds: Map<string, number>;
   deliveredCodexMessageIds: Map<string, number>;
+  deletedChatMessageIds: Map<string, number>;
+  deletedCodexMessageIds: Map<string, number>;
   pendingChatMessages: Map<string, PendingChatSend>;
   injectingChatMessageIds: Set<string>;
   uncertainChatMessages: Map<string, Extract<HubClientMessage, { type: "chat_send" }>>;
@@ -238,17 +240,31 @@ export class SessionHub {
           clientMessageId, state.deliveredCodexAtMs?.[clientMessageId] ?? restoredAt,
         );
       }
+      for (const clientMessageId of state.deleted ?? []) {
+        actor.deletedChatMessageIds.set(
+          clientMessageId, state.deletedAtMs?.[clientMessageId] ?? restoredAt,
+        );
+      }
+      for (const clientMessageId of state.deletedCodex ?? []) {
+        actor.deletedCodexMessageIds.set(
+          clientMessageId, state.deletedCodexAtMs?.[clientMessageId] ?? restoredAt,
+        );
+      }
       compactDeliveredReceipts(actor.deliveredChatMessageIds, restoredAt);
       compactDeliveredReceipts(actor.deliveredCodexMessageIds, restoredAt);
+      compactDeliveredReceipts(actor.deletedChatMessageIds, restoredAt);
+      compactDeliveredReceipts(actor.deletedCodexMessageIds, restoredAt);
       for (const message of state.queued) {
         if (hasDeliveredReceipt(actor.deliveredChatMessageIds, message.clientMessageId, restoredAt) ||
+          hasDeliveredReceipt(actor.deletedChatMessageIds, message.clientMessageId, restoredAt) ||
           actor.pendingChatMessages.has(message.clientMessageId)) continue;
         const entry: PendingChatSend = { message, waiters: [] };
         actor.pendingChatMessages.set(message.clientMessageId, entry);
         actor.chatQueue.push(entry);
       }
       for (const message of state.injecting) {
-        if (!hasDeliveredReceipt(actor.deliveredChatMessageIds, message.clientMessageId, restoredAt)) {
+        if (!hasDeliveredReceipt(actor.deliveredChatMessageIds, message.clientMessageId, restoredAt) &&
+          !hasDeliveredReceipt(actor.deletedChatMessageIds, message.clientMessageId, restoredAt)) {
           // crash 時点で tmux 注入の前後を判定できない。自動再注入は二重実行を生むため、
           // 同じ ID を uncertain として保持し、利用者起点の明示的な新規送信に委ねる。
           actor.uncertainChatMessages.set(message.clientMessageId, message);
@@ -267,13 +283,15 @@ export class SessionHub {
         actor.chatOrder.indexOf(right.message.clientMessageId));
       for (const message of state.queuedCodex ?? []) {
         if (hasDeliveredReceipt(actor.deliveredCodexMessageIds, message.clientUserMessageId, restoredAt) ||
+          hasDeliveredReceipt(actor.deletedCodexMessageIds, message.clientUserMessageId, restoredAt) ||
           actor.pendingCodexTurns.has(message.clientUserMessageId)) continue;
         const entry: PendingCodexTurn = { message, waiters: [] };
         actor.pendingCodexTurns.set(message.clientUserMessageId, entry);
         actor.codexQueue.push(entry);
       }
       for (const message of state.startingCodex) {
-        if (!hasDeliveredReceipt(actor.deliveredCodexMessageIds, message.clientUserMessageId, restoredAt)) {
+        if (!hasDeliveredReceipt(actor.deliveredCodexMessageIds, message.clientUserMessageId, restoredAt) &&
+          !hasDeliveredReceipt(actor.deletedCodexMessageIds, message.clientUserMessageId, restoredAt)) {
           actor.uncertainCodexMessages.set(message.clientUserMessageId, message);
         }
       }
@@ -461,6 +479,13 @@ export class SessionHub {
     }
     if (message.type === "codex_turn_submit") {
       const actor = this.actor(message.session);
+      if (hasDeliveredReceipt(actor.deletedCodexMessageIds, message.clientUserMessageId)) {
+        this.sendTo(client, {
+          type: "codex_turn_result", id: message.id, status: "failed",
+          error: "pending_message_deleted",
+        });
+        return;
+      }
       if (hasDeliveredReceipt(actor.deliveredCodexMessageIds, message.clientUserMessageId)) {
         this.sendTo(client, { type: "codex_turn_result", id: message.id, status: "duplicate" });
         return;
@@ -544,6 +569,13 @@ export class SessionHub {
     }
     if (message.type === "chat_send") {
       const actor = this.actor(message.session);
+      if (hasDeliveredReceipt(actor.deletedChatMessageIds, message.clientMessageId)) {
+        this.sendTo(client, {
+          type: "chat_send_result", id: message.id, status: "failed",
+          error: "pending_message_deleted",
+        });
+        return;
+      }
       if (hasDeliveredReceipt(actor.deliveredChatMessageIds, message.clientMessageId)) {
         this.sendTo(client, { type: "chat_send_result", id: message.id, status: "duplicate" });
         return;
@@ -621,6 +653,17 @@ export class SessionHub {
         }
       actor.chatDrainBlocked = false;
       void this.drainChatQueue(message.session, actor);
+      return;
+    }
+    if (message.type === "pending_message_delete") {
+      // 対象不在も成功だが、client 保存前 crash で同じ Outbox が復元されても実行しないよう
+      // 削除 tombstone は durable に残す。actor 不在でもここだけは軽量 actor を作る。
+      const actor = this.actor(message.session);
+      if (message.kind === "chat") {
+        this.deletePendingChatMessage(client, message.id, message.session, message.clientMessageId, actor);
+      } else {
+        this.deletePendingCodexTurn(client, message.id, message.session, message.clientMessageId, actor);
+      }
       return;
     }
     if (message.type === "input_claim") {
@@ -743,11 +786,13 @@ export class SessionHub {
     actor.pendingChatMessages.clear();
     actor.injectingChatMessageIds.clear();
     actor.uncertainChatMessages.clear();
+    actor.deletedChatMessageIds.clear();
     actor.codexQueue.length = 0;
     actor.codexOrder.length = 0;
     actor.pendingCodexTurns.clear();
     actor.startingCodexMessageIds.clear();
     actor.uncertainCodexMessages.clear();
+    actor.deletedCodexMessageIds.clear();
     actor.pendingQuestion = null;
     actor.focusedBy.clear();
     actor.subscribers.clear();
@@ -1241,6 +1286,7 @@ export class SessionHub {
         previewPump: null, backfillTails: new Map(),
         seenClientMessageIds: new Set(), deliveredChatMessageIds: new Map(),
         deliveredCodexMessageIds: new Map(),
+        deletedChatMessageIds: new Map(), deletedCodexMessageIds: new Map(),
         pendingChatMessages: new Map(), injectingChatMessageIds: new Set(),
         uncertainChatMessages: new Map(), uncertainCodexMessages: new Map(),
         pendingCodexTurns: new Map(), startingCodexMessageIds: new Set(),
@@ -1261,6 +1307,148 @@ export class SessionHub {
       if (oldest !== undefined) actor.seenClientMessageIds.delete(oldest);
     }
     return false;
+  }
+
+  private deletePendingChatMessage(
+    client: object,
+    requestId: string,
+    session: string,
+    clientMessageId: string,
+    actor: SessionActor,
+  ): void {
+    if (actor.injectingChatMessageIds.has(clientMessageId) ||
+      actor.uncertainChatMessages.has(clientMessageId) ||
+      hasDeliveredReceipt(actor.deliveredChatMessageIds, clientMessageId)) {
+      this.sendTo(client, {
+        type: "pending_message_delete_result", id: requestId, status: "processing",
+      });
+      return;
+    }
+    const entry = actor.pendingChatMessages.get(clientMessageId);
+    if (entry === undefined) {
+      if (!hasDeliveredReceipt(actor.deletedChatMessageIds, clientMessageId)) {
+        recordDeliveredReceipt(actor.deletedChatMessageIds, clientMessageId);
+        if (!this.persistChatReceipts()) {
+          actor.deletedChatMessageIds.delete(clientMessageId);
+          this.sendTo(client, {
+            type: "pending_message_delete_result",
+            id: requestId,
+            status: "failed",
+            error: "Session Hub missing message delete receipt write failed",
+          });
+          return;
+        }
+      }
+      this.sendTo(client, {
+        type: "pending_message_delete_result", id: requestId, status: "not_found",
+      });
+      return;
+    }
+    const previousQueue = actor.chatQueue;
+    const previousOrder = actor.chatOrder;
+    actor.pendingChatMessages.delete(clientMessageId);
+    actor.chatQueue = previousQueue.filter(
+      (queued) => queued.message.clientMessageId !== clientMessageId,
+    );
+    actor.chatOrder = previousOrder.filter((id) => id !== clientMessageId);
+    recordDeliveredReceipt(actor.deletedChatMessageIds, clientMessageId);
+    if (!this.persistChatReceipts()) {
+      actor.deletedChatMessageIds.delete(clientMessageId);
+      actor.pendingChatMessages.set(clientMessageId, entry);
+      actor.chatQueue = previousQueue;
+      actor.chatOrder = previousOrder;
+      this.sendTo(client, {
+        type: "pending_message_delete_result",
+        id: requestId,
+        status: "failed",
+        error: "Session Hub pending message delete receipt write failed",
+      });
+      return;
+    }
+    for (const waiter of entry.waiters) {
+      this.sendTo(waiter.client, {
+        type: "chat_send_result",
+        id: waiter.id,
+        status: "failed",
+        error: "Message was deleted before processing",
+      });
+    }
+    this.sendTo(client, {
+      type: "pending_message_delete_result", id: requestId, status: "deleted",
+    });
+    actor.chatDrainBlocked = false;
+    void this.drainChatQueue(session, actor);
+  }
+
+  private deletePendingCodexTurn(
+    client: object,
+    requestId: string,
+    session: string,
+    clientMessageId: string,
+    actor: SessionActor,
+  ): void {
+    if (actor.startingCodexMessageIds.has(clientMessageId) ||
+      actor.uncertainCodexMessages.has(clientMessageId) ||
+      hasDeliveredReceipt(actor.deliveredCodexMessageIds, clientMessageId)) {
+      this.sendTo(client, {
+        type: "pending_message_delete_result", id: requestId, status: "processing",
+      });
+      return;
+    }
+    const entry = actor.pendingCodexTurns.get(clientMessageId);
+    if (entry === undefined) {
+      if (!hasDeliveredReceipt(actor.deletedCodexMessageIds, clientMessageId)) {
+        recordDeliveredReceipt(actor.deletedCodexMessageIds, clientMessageId);
+        if (!this.persistChatReceipts()) {
+          actor.deletedCodexMessageIds.delete(clientMessageId);
+          this.sendTo(client, {
+            type: "pending_message_delete_result",
+            id: requestId,
+            status: "failed",
+            error: "Session Hub missing Codex turn delete receipt write failed",
+          });
+          return;
+        }
+      }
+      this.sendTo(client, {
+        type: "pending_message_delete_result", id: requestId, status: "not_found",
+      });
+      return;
+    }
+    const previousQueue = actor.codexQueue;
+    const previousOrder = actor.codexOrder;
+    actor.pendingCodexTurns.delete(clientMessageId);
+    actor.codexQueue = previousQueue.filter(
+      (queued) => queued.message.clientUserMessageId !== clientMessageId,
+    );
+    actor.codexOrder = previousOrder.filter((id) => id !== clientMessageId);
+    recordDeliveredReceipt(actor.deletedCodexMessageIds, clientMessageId);
+    if (!this.persistChatReceipts()) {
+      actor.deletedCodexMessageIds.delete(clientMessageId);
+      actor.pendingCodexTurns.set(clientMessageId, entry);
+      actor.codexQueue = previousQueue;
+      actor.codexOrder = previousOrder;
+      this.sendTo(client, {
+        type: "pending_message_delete_result",
+        id: requestId,
+        status: "failed",
+        error: "Session Hub pending Codex turn delete receipt write failed",
+      });
+      return;
+    }
+    for (const waiter of entry.waiters) {
+      this.sendTo(waiter.client, {
+        type: "codex_turn_result",
+        id: waiter.id,
+        status: "failed",
+        error: "Codex turn was deleted before processing",
+      });
+    }
+    this.sendTo(client, {
+      type: "pending_message_delete_result", id: requestId, status: "deleted",
+    });
+    actor.codexDrainBlocked = false;
+    void this.drainCodexQueue(session, actor);
   }
 
   private async drainChatQueue(session: string, actor: SessionActor): Promise<void> {
@@ -1559,6 +1747,8 @@ export class SessionHub {
     for (const [session, actor] of this.actors) {
       compactDeliveredReceipts(actor.deliveredChatMessageIds);
       compactDeliveredReceipts(actor.deliveredCodexMessageIds);
+      compactDeliveredReceipts(actor.deletedChatMessageIds);
+      compactDeliveredReceipts(actor.deletedCodexMessageIds);
       const queued = actor.chatQueue.map((entry) => entry.message);
       // shift 済みで注入中の entry も pending map には残るため必ず journal に含める。
       for (const entry of actor.pendingChatMessages.values()) {
@@ -1583,15 +1773,25 @@ export class SessionHub {
         .map((entry) => entry.message)
         .concat([...actor.uncertainCodexMessages.values()]);
       if (queued.length === 0 && injecting.length === 0 && actor.deliveredChatMessageIds.size === 0 &&
-        queuedCodex.length === 0 && startingCodex.length === 0 && actor.deliveredCodexMessageIds.size === 0) continue;
+        actor.deletedChatMessageIds.size === 0 && queuedCodex.length === 0 &&
+        startingCodex.length === 0 && actor.deliveredCodexMessageIds.size === 0 &&
+        actor.deletedCodexMessageIds.size === 0) continue;
       const sessionIdentity = receiptSessionIdentity(this.options.metadataStore.get(session));
       sessions[session] = {
         ...(sessionIdentity !== undefined ? { sessionIdentity } : {}),
         delivered: [...actor.deliveredChatMessageIds.keys()],
         deliveredAtMs: Object.fromEntries(actor.deliveredChatMessageIds),
+        ...(actor.deletedChatMessageIds.size > 0 ? {
+          deleted: [...actor.deletedChatMessageIds.keys()],
+          deletedAtMs: Object.fromEntries(actor.deletedChatMessageIds),
+        } : {}),
         queued, injecting, chatOrder: [...actor.chatOrder],
         deliveredCodex: [...actor.deliveredCodexMessageIds.keys()],
         deliveredCodexAtMs: Object.fromEntries(actor.deliveredCodexMessageIds),
+        ...(actor.deletedCodexMessageIds.size > 0 ? {
+          deletedCodex: [...actor.deletedCodexMessageIds.keys()],
+          deletedCodexAtMs: Object.fromEntries(actor.deletedCodexMessageIds),
+        } : {}),
         queuedCodex, startingCodex, codexOrder: [...actor.codexOrder],
       };
     }
@@ -1655,11 +1855,15 @@ type PersistedChatReceipts = Record<string, {
   sessionIdentity?: string;
   delivered: string[];
   deliveredAtMs?: Record<string, number>;
+  deleted?: string[];
+  deletedAtMs?: Record<string, number>;
   queued: Array<Extract<HubClientMessage, { type: "chat_send" }>>;
   injecting: Array<Extract<HubClientMessage, { type: "chat_send" }>>;
   chatOrder?: string[];
   deliveredCodex: string[];
   deliveredCodexAtMs?: Record<string, number>;
+  deletedCodex?: string[];
+  deletedCodexAtMs?: Record<string, number>;
   queuedCodex?: Array<Extract<HubClientMessage, { type: "codex_turn_submit" }>>;
   startingCodex: Array<Extract<HubClientMessage, { type: "codex_turn_submit" }>>;
   codexOrder?: string[];
@@ -1672,12 +1876,18 @@ function isPersistedChatReceipt(value: unknown): value is PersistedChatReceipts[
     (typeof record["sessionIdentity"] !== "string" || record["sessionIdentity"].length === 0)) return false;
   if (!Array.isArray(record["delivered"]) ||
     !record["delivered"].every((id) => typeof id === "string" && id.length > 0) ||
+    (record["deleted"] !== undefined && (!Array.isArray(record["deleted"]) ||
+      !record["deleted"].every((id) => typeof id === "string" && id.length > 0))) ||
     !Array.isArray(record["queued"]) || !Array.isArray(record["injecting"]) ||
     !Array.isArray(record["deliveredCodex"]) ||
     !record["deliveredCodex"].every((id) => typeof id === "string" && id.length > 0) ||
+    (record["deletedCodex"] !== undefined && (!Array.isArray(record["deletedCodex"]) ||
+      !record["deletedCodex"].every((id) => typeof id === "string" && id.length > 0))) ||
     !Array.isArray(record["startingCodex"])) return false;
   if (!isOptionalTimestampRecord(record["deliveredAtMs"]) ||
+    !isOptionalTimestampRecord(record["deletedAtMs"]) ||
     !isOptionalTimestampRecord(record["deliveredCodexAtMs"]) ||
+    !isOptionalTimestampRecord(record["deletedCodexAtMs"]) ||
     !isOptionalStringArray(record["chatOrder"]) || !isOptionalStringArray(record["codexOrder"]) ||
     (record["queuedCodex"] !== undefined && !Array.isArray(record["queuedCodex"]))) return false;
   const validChat = [...record["queued"], ...record["injecting"]].every((item) => {

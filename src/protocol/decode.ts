@@ -368,6 +368,29 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
       return compact({ type, v, id: requireString(raw, "id"), status, error: optionalString(raw, "error") });
     }
 
+    case "pending_message_delete": {
+      const kind = requireString(raw, "kind");
+      if (kind !== "chat" && kind !== "codex") {
+        throw new ProtocolDecodeError("missing-field", "kind");
+      }
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        session: requireString(raw, "session"),
+        clientMessageId: requireString(raw, "clientMessageId"),
+        kind,
+      };
+    }
+
+    case "pending_message_delete_result": {
+      const status = requireString(raw, "status");
+      if (status !== "deleted" && status !== "not_found" &&
+        status !== "processing" && status !== "failed") {
+        throw new ProtocolDecodeError("missing-field", "status");
+      }
+      return compact({ type, v, id: requireString(raw, "id"), status, error: optionalString(raw, "error") });
+    }
+
     case "error":
       return compact({
         type, v,

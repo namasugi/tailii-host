@@ -515,6 +515,50 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
+  test("pending message delete を Hub へ転送し結果を中継する", async () => {
+    const sent: unknown[] = [];
+    const hubLink: HubLink = {
+      onMessage: null, onReconnect: null,
+      send(message) {
+        sent.push(message);
+        if (message.type === "pending_message_delete") {
+          queueMicrotask(() => hubLink.onMessage?.({
+            type: "pending_message_delete_result",
+            id: message.id,
+            status: "not_found",
+          }));
+        }
+        return true;
+      },
+      close: vi.fn(),
+    };
+    const engine = startEngine({
+      sessionManager: makeManager(new MockTmuxRunner(() => ok(""))),
+      hubLink,
+    });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine(
+      '{"clientMessageId":"client-1","id":"delete-1","kind":"chat","session":"work","type":"pending_message_delete","v":2}',
+    );
+
+    expect(decodeControlMessage(
+      await engine.lines.nextOfType("pending_message_delete_result"),
+    )).toEqual({
+      type: "pending_message_delete_result",
+      v: 2,
+      id: "delete-1",
+      status: "not_found",
+    });
+    expect(sent).toContainEqual({
+      type: "pending_message_delete",
+      id: "delete-1",
+      session: "work",
+      clientMessageId: "client-1",
+      kind: "chat",
+    });
+    await engine.teardown();
+  });
+
   test("chat_send は前面購読が無ければ preview=true で自己修復subscribeする", async () => {
     // engine 再生成/Hub 再起動の狭間で前面購読が失われると、本文は background 購読で
     // 進むのにライブビューだけ消灯する（2026-07-29 実障害）。チャット画面からしか

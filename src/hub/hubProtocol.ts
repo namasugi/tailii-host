@@ -35,6 +35,7 @@ export type HubClientMessage =
     }
   | { type: "codex_turn_interrupt"; id: string; session: string }
   | { type: "chat_send"; id: string; session: string; clientMessageId: string; text: string; explicitRetry?: boolean }
+  | { type: "pending_message_delete"; id: string; session: string; clientMessageId: string; kind: "chat" | "codex" }
   | { type: "runtime_claim"; id: string; session: string }
   | { type: "runtime_claim_release"; session: string }
   | { type: "session_preview_watch"; enabled: boolean }
@@ -69,6 +70,7 @@ export type HubServerMessage =
   | { type: "input_claim_result"; id: string; status: "granted" | "duplicate" }
   | { type: "codex_turn_result"; id: string; status: "started" | "duplicate" | "failed"; error?: string }
   | { type: "chat_send_result"; id: string; status: "accepted" | "duplicate" | "failed"; error?: string }
+  | { type: "pending_message_delete_result"; id: string; status: "deleted" | "not_found" | "processing" | "failed"; error?: string }
   | { type: "runtime_claim_result"; id: string; status: "granted" | "held" }
   | EngineRelayMessage;
 
@@ -184,6 +186,16 @@ export function decodeHubClientLine(line: string): HubClientMessage | null {
           ...(explicitRetry === true ? { explicitRetry: true } : {}) }
       : null;
   }
+  if (record["type"] === "pending_message_delete") {
+    const id = record["id"], session = record["session"];
+    const clientMessageId = record["clientMessageId"], kind = record["kind"];
+    return typeof id === "string" && id.length > 0 &&
+      typeof session === "string" && session.length > 0 &&
+      typeof clientMessageId === "string" && clientMessageId.length > 0 &&
+      (kind === "chat" || kind === "codex")
+      ? { type: "pending_message_delete", id, session, clientMessageId, kind }
+      : null;
+  }
   if (record["type"] === "runtime_claim") {
     const id = record["id"], session = record["session"];
     return typeof id === "string" && id.length > 0 && typeof session === "string" && session.length > 0
@@ -263,6 +275,19 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
     if (typeof id !== "string" || (status !== "accepted" && status !== "duplicate" && status !== "failed") ||
       (error !== undefined && typeof error !== "string")) return null;
     return { type: "chat_send_result", id, status, ...(typeof error === "string" ? { error } : {}) };
+  }
+  if (record["type"] === "pending_message_delete_result") {
+    const id = record["id"], status = record["status"], error = record["error"];
+    if (typeof id !== "string" ||
+      (status !== "deleted" && status !== "not_found" &&
+        status !== "processing" && status !== "failed") ||
+      (error !== undefined && typeof error !== "string")) return null;
+    return {
+      type: "pending_message_delete_result",
+      id,
+      status,
+      ...(typeof error === "string" ? { error } : {}),
+    };
   }
   if (record["type"] === "runtime_claim_result") {
     const id = record["id"], status = record["status"];

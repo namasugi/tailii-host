@@ -355,6 +355,8 @@ export type ControlMessage =
   | { type: "session_processing_state"; v: number; session: string; active: boolean }
   | { type: "chat_send"; v: number; id: string; session: string; clientMessageId: string; text: string; explicitRetry?: boolean }
   | { type: "chat_send_result"; v: number; id: string; status: "accepted" | "duplicate" | "failed"; error?: string }
+  | { type: "pending_message_delete"; v: number; id: string; session: string; clientMessageId: string; kind: "chat" | "codex" }
+  | { type: "pending_message_delete_result"; v: number; id: string; status: "deleted" | "not_found" | "processing" | "failed"; error?: string }
   | { type: "error"; v: number; id?: string; code: string; message: string }
   | { type: "image_available"; v: number; id: string; path: string; mime: string; thumbnail: string; width: number; height: number; relatedApprovalId?: string }
   | { type: "image_fetch_request"; v: number; id: string }

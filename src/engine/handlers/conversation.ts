@@ -78,6 +78,37 @@ export const conversationHandlers: HandlerRegistry = {
     })();
   },
 
+  pending_message_delete: (message, ctx) => {
+    const { writer, state } = ctx;
+    const v = state.negotiatedVersion;
+    void (async () => {
+      try {
+        const result = await ctx.hubRpc<
+          Extract<HubServerMessage, { type: "pending_message_delete_result" }>
+        >(
+          {
+            type: "pending_message_delete",
+            id: message.id,
+            session: message.session,
+            clientMessageId: message.clientMessageId,
+            kind: message.kind,
+          },
+          message.id,
+          5_000,
+        );
+        writer.write({
+          type: "pending_message_delete_result",
+          v,
+          id: result.id,
+          status: result.status,
+          ...(result.error !== undefined ? { error: result.error } : {}),
+        });
+      } catch (error) {
+        writeError(writer, v, message.id, "pending_message_delete_failed", String(error));
+      }
+    })();
+  },
+
   question_answer: async (message, ctx) => {
     const { writer, state } = ctx;
     const v = state.negotiatedVersion;

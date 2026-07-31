@@ -107,6 +107,273 @@ describe("SessionHub actor", () => {
     ]));
   });
 
+  test("pending message delete は durable queued chat を host から先に削除する", async () => {
+    const receiptsPath = path.join(makeTempDir("hub-chat-delete"), "receipts.json");
+    const chatInjector = vi.fn(async () => {});
+    const hub = new SessionHub({
+      runner: async () => ok(""),
+      heartbeatDir: makeTempDir("hub-chat-delete-hb"),
+      metadataStore: makeTempStore(),
+      timeoutSeconds: 1800,
+      chatInjector,
+      chatReceiptsPath: receiptsPath,
+    });
+    hub.handleRelayMessage({
+      type: "question_event",
+      session: "work",
+      event: "prompt",
+      id: "question-blocks-delete",
+      questions: [{ header: "h", question: "q", options: [], multiSelect: false }],
+    });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({
+      type: "chat_send",
+      id: "send-1",
+      session: "work",
+      clientMessageId: "client-delete-1",
+      text: "delete me",
+    }));
+    hub.handleClientMessage(client, JSON.stringify({
+      type: "pending_message_delete",
+      id: "delete-1",
+      session: "work",
+      clientMessageId: "client-delete-1",
+      kind: "chat",
+    }));
+
+    expect(received).toContainEqual({
+      type: "pending_message_delete_result", id: "delete-1", status: "deleted",
+    });
+    expect(received).toContainEqual(expect.objectContaining({
+      type: "chat_send_result", id: "send-1", status: "failed",
+    }));
+    expect(JSON.parse(fs.readFileSync(receiptsPath, "utf8"))).toMatchObject({
+      version: 1,
+      sessions: {
+        work: {
+          deleted: ["client-delete-1"],
+          queued: [],
+          injecting: [],
+          chatOrder: [],
+        },
+      },
+    });
+    hub.handleRelayMessage({
+      type: "question_event", session: "work", event: "dismiss", id: "question-blocks-delete",
+    });
+    await Promise.resolve();
+    expect(chatInjector).not.toHaveBeenCalled();
+
+    // host 削除成功と client 保存の間で crash しても、同じ ID を再実行しない。
+    const restoredInjector = vi.fn(async () => {});
+    const restored = new SessionHub({
+      runner: async () => ok(""),
+      heartbeatDir: makeTempDir("hub-chat-delete-restored-hb"),
+      metadataStore: makeTempStore(),
+      timeoutSeconds: 1800,
+      chatInjector: restoredInjector,
+      chatReceiptsPath: receiptsPath,
+    });
+    restored.restoreChatReceipts();
+    const retryClient = {}, retryReceived: unknown[] = [];
+    restored.registerClient(
+      retryClient,
+      (line) => retryReceived.push(decodeHubServerLine(line)),
+    );
+    restored.handleClientMessage(retryClient, JSON.stringify({
+      type: "chat_send",
+      id: "retry-after-client-crash",
+      session: "work",
+      clientMessageId: "client-delete-1",
+      text: "delete me",
+    }));
+    expect(retryReceived).toContainEqual({
+      type: "chat_send_result",
+      id: "retry-after-client-crash",
+      status: "failed",
+      error: "pending_message_deleted",
+    });
+    expect(restoredInjector).not.toHaveBeenCalled();
+  });
+
+  test("pending message delete は対象不在を成功扱いにしてtombstoneを残す", () => {
+    const { hub } = makeHub();
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({
+      type: "pending_message_delete",
+      id: "delete-missing",
+      session: "missing",
+      clientMessageId: "client-missing",
+      kind: "chat",
+    }));
+
+    expect(received).toEqual([{
+      type: "pending_message_delete_result", id: "delete-missing", status: "not_found",
+    }]);
+    expect(hub.actors.has("missing")).toBe(true);
+    hub.handleClientMessage(client, JSON.stringify({
+      type: "chat_send",
+      id: "send-after-missing-delete",
+      session: "missing",
+      clientMessageId: "client-missing",
+      text: "must not run",
+    }));
+    expect(received).toContainEqual({
+      type: "chat_send_result",
+      id: "send-after-missing-delete",
+      status: "failed",
+      error: "pending_message_deleted",
+    });
+  });
+
+  test("pending message delete のjournal失敗はqueueを復元して削除失敗にする", async () => {
+    const receiptsPath = path.join(makeTempDir("hub-chat-delete-write-fail"), "receipts.json");
+    let writeCount = 0;
+    const chatInjector = vi.fn(async () => {});
+    const hub = new SessionHub({
+      runner: async () => ok(""),
+      heartbeatDir: makeTempDir("hub-chat-delete-write-fail-hb"),
+      metadataStore: makeTempStore(),
+      timeoutSeconds: 1800,
+      chatInjector,
+      chatReceiptsPath: receiptsPath,
+      chatReceiptsWriter: (target, contents) => {
+        writeCount += 1;
+        if (writeCount === 2) throw new Error("disk full during delete");
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, contents);
+      },
+    });
+    hub.handleRelayMessage({
+      type: "question_event",
+      session: "work",
+      event: "prompt",
+      id: "question-blocks-delete-failure",
+      questions: [{ header: "h", question: "q", options: [], multiSelect: false }],
+    });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({
+      type: "chat_send",
+      id: "send-delete-failure",
+      session: "work",
+      clientMessageId: "client-delete-failure",
+      text: "must remain queued",
+    }));
+    hub.handleClientMessage(client, JSON.stringify({
+      type: "pending_message_delete",
+      id: "delete-failure",
+      session: "work",
+      clientMessageId: "client-delete-failure",
+      kind: "chat",
+    }));
+
+    expect(received).toContainEqual(expect.objectContaining({
+      type: "pending_message_delete_result", id: "delete-failure", status: "failed",
+    }));
+    expect(JSON.parse(fs.readFileSync(receiptsPath, "utf8"))).toMatchObject({
+      sessions: { work: { queued: [{ clientMessageId: "client-delete-failure" }] } },
+    });
+    hub.handleRelayMessage({
+      type: "question_event",
+      session: "work",
+      event: "dismiss",
+      id: "question-blocks-delete-failure",
+    });
+    await vi.waitFor(() => expect(chatInjector).toHaveBeenCalledWith(
+      "must remain queued", "work",
+    ));
+  });
+
+  test("pending message delete は注入開始済みchatを失敗扱いにして処理を続ける", async () => {
+    let release!: () => void;
+    const injection = new Promise<void>((resolve) => { release = resolve; });
+    const chatInjector = vi.fn(async () => injection);
+    const hub = new SessionHub({
+      runner: async () => ok(""),
+      heartbeatDir: makeTempDir("hub-chat-delete-processing"),
+      metadataStore: makeTempStore(),
+      timeoutSeconds: 1800,
+      chatInjector,
+    });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({
+      type: "chat_send",
+      id: "send-processing",
+      session: "work",
+      clientMessageId: "client-processing",
+      text: "keep processing",
+    }));
+    await vi.waitFor(() => expect(chatInjector).toHaveBeenCalledOnce());
+    hub.handleClientMessage(client, JSON.stringify({
+      type: "pending_message_delete",
+      id: "delete-processing",
+      session: "work",
+      clientMessageId: "client-processing",
+      kind: "chat",
+    }));
+
+    expect(received).toContainEqual({
+      type: "pending_message_delete_result", id: "delete-processing", status: "processing",
+    });
+    release();
+    await vi.waitFor(() => expect(received).toContainEqual({
+      type: "chat_send_result", id: "send-processing", status: "accepted",
+    }));
+  });
+
+  test("pending message delete は開始待ちCodex turnだけを削除し先行turnを続ける", async () => {
+    let release!: () => void;
+    const firstStart = new Promise<string>((resolve) => { release = () => resolve("turn-1"); });
+    const startTurn = vi.fn()
+      .mockImplementationOnce(async () => firstStart)
+      .mockResolvedValue("turn-2");
+    const hub = new SessionHub({
+      runner: async () => ok(""),
+      heartbeatDir: makeTempDir("hub-codex-delete"),
+      metadataStore: makeTempStore(),
+      timeoutSeconds: 1800,
+      codexAppServerFactory: () => ({ openThread: async () => { throw new Error("unused"); } }),
+      codexTurnControllerFactory: () => ({
+        startTurn, closeSession: vi.fn(), close: vi.fn(),
+      }),
+    });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    const submit = (id: string, clientUserMessageId: string, text: string) => {
+      hub.handleClientMessage(client, JSON.stringify({
+        type: "codex_turn_submit", id, session: "work", text, clientUserMessageId,
+        effort: null, approvalPolicy: null, sandbox: null,
+        threadId: "thread-1", cwd: "/tmp/work",
+      }));
+    };
+    submit("turn-first", "client-first", "first");
+    await vi.waitFor(() => expect(startTurn).toHaveBeenCalledOnce());
+    submit("turn-second", "client-second", "second");
+    hub.handleClientMessage(client, JSON.stringify({
+      type: "pending_message_delete",
+      id: "delete-second",
+      session: "work",
+      clientMessageId: "client-second",
+      kind: "codex",
+    }));
+
+    expect(received).toContainEqual({
+      type: "pending_message_delete_result", id: "delete-second", status: "deleted",
+    });
+    expect(received).toContainEqual(expect.objectContaining({
+      type: "codex_turn_result", id: "turn-second", status: "failed",
+    }));
+    release();
+    await vi.waitFor(() => expect(received).toContainEqual({
+      type: "codex_turn_result", id: "turn-first", status: "started",
+    }));
+    expect(startTurn).toHaveBeenCalledOnce();
+  });
+
   test("chat_send receipt は queued→injecting→delivered を永続化してから ACK する", async () => {
     const receiptsPath = path.join(makeTempDir("hub-chat-receipt"), "receipts.json");
     let release!: () => void;
