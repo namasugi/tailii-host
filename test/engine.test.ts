@@ -1717,6 +1717,35 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
+  test("codex_thread_title_set は App Server の正式名を更新し結果を返す", async () => {
+    const manager = new CodexAppServerManager();
+    const setThreadName = vi.spyOn(manager, "setThreadName").mockResolvedValue();
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({
+      sessionManager: makeManager(runner),
+      codexAppServer: manager,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine(
+      '{"id":"title-1","threadId":"thread-123","title":"正式タイトル","type":"codex_thread_title_set","v":2}',
+    );
+
+    expect(await engine.lines.nextOfType("codex_thread_title_set_result")).toBe(
+      '{"error":null,"id":"title-1","ok":true,"type":"codex_thread_title_set_result","v":2}',
+    );
+    expect(setThreadName).toHaveBeenCalledWith("thread-123", "正式タイトル");
+
+    setThreadName.mockRejectedValueOnce(new Error("thread name must not be empty"));
+    engine.writeLine(
+      '{"id":"title-2","threadId":"thread-123","title":"","type":"codex_thread_title_set","v":2}',
+    );
+    expect(await engine.lines.nextOfType("codex_thread_title_set_result")).toBe(
+      '{"error":"Error: thread name must not be empty","id":"title-2","ok":false,"type":"codex_thread_title_set_result","v":2}',
+    );
+    await engine.teardown();
+  });
+
   test("codex_model_list_request の App Server 失敗は error を返す", async () => {
     const manager = new CodexAppServerManager();
     vi.spyOn(manager, "listModels").mockRejectedValue(new Error("model/list unavailable"));

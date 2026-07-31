@@ -390,6 +390,9 @@ export type ControlMessage =
   /** 会話カスタムタイトルの端末表示追随（iOS→host, session-title）。空 title は解除=セッション名へ戻す。 */
   | { type: "session_title_set"; v: number; id: string; session: string; title: string }
   | { type: "session_title_set_result"; v: number; id: string; ok: boolean; error: string | null }
+  /** Codex App Server の正式な thread.name を設定する。空 title はApp Serverが拒否する。 */
+  | { type: "codex_thread_title_set"; v: number; id: string; threadId: string; title: string }
+  | { type: "codex_thread_title_set_result"; v: number; id: string; ok: boolean; error: string | null }
   | { type: "question_prompt"; v: number; id: string; questions: QuestionPromptQuestion[] }
   | { type: "question_answer"; v: number; id: string; session: string; answers: QuestionAnswer[] }
   | { type: "question_dismiss"; v: number; id: string }

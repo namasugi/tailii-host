@@ -560,6 +560,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
     case "pane_choice_send_result":
     case "pane_key_send_result":
     case "session_title_set_result":
+    case "codex_thread_title_set_result":
       return {
         type, v,
         id: requireString(raw, "id"),
@@ -572,6 +573,14 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         type, v,
         id: requireString(raw, "id"),
         session: requireString(raw, "session"),
+        title: requireString(raw, "title"),
+      };
+
+    case "codex_thread_title_set":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        threadId: requireString(raw, "threadId"),
         title: requireString(raw, "title"),
       };
 

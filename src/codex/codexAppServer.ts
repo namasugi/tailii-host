@@ -541,6 +541,33 @@ export class CodexAppServerManager {
     }
   }
 
+  /**
+   * Codex App Server の正式な会話名を設定する。
+   *
+   * loaded thread と persisted rollout の両方を同じ API で更新できる。
+   * schema上は空文字もstringだが、実App Serverは `thread name must not be empty` で拒否する。
+   */
+  async setThreadName(threadId: string, name: string): Promise<void> {
+    const normalizedThreadId = threadId.trim();
+    if (normalizedThreadId.length === 0) {
+      throw new Error("Codex thread id must not be empty");
+    }
+    if (name.trim().length === 0) {
+      throw new Error("Codex thread name must not be empty");
+    }
+    await this.ensureRunning();
+    const connection = await this.connect(this.socketPath);
+    try {
+      await connection.initialize();
+      await connection.request("thread/name/set", {
+        threadId: normalizedThreadId,
+        name,
+      });
+    } finally {
+      connection.close();
+    }
+  }
+
   /** 現在共有中の App Server から Remote Control 状態を読む。 */
   async remoteControlStatus(): Promise<CodexRemoteControlStatus | null> {
     return this.remoteControlRequest("remoteControl/status/read", {}, parseRemoteControlStatus);

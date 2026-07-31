@@ -157,6 +157,37 @@ describe("CodexAppServerManager", () => {
     expect(connection.closed).toBe(1);
   });
 
+  test("thread/name/set で正式タイトルを保存し空文字を送信前に拒否する", async () => {
+    const connections: FakeConnection[] = [];
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-thread-name-set"),
+      connect: async () => {
+        const connection = new FakeConnection();
+        connections.push(connection);
+        return connection;
+      },
+      launch: () => {
+        throw new Error("must not spawn");
+      },
+    });
+
+    await manager.setThreadName(" thread-1 ", "正式タイトル");
+
+    expect(connections).toHaveLength(2);
+    expect(connections[1]?.requests).toEqual([{
+      method: "thread/name/set",
+      params: { threadId: "thread-1", name: "正式タイトル" },
+    }]);
+    expect(connections.every((connection) => connection.closed === 1)).toBe(true);
+    await expect(manager.setThreadName("  ", "x")).rejects.toThrow(
+      "Codex thread id must not be empty",
+    );
+    await expect(manager.setThreadName("thread-1", " \n ")).rejects.toThrow(
+      "Codex thread name must not be empty",
+    );
+    expect(connections).toHaveLength(2);
+  });
+
   test("共有 App Server の固定 Remote Control RPC を検証して返す", async () => {
     const requests: { method: string; params: unknown }[] = [];
     const connections: FakeConnection[] = [];

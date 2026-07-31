@@ -3,3 +3,7 @@
 {"id":"st2","session":"s-1a2b3c4d","title":"","type":"session_title_set","v":1}
 {"error":"pane not found","id":"st2","ok":false,"type":"session_title_set_result","v":1}
 {"id":"st3","sessions":[{"alive":true,"backend":"herdr","claudeSessionId":"11111111-2222-3333-4444-555555555555","cwd":"/Users/alice/work","displayTitle":"認証バグの調査","name":"s-1a2b3c4d","providerSessionId":"11111111-2222-3333-4444-555555555555"},{"alive":true,"cwd":"/Users/alice/other","name":"s-9f8e7d6c"}],"type":"session_list_response","v":1}
+{"id":"ct1","threadId":"11111111-2222-3333-4444-555555555555","title":"Codex正式タイトル","type":"codex_thread_title_set","v":1}
+{"error":null,"id":"ct1","ok":true,"type":"codex_thread_title_set_result","v":1}
+{"id":"ct2","threadId":"11111111-2222-3333-4444-555555555555","title":"","type":"codex_thread_title_set","v":1}
+{"error":"Codex thread name must not be empty","id":"ct2","ok":false,"type":"codex_thread_title_set_result","v":1}

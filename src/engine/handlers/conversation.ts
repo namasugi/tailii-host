@@ -219,6 +219,39 @@ export const conversationHandlers: HandlerRegistry = {
     }
   },
 
+  codex_thread_title_set: async (message, ctx) => {
+    const { writer, state, codexAppServer } = ctx;
+    const v = state.negotiatedVersion;
+    if (codexAppServer === null) {
+      writer.write({
+        type: "codex_thread_title_set_result",
+        v,
+        id: message.id,
+        ok: false,
+        error: "Codex App Server is unavailable",
+      });
+      return;
+    }
+    try {
+      await codexAppServer.setThreadName(message.threadId, message.title);
+      writer.write({
+        type: "codex_thread_title_set_result",
+        v,
+        id: message.id,
+        ok: true,
+        error: null,
+      });
+    } catch (error) {
+      writer.write({
+        type: "codex_thread_title_set_result",
+        v,
+        id: message.id,
+        ok: false,
+        error: String(error),
+      });
+    }
+  },
+
   session_search_request: (message, ctx) => {
     const { writer, state } = ctx;
     const v = state.negotiatedVersion;
