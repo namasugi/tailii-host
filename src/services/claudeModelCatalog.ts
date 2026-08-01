@@ -12,7 +12,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ClaudeModelInfo } from "../protocol/messages.js";
-import { loadAccessTokenCandidates } from "./planUsageFetcher.js";
+import {
+  withClaudeOAuthCredential,
+  type ClaudeOAuthAttempt,
+} from "./planUsageFetcher.js";
 
 /** Models API のエンドポイント（1ページ完結を実測済み。念のため上限いっぱいで要求する）。 */
 export const CLAUDE_MODELS_ENDPOINT = "https://api.anthropic.com/v1/models?limit=100";
@@ -25,14 +28,14 @@ export async function fetchClaudeModelList(timeoutSeconds = 5): Promise<ClaudeMo
   // API キーが設定されている環境ではそちらの claude が動いているため優先する。
   const apiKey = await loadApiKey(timeoutSeconds);
   if (apiKey !== null) {
-    const models = await fetchOnce(apiKeyHeaders(apiKey), timeoutSeconds);
-    if (models !== null) return models;
+    const result = await fetchOnce(apiKeyHeaders(apiKey), timeoutSeconds);
+    if (result.kind === "success") return result.value;
   }
-  for (const token of await loadAccessTokenCandidates()) {
-    const models = await fetchOnce(oauthHeaders(token), timeoutSeconds);
-    if (models !== null) return models;
-  }
-  return null;
+  const resolved = await withClaudeOAuthCredential(
+    (token) => fetchOnce(oauthHeaders(token), timeoutSeconds),
+    { timeoutSeconds },
+  );
+  return resolved?.value ?? null;
 }
 
 /** API キー認証のヘッダ（Models API の標準認証）。 */
@@ -56,17 +59,19 @@ function oauthHeaders(token: string): Record<string, string> {
 async function fetchOnce(
   headers: Record<string, string>,
   timeoutSeconds: number,
-): Promise<ClaudeModelInfo[] | null> {
+): Promise<ClaudeOAuthAttempt<ClaudeModelInfo[]>> {
   try {
     const response = await fetch(CLAUDE_MODELS_ENDPOINT, {
       method: "GET",
       headers,
       signal: AbortSignal.timeout(timeoutSeconds * 1000),
     });
-    if (response.status !== 200) return null;
-    return curateClaudeModels((await response.json()) as unknown);
+    if (response.status === 401) return { kind: "unauthorized" };
+    if (response.status !== 200) return { kind: "failure" };
+    const models = curateClaudeModels((await response.json()) as unknown);
+    return models === null ? { kind: "failure" } : { kind: "success", value: models };
   } catch {
-    return null;
+    return { kind: "failure" };
   }
 }
 

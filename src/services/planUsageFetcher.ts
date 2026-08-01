@@ -9,6 +9,12 @@ import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { maskEmail } from "./accountIdentity.js";
+import {
+  refreshClaudeCredentialFile,
+  shouldRefreshClaudeCredential,
+  type RefreshedClaudeCredential,
+} from "./claudeCredentialRefresh.js";
 
 /**
  * プラン使用状況（5時間枠/7日枠/上位モデル週間枠の使用率とリセット時刻）。
@@ -28,10 +34,15 @@ export interface PlanUsage {
   subscriptionType: string | null;
   /** レート制限ティアの生値（"default_claude_max_20x" 等）。credentials に無ければ null。 */
   rateLimitTier: string | null;
+  /** 実際に使用量取得へ成功した同じ OAuth token のアカウント（host 側でマスク済み）。 */
+  account?: string | null;
 }
 
 /** 使用量 API のエンドポイント（Claude Code 本体・statusline ツールと同じ）。 */
 export const PLAN_USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage";
+
+/** 使用量と同じ OAuth token の表示アカウントを確定する profile endpoint。 */
+export const CLAUDE_PROFILE_ENDPOINT = "https://api.anthropic.com/api/oauth/profile";
 
 /**
  * トークン候補（値と有効期限 ms epoch、および同じ credentials に載っていたプラン情報）。
@@ -48,6 +59,36 @@ export interface Credential {
   rateLimitTier?: string;
 }
 
+/** 認証源。SSH/file と GUI Keychain のアカウントを混同しないため候補と一緒に運ぶ。 */
+export interface SourcedCredential extends Credential {
+  source: "keychain" | "file";
+}
+
+/** OAuth API 1回分の結果。401だけを refresh/retry 対象として区別する。 */
+export type ClaudeOAuthAttempt<T> =
+  | { kind: "success"; value: T }
+  | { kind: "unauthorized" }
+  | { kind: "failure" };
+
+export interface ClaudeOAuthResolution<T> {
+  value: T;
+  credential: Credential;
+}
+
+/** 共通認証実行器の注入点（テストは実 Keychain/file/token endpoint に触れない）。 */
+export interface ClaudeOAuthExecutionOptions {
+  candidates?: readonly SourcedCredential[];
+  refreshFile?: () => Promise<RefreshedClaudeCredential | null>;
+  now?: () => number;
+  timeoutSeconds?: number;
+}
+
+/** Keychain コマンド実行境界。テストでは秘密を含まないダミー JSON を返す。 */
+export type CredentialCommandRunner = (
+  executable: string,
+  args: readonly string[],
+) => Promise<string | null>;
+
 /** engine へ注入するフェッチャの型（テストは () => null を注入する）。 */
 export type PlanUsageProvider = () => Promise<PlanUsage | null>;
 
@@ -59,21 +100,30 @@ export type PlanUsageProvider = () => Promise<PlanUsage | null>;
  * バッジ表示が一致する）。
  */
 export async function fetchPlanUsage(timeoutSeconds = 5): Promise<PlanUsage | null> {
-  for (const credential of await loadCredentialCandidates()) {
-    const usage = await fetchOnce(credential.token, timeoutSeconds);
-    if (usage !== null) {
-      return {
-        ...usage,
-        subscriptionType: credential.subscriptionType ?? null,
-        rateLimitTier: credential.rateLimitTier ?? null,
-      };
-    }
-  }
-  return null;
+  const resolved = await withClaudeOAuthCredential(
+    async (token): Promise<ClaudeOAuthAttempt<{ usage: PlanUsage; account: string | null }>> => {
+      const usage = await fetchUsageOnce(token, timeoutSeconds);
+      if (usage.kind !== "success") return usage;
+      // アカウント表示は別の `claude auth status` ではなく、成功した同じ token から採る。
+      const account = await fetchMaskedClaudeAccount(token, timeoutSeconds);
+      return { kind: "success", value: { usage: usage.value, account } };
+    },
+    { timeoutSeconds },
+  );
+  if (resolved === null) return null;
+  return {
+    ...resolved.value.usage,
+    subscriptionType: resolved.credential.subscriptionType ?? null,
+    rateLimitTier: resolved.credential.rateLimitTier ?? null,
+    account: resolved.value.account,
+  };
 }
 
-/** 単一トークンで使用量 API を1回叩く。非 200・タイムアウトは null。 */
-async function fetchOnce(token: string, timeoutSeconds: number): Promise<PlanUsage | null> {
+/** 単一トークンで使用量 API を1回叩く。401だけを更新可能として区別する。 */
+async function fetchUsageOnce(
+  token: string,
+  timeoutSeconds: number,
+): Promise<ClaudeOAuthAttempt<PlanUsage>> {
   try {
     const response = await fetch(PLAN_USAGE_ENDPOINT, {
       method: "GET",
@@ -84,11 +134,45 @@ async function fetchOnce(token: string, timeoutSeconds: number): Promise<PlanUsa
       },
       signal: AbortSignal.timeout(timeoutSeconds * 1000),
     });
+    if (response.status === 401) return { kind: "unauthorized" };
+    if (response.status !== 200) return { kind: "failure" };
+    const usage = parsePlanUsage((await response.json()) as unknown);
+    return usage === null ? { kind: "failure" } : { kind: "success", value: usage };
+  } catch {
+    return { kind: "failure" };
+  }
+}
+
+/** 成功 token の profile から email を読み、ワイヤーへ出せるマスク済み文字列だけ返す。 */
+async function fetchMaskedClaudeAccount(
+  token: string,
+  timeoutSeconds: number,
+): Promise<string | null> {
+  try {
+    const response = await fetch(CLAUDE_PROFILE_ENDPOINT, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${token}`, "Cache-Control": "no-cache" },
+      signal: AbortSignal.timeout(timeoutSeconds * 1_000),
+    });
     if (response.status !== 200) return null;
-    return parsePlanUsage((await response.json()) as unknown);
+    return parseMaskedClaudeProfile((await response.json()) as unknown);
   } catch {
     return null;
   }
+}
+
+/** profile 応答からマスク済み email だけを抽出する（秘密の生 email は返さない）。 */
+export function parseMaskedClaudeProfile(raw: unknown): string | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const account = (raw as Record<string, unknown>)["account"];
+  if (typeof account !== "object" || account === null) return null;
+  const rec = account as Record<string, unknown>;
+  const email = typeof rec["email"] === "string"
+    ? rec["email"]
+    : typeof rec["email_address"] === "string"
+      ? rec["email_address"]
+      : null;
+  return maskEmail(email) ?? null;
 }
 
 /**
@@ -155,12 +239,8 @@ function roundedPercent(raw: unknown): number | null {
  * プラン情報も一緒に運ぶので、成功した候補の subscriptionType / rateLimitTier を採れる。
  */
 export async function loadCredentialCandidates(now: Date = new Date()): Promise<Credential[]> {
-  const candidates: Credential[] = [];
-  const keychain = await credentialFromKeychain();
-  if (keychain) candidates.push(keychain);
-  const file = credentialFromFile();
-  if (file) candidates.push(file);
-  return orderCredentials(candidates, now.getTime());
+  const candidates = await prepareSourcedCredentials({ now: () => now.getTime() });
+  return candidates.map(withoutSource);
 }
 
 /**
@@ -172,11 +252,11 @@ export async function loadAccessTokenCandidates(now: Date = new Date()): Promise
 }
 
 /** 候補の試行順を決める（純ロジック, TESTABLE）。期限内を元の順で先に、期限切れを後に、重複除去。 */
-export function orderCredentials(candidates: Credential[], nowMs: number): Credential[] {
+export function orderCredentials<T extends Credential>(candidates: T[], nowMs: number): T[] {
   const valid = candidates.filter((c) => (c.expiresAtMs ?? Number.POSITIVE_INFINITY) > nowMs);
   const expired = candidates.filter((c) => (c.expiresAtMs ?? Number.POSITIVE_INFINITY) <= nowMs);
   const seen = new Set<string>();
-  const result: Credential[] = [];
+  const result: T[] = [];
   for (const c of [...valid, ...expired]) {
     if (!seen.has(c.token)) {
       seen.add(c.token);
@@ -184,6 +264,108 @@ export function orderCredentials(candidates: Credential[], nowMs: number): Crede
     }
   }
   return result;
+}
+
+/**
+ * Claude OAuth を必要とする全機能の共通実行器。
+ * 期限前は file を先に更新し、API が401なら同じ file をロック付きで1回だけ更新して再試行する。
+ */
+export async function withClaudeOAuthCredential<T>(
+  attempt: (token: string) => Promise<ClaudeOAuthAttempt<T>>,
+  options: ClaudeOAuthExecutionOptions = {},
+): Promise<ClaudeOAuthResolution<T> | null> {
+  const now = options.now ?? (() => Date.now());
+  const timeoutSeconds = options.timeoutSeconds ?? 5;
+  const refreshFile = options.refreshFile ?? (() => refreshClaudeCredentialFile({ timeoutSeconds }));
+  let refreshAttempted = false;
+  const candidates = await prepareSourcedCredentials({ ...options, now, refreshFile }, () => {
+    refreshAttempted = true;
+  });
+
+  for (const candidate of candidates) {
+    let result = await attempt(candidate.token);
+    if (result.kind === "success") {
+      return { value: result.value, credential: withoutSource(candidate) };
+    }
+    if (result.kind !== "unauthorized" || candidate.source !== "file" || refreshAttempted) {
+      continue;
+    }
+
+    // expiresAt 欠落・時計ずれ・期限前失効も、401を根拠に一度だけ強制更新する。
+    refreshAttempted = true;
+    const refreshed = await refreshFile();
+    if (refreshed === null) continue;
+    const retryCredential = sourcedFromRefresh(refreshed);
+    result = await attempt(retryCredential.token);
+    if (result.kind === "success") {
+      return { value: result.value, credential: withoutSource(retryCredential) };
+    }
+  }
+  return null;
+}
+
+async function prepareSourcedCredentials(
+  options: ClaudeOAuthExecutionOptions,
+  onRefreshSuccess: () => void = () => {},
+): Promise<SourcedCredential[]> {
+  const now = options.now ?? (() => Date.now());
+  const timeoutSeconds = options.timeoutSeconds ?? 5;
+  const refreshFile = options.refreshFile ?? (() => refreshClaudeCredentialFile({ timeoutSeconds }));
+  let candidates = options.candidates !== undefined
+    ? [...options.candidates]
+    : await loadSourcedCredentialCandidates();
+  const hasKeychain = candidates.some((candidate) => candidate.source === "keychain");
+  const fileIndex = candidates.findIndex((candidate) => candidate.source === "file");
+
+  if (
+    !hasKeychain &&
+    fileIndex >= 0 &&
+    shouldRefreshClaudeCredential(candidates[fileIndex]!.expiresAtMs, now())
+  ) {
+    const refreshed = await refreshFile();
+    if (refreshed !== null) {
+      onRefreshSuccess();
+      candidates[fileIndex] = sourcedFromRefresh(refreshed);
+    }
+  }
+  // 同じ access token が Keychain/file の両方にある場合は、401時に refresh できる file 側を残す。
+  const refreshableCandidates = candidates.filter((candidate) =>
+    candidate.source === "file" ||
+    !candidates.some((other) => other.source === "file" && other.token === candidate.token)
+  );
+  return orderCredentials(refreshableCandidates, now());
+}
+
+async function loadSourcedCredentialCandidates(): Promise<SourcedCredential[]> {
+  const candidates: SourcedCredential[] = [];
+  const keychain = await credentialFromKeychain();
+  if (keychain !== null) candidates.push({ ...keychain, source: "keychain" });
+  const file = credentialFromFile();
+  if (file !== null) candidates.push({ ...file, source: "file" });
+  return candidates;
+}
+
+function sourcedFromRefresh(refreshed: RefreshedClaudeCredential): SourcedCredential {
+  return {
+    token: refreshed.accessToken,
+    expiresAtMs: refreshed.expiresAtMs,
+    source: "file",
+    ...(refreshed.subscriptionType !== undefined
+      ? { subscriptionType: refreshed.subscriptionType }
+      : {}),
+    ...(refreshed.rateLimitTier !== undefined ? { rateLimitTier: refreshed.rateLimitTier } : {}),
+  };
+}
+
+function withoutSource(credential: SourcedCredential): Credential {
+  return {
+    token: credential.token,
+    expiresAtMs: credential.expiresAtMs,
+    ...(credential.subscriptionType !== undefined
+      ? { subscriptionType: credential.subscriptionType }
+      : {}),
+    ...(credential.rateLimitTier !== undefined ? { rateLimitTier: credential.rateLimitTier } : {}),
+  };
 }
 
 /** `orderCredentials` のトークンだけの版（既存呼び出し互換）。 */
@@ -201,21 +383,58 @@ function credentialFromFile(): Credential | null {
   }
 }
 
-/** macOS Keychain（"Claude Code-credentials"）から候補を読む。 */
-function credentialFromKeychain(): Promise<Credential | null> {
+/**
+ * 秘密を stdout 文字列としてだけ受け取り、ログへ出さずに返す。
+ * SSH の Keychain 問い合わせが対話待ちで固まっても account_usage 全体を止めない。
+ */
+function runCredentialCommand(
+  executable: string,
+  args: readonly string[],
+): Promise<string | null> {
   return new Promise((resolve) => {
     execFile(
-      "/usr/bin/security",
-      ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
+      executable,
+      [...args],
+      { timeout: 2_000, maxBuffer: 256 * 1024 },
       (error, stdout) => {
         if (error) {
           resolve(null);
           return;
         }
-        resolve(extractCredential(String(stdout)));
+        resolve(String(stdout));
       },
     );
   });
+}
+
+/**
+ * macOS Keychain（"Claude Code-credentials"）から候補を読む。
+ *
+ * QUIC（LaunchAgent）と SSH（sshd）は異なる bootstrap namespace で起動する。トランスポート
+ * によって認証源が変わらないよう、両方とも最初に `launchctl asuser <uid>` で同じログイン
+ * ユーザーの GUI bootstrap namespace に入り、Claude Code の login Keychain を正本として
+ * 読む。GUI セッション不在時だけ現在の namespace で直接再試行し、それも失敗した場合は
+ * 呼び出し側が `~/.claude/.credentials.json` へフォールバックする。
+ */
+export async function credentialFromKeychain(
+  runner: CredentialCommandRunner = runCredentialCommand,
+  uid: number | null = typeof process.getuid === "function" ? process.getuid() : null,
+): Promise<Credential | null> {
+  const securityArgs = ["find-generic-password", "-s", "Claude Code-credentials", "-w"] as const;
+
+  if (uid !== null) {
+    const shared = extractCredential(
+      (await runner("/bin/launchctl", [
+        "asuser",
+        String(uid),
+        "/usr/bin/security",
+        ...securityArgs,
+      ])) ?? "",
+    );
+    if (shared !== null) return shared;
+  }
+
+  return extractCredential((await runner("/usr/bin/security", securityArgs)) ?? "");
 }
 
 /**

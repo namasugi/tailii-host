@@ -10,7 +10,15 @@ import { ChatTailController } from "../src/chat/chatTailController.js";
 import { ClaudeSessionStore, cwdFromSlug, transcriptTitle } from "../src/sessions/claudeSessionStore.js";
 import { dirCanCreate, dirChildren, dirCreate, dirList } from "../src/services/dirLister.js";
 import { parsePermissionMode } from "../src/shared/permissionMode.js";
-import { extractCredential, orderCandidates, parsePlanUsage } from "../src/services/planUsageFetcher.js";
+import {
+  credentialFromKeychain,
+  extractCredential,
+  orderCandidates,
+  parseMaskedClaudeProfile,
+  parsePlanUsage,
+  withClaudeOAuthCredential,
+  type CredentialCommandRunner,
+} from "../src/services/planUsageFetcher.js";
 import {
   bumpHeartbeat,
   listHeartbeatSessions,
@@ -326,6 +334,14 @@ describe("PlanUsageFetcher", () => {
     expect(parsePlanUsage("not-an-object")).toBeNull();
   });
 
+  test("profile は同じ token の email を host 側でマスクして返す", () => {
+    expect(parseMaskedClaudeProfile({ account: { email: "alice@example.com" } }))
+      .toBe("a***@example.com");
+    expect(parseMaskedClaudeProfile({ account: { email_address: "bob@example.com" } }))
+      .toBe("b***@example.com");
+    expect(parseMaskedClaudeProfile({ account: {} })).toBeNull();
+  });
+
   test("orderCandidates は期限内を先・期限切れを後・重複除去", () => {
     const now = 1000;
     expect(
@@ -366,6 +382,171 @@ describe("PlanUsageFetcher", () => {
     expect(
       extractCredential('{"claudeAiOauth":{"accessToken":"tok-2","subscriptionType":""}}'),
     ).toEqual({ token: "tok-2", expiresAtMs: null });
+  });
+
+  test("QUIC/SSH 共通で login session の Keychain を最初に読む", async () => {
+    const calls: Array<[string, readonly string[]]> = [];
+    const runner: CredentialCommandRunner = async (executable, args) => {
+      calls.push([executable, args]);
+      return '{"claudeAiOauth":{"accessToken":"shared","expiresAt":2000}}';
+    };
+
+    await expect(credentialFromKeychain(runner, 502)).resolves.toEqual({
+      token: "shared",
+      expiresAtMs: 2000,
+    });
+    expect(calls).toEqual([
+      [
+        "/bin/launchctl",
+        [
+          "asuser",
+          "502",
+          "/usr/bin/security",
+          "find-generic-password",
+          "-s",
+          "Claude Code-credentials",
+          "-w",
+        ],
+      ],
+    ]);
+  });
+
+  test("GUI session が無ければ現在の namespace で Keychain を再試行する", async () => {
+    const calls: Array<[string, readonly string[]]> = [];
+    const runner: CredentialCommandRunner = async (executable, args) => {
+      calls.push([executable, args]);
+      if (executable === "/bin/launchctl") return null;
+      return (
+        '{"claudeAiOauth":{"accessToken":"direct","expiresAt":3000,' +
+        '"subscriptionType":"max"}}'
+      );
+    };
+
+    await expect(credentialFromKeychain(runner, 502)).resolves.toEqual({
+      token: "direct",
+      expiresAtMs: 3000,
+      subscriptionType: "max",
+    });
+    expect(calls).toEqual([
+      [
+        "/bin/launchctl",
+        [
+          "asuser",
+          "502",
+          "/usr/bin/security",
+          "find-generic-password",
+          "-s",
+          "Claude Code-credentials",
+          "-w",
+        ],
+      ],
+      [
+        "/usr/bin/security",
+        ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
+      ],
+    ]);
+  });
+
+  test("Keychain が両経路で読めなければ null（credentials file fallback を許可）", async () => {
+    const runner: CredentialCommandRunner = async () => null;
+    await expect(credentialFromKeychain(runner, 502)).resolves.toBeNull();
+  });
+
+  test("expiresAt が無くても file token の401後に一度だけ refresh して再試行する", async () => {
+    const attempted: string[] = [];
+    let refreshCalls = 0;
+    const resolved = await withClaudeOAuthCredential(
+      async (token) => {
+        attempted.push(token);
+        return token === "old"
+          ? { kind: "unauthorized" as const }
+          : { kind: "success" as const, value: "ok" };
+      },
+      {
+        candidates: [{ token: "old", expiresAtMs: null, source: "file" }],
+        refreshFile: async () => {
+          refreshCalls += 1;
+          return { accessToken: "new", expiresAtMs: 9_999, subscriptionType: "max" };
+        },
+        now: () => 1_000,
+      },
+    );
+
+    expect(attempted).toEqual(["old", "new"]);
+    expect(refreshCalls).toBe(1);
+    expect(resolved).toEqual({
+      value: "ok",
+      credential: { token: "new", expiresAtMs: 9_999, subscriptionType: "max" },
+    });
+  });
+
+  test("Keychain/file が同じ失効 token でも refresh 可能な file 候補を残す", async () => {
+    let refreshCalls = 0;
+    const resolved = await withClaudeOAuthCredential(
+      async (token) => token === "same-old"
+        ? { kind: "unauthorized" as const }
+        : { kind: "success" as const, value: "renewed" },
+      {
+        candidates: [
+          { token: "same-old", expiresAtMs: null, source: "keychain" },
+          { token: "same-old", expiresAtMs: null, source: "file" },
+        ],
+        refreshFile: async () => {
+          refreshCalls += 1;
+          return { accessToken: "same-new", expiresAtMs: 9_999 };
+        },
+        now: () => 1_000,
+      },
+    );
+
+    expect(refreshCalls).toBe(1);
+    expect(resolved?.value).toBe("renewed");
+    expect(resolved?.credential.token).toBe("same-new");
+  });
+
+  test("期限前 refresh が失敗してもAPIの401後にもう一度だけ更新を試す", async () => {
+    let refreshCalls = 0;
+    const attempted: string[] = [];
+    const resolved = await withClaudeOAuthCredential(
+      async (token) => {
+        attempted.push(token);
+        return token === "renewed"
+          ? { kind: "success" as const, value: 1 }
+          : { kind: "unauthorized" as const };
+      },
+      {
+        candidates: [{ token: "expired", expiresAtMs: 500, source: "file" }],
+        refreshFile: async () => {
+          refreshCalls += 1;
+          return refreshCalls === 1
+            ? null
+            : { accessToken: "renewed", expiresAtMs: 5_000 };
+        },
+        now: () => 1_000,
+      },
+    );
+
+    expect(refreshCalls).toBe(2);
+    expect(attempted).toEqual(["expired", "renewed"]);
+    expect(resolved?.value).toBe(1);
+  });
+
+  test("401以外の失敗では refresh token を回さない", async () => {
+    let refreshCalls = 0;
+    const resolved = await withClaudeOAuthCredential(
+      async () => ({ kind: "failure" as const }),
+      {
+        candidates: [{ token: "valid", expiresAtMs: 5_000_000, source: "file" }],
+        refreshFile: async () => {
+          refreshCalls += 1;
+          return { accessToken: "unused", expiresAtMs: 9_999 };
+        },
+        now: () => 1_000,
+      },
+    );
+
+    expect(resolved).toBeNull();
+    expect(refreshCalls).toBe(0);
   });
 });
 

@@ -47,6 +47,12 @@ interface CacheEntry<T> {
 }
 
 /**
+ * Claude usage が同じ OAuth token で account 解決を試みた印。
+ * non-enumerable Symbol は JSON に出ず、dropExpiredWindows が加工後のコピーへ明示継承する。
+ */
+const CLAUDE_ACCOUNT_FROM_USAGE_TOKEN = Symbol("claudeAccountFromUsageToken");
+
+/**
  * account_usage ハンドラを作る。TTL メモを閉包に持つため、テストは独自インスタンスを
  * 生成して互いに干渉させない（ENGINE_HANDLERS 側は engine プロセス全体で 1 つを共有する）。
  */
@@ -171,7 +177,14 @@ export function withAccount<T extends ClaudeAccountUsage | CodexAccountUsage>(
   usage: T,
   account: string | undefined,
 ): T {
-  return account === undefined ? usage : { ...usage, account };
+  // Claude usage が「実際に成功した同じ token」の profile から account を持つ場合は、
+  // 別認証源になり得る `claude auth status` のフォールバック値で上書きしない。
+  const sameTokenResolved = (
+    usage as ClaudeAccountUsage & { [CLAUDE_ACCOUNT_FROM_USAGE_TOKEN]?: true }
+  )[CLAUDE_ACCOUNT_FROM_USAGE_TOKEN] === true;
+  return account === undefined || usage.account !== undefined || sameTokenResolved
+    ? usage
+    : { ...usage, account };
 }
 
 /**
@@ -187,6 +200,9 @@ export function dropExpiredWindows<T extends ClaudeAccountUsage | CodexAccountUs
   nowMs: number,
   windows: readonly (readonly [string, string])[],
 ): T {
+  const sameTokenResolved = (
+    usage as ClaudeAccountUsage & { [CLAUDE_ACCOUNT_FROM_USAGE_TOKEN]?: true }
+  )[CLAUDE_ACCOUNT_FROM_USAGE_TOKEN] === true;
   const result: Record<string, unknown> = { ...usage };
   for (const [percentKey, resetsKey] of windows) {
     const iso = result[resetsKey];
@@ -195,6 +211,9 @@ export function dropExpiredWindows<T extends ClaudeAccountUsage | CodexAccountUs
     if (!Number.isFinite(resetsAtMs) || resetsAtMs > nowMs) continue;
     delete result[percentKey];
     delete result[resetsKey];
+  }
+  if (sameTokenResolved) {
+    Object.defineProperty(result, CLAUDE_ACCOUNT_FROM_USAGE_TOKEN, { value: true });
   }
   return result as T;
 }
@@ -214,6 +233,8 @@ export function toClaudeAccountUsage(
     /** credentials 由来の契約種別（無くても使用量は表示できるので optional）。 */
     subscriptionType?: string | null;
     rateLimitTier?: string | null;
+    /** 使用量取得に成功した同じ OAuth token のマスク済みアカウント。 */
+    account?: string | null;
   } | null,
 ): ClaudeAccountUsage | null {
   if (plan === null) return null;
@@ -228,7 +249,13 @@ export function toClaudeAccountUsage(
     // プランバッジ用の生値（credentials 由来。アクセストークンは決して載せない）。
     ...(plan.subscriptionType ? { plan: plan.subscriptionType } : {}),
     ...(plan.rateLimitTier ? { rateLimitTier: plan.rateLimitTier } : {}),
+    ...(plan.account ? { account: plan.account } : {}),
   };
+  // undefined は旧provider/fixture（auth status fallback可）、null は同tokenで解決不能
+  // （別認証源のアカウントを誤表示しないため fallback 不可）。
+  if (plan.account !== undefined) {
+    Object.defineProperty(usage, CLAUDE_ACCOUNT_FROM_USAGE_TOKEN, { value: true });
+  }
   if (
     usage.fiveHourPercent === undefined &&
     usage.sevenDayPercent === undefined &&

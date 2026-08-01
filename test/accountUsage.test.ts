@@ -175,6 +175,29 @@ describe("account_usage_request ハンドラ", () => {
     expect(response.claude?.fiveHourPercent).toBe(42);
   });
 
+  it("使用量と同じ token 由来の account を auth status の値で上書きしない", async () => {
+    const harness = makeHarness({
+      now: () => NOW_MS,
+      plan: async () => ({ ...PLAN, account: "s***@same-token.example" }),
+      codex: async () => CODEX,
+      accounts: async () => ({ claude: "o***@other-source.example" }),
+    });
+    const response = await harness.request("au-same-token");
+    expect(response.claude?.account).toBe("s***@same-token.example");
+  });
+
+  it("同じ token の profile が読めない時は別認証源の account を誤表示しない", async () => {
+    const harness = makeHarness({
+      now: () => NOW_MS,
+      plan: async () => ({ ...PLAN, account: null }),
+      codex: async () => CODEX,
+      accounts: async () => ({ claude: "o***@other-source.example" }),
+    });
+    const response = await harness.request("au-profile-unavailable");
+    expect(response.claude?.account).toBeUndefined();
+    expect(response.claude?.fiveHourPercent).toBe(42);
+  });
+
   it("アカウント provider の例外も応答を壊さない", async () => {
     const harness = makeHarness({
       now: () => NOW_MS,
@@ -379,6 +402,20 @@ describe("toClaudeAccountUsage", () => {
         rateLimitTier: null,
       }),
     ).toEqual({ fiveHourPercent: 7 });
+  });
+
+  it("同じ OAuth token 由来のマスク済み account を wire へ写す", () => {
+    expect(
+      toClaudeAccountUsage({
+        fiveHourUtilization: 7,
+        fiveHourResetsAt: null,
+        sevenDayUtilization: null,
+        sevenDayResetsAt: null,
+        sevenDayFableUtilization: null,
+        sevenDayFableResetsAt: null,
+        account: "a***@example.com",
+      }),
+    ).toEqual({ fiveHourPercent: 7, account: "a***@example.com" });
   });
 
   it("null / 全枠 null は null（= claudeError へ落ちる）", () => {
