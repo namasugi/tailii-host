@@ -619,7 +619,7 @@ describe("CodexAppServerManager", () => {
       "on-request",
     )).toBe("turn-1");
     await expect(thread.steerTurn("turn-1", "")).rejects.toThrow("must not be empty");
-    await thread.steerTurn("turn-1", "追加指示");
+    await thread.steerTurn("turn-1", "追加指示", "client-steer-1");
     await thread.interruptTurn("turn-1");
     const connection = connections.at(-1)!;
     expect(connection.requests).toContainEqual({
@@ -651,6 +651,7 @@ describe("CodexAppServerManager", () => {
       params: {
         threadId: "thread-live",
         input: [{ type: "text", text: "追加指示" }],
+        clientUserMessageId: "client-steer-1",
         expectedTurnId: "turn-1",
       },
     });
@@ -661,6 +662,92 @@ describe("CodexAppServerManager", () => {
     expect(calls).toBeGreaterThan(0);
     thread.close();
     expect(connection.closed).toBe(1);
+  });
+
+  test("旧App ServerがsteerのclientUserMessageIdを拒否したらIDなしで同じturnへ再試行する", async () => {
+    const probe = new FakeConnection();
+    const connection = new FakeConnection("thread-legacy-steer");
+    let rejectedStableID = false;
+    connection.request = async (method, params) => {
+      connection.requests.push({ method, params });
+      if (method === "thread/resume") {
+        return { thread: { id: "thread-legacy-steer", turns: [] } };
+      }
+      if (method === "turn/steer" &&
+        typeof params === "object" && params !== null &&
+        "clientUserMessageId" in params) {
+        rejectedStableID = true;
+        throw new Error(
+          "Invalid params: unknown field `clientUserMessageId`, expected `threadId`",
+        );
+      }
+      return {};
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-legacy-steer"),
+      connect: async () => probe.closed === 0 ? probe : connection,
+      launch: () => {},
+    });
+    const thread = await manager.openThread({ threadId: "thread-legacy-steer" });
+
+    await thread.steerTurn("turn-1", "最初の追加", "client-steer-1");
+    await thread.steerTurn("turn-1", "次の追加", "client-steer-2");
+
+    expect(rejectedStableID).toBe(true);
+    expect(connection.requests.filter((request) => request.method === "turn/steer"))
+      .toEqual([
+        {
+          method: "turn/steer",
+          params: {
+            threadId: "thread-legacy-steer",
+            input: [{ type: "text", text: "最初の追加" }],
+            expectedTurnId: "turn-1",
+            clientUserMessageId: "client-steer-1",
+          },
+        },
+        {
+          method: "turn/steer",
+          params: {
+            threadId: "thread-legacy-steer",
+            input: [{ type: "text", text: "最初の追加" }],
+            expectedTurnId: "turn-1",
+          },
+        },
+        {
+          method: "turn/steer",
+          params: {
+            threadId: "thread-legacy-steer",
+            input: [{ type: "text", text: "次の追加" }],
+            expectedTurnId: "turn-1",
+          },
+        },
+      ]);
+  });
+
+  test("steerのtimeoutはIDなし再試行をせず到達不明のまま上位へ返す", async () => {
+    const probe = new FakeConnection();
+    const connection = new FakeConnection("thread-steer-timeout");
+    connection.request = async (method, params) => {
+      connection.requests.push({ method, params });
+      if (method === "thread/resume") {
+        return { thread: { id: "thread-steer-timeout", turns: [] } };
+      }
+      if (method === "turn/steer") {
+        throw new Error("Codex App Server request timed out: turn/steer");
+      }
+      return {};
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-steer-timeout"),
+      connect: async () => probe.closed === 0 ? probe : connection,
+      launch: () => {},
+    });
+    const thread = await manager.openThread({ threadId: "thread-steer-timeout" });
+
+    await expect(thread.steerTurn("turn-1", "一度だけ", "client-steer"))
+      .rejects.toThrow("timed out");
+    expect(connection.requests.filter((request) => request.method === "turn/steer"))
+      .toHaveLength(1);
   });
 
   test("turn の未指定セキュリティ設定は project-aware config/read から復元する", async () => {

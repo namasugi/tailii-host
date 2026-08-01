@@ -86,8 +86,8 @@ export interface CodexTurnControllerRuntime {
   }): Promise<string>;
   interruptTurn?(session: string): Promise<void>;
   /**
-   * rollout の task_complete を、現在追跡中の同一 turn に限って完了へ反映する。
-   * App Server の turn/completed 通知欠落を補う副経路。
+   * rollout の terminal event（task_complete / turn_aborted）を、現在追跡中の
+   * 同一 turn に限って完了へ反映する。App Server の turn/completed 通知欠落を補う副経路。
    */
   reconcileCompletedTurn?(session: string, turnId: string): boolean;
   closeSession(session: string): void;
@@ -107,7 +107,11 @@ export interface CodexThreadClient {
     sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null,
     approvalPolicy?: CodexAppServerApprovalPolicy | null,
   ): Promise<string>;
-  steerTurn(turnId: string, text: string): Promise<void>;
+  steerTurn(
+    turnId: string,
+    text: string,
+    clientUserMessageId?: string | null,
+  ): Promise<void>;
   interruptTurn(turnId: string): Promise<void>;
   close(): void;
 }
@@ -126,6 +130,20 @@ export interface CodexAppServerThreadRuntime {
     cwd: string;
     prompt: string;
   }): Promise<CodexThreadTitleGenerationResult>;
+}
+
+function isDefinitiveSteerRejection(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const message = error.message.toLowerCase();
+  return [
+    "no active turn to steer",
+    "expected active turn id",
+    "cannot steer a review turn",
+    "cannot steer a compact turn",
+    "active turn not steerable",
+    "turn already completed",
+    "turn has already completed",
+  ].some((marker) => message.includes(marker));
 }
 
 interface OpenThread {
@@ -220,11 +238,18 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       const activeTurnId = opened.activeTurnId;
       if (activeTurnId !== null) {
         try {
-          await opened.thread.steerTurn(activeTurnId, options.text);
+          await opened.thread.steerTurn(
+            activeTurnId,
+            options.text,
+            options.clientUserMessageId,
+          );
           this.generateThreadTitle(opened, options.session, options.text);
           return activeTurnId;
-        } catch {
-          // turn 完了直後など steer と競合した場合は、新しい turn を開始する。
+        } catch (error) {
+          // App Serverが明示的に「このturnへはsteerできない」と拒否した場合だけ、新規turnへ
+          // 切り替える。timeout/切断はsteer受理済みか不明なので、turn/startすると二重実行に
+          // なり得る。到達不明は上位へ返し、clientUserMessageId receiptで後から確定させる。
+          if (!isDefinitiveSteerRejection(error)) throw error;
         }
       }
       const turnId = await opened.thread.startTurn(

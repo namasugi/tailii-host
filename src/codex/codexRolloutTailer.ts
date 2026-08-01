@@ -232,7 +232,7 @@ export class CodexRolloutTailer {
             }
             yield* flushPendingAssistantEvent(state);
           }
-          // 初回 EOF は rollout の現在状態へ追いついた境界。履歴中の task_complete を
+          // 初回 EOF は rollout の現在状態へ追いついた境界。履歴中の terminal event を
           // 1件ずつ再通知せず、最後の lifecycle だけを照合候補として渡す。
           if (!lifecycleCaughtUp) {
             if (lineBuf.length > 0) {
@@ -332,7 +332,11 @@ function parseTurnLifecycle(line: Buffer): CodexTurnLifecycleEvent | null {
       typeof record.payload !== "object" || record.payload === null ||
       Array.isArray(record.payload)) return null;
     const payload = record.payload as { type?: unknown; turn_id?: unknown };
-    if (payload.type !== "task_started" && payload.type !== "task_complete") return null;
+    if (
+      payload.type !== "task_started" &&
+      payload.type !== "task_complete" &&
+      payload.type !== "turn_aborted"
+    ) return null;
     if (typeof payload.turn_id !== "string" || payload.turn_id.length === 0) return null;
     return {
       state: payload.type === "task_started" ? "active" : "done",

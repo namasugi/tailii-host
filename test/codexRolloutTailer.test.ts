@@ -71,7 +71,10 @@ function tokenCount(contextTokens: number, contextWindow?: number): string {
   });
 }
 
-function taskLifecycle(type: "task_started" | "task_complete", turnId: string): string {
+function taskLifecycle(
+  type: "task_started" | "task_complete" | "turn_aborted",
+  turnId: string,
+): string {
   return JSON.stringify({ type: "event_msg", payload: { type, turn_id: turnId } });
 }
 
@@ -197,6 +200,37 @@ describe("CodexRolloutTailer.streamForCwd（有限 tail）", () => {
     await vi.waitFor(() => expect(lifecycle).toEqual([
       { state: "active", turnId: "turn-live" },
       { state: "done", turnId: "turn-live" },
+    ]));
+    abort.abort();
+    await pump;
+  });
+
+  test("turn_abortedを処理完了としてライブ通知する", async () => {
+    const root = makeTempDir("codex-lifecycle-aborted");
+    const cwd = makeTempDir("codex-lifecycle-aborted-cwd");
+    const rollout = writeRollout(root, "2026/07/31", "r.jsonl", cwd, [
+      taskLifecycle("task_started", "turn-aborted"),
+    ]);
+    const lifecycle: CodexTurnLifecycleEvent[] = [];
+    const abort = new AbortController();
+    const tailer = new CodexRolloutTailer({
+      sessionsRoot: root,
+      pollIntervalMs: 5,
+      tailIndefinitely: true,
+      onTurnLifecycle: (event) => lifecycle.push(event),
+    });
+    const pump = (async () => {
+      for await (const _ of tailer.streamForCwd(cwd, null, abort.signal)) {
+        // lifecycle だけを検証する。
+      }
+    })();
+    await vi.waitFor(() =>
+      expect(lifecycle).toEqual([{ state: "active", turnId: "turn-aborted" }]));
+
+    fs.appendFileSync(rollout, taskLifecycle("turn_aborted", "turn-aborted") + "\n");
+    await vi.waitFor(() => expect(lifecycle).toEqual([
+      { state: "active", turnId: "turn-aborted" },
+      { state: "done", turnId: "turn-aborted" },
     ]));
     abort.abort();
     await pump;

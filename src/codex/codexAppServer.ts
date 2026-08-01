@@ -262,6 +262,9 @@ class WebSocketCodexAppServerConnection implements CodexAppServerConnection {
 
 /** 1 thread を購読し、Tailii から turn を開始する長寿命 App Server 接続。 */
 export class CodexAppServerThread {
+  /** null=未判定、true=stable ID対応、false=旧App ServerなのでIDなしsteerへ固定。 */
+  private supportsSteerClientUserMessageId: boolean | null = null;
+
   constructor(
     readonly threadId: string,
     readonly initialItems: readonly Record<string, unknown>[],
@@ -307,13 +310,32 @@ export class CodexAppServerThread {
     return turnId;
   }
 
-  async steerTurn(turnId: string, text: string): Promise<void> {
+  async steerTurn(
+    turnId: string,
+    text: string,
+    clientUserMessageId?: string | null,
+  ): Promise<void> {
     if (text.length === 0) throw new Error("Codex turn text must not be empty");
-    await this.connection.request("turn/steer", {
+    const params = {
       threadId: this.threadId,
       input: [{ type: "text", text }],
       expectedTurnId: turnId,
-    });
+    };
+    if (!clientUserMessageId || this.supportsSteerClientUserMessageId === false) {
+      await this.connection.request("turn/steer", params);
+      return;
+    }
+    try {
+      await this.connection.request("turn/steer", { ...params, clientUserMessageId });
+      this.supportsSteerClientUserMessageId = true;
+    } catch (error) {
+      // codex-cli 0.144系にはこの additive field が無い。未知フィールド拒否だけは
+      // 同じactive turnへIDなしで再試行し、別turnを開始するcontroller fallbackへ落とさない。
+      // timeout/切断など「受理済みか不明」な失敗は再試行せず、そのまま上位へ返す。
+      if (!isUnsupportedSteerClientUserMessageIdError(error)) throw error;
+      await this.connection.request("turn/steer", params);
+      this.supportsSteerClientUserMessageId = false;
+    }
   }
 
   async interruptTurn(turnId: string): Promise<void> {
@@ -326,6 +348,21 @@ export class CodexAppServerThread {
   close(): void {
     this.connection.close();
   }
+}
+
+function isUnsupportedSteerClientUserMessageIdError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const message = error.message.toLowerCase();
+  if (!message.includes("clientusermessageid")) return false;
+  return [
+    "unknown field",
+    "unknown parameter",
+    "unexpected field",
+    "invalid params",
+    "invalid parameter",
+    "not supported",
+    "unsupported",
+  ].some((marker) => message.includes(marker));
 }
 
 interface CodexSecurityDefaults {

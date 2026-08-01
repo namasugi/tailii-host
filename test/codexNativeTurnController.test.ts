@@ -10,7 +10,7 @@ import {
 
 class FakeThread implements CodexThreadClient {
   readonly starts: { text: string; clientId?: string | null; effort?: string | null }[] = [];
-  readonly steers: { turnId: string; text: string }[] = [];
+  readonly steers: { turnId: string; text: string; clientId?: string | null }[] = [];
   readonly interrupts: string[] = [];
   nextTurnId = "turn-1";
   initialActiveTurnId: string | null = null;
@@ -22,8 +22,8 @@ class FakeThread implements CodexThreadClient {
     return this.nextTurnId;
   }
 
-  async steerTurn(turnId: string, text: string): Promise<void> {
-    this.steers.push({ turnId, text });
+  async steerTurn(turnId: string, text: string, clientId?: string | null): Promise<void> {
+    this.steers.push({ turnId, text, clientId });
     if (this.steerError !== null) throw this.steerError;
   }
 
@@ -316,10 +316,13 @@ describe("CodexNativeTurnController", () => {
     });
     await expect(controller.startTurn({
       session: "work", threadId: "thread-1", cwd: "/tmp/work", text: "追加指示",
+      clientUserMessageId: "client-steer-1",
       effort: "xhigh", sandbox: "workspace-write",
     })).resolves.toBe("turn-1");
 
-    expect(thread.steers).toEqual([{ turnId: "turn-1", text: "追加指示" }]);
+    expect(thread.steers).toEqual([{
+      turnId: "turn-1", text: "追加指示", clientId: "client-steer-1",
+    }]);
     expect(thread.starts).toEqual([{ text: "first", clientId: undefined, effort: undefined }]);
   });
 
@@ -333,18 +336,45 @@ describe("CodexNativeTurnController", () => {
       session: "work", threadId: "thread-1", cwd: "/tmp/work", text: "first",
     });
     thread.nextTurnId = "turn-2";
-    thread.steerError = new Error("turn already completed");
+    thread.steerError = new Error("no active turn to steer");
     await expect(controller.startTurn({
       session: "work", threadId: "thread-1", cwd: "/tmp/work", text: "retry",
+      clientUserMessageId: "client-retry",
     })).resolves.toBe("turn-2");
     await controller.interruptTurn("work");
 
-    expect(thread.steers).toEqual([{ turnId: "turn-1", text: "retry" }]);
+    expect(thread.steers).toEqual([{
+      turnId: "turn-1", text: "retry", clientId: "client-retry",
+    }]);
     expect(thread.starts).toEqual([
       { text: "first", clientId: undefined, effort: undefined },
-      { text: "retry", clientId: undefined, effort: undefined },
+      { text: "retry", clientId: "client-retry", effort: undefined },
     ]);
     expect(thread.interrupts).toEqual(["turn-2"]);
+  });
+
+  test("steer timeoutはturn/startへフォールバックせず到達不明として返す", async () => {
+    const thread = new FakeThread();
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => thread },
+    });
+
+    await controller.startTurn({
+      session: "work", threadId: "thread-1", cwd: "/tmp/work", text: "first",
+    });
+    thread.steerError = new Error("Codex App Server request timed out: turn/steer");
+
+    await expect(controller.startTurn({
+      session: "work", threadId: "thread-1", cwd: "/tmp/work", text: "一度だけ",
+      clientUserMessageId: "client-ambiguous-timeout",
+    })).rejects.toThrow("timed out");
+
+    expect(thread.steers).toEqual([{
+      turnId: "turn-1", text: "一度だけ", clientId: "client-ambiguous-timeout",
+    }]);
+    expect(thread.starts).toEqual([
+      { text: "first", clientId: undefined, effort: undefined },
+    ]);
   });
 
   test("idle の startTurn は従来どおり turn/start を呼ぶ", async () => {

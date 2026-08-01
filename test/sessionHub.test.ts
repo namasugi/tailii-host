@@ -1594,6 +1594,87 @@ describe("SessionHub conversation stream", () => {
     pumpWrite?.({ type: "pane_preview", v: 2, session: "work", seq: 4, active: false, text: "" });
     expect(framesOf(wr)).toHaveLength(1);
   });
+
+  test("中断済みCodexのstale Working frameを消灯へ正規化する", () => {
+    const metadataStore = makeTempStore();
+    metadataStore.put({
+      name: "codex-work",
+      cwd: "/tmp/work",
+      createdAt: 0,
+      agent: "codex",
+      providerSessionId: "thread-1",
+    });
+    let pumpWrite: ((payload: ControlMessage) => void) | undefined;
+    const hub = new SessionHub({
+      runner: async () => ok(""),
+      heartbeatDir: makeTempDir("hub-codex-aborted-preview"),
+      metadataStore,
+      timeoutSeconds: 1800,
+      previewPumpFactory: (write) => {
+        pumpWrite = write;
+        return { start() {}, stop() {} };
+      },
+    });
+    const client = {}, received: unknown[] = [];
+    subscribe(hub, client, received, { afterSeq: 0, preview: true, session: "codex-work" });
+    hub.handleClientMessage(client, JSON.stringify({
+      type: "session_processing",
+      session: "codex-work",
+      state: "done",
+    }));
+
+    pumpWrite?.({
+      type: "pane_preview",
+      v: 2,
+      session: "codex-work",
+      seq: 1,
+      active: true,
+      text: [
+        "■ Conversation interrupted",
+        "• Working (24m 12s • esc to interrupt)",
+        "› Improve documentation in @filename",
+      ].join("\n"),
+      mode: "codex_terminal",
+    });
+
+    expect(received.find((message) =>
+      (message as { type?: string }).type === "conversation_pane_preview")).toEqual({
+      type: "conversation_pane_preview",
+      session: "codex-work",
+      payload: {
+        type: "pane_preview",
+        v: 2,
+        session: "codex-work",
+        seq: 1,
+        active: false,
+        text: "",
+        mode: "codex_terminal",
+      },
+    });
+
+    received.length = 0;
+    const resumedFrame: ControlMessage = {
+      type: "pane_preview",
+      v: 2,
+      session: "codex-work",
+      seq: 2,
+      active: true,
+      text: [
+        "■ Conversation interrupted",
+        "› 修正を続けて",
+        "• Working (2s • esc to interrupt)",
+        "› Improve documentation in @filename",
+      ].join("\n"),
+      mode: "codex_terminal",
+    };
+    pumpWrite?.(resumedFrame);
+    expect(received.find((message) =>
+      (message as { type?: string }).type === "conversation_pane_preview")).toEqual({
+      type: "conversation_pane_preview",
+      session: "codex-work",
+      payload: resumedFrame,
+    });
+  });
 });
 
 function makeCodexStreamingHub(options: {

@@ -1028,14 +1028,15 @@ export class SessionHub {
           state.phase = "live";
           // 本文は以後 App Server のみを採用するが、rollout tail 自体は lifecycle の
           // 副監視として残す。ここで止めると、後続 turn の App Server `turn/completed`
-          // 欠落時に `task_complete` を観測できず、処理中状態を自己修復できない。
+          // 欠落時に terminal event（task_complete / turn_aborted）を観測できず、
+          // 処理中状態を自己修復できない。
         }
       },
       (event) => {
         if (actor.codexLive !== state || event.state !== "done") return;
         if (this.codexTurnController?.reconcileCompletedTurn?.(session, event.turnId) === true) {
           this.options.log?.(
-            `Codex rollout task_complete で処理完了を補完 session=${session} turn=${event.turnId}`,
+            `Codex rollout terminal event で処理完了を補完 session=${session} turn=${event.turnId}`,
           );
         }
       },
@@ -1236,20 +1237,33 @@ export class SessionHub {
     this.options.log?.(`audit preview-pump start session=${session}`);
     const pump = this.options.previewPumpFactory(
       (payload) => {
+        const outgoingPayload = reconcileCodexInterruptedPreview(
+          payload,
+          this.options.metadataStore.get(session)?.agent === "codex",
+          actor.processingSince !== null,
+        );
         const delivered = new Set<object>();
         for (const [client, state] of actor.subscribers) {
           if (state.preview) {
-            this.sendTo(client, { type: "conversation_pane_preview", session, payload });
+            this.sendTo(client, {
+              type: "conversation_pane_preview",
+              session,
+              payload: outgoingPayload,
+            });
             delivered.add(client);
           }
         }
         // watcher へは処理中の会話だけ流す（前面都合で動く pump のアイドル画面は一覧に不要）。
         // 消灯フレーム（active=false）だけは処理完了直後でも届け、一覧側の表示を確実に落とす。
-        const inactiveFrame = payload.type === "pane_preview" && !payload.active;
+        const inactiveFrame = outgoingPayload.type === "pane_preview" && !outgoingPayload.active;
         if (actor.processingSince !== null || inactiveFrame) {
           for (const watcher of this.previewWatchers) {
             if (!delivered.has(watcher)) {
-              this.sendTo(watcher, { type: "conversation_pane_preview", session, payload });
+              this.sendTo(watcher, {
+                type: "conversation_pane_preview",
+                session,
+                payload: outgoingPayload,
+              });
             }
           }
         }
@@ -1831,6 +1845,29 @@ export class SessionHub {
       return result;
     } catch { return {}; }
   }
+}
+
+/**
+ * Codex TUI 0.145 は abort 済みでも `Conversation interrupted` の下に古い
+ * `Working (... esc to interrupt)` 行を残すことがある。Hub の turn lifecycle が
+ * idle を確定済みなら、その矛盾フレームを消灯へ正規化し、旧 iOS でもライブ表示を
+ * 復活させない。番号付き choice prompt など通常の idle pane はそのまま通す。
+ */
+function reconcileCodexInterruptedPreview(
+  payload: ControlMessage,
+  isCodex: boolean,
+  processing: boolean,
+): ControlMessage {
+  if (!isCodex || processing || payload.type !== "pane_preview" || !payload.active) return payload;
+  const lower = payload.text.toLowerCase();
+  const interruptedIndex = lower.lastIndexOf("conversation interrupted");
+  const workingIndex = lower.lastIndexOf("esc to interrupt");
+  if (interruptedIndex < 0 || workingIndex <= interruptedIndex) return payload;
+  // 中断後に新しい user prompt が在れば、その下の Working は新 turn の正当な表示。
+  // stale 事例は interrupted → Working が直結し、入力欄プレースホルダは Working の後ろに在る。
+  const between = lower.slice(interruptedIndex, workingIndex);
+  if (/^[ \t]*[›❯][ \t]*\S/mu.test(between)) return payload;
+  return { ...payload, active: false, text: "" };
 }
 
 /** 監査行を必ず 1 行の key=value として保つ。 */
