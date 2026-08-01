@@ -1050,6 +1050,19 @@ function decodeHostVersions(value: unknown): HostVersions | undefined {
     hostVersion: optionalString(obj, "hostVersion"),
     claudeCliVersion: optionalString(obj, "claudeCliVersion"),
     codexCliVersion: optionalString(obj, "codexCliVersion"),
+    diagnostics: obj["diagnostics"] === undefined
+      ? undefined
+      : requireArray(obj, "diagnostics").map((item) => {
+          const check = requireObject(item, "host.diagnostics[]");
+          return compact({
+            id: requireString(check, "id"),
+            label: requireString(check, "label"),
+            ok: requireBoolean(check, "ok"),
+            required: requireBoolean(check, "required"),
+            detail: requireString(check, "detail"),
+            remediation: optionalString(check, "remediation"),
+          });
+        }),
   });
 }
 

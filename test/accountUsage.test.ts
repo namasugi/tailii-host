@@ -1,6 +1,6 @@
 // accountUsage.test.ts — アカウント使用量（account-usage）のハンドラ・パーサ
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   CLAUDE_ACCOUNT_USAGE_ERROR,
   CLAUDE_WINDOW_KEYS,
@@ -19,7 +19,11 @@ import {
   maskEmail,
   type AccountIdentities,
 } from "../src/services/accountIdentity.js";
-import { collectHostVersions, parseCliVersion } from "../src/services/hostVersions.js";
+import {
+  collectHostVersions,
+  fetchHostVersions,
+  parseCliVersion,
+} from "../src/services/hostVersions.js";
 import type { HandlerContext } from "../src/engine/context.js";
 import type {
   ClaudeAccountUsage,
@@ -705,5 +709,34 @@ describe("collectHostVersions", () => {
         packageVersion: () => { throw new Error("boom"); },
       }),
     ).toBeNull();
+  });
+});
+
+describe("fetchHostVersions", () => {
+  it("refresh ごとに CLI バージョンを取り直す", async () => {
+    let codexCliVersion = "0.145.0";
+    const options = {
+      versions: async (): Promise<HostVersions> => ({ codexCliVersion }),
+      diagnostics: async () => [],
+    };
+
+    await expect(fetchHostVersions(options)).resolves.toEqual({ codexCliVersion: "0.145.0" });
+    codexCliVersion = "0.146.0";
+    await expect(fetchHostVersions(options)).resolves.toEqual({ codexCliVersion: "0.146.0" });
+  });
+
+  it("診断が応答しなくても上限時間で切り離し、バージョン行を返す", async () => {
+    vi.useFakeTimers();
+    try {
+      const result = fetchHostVersions({
+        versions: async () => ({ hostVersion: "0.2.0" }),
+        diagnostics: () => new Promise(() => { /* 意図的に未解決 */ }),
+        diagnosticsTimeoutMs: 50,
+      });
+      await vi.advanceTimersByTimeAsync(50);
+      await expect(result).resolves.toEqual({ hostVersion: "0.2.0" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -11,6 +11,7 @@
 // SSH 経由では見えない」タイプの偽陽性を避ける。
 
 import * as fs from "node:fs";
+import { execFile } from "node:child_process";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -109,6 +110,8 @@ export function checkTcpPort(host: string, port: number, timeoutMs = 1500): Prom
 
 /** 1 検査項目の結果。 */
 export interface DoctorCheck {
+  /** wire/UI でも安定して使える識別子。表示名は変更可能なので id と分離する。 */
+  id: string;
   /** 表示名。 */
   label: string;
   ok: boolean;
@@ -116,6 +119,226 @@ export interface DoctorCheck {
   required: boolean;
   /** 詳細（見つかったパス、または直し方のヒント）。 */
   detail: string;
+  /** ホスト側で行う対処。コマンドの場合は説明と混ぜず、そのまま実行できる 1 行にする。 */
+  remediation?: string;
+}
+
+/** Tailii が依存している／相互運用を確認済みの最低版。最新版追従ではなく互換性境界。 */
+export const MINIMUM_NODE_MAJOR = 20;
+export const MINIMUM_CLAUDE_CLI_VERSION = "2.1.215";
+export const MINIMUM_CODEX_CLI_VERSION = "0.144.5";
+export const MINIMUM_HERDR_VERSION = "0.7.5";
+/** launchctl の応答がなくても診断全体を止めない上限。 */
+export const DOCTOR_QUIC_STATUS_TIMEOUT_MS = 2_000;
+
+/** `--version` の先頭に現れる数値版を比較用の整数列へ変換する。 */
+export function parseNumericVersion(raw: string | null): number[] | null {
+  if (raw === null) return null;
+  const match = /\d+(?:\.\d+)+/.exec(raw);
+  if (match === null) return null;
+  const parts = match[0].split(".").map(Number);
+  return parts.every(Number.isFinite) ? parts : null;
+}
+
+/** prerelease の飾りは無視し、数値成分だけで `actual >= minimum` を判定する。 */
+export function versionAtLeast(actual: string | null, minimum: string): boolean | null {
+  const left = parseNumericVersion(actual);
+  const right = parseNumericVersion(minimum);
+  if (left === null || right === null) return null;
+  const length = Math.max(left.length, right.length);
+  for (let index = 0; index < length; index += 1) {
+    const l = left[index] ?? 0;
+    const r = right[index] ?? 0;
+    if (l > r) return true;
+    if (l < r) return false;
+  }
+  return true;
+}
+
+/**
+ * 診断用の短いバージョン取得。
+ * 実体パスを直接起動しつつ、`#!/usr/bin/env node` 等のシバンにも検査時の PATH を渡す。
+ */
+export function probeVersion(
+  command: string | null,
+  args: readonly string[],
+  envPath: string,
+): Promise<string | null> {
+  if (command === null) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    execFile(
+      command,
+      [...args],
+      {
+        cwd: os.homedir(),
+        timeout: 3_000,
+        maxBuffer: 64 * 1024,
+        env: {
+          ...process.env,
+          PATH: [envPath, process.env["PATH"] ?? ""].filter(Boolean).join(":"),
+        },
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          resolve(null);
+          return;
+        }
+        const output = String(stdout).trim() || String(stderr).trim();
+        resolve(output.length > 0 ? output.split("\n")[0]?.trim() ?? null : null);
+      },
+    );
+  });
+}
+
+function versionDetail(pathname: string, raw: string | null): string {
+  return raw === null ? `バージョン確認に失敗 · ${pathname}` : `${raw} · ${pathname}`;
+}
+
+export type VersionCompatibility = "compatible" | "outdated" | "unknown" | "missing";
+
+/** コマンドの有無と解析結果を区別し、形式不明を互換扱いしない。 */
+export function versionCompatibility(
+  command: string | null,
+  rawVersion: string | null,
+  minimum: string,
+): VersionCompatibility {
+  if (command === null) return "missing";
+  if (rawVersion === null) return "unknown";
+  const comparison = versionAtLeast(rawVersion, minimum);
+  if (comparison === null) return "unknown";
+  return comparison ? "compatible" : "outdated";
+}
+
+function minimumVersionDetail(
+  pathname: string,
+  rawVersion: string | null,
+  minimum: string,
+): string {
+  const compatibility = versionCompatibility(pathname, rawVersion, minimum);
+  switch (compatibility) {
+    case "compatible":
+      return versionDetail(pathname, rawVersion);
+    case "outdated":
+      return `${rawVersion ?? "バージョン不明"}（${minimum} 以上が必要） · ${pathname}`;
+    case "unknown":
+      return rawVersion === null
+        ? `バージョン確認に失敗 · ${pathname}`
+        : `${rawVersion}（バージョン形式を確認できません） · ${pathname}`;
+    case "missing":
+      return "見つかりません";
+  }
+}
+
+/** 見つかったパッケージマネージャーに合わせた tmux 導入手順。 */
+export function tmuxInstallRemediation(envPath: string): string {
+  if (findCommand("brew", envPath) !== null) return "brew install tmux";
+  if (findCommand("apt-get", envPath) !== null) return "sudo apt-get install -y tmux";
+  if (findCommand("dnf", envPath) !== null) return "sudo dnf install -y tmux";
+  if (findCommand("yum", envPath) !== null) return "sudo yum install -y tmux";
+  if (findCommand("pacman", envPath) !== null) return "sudo pacman -S --needed tmux";
+  if (findCommand("zypper", envPath) !== null) return "sudo zypper install tmux";
+  return "ホストOSのパッケージマネージャーで tmux をインストールする";
+}
+
+/** macOS / Linux を取り違えない SSH サーバーの起動手順。 */
+export function sshServerRemediation(
+  envPath: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  if (platform === "darwin") {
+    return "システム設定 → 一般 → 共有 → リモートログイン をオンにする";
+  }
+  if (findCommand("apt-get", envPath) !== null) {
+    return "sudo apt-get install -y openssh-server && sudo systemctl enable --now ssh";
+  }
+  if (findCommand("dnf", envPath) !== null) {
+    return "sudo dnf install -y openssh-server && sudo systemctl enable --now sshd";
+  }
+  if (findCommand("yum", envPath) !== null) {
+    return "sudo yum install -y openssh-server && sudo systemctl enable --now sshd";
+  }
+  if (findCommand("pacman", envPath) !== null) {
+    return "sudo pacman -S --needed openssh && sudo systemctl enable --now sshd";
+  }
+  if (findCommand("zypper", envPath) !== null) {
+    return "sudo zypper install openssh && sudo systemctl enable --now sshd";
+  }
+  return "ホストOSの手順で SSH サーバーをインストールし、TCP 22 で起動する";
+}
+
+function nodeUpdateRemediation(envPath: string): string {
+  if (findCommand("mise", envPath) !== null || process.execPath.includes("/mise/")) {
+    return "mise use -g node@24";
+  }
+  if (findCommand("brew", envPath) !== null) return "brew upgrade node";
+  return "https://nodejs.org/en/download の手順で Node.js 20 以上へ更新する";
+}
+
+/** herdr は直接導入とパッケージ管理下で更新手順が異なる。 */
+export function herdrRemediation(command: string | null): string {
+  if (command === null) return "curl -fsSL https://herdr.dev/install.sh | sh";
+  if (
+    command.includes("/Cellar/")
+    || command.includes("/homebrew/")
+    || command.includes("/linuxbrew/")
+  ) {
+    return "brew upgrade herdr";
+  }
+  if (command.includes("/nix/store/")) return "Nix の導入設定で herdr を更新する";
+  return "herdr update";
+}
+
+/** timeout 後も元 Promise の reject を捕捉し、未処理 rejection を残さない。 */
+function resolveWithin<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const guarded = promise.catch(() => fallback);
+  const timeout = new Promise<T>((resolve) => {
+    timer = setTimeout(() => resolve(fallback), Math.max(0, timeoutMs));
+  });
+  return Promise.race([guarded, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
+/** macOS 専用の任意 QUIC 診断。Linux では launchd 項目自体を表示しない。 */
+async function collectDarwinQuicChecks(): Promise<DoctorCheck[]> {
+  const { isQuicGatewayLoaded, quicCredentialsDir, resolveQuicGatewayBinary } = await import(
+    "../services/quicGateway.js"
+  );
+  const gatewayPath = resolveQuicGatewayBinary(process.env);
+  const credsDir = quicCredentialsDir();
+  const credsOk = ["cert.pem", "key.pem", "token"].every((name) =>
+    fs.existsSync(path.join(credsDir, name)),
+  );
+  const loaded = gatewayPath !== null
+    ? await resolveWithin(isQuicGatewayLoaded(), DOCTOR_QUIC_STATUS_TIMEOUT_MS, false)
+    : false;
+  return [
+    {
+      id: "quic-binary",
+      label: "QUIC GW バイナリ(任意)",
+      ok: gatewayPath !== null,
+      required: false,
+      detail: gatewayPath ?? "未検出（SSH のみでも動作します）",
+      ...(gatewayPath === null ? { remediation: "tailii setup" } : {}),
+    },
+    {
+      id: "quic-credentials",
+      label: "QUIC 資格情報(~/.tailii/quic)",
+      ok: credsOk,
+      required: false,
+      detail: credsOk ? credsDir : "未生成",
+      ...(!credsOk ? { remediation: "tailii setup" } : {}),
+    },
+    {
+      id: "quic-service",
+      label: "QUIC GW 常駐(launchd)",
+      ok: loaded,
+      required: false,
+      detail: loaded ? "com.tailii.quic-gw 稼働中" : "未常駐",
+      ...(!loaded ? { remediation: "tailii setup" } : {}),
+    },
+  ];
 }
 
 /** 全検査を実行する（副作用なし・シムは検査のみ）。 */
@@ -123,100 +346,132 @@ export async function collectDoctorChecks(envPath: string = defaultInjectedPath(
   const checks: DoctorCheck[] = [];
 
   const nodeMajor = Number(process.versions.node.split(".")[0]);
+  const nodeRemediation = nodeUpdateRemediation(envPath);
   checks.push({
-    label: "Node.js 20+",
-    ok: nodeMajor >= 20,
+    id: "node",
+    label: `Node.js ${MINIMUM_NODE_MAJOR}+`,
+    ok: nodeMajor >= MINIMUM_NODE_MAJOR,
     required: true,
     detail: `v${process.versions.node}`,
+    ...(nodeMajor >= MINIMUM_NODE_MAJOR ? {} : { remediation: nodeRemediation }),
   });
 
   const tmux = findCommand("tmux", envPath);
+  const herdr = findCommand("herdr", envPath);
+  const claude = findCommand("claude", envPath);
+  const codex = findCommand("codex", envPath);
+  const sshdPromise = checkTcpPort("127.0.0.1", 22);
+  const quicChecksPromise = process.platform === "darwin"
+    ? collectDarwinQuicChecks().catch(() => [])
+    : Promise.resolve([]);
+  const [tmuxVersion, herdrVersion, claudeVersion, codexVersion] = await Promise.all([
+    probeVersion(tmux, ["-V"], envPath),
+    probeVersion(herdr, ["--version"], envPath),
+    probeVersion(claude, ["--version"], envPath),
+    probeVersion(codex, ["--version"], envPath),
+  ]);
+
   checks.push({
+    id: "tmux",
     label: "tmux",
     ok: tmux !== null,
     required: true,
-    detail: tmux ?? "見つかりません。`brew install tmux` 等で導入してください",
+    detail: tmux === null ? "見つかりません" : versionDetail(tmux, tmuxVersion),
+    ...(tmux === null ? { remediation: tmuxInstallRemediation(envPath) } : {}),
   });
 
   // 端末バックエンドに herdr を選んでいる場合のみ必須（既定 tmux では情報提供のみ）。
   const backendKind = resolveSessionBackendKind();
-  const herdr = findCommand("herdr", envPath);
+  const herdrCompatibility = versionCompatibility(herdr, herdrVersion, MINIMUM_HERDR_VERSION);
+  const herdrVersionOK = herdrCompatibility === "compatible";
   checks.push({
+    id: "herdr",
     label: backendKind === "herdr" ? "herdr(backend=herdr)" : "herdr(任意)",
-    ok: herdr !== null,
+    ok: herdrVersionOK,
     required: backendKind === "herdr",
     detail:
-      herdr ??
-      (backendKind === "herdr"
-        ? "見つかりません。~/.tailii/backend が herdr ですが herdr CLI が PATH にありません"
-        : "未導入(~/.tailii/backend で herdr backend を使う場合のみ必要)"),
+      herdr === null
+        ? (backendKind === "herdr"
+          ? "見つかりません（現在の backend には必要です）"
+          : "未導入（herdr backend を使う場合のみ必要）")
+        : minimumVersionDetail(herdr, herdrVersion, MINIMUM_HERDR_VERSION),
+    ...(!herdrVersionOK
+      ? { remediation: herdrRemediation(herdr) }
+      : {}),
   });
 
-  const claude = findCommand("claude", envPath);
-  const codex = findCommand("codex", envPath);
+  const claudeVersionOK = versionCompatibility(
+    claude,
+    claudeVersion,
+    MINIMUM_CLAUDE_CLI_VERSION,
+  ) === "compatible";
+  const codexVersionOK = versionCompatibility(
+    codex,
+    codexVersion,
+    MINIMUM_CODEX_CLI_VERSION,
+  ) === "compatible";
   checks.push({
+    id: "claude",
     label: "claude CLI",
-    // どちらかのエージェント CLI があれば必須要件は満たす（claude 無しの codex 運用も許す）。
-    ok: claude !== null,
-    required: codex === null,
-    detail: claude ?? "見つかりません。https://claude.com/claude-code から導入してください",
-  });
-  checks.push({
-    label: "codex CLI(任意)",
-    ok: codex !== null,
-    required: false,
-    detail: codex ?? "未導入(Codex セッションを使う場合のみ必要)",
+    // 対応最低版を満たす Codex があれば、Claude 無しの Codex 専用運用も許す。
+    ok: claudeVersionOK,
+    required: !codexVersionOK,
+    detail:
+      claude === null
+        ? "見つかりません"
+        : minimumVersionDetail(claude, claudeVersion, MINIMUM_CLAUDE_CLI_VERSION),
+    ...(!claudeVersionOK
+      ? {
+          remediation: claude === null
+            ? "curl -fsSL https://claude.ai/install.sh | bash"
+            : "claude update",
+        }
+      : {}),
   });
 
-  const sshdUp = await checkTcpPort("127.0.0.1", 22);
   checks.push({
-    label: "リモートログイン(sshd:22)",
+    id: "codex",
+    label: "codex CLI(任意)",
+    ok: codexVersionOK,
+    required: false,
+    detail:
+      codex === null
+        ? "未導入（Codex セッションを使う場合のみ必要）"
+        : minimumVersionDetail(codex, codexVersion, MINIMUM_CODEX_CLI_VERSION),
+    ...(!codexVersionOK
+      ? {
+          remediation: codex === null
+            ? "curl -fsSL https://chatgpt.com/codex/install.sh | sh"
+            : "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
+        }
+      : {}),
+  });
+
+  const sshdUp = await sshdPromise;
+  checks.push({
+    id: "remote-login",
+    label: "SSH サーバー(sshd:22)",
     ok: sshdUp,
     required: true,
-    detail: sshdUp
-      ? "接続可"
-      : "接続不可。システム設定 → 一般 → 共有 → リモートログイン を ON にしてください",
+    detail: sshdUp ? "接続可" : "接続不可",
+    ...(!sshdUp
+      ? { remediation: sshServerRemediation(envPath) }
+      : {}),
   });
 
   const shimPath = path.join(defaultShimBinDir(), "tailii-host");
   const shimOk = fs.existsSync(shimPath);
   checks.push({
+    id: "host-shim",
     label: "ホストシム(~/.local/bin/tailii-host)",
     ok: shimOk,
     required: true,
-    detail: shimOk ? shimPath : "未生成。`tailii setup` を実行すると自動生成されます",
+    detail: shimOk ? shimPath : "未生成",
+    ...(!shimOk ? { remediation: "tailii setup" } : {}),
   });
 
-  // --- QUIC ゲートウェイ（任意機能。未整備でも SSH のみで全機能が動く） ---
-  const { isQuicGatewayLoaded, quicCredentialsDir, resolveQuicGatewayBinary } = await import(
-    "../services/quicGateway.js"
-  );
-  const gatewayPath = resolveQuicGatewayBinary(process.env);
-  checks.push({
-    label: "QUIC GW バイナリ(任意)",
-    ok: gatewayPath !== null,
-    required: false,
-    detail: gatewayPath ?? "未検出(QUIC は使わず SSH のみで動作します)",
-  });
-  const credsDir = quicCredentialsDir();
-  const credsOk = ["cert.pem", "key.pem", "token"].every((name) =>
-    fs.existsSync(path.join(credsDir, name)),
-  );
-  checks.push({
-    label: "QUIC 資格情報(~/.tailii/quic)",
-    ok: credsOk,
-    required: false,
-    detail: credsOk ? credsDir : "未生成。`tailii setup` を実行すると自動生成されます",
-  });
-  const loaded = gatewayPath !== null ? await isQuicGatewayLoaded() : false;
-  checks.push({
-    label: "QUIC GW 常駐(launchd)",
-    ok: loaded,
-    required: false,
-    detail: loaded
-      ? "com.tailii.quic-gw 稼働中"
-      : "未常駐。`tailii setup` を実行すると launchd に登録されます",
-  });
+  // QUIC は macOS 専用の任意機能。SSH / version 検査と並行し、launchctl は上限付き。
+  checks.push(...await quicChecksPromise);
 
   return checks;
 }
@@ -224,7 +479,10 @@ export async function collectDoctorChecks(envPath: string = defaultInjectedPath(
 /** 検査結果を人間向けに整形する。 */
 export function formatDoctorChecks(checks: DoctorCheck[]): string {
   return checks
-    .map((c) => `  ${c.ok ? "✓" : c.required ? "✗" : "-"} ${c.label} : ${c.detail}`)
+    .map((c) => {
+      const line = `  ${c.ok ? "✓" : c.required ? "✗" : "-"} ${c.label} : ${c.detail}`;
+      return c.remediation === undefined ? line : `${line}\n      対処: ${c.remediation}`;
+    })
     .join("\n");
 }
 

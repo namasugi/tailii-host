@@ -311,11 +311,24 @@ export interface CodexAccountUsage {
   account?: string;
 }
 
+/** ホスト上で実行した `tailii doctor` 相当の 1 項目。 */
+export interface HostDiagnosticCheck {
+  /** 表示名と独立した安定識別子。 */
+  id: string;
+  label: string;
+  ok: boolean;
+  /** false の失敗は任意機能の未導入など、情報提供として扱う。 */
+  required: boolean;
+  detail: string;
+  /** ホスト側で行う対処（実行コマンド、または設定画面の経路）。 */
+  remediation?: string;
+}
+
 /**
- * ホスト環境のバージョン情報（`account_usage_response.host`, account-usage）。
+ * ホスト環境の情報（`account_usage_response.host`, account-usage）。
  *
- * 全フィールド optional — 取得できたものだけ載せる（取れなかった行は iOS でも出さない）。
- * 値はバージョン文字列そのもの（"2.1.220" 等。飾りは host 側で落とし済み）。
+ * 全フィールド optional — 取得できたものだけ載せる。旧 host は `diagnostics` を送らないため、
+ * iOS はバージョン行だけでも表示できる後方互換形を維持する。
  */
 export interface HostVersions {
   /** tailii host（package.json version）。 */
@@ -324,6 +337,8 @@ export interface HostVersions {
   claudeCliVersion?: string;
   /** `codex --version` 由来。 */
   codexCliVersion?: string;
+  /** `tailii doctor` 相当の診断結果。 */
+  diagnostics?: HostDiagnosticCheck[];
 }
 
 export type ControlMessage =

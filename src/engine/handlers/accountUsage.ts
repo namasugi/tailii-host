@@ -93,8 +93,8 @@ export function createAccountUsageHandlers(
   }
 
   /**
-   * ホストのバージョン情報（プロセス内キャッシュは provider 側が持つ）。
-   * 使用量とは独立なので TTL メモには載せず、失敗は「載せない」だけで済ませる。
+   * ホストのバージョン・診断情報。CLI 更新や環境変更を refresh へ反映するため
+   * TTL メモには載せない。provider 側の診断 timeout 後は、取れた情報だけを返す。
    */
   async function loadHost(ctx: HandlerContext): Promise<HostVersions | null> {
     try {
