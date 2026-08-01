@@ -862,7 +862,7 @@ describe("CodexAppServerManager", () => {
     const connection = new FakeConnection("thread-fresh");
     connection.request = async (method, params) => {
       connection.requests.push({ method, params });
-      if (method === "thread/resume") {
+      if (method === "thread/resume" || method === "thread/read") {
         throw new Error("no rollout found for thread id thread-fresh");
       }
       if (method === "turn/start") return { turn: { id: "turn-first" } };
@@ -878,9 +878,11 @@ describe("CodexAppServerManager", () => {
     expect(thread.initialItems).toEqual([]);
     expect(thread.initialActiveTurnId).toBeNull();
     expect(thread.liveSubscriptionReady).toBe(false);
+    await expect(thread.readActiveTurnId()).resolves.toBeUndefined();
     await expect(thread.startTurn("first", "client-first")).resolves.toBe("turn-first");
     expect(connection.requests.map((request) => request.method)).toEqual([
       "thread/resume",
+      "thread/read",
       "turn/start",
     ]);
     expect(connection.closed).toBe(0);
@@ -923,6 +925,12 @@ describe("CodexAppServerManager", () => {
           { id: "turn-live", status: "inProgress", items: [] },
         ] } };
       }
+      if (method === "thread/read") {
+        return { thread: { id: "thread-running", turns: [
+          { id: "turn-live", status: "completed", items: [] },
+          { id: "turn-refreshed", status: "inProgress", items: [] },
+        ] } };
+      }
       return {};
     };
     const manager = new CodexAppServerManager({
@@ -935,6 +943,11 @@ describe("CodexAppServerManager", () => {
 
     expect(thread.initialActiveTurnId).toBe("turn-live");
     expect(thread.liveSubscriptionReady).toBe(true);
+    await expect(thread.readActiveTurnId()).resolves.toBe("turn-refreshed");
+    expect(connection.requests).toContainEqual({
+      method: "thread/read",
+      params: { threadId: "thread-running", includeTurns: true },
+    });
   });
 
   test("未materialize以外のresume失敗は接続を閉じて伝播する", async () => {

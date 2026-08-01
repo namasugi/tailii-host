@@ -100,6 +100,11 @@ export interface CodexThreadClient {
   readonly initialActiveTurnId?: string | null;
   /** false は rollout 未生成で thread/resume が成立せず、live 通知を保証できない接続。 */
   readonly liveSubscriptionReady?: boolean;
+  /**
+   * 保存済み thread から現在の turn ID を読み直す。
+   * undefined は rollout 未生成で、App Server からまだ確認できない状態を表す。
+   */
+  readActiveTurnId?(): Promise<string | null | undefined>;
   startTurn(
     text: string,
     clientUserMessageId?: string | null,
@@ -144,6 +149,15 @@ function isDefinitiveSteerRejection(error: unknown): boolean {
     "turn already completed",
     "turn has already completed",
   ].some((marker) => message.includes(marker));
+}
+
+/** App Server の競合エラーから、その時点で実際に active だった turn ID を取り出す。 */
+function activeTurnIdFromMismatch(error: unknown): string | null {
+  if (!(error instanceof Error)) return null;
+  const match = error.message.match(
+    /expected active turn id [A-Za-z0-9_-]+ but found ([A-Za-z0-9_-]+)/i,
+  );
+  return match?.[1] ?? null;
 }
 
 interface OpenThread {
@@ -235,6 +249,13 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     const opened = await this.threadFor(options.session, options.threadId, options.cwd);
     this.onProcessing(options.session, "active");
     try {
+      // 未materialize fallback 接続は、別 client の実行中 turn を初期 snapshot で
+      // 復元できない。新規 turn/start の前に rollout を読み直し、既存 turn が
+      // materialize 済みなら steer へ戻す。undefined（まだ未生成）だけは従来どおり開始する。
+      if (opened.activeTurnId === null && opened.thread.liveSubscriptionReady === false) {
+        const refreshedTurnId = await opened.thread.readActiveTurnId?.();
+        if (refreshedTurnId !== undefined) opened.activeTurnId = refreshedTurnId;
+      }
       const activeTurnId = opened.activeTurnId;
       if (activeTurnId !== null) {
         try {
@@ -246,6 +267,19 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
           this.generateThreadTitle(opened, options.session, options.text);
           return activeTurnId;
         } catch (error) {
+          // 接続切替などでローカル ID だけが古い場合、App Server は未受理を明示しつつ
+          // 実際の active ID を返す。同じ入力をその turn へ一度だけ steer し直せる。
+          const currentTurnId = activeTurnIdFromMismatch(error);
+          if (currentTurnId !== null && currentTurnId !== activeTurnId) {
+            opened.activeTurnId = currentTurnId;
+            await opened.thread.steerTurn(
+              currentTurnId,
+              options.text,
+              options.clientUserMessageId,
+            );
+            this.generateThreadTitle(opened, options.session, options.text);
+            return currentTurnId;
+          }
           // App Serverが明示的に「このturnへはsteerできない」と拒否した場合だけ、新規turnへ
           // 切り替える。timeout/切断はsteer受理済みか不明なので、turn/startすると二重実行に
           // なり得る。到達不明は上位へ返し、clientUserMessageId receiptで後から確定させる。
@@ -322,8 +356,23 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
 
   async interruptTurn(session: string): Promise<void> {
     const opened = this.open.get(session);
-    if (opened === undefined || opened.activeTurnId === null) return;
-    await opened.thread.interruptTurn(opened.activeTurnId);
+    if (opened === undefined) return;
+    if (opened.activeTurnId === null && opened.thread.liveSubscriptionReady === false) {
+      const refreshedTurnId = await opened.thread.readActiveTurnId?.();
+      if (refreshedTurnId !== undefined) opened.activeTurnId = refreshedTurnId;
+    }
+    const activeTurnId = opened.activeTurnId;
+    if (activeTurnId === null) return;
+    try {
+      await opened.thread.interruptTurn(activeTurnId);
+    } catch (error) {
+      // 中断要求は「このセッションの現在の turn を止める」という利用者操作なので、
+      // App Server が返した実 ID へ同期して一度だけ再試行する。二度目の失敗は伝播する。
+      const currentTurnId = activeTurnIdFromMismatch(error);
+      if (currentTurnId === null || currentTurnId === activeTurnId) throw error;
+      opened.activeTurnId = currentTurnId;
+      await opened.thread.interruptTurn(currentTurnId);
+    }
   }
 
   reconcileCompletedTurn(session: string, turnId: string): boolean {
@@ -430,6 +479,12 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     notification: CodexAppServerNotification,
   ): void {
     const params = asRecord(notification.params);
+    const notificationThreadId = params?.["threadId"];
+    // App Server が接続をまたいで通知する版でも、別 thread の lifecycle が
+    // このセッションの activeTurnId と processing 状態を上書きしないようにする。
+    // item は subagent thread 由来も表示対象になり得るため、ここでは一括破棄しない。
+    const lifecycleMatchesThread =
+      typeof notificationThreadId !== "string" || notificationThreadId === threadId;
     if (notification.method === "item/started" || notification.method === "item/completed") {
       const item = asRecord(params?.["item"]);
       const id = item?.["id"];
@@ -460,23 +515,24 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
         }
       }
     }
-    if (notification.method === "turn/started") {
+    if (notification.method === "turn/started" && lifecycleMatchesThread) {
       const current = this.open.get(session);
       const startedTurn = asRecord(params?.["turn"])?.["id"];
       if (current?.threadId === threadId && typeof startedTurn === "string" && startedTurn.length > 0) {
         current.activeTurnId = startedTurn;
+        this.onProcessing(session, "active");
       }
-      this.onProcessing(session, "active");
     }
-    if (notification.method === "turn/completed") {
+    if (notification.method === "turn/completed" && lifecycleMatchesThread) {
       const current = this.open.get(session);
       const completedTurn = asRecord(params?.["turn"])?.["id"];
       if (current?.threadId === threadId &&
-        (typeof completedTurn !== "string" || current.activeTurnId === completedTurn)) {
+        (typeof completedTurn !== "string" ||
+          current.activeTurnId === null || current.activeTurnId === completedTurn)) {
         current.activeTurnId = null;
+        this.onProcessing(session, "done");
+        this.resolvePendingQuestionsForSession(session);
       }
-      this.onProcessing(session, "done");
-      this.resolvePendingQuestionsForSession(session);
     }
     if (notification.method === "thread/settings/updated") {
       const settings = asRecord(params?.["threadSettings"]);

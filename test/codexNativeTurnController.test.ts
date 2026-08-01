@@ -12,10 +12,22 @@ class FakeThread implements CodexThreadClient {
   readonly starts: { text: string; clientId?: string | null; effort?: string | null }[] = [];
   readonly steers: { turnId: string; text: string; clientId?: string | null }[] = [];
   readonly interrupts: string[] = [];
+  activeTurnReads = 0;
+  activeTurnReadResult: string | null | undefined = undefined;
+  activeTurnReadError: Error | null = null;
   nextTurnId = "turn-1";
   initialActiveTurnId: string | null = null;
+  liveSubscriptionReady: boolean | undefined;
   steerError: Error | null = null;
+  readonly steerFailures: Error[] = [];
+  readonly interruptFailures: Error[] = [];
   closed = 0;
+
+  async readActiveTurnId(): Promise<string | null | undefined> {
+    this.activeTurnReads += 1;
+    if (this.activeTurnReadError !== null) throw this.activeTurnReadError;
+    return this.activeTurnReadResult;
+  }
 
   async startTurn(text: string, clientId?: string | null, effort?: string | null): Promise<string> {
     this.starts.push({ text, clientId, effort });
@@ -24,11 +36,15 @@ class FakeThread implements CodexThreadClient {
 
   async steerTurn(turnId: string, text: string, clientId?: string | null): Promise<void> {
     this.steers.push({ turnId, text, clientId });
+    const failure = this.steerFailures.shift();
+    if (failure !== undefined) throw failure;
     if (this.steerError !== null) throw this.steerError;
   }
 
   async interruptTurn(turnId: string): Promise<void> {
     this.interrupts.push(turnId);
+    const failure = this.interruptFailures.shift();
+    if (failure !== undefined) throw failure;
   }
 
   close(): void {
@@ -353,6 +369,111 @@ describe("CodexNativeTurnController", () => {
     expect(thread.interrupts).toEqual(["turn-2"]);
   });
 
+  test("未materialize再接続は実行中turnを読み直し、新規startではなくsteerする", async () => {
+    const thread = new FakeThread();
+    thread.liveSubscriptionReady = false;
+    thread.activeTurnReadResult = "turn-real";
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => thread },
+    });
+
+    await expect(controller.startTurn({
+      session: "work", threadId: "thread-1", cwd: "/tmp/work", text: "追加指示",
+      clientUserMessageId: "client-reconnected",
+    })).resolves.toBe("turn-real");
+    await controller.interruptTurn("work");
+
+    expect(thread.activeTurnReads).toBe(1);
+    expect(thread.starts).toEqual([]);
+    expect(thread.steers).toEqual([{
+      turnId: "turn-real", text: "追加指示", clientId: "client-reconnected",
+    }]);
+    expect(thread.interrupts).toEqual(["turn-real"]);
+  });
+
+  test("未materializeのままなら従来どおり最初のturnを開始する", async () => {
+    const thread = new FakeThread();
+    thread.liveSubscriptionReady = false;
+    thread.activeTurnReadResult = undefined;
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => thread },
+    });
+
+    await expect(controller.startTurn({
+      session: "work", threadId: "thread-1", cwd: "/tmp/work", text: "最初の入力",
+    })).resolves.toBe("turn-1");
+
+    expect(thread.activeTurnReads).toBe(1);
+    expect(thread.starts).toEqual([{
+      text: "最初の入力", clientId: undefined, effort: undefined,
+    }]);
+    expect(thread.steers).toEqual([]);
+  });
+
+  test("steerのturn ID不一致はApp Serverの実IDへ同期して一度だけ再試行する", async () => {
+    const thread = new FakeThread();
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => thread },
+    });
+    await controller.startTurn({
+      session: "work", threadId: "thread-1", cwd: "/tmp/work", text: "first",
+    });
+    thread.steerFailures.push(new Error(
+      "expected active turn id turn-1 but found turn-real",
+    ));
+
+    await expect(controller.startTurn({
+      session: "work", threadId: "thread-1", cwd: "/tmp/work", text: "追加",
+      clientUserMessageId: "client-retry",
+    })).resolves.toBe("turn-real");
+
+    expect(thread.starts).toHaveLength(1);
+    expect(thread.steers).toEqual([
+      { turnId: "turn-1", text: "追加", clientId: "client-retry" },
+      { turnId: "turn-real", text: "追加", clientId: "client-retry" },
+    ]);
+  });
+
+  test("中断のturn ID不一致はApp Serverの実IDへ同期して一度だけ再試行する", async () => {
+    const thread = new FakeThread();
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => thread },
+    });
+    await controller.startTurn({
+      session: "work", threadId: "thread-1", cwd: "/tmp/work", text: "run",
+    });
+    thread.interruptFailures.push(new Error(
+      "expected active turn id turn-1 but found turn-real",
+    ));
+
+    await expect(controller.interruptTurn("work")).resolves.toBeUndefined();
+    expect(thread.interrupts).toEqual(["turn-1", "turn-real"]);
+
+    await expect(controller.startTurn({
+      session: "work", threadId: "thread-1", cwd: "/tmp/work", text: "続き",
+    })).resolves.toBe("turn-real");
+    expect(thread.steers.at(-1)).toEqual({
+      turnId: "turn-real", text: "続き", clientId: undefined,
+    });
+  });
+
+  test("未materialize再接続直後の中断は実行中turnを読み直す", async () => {
+    const thread = new FakeThread();
+    thread.liveSubscriptionReady = false;
+    thread.activeTurnReadResult = "turn-real";
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => thread },
+    });
+    await controller.subscribeSession({
+      session: "work", threadId: "thread-1", cwd: "/tmp/work",
+    });
+
+    await expect(controller.interruptTurn("work")).resolves.toBeUndefined();
+
+    expect(thread.activeTurnReads).toBe(1);
+    expect(thread.interrupts).toEqual(["turn-real"]);
+  });
+
   test("steer timeoutはturn/startへフォールバックせず到達不明として返す", async () => {
     const thread = new FakeThread();
     const controller = new CodexNativeTurnController({
@@ -451,6 +572,53 @@ describe("CodexNativeTurnController", () => {
     await controller.interruptTurn("work");
 
     expect(thread.interrupts).toEqual(["turn-external"]);
+  });
+
+  test("古いturn/completed通知は新しいactive turnと処理中状態を維持する", async () => {
+    const thread = new FakeThread();
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const processing: string[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return thread; } },
+      onProcessing: (session, state) => processing.push(`${session}:${state}`),
+    });
+    await controller.startTurn({
+      session: "work", threadId: "thread-1", cwd: "/tmp/work", text: "first",
+    });
+    openOptions?.onNotification?.({
+      method: "turn/started",
+      params: { threadId: "thread-1", turn: { id: "turn-2", status: "inProgress" } },
+    });
+    openOptions?.onNotification?.({
+      method: "turn/completed",
+      params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } },
+    });
+
+    await controller.interruptTurn("work");
+    expect(thread.interrupts).toEqual(["turn-2"]);
+    expect(processing).toEqual(["work:active", "work:active"]);
+  });
+
+  test("別threadのlifecycle通知はactive turnを上書きしない", async () => {
+    const thread = new FakeThread();
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return thread; } },
+    });
+    await controller.startTurn({
+      session: "work", threadId: "thread-1", cwd: "/tmp/work", text: "run",
+    });
+    openOptions?.onNotification?.({
+      method: "turn/started",
+      params: { threadId: "thread-other", turn: { id: "turn-other", status: "inProgress" } },
+    });
+    openOptions?.onNotification?.({
+      method: "turn/completed",
+      params: { threadId: "thread-other", turn: { id: "turn-other", status: "completed" } },
+    });
+
+    await controller.interruptTurn("work");
+    expect(thread.interrupts).toEqual(["turn-1"]);
   });
 
   test("再購読時の実行中 turnId を復元して中断する", async () => {

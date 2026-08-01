@@ -310,6 +310,22 @@ export class CodexAppServerThread {
     return turnId;
   }
 
+  async readActiveTurnId(): Promise<string | null | undefined> {
+    let response: unknown;
+    try {
+      response = await this.connection.request("thread/read", {
+        threadId: this.threadId,
+        includeTurns: true,
+      });
+    } catch (error) {
+      // 新規 thread の最初の rollout 行がまだ無い間は、idle とは断定できない。
+      // controller は手元の ID を維持するか、初回 turn/start へ進む。
+      if (isUnmaterializedThreadError(error, this.threadId)) return undefined;
+      throw error;
+    }
+    return extractActiveTurnId(response);
+  }
+
   async steerTurn(
     turnId: string,
     text: string,
