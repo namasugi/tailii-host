@@ -287,7 +287,7 @@ export const sessionHandlers: HandlerRegistry = {
           ctx, writer, v, message.id, liveAlias.name, shouldSubscribe,
         )) return;
         writeSessionListResponse(
-          writer, v, message.id, shouldSubscribe ? aliases : [], null, liveAlias.name,
+          writer, v, message.id, shouldSubscribe ? aliases : [liveAlias], null, liveAlias.name,
         );
         return;
       }
@@ -312,7 +312,7 @@ export const sessionHandlers: HandlerRegistry = {
           try { writeSessionListResponse(writer, v, message.id, await sessionManager.list(), null, appeared.name); }
           catch { writeSessionListResponse(writer, v, message.id, [appeared], null, appeared.name); }
         } else {
-          writeSessionListResponse(writer, v, message.id, [], null, appeared.name);
+          writeSessionListResponse(writer, v, message.id, [appeared], null, appeared.name);
         }
       } else {
         writeError(writer, v, message.id, "launch_failed", "他の接続による会話の起動を確認できませんでした。");
@@ -362,7 +362,31 @@ export const sessionHandlers: HandlerRegistry = {
       )) return;
       // 成功: 現況一覧で応答する（kill と同じ疎通様式）。
       if (!shouldSubscribe) {
-        writeSessionListResponse(writer, v, message.id, [], null, message.name);
+        // prepare 応答にも採用 session 1 件を載せ、iOS が reattach 前から実 backend を
+        // 観測できるようにする。購読は引き続き開始しない（sessions は状態スナップショットのみ）。
+        let adopted: SessionInfo | undefined;
+        try {
+          adopted = (await sessionManager.list()).find((info) => info.name === message.name);
+        } catch {
+          // launcher 成功後の一覧取得失敗は、下のメタデータ由来 1 件へ縮退する。
+        }
+        if (adopted === undefined) {
+          const meta = metadataStore?.get(message.name) ?? null;
+          adopted = {
+            name: message.name,
+            cwd: meta?.cwd ?? message.cwd,
+            alive: true,
+            ...(meta?.backend === "herdr" ? { backend: "herdr" as const } : {}),
+            ...(meta?.claudeSessionId !== undefined
+              ? { claudeSessionId: meta.claudeSessionId }
+              : {}),
+            ...(meta?.agent !== undefined ? { agent: meta.agent } : {}),
+            ...(meta?.providerSessionId !== undefined
+              ? { providerSessionId: meta.providerSessionId }
+              : {}),
+          };
+        }
+        writeSessionListResponse(writer, v, message.id, [adopted], null, message.name);
         return;
       }
       try {

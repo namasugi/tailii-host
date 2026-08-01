@@ -1236,7 +1236,7 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
-  test("session_start prepare は採用名を返し、reattach 前には会話購読しない", async () => {
+  test("session_start prepare は採用名と実 backend を返し、reattach 前には会話購読しない", async () => {
     const store = makeTempStore();
     const heartbeatDir = makeTempDir("prepare-heartbeat");
     const sessionId = "f622acb5-1111-2222-3333-444444444444";
@@ -1249,8 +1249,13 @@ describe("EngineControl — 横断制御チャネル", () => {
       send: (message) => { sent.push(message); },
       close: vi.fn(),
     };
+    const manager = makeManager(runner, store);
+    vi.spyOn(manager, "list").mockResolvedValue([{
+      name: "s-c0de7369", cwd: "/tmp/fresh-dir", alive: true,
+      claudeSessionId: sessionId, providerSessionId: sessionId, backend: "herdr",
+    }]);
     const engine = startEngine({
-      sessionManager: makeManager(runner, store), metadataStore: store, heartbeatDir, hubLink,
+      sessionManager: manager, metadataStore: store, heartbeatDir, hubLink,
       launcher: async () => ({ exitCode: 0, errorText: "" }),
     });
     await engine.lines.nextOfType("channel_hello");
@@ -1266,8 +1271,64 @@ describe("EngineControl — 横断制御チャネル", () => {
       type: "session_list_response", id: "S-prepare", adoptedName: "s-c0de7369",
     });
     if (response.type !== "session_list_response") throw new Error("unexpected response");
-    expect(response.sessions).toEqual([]);
+    expect(response.sessions).toEqual([{
+      name: "s-c0de7369", cwd: "/tmp/fresh-dir", alive: true,
+      claudeSessionId: sessionId, providerSessionId: sessionId, backend: "herdr",
+    }]);
     expect(readHeartbeat(heartbeatDir, "s-c0de7369")).toMatchObject({
+      state: "idle", event: "session-prepare",
+    });
+    expect(sent.filter((message) =>
+      (message as { type?: string }).type === "conversation_subscribe",
+    )).toEqual([]);
+    await engine.teardown();
+  });
+
+  test("session_start prepare の新規起動も採用 session の実 backend を返す", async () => {
+    const store = makeTempStore();
+    const heartbeatDir = makeTempDir("prepare-launch-backend-heartbeat");
+    const sessionId = "f622acb5-1111-2222-3333-444444444444";
+    const runner = new MockTmuxRunner(() => ok(""));
+    const manager = makeManager(runner, store);
+    let launched = false;
+    vi.spyOn(manager, "list").mockImplementation(async () => launched
+      ? [{
+          name: "cs-f622acb5", cwd: "/tmp/fresh-dir", alive: true,
+          claudeSessionId: sessionId, providerSessionId: sessionId, backend: "herdr",
+        }]
+      : []);
+    const sent: unknown[] = [];
+    const hubLink: HubLink = {
+      onMessage: null, onReconnect: null,
+      send: (message) => { sent.push(message); },
+      close: vi.fn(),
+    };
+    const engine = startEngine({
+      sessionManager: manager,
+      metadataStore: store,
+      heartbeatDir,
+      hubLink,
+      launcher: async () => {
+        launched = true;
+        return { exitCode: 0, errorText: "", providerSessionId: sessionId };
+      },
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine(
+      `{"cwd":"/tmp/fresh-dir","deferSubscribe":true,"id":"S-prepare-launch","name":"cs-f622acb5","resumeSessionId":"${sessionId}","type":"session_start","v":2}`,
+    );
+
+    const response = decodeControlMessage(
+      await engine.lines.nextOfType("session_list_response"),
+    );
+    expect(response).toMatchObject({
+      type: "session_list_response",
+      id: "S-prepare-launch",
+      adoptedName: "cs-f622acb5",
+      sessions: [{ name: "cs-f622acb5", backend: "herdr" }],
+    });
+    expect(readHeartbeat(heartbeatDir, "cs-f622acb5")).toMatchObject({
       state: "idle", event: "session-prepare",
     });
     expect(sent.filter((message) =>
