@@ -2,7 +2,7 @@
 // 作業ディレクトリまわり: slash コマンド候補・ディレクトリ候補/ブラウズ/作成・
 // ファイル一覧（git バッジ付き）/読み取り。
 
-import { dirChildren, dirCreate, dirList } from "../../services/dirLister.js";
+import { dirCanCreate, dirChildren, dirCreate, dirList } from "../../services/dirLister.js";
 import { fileList, fileRead } from "../../services/fileService.js";
 import { gitEntryStatuses } from "../../services/gitService.js";
 import { engineDiag, type HandlerRegistry } from "../context.js";
@@ -44,7 +44,10 @@ export const workspaceHandlers: HandlerRegistry = {
     engineDiag(`browse_request id=${message.id} path=${message.path}`);
     const entries = dirChildren(message.path);
     try {
-      writer.write({ type: "browse_response", v, id: message.id, path: message.path, entries });
+      writer.write({
+        type: "browse_response", v, id: message.id, path: message.path, entries,
+        canCreateDirectory: dirCanCreate(message.path),
+      });
       engineDiag(`browse_response id=${message.id} entries=${entries.length}`);
     } catch (error) {
       engineDiag(`browse_response 書込失敗 id=${message.id}: ${String(error)}`);
@@ -62,6 +65,7 @@ export const workspaceHandlers: HandlerRegistry = {
     try {
       writer.write({
         type: "dir_create_response", v, id: message.id, path: result.path, ok: result.ok,
+        error: result.error,
       });
     } catch (error) {
       process.stderr.write(

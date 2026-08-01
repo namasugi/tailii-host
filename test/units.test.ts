@@ -8,7 +8,7 @@ import * as path from "node:path";
 import { describe, expect, test } from "vitest";
 import { ChatTailController } from "../src/chat/chatTailController.js";
 import { ClaudeSessionStore, cwdFromSlug, transcriptTitle } from "../src/sessions/claudeSessionStore.js";
-import { dirChildren, dirCreate, dirList } from "../src/services/dirLister.js";
+import { dirCanCreate, dirChildren, dirCreate, dirList } from "../src/services/dirLister.js";
 import { parsePermissionMode } from "../src/shared/permissionMode.js";
 import { extractCredential, orderCandidates, parsePlanUsage } from "../src/services/planUsageFetcher.js";
 import {
@@ -180,10 +180,72 @@ describe("DirLister", () => {
     expect(fs.statSync(path.join(base, "a", "b")).isDirectory()).toBe(true);
     // 冪等
     expect(dirCreate(base, "a/b").ok).toBe(true);
-    expect(dirCreate(base, "../escape").ok).toBe(false);
-    expect(dirCreate(base, "/abs").ok).toBe(false);
-    expect(dirCreate(base, "  ").ok).toBe(false);
+    expect(dirCreate(base, "../escape")).toMatchObject({ ok: false, error: "invalid_path" });
+    expect(dirCreate(base, "/abs")).toMatchObject({ ok: false, error: "invalid_path" });
+    expect(dirCreate(base, "  ")).toMatchObject({ ok: false, error: "invalid_path" });
+    expect(dirCreate(base, "~project").ok).toBe(true);
+    expect(fs.statSync(path.join(base, "~project")).isDirectory()).toBe(true);
   });
+
+  test("dirCreate は base 外を指す symlink 経由の作成を拒否する", () => {
+    const root = makeTempDir("dircreate-symlink-escape");
+    const base = path.join(root, "base");
+    const outside = path.join(root, "outside");
+    fs.mkdirSync(base);
+    fs.mkdirSync(outside);
+    fs.symlinkSync(outside, path.join(base, "link"));
+
+    expect(dirCreate(base, "link/escaped")).toMatchObject({
+      ok: false,
+      error: "invalid_path",
+    });
+    expect(fs.existsSync(path.join(outside, "escaped"))).toBe(false);
+  });
+
+  test("dirCreate は base 内を指す symlink と symlink 自体を base にした作成を許可する", () => {
+    const root = makeTempDir("dircreate-symlink-inside");
+    const base = path.join(root, "base");
+    const inside = path.join(base, "inside");
+    const alias = path.join(root, "base-alias");
+    fs.mkdirSync(inside, { recursive: true });
+    fs.symlinkSync(inside, path.join(base, "inside-link"));
+    fs.symlinkSync(base, alias);
+
+    expect(dirCreate(base, "inside-link/child").ok).toBe(true);
+    expect(fs.statSync(path.join(inside, "child")).isDirectory()).toBe(true);
+    expect(dirCreate(alias, "alias-child").ok).toBe(true);
+    expect(fs.statSync(path.join(base, "alias-child")).isDirectory()).toBe(true);
+  });
+
+  test("dirCreate は作成先の状態を区別し、dirCanCreate は事前権限を返す", () => {
+    const base = makeTempDir("dircreate-state");
+    const file = path.join(base, "file");
+    fs.writeFileSync(file, "x");
+
+    expect(dirCanCreate(base)).toBe(true);
+    expect(dirCanCreate(path.join(base, "missing"))).toBe(false);
+    expect(dirCreate(file, "child")).toMatchObject({
+      ok: false,
+      error: "parent_not_directory",
+    });
+  });
+
+  test.skipIf(process.getuid?.() === 0)(
+    "dirCreate は書込み不可ディレクトリを permission_denied で拒否する",
+    () => {
+      const base = makeTempDir("dircreate-permission");
+      fs.chmodSync(base, 0o555);
+      try {
+        expect(dirCanCreate(base)).toBe(false);
+        expect(dirCreate(base, "child")).toMatchObject({
+          ok: false,
+          error: "permission_denied",
+        });
+      } finally {
+        fs.chmodSync(base, 0o755);
+      }
+    },
+  );
 
   test("dirChildren は隠し dir とファイルを除外してソートで返す", () => {
     const base = makeTempDir("dirchildren");

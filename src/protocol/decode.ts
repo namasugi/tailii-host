@@ -703,6 +703,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         id: requireString(raw, "id"),
         path: requireString(raw, "path"),
         entries: requireStringArray(raw, "entries"),
+        canCreateDirectory: optionalBoolean(raw, "canCreateDirectory"),
       };
 
     case "file_list_request":
@@ -902,6 +903,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         id: requireString(raw, "id"),
         path: requireString(raw, "path"),
         ok: requireBoolean(raw, "ok"),
+        error: optionalString(raw, "error"),
       };
 
     case "session_search_request":

@@ -2176,6 +2176,7 @@ describe("EngineControl — 横断制御チャネル", () => {
     expect(resp).toContain('"id":"B1"');
     expect(resp).toContain(`"path":"${dir}"`);
     expect(resp).toContain('"entries":["Documents","dev"]');
+    expect(resp).toContain('"canCreateDirectory":true');
 
     await engine.teardown();
   });
@@ -2255,6 +2256,24 @@ describe("EngineControl — 横断制御チャネル", () => {
     expect(resp).toContain('"id":"DC1"');
     expect(resp).toContain('"ok":true');
     expect(fs.statSync(path.join(base, "created")).isDirectory()).toBe(true);
+
+    await engine.teardown();
+  });
+
+  test("dir_create_request の不正パスは理由付きで拒否する", async () => {
+    const base = makeTempDir("tailii-dc-invalid-engine");
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner) });
+
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine(
+      `{"baseDir":"${base}","id":"DC2","relative":"../escape","type":"dir_create_request","v":1}`,
+    );
+
+    const resp = await engine.lines.nextOfType("dir_create_response");
+    expect(resp).toContain('"id":"DC2"');
+    expect(resp).toContain('"ok":false');
+    expect(resp).toContain('"error":"invalid_path"');
 
     await engine.teardown();
   });

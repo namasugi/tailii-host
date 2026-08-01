@@ -433,7 +433,7 @@ export type ControlMessage =
   | { type: "dir_list_request"; v: number; id: string; baseDir: string; partial: string }
   | { type: "dir_list_response"; v: number; id: string; entries: string[] }
   | { type: "browse_request"; v: number; id: string; path: string }
-  | { type: "browse_response"; v: number; id: string; path: string; entries: string[] }
+  | { type: "browse_response"; v: number; id: string; path: string; entries: string[]; canCreateDirectory?: boolean }
   | { type: "file_list_request"; v: number; id: string; path: string }
   | { type: "file_list_response"; v: number; id: string; path: string; entries: FileEntry[]; truncated: boolean }
   | { type: "file_read_request"; v: number; id: string; path: string }
@@ -468,7 +468,7 @@ export type ControlMessage =
       liveSessionsResolved?: boolean;
     }
   | { type: "dir_create_request"; v: number; id: string; baseDir: string; relative: string }
-  | { type: "dir_create_response"; v: number; id: string; path: string; ok: boolean }
+  | { type: "dir_create_response"; v: number; id: string; path: string; ok: boolean; error?: string }
   | { type: "session_search_request"; v: number; id: string; query: string; limit?: number }
   | { type: "session_search_response"; v: number; id: string; results: SessionSearchResult[] }
   | { type: "preview_open"; v: number; id: string; target: string }
