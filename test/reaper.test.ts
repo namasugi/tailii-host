@@ -280,7 +280,7 @@ describe("reaperTick herdr backend", () => {
     };
   }
 
-  test("未命名（セッション名/空ラベル）タブへ会話タイトルを自動反映し、命名済み/codex/導出不能は触らない（session-title）", async () => {
+  test("未命名タブへClaude/Codexの会話タイトルを自動反映し、命名済み/導出不能は触らない（session-title）", async () => {
     const dir = makeTempDir("reaper-herdr-title");
     const tmux = runnerWithSessions([]);
     const store = makeTempStore();
@@ -298,6 +298,7 @@ describe("reaperTick herdr backend", () => {
     const names = ["s-codex", "s-default", "s-empty", "s-named", "s-notitle", "s-stale", "s-unnamed"];
     for (const name of names) writeHeartbeat(dir, name, { ts: NOW - 10, state: "idle" });
     const renamed: [string, string | null][] = [];
+    const derivedCodexThreadIDs: string[] = [];
     const ops: import("../src/hub/reaper.js").HerdrReaperOps = {
       list: async () =>
         names.map((name) => ({ name, cwd: "/w", alive: true, backend: "herdr" as const })),
@@ -331,17 +332,24 @@ describe("reaperTick herdr backend", () => {
           : sessionId === "conv-4" ? "空ラベル側"
           : sessionId === "conv-5" ? "連番ラベル側"
           : sessionId === "conv-6" ? "新AIタイトル" : null,
+      deriveCodexTitle: async (threadId) => {
+        derivedCodexThreadIDs.push(threadId);
+        return threadId === "th-1" ? "Codex正式タイトル" : null;
+      },
     });
 
-    // 未命名（ラベル==セッション名 / 空 / 既定連番 / 前回の自動適用値）かつ claude かつ
-    // タイトル導出可のものだけ反映される。人為リネーム（s-named）は触らない。
+    // 未命名（ラベル==セッション名 / 空 / 既定連番 / 前回の自動適用値）かつタイトル導出可の
+    // Claude/Codexへ反映される。人為リネーム（s-named）は触らない。
     expect(renamed).toEqual([
+      ["s-codex", "Codex正式タイトル"],
       ["s-default", "連番ラベル側"],
       ["s-empty", "空ラベル側"],
       ["s-stale", "新AIタイトル"],
       ["s-unnamed", "最初の発話タイトル"],
     ]);
+    expect(derivedCodexThreadIDs).toEqual(["th-1"]);
     // 自動適用値はメタデータへ記録され、次周期の追随判定の権威になる。
+    expect(store.get("s-codex")?.autoTabTitle).toBe("Codex正式タイトル");
     expect(store.get("s-unnamed")?.autoTabTitle).toBe("最初の発話タイトル");
     expect(store.get("s-stale")?.autoTabTitle).toBe("新AIタイトル");
     expect(store.get("s-named")?.autoTabTitle).toBeUndefined();

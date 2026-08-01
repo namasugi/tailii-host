@@ -26,6 +26,7 @@ import {
   writeHeartbeat,
 } from "../sessions/heartbeat.js";
 import { HerdrSessionManager, isDefaultHerdrTabLabel } from "../backend/herdr.js";
+import { CodexAppServerManager } from "../codex/codexAppServer.js";
 import type { SessionInfo } from "../protocol.js";
 import { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
 import { ClaudeSessionStore, transcriptTitle } from "../sessions/claudeSessionStore.js";
@@ -70,6 +71,11 @@ export interface ReaperTickOptions {
    * 省略時は transcript の明示タイトル（custom-title/ai-title）優先 → 最初のユーザー発話。
    */
   deriveClaudeTitle?: (claudeSessionId: string) => string | null;
+  /**
+   * Codex の正式な会話名（thread.name）の導出（session-title 自動タイトル同期用）。
+   * 省略時は稼働中の共有 App Server の thread/list を巡回ごとに一度だけ読む。
+   */
+  deriveCodexTitle?: (threadId: string) => string | null | Promise<string | null>;
 }
 
 export interface ReaperTickResult {
@@ -146,6 +152,16 @@ function defaultDeriveClaudeTitle(claudeSessionId: string): string | null {
   const transcript = new ClaudeSessionStore().transcriptPath(claudeSessionId);
   if (transcript === null) return null;
   return transcriptTitle(transcript);
+}
+
+/** 稼働中の共有 App Server から正式名つき Codex thread を一括取得する（server は起動しない）。 */
+async function loadCodexThreadTitles(): Promise<ReadonlyMap<string, string>> {
+  const threads = await new CodexAppServerManager().listThreads();
+  if (threads === null) return new Map();
+  return new Map(
+    threads.flatMap((thread) =>
+      thread.name === null ? [] : [[thread.id, thread.name] as const]),
+  );
 }
 
 /** 巡回 1 回分。判定表は docs/architecture.md「セッション自動掃除」を参照。 */
@@ -255,21 +271,31 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
       await herdrOps.stopServerIfEmpty?.();
     }
 
-    // --- 未命名タブへ会話タイトルを自動反映（session-title, claude のみ）---
+    // --- 未命名タブへ会話タイトルを自動反映（session-title）---
     // タブラベルが未命名（null / 空 / セッション名 / 0.7.5 tab create の既定連番 "1"…）の
-    // 生存セッションだけを対象に、transcript の会話タイトル（明示タイトル custom-title/
-    // ai-title 優先 = 一覧と同じ導出 transcriptTitle）をタブへ書く。
+    // 生存セッションだけを対象に、Claude は transcript の会話タイトル（明示タイトル
+    // custom-title/ai-title 優先）、Codex は App Server の正式名 thread.name をタブへ書く。
     // 命名済み（それ以外のラベル）は手動を優先して触らない。
     if (herdrLive.length > 0 &&
         herdrOps.tabInfoByName !== undefined && herdrOps.setDisplayTitle !== undefined) {
-      const deriveTitle = options.deriveClaudeTitle ?? defaultDeriveClaudeTitle;
+      const deriveClaudeTitle = options.deriveClaudeTitle ?? defaultDeriveClaudeTitle;
+      let codexTitlesPromise: Promise<ReadonlyMap<string, string>> | null = null;
+      const deriveCodexTitle = options.deriveCodexTitle ?? (async (threadId: string) => {
+        codexTitlesPromise ??= loadCodexThreadTitles();
+        return (await codexTitlesPromise).get(threadId) ?? null;
+      });
       try {
         const tabInfo = await herdrOps.tabInfoByName();
         for (const name of herdrLive) {
           if (killed.includes(name)) continue;
           const meta = metadataStore.get(name);
-          if (meta === null || (meta.agent ?? "claude") !== "claude") continue;
-          if (meta.claudeSessionId === undefined) continue;
+          if (meta === null) continue;
+          const agent = meta.agent ?? "claude";
+          const providerSessionId =
+            agent === "codex"
+              ? meta.providerSessionId
+              : meta.providerSessionId ?? meta.claudeSessionId;
+          if (providerSessionId === undefined) continue;
           const info = tabInfo.get(name);
           if (info === undefined) continue;
           // 「ラベル==前回の自動適用値」も未命名扱い = ai-title の更新へ追随して再リネーム
@@ -279,7 +305,16 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
             info.label === null || info.label === "" || info.label === name ||
             isDefaultHerdrTabLabel(info.label) || info.label === meta.autoTabTitle;
           if (!unnamed) continue; // 命名済み（人為リネーム）は触らない
-          const title = deriveTitle(meta.claudeSessionId);
+          let title: string | null;
+          try {
+            title =
+              agent === "codex"
+                ? await deriveCodexTitle(providerSessionId)
+                : deriveClaudeTitle(providerSessionId);
+          } catch (error) {
+            log(`session-title 導出失敗(継続): ${name}: ${String(error)}`);
+            continue;
+          }
           if (title === null || title.length === 0) continue;
           if (info.label === title) {
             // ラベルは最新。自動適用の記録だけ追いつかせる（旧版からの移行時）。
