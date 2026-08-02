@@ -6,7 +6,10 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import {
   acquireHubLock,
   controlMessageCallbackWriter,
+  createPrioritizedHubSocketWriter,
   ensureHubDaemon,
+  HUB_SOCKET_CONVERSATION_EVENT_BATCH_SIZE,
+  HUB_SOCKET_CONVERSATION_EVENT_FLUSH_INTERVAL_MS,
   HUB_SOCKET_WRITABLE_LENGTH_LIMIT,
   pidAlive,
   readHubLock,
@@ -178,6 +181,32 @@ describe("hub socket", () => {
       "audit slow_client_disconnect writableLength=11 threshold=10",
     );
     expect(HUB_SOCKET_WRITABLE_LENGTH_LIMIT).toBe(4 * 1024 * 1024);
+  });
+
+  test("pane preview は未送信の履歴 conversation_event を追い越す", async () => {
+    const written: string[] = [];
+    const socket = {
+      writableLength: 0,
+      destroyed: false,
+      write: (line: string) => { written.push(line); },
+      destroy: vi.fn(),
+    };
+    const write = createPrioritizedHubSocketWriter(socket, 1_000_000, vi.fn(), {
+      batchSize: 1,
+      flushIntervalMs: 5,
+    });
+    const history1 = '{"type":"conversation_event","serverSeq":1}\n';
+    const history2 = '{"type":"conversation_event","serverSeq":2}\n';
+    const preview = '{"type":"conversation_pane_preview","payload":{}}\n';
+
+    write(history1);
+    write(history2);
+    write(preview);
+
+    expect(written).toEqual([preview]);
+    await vi.waitFor(() => expect(written).toEqual([preview, history1, history2]));
+    expect(HUB_SOCKET_CONVERSATION_EVENT_BATCH_SIZE).toBe(16);
+    expect(HUB_SOCKET_CONVERSATION_EVENT_FLUSH_INTERVAL_MS).toBe(8);
   });
 
   test("hub_hello に ack を返して clientCount を反映する", async () => {

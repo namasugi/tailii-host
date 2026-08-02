@@ -826,7 +826,12 @@ export class SessionHub {
       // 再購読を単なる no-op にせず、共有 tail がまだ無い場合は開始を再試行する。
       // Codex の App Server live は actor.tail が null でも codexLive を持つため重複起動しない。
       if (actor.tail === null && actor.codexLive === null) {
+        // preview pump を履歴再生より先に起動する。socket writer 側の優先配送と組み合わせ、
+        // pane capture の初回フレームが大量の履歴行の後ろへ並ぶのを防ぐ。
+        this.syncPreview(session, actor);
         this.startSharedTail(session, actor, newerThanMs ?? null);
+      } else {
+        this.syncPreview(session, actor);
       }
       // preview=false 中に engine が route できなかった image/subagent event を、同じ
       // subscriber の前面昇格時にも afterSeq から回収する。既存購読だからと no-op にしない。
@@ -841,7 +846,6 @@ export class SessionHub {
           this.startBackfill(client, session, actor, newerThanMs ?? null);
         }
       }
-      this.syncPreview(session, actor);
       return;
     }
     const first = actor.subscribers.size === 0;
@@ -850,6 +854,8 @@ export class SessionHub {
       actor.focusedBy.add(client);
       this.bumpSafe(session, "chat-open");
     }
+    // 初回 backfill が同期的に多数の行を生成する前に pane capture を開始する。
+    this.syncPreview(session, actor);
     if (first) {
       this.startSharedTail(session, actor, newerThanMs ?? null);
       // processing 完了で一度 unsubscribe された後も、actor の replay buffer が残る間は
@@ -869,7 +875,6 @@ export class SessionHub {
     } else {
       this.startBackfill(client, session, actor, newerThanMs ?? null);
     }
-    this.syncPreview(session, actor);
   }
 
   private unsubscribe(client: object, session: string, actor: SessionActor): void {

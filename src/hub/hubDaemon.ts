@@ -154,6 +154,8 @@ export interface HubSocketServer {
 }
 
 export const HUB_SOCKET_WRITABLE_LENGTH_LIMIT = 4 * 1024 * 1024;
+export const HUB_SOCKET_CONVERSATION_EVENT_BATCH_SIZE = 16;
+export const HUB_SOCKET_CONVERSATION_EVENT_FLUSH_INTERVAL_MS = 8;
 
 interface HubWritableSocket {
   readonly writableLength: number;
@@ -179,6 +181,73 @@ export function writeHubSocketLine(
   socket.write(line);
 }
 
+/**
+ * 大量の履歴 conversation_event を同期的に socket へ積むと、後着した pane_preview が
+ * history-done の後ろまで待たされる。履歴だけを小分けにし、ライブ状態・RPC応答は
+ * 直送して追い越せるようにする。conversation_event 同士の順序は FIFO で維持する。
+ */
+export function createPrioritizedHubSocketWriter(
+  socket: HubWritableSocket,
+  writableLengthLimit: number,
+  log: (message: string) => void,
+  options: { batchSize?: number; flushIntervalMs?: number } = {},
+): (line: string) => void {
+  const batchSize = options.batchSize ?? HUB_SOCKET_CONVERSATION_EVENT_BATCH_SIZE;
+  const flushIntervalMs = options.flushIntervalMs ??
+    HUB_SOCKET_CONVERSATION_EVENT_FLUSH_INTERVAL_MS;
+  const conversationEvents: string[] = [];
+  let queuedBytes = 0;
+  let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const clearQueue = (): void => {
+    conversationEvents.length = 0;
+    queuedBytes = 0;
+  };
+  const scheduleFlush = (): void => {
+    if (flushTimer !== null || conversationEvents.length === 0 || socket.destroyed) return;
+    flushTimer = setTimeout(() => {
+      flushTimer = null;
+      if (socket.destroyed) {
+        clearQueue();
+        return;
+      }
+      for (let index = 0; index < batchSize; index += 1) {
+        const line = conversationEvents.shift();
+        if (line === undefined) break;
+        queuedBytes -= Buffer.byteLength(line, "utf8");
+        writeHubSocketLine(socket, line, writableLengthLimit, log);
+        if (socket.destroyed) {
+          clearQueue();
+          return;
+        }
+      }
+      scheduleFlush();
+    }, flushIntervalMs);
+  };
+
+  return (line: string): void => {
+    // 外側 envelope の type だけを照合する。payload 内の同名 type では誤判定しない。
+    if (line.startsWith('{"type":"conversation_event"')) {
+      const lineBytes = Buffer.byteLength(line, "utf8");
+      if (socket.writableLength + queuedBytes + lineBytes > writableLengthLimit) {
+        log(
+          `audit slow_client_disconnect writableLength=${socket.writableLength + queuedBytes}` +
+            ` threshold=${writableLengthLimit}`,
+        );
+        clearQueue();
+        socket.destroy();
+        return;
+      }
+      conversationEvents.push(line);
+      queuedBytes += lineBytes;
+      scheduleFlush();
+      return;
+    }
+    // pane_preview / processing state / RPC応答は履歴キューを待たせず即時配送する。
+    writeHubSocketLine(socket, line, writableLengthLimit, log);
+  };
+}
+
 /** engine 接続の各行を SessionHub コアへ渡す NDJSON socket。 */
 export async function startHubSocket(options: {
   hub: SessionHub;
@@ -199,8 +268,7 @@ export async function startHubSocket(options: {
   const server = net.createServer((socket) => {
     clients.add(socket);
     log(`audit client_connect clients=${clients.size}`);
-    const write = (line: string): void =>
-      writeHubSocketLine(socket, line, writableLengthLimit, log);
+    const write = createPrioritizedHubSocketWriter(socket, writableLengthLimit, log);
     options.hub.registerClient(socket, write);
     let buffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     socket.on("data", (chunk: Buffer) => {
