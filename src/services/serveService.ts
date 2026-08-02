@@ -41,9 +41,21 @@ function run(command: string, args: string[]): Promise<ExecResult> {
       command,
       args,
       { timeout: LSOF_TIMEOUT_MS, maxBuffer: EXEC_MAX_BUFFER, encoding: "utf8" },
-      (error, stdout) => {
-        // lsof は「該当なし」でも exit 1 を返すため、stdout があれば成功扱いにする。
-        resolve({ ok: error === null || String(stdout).length > 0, stdout: String(stdout) });
+      (error, stdout, stderr) => {
+        const typed = error as (Error & {
+          code?: string | number;
+          killed?: boolean;
+          signal?: string | null;
+        }) | null;
+        // lsof は「該当なし」でも stderr なしの exit 1 を返す。これは信頼できる空結果。
+        // ENOENT・timeout・signal 終了は部分 stdout があっても不完全なので失敗扱いにする。
+        const noMatches =
+          typed !== null && typed.code === 1 && String(stdout).length === 0 &&
+          String(stderr).length === 0 && typed.killed !== true && typed.signal == null;
+        resolve({
+          ok: error === null || noMatches,
+          stdout: String(stdout),
+        });
       },
     );
   });
@@ -114,10 +126,10 @@ export function parseLsofCwdOutput(output: string): Map<number, string> {
   return cwds;
 }
 
-async function fetchCwds(pids: number[]): Promise<Map<number, string>> {
-  if (pids.length === 0) return new Map();
+async function fetchCwds(pids: number[]): Promise<{ ok: boolean; cwds: Map<number, string> }> {
+  if (pids.length === 0) return { ok: true, cwds: new Map() };
   const result = await run("lsof", ["-a", "-d", "cwd", "-Fpn", "-p", pids.join(",")]);
-  return parseLsofCwdOutput(result.stdout);
+  return { ok: result.ok, cwds: parseLsofCwdOutput(result.stdout) };
 }
 
 async function fetchCommandLines(pids: number[]): Promise<Map<number, string>> {
@@ -224,20 +236,29 @@ async function fetchTitles(ports: number[]): Promise<Map<number, string>> {
  * `withTitles` で各ポートへ HTTP GET し HTML の `<title>` を付与する
  * （一覧表示用。停止前照合など内部利用では省く）。
  */
-export async function listServeProcesses(
+export interface ServeProcessListResult {
+  /** false は lsof 未導入・timeout 等で一覧の完全性を保証できないことを表す。 */
+  ok: boolean;
+  servers: ServeProcessInfo[];
+}
+
+/**
+ * 一覧と検出成否を返す。reaper は `ok=false` を「サーバーなし」とみなさず回収を延期する。
+ */
+export async function listServeProcessesWithStatus(
   options: { excludePids?: number[]; withTitles?: boolean } = {},
-): Promise<ServeProcessInfo[]> {
+): Promise<ServeProcessListResult> {
   const excluded = new Set(options.excludePids ?? []);
   const listen = await run("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcn"]);
   const entries = parseLsofListenOutput(listen.stdout)
     .filter((entry) => !excluded.has(entry.pid));
 
   const pids = [...new Set(entries.map((entry) => entry.pid))];
-  const [cwds, commandLines] = await Promise.all([fetchCwds(pids), fetchCommandLines(pids)]);
+  const [cwdResult, commandLines] = await Promise.all([fetchCwds(pids), fetchCommandLines(pids)]);
 
   const servers: ServeProcessInfo[] = entries
     .map((entry) => {
-      const cwd = cwds.get(entry.pid);
+      const cwd = cwdResult.cwds.get(entry.pid);
       return {
         pid: entry.pid,
         port: entry.port,
@@ -258,7 +279,14 @@ export async function listServeProcesses(
       if (title !== undefined) server.title = title;
     }
   }
-  return servers;
+  return { ok: listen.ok && cwdResult.ok, servers };
+}
+
+/** 従来の一覧 API。UI/停止処理は失敗時も取得できた部分結果を表示する。 */
+export async function listServeProcesses(
+  options: { excludePids?: number[]; withTitles?: boolean } = {},
+): Promise<ServeProcessInfo[]> {
+  return (await listServeProcessesWithStatus(options)).servers;
 }
 
 function isAlive(pid: number): boolean {

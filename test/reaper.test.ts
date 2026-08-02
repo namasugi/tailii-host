@@ -3,10 +3,13 @@
 // codex active は bump 停止(ts stale)= 死んだターンとして kill / 未採番は adopt。
 
 import { describe, expect, test } from "vitest";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { readHeartbeat, writeHeartbeat, listHeartbeatSessions } from "../src/sessions/heartbeat.js";
 import {
   REAPER_IDLE_TIMEOUT_SECONDS,
   reaperTick,
+  serverCwdBelongsToSession,
 } from "../src/hub/reaper.js";
 import { MockTmuxRunner, makeTempDir, makeTempStore, ok } from "./helpers.js";
 
@@ -33,6 +36,21 @@ function killed(runner: MockTmuxRunner): string[] {
 }
 
 describe("reaperTick", () => {
+  test("server cwd はセッション cwd 自身・子孫・symlink 実体を含み prefix sibling を除外する", () => {
+    const root = makeTempDir("reaper-cwd-match");
+    const project = path.join(root, "site");
+    const frontend = path.join(project, "packages", "frontend");
+    const alias = path.join(root, "site-alias");
+    fs.mkdirSync(frontend, { recursive: true });
+    fs.symlinkSync(project, alias, "dir");
+
+    expect(serverCwdBelongsToSession(project, project)).toBe(true);
+    expect(serverCwdBelongsToSession(project, frontend)).toBe(true);
+    expect(serverCwdBelongsToSession(alias, frontend)).toBe(true);
+    expect(serverCwdBelongsToSession(project, path.join(root, "site-other"))).toBe(false);
+    expect(serverCwdBelongsToSession(frontend, project)).toBe(false);
+  });
+
   test("idle かつ timeout 超過のセッションだけ kill し heartbeat も掃除する（旧 4.3）", async () => {
     const dir = makeTempDir("reaper");
     const runner = runnerWithSessions(["cs-old", "cs-fresh"]);
@@ -376,6 +394,106 @@ describe("reaperTick herdr backend", () => {
     expect(readHeartbeat(dir, "s-hold")).toBeNull();
     expect(readHeartbeat(dir, "s-hfresh")).not.toBeNull();
     expect(result.liveCount).toBe(2);
+  });
+
+  test("同じプロジェクト配下のローカルサーバーが LISTEN 中なら herdr pane を回収しない", async () => {
+    const dir = makeTempDir("reaper-herdr-server-protect");
+    const tmux = runnerWithSessions([]);
+    const store = makeTempStore();
+    store.put({ name: "s-preview", cwd: "/work/site", createdAt: 1, backend: "herdr" });
+    const { ops, killedNames } = herdrOpsWith({ names: ["s-preview"] });
+    writeHeartbeat(dir, "s-preview", { ts: NOW - TIMEOUT, state: "idle" });
+    let detections = 0;
+
+    const result = await reaperTick({
+      runner: tmux.runner,
+      heartbeatDir: dir,
+      metadataStore: store,
+      timeoutSeconds: TIMEOUT,
+      now: NOW,
+      herdrOps: ops,
+      listLocalServerCwds: async () => {
+        detections += 1;
+        return new Set(["/work/site/frontend"]);
+      },
+    });
+
+    expect(result.killed).toEqual([]);
+    expect(killedNames).toEqual([]);
+    expect(detections).toBe(1);
+    expect(readHeartbeat(dir, "s-preview")).toEqual({
+      ts: NOW,
+      state: "idle",
+      event: "daemon-local-server",
+    });
+  });
+
+  test("fresh セッションだけならローカルサーバー検出を呼ばない", async () => {
+    const dir = makeTempDir("reaper-server-protect-lazy");
+    const tmux = runnerWithSessions([]);
+    const { ops } = herdrOpsWith({ names: ["s-fresh"] });
+    writeHeartbeat(dir, "s-fresh", { ts: NOW - 10, state: "idle" });
+    let detections = 0;
+
+    await reaperTick({
+      runner: tmux.runner,
+      heartbeatDir: dir,
+      metadataStore: makeTempStore(),
+      timeoutSeconds: TIMEOUT,
+      now: NOW,
+      herdrOps: ops,
+      listLocalServerCwds: async () => {
+        detections += 1;
+        return new Set();
+      },
+    });
+
+    expect(detections).toBe(0);
+  });
+
+  test("ローカルサーバー検出不能なら回収せず、heartbeat を進めず次 tick で再試行する", async () => {
+    const dir = makeTempDir("reaper-server-detection-unavailable");
+    const tmux = runnerWithSessions([]);
+    const store = makeTempStore();
+    store.put({ name: "s-preview", cwd: "/work/site", createdAt: 1, backend: "herdr" });
+    const { ops, killedNames } = herdrOpsWith({ names: ["s-preview"] });
+    const stale = { ts: NOW - TIMEOUT, state: "idle" as const };
+    writeHeartbeat(dir, "s-preview", stale);
+    let detectionAvailable = false;
+    let detections = 0;
+    const listLocalServerCwds = async (): Promise<ReadonlySet<string> | null> => {
+      detections += 1;
+      return detectionAvailable ? new Set() : null;
+    };
+
+    const deferred = await reaperTick({
+      runner: tmux.runner,
+      heartbeatDir: dir,
+      metadataStore: store,
+      timeoutSeconds: TIMEOUT,
+      now: NOW,
+      herdrOps: ops,
+      listLocalServerCwds,
+    });
+
+    expect(deferred.killed).toEqual([]);
+    expect(killedNames).toEqual([]);
+    expect(readHeartbeat(dir, "s-preview")).toEqual(stale);
+
+    detectionAvailable = true;
+    const retried = await reaperTick({
+      runner: tmux.runner,
+      heartbeatDir: dir,
+      metadataStore: store,
+      timeoutSeconds: TIMEOUT,
+      now: NOW + 60,
+      herdrOps: ops,
+      listLocalServerCwds,
+    });
+
+    expect(retried.killed).toEqual(["s-preview"]);
+    expect(killedNames).toEqual(["s-preview"]);
+    expect(detections).toBe(2);
   });
 
   test("herdr claude active はプロセス生存で bump 代行され kill されない", async () => {

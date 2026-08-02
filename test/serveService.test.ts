@@ -10,6 +10,7 @@ import net from "node:net";
 
 import {
   listServeProcesses,
+  listServeProcessesWithStatus,
   parseHtmlTitle,
   parseListenPort,
   parseLsofCwdOutput,
@@ -85,7 +86,9 @@ describe("listServeProcesses（実ソケット）", () => {
       });
     });
     try {
-      const entries = await listServeProcesses();
+      const result = await listServeProcessesWithStatus();
+      expect(result.ok).toBe(true);
+      const entries = result.servers;
       const mine = entries.find(
         (entry) => entry.pid === process.pid && entry.port === port,
       );

@@ -4,7 +4,8 @@
 // engine 内蔵の idle reaper は「engine(=SSH 接続)が生きている間しか回らない」「tracker が
 // in-memory で再起動時に空」という構造穴があった。Session Hub daemon は engine から独立した
 // detached プロセスとして動き、heartbeat ファイル(heartbeat.ts)を唯一の判定権威にして
-// `now - ts >= timeout`(一律 1800 秒)で kill する。
+// `now - ts >= timeout`(一律 1800 秒)で kill する。ただし cwd 自身または子孫でローカル
+// 開発サーバーが LISTEN 中なら activity とみなし、heartbeat を更新して巻き添え終了を防ぐ。
 //
 // state=active(処理中)の扱いはエージェントで異なる:
 //   - claude: ターン中でも hook はツール実行中に沈黙する(長い1ツール呼びの間イベントが無い)
@@ -18,6 +19,8 @@
 // heartbeat 未採番の生存セッション(過去の残骸)は「今を idle」として採番し、次周期から計時する。
 // 対象セッションが 0 になったら自然終了する(次の engine 接続 / hook 発火で ensure され再起動)。
 
+import * as fs from "node:fs";
+import * as path from "node:path";
 import {
   bumpHeartbeat,
   listHeartbeatSessions,
@@ -62,6 +65,11 @@ export interface ReaperTickOptions {
   now: number;
   log?: (message: string) => void;
   /**
+   * LISTEN 中のローカル開発サーバーが持つ cwd 集合。timeout 候補がある tick でだけ呼ぶ。
+   * null は検出不能。サーバーなしの空集合とは区別し、回収を次 tick へ延期する。
+   */
+  listLocalServerCwds?: () => Promise<ReadonlySet<string> | null>;
+  /**
    * herdr backend の操作面。省略時は herdr メタが存在するときだけ実 HerdrSessionManager を使う
    * （純 tmux 環境では herdr CLI を一切呼ばない）。null で herdr 巡回を無効化。
    */
@@ -86,6 +94,24 @@ export interface ReaperTickResult {
   demoted: string[];
   /** 生存セッションが無く heartbeat 残骸を掃除したセッション。 */
   reclaimed: string[];
+}
+
+/** 存在するパスは symlink / `..` / 大文字小文字表記を実体パスへ寄せる。 */
+function canonicalCwd(cwd: string): string {
+  const absolute = path.resolve(cwd);
+  try {
+    return fs.realpathSync(absolute);
+  } catch {
+    // stale metadata 等で既に消えた cwd も、字句正規化した値なら安全に比較できる。
+    return absolute;
+  }
+}
+
+/** server cwd がセッション cwd 自身またはその子孫か（prefix sibling は除外）。 */
+export function serverCwdBelongsToSession(sessionCwd: string, serverCwd: string): boolean {
+  const relative = path.relative(canonicalCwd(sessionCwd), canonicalCwd(serverCwd));
+  return relative === "" ||
+    (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
 /** 生存中の tailii セッション名(`cs-*`/`s-*`)。tmux サーバ不在は空集合。 */
@@ -173,6 +199,21 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
   const killed: string[] = [];
   const demoted: string[] = [];
   const reclaimed: string[] = [];
+  let localServerCwdsPromise: Promise<ReadonlySet<string> | null> | null = null;
+  let localServerUnavailableLogged = false;
+
+  /** 同一 tick では lsof 結果を全セッションで共有する。検出失敗は null にして回収を延期。 */
+  const localServerCwds = (): Promise<ReadonlySet<string> | null> => {
+    if (localServerCwdsPromise === null) {
+      localServerCwdsPromise = (options.listLocalServerCwds?.() ?? Promise.resolve(new Set<string>()))
+        .catch((error: unknown) => {
+          log(`local server 検出失敗(回収を延期): ${String(error)}`);
+          localServerUnavailableLogged = true;
+          return null;
+        });
+    }
+    return localServerCwdsPromise;
+  };
 
   /**
    * 1 セッション分の判定（tmux / herdr 共通）。heartbeat のルールは backend に依らない:
@@ -212,6 +253,26 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
     }
     // idle、および codex の active(bump 停止=ターン死亡)は一律 timeout で kill。
     if (now - heartbeat.ts < timeoutSeconds) return;
+    // 同じプロジェクト配下でローカル開発サーバーが LISTEN 中なら、その pane を閉じると
+    // server まで巻き添え終了する。server 自体を利用中の activity とみなし、停止後に改めて
+    // timeout 分の猶予を取る（herdr は attach 状態を取得できないため特に重要）。
+    const serverCwds = await localServerCwds();
+    // lsof 未導入・timeout 等を「サーバーなし」に倒すと、その瞬間に pane と server を
+    // 破壊し得る。heartbeat は進めず次の 60 秒 tick で再検出する。
+    if (serverCwds === null) {
+      if (!localServerUnavailableLogged) {
+        log("local server 検出不能のため timeout セッション回収を延期");
+        localServerUnavailableLogged = true;
+      }
+      return;
+    }
+    const cwd = metadataStore.get(name)?.cwd;
+    if (cwd !== undefined && [...serverCwds].some((serverCwd) =>
+      serverCwdBelongsToSession(cwd, serverCwd))) {
+      bumpHeartbeat(heartbeatDir, name, now, "daemon-local-server");
+      log(`protect ${name} (local server cwd=${cwd})`);
+      return;
+    }
     // kill 直前に再読取して再判定する: tick 中に会話が再オープンされ engine が bump した
     // 直後のセッションを殺さない(読取→kill 間の競合窓を閉じる)。
     const recheck = readHeartbeat(heartbeatDir, name);

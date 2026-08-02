@@ -39,6 +39,7 @@ import {
 } from "../protocol.js";
 import { injectQuestionAnswers } from "./questionInjection.js";
 import { ImageService } from "../chat/imageService.js";
+import { listServeProcessesWithStatus } from "../services/serveService.js";
 
 export interface HubLock {
   pid: number;
@@ -408,7 +409,6 @@ export async function runHubCommand(args: string[]): Promise<number> {
   const metadataStore = new SessionMetadataStore();
   // 端末バックエンド（tmux / herdr）。常時 Composite（メタの backend 欄で per-session ルーティング）
   // なので、アプリの backend_set による切替後も hub 再起動なしで両方のセッションへ届く。
-  // reaper（SessionHub の tick）は tmux runner 直結のまま = herdr セッションは reaper 対象外。
   const sessionBackend = makeSessionBackend({ store: metadataStore });
   // Session Hub 導入後は Hub 所有の ChatTailController が会話を配信する。
   // ここで ImageService を渡さないと engine 側のサービスは tail を通らず、
@@ -419,6 +419,15 @@ export async function runHubCommand(args: string[]): Promise<number> {
     heartbeatDir: defaultHeartbeatDir(),
     metadataStore,
     timeoutSeconds,
+    // ローカル開発サーバー稼働中の cwd は activity とみなし、pane close / kill-session に
+    // よる巻き添え終了を防ぐ。reaper は timeout 候補がある tick でのみこの検出を呼ぶ。
+    listLocalServerCwds: async () => {
+      const result = await listServeProcessesWithStatus({ excludePids: [process.pid] });
+      if (!result.ok) return null;
+      return new Set(
+        result.servers.flatMap((server) => server.cwd === undefined ? [] : [server.cwd]),
+      );
+    },
     pendingQuestionsPath: defaultPendingQuestionsPath(),
     chatReceiptsPath: defaultChatReceiptsPath(),
     log,
