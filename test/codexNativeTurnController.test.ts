@@ -1,6 +1,6 @@
 // Codex App Server native turn / approval bridge の単体テスト。
 
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import type { CodexAppServerThreadOptions } from "../src/codex/codexAppServer.js";
 import {
   CodexNativeTurnController,
@@ -268,6 +268,100 @@ describe("CodexNativeTurnController", () => {
         nodeId: "thread-history", label: "履歴を調査", status: "completed",
       }) }),
     })]);
+  });
+
+  test("完了済み会話の initial subAgentActivity.started は履歴状態へ収束する", async () => {
+    const childThreadId = "019fc076-4c1f-7fb3-bd89-a9a417451788";
+    const thread = Object.assign(new FakeThread(), {
+      initialActiveTurnId: null,
+      initialItems: [{
+        id: "spawn-history", type: "subAgentActivity", kind: "started",
+        agentThreadId: childThreadId, agentPath: "/root/background_view_test",
+      }],
+    });
+    const chats: { itemId: string; payload: unknown }[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => thread },
+      onChatItem: (event) => chats.push(event),
+    });
+
+    await controller.subscribeSession({ session: "work", threadId: "thread-root", cwd: "/tmp/work" });
+
+    expect(chats).toEqual([expect.objectContaining({
+      itemId: `subagent:${childThreadId}:0`,
+      payload: expect.objectContaining({ type: "subagent_node", v: 2, node: expect.objectContaining({
+        nodeId: childThreadId,
+        label: "background_view_test",
+        status: "completed",
+        ts: Number.parseInt("019fc0764c1f", 16),
+      }) }),
+    })]);
+  });
+
+  test("親に新しい active turn があっても過去の idle sub-agent は完了として復元する", async () => {
+    const thread = Object.assign(new FakeThread(), {
+      initialActiveTurnId: "turn-current",
+      initialItems: [{
+        id: "spawn-old", type: "subAgentActivity", kind: "started",
+        agentThreadId: "thread-old", agentPath: "/root/old_task",
+      }],
+      readThreadStatus: async (threadId: string) => {
+        expect(threadId).toBe("thread-old");
+        return { status: { type: "idle" }, timestampMs: 1_000 };
+      },
+    });
+    const chats: { payload: unknown }[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => thread },
+      onChatItem: (event) => chats.push(event),
+    });
+
+    await controller.subscribeSession({ session: "work", threadId: "thread-root", cwd: "/tmp/work" });
+
+    expect(chats).toEqual([expect.objectContaining({
+      payload: expect.objectContaining({ node: expect.objectContaining({
+        nodeId: "thread-old", label: "old_task", status: "completed", ts: 1_000,
+      }) }),
+    })]);
+  });
+
+  test("snapshot 構築中のlive通知は後から適用して新しい状態を保持する", async () => {
+    let resolveStatus: ((value: { status: unknown; timestampMs: number }) => void) | null = null;
+    const status = new Promise<{ status: unknown; timestampMs: number }>((resolve) => {
+      resolveStatus = resolve;
+    });
+    let statusReadStarted = false;
+    const thread = Object.assign(new FakeThread(), {
+      initialActiveTurnId: "turn-current",
+      initialItems: [{
+        id: "spawn-old", type: "subAgentActivity", kind: "started",
+        agentThreadId: "thread-old", agentPath: "/root/old_task",
+      }],
+      readThreadStatus: async () => {
+        statusReadStarted = true;
+        return await status;
+      },
+    });
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const statuses: string[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return thread; } },
+      onChatItem: (event) => {
+        if (event.payload.type === "subagent_node") statuses.push(event.payload.node.status);
+      },
+    });
+
+    const subscription = controller.subscribeSession({
+      session: "work", threadId: "thread-root", cwd: "/tmp/work",
+    });
+    await vi.waitFor(() => expect(statusReadStarted).toBe(true));
+    openOptions?.onNotification?.({ method: "thread/status/changed", params: {
+      threadId: "thread-old", status: { type: "systemError" },
+    } });
+    resolveStatus?.({ status: { type: "idle" }, timestampMs: 1_000 });
+    await subscription;
+
+    expect(statuses).toEqual(["completed", "error"]);
   });
 
   test("同一 thread を購読して turn/start し、turn lifecycle を処理中状態へ反映する", async () => {

@@ -107,6 +107,11 @@ export interface CodexThreadClient {
    * undefined は rollout 未生成で、App Server からまだ確認できない状態を表す。
    */
   readActiveTurnId?(): Promise<string | null | undefined>;
+  /** 履歴復元時に、各 sub-agent thread 自身の現在状態と安定した開始時刻を確認する。 */
+  readThreadStatus?(threadId: string): Promise<{
+    status: unknown;
+    timestampMs?: number;
+  } | undefined>;
   startTurn(
     text: string,
     clientUserMessageId?: string | null,
@@ -160,6 +165,14 @@ function activeTurnIdFromMismatch(error: unknown): string | null {
     /expected active turn id [A-Za-z0-9_-]+ but found ([A-Za-z0-9_-]+)/i,
   );
   return match?.[1] ?? null;
+}
+
+/** Codex thread ID はUUIDv7。先頭48bitのUnixミリ秒を履歴snapshotの安定時刻に使う。 */
+function codexThreadIdTimestampMs(threadId: string): number | null {
+  const compact = threadId.replaceAll("-", "");
+  if (!/^[0-9a-fA-F]{32}$/.test(compact) || compact[12]?.toLowerCase() !== "7") return null;
+  const value = Number.parseInt(compact.slice(0, 12), 16);
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
 }
 
 interface OpenThread {
@@ -472,11 +485,51 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       subagentSeq: 0,
     };
     this.open.set(session, opened);
-    notificationTargetReady = true;
     if (opened.activeTurnId !== null) this.onProcessing(session, "active");
+    const restoredSubagents = [];
     for (const item of thread.initialItems ?? []) {
-      this.publishSubagentNodes(session, opened, opened.subagents.ingestItem(item, Date.now()));
+      restoredSubagents.push(...opened.subagents.ingestItem(item, Date.now()));
     }
+    // thread/resume の親履歴は subAgentActivity.started だけを返し、子の完了イベントを
+    // 省略する版がある。現在の親 turn が active でも過去の子は既に idle になり得るため、
+    // 子 thread 自身の status を権威にする。読めない子だけは親も idle の場合に終端補正する。
+    const restoredNodeIds = [...new Set(restoredSubagents.map((node) => node.nodeId))];
+    const unresolvedNodeIds = new Set(restoredNodeIds);
+    if (thread.readThreadStatus !== undefined) {
+      const statuses = await Promise.all(restoredNodeIds.map(async (nodeId) => {
+        try {
+          return { nodeId, status: await thread.readThreadStatus!(nodeId) };
+        } catch {
+          return { nodeId, status: undefined };
+        }
+      }));
+      // status 読み取り中に切断・別threadへの切替が起きた場合、古いsnapshotを配信しない。
+      if (this.open.get(session) !== opened) return opened;
+      for (const { nodeId, status: snapshot } of statuses) {
+        if (snapshot === undefined) continue;
+        unresolvedNodeIds.delete(nodeId);
+        restoredSubagents.push(...opened.subagents.ingestThreadSnapshot(
+          nodeId,
+          snapshot.status,
+          snapshot.timestampMs ?? Date.now(),
+        ));
+      }
+    }
+    if (opened.activeTurnId === null) {
+      for (const nodeId of unresolvedNodeIds) {
+        restoredSubagents.push(...opened.subagents.ingestThreadSnapshot(
+          nodeId,
+          { type: "idle" },
+          codexThreadIdTimestampMs(nodeId) ?? Date.now(),
+        ));
+      }
+    }
+    const latestRestoredSubagents = new Map(
+      restoredSubagents.map((node) => [node.nodeId, node] as const),
+    );
+    this.publishSubagentNodes(session, opened, [...latestRestoredSubagents.values()]);
+    // snapshot の構築中に届いたlive通知は、snapshot送出後に適用して必ず新しい状態を勝たせる。
+    notificationTargetReady = true;
     for (const notification of bufferedNotifications) {
       this.handleNotification(session, threadId, items, notification);
     }

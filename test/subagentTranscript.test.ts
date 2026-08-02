@@ -1,7 +1,11 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { parseSubagentTranscript, readBackgroundOutput } from "../src/chat/subagentTranscript.js";
+import {
+  parseCodexSubagentTranscript,
+  parseSubagentTranscript,
+  readBackgroundOutput,
+} from "../src/chat/subagentTranscript.js";
 import { makeTempDir } from "./helpers.js";
 
 describe("parseSubagentTranscript", () => {
@@ -91,5 +95,73 @@ describe("readBackgroundOutput", () => {
   it("不在ファイル・null は空応答", () => {
     expect(readBackgroundOutput(null)).toEqual({ entries: [], omitted: 0 });
     expect(readBackgroundOutput("/nonexistent/bg.output")).toEqual({ entries: [], omitted: 0 });
+  });
+});
+
+describe("parseCodexSubagentTranscript", () => {
+  it("fork 前の親履歴を除外し、子の発話とツール実行だけを返す", () => {
+    const fixture = [
+      JSON.stringify({ type: "session_meta", payload: { source: { subagent: { thread_spawn: {
+        agent_path: "/root/background_view_test",
+      } } } } }),
+      JSON.stringify({ timestamp: "2026-08-02T03:13:26.000Z", type: "event_msg",
+        payload: { type: "agent_message", message: "親の履歴" } }),
+      JSON.stringify({ timestamp: "2026-08-02T03:13:28.000Z", type: "response_item", payload: {
+        type: "agent_message", author: "/root", recipient: "/root/background_view_test",
+        content: [{ type: "input_text", text: "Message Type: NEW_TASK\nPayload:\nテストを実行" }],
+      } }),
+      JSON.stringify({ timestamp: "2026-08-02T03:13:31.000Z", type: "event_msg",
+        payload: { type: "agent_message", message: "確認します" } }),
+      JSON.stringify({ timestamp: "2026-08-02T03:13:32.000Z", type: "response_item", payload: {
+        type: "custom_tool_call", call_id: "call-1", name: "exec",
+        input: 'await tools.exec_command({"cmd":"npm test"})',
+      } }),
+      JSON.stringify({ timestamp: "2026-08-02T03:13:33.000Z", type: "response_item", payload: {
+        type: "custom_tool_call_output", call_id: "call-1",
+        output: [{ type: "input_text", text: "90 passed" }],
+      } }),
+      JSON.stringify({ timestamp: "2026-08-02T03:13:34.000Z", type: "event_msg",
+        payload: { type: "agent_message", message: "完了しました" } }),
+      JSON.stringify({ timestamp: "2026-08-02T03:13:35.000Z", type: "response_item", payload: {
+        type: "function_call", call_id: "call-2", name: "view_image",
+        arguments: JSON.stringify({ path: "/tmp/result.png" }),
+      } }),
+      JSON.stringify({ timestamp: "2026-08-02T03:13:36.000Z", type: "response_item", payload: {
+        type: "function_call_output", call_id: "call-2", output: "画像を確認",
+      } }),
+      JSON.stringify({ timestamp: "2026-08-02T03:13:37.000Z", type: "response_item", payload: {
+        type: "function_call", call_id: "call-3", name: "send_message",
+        arguments: JSON.stringify({ target: "/root", message: "encrypted-secret" }),
+      } }),
+    ].join("\n");
+
+    expect(parseCodexSubagentTranscript(fixture)).toEqual({
+      entries: [
+        { role: "user", text: "テストを実行", ts: Date.parse("2026-08-02T03:13:28.000Z") },
+        { role: "assistant", text: "確認します", ts: Date.parse("2026-08-02T03:13:31.000Z") },
+        {
+          role: "tool", text: "Bash: npm test",
+          ts: Date.parse("2026-08-02T03:13:32.000Z"), kind: "tool_use",
+        },
+        {
+          role: "tool", text: "90 passed",
+          ts: Date.parse("2026-08-02T03:13:33.000Z"), kind: "tool_result",
+        },
+        { role: "assistant", text: "完了しました", ts: Date.parse("2026-08-02T03:13:34.000Z") },
+        {
+          role: "tool", text: 'view_image: {"path":"/tmp/result.png"}',
+          ts: Date.parse("2026-08-02T03:13:35.000Z"), kind: "tool_use",
+        },
+        {
+          role: "tool", text: "画像を確認",
+          ts: Date.parse("2026-08-02T03:13:36.000Z"), kind: "tool_result",
+        },
+        {
+          role: "tool", text: "send_message",
+          ts: Date.parse("2026-08-02T03:13:37.000Z"), kind: "tool_use",
+        },
+      ],
+      omitted: 0,
+    });
   });
 });

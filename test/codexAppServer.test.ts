@@ -26,7 +26,7 @@ class FakeConnection implements CodexAppServerConnection {
     this.initialized += 1;
   }
 
-  async request(method: string, params: unknown): Promise<unknown> {
+  async request(method: string, params: unknown, _timeoutMs?: number): Promise<unknown> {
     this.requests.push({ method, params });
     return { thread: { id: this.threadId } };
   }
@@ -892,6 +892,105 @@ describe("CodexAppServerManager", () => {
       "turn/start",
     ]);
     expect(connection.closed).toBe(0);
+  });
+
+  test("未materialize threadのthread/read timeoutは有界リトライして回復する", async () => {
+    const probe = new FakeConnection();
+    const connection = new FakeConnection("thread-read-retry");
+    let readAttempts = 0;
+    const readTimeouts: Array<number | undefined> = [];
+    connection.request = async (method, params, timeoutMs) => {
+      connection.requests.push({ method, params });
+      if (method === "thread/resume") {
+        throw new Error("no rollout found for thread id thread-read-retry");
+      }
+      if (method === "thread/read") {
+        readAttempts += 1;
+        readTimeouts.push(timeoutMs);
+        if (readAttempts < 2) {
+          throw new Error("Codex App Server request timed out: thread/read");
+        }
+        return { thread: { id: "thread-read-retry", turns: [
+          { id: "turn-live", status: "inProgress", items: [] },
+        ] } };
+      }
+      return {};
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-read-retry"),
+      connect: async () => probe.closed === 0 ? probe : connection,
+      launch: () => {},
+    });
+
+    const thread = await manager.openThread({ threadId: "thread-read-retry" });
+
+    await expect(thread.readActiveTurnId()).resolves.toBe("turn-live");
+    expect(readAttempts).toBe(2);
+    expect(readTimeouts).toEqual([undefined, 2_000]);
+  });
+
+  test("子 thread の status を履歴復元用に読み取る", async () => {
+    const probe = new FakeConnection();
+    const connection = new FakeConnection("thread-parent");
+    let childReadAttempts = 0;
+    connection.request = async (method, params) => {
+      connection.requests.push({ method, params });
+      if (method === "thread/resume") {
+        return { thread: { id: "thread-parent", turns: [] } };
+      }
+      if (method === "thread/read") {
+        childReadAttempts += 1;
+        if (childReadAttempts === 1) {
+          throw new Error("Codex App Server request timed out: thread/read");
+        }
+        return { thread: {
+          id: "thread-child", status: { type: "idle" }, createdAt: 1_785_640_406,
+        } };
+      }
+      return {};
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-child-status"),
+      connect: async () => probe.closed === 0 ? probe : connection,
+      launch: () => {},
+    });
+
+    const thread = await manager.openThread({ threadId: "thread-parent" });
+
+    await expect(thread.readThreadStatus("thread-child")).resolves.toEqual({
+      status: { type: "idle" }, timestampMs: 1_785_640_406_000,
+    });
+    expect(childReadAttempts).toBe(2);
+    expect(connection.requests.at(-1)).toEqual({
+      method: "thread/read",
+      params: { threadId: "thread-child", includeTurns: false },
+    });
+  });
+
+  test("未materialize threadのthread/read timeoutは2回で打ち切る", async () => {
+    const probe = new FakeConnection();
+    const connection = new FakeConnection("thread-read-timeout");
+    connection.request = async (method, params) => {
+      connection.requests.push({ method, params });
+      if (method === "thread/resume") {
+        throw new Error("no rollout found for thread id thread-read-timeout");
+      }
+      if (method === "thread/read") {
+        throw new Error("Codex App Server request timed out: thread/read");
+      }
+      return {};
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-read-timeout"),
+      connect: async () => probe.closed === 0 ? probe : connection,
+      launch: () => {},
+    });
+
+    const thread = await manager.openThread({ threadId: "thread-read-timeout" });
+
+    await expect(thread.readActiveTurnId()).rejects.toThrow("timed out: thread/read");
+    expect(connection.requests.filter((request) => request.method === "thread/read"))
+      .toHaveLength(2);
   });
 
   test("作成直後の空rolloutも未materializeとして最初のturnへ進む", async () => {

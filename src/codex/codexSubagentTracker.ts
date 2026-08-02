@@ -64,6 +64,19 @@ export class CodexSubagentTracker {
     }, nowMs);
   }
 
+  /** 再オープン時の thread/read snapshot。live通知と違い、保存済み時刻へ置き換える。 */
+  ingestThreadSnapshot(
+    threadId: string,
+    rawStatus: unknown,
+    timestampMs: number,
+  ): SubagentNode[] {
+    if (threadId === this.rootThreadId || !this.nodes.has(threadId)) return [];
+    return this.upsert(threadId, {
+      status: threadStatus(rawStatus, this.nodes.get(threadId)!.status),
+      currentActivity: null,
+    }, timestampMs, true);
+  }
+
   ingestThreadClosed(threadId: string, nowMs: number): SubagentNode[] {
     if (threadId === this.rootThreadId || !this.nodes.has(threadId)) return [];
     return this.upsert(threadId, { status: "completed", currentActivity: null }, nowMs);
@@ -121,13 +134,14 @@ export class CodexSubagentTracker {
     const nodeId = stringValue(item["agentThreadId"]);
     if (nodeId === null || nodeId === this.rootThreadId) return [];
     const kind = stringValue(item["kind"]);
+    const agentPath = stringValue(item["agentPath"]);
     const existing = this.nodes.get(nodeId);
     const metadata = this.metadata.get(nodeId);
     return this.upsert(nodeId, {
       toolUseId: existing?.toolUseId ?? (stringValue(item["id"]) ?? `thread:${nodeId}`),
       parentThreadId: existing?.parentNodeId ?? metadata?.parentThreadId ?? this.rootThreadId,
       depth: existing?.depth ?? metadata?.depth,
-      label: existing?.label ?? metadata?.label,
+      label: existing?.label ?? metadata?.label ?? labelFromAgentPath(agentPath),
       agentType: metadata?.agentType ?? existing?.agentType,
       status: kind === "interrupted" ? "completed" : "running",
       currentActivity: kind === "interacted" ? "親エージェントと連携中" : null,
@@ -146,6 +160,7 @@ export class CodexSubagentTracker {
       currentActivity?: string | null;
     },
     nowMs: number,
+    replaceTimestamp = false,
   ): SubagentNode[] {
     const existing = this.nodes.get(nodeId);
     const parentThreadId = normalizeParent(
@@ -153,7 +168,7 @@ export class CodexSubagentTracker {
       this.rootThreadId,
     );
     const statusChanged = existing !== undefined && existing.status !== update.status;
-    const ts = existing === undefined || statusChanged ? nowMs : existing.ts;
+    const ts = existing === undefined || statusChanged || replaceTimestamp ? nowMs : existing.ts;
     const node: SubagentNode = {
       nodeId,
       toolUseId: update.toolUseId ?? existing?.toolUseId ?? `thread:${nodeId}`,
@@ -276,6 +291,12 @@ function normalizedActivity(value: string | null): string | null {
   const normalized = value.replace(/\s+/g, " ").trim();
   if (normalized.length === 0) return null;
   return normalized.length > 240 ? `${normalized.slice(0, 237)}...` : normalized;
+}
+
+function labelFromAgentPath(value: string | null): string | null {
+  if (value === null) return null;
+  const segments = value.split("/").filter((segment) => segment.length > 0);
+  return normalizedLabel(segments.at(-1) ?? null);
 }
 
 function stableNodeKey(node: SubagentNode): string {

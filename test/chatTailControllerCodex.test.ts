@@ -123,4 +123,43 @@ describe("ChatTailController — codex モード", () => {
     );
     expect(chats.filter((m) => m.role === "user")).toHaveLength(1);
   });
+
+  test("subagentTranscript() は Codex 子 rollout の実行履歴を返す", async () => {
+    const sessionsRoot = makeTempDir("cc-codex-subagent-sessions");
+    const cwd = makeTempDir("cc-codex-subagent-cwd");
+    writeRollout(sessionsRoot, cwd, "parent", "-parent");
+    const dir = path.join(sessionsRoot, "2026", "07", "07");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "rollout-child.jsonl"), [
+      JSON.stringify({ type: "session_meta", payload: {
+        id: "child", cwd, source: { subagent: { thread_spawn: {
+          agent_path: "/root/tester",
+        } } },
+      } }),
+      JSON.stringify({ type: "response_item", payload: {
+        type: "agent_message", author: "/root", recipient: "/root/tester",
+        content: [{ type: "input_text", text: "Message Type: NEW_TASK\nPayload:\n検証して" }],
+      } }),
+      JSON.stringify({ type: "event_msg", payload: {
+        type: "agent_message", message: "検証完了", phase: "final_answer",
+      } }),
+    ].join("\n") + "\n");
+
+    const { writer } = capturingWriter();
+    const controller = new ChatTailController({
+      writer,
+      tailer: undefined as never,
+      projectsRoot: makeTempDir("cc-codex-subagent-projects"),
+      agent: "codex",
+      codexTailer: new CodexRolloutTailer({ sessionsRoot, tailDeadlineMs: 0 }),
+    });
+
+    controller.open(cwd, "parent");
+    await (controller as unknown as { currentPump: Promise<void> | null }).currentPump;
+
+    expect(controller.subagentTranscript("child").entries).toEqual([
+      { role: "user", text: "検証して" },
+      { role: "assistant", text: "検証完了" },
+    ]);
+  });
 });

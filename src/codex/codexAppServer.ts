@@ -88,7 +88,7 @@ export interface CodexAppServerThreadOptions {
 /** テスト差し替え可能なApp Server 1接続分。 */
 export interface CodexAppServerConnection {
   initialize(): Promise<void>;
-  request(method: string, params: unknown): Promise<unknown>;
+  request(method: string, params: unknown, timeoutMs?: number): Promise<unknown>;
   onNotification(handler: (notification: CodexAppServerNotification) => void): () => void;
   onServerRequest(handler: (request: CodexAppServerRequest) => void): () => void;
   onDisconnect?(handler: (error: Error) => void): () => void;
@@ -159,14 +159,14 @@ class WebSocketCodexAppServerConnection implements CodexAppServerConnection {
     this.notify("initialized", undefined);
   }
 
-  request(method: string, params: unknown): Promise<unknown> {
+  request(method: string, params: unknown, timeoutMs?: number): Promise<unknown> {
     const id = this.nextId;
     this.nextId += 1;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`Codex App Server request timed out: ${method}`));
-      }, this.requestTimeoutMs);
+      }, timeoutMs ?? this.requestTimeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       this.socket.send(JSON.stringify({ id, method, params }));
     });
@@ -262,6 +262,11 @@ class WebSocketCodexAppServerConnection implements CodexAppServerConnection {
 
 /** 1 thread を購読し、Tailii から turn を開始する長寿命 App Server 接続。 */
 export class CodexAppServerThread {
+  /** 読み取り専用の readiness 確認だけは、共有 App Server の一時的な混雑を自動回復する。 */
+  // 初回5秒 + 再試行2秒に抑え、上位の15秒 Hub RPC に turn/start の予算を残す。
+  private static readonly activeTurnReadMaxAttempts = 2;
+  private static readonly activeTurnReadRetryTimeoutMs = 2_000;
+
   /** null=未判定、true=stable ID対応、false=旧App ServerなのでIDなしsteerへ固定。 */
   private supportsSteerClientUserMessageId: boolean | null = null;
 
@@ -311,19 +316,64 @@ export class CodexAppServerThread {
   }
 
   async readActiveTurnId(): Promise<string | null | undefined> {
-    let response: unknown;
-    try {
-      response = await this.connection.request("thread/read", {
-        threadId: this.threadId,
-        includeTurns: true,
-      });
-    } catch (error) {
-      // 新規 thread の最初の rollout 行がまだ無い間は、idle とは断定できない。
-      // controller は手元の ID を維持するか、初回 turn/start へ進む。
-      if (isUnmaterializedThreadError(error, this.threadId)) return undefined;
-      throw error;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        const response = await this.connection.request(
+          "thread/read",
+          {
+            threadId: this.threadId,
+            includeTurns: true,
+          },
+          attempt === 1 ? undefined : CodexAppServerThread.activeTurnReadRetryTimeoutMs,
+        );
+        return extractActiveTurnId(response);
+      } catch (error) {
+        // 新規 thread の最初の rollout 行がまだ無い間は、idle とは断定できない。
+        // controller は手元の ID を維持するか、初回 turn/start へ進む。
+        if (isUnmaterializedThreadError(error, this.threadId)) return undefined;
+        // thread/read は副作用が無い。未 materialize thread の初回送信と
+        // 別セッションの処理が共有 App Server 上で重なった場合のみ、
+        // 5秒 timeout を有界リトライする。turn/start / turn/steer は受理済みか
+        // 不明なため、この自動リトライの対象にしない。
+        if (!isRequestTimeout(error, "thread/read") ||
+          attempt >= CodexAppServerThread.activeTurnReadMaxAttempts) {
+          throw error;
+        }
+      }
     }
-    return extractActiveTurnId(response);
+  }
+
+  /** 親履歴で欠落する sub-agent の終端状態を、子 thread 自身から読み直す。 */
+  async readThreadStatus(threadId: string): Promise<{
+    status: unknown;
+    timestampMs?: number;
+  } | undefined> {
+    for (let attempt = 1; attempt <= CodexAppServerThread.activeTurnReadMaxAttempts; attempt += 1) {
+      try {
+        const response = objectRecord(await this.connection.request(
+          "thread/read",
+          { threadId, includeTurns: false },
+          CodexAppServerThread.activeTurnReadRetryTimeoutMs,
+        ));
+        const thread = objectRecord(response?.["thread"]);
+        if (thread === null || thread["status"] === undefined) return undefined;
+        const timestampMs = codexTimestampMs(
+          thread["createdAt"] ?? thread["updatedAt"] ?? thread["recencyAt"],
+        );
+        return {
+          status: thread["status"],
+          ...(timestampMs === undefined ? {} : { timestampMs }),
+        };
+      } catch (error) {
+        if (isRequestTimeout(error, "thread/read") &&
+          attempt < CodexAppServerThread.activeTurnReadMaxAttempts) {
+          continue;
+        }
+        // workflow snapshot の補完経路なので、子 rollout の一時的不在で親会話を開けなくしない。
+        return undefined;
+      }
+    }
+    return undefined;
   }
 
   async steerTurn(
@@ -379,6 +429,11 @@ function isUnsupportedSteerClientUserMessageIdError(error: unknown): boolean {
     "not supported",
     "unsupported",
   ].some((marker) => message.includes(marker));
+}
+
+function isRequestTimeout(error: unknown, method: string): boolean {
+  return error instanceof Error &&
+    error.message === `Codex App Server request timed out: ${method}`;
 }
 
 interface CodexSecurityDefaults {
@@ -1379,6 +1434,12 @@ function stringValue(value: unknown): string | null {
 
 function positiveInteger(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+/** App Server のUnix秒をprotocolのミリ秒へ揃える。将来ミリ秒値になっても二重変換しない。 */
+function codexTimestampMs(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined;
+  return Math.floor(value < 10_000_000_000 ? value * 1_000 : value);
 }
 
 function readLockPid(lockPath: string): number | null {

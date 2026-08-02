@@ -14,6 +14,7 @@ import { TranscriptTailer } from "./transcriptTailer.js";
 import { SubagentTailer } from "./subagentTailer.js";
 import {
   readBackgroundOutput,
+  readCodexSubagentTranscript,
   readSubagentTranscript,
   type SubagentTranscriptResult,
 } from "./subagentTranscript.js";
@@ -86,6 +87,10 @@ export class ChatTailController {
 
   /** Hub からのオンデマンド要求に、現在 tail 中のノード全文を返す。 */
   subagentTranscript(nodeId: string): SubagentTranscriptResult {
+    if (this.openAgent === "codex" && this.currentDir !== null) {
+      const rollout = this.codexTailer.resolve(this.currentDir, null, nodeId);
+      return readCodexSubagentTranscript(rollout);
+    }
     const jsonl = this.subagentTranscriptPath(nodeId);
     if (jsonl !== null) return readSubagentTranscript(jsonl);
     // バックグラウンドコマンドは jsonl を持たないので、出力ファイルの末尾を返す。
