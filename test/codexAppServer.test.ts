@@ -862,8 +862,14 @@ describe("CodexAppServerManager", () => {
     const connection = new FakeConnection("thread-fresh");
     connection.request = async (method, params) => {
       connection.requests.push({ method, params });
-      if (method === "thread/resume" || method === "thread/read") {
+      if (method === "thread/resume") {
         throw new Error("no rollout found for thread id thread-fresh");
+      }
+      if (method === "thread/read") {
+        throw new Error(
+          "thread thread-fresh is not materialized yet; " +
+          "includeTurns is unavailable before first user message",
+        );
       }
       if (method === "turn/start") return { turn: { id: "turn-first" } };
       return {};

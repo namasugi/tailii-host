@@ -1166,6 +1166,10 @@ function normalizeFallbackThreadTitle(raw: string): string {
 function isUnmaterializedThreadError(error: unknown, threadId: string): boolean {
   if (!(error instanceof Error)) return false;
   if (error.message === `no rollout found for thread id ${threadId}`) return true;
+  const notMaterializedYet =
+    `thread ${threadId} is not materialized yet; ` +
+    "includeTurns is unavailable before first user message";
+  if (error.message === notMaterializedYet) return true;
   return error.message.includes(threadId) &&
     error.message.includes("failed to read session metadata") &&
     error.message.endsWith("is empty");
