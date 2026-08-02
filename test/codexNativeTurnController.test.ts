@@ -146,6 +146,130 @@ describe("CodexNativeTurnController", () => {
     ]);
   });
 
+  test("Codex collab lifecycle を Claude と共通の subagent_node へ写像する", async () => {
+    const thread = new FakeThread();
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const chats: { session: string; itemId: string; payload: unknown }[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return thread; } },
+      onChatItem: (event) => chats.push(event),
+    });
+    await controller.subscribeSession({ session: "work", threadId: "thread-root", cwd: "/tmp/work" });
+
+    openOptions?.onNotification?.({ method: "thread/started", params: { thread: {
+      // thread/started 時点では最初の user message が未永続化で preview が空になり得る。
+      id: "thread-child", parentThreadId: "thread-root", preview: "",
+      agentRole: "explorer", agentNickname: "maple", status: { type: "active", activeFlags: [] },
+      source: { subAgent: { thread_spawn: {
+        parent_thread_id: "thread-root", depth: 1, agent_path: null,
+        agent_nickname: "maple", agent_role: "explorer",
+      } } },
+    } } });
+    openOptions?.onNotification?.({ method: "item/completed", params: {
+      threadId: "thread-root",
+      item: {
+        id: "collab-spawn", type: "collabAgentToolCall", tool: "spawnAgent",
+        status: "completed", senderThreadId: "thread-root", receiverThreadIds: ["thread-child"],
+        prompt: "型安全性を調査する", model: "gpt-5.6-terra",
+        agentsStates: { "thread-child": { status: "running", message: "関連箇所を検索中" } },
+      },
+    } });
+    openOptions?.onNotification?.({ method: "item/completed", params: {
+      threadId: "thread-root",
+      item: {
+        id: "collab-wait", type: "collabAgentToolCall", tool: "wait",
+        status: "completed", senderThreadId: "thread-root", receiverThreadIds: ["thread-child"],
+        prompt: null, model: null,
+        agentsStates: { "thread-child": { status: "completed", message: "調査完了" } },
+      },
+    } });
+
+    const nodes = chats.map((event) => event.payload).filter((payload): payload is {
+      type: "subagent_node";
+      v: number;
+      node: Record<string, unknown>;
+    } => typeof payload === "object" && payload !== null &&
+      (payload as Record<string, unknown>)["type"] === "subagent_node");
+    expect(nodes).toHaveLength(3);
+    expect(nodes[0]).toMatchObject({ type: "subagent_node", v: 2, node: {
+      nodeId: "thread-child", toolUseId: "thread:thread-child", parentNodeId: "root",
+      agentType: "explorer", label: "Codex sub-agent", depth: 1, status: "running",
+    } });
+    expect(nodes[1]).toMatchObject({ node: {
+      nodeId: "thread-child", toolUseId: "collab-spawn", status: "running",
+      label: "型安全性を調査する", currentActivity: "関連箇所を検索中",
+    } });
+    expect(nodes[2]).toMatchObject({ node: {
+      nodeId: "thread-child", toolUseId: "collab-spawn", status: "completed",
+      currentActivity: null,
+    } });
+    expect(chats.map((event) => event.itemId)).toEqual([
+      "subagent:thread-child:0", "subagent:thread-child:1", "subagent:thread-child:2",
+    ]);
+  });
+
+  test("Codex の子 thread status と入れ子 spawn を workflow tree へ反映する", async () => {
+    const thread = new FakeThread();
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const chats: { payload: unknown }[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return thread; } },
+      onChatItem: (event) => chats.push(event),
+    });
+    await controller.subscribeSession({ session: "work", threadId: "thread-root", cwd: "/tmp/work" });
+
+    openOptions?.onNotification?.({ method: "item/completed", params: { item: {
+      id: "spawn-parent", type: "collabAgentToolCall", tool: "spawnAgent", status: "completed",
+      senderThreadId: "thread-root", receiverThreadIds: ["thread-parent"], prompt: "親タスク",
+      agentsStates: { "thread-parent": { status: "running", message: null } },
+    } } });
+    openOptions?.onNotification?.({ method: "item/completed", params: { item: {
+      id: "spawn-child", type: "collabAgentToolCall", tool: "spawnAgent", status: "completed",
+      senderThreadId: "thread-parent", receiverThreadIds: ["thread-child"], prompt: "子タスク",
+      agentsStates: { "thread-child": { status: "running", message: null } },
+    } } });
+    openOptions?.onNotification?.({ method: "thread/status/changed", params: {
+      threadId: "thread-child", status: { type: "systemError" },
+    } });
+
+    const payloads = chats.map((event) => event.payload as {
+      type: string;
+      node: Record<string, unknown>;
+    });
+    expect(payloads).toHaveLength(3);
+    expect(payloads[0]?.node).toMatchObject({
+      nodeId: "thread-parent", parentNodeId: "root", depth: 1, status: "running",
+    });
+    expect(payloads[1]?.node).toMatchObject({
+      nodeId: "thread-child", parentNodeId: "thread-parent", depth: 2, status: "running",
+    });
+    expect(payloads[2]?.node).toMatchObject({
+      nodeId: "thread-child", parentNodeId: "thread-parent", depth: 2, status: "error",
+    });
+  });
+
+  test("Codex 会話の再購読時も initial collab item から完了済み workflow を復元する", async () => {
+    const thread = Object.assign(new FakeThread(), { initialItems: [{
+      id: "spawn-history", type: "collabAgentToolCall", tool: "spawnAgent", status: "completed",
+      senderThreadId: "thread-root", receiverThreadIds: ["thread-history"], prompt: "履歴を調査",
+      agentsStates: { "thread-history": { status: "completed", message: "完了" } },
+    }] });
+    const chats: { itemId: string; payload: unknown }[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => thread },
+      onChatItem: (event) => chats.push(event),
+    });
+
+    await controller.subscribeSession({ session: "work", threadId: "thread-root", cwd: "/tmp/work" });
+
+    expect(chats).toEqual([expect.objectContaining({
+      itemId: "subagent:thread-history:0",
+      payload: expect.objectContaining({ type: "subagent_node", v: 2, node: expect.objectContaining({
+        nodeId: "thread-history", label: "履歴を調査", status: "completed",
+      }) }),
+    })]);
+  });
+
   test("同一 thread を購読して turn/start し、turn lifecycle を処理中状態へ反映する", async () => {
     const thread = new FakeThread();
     let openOptions: CodexAppServerThreadOptions | null = null;

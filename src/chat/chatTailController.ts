@@ -243,8 +243,9 @@ export class ChatTailController {
   }
 
   /**
-   * codex モードの tail 開始/切替。claude の slug/subagent/添付は使わず、
-   * cwd から rollout を解決して chat_output を流す。同一 rollout への張り直しはスキップする。
+   * codex モードの tail 開始/切替。Claude の slug/subagent transcript 監視は使わず、
+   * cwd から rollout を解決して chat_output を流す。Codex sub-agent の進捗は App Server の
+   * collabAgentToolCall を CodexNativeTurnController が subagent_node へ変換する。
    */
   private openCodex(
     cwd: string,

@@ -1867,6 +1867,36 @@ describe("SessionHub Codex App Server live stream", () => {
     expect(toolsOf(received)).toEqual(["call_a", "exec-b", "call_c"]);
   });
 
+  test("Codex subagent_node は backfill 境界を越えて workflow UI へ配信する", async () => {
+    const node = (status: "running" | "completed"): ControlMessage => ({
+      type: "subagent_node",
+      v: 2,
+      node: {
+        nodeId: "thread-child", toolUseId: "collab-spawn", parentNodeId: "root",
+        agentType: "explorer", label: "調査", depth: 1, status, ts: 1_000,
+      },
+    });
+    const { hub, writes, getCallbacks } = makeCodexStreamingHub();
+    const client = {}, received: any[] = [];
+    subscribe(hub, client, received);
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+
+    // subscribe 直後の spawn は backfill 完了まで保持し、rollout に存在しない ephemeral
+    // workflow event として境界 flush で必ず配信する。
+    getCallbacks().onChatItem?.({
+      session: "work", itemId: "subagent:thread-child:0", payload: node("running"),
+    });
+    expect(received.some((message) => message?.payload?.type === "subagent_node")).toBe(false);
+    writes[0]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+
+    getCallbacks().onChatItem?.({
+      session: "work", itemId: "subagent:thread-child:1", payload: node("completed"),
+    });
+    expect(received.flatMap((message) =>
+      message?.payload?.type === "subagent_node" ? [message.payload.node.status] : []
+    )).toEqual(["running", "completed"]);
+  });
+
   test("接続断 fallback の再走査は既配信本文を occurrence 単位で除外する", async () => {
     const { hub, writes, getCallbacks } = makeCodexStreamingHub();
     const client = {}, received: any[] = [];

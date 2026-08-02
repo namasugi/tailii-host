@@ -13,6 +13,7 @@ import {
   decodeControlMessage,
   encodeControlMessage,
   PROTOCOL_V1,
+  PROTOCOL_V2,
   type Decision,
   type QuestionAnswer,
   type QuestionPromptQuestion,
@@ -26,6 +27,7 @@ import {
   toolActivityContentKey,
   toolActivityMessage,
 } from "./codexToolActivity.js";
+import { CodexSubagentTracker } from "./codexSubagentTracker.js";
 
 const TITLE_GENERATION_MAX_ATTEMPTS = 3;
 const TITLE_GENERATION_RETRY_BASE_MS = 250;
@@ -170,6 +172,10 @@ interface OpenThread {
   titleGenerationPending: boolean;
   /** turn/plan/updated へ振る連番（通知に item id が無いため dedup 用 id を合成する）。 */
   planSeq: number;
+  /** App Server の collab/thread lifecycle を Tailii 共通の workflow node へ合流する。 */
+  subagents: CodexSubagentTracker;
+  /** subagent_node は同じ collab item から状態更新を複数回流すため専用連番で dedup する。 */
+  subagentSeq: number;
 }
 
 interface PendingUserInput {
@@ -462,10 +468,15 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       // TUI attach / resume の競合で initialItems が先に埋まっても、新規会話の命名を落とさない。
       titleGenerationPending: true,
       planSeq: 0,
+      subagents: new CodexSubagentTracker(threadId),
+      subagentSeq: 0,
     };
     this.open.set(session, opened);
     notificationTargetReady = true;
     if (opened.activeTurnId !== null) this.onProcessing(session, "active");
+    for (const item of thread.initialItems ?? []) {
+      this.publishSubagentNodes(session, opened, opened.subagents.ingestItem(item, Date.now()));
+    }
     for (const notification of bufferedNotifications) {
       this.handleNotification(session, threadId, items, notification);
     }
@@ -485,10 +496,49 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     // item は subagent thread 由来も表示対象になり得るため、ここでは一括破棄しない。
     const lifecycleMatchesThread =
       typeof notificationThreadId !== "string" || notificationThreadId === threadId;
+    const current = this.open.get(session);
+    if (current?.threadId === threadId && notification.method === "thread/started") {
+      const startedThread = asRecord(params?.["thread"]);
+      if (startedThread !== null) {
+        this.publishSubagentNodes(
+          session,
+          current,
+          current.subagents.ingestThreadStarted(startedThread, Date.now()),
+        );
+      }
+    }
+    if (current?.threadId === threadId && notification.method === "thread/status/changed") {
+      const changedThreadId = params?.["threadId"];
+      if (typeof changedThreadId === "string") {
+        this.publishSubagentNodes(
+          session,
+          current,
+          current.subagents.ingestThreadStatus(changedThreadId, params?.["status"], Date.now()),
+        );
+      }
+    }
+    if (current?.threadId === threadId &&
+      (notification.method === "thread/closed" || notification.method === "thread/archived")) {
+      const closedThreadId = params?.["threadId"];
+      if (typeof closedThreadId === "string") {
+        this.publishSubagentNodes(
+          session,
+          current,
+          current.subagents.ingestThreadClosed(closedThreadId, Date.now()),
+        );
+      }
+    }
     if (notification.method === "item/started" || notification.method === "item/completed") {
       const item = asRecord(params?.["item"]);
       const id = item?.["id"];
       if (item !== null && typeof id === "string") items.set(id, item);
+      if (current?.threadId === threadId && item !== null) {
+        this.publishSubagentNodes(
+          session,
+          current,
+          current.subagents.ingestItem(item, Date.now()),
+        );
+      }
       if (notification.method === "item/completed" && item !== null && typeof id === "string") {
         const payload = codexItemToChatOutput(item);
         if (payload !== null) this.onChatItem({ session, itemId: id, payload });
@@ -529,6 +579,12 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       if (current?.threadId === threadId &&
         (typeof completedTurn !== "string" ||
           current.activeTurnId === null || current.activeTurnId === completedTurn)) {
+        const turnStatus = asRecord(params?.["turn"])?.["status"];
+        this.publishSubagentNodes(
+          session,
+          current,
+          current.subagents.settleRunning(turnStatus === "failed" ? "error" : "completed", Date.now()),
+        );
         current.activeTurnId = null;
         this.onProcessing(session, "done");
         this.resolvePendingQuestionsForSession(session);
@@ -554,6 +610,22 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
           positiveInteger(tokenUsage?.["modelContextWindow"]),
         );
       }
+    }
+  }
+
+  private publishSubagentNodes(
+    session: string,
+    opened: OpenThread,
+    nodes: ReturnType<CodexSubagentTracker["ingestItem"]>,
+  ): void {
+    for (const node of nodes) {
+      const itemId = `subagent:${node.nodeId}:${opened.subagentSeq}`;
+      opened.subagentSeq += 1;
+      this.onChatItem({
+        session,
+        itemId,
+        payload: { type: "subagent_node", v: PROTOCOL_V2, node },
+      });
     }
   }
 
