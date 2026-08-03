@@ -47,6 +47,19 @@ for (const arch of arches) {
   fs.copyFileSync(source, dest);
   fs.chmodSync(dest, 0o755);
 
+  // 静的リンクした全 crate の第三者ライセンス表記を同梱する（バイナリ再頒布の条件）。
+  // 正本は quic-gw/THIRD-PARTY-LICENSES.yml（cargo-bundle-licenses 生成・git 管理。
+  // 依存更新時の再生成手順は npm/RELEASING.md）。
+  const licenses = path.join(hostRoot, "quic-gw", "THIRD-PARTY-LICENSES.yml");
+  if (!fs.existsSync(licenses)) {
+    console.error(
+      `missing license bundle: ${licenses}\n` +
+        `  regenerate it: (cd quic-gw && cargo bundle-licenses --format yaml --output THIRD-PARTY-LICENSES.yml)`,
+    );
+    process.exit(1);
+  }
+  fs.copyFileSync(licenses, path.join(pkgDir, "THIRD-PARTY-LICENSES.yml"));
+
   // version を main package に揃える。
   const pkgJsonPath = path.join(pkgDir, "package.json");
   const pkgJson = JSON.parse(fs.readFileSync(pkgJsonPath, "utf8"));

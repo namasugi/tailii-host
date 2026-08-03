@@ -1,2 +1,4 @@
-# prebuilt バイナリは CI が配置する成果物（コミットしない）。
+# prebuilt バイナリと同梱ライセンスは CI(stage-prebuilt.mjs)が配置する成果物（コミットしない）。
+# ライセンスの正本は quic-gw/THIRD-PARTY-LICENSES.yml。
 */bin/tailii-quic-gw
+*/THIRD-PARTY-LICENSES.yml
