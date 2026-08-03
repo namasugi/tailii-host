@@ -524,6 +524,55 @@ describe("Engine — アイドルライフサイクル/ページング", () => {
     await engine.teardown();
   });
 
+  test("mode_get は capture 失敗を挟んでもリトライで現在モードを返す（mode-get-race）", async () => {
+    // 新規セッションの楽観オープンでは、launch のメタ記録前に mode_get が届いて
+    // 初回 capture が「pane 不在」で失敗し得る。次試行での回復を失敗にしない。
+    let captures = 0;
+    const runner = new MockTmuxRunner((args) => {
+      if (args[0] === "capture-pane") {
+        captures += 1;
+        if (captures === 1) return { exitCode: 1, stdout: "", stderr: "can't find pane: work" };
+        return ok("会話本文\n⏸ plan mode on (shift+tab to cycle)\n");
+      }
+      return ok("");
+    });
+    const mgr = new TmuxSessionManager({ runner: runner.runner, store: makeTempStore() });
+    const engine = startEngine({
+      sessionManager: mgr,
+      modeTiming: { getPollMs: 1, getAttempts: 4 },
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"id":"M1-race","session":"work","type":"mode_get","v":1}');
+    const resp = await engine.lines.nextOfType("mode_set_response");
+    expect(resp).toContain('"id":"M1-race"');
+    expect(resp).toContain('"mode":"plan"');
+
+    await engine.teardown();
+  });
+
+  test("mode_get は capture が一度も成功しなければ mode_get_failed を返す", async () => {
+    const runner = new MockTmuxRunner((args) => {
+      if (args[0] === "capture-pane") {
+        return { exitCode: 1, stdout: "", stderr: "can't find pane: work" };
+      }
+      return ok("");
+    });
+    const mgr = new TmuxSessionManager({ runner: runner.runner, store: makeTempStore() });
+    const engine = startEngine({
+      sessionManager: mgr,
+      modeTiming: { getPollMs: 1, getAttempts: 3 },
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"id":"M1-dead","session":"work","type":"mode_get","v":1}');
+    const err = await engine.lines.nextOfType("error");
+    expect(err).toContain('"id":"M1-dead"');
+    expect(err).toContain('"code":"mode_get_failed"');
+
+    await engine.teardown();
+  });
+
   test("mode_get は subagent 一覧の上にあるモードマーカーを返す", async () => {
     const pane = [
       "会話本文",

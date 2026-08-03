@@ -127,18 +127,34 @@ export const modeHandlers: HandlerRegistry = {
  */
 const PANE_KEY_ALLOWLIST = new Set(["C-c", "Escape", "Up", "Down", "Enter"]);
 
-/** pane から mode が判定できるまで、指定回数だけ短く待つ。 */
+/**
+ * pane から mode が判定できるまで、指定回数だけ短く待つ。
+ *
+ * capture の失敗は「まだ判定できない」として次の試行へ進む: 新規セッションでは
+ * アプリの楽観オープン（mode_get）が launch のメタデータ記録より先に届き、
+ * backend 未記録 → tmux フォールバック → pane 不在で capture が throw する
+ * （mode-get-race, 2026-08-03）。メタが書かれれば次試行が正しい backend へ乗る。
+ * 一度も capture できずに終わったときだけ、最後の失敗を投げて実障害として返す。
+ */
 async function waitForPermissionMode(
   sessionManager: SessionBackend,
   session: string,
   attempts: number,
   intervalMs: number,
 ): Promise<string | null> {
+  let captured = false;
+  let lastError: unknown = null;
   for (let i = 0; i < attempts; i += 1) {
-    const mode = parsePermissionMode(await sessionManager.capturePane(session));
-    if (mode !== null) return mode;
+    try {
+      const mode = parsePermissionMode(await sessionManager.capturePane(session));
+      captured = true;
+      if (mode !== null) return mode;
+    } catch (error) {
+      lastError = error;
+    }
     if (i < attempts - 1) await sleep(intervalMs);
   }
+  if (!captured && lastError !== null) throw lastError;
   return null;
 }
 
@@ -150,9 +166,21 @@ async function setPermissionMode(
   timing: ModeTiming,
 ): Promise<{ kind: "ok"; mode: string | null } | { kind: "unavailable" }> {
   let current: string | null = null;
+  let captureFailureLogged = false;
   const initialDeadline = Date.now() + timing.setInitialTimeoutMs;
   while (Date.now() <= initialDeadline) {
-    current = parsePermissionMode(await sessionManager.capturePane(session));
+    try {
+      current = parsePermissionMode(await sessionManager.capturePane(session));
+    } catch (error) {
+      // 起動直後はメタ未記録で capture が失敗し得る（mode-get-race）。deadline まで待つ。
+      // 実死亡セッションだと deadline まで失敗し続けて unavailable になるため、
+      // 実因（pane 不在等）を診断ログへ一度だけ残す。
+      if (!captureFailureLogged) {
+        captureFailureLogged = true;
+        engineDiag(`mode_set capture 失敗（リトライ継続） session=${session}: ${String(error)}`);
+      }
+      current = null;
+    }
     if (current !== null) break;
     await sleep(timing.setInitialPollMs);
   }
