@@ -31,6 +31,44 @@ async function nextWithin(
   return await Promise.race([next, timeout]);
 }
 
+/** 背景コマンドの spawn（tool_use + 起動 ack）だけを書いた main transcript を作る。 */
+function writeBgSpawn(
+  main: string,
+  toolUseId: string,
+  taskId: string,
+  outputPath: string,
+  timestamp = "2026-07-28T07:41:51.866Z",
+): void {
+  fs.writeFileSync(
+    main,
+    [
+      JSON.stringify({
+        message: {
+          role: "assistant",
+          content: [{
+            type: "tool_use",
+            id: toolUseId,
+            name: "Bash",
+            input: { command: "npm test", run_in_background: true, description: "背景コマンド" },
+          }],
+        },
+        timestamp,
+      }),
+      JSON.stringify({
+        message: {
+          role: "user",
+          content: [{
+            type: "tool_result",
+            tool_use_id: toolUseId,
+            content: `Command running in background with ID: ${taskId}. Output is being written to: ${outputPath}. You will be notified when it completes.`,
+          }],
+        },
+        timestamp,
+      }),
+    ].join("\n") + "\n",
+  );
+}
+
 describe("SubagentTailer", () => {
   test("meta spawn と親 transcript の tool_result から running→completed を送出する", async () => {
     const project = makeTempDir("subagent-tailer");
@@ -518,7 +556,8 @@ describe("SubagentTailer", () => {
     );
 
     const ac = new AbortController();
-    const tailer = new SubagentTailer({ pollIntervalMs: 10 });
+    // 実 lsof の孤児判定に巻き込まれないよう、常に「生存」を返す。
+    const tailer = new SubagentTailer({ pollIntervalMs: 10, probeOutputOpen: () => Promise.resolve(true) });
     const gen = tailer.streamSession(main, ac.signal);
 
     const running = await nextOfType(gen, "subagent_node");
@@ -558,6 +597,121 @@ describe("SubagentTailer", () => {
         ts: Date.parse("2026-07-28T07:45:00.000Z"),
       },
     });
+    ac.abort();
+  });
+
+  test("通知が消えた背景コマンドは output 非保持の孤児判定で完了へ落とす", async () => {
+    const project = makeTempDir("subagent-tailer-bg-orphan");
+    const sessionId = "88888888-9999-aaaa-bbbb-cccccccccccc";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    fs.mkdirSync(path.join(project, sessionId, "subagents"), { recursive: true });
+
+    const outputPath = path.join(project, "tasks", "borphan1.output");
+    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+    fs.writeFileSync(outputPath, "done output\n");
+    writeBgSpawn(main, "toolu_bg_orphan", "borphan1", outputPath);
+
+    const ac = new AbortController();
+    const probed: string[] = [];
+    const tailer = new SubagentTailer({
+      pollIntervalMs: 10,
+      orphanGraceMs: 0,
+      orphanProbeIntervalMs: 0,
+      probeOutputOpen: (filePath) => {
+        probed.push(filePath);
+        return Promise.resolve(false);
+      },
+    });
+    const gen = tailer.streamSession(main, ac.signal);
+
+    const finished = await nextOfType(gen, "subagent_node");
+    expect(finished).toMatchObject({
+      node: {
+        nodeId: "borphan1",
+        status: "completed",
+        kind: "command",
+        ts: Math.floor(fs.statSync(outputPath).mtimeMs),
+      },
+    });
+    expect(probed).toContain(outputPath);
+    ac.abort();
+  });
+
+  test("output を保持するプロセスがいる背景コマンドは孤児にせず running を維持する", async () => {
+    const project = makeTempDir("subagent-tailer-bg-alive");
+    const sessionId = "99999999-aaaa-bbbb-cccc-dddddddddddd";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    fs.mkdirSync(path.join(project, sessionId, "subagents"), { recursive: true });
+
+    const outputPath = path.join(project, "tasks", "balive1.output");
+    writeBgSpawn(main, "toolu_bg_alive", "balive1", outputPath);
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({
+      pollIntervalMs: 10,
+      orphanGraceMs: 0,
+      orphanProbeIntervalMs: 0,
+      probeOutputOpen: () => Promise.resolve(true),
+    });
+    const gen = tailer.streamSession(main, ac.signal);
+
+    const running = await nextOfType(gen, "subagent_node");
+    expect(running).toMatchObject({ node: { nodeId: "balive1", status: "running", kind: "command" } });
+    expect(await nextWithin(gen, 50)).toBeNull();
+    ac.abort();
+  });
+
+  test("孤児判定が不能(null)なら安全側で running を維持する", async () => {
+    const project = makeTempDir("subagent-tailer-bg-unknown");
+    const sessionId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    fs.mkdirSync(path.join(project, sessionId, "subagents"), { recursive: true });
+
+    const outputPath = path.join(project, "tasks", "bunknown1.output");
+    writeBgSpawn(main, "toolu_bg_unknown", "bunknown1", outputPath);
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({
+      pollIntervalMs: 10,
+      orphanGraceMs: 0,
+      orphanProbeIntervalMs: 0,
+      probeOutputOpen: () => Promise.resolve(null),
+    });
+    const gen = tailer.streamSession(main, ac.signal);
+
+    const running = await nextOfType(gen, "subagent_node");
+    expect(running).toMatchObject({ node: { nodeId: "bunknown1", status: "running", kind: "command" } });
+    expect(await nextWithin(gen, 50)).toBeNull();
+    ac.abort();
+  });
+
+  test("起動猶予中の背景コマンドは孤児プローブの対象にしない", async () => {
+    const project = makeTempDir("subagent-tailer-bg-grace");
+    const sessionId = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    fs.mkdirSync(path.join(project, sessionId, "subagents"), { recursive: true });
+
+    const outputPath = path.join(project, "tasks", "bgrace1.output");
+    // 直近の起動として扱わせる（transcript ts を現在時刻にする）。
+    writeBgSpawn(main, "toolu_bg_grace", "bgrace1", outputPath, new Date().toISOString());
+
+    const ac = new AbortController();
+    const probed: string[] = [];
+    const tailer = new SubagentTailer({
+      pollIntervalMs: 10,
+      orphanGraceMs: 60_000,
+      orphanProbeIntervalMs: 0,
+      probeOutputOpen: (filePath) => {
+        probed.push(filePath);
+        return Promise.resolve(false);
+      },
+    });
+    const gen = tailer.streamSession(main, ac.signal);
+
+    const running = await nextOfType(gen, "subagent_node");
+    expect(running).toMatchObject({ node: { nodeId: "bgrace1", status: "running", kind: "command" } });
+    expect(await nextWithin(gen, 50)).toBeNull();
+    expect(probed).toEqual([]);
     ac.abort();
   });
 

@@ -4,6 +4,7 @@
 // claude の `<sessionId>/subagents/agent-*.meta.json` と main/subagent transcript を監視し、
 // subagent_node（spawn/running → completed/error）を engine チャネルへ流す。
 
+import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { PROTOCOL_V2, type ControlMessage, type SubagentNode, type SubagentNodeStatus, type ToolActivity } from "../protocol.js";
@@ -15,6 +16,12 @@ export interface SubagentTailerOptions {
   pollIntervalMs?: number;
   /** EOF 後も abort まで無期限に tail するか。既定 true。 */
   tailIndefinitely?: boolean;
+  /** 孤児判定を始めるまでの起動猶予（ms）。既定 60s。 */
+  orphanGraceMs?: number;
+  /** 孤児判定プローブの間隔（ms）。既定 30s。 */
+  orphanProbeIntervalMs?: number;
+  /** output ファイルを開いているプロセスの有無（null=判定不能）。テスト差し替え用。 */
+  probeOutputOpen?: (filePath: string) => Promise<boolean | null>;
 }
 
 interface Meta {
@@ -79,12 +86,18 @@ interface FileTailState {
 export class SubagentTailer {
   private readonly pollIntervalMs: number;
   private readonly tailIndefinitely: boolean;
+  private readonly orphanGraceMs: number;
+  private readonly orphanProbeIntervalMs: number;
+  private readonly probeOutputOpen: (filePath: string) => Promise<boolean | null>;
   private readonly jsonlPaths = new Map<string, string>();
   private readonly outputPaths = new Map<string, string>();
 
   constructor(options: SubagentTailerOptions = {}) {
     this.pollIntervalMs = options.pollIntervalMs ?? 50;
     this.tailIndefinitely = options.tailIndefinitely ?? true;
+    this.orphanGraceMs = options.orphanGraceMs ?? 60_000;
+    this.orphanProbeIntervalMs = options.orphanProbeIntervalMs ?? 30_000;
+    this.probeOutputOpen = options.probeOutputOpen ?? defaultProbeOutputOpen;
   }
 
   /** 現在 tail 中の nodeId から transcript 実体を引く。 */
@@ -131,6 +144,10 @@ export class SubagentTailer {
     const notificationByTaskId = new Map<string, TaskNotification>();
     const bgCommandByTaskId = new Map<string, BackgroundCommand>();
     const bgLastKeyByTaskId = new Map<string, string>();
+    // 通知が握り潰された背景コマンドの孤児判定（taskId → 終了扱いにした ts）。
+    const bgOrphanTsByTaskId = new Map<string, number>();
+    const bgFirstSeenMsByTaskId = new Map<string, number>();
+    let lastOrphanProbeMs = 0;
     let aggregateDirty = true;
 
     while (!signal?.aborted) {
@@ -268,12 +285,41 @@ export class SubagentTailer {
         yield { type: "subagent_node", v: PROTOCOL_V2, node: messageNode };
       }
 
+      // 孤児判定: task-notification は起動元エージェントが先に終了すると届かないまま
+      // 消えることがある（完了信号の消失）。output ファイルを開いているプロセスが
+      // いなければ「終了済みなのに通知が来ない孤児」として完了へ落とす。
+      // 実行中のコマンドはシェルが output の fd を保持し続けるため誤爆しない。
+      const nowMs = Date.now();
+      if (nowMs - lastOrphanProbeMs >= this.orphanProbeIntervalMs) {
+        lastOrphanProbeMs = nowMs;
+        for (const command of bgCommandByTaskId.values()) {
+          if (notificationByTaskId.has(command.taskId)) continue;
+          if (bgOrphanTsByTaskId.has(command.taskId)) continue;
+          if (command.outputPath === null) continue;
+          let bornMs = bgFirstSeenMsByTaskId.get(command.taskId);
+          if (bornMs === undefined) {
+            bornMs = command.startTs ?? nowMs;
+            bgFirstSeenMsByTaskId.set(command.taskId, bornMs);
+          }
+          if (nowMs - bornMs < this.orphanGraceMs) continue;
+          const open = await this.probeOutputOpen(command.outputPath);
+          if (open === false) {
+            const endTs = mtimeMs(command.outputPath);
+            bgOrphanTsByTaskId.set(command.taskId, endTs > 0 ? endTs : nowMs);
+          }
+        }
+      }
+
       for (const command of bgCommandByTaskId.values()) {
         if (command.outputPath !== null) this.outputPaths.set(command.taskId, command.outputPath);
         const notification = notificationByTaskId.get(command.taskId) ?? null;
+        // 遅配された本物の通知が届いたら exit code 込みでそちらを優先する。
+        const orphanTs = notification === null ? (bgOrphanTsByTaskId.get(command.taskId) ?? null) : null;
         const failed = notification !== null
           && (notification.status !== "completed" || (notification.exitCode ?? 0) !== 0);
-        const status: SubagentNodeStatus = notification === null ? "running" : (failed ? "error" : "completed");
+        const status: SubagentNodeStatus = notification !== null
+          ? (failed ? "error" : "completed")
+          : (orphanTs !== null ? "completed" : "running");
         const ownerNode = tracked.get(command.owner) ?? null;
         const messageNode: SubagentNode = {
           nodeId: command.taskId,
@@ -284,7 +330,7 @@ export class SubagentTailer {
           depth: ownerNode === null ? 1 : ownerNode.meta.spawnDepth + 1,
           status,
           currentActivity: null,
-          ts: notification?.ts ?? command.startTs ?? 0,
+          ts: notification?.ts ?? orphanTs ?? command.startTs ?? 0,
           kind: "command",
         };
         const key = stableNodeKey(messageNode);
@@ -651,6 +697,65 @@ function mtimeMs(file: string): number {
 
 function fallbackParent(depth: number): string | null {
   return depth <= 1 ? "root" : null;
+}
+
+/**
+ * 背景コマンドの output ファイルを開いているプロセスの有無を調べる。
+ * ハーネスは背景シェルの stdout/stderr を output へ向けるため、コマンド（と子孫）が
+ * 生きている限り fd 保持者が存在する。true=生存 / false=誰も開いていない / null=判定不能。
+ */
+async function defaultProbeOutputOpen(filePath: string): Promise<boolean | null> {
+  const viaLsof = await probeViaLsof(filePath);
+  if (viaLsof !== null) return viaLsof;
+  return probeViaProcFd(filePath);
+}
+
+function probeViaLsof(filePath: string): Promise<boolean | null> {
+  return new Promise((resolve) => {
+    execFile("lsof", ["-t", "--", filePath], { timeout: 10_000 }, (error, stdout) => {
+      if (error === null) {
+        resolve(stdout.trim().length > 0);
+        return;
+      }
+      // exit 1 = 開いているプロセスなし（ファイル消失も同じ扱いで孤児側に倒す）。
+      // lsof 不在・タイムアウト等は判定不能として running 維持（安全側）。
+      const code: unknown = (error as { code?: unknown }).code;
+      resolve(code === 1 ? false : null);
+    });
+  });
+}
+
+/** lsof が無い Linux 向けフォールバック。/proc/<pid>/fd を走査する。 */
+function probeViaProcFd(filePath: string): boolean | null {
+  let target: string;
+  try {
+    target = fs.realpathSync(filePath);
+  } catch {
+    return false;
+  }
+  let pids: string[];
+  try {
+    pids = fs.readdirSync("/proc");
+  } catch {
+    return null;
+  }
+  for (const pid of pids) {
+    if (!/^\d+$/.test(pid)) continue;
+    let fds: string[];
+    try {
+      fds = fs.readdirSync(`/proc/${pid}/fd`);
+    } catch {
+      continue;
+    }
+    for (const fd of fds) {
+      try {
+        if (fs.readlinkSync(`/proc/${pid}/fd/${fd}`) === target) return true;
+      } catch {
+        // 走査中に消えた fd は無視。
+      }
+    }
+  }
+  return false;
 }
 
 function stableNodeKey(node: SubagentNode): string {
