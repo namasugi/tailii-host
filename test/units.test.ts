@@ -839,6 +839,20 @@ describe("ClaudeSessionStore", () => {
     expect(list[0]?.updatedAt).toBe(Math.floor(Date.parse("2026-01-01T00:02:00Z") / 1000));
   });
 
+  test("シェルモード記録は実行行を `!cmd` へ戻し、出力行（stdout/stderr）は採用しない", () => {
+    const root = makeTempDir("claude-sessions-bash");
+    const slugDir = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slugDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(slugDir, "iiiiiiii-9999.jsonl"),
+      '{"type":"user","cwd":"/tmp/proj","timestamp":"2026-01-01T00:00:00Z","message":{"content":"<bash-input>ls -la</bash-input>"}}\n' +
+        '{"type":"user","timestamp":"2026-01-01T00:01:00Z","message":{"content":"<bash-stdout>total 0</bash-stdout><bash-stderr></bash-stderr>"}}\n',
+    );
+    const list = new ClaudeSessionStore(root).list();
+    expect(list[0]?.lastMessage).toBe("!ls -la");
+    expect(list[0]?.title).toBe("!ls -la");
+  });
+
   test("注入されたスキル本文は lastMessage/title に採用せず前後の実発話へ遡る", () => {
     const root = makeTempDir("claude-sessions-skill");
     const slugDir = path.join(root, "-tmp-proj");

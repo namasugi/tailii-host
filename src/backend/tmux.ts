@@ -36,6 +36,112 @@ export interface CapturePaneOptions {
   joinWrappedLines?: boolean;
 }
 
+/**
+ * claude TUI 入力欄の先頭に付くモード記号。
+ * - `❯`(276F) / `›`(203A): 通常入力
+ * - `!`: シェルモード（空入力の先頭 `!` が記号として吸われ、本文には残らない）
+ *
+ * 実測 2.1.220: `#` はモード記号ではなく本文の一部（`❯ #メモ` と描画される）。
+ */
+const INPUT_PROMPT_SIGILS = ["❯", "›", "!"] as const;
+
+/** claude TUI 入力欄の状態（プロンプト記号と未送信本文）。 */
+export interface ClaudeInputBox {
+  /** 先頭のモード記号。記号なしで本文だけの行なら空文字。 */
+  prompt: string;
+  /** 未送信本文（記号と前後空白を除いたもの）。空なら入力欄は空。 */
+  text: string;
+}
+
+/** 入力欄がシェルモード（プロンプトが `!`）か。 */
+export function inputBoxIsShellMode(box: ClaudeInputBox | null): boolean {
+  return box?.prompt === "!";
+}
+
+/** 行が入力欄の水平罫線（`────…`）か。名前付き会話は上罫線中央にタイトルが埋まる。 */
+function isInputBoxRuleLine(line: string): boolean {
+  const scalars = [...line];
+  if (scalars.length < 3) return false;
+  let leading = 0;
+  for (const ch of scalars) {
+    if (ch === "─" || ch === "━") leading += 1;
+    else break;
+  }
+  if (leading === scalars.length) return true;
+  if (leading < 3) return false;
+  let trailing = 0;
+  for (const ch of [...scalars].reverse()) {
+    if (ch === "─" || ch === "━") trailing += 1;
+    else break;
+  }
+  return trailing >= 2;
+}
+
+/**
+ * 画面から claude TUI の入力欄を取り出す（TESTABLE）。
+ *
+ * 入力欄は末尾側の 2 本の水平罫線に挟まれた領域。`❯` 行だけを探す旧実装は
+ * シェルモード（プロンプトが `!` になる）で入力欄を見失い、注入検証が必ず失敗
+ * → 本文を 3 回重ね打ちして入力欄を壊し、送信失敗として throw していた
+ * （実障害 2026-08-03: `!` 始まりの送信が HerdrFailedError）。
+ * 罫線が見つからない画面は最後の `❯` 行 **1 行だけ**へフォールバックする
+ * （旧 `inputBoxHasPendingText` と同じ判定なので退行しない）。
+ * 判定不能は null（呼び出し側は fail-open 材料として扱う）。
+ *
+ * **前提**: 選択ダイアログ表示中は本文側の罫線ペア（`──── Planning: … ────` 等）を
+ * 入力欄と誤認しうる。注入前にダイアログを閉じるのは呼び出し側の責務
+ * （`sendTextSubmit` が `selectionDialogVisible` → Esc で担保）。
+ */
+export function extractClaudeInputBox(screen: string): ClaudeInputBox | null {
+  const lines = screen.split("\n").map((line) => line.trim());
+  let bottom = -1;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (isInputBoxRuleLine(lines[index] ?? "")) {
+      bottom = index;
+      break;
+    }
+  }
+  let top = -1;
+  for (let index = bottom - 1; index >= 0; index -= 1) {
+    if (isInputBoxRuleLine(lines[index] ?? "")) {
+      top = index;
+      break;
+    }
+  }
+  if (top >= 0 && bottom > top) return splitInputPrompt(lines.slice(top + 1, bottom));
+  // 罫線が無い画面は最後の `❯` 行 1 行だけを入力欄とみなす（下の行まで含めると
+  // フッターを未送信テキストと誤認して送信確定ループが終わらない）。
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if ((lines[index] ?? "").startsWith("❯")) return splitInputPrompt([lines[index] ?? ""]);
+  }
+  return null;
+}
+
+/**
+ * 入力が空のとき claude TUI が入力欄へ薄字で出すプレースホルダ（実測 2.1.220）。
+ * 未送信テキストと誤認すると、シェルモード離脱（空入力の Backspace）に入れず
+ * 通常メッセージがシェルコマンドとして実行される（実機フレーム 2026-08-03）。
+ *
+ * 割り切り: 薄字かどうかは capture では判別できないため文言一致で判定する。
+ * ユーザーが偶然この文言だけを打つと「空」と誤判定するが、その場合の実害は
+ * 残留 flush の Enter が飛ばないこと（次の注入で本文が連結される）に留まる。
+ */
+function isInputPlaceholder(text: string): boolean {
+  if (text === "Press up to edit queued messages") return true;
+  if (text.startsWith('Try "') && text.endsWith('"')) return true;
+  return text.startsWith("Message @") && text.endsWith("…");
+}
+
+/** 入力欄の行群を「モード記号 + 本文」へ分解する。 */
+function splitInputPrompt(bodyLines: string[]): ClaudeInputBox {
+  const body = [...bodyLines];
+  const first = body[0] ?? "";
+  const sigil = INPUT_PROMPT_SIGILS.find((s) => first.startsWith(s));
+  if (sigil !== undefined) body[0] = first.slice(sigil.length);
+  const text = body.join("\n").trim();
+  return { prompt: sigil ?? "", text: isInputPlaceholder(text) ? "" : text };
+}
+
 /** 実 tmux を絶対パスで起動する既定ランナー。tmux 非0 exit は throw せず結果で表現する。 */
 export function processTmuxCommandRunner(tmuxPath: string = DEFAULT_TMUX_PATH): TmuxCommandRunner {
   return (args) =>
@@ -208,24 +314,64 @@ export class TmuxSessionManager {
       await this.sendKeys(name, ["Enter"]);
       await new Promise((resolve) => setTimeout(resolve, 300));
     }
+    // 入力欄がシェルモード（プロンプト `!`）のまま残っていると、注入した通常メッセージが
+    // そのままシェルコマンドとして実行される。空入力の Backspace（tmux キー名は BSpace）で
+    // 記号を消して通常入力へ戻す。`!` 始まりの本文は注入時に自分でシェルモードへ入るので、
+    // 常に通常モードから始めるのが決定的で安全（herdr 側 exitShellMode と同じ防御）。
+    await this.exitShellMode(name);
     await this.sendKeys(name, [text], true);
     await new Promise((resolve) => setTimeout(resolve, 150));
     await this.sendKeys(name, ["Enter"]);
   }
 
-  /** 入力欄（最後の `❯` 行）に未送信テキストが残っているか。判定不能は false。 */
+  /**
+   * 入力欄がシェルモードなら BSpace で通常入力へ戻す。判定不能・tmux エラーは no-op
+   * （fail-open。この補助操作のエラーを表に出すと「送信できない」原因が BSpace 送出の
+   * 失敗に見えてしまうので、実エラーは続く本文注入の send-keys 失敗として顕在化させる）。
+   */
+  private async exitShellMode(name: string): Promise<void> {
+    try {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const box = extractClaudeInputBox(await this.captureVisibleScreen(name));
+        if (!inputBoxIsShellMode(box) || (box?.text.length ?? 0) > 0) return;
+        await this.sendKeys(name, ["BSpace"]);
+        await new Promise((resolve) => setTimeout(resolve, 150));
+      }
+    } catch {
+      // no-op（fail-open）
+    }
+  }
+
+  /** 入力欄に未送信テキストが残っているか。判定不能は false。 */
   private async inputBoxHasPendingText(name: string): Promise<boolean> {
     try {
-      const screen = await this.capturePane(name, { lines: 30 });
-      const promptLines = screen
-        .split("\n")
-        .map((line) => line.trim())
-        .filter((line) => line.startsWith("❯"));
-      const last = promptLines[promptLines.length - 1];
-      return last !== undefined && last.slice(1).trim().length > 0;
+      const box = extractClaudeInputBox(await this.captureVisibleScreen(name));
+      return box !== null && box.text.length > 0;
     } catch {
       return false;
     }
+  }
+
+  /**
+   * 入力欄判定用に **viewport 全体**を取る（末尾 N 行で切らない）。
+   *
+   * claude TUI の入力欄の最大高さは端末サイズにほぼ比例する（実測 2.1.220:
+   * 63 行端末で 26 行 / 120 行端末で 55 行）。固定行数の窓では大きな端末で上罫線が
+   * 窓外に出て入力欄を見失い、本文を重ね打ちして送信失敗する。窓を広く取っても
+   * `extractClaudeInputBox` は罫線で入力欄を切り出すので過検出にはならない。
+   * tmux は `-S` を付けなければ viewport のみ（履歴を引かない）。
+   */
+  private async captureVisibleScreen(name: string): Promise<string> {
+    const args = ["capture-pane", "-p", "-t", this.paneTarget(name)];
+    const result = await this.runner(args);
+    if (result.exitCode !== 0) {
+      throw new TmuxFailedError(args, result.exitCode, result.stderr);
+    }
+    const lines = result.stdout.split("\n");
+    while (lines.length > 0 && (lines[lines.length - 1] ?? "").trim() === "") {
+      lines.pop();
+    }
+    return lines.join("\n");
   }
 
   /** 指定セッションの pane へ tmux send-keys を発行する（literal は -l）。 */

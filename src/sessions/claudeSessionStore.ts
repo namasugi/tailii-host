@@ -403,6 +403,14 @@ function extractMessageText(obj: Record<string, unknown>, maxLength: number): st
   if (!text) return null;
   // slash コマンドのメタ包み（`<command-…>` で始まる）は提示に向かないので除外。
   if (text.startsWith("<command-") || text.startsWith("<local-command")) return null;
+  // シェルモード（`!cmd`）の記録。実行行はタイトル/プレビューに使えるので `!cmd` へ
+  // 戻し、出力側（stdout/stderr）は提示に向かないので除外する。
+  if (text.startsWith("<bash-stdout>") || text.startsWith("<bash-stderr>")) return null;
+  if (text.startsWith("<bash-input>")) {
+    const command = text.slice("<bash-input>".length).replace(/<\/bash-input>[\s\S]*$/u, "").trim();
+    if (!command) return null;
+    text = `!${command}`;
+  }
   // スキル実行時に注入される展開済み SKILL.md 本文も提示しない（前の実発話へ遡る）。
   if (isInjectedSkillContent(obj, raw)) return null;
   if (text.length > maxLength) text = text.slice(0, maxLength);

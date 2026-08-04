@@ -12,6 +12,7 @@ import {
   parseHerdrPaneList,
   parseHerdrStartedPaneId,
   screenHasSelectionFooter,
+  typedTextProbe,
   type HerdrCommandResult,
   type HerdrCommandRunner,
 } from "../src/backend/herdr.js";
@@ -23,8 +24,8 @@ import {
   resolveSessionBackendKind,
 } from "../src/backend/sessionBackend.js";
 import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
-import { TmuxSessionManager } from "../src/backend/tmux.js";
-import { makeTempDir, ok } from "./helpers.js";
+import { extractClaudeInputBox, TmuxSessionManager } from "../src/backend/tmux.js";
+import { makeTempDir, MockTmuxRunner, ok } from "./helpers.js";
 
 /** 記録付きモック herdr ランナー。 */
 class MockHerdrRunner {
@@ -306,9 +307,12 @@ describe("HerdrSessionManager", () => {
     dialogInitiallyOpen?: boolean;
     /** 初期状態で入力欄に残存テキストがある（中断で queued が書き戻された状態）。 */
     initialInput?: string;
+    /** 初期状態でシェルモード（プロンプトが `!`）に入ったままになっている。 */
+    initiallyShellMode?: boolean;
   } = {}) {
     const state = {
       input: options.initialInput ?? "",
+      shellMode: options.initiallyShellMode ?? false,
       dialogOpen: options.dialogInitiallyOpen ?? false,
       swallowTextInputs: options.swallowTextInputs ?? 0,
       swallowEnters: options.swallowEnters ?? 0,
@@ -339,14 +343,22 @@ describe("HerdrSessionManager", () => {
         state.dialogOpen = false;
         return herdrOk("");
       }
+      if (args[0] === "pane" && args[1] === "send-keys" && args[3] === "Backspace") {
+        // 空入力の Backspace はシェルモード記号を消す（本文があれば 1 文字削る）。
+        if (state.input.length > 0) state.input = state.input.slice(0, -1);
+        else state.shellMode = false;
+        return herdrOk("");
+      }
       if (args[0] === "pane" && args[1] === "send-text" && args[3] === "\r") {
         if (state.swallowEnters > 0) {
           state.swallowEnters -= 1;
         } else if (options.openDialogOnEnter) {
           state.dialogOpen = true;
           state.input = "";
+          state.shellMode = false;
         } else {
           state.input = "";
+          state.shellMode = false;
         }
         return herdrOk("");
       }
@@ -355,13 +367,24 @@ describe("HerdrSessionManager", () => {
           if (state.swallowTextInputs > 0) state.swallowTextInputs -= 1;
           // ダイアログ/limbo は本文を反映しない。
         } else {
-          state.input = String(args[3]);
+          // 空入力の先頭 `!` はモード記号として吸われ、本文には残らない（実測 2.1.220）。
+          let typed = String(args[3]);
+          if (state.input.length === 0 && !state.shellMode && typed.startsWith("!")) {
+            state.shellMode = true;
+            typed = typed.slice(1);
+          }
+          state.input += typed;
         }
         return herdrOk("");
       }
       if (args[0] === "pane" && args[1] === "read") {
         if (state.dialogOpen) return herdrOk(dialogScreen);
-        return herdrOk(`❯ 古いメッセージのエコー\n──\n❯ ${state.input}\n──\n  ⏸ manual mode on`);
+        const rule = "─".repeat(40);
+        const sigil = state.shellMode ? "!" : "❯";
+        const footer = state.shellMode ? "  ! for shell mode" : "  ⏸ manual mode on";
+        return herdrOk(
+          [`❯ 古いメッセージのエコー`, rule, `${sigil} ${state.input}`, rule, footer].join("\n"),
+        );
       }
       return herdrOk("");
     });
@@ -487,6 +510,116 @@ describe("HerdrSessionManager", () => {
       ["pane", "send-text", "w4:p2", "こんにちは"],
       ["pane", "send-text", "w4:p2", "\r"],
     ]);
+  });
+
+  test("sendTextSubmit: シェルモード（先頭 `!`）は 1 回の注入で成立し重ね打ちしない", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const { runner, state } = makeSubmitHarness();
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    // 先頭 `!` はモード記号に吸われ入力欄には `! ls -la` と描画される。旧実装は `❯` 行が
+    // 消えるため反映検証が必ず失敗し、3 回重ね打ちしてから throw していた（実障害 2026-08-03）。
+    await manager.sendTextSubmit("s-a", "!ls -la");
+    expect(submitSends(runner)).toEqual([
+      ["pane", "send-text", "w4:p2", "!ls -la"],
+      ["pane", "send-text", "w4:p2", "\r"],
+    ]);
+    expect(state.input).toBe("");
+    expect(state.shellMode).toBe(false);
+  });
+
+  test("sendTextSubmit: シェルモードのまま残った入力欄は Backspace で通常入力へ戻してから注入する", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const { runner, state } = makeSubmitHarness({ initiallyShellMode: true });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    // 戻さずに注入すると通常メッセージがそのままシェルコマンドとして実行される。
+    await manager.sendTextSubmit("s-a", "こんにちは");
+    expect(submitSends(runner)).toEqual([
+      ["pane", "send-keys", "w4:p2", "Backspace"],
+      ["pane", "send-text", "w4:p2", "こんにちは"],
+      ["pane", "send-text", "w4:p2", "\r"],
+    ]);
+    expect(state.shellMode).toBe(false);
+  });
+
+  test("sendTextSubmit: 入力欄判定は viewport 全体を読む（--lines で切らない）", async () => {
+    // `--source visible` は viewport 全行を返す（--lines は無視される）。末尾 N 行へ
+    // 切ると大きな端末で上罫線が窓外に出て入力欄を見失う（63 行端末で 26 行 /
+    // 120 行端末で 55 行まで入力欄が伸びる実測）。
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const { runner } = makeSubmitHarness();
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+
+    await manager.sendTextSubmit("s-a", "こんにちは");
+
+    const reads = runner.recorded.filter((args) => args[0] === "pane" && args[1] === "read");
+    expect(reads.length).toBeGreaterThan(0);
+    for (const args of reads) {
+      expect(args).toContain("--source");
+      expect(args).toContain("visible");
+      expect(args).not.toContain("--lines");
+    }
+  });
+
+  test("sendTextSubmit: Backspace 送出が失敗してもシェルモード離脱は諦めて本文注入へ進む", async () => {
+    // 補助操作のエラーを表に出すと「送信できない」原因が Backspace 失敗に見えてしまう。
+    // 実エラーは続く send-text の失敗として顕在化させる（fail-open）。
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const { runner } = makeSubmitHarness({ initiallyShellMode: true });
+    const manager = new HerdrSessionManager({
+      // Backspace だけ失敗させ、他はハーネスへ委譲する。
+      runner: async (args) => {
+        if (args[1] === "send-keys" && args[3] === "Backspace") {
+          return { exitCode: 1, stdout: "", stderr: "pane not found" };
+        }
+        return runner.runner(args);
+      },
+      store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+
+    // throw せず本文注入まで進む（シェルモードのままなので TUI 側の実行結果は claude 任せ）。
+    await expect(manager.sendTextSubmit("s-a", "こんにちは")).resolves.toBeUndefined();
+    expect(runner.recorded.some((args) => args[1] === "send-text" && args[3] === "こんにちは")).toBe(true);
+  });
+
+  test("extractClaudeInputBox: 罫線に挟まれた領域だけを入力欄として読み、モード記号を分離する", () => {
+    const rule = "─".repeat(40);
+    const normal = [`❯ 過去のエコー`, rule, "❯ 未送信の本文", rule, "  ⏸ manual mode on"].join("\n");
+    expect(extractClaudeInputBox(normal)).toEqual({ prompt: "❯", text: "未送信の本文" });
+    // シェルモード: プロンプトが `!` になり、記号は本文に残らない。
+    const shell = [`⏺ ok`, rule, "! ls -la", rule, "  ! for shell mode"].join("\n");
+    expect(extractClaudeInputBox(shell)).toEqual({ prompt: "!", text: "ls -la" });
+    // 名前付き会話は上罫線中央にタイトルが埋まる（全文字一致では外れる）。
+    const titled = ["───── 会話タイトル ──", "❯ 本文", rule, "  ⏸ manual"].join("\n");
+    expect(extractClaudeInputBox(titled)).toEqual({ prompt: "❯", text: "本文" });
+    // 罫線が無い画面は最後の `❯` 行 1 行だけ（フッターを未送信本文と誤認しない）。
+    expect(extractClaudeInputBox("❯ のこり\n  ⏸ manual mode on")).toEqual({
+      prompt: "❯", text: "のこり",
+    });
+    expect(extractClaudeInputBox("何も無い画面")).toBeNull();
+  });
+
+  test("typedTextProbe: シェルモードの先頭 `!` は照合キーから落とす", () => {
+    expect(typedTextProbe("!ls -la")).toBe("ls -la");
+    expect(typedTextProbe("こんにちは")).toBe("こんにちは");
+    expect(typedTextProbe("!")).toBeNull();
   });
 
   test("capturePane: joinWrappedLines は recent-unwrapped、空なら visible 末尾へフォールバック", async () => {
@@ -675,6 +808,126 @@ describe("TmuxSessionManager と herdr メタの分離", () => {
       store,
     });
     expect((await manager.list()).map((info) => info.name)).toEqual(["s-t"]);
+  });
+
+  /** tmux backend の sendTextSubmit 検証用ハーネス（capture-pane が現在の入力欄を返す）。 */
+  function makeTmuxSubmitHarness(options: { shellMode?: boolean; input?: string } = {}) {
+    const state = { shellMode: options.shellMode ?? false, input: options.input ?? "" };
+    const runner = new MockTmuxRunner((args) => {
+      if (args[0] === "capture-pane") {
+        const rule = "─".repeat(40);
+        const sigil = state.shellMode ? "!" : "❯";
+        const footer = state.shellMode ? "  ! for shell mode" : "  ⏸ manual mode on";
+        return ok([rule, `${sigil} ${state.input}`, rule, footer].join("\n"));
+      }
+      if (args[0] === "send-keys" && args.includes("BSpace")) {
+        if (state.input.length > 0) state.input = state.input.slice(0, -1);
+        else state.shellMode = false;
+        return ok("");
+      }
+      if (args[0] === "send-keys" && args.includes("Enter")) {
+        state.input = "";
+        state.shellMode = false;
+        return ok("");
+      }
+      return ok("");
+    });
+    return { runner, state };
+  }
+
+  test("tmux sendTextSubmit: シェルモード残留は BSpace で通常入力へ戻してから注入する", async () => {
+    // 戻さずに注入すると通常メッセージがそのままシェルコマンドとして実行される
+    // （herdr 側 exitShellMode と同じ防御。tmux は既定 backend なので同様に必要）。
+    const store = makeStore();
+    store.put({ name: "s-t", cwd: "/t", createdAt: 1 });
+    const { runner, state } = makeTmuxSubmitHarness({ shellMode: true });
+    const manager = new TmuxSessionManager({ runner: runner.runner, store });
+
+    await manager.sendTextSubmit("s-t", "こんにちは");
+
+    expect(state.shellMode).toBe(false);
+    expect(runner.recorded.filter((args) => args[0] === "send-keys")).toEqual([
+      ["send-keys", "-t", "s-t", "BSpace"],
+      ["send-keys", "-t", "s-t", "-l", "こんにちは"],
+      ["send-keys", "-t", "s-t", "Enter"],
+    ]);
+  });
+
+  test("tmux sendTextSubmit: 通常モードでは余計な BSpace を送らない", async () => {
+    const store = makeStore();
+    store.put({ name: "s-t", cwd: "/t", createdAt: 1 });
+    const { runner } = makeTmuxSubmitHarness();
+    const manager = new TmuxSessionManager({ runner: runner.runner, store });
+
+    await manager.sendTextSubmit("s-t", "こんにちは");
+
+    expect(runner.recorded.filter((args) => args[0] === "send-keys")).toEqual([
+      ["send-keys", "-t", "s-t", "-l", "こんにちは"],
+      ["send-keys", "-t", "s-t", "Enter"],
+    ]);
+  });
+
+  test("tmux sendTextSubmit: BSpace 送出が失敗しても本文注入は続行する（fail-open）", () => {
+    // 補助操作のエラーを表に出すと「送信できない」原因が BSpace 失敗に見えてしまう。
+    // 実エラーは続く本文注入の send-keys 失敗として顕在化させる。
+    const store = makeStore();
+    store.put({ name: "s-t", cwd: "/t", createdAt: 1 });
+    const rule = "─".repeat(40);
+    const runner = new MockTmuxRunner((args) => {
+      if (args[0] === "capture-pane") {
+        return ok([rule, "! ", rule, "  ! for shell mode"].join("\n"));
+      }
+      if (args.includes("BSpace")) return { exitCode: 1, stdout: "", stderr: "pane not found" };
+      return ok("");
+    });
+    const manager = new TmuxSessionManager({ runner: runner.runner, store });
+
+    return expect(manager.sendTextSubmit("s-t", "こんにちは")).resolves.toBeUndefined();
+  });
+
+  test("extractClaudeInputBox: 大きな端末の巨大な入力欄でも全行を読み取る", () => {
+    // 実測 2.1.220: 入力欄の最大高さは端末サイズにほぼ比例する（63 行端末で 26 行 /
+    // 120 行端末で 55 行）。固定行数の窓で切ると大きな端末で上罫線が窓外に出て入力欄を
+    // 見失い、本文を重ね打ちして送信失敗する。判定は viewport 全体に対して行う。
+    const rule = "─".repeat(40);
+    const body = Array.from({ length: 55 }, (_, i) =>
+      i === 0 ? "❯ line01" : `line${String(i + 1).padStart(2, "0")}`);
+    const footer = ["  ⏵⏵ auto mode on", "  ⧉ artifact", "  ⏺ main", "  ◯ agent-a"];
+    const screen = ["過去の応答本文", rule, ...body, rule, ...footer].join("\n");
+
+    const box = extractClaudeInputBox(screen);
+    expect(box).not.toBeNull();
+    expect(box?.text.split("\n").length).toBe(55);
+    // 窓で切ると上罫線も `❯` 行も外れて入力欄を特定できない（固定行数が誤りである根拠）。
+    expect(extractClaudeInputBox(screen.split("\n").slice(-50).join("\n"))).toBeNull();
+  });
+
+  test("入力欄判定は viewport 全体を capture する（末尾 N 行で切らない）", async () => {
+    // tmux は `-S` を付けない = viewport のみ。付けるとスクロールバックを引くうえ、
+    // 固定行数の窓は大きな端末で入力欄を取りこぼす。
+    const store = makeStore();
+    store.put({ name: "s-t", cwd: "/t", createdAt: 1 });
+    const { runner } = makeTmuxSubmitHarness();
+    const manager = new TmuxSessionManager({ runner: runner.runner, store });
+
+    await manager.sendTextSubmit("s-t", "こんにちは");
+
+    const captures = runner.recorded.filter((args) => args[0] === "capture-pane");
+    expect(captures.length).toBeGreaterThan(0);
+    for (const args of captures) {
+      expect(args).toEqual(["capture-pane", "-p", "-t", "s-t"]);
+      expect(args).not.toContain("-S");
+    }
+  });
+
+  test("extractClaudeInputBox: 空入力時のプレースホルダは未送信テキストと数えない", () => {
+    // 数えるとシェルモード離脱（空入力の Backspace）に入れず、次の通常メッセージが
+    // シェルコマンドとして実行される（実機フレーム 2026-08-03 で確認）。
+    const rule = "─".repeat(40);
+    const queued = [rule, "! Press up to edit queued messages", rule, "  ! for shell mode"].join("\n");
+    expect(extractClaudeInputBox(queued)).toEqual({ prompt: "!", text: "" });
+    const fresh = [rule, '❯ Try "how does src/foo.ts work?"', rule, "  ⏸ manual"].join("\n");
+    expect(extractClaudeInputBox(fresh)?.text).toBe("");
   });
 });
 

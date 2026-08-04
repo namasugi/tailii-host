@@ -27,7 +27,14 @@ import {
   SessionMetadataStore,
   validateSessionName,
 } from "../sessions/sessionMetadataStore.js";
-import { paneCommandLooksLikeAgent, type CapturePaneOptions, type ReattachResult } from "./tmux.js";
+import {
+  extractClaudeInputBox,
+  inputBoxIsShellMode,
+  paneCommandLooksLikeAgent,
+  type CapturePaneOptions,
+  type ClaudeInputBox,
+  type ReattachResult,
+} from "./tmux.js";
 
 /** herdr コマンド 1 回分の実行結果。 */
 export interface HerdrCommandResult {
@@ -112,6 +119,9 @@ const HERDR_KEY_NAMES = new Set([
   "Right",
   "Tab",
   "Space",
+  // シェルモード離脱（空入力の `!` を消す）に使う。テキスト送出へ落ちると
+  // 「Backspace」の 9 文字がそのまま入力欄へ打ち込まれるので必ずキー名で送る。
+  "Backspace",
 ]);
 
 /** Shift+Tab の生シーケンス（herdr send-keys は BTab を受理しないため send-text で送る）。 */
@@ -138,11 +148,16 @@ export function screenHasSelectionFooter(screen: string): boolean {
 
 /**
  * 入力反映検証に使う probe（本文 1 行目の先頭部分）。検証不能な本文（空など）は null。
+ *
+ * 先頭 `!`（シェルモード）は claude TUI がモード記号として吸い上げ、入力欄本文には
+ * 残らない（`!ls -la` は `! ls -la` と描画される）。照合キーからも落とさないと
+ * 反映検証が必ず失敗する。
  */
 export function typedTextProbe(text: string): string | null {
   const firstLine = (text.split("\n")[0] ?? "").trim();
-  if (firstLine.length === 0) return null;
-  return firstLine.slice(0, 24);
+  const body = firstLine.startsWith("!") ? firstLine.slice(1).trim() : firstLine;
+  if (body.length === 0) return null;
+  return body.slice(0, 24);
 }
 
 /** herdr CLI の JSON stdout から `result` を取り出す。JSON でない/エラー封筒は null。 */
@@ -509,6 +524,11 @@ export class HerdrSessionManager {
       await this.sendKeys(name, ["Enter"]);
       await new Promise((resolve) => setTimeout(resolve, this.submitDelayMs));
     }
+    // 前回の注入が途中で終わった等でシェルモード（プロンプト `!`）に入ったままの入力欄へ
+    // 注入すると、本文がそのままシェルコマンドとして実行される。空入力の Backspace で
+    // モード記号を消して通常入力へ戻してから注入する（`!` 始まりの本文は注入時に自分で
+    // シェルモードへ入るので、常に通常モードから始めるのが決定的で安全）。
+    await this.exitShellMode(name);
     // Remote Control 切断直後の limbo では typed 入力が入力欄に一切入らず破棄される
     // （実測 2026-07-28: 通常メッセージが本文ごと消失し、旧実装は「入力欄に残っていない
     // = 送信成立」と誤判定して配送済みレシートを発行 → silent loss）。本文が入力欄へ
@@ -554,29 +574,48 @@ export class HerdrSessionManager {
   }
 
   /**
-   * 入力欄（最後の `❯` 行から下）に probe テキストが反映されているか。
+   * 入力欄に probe テキストが反映されているか。
    * ペイン履歴の同文エコー（同一メッセージの再送時など）を誤って「入力済み」と
-   * 判定しないよう、走査範囲を最後の `❯` 行以降に限定する。判定不能は false。
+   * 判定しないよう、走査範囲を入力欄（末尾の罫線に挟まれた領域）に限定する。
+   * 判定不能は false。
    */
   private async inputBoxContainsText(name: string, probe: string): Promise<boolean> {
     try {
-      const screen = await this.capturePane(name, { lines: 30 });
-      const lines = screen.split("\n");
-      let lastPromptIndex = -1;
-      for (let index = lines.length - 1; index >= 0; index -= 1) {
-        if ((lines[index] ?? "").trim().startsWith("❯")) {
-          lastPromptIndex = index;
-          break;
-        }
-      }
-      if (lastPromptIndex < 0) return false;
-      return lines.slice(lastPromptIndex).join("\n").includes(probe);
+      const box = extractClaudeInputBox(await this.captureVisibleScreen(name));
+      return box !== null && box.text.includes(probe);
     } catch {
       return false;
     }
   }
 
-  /** claude TUI の選択ダイアログ（`Enter to select` フッター）が表示中か。判定不能は false。 */
+  /**
+   * 入力欄がシェルモード（プロンプト `!`）なら Backspace でモード記号を消し、通常入力へ戻す。
+   * 本文が残っている状態では呼ばない（呼び出し元が Enter で送信し切ってから使う）。
+   *
+   * 判定不能・herdr エラーは no-op（fail-open）。pane 不在などの実エラーはここで throw せず、
+   * 続く本文注入の `send-text` 失敗として顕在化させる（この補助操作のエラーを表に出すと
+   * 「送信できない」原因が Backspace 送出の失敗に見えてしまう）。
+   */
+  private async exitShellMode(name: string): Promise<void> {
+    try {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const box = extractClaudeInputBox(await this.captureVisibleScreen(name));
+        if (!inputBoxIsShellMode(box) || (box?.text.length ?? 0) > 0) return;
+        await this.sendKeys(name, ["Backspace"]);
+        await new Promise((resolve) => setTimeout(resolve, this.submitVerifyDelayMs));
+      }
+    } catch {
+      // no-op（fail-open）
+    }
+  }
+
+  /**
+   * claude TUI の選択ダイアログ（`Enter to select` フッター）が表示中か。判定不能は false。
+   *
+   * 窓は入力欄判定より狭い 30 行に据え置く（ダイアログのフッターは画面最下部にあるので
+   * 広げる必要が無い一方、閉じたダイアログの転写が viewport に残っていると誤検出し、
+   * 不要な Esc で入力欄の打ちかけを「送信されないまま」消してしまう）。
+   */
   private async selectionDialogVisible(name: string): Promise<boolean> {
     try {
       return screenHasSelectionFooter(await this.capturePane(name, { lines: 30 }));
@@ -613,20 +652,15 @@ export class HerdrSessionManager {
   }
 
   /**
-   * claude TUI の入力欄（画面末尾側の `❯` 行）に未送信テキストが残っているか。
-   * 送信済みメッセージのエコーも `❯` で始まるため、**最後の** `❯` 行だけを見る。
-   * 判定不能（読取失敗・`❯` 行なし）は false = 送信成立扱い（fail-open。
-   * 誤リトライしても空入力 Enter の no-op で無害だが、無限再送はしない側に倒す）。
+   * claude TUI の入力欄に未送信テキストが残っているか。
+   * 送信済みメッセージのエコーも `❯` で始まるため、入力欄（末尾の罫線に挟まれた領域）
+   * だけを見る。判定不能（読取失敗・入力欄を特定できない）は false = 送信成立扱い
+   * （fail-open。誤リトライしても空入力 Enter の no-op で無害だが、無限再送はしない側に倒す）。
    */
   private async inputBoxHasPendingText(name: string): Promise<boolean> {
     try {
-      const screen = await this.capturePane(name, { lines: 30 });
-      const promptLines = screen
-        .split("\n")
-        .map((line) => line.trim())
-        .filter((line) => line.startsWith("❯"));
-      const last = promptLines[promptLines.length - 1];
-      return last !== undefined && last.slice(1).trim().length > 0;
+      const box = extractClaudeInputBox(await this.captureVisibleScreen(name));
+      return box !== null && box.text.length > 0;
     } catch {
       return false;
     }
@@ -684,6 +718,24 @@ export class HerdrSessionManager {
     const visible = await this.readPane(target, ["--source", "visible"]);
     const all = visible.split("\n");
     return all.slice(Math.max(0, all.length - lines)).join("\n");
+  }
+
+  /**
+   * 入力欄判定用に **viewport 全体**を取る（末尾 N 行で切らない）。
+   *
+   * claude TUI の入力欄の最大高さは端末サイズにほぼ比例する（実測 2.1.220:
+   * 63 行端末で 26 行 / 120 行端末で 55 行）。固定行数の窓では大きな端末で上罫線が
+   * 窓外に出て入力欄を見失い、本文を 3 回重ね打ちして送信失敗する。窓を広く取っても
+   * `extractClaudeInputBox` は罫線で入力欄を切り出すので過検出にはならない。
+   * `--source visible` は viewport 全行を返す（`--lines` は無視される）。
+   */
+  private async captureVisibleScreen(name: string): Promise<string> {
+    validateSessionName(name);
+    const target = await this.paneTarget(name);
+    if (target === null) {
+      throw new HerdrFailedError(["pane", "read", name], 1, "pane not found");
+    }
+    return this.readPane(target, ["--source", "visible"]);
   }
 
   private async readPane(target: string, sourceArgs: string[]): Promise<string> {
