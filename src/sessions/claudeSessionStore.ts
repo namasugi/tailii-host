@@ -40,7 +40,14 @@ export class ClaudeSessionStore {
     this.root = root ?? path.join(os.homedir(), ".claude", "projects");
   }
 
-  /** 指定会話 ID の jsonl パスを projects root から探す。見つからない場合は null。 */
+  /**
+   * 指定会話 ID の jsonl パスを projects root から探す。見つからない場合は null。
+   *
+   * 同一 id が複数 slug に在り得る（duplicate-transcript: worktree 削除後の resume で
+   * transcript を repo ルートへ移設すると、worktree 側 slug に状態行だけの残骸が残る）。
+   * その場合は**会話本体（timestamp 行）を持つ方**を返す。readdir 順の先勝ちだと、
+   * 残骸を掴んで検索・タブ名同期・再移設が空振りする。
+   */
   transcriptPath(sessionId: string): string | null {
     let slugs: string[];
     try {
@@ -48,20 +55,33 @@ export class ClaudeSessionStore {
     } catch {
       return null;
     }
+    const candidates: string[] = [];
     for (const slug of slugs) {
       const candidate = path.join(this.root, slug, `${sessionId}.jsonl`);
       try {
-        if (fs.statSync(candidate).isFile()) return candidate;
+        if (fs.statSync(candidate).isFile()) candidates.push(candidate);
       } catch {
         // 読めない slug は無視する。
       }
     }
-    return null;
+    if (candidates.length <= 1) return candidates[0] ?? null;
+    let best: string | null = null;
+    let bestUpdatedAt = Number.NEGATIVE_INFINITY;
+    for (const candidate of candidates) {
+      const updatedAt = lastConversationTimestamp(candidate);
+      if (updatedAt !== null && updatedAt > bestUpdatedAt) {
+        best = candidate;
+        bestUpdatedAt = updatedAt;
+      }
+    }
+    return best ?? candidates[0] ?? null;
   }
 
   /**
    * 会話一覧を updatedAt 降順で返す（nil は末尾、同値は sessionId 昇順で安定化）。
    * `baseDir` 指定時は cwd が baseDir 自身/配下の会話のみに絞る（engine は無指定で呼ぶ）。
+   * 同一 sessionId が複数 slug に在る場合は 1 行へ畳む（duplicate-transcript,
+   * `transcriptPath` と同じ「会話本体を持つ方が正」の判定）。
    */
   list(baseDir?: string): ClaudeSessionInfo[] {
     let slugs: string[];
@@ -71,7 +91,9 @@ export class ClaudeSessionStore {
       return [];
     }
 
-    let result: ClaudeSessionInfo[] = [];
+    // 同一 sessionId は 1 行へ畳む。cwd/updatedAt の権威は「会話本体を持つ方」なので、
+    // baseDir 絞り込みより **先に** 畳む（残骸の lossy cwd で絞り込ませない）。
+    const bySessionId = new Map<string, ClaudeSessionInfo>();
     for (const slug of slugs) {
       const slugDir = path.join(this.root, slug);
       let stat: fs.Stats;
@@ -91,10 +113,13 @@ export class ClaudeSessionStore {
         if (!file.endsWith(".jsonl")) continue;
         const sessionId = file.slice(0, -".jsonl".length);
         if (!sessionId) continue;
-        result.push(deriveInfo(path.join(slugDir, file), sessionId, slug));
+        const info = deriveInfo(path.join(slugDir, file), sessionId, slug);
+        const existing = bySessionId.get(sessionId);
+        bySessionId.set(sessionId, existing === undefined ? info : richerInfo(existing, info));
       }
     }
 
+    let result: ClaudeSessionInfo[] = [...bySessionId.values()];
     if (baseDir) {
       result = result.filter((info) => isInsideBase(info.cwd, baseDir));
     }
@@ -327,16 +352,39 @@ export function scanTranscriptHead(filePath: string): TranscriptHeadSummary {
   return { cwd, title, ...titles };
 }
 
+/**
+ * 同一 sessionId の 2 行から一覧に残す方を選ぶ（duplicate-transcript）。
+ *
+ * 会話本体（timestamp を持つ行）がある方が正。両方あれば新しい方、どちらも無ければ
+ * 最終メッセージを持つ方 → 先に見つけた方（readdir 順で安定）。
+ */
+function richerInfo(lhs: ClaudeSessionInfo, rhs: ClaudeSessionInfo): ClaudeSessionInfo {
+  const l = lhs.updatedAt;
+  const r = rhs.updatedAt;
+  if (l !== undefined && r !== undefined) return r > l ? rhs : lhs;
+  if (l !== undefined || r !== undefined) return l !== undefined ? lhs : rhs;
+  if ((lhs.lastMessage !== undefined) !== (rhs.lastMessage !== undefined)) {
+    return lhs.lastMessage !== undefined ? lhs : rhs;
+  }
+  return lhs;
+}
+
 /** 1 つの jsonl から ClaudeSessionInfo を導出する（先頭 + 末尾チャンクのみ読む）。 */
 function deriveInfo(filePath: string, sessionId: string, slug: string): ClaudeSessionInfo {
   const tail = scanTranscriptTail(filePath);
   const updatedAt = tail.updatedAt ?? undefined;
   const head = scanTranscriptHead(filePath);
 
+  // 明示タイトル（custom-title / ai-title）が既に書かれたかを iOS へ伝える（title-refresh）。
+  // 新規会話の実体化直後は transcript がまだ無い / 最初のユーザー発話しか無いため、iOS は
+  // このフラグが立つまでタイトルを取り直す（立たないまま打ち切ると発話そのままの仮タイトルで
+  // 固定され、一覧へ戻って開き直すまで AI タイトルへ更新されない）。
+  const explicitTitle = resolveExplicitTitle(head, tail);
   const info: ClaudeSessionInfo = {
     sessionId,
     cwd: head.cwd ?? cwdFromSlug(slug),
-    title: resolveExplicitTitle(head, tail) ?? head.title ?? sessionId.slice(0, 8),
+    title: explicitTitle ?? head.title ?? sessionId.slice(0, 8),
+    hasProviderTitle: explicitTitle !== null,
   };
   if (updatedAt !== undefined) info.updatedAt = updatedAt;
   if (tail.lastMessage !== null) info.lastMessage = tail.lastMessage;

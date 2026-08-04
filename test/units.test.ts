@@ -917,6 +917,52 @@ describe("ClaudeSessionStore", () => {
     expect(new ClaudeSessionStore(root).list()[0]?.title).toBe("ユーザー命名");
   });
 
+  test("hasProviderTitle は明示タイトル（ai-title/custom-title）の有無を表す（title-refresh）", () => {
+    const root = makeTempDir("claude-sessions-has-provider-title");
+    const slugDir = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slugDir, { recursive: true });
+    const file = path.join(slugDir, "nnnnnnnn-9999.jsonl");
+    // 会話直後: 最初の発話だけ = 仮タイトル。iOS はここで打ち切らない。
+    fs.writeFileSync(
+      file,
+      '{"type":"user","cwd":"/tmp/proj","timestamp":"2026-01-01T00:00:00Z","message":{"content":"最初の発話"}}\n',
+    );
+    expect(new ClaudeSessionStore(root).list()[0]?.hasProviderTitle).toBe(false);
+
+    // CLI が AI タイトルを書いた時点で true。
+    fs.appendFileSync(file, '{"type":"ai-title","aiTitle":"AI生成タイトル","sessionId":"nnnnnnnn-9999"}\n');
+    const withAiTitle = new ClaudeSessionStore(root).list()[0];
+    expect(withAiTitle?.hasProviderTitle).toBe(true);
+    expect(withAiTitle?.title).toBe("AI生成タイトル");
+  });
+
+  test("同一 sessionId が複数 slug に在っても会話本体の側 1 行へ畳む（duplicate-transcript）", () => {
+    const root = makeTempDir("claude-sessions-duplicate");
+    const worktreeSlug = path.join(root, "-tmp-proj--claude-worktrees-1");
+    const repoSlug = path.join(root, "-tmp-proj");
+    fs.mkdirSync(worktreeSlug, { recursive: true });
+    fs.mkdirSync(repoSlug, { recursive: true });
+    // worktree 削除後 resume で本体は repo ルートへ移設され、worktree 側には状態行だけ残る。
+    fs.writeFileSync(
+      path.join(worktreeSlug, "oooooooo-9999.jsonl"),
+      '{"type":"ai-title","aiTitle":"残骸のタイトル","sessionId":"oooooooo-9999"}\n' +
+        '{"type":"mode","mode":"normal","sessionId":"oooooooo-9999"}\n',
+    );
+    fs.writeFileSync(
+      path.join(repoSlug, "oooooooo-9999.jsonl"),
+      '{"type":"user","cwd":"/tmp/proj","timestamp":"2026-01-01T00:00:00Z","message":{"content":"最初の発話"}}\n' +
+        '{"type":"ai-title","aiTitle":"本体のタイトル","sessionId":"oooooooo-9999"}\n',
+    );
+
+    const list = new ClaudeSessionStore(root).list();
+    expect(list.length).toBe(1);
+    expect(list[0]?.cwd).toBe("/tmp/proj");
+    expect(list[0]?.title).toBe("本体のタイトル");
+    // 残骸ではなく本体の jsonl を返す（検索・タブ名同期・再移設の対象）。
+    expect(new ClaudeSessionStore(root).transcriptPath("oooooooo-9999"))
+      .toBe(path.join(repoSlug, "oooooooo-9999.jsonl"));
+  });
+
   test("末尾直近数行より上に埋まった custom-title も深掘りで拾う（早期打ち切りの補完）", () => {
     const root = makeTempDir("claude-sessions-title-deep");
     const slugDir = path.join(root, "-tmp-proj");
