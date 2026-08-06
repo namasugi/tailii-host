@@ -58,6 +58,24 @@ test("注入後にダイアログが消えていれば正常完了する", async
   expect(keys).toEqual([["1"]]);
 });
 
+test("単一選択の Other は生キーで本文→Enter を注入する（sendTextSubmit を経由しない）", async () => {
+  // sendTextSubmit は選択ダイアログ残存 → Esc の防御を持ち、設問ダイアログ自体を
+  // 誤認して却下（Request interrupted）するため、Other 経路では使わない。
+  const { keys, backend } = stubBackend([""]);
+  let textSubmitCalls = 0;
+  (backend as { sendTextSubmit: () => Promise<void> }).sendTextSubmit = async () => {
+    textSubmitCalls += 1;
+  };
+  await expect(
+    injectQuestionAnswers(
+      [{ questionIndex: 0, selectedOptionIndexes: [2], otherText: "rsync で移行する", multiSelect: false }],
+      "work", backend,
+    ),
+  ).resolves.toBeUndefined();
+  expect(keys).toEqual([["3"], ["rsync で移行する"], ["Enter"]]);
+  expect(textSubmitCalls).toBe(0);
+});
+
 test("注入後もダイアログが残っていれば throw する（hub が pending 復元へ進む）", async () => {
   const { backend } = stubBackend([QUESTION_DIALOG]);
   await expect(

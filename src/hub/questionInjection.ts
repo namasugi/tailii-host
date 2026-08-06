@@ -6,6 +6,8 @@ import { sleep } from "../shared/sleep.js";
 import type { SessionBackend } from "../backend/sessionBackend.js";
 
 const KEY_STEP_MS = 150;
+/** Other 本文 → Enter の猶予（herdr 実測: 300ms 未満だと CR が本文に飲まれる）。 */
+const OTHER_TEXT_CR_GAP_MS = 400;
 /** 注入完了からダイアログ消滅検証までの猶予（TUI の再描画待ち）。 */
 const VERIFY_DELAY_MS = 600;
 /** 1回目の検証でダイアログ残存だったときの再検証までの猶予。 */
@@ -86,8 +88,16 @@ export async function injectQuestionAnswers(
       await sessionManager.sendKeys(session, ["Right"]);
     } else if (otherIndex !== null) {
       await sessionManager.sendKeys(session, [String(otherIndex + 1)]);
-      // 本文+確定は 1 操作（herdr は分割すると CR が飲まれる。sendTextSubmit に集約）。
-      await sessionManager.sendTextSubmit(session, other);
+      await sleep(KEY_STEP_MS);
+      // 本文は生キーで注入する。sendTextSubmit は「選択ダイアログ残存 → Esc で閉じる」防御を
+      // 持ち、AskUserQuestion ダイアログ自体（Enter to select フッター）を誤認して Esc で
+      // 設問を却下してしまう（実機FB 2026-08-05: その他回答が Request interrupted になり、
+      // 本文が通常メッセージとして送信される）。CR は本文から 300ms 以上空ければ飲まれない
+      // （herdr 実測 2026-07-22）ので、本文 → 猶予 → Enter の open-loop で確定し、
+      // 取りこぼしは末尾のダイアログ残存検証（throw → pending 復元）に任せる。
+      await sessionManager.sendKeys(session, [other], true);
+      await sleep(OTHER_TEXT_CR_GAP_MS);
+      await sessionManager.sendKeys(session, ["Enter"]);
     } else if (indexes.length > 0) {
       // 数字キーで即確定（Enter は送らない）。
       await sessionManager.sendKeys(session, [String(indexes[0]! + 1)]);
