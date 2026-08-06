@@ -145,12 +145,17 @@ export class ChatTailController {
       ChatTailController.diag(
         `tail task started for dir=${dir} newerThan=${newerThanMs === null ? "nil" : String(newerThanMs)}`,
       );
-      // この tail で image_available を発行済みの原本パス（chat-image-dedupe）。
-      // 添付（att-）で表示済みの画像を Claude が Read すると read-<toolUseId> でも
-      // 再発行され、iOS の imageId 冪等ガードを素通りして同一画像のサムネが2枚並ぶ。
+      // この tail で添付（att-）として image_available を発行済みの原本パス
+      // （chat-image-dedupe）。添付で表示済みの画像を Claude が Read すると
+      // read-<toolUseId> でも再発行され、iOS の imageId 冪等ガードを素通りして
+      // 同一画像のサムネが2枚並ぶため、att- 由来のパスに限り read- 側を抑止する。
       // transcript 上は必ず user 行（att-）が Read（read-）より先に現れるため、
-      // pump ローカルの集合で read- 側だけを抑止すれば replay でも決定的に働く。
-      const emittedImagePaths = new Set<string>();
+      // pump ローカルの集合で決定的に働く。
+      // Read→Read の同一パスは抑止しない: 反復レンダリング（同名ファイルへ再出力→再 Read）
+      // では内容が毎回変わり、初回 Read の id に発行を独占させると最新の Read カードに
+      // 画像が付かず、初回アンカーがキャッシュ窓外の端末では1枚も表示されない
+      // （chat-image-reread。Lab 会話の実障害）。各 Read の id で毎回発行する。
+      const attachedImagePaths = new Set<string>();
       let count = 0;
       try {
         for await (const message of tailer.streamProjectDir(
@@ -186,7 +191,7 @@ export class ChatTailController {
                   `att-${message.streamId}-${n}`,
                 );
                 if (available !== null) {
-                  emittedImagePaths.add(paths[n]!);
+                  attachedImagePaths.add(paths[n]!);
                   writer.write(available);
                 }
               }
@@ -194,18 +199,16 @@ export class ChatTailController {
             // Read ツールで画像ファイルを読んだら、そのサムネ（image_available）を後続で発行し
             // iOS にインライン表示させる（既存 chat-attachments と同じ描画経路を再利用）。
             // id は tool_use id 由来で決定的（read-<id>）→ 再 tail/再オープンでも二重挿入されない。
-            // 添付等で発行済みのパスは再発行しない（同一画像のサムネ二重表示防止）。
+            // 添付（att-）で発行済みのパスだけ再発行しない（同一画像のサムネ二重表示防止）。
+            // 同一パスの再 Read はその Read の id で毎回発行する（chat-image-reread）。
             if (imageService !== null && message.type === "tool_activity") {
               const readPath = ChatTailController.readImagePath(message.activity);
-              if (readPath !== null && !emittedImagePaths.has(readPath)) {
+              if (readPath !== null && !attachedImagePaths.has(readPath)) {
                 const available = await imageService.makeAvailable(
                   readPath,
                   `read-${message.activity.id}`,
                 );
-                if (available !== null) {
-                  emittedImagePaths.add(readPath);
-                  writer.write(available);
-                }
+                if (available !== null) writer.write(available);
               }
             }
           } catch (error) {

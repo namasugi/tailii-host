@@ -254,4 +254,75 @@ describe("ChatTailController — Tailii 添付画像のインライン化", () =
       "read-toolu_read_other",
     ]);
   });
+
+  test("同一パスの再 Read はそれぞれの id で毎回発行する（chat-image-reread）", async () => {
+    const cwd = makeTempDir("cc-reread-cwd");
+    const imagePath = path.join(makeTempDir("cc-reread-img"), "render.png");
+    fs.writeFileSync(imagePath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+
+    const readActivity = (id: string): ControlMessage => ({
+      type: "tool_activity",
+      v: 1,
+      activity: {
+        id,
+        name: "Read",
+        label: `既読 ${imagePath}`,
+        file: imagePath,
+        commandTruncated: false,
+        descriptionTruncated: false,
+      },
+    });
+    const { writer, messages } = capturingWriter();
+    const controller = new ChatTailController({
+      writer,
+      tailer: fakeTailer([readActivity("toolu_first"), readActivity("toolu_second")]) as never,
+      subagentTailer: fakeTailer([]) as never,
+      projectsRoot: makeTempDir("cc-reread-projects"),
+      imageService: stubImageService(makeTempDir("cc-reread-index")),
+    });
+
+    controller.open(cwd, null);
+    const c = controller as unknown as {
+      currentPump: Promise<void> | null;
+      currentSubagentPump: Promise<void> | null;
+    };
+    await c.currentPump;
+    await c.currentSubagentPump;
+
+    const available = messages().filter(
+      (message): message is Extract<ControlMessage, { type: "image_available" }> =>
+        message.type === "image_available",
+    );
+    // 反復レンダリング（同名ファイルへ再出力→再 Read）では各 Read カードに画像を付ける。
+    // 初回 id に独占させると最新カードへ画像が付かない（Lab 会話の実障害）。
+    expect(available.map((m) => m.id)).toEqual(["read-toolu_first", "read-toolu_second"]);
+  });
+});
+
+describe("ImageService — サムネ生成メモ", () => {
+  test("未変更ファイルの再生成はメモ命中で thumbnailer を再実行しない", async () => {
+    const imagePath = path.join(makeTempDir("is-memo-img"), "render.png");
+    fs.writeFileSync(imagePath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+
+    let calls = 0;
+    const service = new ImageService({
+      indexBase: makeTempDir("is-memo-index"),
+      thumbnailer: async () => {
+        calls += 1;
+        return { thumbnailBase64: "QUFB", width: 8, height: 6 };
+      },
+    });
+
+    const first = await service.makeAvailable(imagePath, "read-a");
+    const second = await service.makeAvailable(imagePath, "read-b");
+    expect(first).toMatchObject({ type: "image_available", id: "read-a", thumbnail: "QUFB" });
+    expect(second).toMatchObject({ type: "image_available", id: "read-b", thumbnail: "QUFB" });
+    expect(calls).toBe(1);
+
+    // ファイルが書き換われば（mtime/size 変化）再生成する。
+    fs.writeFileSync(imagePath, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a]));
+    const third = await service.makeAvailable(imagePath, "read-c");
+    expect(third).toMatchObject({ type: "image_available", id: "read-c" });
+    expect(calls).toBe(2);
+  });
 });

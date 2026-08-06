@@ -131,6 +131,13 @@ export class ImageService {
   private readonly indexBase: string;
   private readonly thumbnailMaxPixelSize: number;
   private readonly thumbnailer: Thumbnailer;
+  /**
+   * サムネ生成結果のメモ（key = path + mtimeMs + size）。同一パスの再 Read を毎回発行する
+   * ようになった（chat-image-reread）ため、replay で同じ未変更ファイルに sips を何十回も
+   * 走らせない。ファイルが書き換われば mtime/size が変わり自然に再生成される。
+   */
+  private readonly thumbnailMemo = new Map<string, ThumbnailResult>();
+  private static readonly THUMBNAIL_MEMO_LIMIT = 256;
 
   constructor(options: {
     pendingBase?: string;
@@ -237,10 +244,24 @@ export class ImageService {
       return { type: "error", v: PROTOCOL_V1, id: imageId, code: "not_an_image", message: "画像として扱えません" };
     }
 
-    // サムネ生成 + 原寸取得。読み取り不可 / 画像でない → not_an_image
-    const thumb = await this.thumbnailer(imagePath, this.thumbnailMaxPixelSize);
-    if (thumb === null) {
-      return { type: "error", v: PROTOCOL_V1, id: imageId, code: "not_an_image", message: "画像として読み取れません" };
+    // サムネ生成 + 原寸取得。読み取り不可 / 画像でない → not_an_image。
+    // 未変更ファイル（path + mtime + size 一致）はメモ命中で sips を再実行しない。
+    const memoKey = `${imagePath}\u0000${stat.mtimeMs}\u0000${stat.size}`;
+    let thumb = this.thumbnailMemo.get(memoKey) ?? null;
+    if (thumb !== null) {
+      // 命中エントリを末尾へ移して LRU 順を保つ。
+      this.thumbnailMemo.delete(memoKey);
+      this.thumbnailMemo.set(memoKey, thumb);
+    } else {
+      thumb = await this.thumbnailer(imagePath, this.thumbnailMaxPixelSize);
+      if (thumb === null) {
+        return { type: "error", v: PROTOCOL_V1, id: imageId, code: "not_an_image", message: "画像として読み取れません" };
+      }
+      this.thumbnailMemo.set(memoKey, thumb);
+      if (this.thumbnailMemo.size > ImageService.THUMBNAIL_MEMO_LIMIT) {
+        const oldest = this.thumbnailMemo.keys().next().value;
+        if (oldest !== undefined) this.thumbnailMemo.delete(oldest);
+      }
     }
 
     // 生成成功時のみ id→path を index に記録
