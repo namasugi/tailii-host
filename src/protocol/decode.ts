@@ -73,7 +73,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
 
   switch (type) {
     case "channel_hello":
-      return compact({ type, v, maxVersion: requireNumber(raw, "maxVersion"), serverVersion: optionalString(raw, "serverVersion") });
+      return compact({ type, v, maxVersion: requireNumber(raw, "maxVersion"), serverVersion: optionalString(raw, "serverVersion"), hostName: optionalString(raw, "hostName") });
 
     case "approval_request":
       return compact({

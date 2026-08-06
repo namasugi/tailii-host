@@ -675,15 +675,30 @@ describe("EngineControl — 横断制御チャネル", () => {
 
   test("engine は確立直後に channel_hello を送出し、相手 hello 受信後に採用版を決める", async () => {
     const runner = new MockTmuxRunner(() => ok(""));
-    const engine = startEngine({ sessionManager: makeManager(runner) });
+    const engine = startEngine({
+      sessionManager: makeManager(runner),
+      hostDisplayName: "Alice's Mac mini",
+    });
 
     const hello = await engine.lines.nextOfType("channel_hello");
     expect(hello).toContain('"maxVersion":2');
     // serverVersion は package.json の実バージョンを載せる(ハードコードすると bump で壊れる)。
     expect(hello).toContain(`"serverVersion":"${readPackageVersion()}"`);
+    // マシン名（iOS 接続先一覧タイトルの供給源）を同梱する。
+    expect(hello).toContain('"hostName":"Alice\'s Mac mini"');
     expect(hello).toContain('"v":1');
 
     engine.writeLine('{"maxVersion":1,"type":"channel_hello","v":1}');
+    await engine.teardown();
+  });
+
+  test("hostDisplayName 未解決（null）の hello は hostName を省略する", async () => {
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner) });
+
+    const hello = await engine.lines.nextOfType("channel_hello");
+    expect(hello).not.toContain('"hostName"');
+
     await engine.teardown();
   });
 

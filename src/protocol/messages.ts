@@ -345,7 +345,7 @@ export interface HostVersions {
 }
 
 export type ControlMessage =
-  | { type: "channel_hello"; v: number; maxVersion: number; serverVersion?: string }
+  | { type: "channel_hello"; v: number; maxVersion: number; serverVersion?: string; hostName?: string }
   | { type: "approval_request"; v: number; id: string; tool: string; summary: string; cwd: string; diff?: ToolDiff }
   | { type: "approval_decision"; v: number; id: string; decision: Decision; reason?: string }
   | { type: "remote_pending"; v: number; id: string; session: string; kind: RemotePendingKind; tool?: string; summary: string }

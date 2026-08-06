@@ -74,6 +74,7 @@ import {
 } from "../backend/sessionBackend.js";
 import { herdrInstalled } from "../backend/herdr.js";
 import { createStaleDistGuard, isStaleDist, readPackageVersion, type StaleDistGuard } from "../shared/version.js";
+import { resolveHostDisplayName } from "../shared/hostDisplayName.js";
 import {
   DEFAULT_MODE_TIMING,
   engineDiag,
@@ -323,6 +324,11 @@ export interface RunEngineOptions {
   modeTiming?: Partial<ModeTiming>;
   /** 起動時 package version と現在の package version を比較する stale 判定（テスト注入用）。 */
   staleDistGuard?: StaleDistGuard | null;
+  /**
+   * channel_hello に載せるマシン名（既定は scutil ComputerName → os.hostname()）。
+   * iOS の接続先一覧タイトルの供給源。null は省略（テスト注入用）。
+   */
+  hostDisplayName?: string | null;
   /** stale dist 検出時の通知（CLI では return によりプロセス終了、テストは観測用）。 */
   onStaleDist?: () => void;
   /** @deprecated Hub 移管前のテスト互換。現在は使用しない。 */
@@ -367,6 +373,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     homeDir = os.homedir(),
     modeTiming = {},
     staleDistGuard = createStaleDistGuard(),
+    hostDisplayName = resolveHostDisplayName() ?? null,
     onStaleDist = undefined,
     hubLink: injectedHubLink = undefined,
     codexHubRpcTimeoutMs = 15_000,
@@ -463,6 +470,8 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
       v: PROTOCOL_V1,
       maxVersion,
       ...(helloVersion !== undefined ? { serverVersion: helloVersion } : {}),
+      // マシン名（iOS の接続先一覧タイトルの供給源）。取れない環境では省略する。
+      ...(hostDisplayName !== null ? { hostName: hostDisplayName } : {}),
     });
 
     // ---- 1.5 画像 pending を drain し image_available を送出 ----

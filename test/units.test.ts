@@ -10,6 +10,7 @@ import { ChatTailController } from "../src/chat/chatTailController.js";
 import { ClaudeSessionStore, cwdFromSlug, transcriptTitle } from "../src/sessions/claudeSessionStore.js";
 import { dirCanCreate, dirChildren, dirCreate, dirList } from "../src/services/dirLister.js";
 import { parsePermissionMode } from "../src/shared/permissionMode.js";
+import { resolveHostDisplayName } from "../src/shared/hostDisplayName.js";
 import {
   credentialFromKeychain,
   extractCredential,
@@ -1124,5 +1125,49 @@ describe("ChatTailController.readImagePath", () => {
     expect(ChatTailController.readImagePath({ name: "Write", file: "/tmp/out.png" })).toBeNull();
     expect(ChatTailController.readImagePath({ name: "Edit", file: "/tmp/out.png" })).toBeNull();
     expect(ChatTailController.readImagePath({ name: "Glob", file: "/tmp/out.png" })).toBeNull();
+  });
+});
+
+describe("resolveHostDisplayName", () => {
+  test("darwin は scutil ComputerName を第一候補にする（日本語・空白可）", () => {
+    expect(
+      resolveHostDisplayName({
+        platform: "darwin",
+        hostname: () => "alices-mac-mini.local",
+        scutilComputerName: () => "アリスの Mac mini\n",
+      }),
+    ).toBe("アリスの Mac mini");
+  });
+
+  test("darwin で scutil 失敗時は hostname の .local を落としてフォールバックする", () => {
+    expect(
+      resolveHostDisplayName({
+        platform: "darwin",
+        hostname: () => "alices-mac-mini.local",
+        scutilComputerName: () => {
+          throw new Error("scutil not found");
+        },
+      }),
+    ).toBe("alices-mac-mini");
+  });
+
+  test("linux は hostname を使う（.local 無しはそのまま）", () => {
+    expect(
+      resolveHostDisplayName({
+        platform: "linux",
+        hostname: () => "build-server",
+        scutilComputerName: () => "unused",
+      }),
+    ).toBe("build-server");
+  });
+
+  test("空しか得られなければ undefined（hello から hostName を省略）", () => {
+    expect(
+      resolveHostDisplayName({
+        platform: "linux",
+        hostname: () => "  ",
+        scutilComputerName: () => "unused",
+      }),
+    ).toBeUndefined();
   });
 });

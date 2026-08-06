@@ -166,6 +166,9 @@ export function startEngine(
     planUsage: options.planUsage ?? (async () => null),
     ...engineOptions,
     hubLink: options.hubLink ?? connectInProcessHub(hub),
+    // テストの既定はマシン名なし（hello を実行環境に依存させない）。個別テストで上書き可能。
+    // spread の後ろに置き、undefined 渡しでも実環境解決（scutil）へ落ちないようにする。
+    hostDisplayName: options.hostDisplayName ?? null,
   });
   // teardown 前に reject されても unhandled rejection にしない。
   done.catch(() => {});
