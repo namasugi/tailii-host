@@ -7,6 +7,7 @@ import { describe, expect, test } from "vitest";
 import {
   HerdrFailedError,
   HerdrSessionManager,
+  inputBoxTextIncludesProbe,
   parseHerdrCreatedTabPaneId,
   parseHerdrForegroundCommand,
   parseHerdrPaneList,
@@ -131,6 +132,20 @@ describe("herdr JSON パーサ", () => {
     expect(parseHerdrCreatedTabPaneId("not json")).toBeNull();
     expect(parseHerdrForegroundCommand(processInfoJson("claude"))).toBe("claude");
     expect(parseHerdrForegroundCommand("{}")).toBe("");
+  });
+});
+
+describe("inputBoxTextIncludesProbe", () => {
+  test("折り返し（改行+trim 痕）をまたいでも一致し、別内容には一致しない", () => {
+    // 全角24字=48桁 > 内幅の狭ペインで折り返された描画（各行 trim 済み・\n 連結）。
+    expect(
+      inputBoxTextIncludesProbe("このメッセージが二重に\nなっていないか確認した\nいので、ZQ", "が二重になっていないか確認したいので、ZQ"),
+    ).toBe(true);
+    expect(inputBoxTextIncludesProbe("全く別の内容が残っている", "確認したいので、ZQ")).toBe(false);
+    expect(inputBoxTextIncludesProbe("何か入っている", "")).toBe(false);
+    // 既知の割り切り: 空白除去照合なので語境界の違いは偽陽性になり得る（残留 flush が
+    // 先に走るため実発生は稀。REFUTE レビュー P2）。
+    expect(inputBoxTextIncludesProbe("git status を\n見て", "を見て")).toBe(true);
   });
 });
 
@@ -309,6 +324,18 @@ describe("HerdrSessionManager", () => {
     initialInput?: string;
     /** 初期状態でシェルモード（プロンプトが `!`）に入ったままになっている。 */
     initiallyShellMode?: boolean;
+    /** 入力欄をこの表示幅（コードポイント数）で折り返して描画する（折り返し照合の検証用）。 */
+    wrapWidth?: number;
+    /** 最初の N 回の pane read は入力欄を空で描画する（TUI 描画遅延=反映検証の偽陰性の再現）。 */
+    hideInputReads?: number;
+    /** 入力欄に常にこのテキストを描画する（C-u/Backspace で消えない残骸の再現）。 */
+    ghostInput?: string;
+    /** 入力欄の表示行を末尾 N 行に制限する（composer スクロールで先頭行が窓外に出る再現）。 */
+    visibleTailLines?: number;
+    /** 本文の send-text が届いた瞬間に選択ダイアログを開く（注入がダイアログを誘発する再現）。 */
+    openDialogOnText?: boolean;
+    /** pane read が常にこの画面を返す（罫線なし=入力欄不可視の再現）。 */
+    plainScreen?: string;
   } = {}) {
     const state = {
       input: options.initialInput ?? "",
@@ -317,6 +344,7 @@ describe("HerdrSessionManager", () => {
       swallowTextInputs: options.swallowTextInputs ?? 0,
       swallowEnters: options.swallowEnters ?? 0,
       statusReads: 0,
+      hideInputReads: options.hideInputReads ?? 0,
     };
     const dialogScreen = [
       "   Remote Control",
@@ -349,6 +377,18 @@ describe("HerdrSessionManager", () => {
         else state.shellMode = false;
         return herdrOk("");
       }
+      if (args[0] === "pane" && args[1] === "send-text" && args[3] === "\u0015") {
+        // C-u(kill-line): 「末尾行のテキスト → その改行」の順に消える（実測 2.1.220。
+        // `AAA\nBBB\nCCC` へ連打すると CCC→改行→BBB→…と 2N-1 回で空になる）。
+        if (state.input.endsWith("\n")) {
+          state.input = state.input.slice(0, -1);
+        } else {
+          const lines = state.input.split("\n");
+          lines[lines.length - 1] = "";
+          state.input = lines.length === 1 ? "" : lines.join("\n");
+        }
+        return herdrOk("");
+      }
       if (args[0] === "pane" && args[1] === "send-text" && args[3] === "\r") {
         if (state.swallowEnters > 0) {
           state.swallowEnters -= 1;
@@ -374,17 +414,43 @@ describe("HerdrSessionManager", () => {
             typed = typed.slice(1);
           }
           state.input += typed;
+          if (options.openDialogOnText === true) state.dialogOpen = true;
         }
         return herdrOk("");
       }
       if (args[0] === "pane" && args[1] === "read") {
+        if (options.plainScreen !== undefined) return herdrOk(options.plainScreen);
         if (state.dialogOpen) return herdrOk(dialogScreen);
         const rule = "─".repeat(40);
         const sigil = state.shellMode ? "!" : "❯";
         const footer = state.shellMode ? "  ! for shell mode" : "  ⏸ manual mode on";
-        return herdrOk(
-          [`❯ 古いメッセージのエコー`, rule, `${sigil} ${state.input}`, rule, footer].join("\n"),
-        );
+        let shown = options.ghostInput ?? state.input;
+        if (state.hideInputReads > 0) {
+          state.hideInputReads -= 1;
+          shown = "";
+        }
+        const wrap = options.wrapWidth ?? 0;
+        const inputLines: string[] = [];
+        for (const logical of shown.split("\n")) {
+          if (wrap <= 0 || [...logical].length <= wrap) {
+            inputLines.push(logical);
+            continue;
+          }
+          const chars = [...logical];
+          for (let start = 0; start < chars.length; start += wrap) {
+            inputLines.push(chars.slice(start, start + wrap).join(""));
+          }
+        }
+        const tail = options.visibleTailLines ?? 0;
+        const visibleLines = tail > 0 ? inputLines.slice(-tail) : inputLines;
+        const scrolled = tail > 0 && visibleLines.length < inputLines.length;
+        const rendered = visibleLines
+          .map((line, index) =>
+            // スクロール時は先頭に sigil が付かない継続行だけが見える（実測の簡略化）。
+            index === 0 && !scrolled ? `${sigil} ${line}` : `  ${line}`,
+          )
+          .join("\n");
+        return herdrOk([`❯ 古いメッセージのエコー`, rule, rendered, rule, footer].join("\n"));
       }
       return herdrOk("");
     });
@@ -468,6 +534,124 @@ describe("HerdrSessionManager", () => {
       ["pane", "send-text", "w4:p2", "重要なメッセージ"],
       ["pane", "send-text", "w4:p2", "\r"],
     ]);
+  });
+
+  test("sendTextSubmit: 入力欄で折り返された本文も反映済みと判定し再投入しない（初回送信二重化の根因①）", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    // 全角24文字=48桁 > 内幅となる狭ペインを模す（表示幅10で折り返し）。
+    const { runner } = makeSubmitHarness({ wrapWidth: 10 });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    const text = "このメッセージが二重になっていないか確認したいので、ZQ とだけ返して。";
+    await manager.sendTextSubmit("s-a", text);
+    // 折り返しをまたぐ probe でも反映済みと判定でき、本文は 1 回だけ送られる。
+    expect(submitSends(runner)).toEqual([
+      ["pane", "send-text", "w4:p2", text],
+      ["pane", "send-text", "w4:p2", "\r"],
+    ]);
+  });
+
+  test("sendTextSubmit: 描画遅延の偽陰性で再投入するときは先に C-u で入力欄を空にする（初回送信二重化の根因②）", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    // 事前確認（ダイアログ/残存/シェルモード）の 3 read + attempt1 の反映検証 2 read までは
+    // 入力欄が空描画（ブート直後の TUI 描画遅延を模す）。
+    const { runner, state } = makeSubmitHarness({ hideInputReads: 5 });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    await manager.sendTextSubmit("s-a", "はじめまして。よろしくお願いします。");
+    // 再投入前に C-u でクリアされ、送信直前の入力欄は本文 1 つ分（連結されない）。
+    expect(submitSends(runner)).toEqual([
+      ["pane", "send-text", "w4:p2", "はじめまして。よろしくお願いします。"],
+      ["pane", "send-text", "w4:p2", "\u0015"],
+      ["pane", "send-text", "w4:p2", "はじめまして。よろしくお願いします。"],
+      ["pane", "send-text", "w4:p2", "\r"],
+    ]);
+    expect(state.input).toBe("");
+  });
+
+  test("sendTextSubmit: 入力欄を空にできないときは再投入せず throw する（二重化より明示再送）", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    // C-u/Backspace で消えない残骸が入力欄に居座る状態を模す。
+    const { runner } = makeSubmitHarness({ ghostInput: "消えない別の残骸テキスト" });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    await expect(manager.sendTextSubmit("s-a", "重要なメッセージ")).rejects.toThrow(
+      /did not reach the input box/,
+    );
+    // 本文の投入は 1 回だけ（クリアを確信できないまま重ね打ちしない）。
+    const bodySends = runner.recorded.filter(
+      (args) => args[1] === "send-text" && args[3] === "重要なメッセージ",
+    );
+    expect(bodySends).toHaveLength(1);
+  });
+
+  test("sendTextSubmit: composer がスクロールして先頭行が窓外でも末尾側 probe で反映済みと判定する", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    // 3 論理行のうち末尾 1 行しか見えない（実測: 10行ペーストで先頭4行が capture から消失）。
+    const { runner } = makeSubmitHarness({ visibleTailLines: 1 });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    const text = "一行目は窓の外に消える\n二行目も見えない\n三行目の末尾だけが見えている";
+    await manager.sendTextSubmit("s-a", text);
+    // 旧実装（本文1行目の先頭24字 probe）では構造的に偽陰性 → 再投入だった。
+    expect(submitSends(runner)).toEqual([
+      ["pane", "send-text", "w4:p2", text],
+      ["pane", "send-text", "w4:p2", "\r"],
+    ]);
+  });
+
+  test("sendTextSubmit: 注入がダイアログを開いたら clearInputBox は書き込まず throw する（誤操作防止）", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const { runner } = makeSubmitHarness({ openDialogOnText: true });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    await expect(manager.sendTextSubmit("s-a", "ダイアログを開く本文")).rejects.toThrow(
+      /did not reach the input box/,
+    );
+    // ダイアログへ C-u を撃ち込まない（誤 Esc/誤 Continue と同型の実害防止）。
+    expect(runner.recorded.some((args) => args[1] === "send-text" && args[3] === "\u0015")).toBe(false);
+    expect(
+      runner.recorded.filter((args) => args[1] === "send-text" && args[3] === "ダイアログを開く本文"),
+    ).toHaveLength(1);
+  });
+
+  test("sendTextSubmit: 入力欄が見えない画面では clearInputBox が書き込まず throw する", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    // 罫線のない画面（描画崩れ/罫線が窓外）: 入力欄を特定できない。
+    const { runner } = makeSubmitHarness({ plainScreen: "ただのシェル出力\n$ " });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    await expect(manager.sendTextSubmit("s-a", "見えない本文")).rejects.toThrow(
+      /did not reach the input box/,
+    );
+    expect(runner.recorded.some((args) => args[1] === "send-text" && args[3] === "\u0015")).toBe(false);
+    expect(
+      runner.recorded.filter((args) => args[1] === "send-text" && args[3] === "見えない本文"),
+    ).toHaveLength(1);
   });
 
   test("sendTextSubmit: 送出が選択ダイアログを開いたら Enter を再送しない（誤 Continue 防止）", async () => {

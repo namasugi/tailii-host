@@ -134,6 +134,14 @@ const SHIFT_TAB_SEQUENCE = "\u001b[Z";
  * `send-text` で生 `\r` を送る。
  */
 const ENTER_SEQUENCE = "\r";
+/**
+ * Ctrl-U（kill-line）の生制御文字。herdr の send-keys は `C-u` をキー名として
+ * 受け付けない（実測: unsupported key）ため、Enter(CR) と同じく send-text で流す。
+ * claude TUI では「行末尾のテキスト → その改行」の順に消える（実測 2.1.220:
+ * `AAA\nBBB\nCCC` へ C-u 連打で CCC→改行→BBB→…と 2N-1 回で必ず空になる。
+ * 空 composer への C-u は完全に no-op で、処理中の agent にも干渉しない）。
+ */
+const KILL_LINE_SEQUENCE = "\u0015";
 
 /**
  * 画面に選択ダイアログのフッター行があるか。チャット本文が「Enter to select」を
@@ -147,17 +155,43 @@ export function screenHasSelectionFooter(screen: string): boolean {
 }
 
 /**
- * 入力反映検証に使う probe（本文 1 行目の先頭部分）。検証不能な本文（空など）は null。
+ * 入力反映検証に使う probe（本文の**末尾側**）。検証不能な本文（空など）は null。
+ *
+ * 末尾側なのは composer の表示特性のため: 入力が表示高を超えると composer は下へ
+ * スクロールし**先頭行が窓外へ消える**（実測 2.1.220: 10行ペーストで先頭4行が
+ * capture から消失）。カーソルは常に末尾にあるので、末尾側の probe だけが
+ * 「見えている範囲」との照合を保証できる（先頭24字の旧 probe は多行/長文で
+ * 構造的に偽陰性 → 再投入 → 本文二重化の温床だった）。
  *
  * 先頭 `!`（シェルモード）は claude TUI がモード記号として吸い上げ、入力欄本文には
- * 残らない（`!ls -la` は `! ls -la` と描画される）。照合キーからも落とさないと
- * 反映検証が必ず失敗する。
+ * 残らない（`!ls -la` は `! ls -la` と描画される）。単一行本文では照合キーからも
+ * 落とさないと末尾24字に `!` が含まれるとき反映検証が失敗する。
  */
 export function typedTextProbe(text: string): string | null {
-  const firstLine = (text.split("\n")[0] ?? "").trim();
-  const body = firstLine.startsWith("!") ? firstLine.slice(1).trim() : firstLine;
+  const lines = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  const lastLine = lines.at(-1);
+  if (lastLine === undefined) return null;
+  const body =
+    lines.length === 1 && lastLine.startsWith("!") ? lastLine.slice(1).trim() : lastLine;
   if (body.length === 0) return null;
-  return body.slice(0, 24);
+  return body.slice(-24);
+}
+
+/**
+ * 入力欄テキストに probe が反映されているか（折り返し非依存）。
+ * extractClaudeInputBox は表示行を trim + "\n" 連結で返すため、probe が入力欄の
+ * 行折り返しをまたぐと生の includes は絶対に一致しない（全角24字=48桁 > 内幅で必発）。
+ * この偽陰性が「反映済み本文の再投入 = 初回送信の本文二重化」の根因だった（実機5件）。
+ * 空白類（折り返しの改行・trim 痕・全角空白含む）を両辺から除去して照合する。
+ */
+export function inputBoxTextIncludesProbe(boxText: string, probe: string): boolean {
+  const strip = (value: string): string => value.replace(/\s+/g, "");
+  const needle = strip(probe);
+  if (needle.length === 0) return false;
+  return strip(boxText).includes(needle);
 }
 
 /** herdr CLI の JSON stdout から `result` を取り出す。JSON でない/エラー封筒は null。 */
@@ -305,6 +339,8 @@ export class HerdrSessionManager {
   private readonly submitVerifyDelayMs: number;
   /** 入力欄へ本文が反映されなかったときの再投入間隔 ms（RC 切断 limbo 対策）。 */
   private readonly inputRetryDelayMs: number;
+  /** clearInputBox の C-u 1回ごとの反映待ち ms（実測レイテンシ 9〜27ms。テスト注入用）。 */
+  private readonly clearKeyDelayMs: number;
   /** 注入前の claude 検出待ちの上限/間隔 ms（テスト注入用）。 */
   private readonly readyTimeoutMs: number;
   private readonly readyPollMs: number;
@@ -317,6 +353,7 @@ export class HerdrSessionManager {
     submitDelayMs?: number;
     submitVerifyDelayMs?: number;
     inputRetryDelayMs?: number;
+    clearKeyDelayMs?: number;
     readyTimeoutMs?: number;
     readyPollMs?: number;
   } = {}) {
@@ -327,6 +364,7 @@ export class HerdrSessionManager {
     this.submitDelayMs = options.submitDelayMs ?? 600;
     this.submitVerifyDelayMs = options.submitVerifyDelayMs ?? 700;
     this.inputRetryDelayMs = options.inputRetryDelayMs ?? 1_500;
+    this.clearKeyDelayMs = options.clearKeyDelayMs ?? 150;
     this.readyTimeoutMs = options.readyTimeoutMs ?? 10_000;
     this.readyPollMs = options.readyPollMs ?? 300;
   }
@@ -539,6 +577,13 @@ export class HerdrSessionManager {
     for (let attempt = 0; attempt < 3 && !typed; attempt += 1) {
       if (attempt > 0) {
         await new Promise((resolve) => setTimeout(resolve, this.inputRetryDelayMs));
+        // 反映検証の偽陰性時にクリアせず再投入すると、前回分と連結され 1 メッセージの
+        // 本文が二重になる（初回送信の本文二重化・実機5件）。再投入前に必ず入力欄を
+        // 空にし、空にできたと確信できなければ再投入を諦めて throw（明示再送）へ倒す。
+        if (!(await this.clearInputBox(name))) break;
+        // クリアがシェルモード記号だけを残すことがある（実測: `!echo ...` へ C-u 1回で
+        // `!` プロンプトの空入力になる）。常に通常モードから再投入する既存方針に合わせる。
+        await this.exitShellMode(name);
       }
       await this.sendKeys(name, [text], true);
       await new Promise((resolve) => setTimeout(resolve, this.submitDelayMs));
@@ -554,10 +599,14 @@ export class HerdrSessionManager {
       }
     }
     if (!typed) {
+      // 残骸（自分の投入分）を残したまま throw すると、アプリの明示再送時に冒頭の
+      // Enter flush が残骸を独立メッセージとして送ってしまう（幽霊バブル）。
+      // best-effort で掃除してから throw する（掃除できない場合もそのまま throw）。
+      await this.clearInputBox(name);
       throw new HerdrFailedError(
         ["pane", "send-text", name],
         1,
-        "typed text did not reach the input box (Remote Control 切断直後の limbo の可能性)",
+        "typed text did not reach the input box (RC limbo / ダイアログ表示中 / 入力欄不可視のいずれか)",
       );
     }
     for (let attempt = 0; attempt < 4; attempt += 1) {
@@ -582,7 +631,44 @@ export class HerdrSessionManager {
   private async inputBoxContainsText(name: string, probe: string): Promise<boolean> {
     try {
       const box = extractClaudeInputBox(await this.captureVisibleScreen(name));
-      return box !== null && box.text.includes(probe);
+      return box !== null && inputBoxTextIncludesProbe(box.text, probe);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 入力欄を空にする（反映検証が偽陰性だったときの再投入前クリア／throw 前の残骸掃除）。
+   * C-u(kill-line) のみを繰り返す（実測: 2N-1 回で必ず空になる。Backspace は本文の
+   * 実文字を削るため使わない）。空にできたら true。次の場合は false を返し、呼び出し側は
+   * 再投入を諦める:
+   * - 選択/承認ダイアログ表示中（本文側の罫線を入力欄と誤認して C-u を撃ち込むと
+   *   既存の誤 Esc/誤 Continue と同型の実害になるため、書き込み自体をしない）
+   * - 入力欄が見えない（罫線が窓外・描画崩れ・capture 失敗）
+   * - 上限回数で空にならない（1回150ms×15回=2.25s。iOS の chat_send ACK 予算 18s の
+   *   内側で速やかに諦めて明示再送へ倒す）
+   *
+   * トレードオフ（意図的な設計判断）: 中断直後に claude が queued 本文を composer へ
+   * 書き戻すタイミングと重なると、そのテキストも C-u で消える（receipt なしの破棄）。
+   * 再投入前クリアを省くと「本文二重化」という別のデータ破損になるため、注入経路では
+   * 「重複より欠落」を選ぶ（残存の主経路は sendTextSubmit 冒頭の Enter flush が先に守る）。
+   */
+  private async clearInputBox(name: string): Promise<boolean> {
+    try {
+      for (let attempt = 0; attempt < 15; attempt += 1) {
+        // ダイアログ判定は selectionDialogVisible（末尾30行窓）に揃える。全画面を
+        // 走査すると、チャット本文に残る閉じたダイアログの転写（「Enter to select」行）を
+        // 誤検出して、クリアできる場面でも常に諦めてしまう（08-03 の窓設計と同じ理由）。
+        if (await this.selectionDialogVisible(name)) return false;
+        const box = extractClaudeInputBox(await this.captureVisibleScreen(name));
+        if (box === null) return false;
+        if (box.text.replace(/\s+/g, "").length === 0) return true;
+        await this.sendKeys(name, [KILL_LINE_SEQUENCE], true);
+        await new Promise((resolve) => setTimeout(resolve, this.clearKeyDelayMs));
+      }
+      // 上限到達時も最後の C-u の結果は未観測なので、最終状態を見てから判定する。
+      const box = extractClaudeInputBox(await this.captureVisibleScreen(name));
+      return box !== null && box.text.replace(/\s+/g, "").length === 0;
     } catch {
       return false;
     }
