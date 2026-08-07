@@ -113,6 +113,22 @@ describe("golden roundtrip", () => {
     }
   });
 
+  it("host-update v1 golden 全行が byte-exact でラウンドトリップする", () => {
+    for (const line of goldenLines("host-update-v1.ndjson")) {
+      const decoded = decodeControlMessage(line);
+      expect(encodeControlMessage(decoded)).toBe(line);
+    }
+  });
+
+  it("forward-compat golden: 未知フィールド入りでも decode が成功する（decode-only・追加のみ規約の固定）", () => {
+    for (const line of goldenLines("forward-compat-v1.ndjson")) {
+      // ラウンドトリップは対象外(未知フィールドは落ちる)。decode が例外なく通り、
+      // 既知フィールドが読めることだけを保証する。
+      const decoded = decodeControlMessage(line);
+      expect(decoded.type.length).toBeGreaterThan(0);
+    }
+  });
+
   it("v0 golden 全行が byte-exact でラウンドトリップする（v 欠落 = v0 互換）", () => {
     for (const line of goldenLines("approval-protocol-v0.ndjson")) {
       const decoded = decodeControlMessage(line);

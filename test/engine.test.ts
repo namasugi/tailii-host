@@ -946,8 +946,9 @@ describe("EngineControl — 横断制御チャネル", () => {
       },
     });
 
+    // managed は host-auto-update の能力広告（開発ツリー実行のため false）。
     expect(await engine.lines.nextOfType("channel_hello")).toBe(
-      '{"maxVersion":2,"serverVersion":"0.1.0","type":"channel_hello","v":1}',
+      '{"managed":false,"maxVersion":2,"serverVersion":"0.1.0","type":"channel_hello","v":1}',
     );
     currentVersion = "0.2.0";
     engine.writeLine('{"id":"L-stale","type":"session_list_request","v":1}');

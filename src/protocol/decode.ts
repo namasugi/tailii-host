@@ -15,6 +15,7 @@ import {
   type GitBranchInfo,
   type GitCommitInfo,
   type GitStatusFile,
+  type HostUpdateStatus,
   type HostVersions,
   type OfficialAppProvider,
   type QuestionAnswer,
@@ -73,7 +74,23 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
 
   switch (type) {
     case "channel_hello":
-      return compact({ type, v, maxVersion: requireNumber(raw, "maxVersion"), serverVersion: optionalString(raw, "serverVersion"), hostName: optionalString(raw, "hostName") });
+      return compact({ type, v, maxVersion: requireNumber(raw, "maxVersion"), serverVersion: optionalString(raw, "serverVersion"), hostName: optionalString(raw, "hostName"), managed: optionalBoolean(raw, "managed"), updateError: optionalString(raw, "updateError") });
+
+    case "host_update_request":
+      return compact({
+        type, v,
+        id: requireString(raw, "id"),
+        version: requireString(raw, "version"),
+        integrity: optionalString(raw, "integrity"),
+      });
+
+    case "host_update_response":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        status: requireHostUpdateStatus(raw),
+        error: optionalNullableString(raw, "error") ?? null,
+      };
 
     case "approval_request":
       return compact({
@@ -1078,6 +1095,17 @@ function decodeCodexAccountUsage(value: unknown): CodexAccountUsage | undefined 
     weeklyResetsAt: optionalString(obj, "weeklyResetsAt"),
     account: optionalString(obj, "account"),
   });
+}
+
+function requireHostUpdateStatus(raw: Raw): HostUpdateStatus {
+  const status = requireString(raw, "status");
+  if (
+    status !== "started" && status !== "already" && status !== "in_progress" &&
+    status !== "unsupported" && status !== "error"
+  ) {
+    throw new ProtocolDecodeError("missing-field", "status");
+  }
+  return status;
 }
 
 function requireBackendKind(raw: Raw): TerminalBackendKind {

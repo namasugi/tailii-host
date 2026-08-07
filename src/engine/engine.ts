@@ -74,6 +74,7 @@ import {
 } from "../backend/sessionBackend.js";
 import { herdrInstalled } from "../backend/herdr.js";
 import { createStaleDistGuard, isStaleDist, readPackageVersion, type StaleDistGuard } from "../shared/version.js";
+import { readRecentUpdateError, resolveInstallState } from "../commands/selfUpdate.js";
 import { resolveHostDisplayName } from "../shared/hostDisplayName.js";
 import {
   DEFAULT_MODE_TIMING,
@@ -465,6 +466,12 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
   try {
     // ---- 1. channel_hello を送出（確立直後）----
     const helloVersion = staleDistGuard?.startupVersion ?? readPackageVersion() ?? undefined;
+    // 自動更新の能力広告と直近失敗の通知（host-auto-update）。
+    // managed=true は「host_update_request を受けられる」ことも兼ねる。
+    const installState = resolveInstallState();
+    // updateError は managed のときだけ載せる（unmanaged では self-update が動かず提示先も無い。
+    // dev 機に残った last-update.json が hello を環境依存にするのも防ぐ）。
+    const updateError = installState.managed ? readRecentUpdateError(helloVersion ?? null) : undefined;
     writer.write({
       type: "channel_hello",
       v: PROTOCOL_V1,
@@ -472,6 +479,8 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
       ...(helloVersion !== undefined ? { serverVersion: helloVersion } : {}),
       // マシン名（iOS の接続先一覧タイトルの供給源）。取れない環境では省略する。
       ...(hostDisplayName !== null ? { hostName: hostDisplayName } : {}),
+      managed: installState.managed,
+      ...(updateError !== undefined ? { updateError } : {}),
     });
 
     // ---- 1.5 画像 pending を drain し image_available を送出 ----

@@ -13,6 +13,7 @@ import { gitHandlers } from "./git.js";
 import { modeHandlers } from "./mode.js";
 import { officialAppHandlers } from "./officialApps.js";
 import { previewHandlers } from "./preview.js";
+import { selfUpdateHandlers } from "./selfUpdate.js";
 import { sessionHandlers } from "./session.js";
 import { usageHandlers } from "./usage.js";
 import { workspaceHandlers } from "./workspace.js";
@@ -31,4 +32,5 @@ export const ENGINE_HANDLERS: HandlerRegistry = {
   ...workspaceHandlers,
   ...gitHandlers,
   ...previewHandlers,
+  ...selfUpdateHandlers,
 };

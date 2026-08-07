@@ -247,6 +247,16 @@ export interface SubagentTranscriptEntry {
 }
 export type Decision = "allow" | "deny";
 export type RemotePendingKind = "approval" | "question";
+
+/**
+ * host_update_response.status:
+ *   started     — updater を起動した(完了は再接続後の channel_hello.serverVersion で確認する)
+ *   already     — 既に目標版(冪等成功)
+ *   in_progress — 別の更新が進行中(冪等成功扱い)
+ *   unsupported — 自動更新の対象外(dev インストール / 手動管理シム)
+ *   error       — 起動前検証で拒否(ダウングレード等。詳細は error)
+ */
+export type HostUpdateStatus = "started" | "already" | "in_progress" | "unsupported" | "error";
 export type OfficialAppProvider = "claude" | "codex";
 export type OfficialAppAction = "open" | "repair" | "stop";
 export type OfficialAppState = "active" | "inactive" | "unavailable";
@@ -345,7 +355,9 @@ export interface HostVersions {
 }
 
 export type ControlMessage =
-  | { type: "channel_hello"; v: number; maxVersion: number; serverVersion?: string; hostName?: string }
+  | { type: "channel_hello"; v: number; maxVersion: number; serverVersion?: string; hostName?: string; managed?: boolean; updateError?: string }
+  | { type: "host_update_request"; v: number; id: string; version: string; integrity?: string }
+  | { type: "host_update_response"; v: number; id: string; status: HostUpdateStatus; error?: string | null }
   | { type: "approval_request"; v: number; id: string; tool: string; summary: string; cwd: string; diff?: ToolDiff }
   | { type: "approval_decision"; v: number; id: string; decision: Decision; reason?: string }
   | { type: "remote_pending"; v: number; id: string; session: string; kind: RemotePendingKind; tool?: string; summary: string }

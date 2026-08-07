@@ -1,0 +1,3 @@
+{"maxVersion":2,"type":"channel_hello","v":2,"xFutureField":"decode は未知フィールドを無視する(この行はラウンドトリップ対象外)"}
+{"cwd":"/tmp","id":"fc1","summary":"ls","tool":"Bash","type":"approval_request","v":1,"xFutureFlag":true}
+{"id":"fc2","type":"host_update_request","v":2,"version":"9.9.9","xFutureNested":{"a":1}}

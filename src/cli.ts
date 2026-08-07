@@ -24,7 +24,9 @@ import { runSetupCommand } from "./commands/setup.js";
 import { runDoctorCommand } from "./commands/doctor.js";
 import { runHubCommand } from "./hub/hubDaemon.js";
 import { runQuicInfoCommand } from "./services/quicGateway.js";
+import { runSelfUpdateCommand } from "./commands/selfUpdate.js";
 import { migrateLegacyHome } from "./commands/legacyHomeMigration.js";
+import { readPackageVersion } from "./shared/version.js";
 
 const PORTED: Record<string, (args: string[]) => Promise<number>> = {
   engine: runEngineCommand,
@@ -37,14 +39,21 @@ const PORTED: Record<string, (args: string[]) => Promise<number>> = {
   doctor: runDoctorCommand,
   hub: runHubCommand,
   "quic-info": runQuicInfoCommand,
+  "self-update": runSelfUpdateCommand,
 };
 
 async function main(): Promise<number> {
   migrateLegacyHome();
   const [subcommand, ...rest] = process.argv.slice(2);
+  // `--version` の出力形式（version 文字列 + 改行のみ）は self-update のスモークテストが
+  // 新旧バージョンをまたいで依存する凍結契約。変更しないこと。
+  if (subcommand === "--version" || subcommand === "-v") {
+    process.stdout.write(`${readPackageVersion() ?? "unknown"}\n`);
+    return 0;
+  }
   if (!subcommand || subcommand === "--help" || subcommand === "-h") {
     process.stderr.write(
-      "usage: tailii <engine|serve|hook|launch|kick|push-token|setup|doctor|hub> [options]\n",
+      "usage: tailii <engine|serve|hook|launch|kick|push-token|setup|doctor|hub|self-update> [options]\n",
     );
     return 64;
   }

@@ -1,0 +1,9 @@
+{"managed":true,"maxVersion":2,"serverVersion":"0.4.0","type":"channel_hello","v":2}
+{"hostName":"Alice's Mac mini","managed":true,"maxVersion":2,"serverVersion":"0.3.0","type":"channel_hello","updateError":"Node.js が不足しています(必要 >=22, 現在 20.11.0)","v":2}
+{"id":"u1","integrity":"sha512-o8PSY4EJcVNrOnawvHW1WjBWGGnyQEnUYtWvGXjTF8TDf58ChpV+RH7ZAIJmzCDPyBqEdMV8CTBSCzWbTOZ7WA==","type":"host_update_request","v":2,"version":"0.4.0"}
+{"id":"u2","type":"host_update_request","v":2,"version":"0.4.1"}
+{"error":null,"id":"u1","status":"started","type":"host_update_response","v":2}
+{"error":null,"id":"u2","status":"already","type":"host_update_response","v":2}
+{"error":null,"id":"u3","status":"in_progress","type":"host_update_response","v":2}
+{"error":"自動更新の対象外です(dev-install)","id":"u4","status":"unsupported","type":"host_update_response","v":2}
+{"error":"ダウングレード要求(0.5.0 → 0.4.0)は受け付けません","id":"u5","status":"error","type":"host_update_response","v":2}
