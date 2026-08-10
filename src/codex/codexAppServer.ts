@@ -138,16 +138,34 @@ class WebSocketCodexAppServerConnection implements CodexAppServerConnection {
         // permessage-deflateを送るとRust側がhandshakeを拒否する。
         perMessageDeflate: false,
       });
+      // handshake にも期限を切る。UNIX socket は listen backlog がある限りカーネルが接続を
+      // 受理するため、app-server が「死んでいる」のではなく「応答不能（刺さっている）」場合は
+      // open も error も発火せず Promise が永久に settle しない。これを直列 await する
+      // engine の read loop と hub の tick ループが同時に止まる（request 側には期限があるのに
+      // connect だけ素通しだった非対称の解消）。
+      let handshakeTimer: ReturnType<typeof setTimeout> | null = null;
       const onError = (error: Error): void => {
+        if (handshakeTimer !== null) clearTimeout(handshakeTimer);
         socket.removeListener("open", onOpen);
         reject(error);
       };
       const onOpen = (): void => {
+        if (handshakeTimer !== null) clearTimeout(handshakeTimer);
         socket.removeListener("error", onError);
         resolve(new WebSocketCodexAppServerConnection(socket, requestTimeoutMs));
       };
       socket.once("error", onError);
       socket.once("open", onOpen);
+      handshakeTimer = setTimeout(() => {
+        socket.removeListener("open", onOpen);
+        socket.removeListener("error", onError);
+        // terminate は基底ソケットを破棄するため ECONNRESET 等の "error" を後追いで
+        // 発火しうる。リスナー不在の EventEmitter "error" は throw になるので、
+        // 捨てる先を必ず用意してから落とす。
+        socket.on("error", () => {});
+        socket.terminate();
+        reject(new Error("Codex App Server handshake timed out"));
+      }, requestTimeoutMs);
     });
   }
 
