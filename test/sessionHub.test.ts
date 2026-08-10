@@ -1303,6 +1303,93 @@ describe("SessionHub conversation stream", () => {
     expect(tails[0]!.stopped).toBe(true);
   });
 
+  // backfilling 中の購読者は publishConversationEvent が丸ごと飛ばす。センチネルが来ない会話で
+  // 旗が立ちっぱなしになり「接続は健全なのに会話だけ永久に更新されない」実障害になった。
+  test("履歴 backfill が停滞しても live 配信へ復帰し、境界後のイベントを取りこぼさない", async () => {
+    vi.useFakeTimers();
+    try {
+      const { hub, writes } = makeStreamingHub();
+      const a = {}, b = {}, ar: unknown[] = [], br: unknown[] = [];
+      subscribe(hub, a, ar);
+      writes[0]!(output("before"));
+      // buffer 範囲外の afterSeq で 2 人目が購読 → backfill 経路に入る。
+      subscribe(hub, b, br, { afterSeq: 999 });
+      br.length = 0;
+      // 履歴 tail は 1 行も流さない（transcript を開けない会話の再現）。
+      writes[0]!(output("during-stall"));
+      expect(br).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(15_000);
+      // 停滞中に発生したイベントは replay で埋め戻す（無音の欠落を作らない）。
+      expect(br).toContainEqual(expect.objectContaining({
+        payload: expect.objectContaining({ streamId: "during-stall" }),
+      }));
+      writes[0]!(output("after-recovery"));
+      expect(br).toContainEqual(expect.objectContaining({
+        payload: expect.objectContaining({ streamId: "after-recovery" }),
+      }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // 同じ client オブジェクトが離脱→再購読すると SubscriberState と tail が入れ替わる。
+  // 前回の停滞タイマーが無条件に後始末すると、新しい購読の backfilling を履歴再生の途中で
+  // 落として履歴と live を混線させ、さらに新しい tail を管理表から外して停止不能にする。
+  test("停滞 backfill の離脱→再購読で、古いタイマーが新しい購読を壊さない", async () => {
+    vi.useFakeTimers();
+    try {
+      const { hub, writes, tails } = makeStreamingHub();
+      const a = {}, b = {}, ar: unknown[] = [], br: unknown[] = [];
+      subscribe(hub, a, ar);
+      writes[0]!(output("before"));
+      subscribe(hub, b, br, { afterSeq: 999 });
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      hub.handleClientMessage(b, JSON.stringify({ type: "conversation_unsubscribe", session: "work" }));
+      subscribe(hub, b, br, { afterSeq: 999 });
+      br.length = 0;
+      // 1 回目の停滞タイマーが発火する時刻をまたぐ。2 回目の backfill はまだ進行中。
+      await vi.advanceTimersByTimeAsync(6_000);
+
+      writes[0]!(output("during-second-backfill"));
+      expect(br).toEqual([]);
+      // 2 回目の tail が管理表に残っていること（離脱で確実に stop できること）。
+      hub.handleClientMessage(b, JSON.stringify({ type: "conversation_unsubscribe", session: "work" }));
+      expect(tails[2]!.stopped).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("履歴 tail を開けなくても live 配信を止めない", () => {
+    const metadataStore = makeTempStore();
+    metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0, providerSessionId: "provider-1" });
+    const writes: Array<(payload: ControlMessage) => void> = [];
+    let created = 0;
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir: makeTempDir("session-hub-open-fail"), metadataStore,
+      timeoutSeconds: 1800, replayLimit: 500,
+      tailFactory: (write) => {
+        writes.push(write);
+        const shouldFail = ++created > 1;
+        return {
+          open() { if (shouldFail) throw new Error("transcript missing"); },
+          stop() {},
+        };
+      },
+    });
+    const a = {}, b = {}, ar: unknown[] = [], br: unknown[] = [];
+    subscribe(hub, a, ar);
+    writes[0]!(output("before"));
+    subscribe(hub, b, br, { afterSeq: 999 });
+    br.length = 0;
+    writes[0]!(output("after-open-failure"));
+    expect(br).toContainEqual(expect.objectContaining({
+      payload: expect.objectContaining({ streamId: "after-open-failure" }),
+    }));
+  });
+
   test("初回購読時にmetadata未作成でも出現後に自動でtailを開始する", async () => {
     vi.useFakeTimers();
     try {
@@ -1759,6 +1846,40 @@ describe("SessionHub Codex App Server live stream", () => {
     writes[0]!(chat("system", "gpt-one-source", "pc:model")); // stop と競合しても rollout marker は無視。
     expect(received.filter((message) => message?.payload?.text === "TUI からの turn")).toHaveLength(1);
     expect(received.filter((message) => message?.payload?.text === "gpt-one-source")).toHaveLength(1);
+  });
+
+  // 強制完了（停滞）でも codex の二重表示打ち消しを迂回しない。rollout(履歴) と
+  // app-server(live) が同じ発話を表すため、境界後の replay を素通しすると重複する。
+  test("codex は強制完了でも履歴と live の二重表示を打ち消す", async () => {
+    vi.useFakeTimers();
+    try {
+      const { hub, writes, getCallbacks } = makeCodexStreamingHub();
+      const a = {}, ar: any[] = [];
+      subscribe(hub, a, ar);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(writes).toHaveLength(1);
+      writes[0]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+
+      // 2 人目は buffer 範囲外の afterSeq で backfill 経路に入る。
+      const b = {}, br: any[] = [];
+      subscribe(hub, b, br, { afterSeq: 999 });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(writes).toHaveLength(2);
+      br.length = 0;
+
+      // 境界後の live 発話（backfilling 中なので B へは配信されず replayBuffer に載る）と、
+      // 同じ発話を B の履歴 tail も rollout 由来で配信する。
+      getCallbacks().onChatItem?.({ session: "work", itemId: "dup",
+        payload: chat("assistant", "重複候補", "codex-item-dup") });
+      writes[1]!(chat("assistant", "重複候補", "codex-turn-dup"));
+
+      // センチネルは来ないまま停滞 → 強制完了。
+      await vi.advanceTimersByTimeAsync(15_000);
+
+      expect(br.filter((message) => message?.payload?.text === "重複候補")).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("snapshot 前の同文履歴だけでは snapshot 後の正当な再投稿を除外しない", async () => {

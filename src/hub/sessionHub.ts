@@ -95,6 +95,13 @@ interface PendingCodexTurn {
   message: Extract<HubClientMessage, { type: "codex_turn_submit" }>;
   waiters: Array<{ client: object; id: string }>;
 }
+/**
+ * backfilling 中の購読者は publishConversationEvent が丸ごと飛ばす。旗が立ちっぱなしになると
+ * 「接続は健全なのに会話だけ永久に更新されない」実障害になるため、履歴が一定時間 1 行も進まな
+ * ければ強制的に live へ切り替える。進捗があるうちは延長するので、巨大な transcript の再生を
+ * 途中で打ち切ることはない。
+ */
+const BACKFILL_STALL_TIMEOUT_MS = 15_000;
 const DELIVERED_RECEIPT_TTL_MS = 30 * 24 * 60 * 60 * 1_000;
 const MAX_DELIVERED_RECEIPTS_PER_SESSION = 10_000;
 interface CodexBufferedItem { itemId: string; payload: ControlMessage }
@@ -1173,19 +1180,44 @@ export class SessionHub {
     if (this.options.tailFactory === undefined) return;
     const meta = this.options.metadataStore.get(session);
     if (meta === null) return;
-    actor.subscribers.get(client)!.backfilling = true;
+    // 離脱→再購読で同じ client オブジェクトが**別の** SubscriberState / tail を持つ。古い
+    // backfill の後始末が新しい購読を壊さないよう、自分が始めた分だけを識別して触る。
+    const ownState = actor.subscribers.get(client)!;
+    ownState.backfilling = true;
     const boundarySeq = actor.nextServerSeq - 1;
     const liveCountsAtStart = new Map(actor.codexLive?.publishedContentCounts ?? []);
     const backfillCounts = new Map<string, number>();
     let completedSynchronously = false;
+    let finished = false;
+    let stallTimer: ReturnType<typeof setTimeout> | null = null;
     let tail: HubTail | null = null;
-    const finish = (): void => {
-      const state = actor.subscribers.get(client);
-      if (state === undefined) return;
+    const clearStallTimer = (): void => {
+      if (stallTimer === null) return;
+      clearTimeout(stallTimer);
+      stallTimer = null;
+    };
+    const finish = (reason: "history-done" | "stalled" | "open-failed"): void => {
+      if (finished) return;
+      finished = true;
+      clearStallTimer();
+      // 自分の tail だけを管理表から外す。停滞タイマーが再購読後に発火した場合、無条件に
+      // delete すると**新しい** tail が管理外になり、以後 unsubscribe しても停止できない。
+      if (actor.backfillTails.get(client) === tail) actor.backfillTails.delete(client);
+      const superseded = actor.subscribers.get(client) !== ownState;
+      completedSynchronously = tail === null;
+      tail?.stop();
+      // 既に離脱済み、または再購読で別の backfill が走っているなら状態は触らない。
+      if (superseded) return;
       // 共有 tail の emit 時点でイベントは transcript に存在する。その後 EOF まで読む
       // 履歴 tail に必ず含まれるため、同じ同期処理で live へ切り替えても取りこぼさない。
-      state.backfilling = false;
+      ownState.backfilling = false;
+      if (reason !== "history-done") {
+        this.options.log?.(`audit backfill-force-finish session=${session} reason=${reason}`);
+      }
       if (actor.codexLive !== null) {
+        // codex は rollout(履歴) と app-server(live) が同じ発話を二重に表すため、履歴側が
+        // 何を出したかで打ち消してから境界後を replay する。強制完了で履歴が途中まで進んで
+        // いた場合も `backfillCounts` にその分が入っているので、同じ経路が正しく効く。
         const representedAfterBoundary = new Map<string, number>();
         for (const [key, count] of backfillCounts) {
           const excess = count - (liveCountsAtStart.get(key) ?? 0);
@@ -1201,20 +1233,53 @@ export class SessionHub {
           }
           this.sendTo(client, { type: "conversation_event", session, ...event });
         }
+      } else if (reason !== "history-done") {
+        // 履歴を最後まで読めていない。境界後のイベントは履歴側に含まれないため replay で補う
+        // （止まった backfill が境界後の行まで到達している見込みは薄く、重複表示のリスクより
+        // 応答が丸ごと欠ける実害のほうが大きい）。
+        for (const event of actor.replayBuffer) {
+          if (event.serverSeq <= boundarySeq) continue;
+          this.sendTo(client, { type: "conversation_event", session, ...event });
+        }
       }
-      completedSynchronously = tail === null;
-      tail?.stop();
-      actor.backfillTails.delete(client);
+    };
+    // 進捗は「最後に 1 行流れた時刻」で測る。履歴行ごとに setTimeout を張り替えると
+    // 巨大な transcript でタイマー生成が支配的になるため、タイマーは 1 本のまま残時間を見る。
+    let lastProgressAt = Date.now();
+    const armStallTimer = (delayMs: number): void => {
+      stallTimer = setTimeout(() => {
+        stallTimer = null;
+        if (finished) return;
+        const remaining = BACKFILL_STALL_TIMEOUT_MS - (Date.now() - lastProgressAt);
+        if (remaining > 0) {
+          armStallTimer(remaining);
+          return;
+        }
+        finish("stalled");
+      }, delayMs);
+      stallTimer.unref();
     };
     tail = this.options.tailFactory((payload) => {
       this.sendTo(client, { type: "conversation_event", session, serverSeq: 0, payload });
+      lastProgressAt = Date.now();
       const key = chatContentKey(payload);
       if (key !== null) incrementCount(backfillCounts, key);
-      if (payload.type === "chat_output" && payload.streamId === HISTORY_DONE_STREAM_ID) finish();
+      if (payload.type === "chat_output" && payload.streamId === HISTORY_DONE_STREAM_ID) finish("history-done");
     });
     if (!completedSynchronously) actor.backfillTails.set(client, tail);
-    tail.open(meta.cwd, meta.providerSessionId ?? meta.claudeSessionId ?? null, newerThanMs, meta.agent ?? "claude");
-    if (completedSynchronously) tail.stop();
+    try {
+      tail.open(meta.cwd, meta.providerSessionId ?? meta.claudeSessionId ?? null, newerThanMs, meta.agent ?? "claude");
+    } catch (error) {
+      // transcript を開けない会話で旗を立てたまま抜けると live 配信が永久に止まる。
+      this.options.log?.(`audit backfill-open-failed session=${session} error=${String(error)}`);
+      finish("open-failed");
+      return;
+    }
+    if (completedSynchronously) {
+      tail.stop();
+      return;
+    }
+    if (!finished) armStallTimer(BACKFILL_STALL_TIMEOUT_MS);
   }
 
   private canReplay(actor: SessionActor, afterSeq: number): boolean {
