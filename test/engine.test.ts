@@ -375,6 +375,34 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
+  // hub_state_request は read loop の中で await される。settle しないと以後 iOS からの全
+  // メッセージを読まなくなり、「会話も一覧も更新されず新規セッションも始められない。接続先
+  // 一覧へ戻って繋ぎ直すと（engine が作り直されて）直る」という実障害になる。
+  test("hub_state_request がリンク不調で破棄されても read loop を止めない", async () => {
+    const store = makeTempStore();
+    store.put({ name: "work", cwd: "/tmp/work", createdAt: 1, agent: "claude",
+      providerSessionId: "provider-1" });
+    const hubLink: HubLink = {
+      onMessage: null, onReconnect: null,
+      // 非 replayable な id 相関 RPC はリンク不調時に破棄され false が返る。応答も来ない。
+      send: (message) => message.type !== "hub_state_request",
+      close: vi.fn(),
+    };
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("work\n") : ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner, store), metadataStore: store, hubLink });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine('{"id":"open","name":"work","type":"session_reattach","v":2}');
+    await engine.lines.nextOfType("session_list_response");
+
+    // reattach は応答を先に書いてから hub 状態を待つ。止まるのはその後に届くメッセージなので、
+    // 「次の要求に応答が返ること」で read loop の生存を確かめる。
+    engine.writeLine('{"id":"after-stall","type":"session_list_request","v":1}');
+    expect(decodeControlMessage(
+      await engine.lines.nextOfType("session_list_response"),
+    )).toMatchObject({ id: "after-stall" });
+    await engine.teardown();
+  });
+
   test("Hub 世代変更は未購読 session の旧 serverSeq checkpoint も破棄する", async () => {
     const store = makeTempStore();
     for (const name of ["work", "other"]) {

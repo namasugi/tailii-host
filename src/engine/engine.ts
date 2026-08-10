@@ -814,28 +814,36 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
         }
       }
     };
-    const requestHubState = (session: string): Promise<{ id: string; questions: QuestionPromptQuestion[] } | null> => {
+    const requestHubState = async (
+      session: string,
+    ): Promise<{ id: string; questions: QuestionPromptQuestion[] } | null> => {
       const id = randomUUID();
-      return new Promise((resolve) => {
-        rpcWaiters.set(id, (raw) => {
-          const response = raw as Extract<HubServerMessage, { type: "hub_state_response" }>;
-          if (response.processing) {
-            processingSessions.set(session, Math.floor(Date.now() / 1000));
-            watchBackgroundSession(session);
-          } else {
-            processingSessions.delete(session);
-            finishWatchingBackgroundSession(session);
-          }
-          writer.write({
-            type: "session_processing_state",
-            v: state.negotiatedVersion,
-            session,
-            active: response.processing,
-          });
-          resolve(response.pendingQuestion);
-        });
-        hubLink.send({ type: "hub_state_request", id, session });
+      let response: Extract<HubServerMessage, { type: "hub_state_response" }>;
+      try {
+        response = await hubRpc<Extract<HubServerMessage, { type: "hub_state_response" }>>(
+          { type: "hub_state_request", id, session }, id, 3_000,
+        );
+      } catch (error) {
+        // Hub 不達で会話操作を止めない。この await は read loop の中にあり、settle しないと
+        // 以後 iOS からの全メッセージを読まなくなる（会話も一覧も更新されず新規セッションも
+        // 始められない実障害）。設問再掲と処理中表示は次の push で追いつくので fail-open する。
+        process.stderr.write(`[tailii-host engine] hub_state_request 失敗: ${String(error)}\n`);
+        return null;
+      }
+      if (response.processing) {
+        processingSessions.set(session, Math.floor(Date.now() / 1000));
+        watchBackgroundSession(session);
+      } else {
+        processingSessions.delete(session);
+        finishWatchingBackgroundSession(session);
+      }
+      writer.write({
+        type: "session_processing_state",
+        v: state.negotiatedVersion,
+        session,
+        active: response.processing,
       });
+      return response.pendingQuestion;
     };
     // remoteQuestionMonitor は起動しない（question-hook-relay で陳腐化）。transcript には
     // 回答済みの設問しか現れなくなったため、monitor が出せるのは「回答直後の
