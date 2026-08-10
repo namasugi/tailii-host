@@ -176,6 +176,30 @@ describe("HerdrSessionManager", () => {
     expect((await manager.list()).map((info) => info.alive)).toEqual([false]);
   });
 
+  // reaper はこの区別で「消滅」判定を止める。list() の空集合と混同すると、CLI の一時的な
+  // 失敗で生存中の会話を retire してしまう。
+  test("listLive は取得失敗を null で返し、成功時は list と同じ内容を返す", async () => {
+    const store = makeStore();
+    store.put({ name: "s-x", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+
+    const failing = new MockHerdrRunner(() => ({ exitCode: 1, stdout: "", stderr: "connect error" }));
+    expect(await new HerdrSessionManager({ runner: failing.runner, store }).listLive()).toBeNull();
+    // 同じ失敗でも list() は従来どおり alive:false の配列に倒す（呼び出し側の契約は不変）。
+    expect((await new HerdrSessionManager({ runner: failing.runner, store }).list())
+      .map((info) => info.alive)).toEqual([false]);
+
+    const ok = new MockHerdrRunner(() => herdrOk(paneListJson([{ pane_id: "w4:p2" }])));
+    const manager = new HerdrSessionManager({ runner: ok.runner, store });
+    expect(await manager.listLive()).toEqual(await manager.list());
+  });
+
+  test("listLive は herdr メタが皆無なら CLI を呼ばず空配列（null ではない）", async () => {
+    const store = makeStore();
+    store.put({ name: "s-tmux", cwd: "/d", createdAt: 1 });
+    const runner = new MockHerdrRunner(() => { throw new Error("呼ばれてはいけない"); });
+    expect(await new HerdrSessionManager({ runner: runner.runner, store }).listLive()).toEqual([]);
+  });
+
   test("sendKeys: literal はテキスト、既知キーは send-keys、BTab は生シーケンス、数字はテキスト", async () => {
     const store = makeStore();
     store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });

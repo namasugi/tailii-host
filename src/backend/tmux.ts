@@ -142,11 +142,24 @@ function splitInputPrompt(bodyLines: string[]): ClaudeInputBox {
   return { prompt: sigil ?? "", text: isInputPlaceholder(text) ? "" : text };
 }
 
+/**
+ * 発行するのは ls / capture-pane / send-keys / kill-session など即応するコマンドだけで、
+ * 正当に長引くものは無い。無期限に待つと、これを直列 await する engine の read loop
+ * （以後の全メッセージを読まなくなる）と hub の tick ループが同時に止まるため、
+ * 上限を切って「失敗」として返す（`gitService` の execFile と同じ規約）。
+ */
+const TMUX_TIMEOUT_MS = 15_000;
+
 /** 実 tmux を絶対パスで起動する既定ランナー。tmux 非0 exit は throw せず結果で表現する。 */
-export function processTmuxCommandRunner(tmuxPath: string = DEFAULT_TMUX_PATH): TmuxCommandRunner {
+export function processTmuxCommandRunner(
+  tmuxPath: string = DEFAULT_TMUX_PATH,
+  timeoutMs: number = TMUX_TIMEOUT_MS,
+): TmuxCommandRunner {
   return (args) =>
     new Promise((resolve, reject) => {
-      execFile(tmuxPath, args, { maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
+      execFile(tmuxPath, args, {
+        maxBuffer: 16 * 1024 * 1024, timeout: timeoutMs,
+      }, (error, stdout, stderr) => {
         if (error && typeof (error as NodeJS.ErrnoException).code === "string") {
           // 実行ファイル起動自体の失敗（ENOENT 等）のみ throw（Swift 版と同じ境界）。
           reject(error);

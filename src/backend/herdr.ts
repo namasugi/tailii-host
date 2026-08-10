@@ -70,6 +70,9 @@ export function herdrInstalled(herdrPath: string = defaultHerdrPath()): boolean 
   }
 }
 
+/** herdr コマンドの上限。無期限待ちが read loop / tick ループを止めるのを防ぐ。 */
+const HERDR_TIMEOUT_MS = 15_000;
+
 /**
  * 実 herdr を起動する既定ランナー。herdr 非0 exit は throw せず結果で表現する。
  * `sessionName`（既定 tailii）を `--session` として全コマンドに前置する。
@@ -77,13 +80,17 @@ export function herdrInstalled(herdrPath: string = defaultHerdrPath()): boolean 
 export function processHerdrCommandRunner(
   herdrPath: string = defaultHerdrPath(),
   sessionName: string = HERDR_TAILII_SESSION,
+  timeoutMs: number = HERDR_TIMEOUT_MS,
 ): HerdrCommandRunner {
   return (args) =>
     new Promise((resolve, reject) => {
       execFile(
         herdrPath,
         ["--session", sessionName, ...args],
-        { maxBuffer: 16 * 1024 * 1024 },
+        // 発行するのは pane list / pane get / tab list など即応するコマンドだけ。無期限に
+        // 待つと engine の read loop と hub の tick ループが同時に止まるため上限を切る
+        // （tmux ランナー・`gitService` と同じ規約）。
+        { maxBuffer: 16 * 1024 * 1024, timeout: timeoutMs },
         (error, stdout, stderr) => {
           if (error && typeof (error as NodeJS.ErrnoException).code === "string") {
             // 実行ファイル起動自体の失敗（ENOENT 等）のみ throw（tmux ランナーと同じ境界）。
@@ -377,7 +384,23 @@ export class HerdrSessionManager {
   async list(): Promise<SessionInfo[]> {
     // herdr メタが皆無なら CLI を呼ばない（常時 Composite 構成でも純 tmux 環境に副作用ゼロ）。
     if (!this.store.all().some((meta) => meta.backend === "herdr")) return [];
-    const panes = await this.livePanes();
+    return this.listFromPanes(await this.livePanes());
+  }
+
+  /**
+   * reaper 用の列挙。pane 一覧を**取得できなかった**場合は null を返し、「herdr セッション
+   * 0 件」と区別する。両者を混同すると、CLI の一時的な失敗（タイムアウト・server 再起動中）
+   * で生存中のセッションを「消滅」と誤判定し、heartbeat を回収して会話を retire してしまう
+   * （`ReaperTickOptions.listLocalServerCwds` の「null=検出不能」と同じ規約）。
+   */
+  async listLive(): Promise<SessionInfo[] | null> {
+    if (!this.store.all().some((meta) => meta.backend === "herdr")) return [];
+    const panes = await this.livePanesOrNull();
+    if (panes === null) return null;
+    return this.listFromPanes(panes);
+  }
+
+  private async listFromPanes(panes: HerdrPane[]): Promise<SessionInfo[]> {
     const paneIds = new Set(panes.map((pane) => pane.paneId));
     const labels = new Set(panes.map((pane) => pane.label).filter((label) => label !== null));
     // タブラベル（Mac 側リネーム含む会話タイトル表示）を name→label で引けるようにする
@@ -854,15 +877,20 @@ export class HerdrSessionManager {
     }
   }
 
-  /** 生存 pane の一覧。herdr server 未起動などの失敗は空集合として扱う（tmux `ls` と同じ流儀）。 */
-  private async livePanes(): Promise<HerdrPane[]> {
+  /** 生存 pane の一覧。取得できなかった場合は null（「0 件」と区別する）。 */
+  private async livePanesOrNull(): Promise<HerdrPane[] | null> {
     try {
       const result = await this.runner(["pane", "list"]);
-      if (result.exitCode !== 0) return [];
+      if (result.exitCode !== 0) return null;
       return parseHerdrPaneList(result.stdout);
     } catch {
-      return [];
+      return null;
     }
+  }
+
+  /** 生存 pane の一覧。herdr server 未起動などの失敗は空集合として扱う（tmux `ls` と同じ流儀）。 */
+  private async livePanes(): Promise<HerdrPane[]> {
+    return (await this.livePanesOrNull()) ?? [];
   }
 
   /** セッション名の現存 pane を解決する（記録済み pane ID 優先、無ければ label 一致）。 */

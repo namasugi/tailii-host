@@ -298,6 +298,64 @@ describe("reaperTick herdr backend", () => {
     };
   }
 
+  // herdr が答えられなかった tick を「セッション 0 件」と混同すると、生存中の会話を
+  // 「消滅」と誤判定して heartbeat を回収し、retire（queue 破棄・Session disappeared 通知）
+  // まで走る。アプリ上は実行中の会話が突然消える。
+  test("herdr の生存判定に失敗した tick は herdr セッションを回収しない", async () => {
+    const dir = makeTempDir("reaper-herdr-unavailable");
+    const tmux = runnerWithSessions([]);
+    const store = makeTempStore();
+    store.put({ name: "s-herdr", cwd: "/w", createdAt: 1, backend: "herdr" });
+    writeHeartbeat(dir, "s-herdr", { ts: NOW - 10, state: "idle" });
+    // 素性の分からない残骸（メタ無し）は従来どおり回収する。
+    writeHeartbeat(dir, "s-orphan", { ts: NOW - 10, state: "idle" });
+    let stopServerCalls = 0;
+
+    const result = await reaperTick({
+      runner: tmux.runner,
+      heartbeatDir: dir,
+      metadataStore: store,
+      timeoutSeconds: TIMEOUT,
+      now: NOW,
+      herdrOps: {
+        list: async () => [],
+        listLive: async () => null, // 検出不能（CLI タイムアウト / server 再起動中）
+        agentProcessAlive: async () => true,
+        kill: async () => {},
+        stopServerIfEmpty: async () => { stopServerCalls += 1; },
+      },
+    });
+
+    expect(result.reclaimed).toEqual(["s-orphan"]);
+    expect(readHeartbeat(dir, "s-herdr")).not.toBeNull();
+    // 「0 件」ではないので空 server 停止も試みない。
+    expect(stopServerCalls).toBe(0);
+  });
+
+  test("listLive が空配列を返す tick は従来どおり回収する（0 件と検出不能を取り違えない）", async () => {
+    const dir = makeTempDir("reaper-herdr-empty");
+    const tmux = runnerWithSessions([]);
+    const store = makeTempStore();
+    store.put({ name: "s-herdr", cwd: "/w", createdAt: 1, backend: "herdr" });
+    writeHeartbeat(dir, "s-herdr", { ts: NOW - 10, state: "idle" });
+
+    const result = await reaperTick({
+      runner: tmux.runner,
+      heartbeatDir: dir,
+      metadataStore: store,
+      timeoutSeconds: TIMEOUT,
+      now: NOW,
+      herdrOps: {
+        list: async () => [],
+        listLive: async () => [],
+        agentProcessAlive: async () => true,
+        kill: async () => {},
+      },
+    });
+
+    expect(result.reclaimed).toEqual(["s-herdr"]);
+  });
+
   test("未命名タブへClaude/Codexの会話タイトルを自動反映し、命名済み/導出不能は触らない（session-title）", async () => {
     const dir = makeTempDir("reaper-herdr-title");
     const tmux = runnerWithSessions([]);

@@ -47,6 +47,11 @@ export const TAILII_SESSION_PATTERN = /^(cs|s)-/;
 /** herdr backend セッションの reaper 操作面（テストはモックを注入する）。 */
 export interface HerdrReaperOps {
   list(): Promise<SessionInfo[]>;
+  /**
+   * 列挙できなかった場合に null を返す版（任意実装）。null=検出不能として heartbeat 回収を
+   * 見送る。実装が無い ops は従来どおり `list()` の空集合を「0 件」として扱う。
+   */
+  listLive?(): Promise<SessionInfo[] | null>;
   agentProcessAlive(name: string): Promise<boolean>;
   kill(name: string): Promise<void>;
   /** 生存 Tailii セッションが 0 のとき、pane ゼロの専用 server を停止する（任意実装）。 */
@@ -303,14 +308,25 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
   const herdrOps =
     options.herdrOps !== undefined ? options.herdrOps : defaultHerdrReaperOps(metadataStore);
   let herdrLive: string[] = [];
+  // 「herdr が答えられなかった」tick では herdr セッションの回収を見送る（0 件と混同しない）。
+  let herdrUnavailable = false;
   if (herdrOps !== null) {
     try {
-      herdrLive = (await herdrOps.list())
-        .filter((info) => info.alive && TAILII_SESSION_PATTERN.test(info.name))
-        .map((info) => info.name)
-        .sort();
-    } catch {
-      herdrLive = [];
+      const listed = herdrOps.listLive !== undefined
+        ? await herdrOps.listLive()
+        : await herdrOps.list();
+      if (listed === null) {
+        herdrUnavailable = true;
+        log("herdr 生存判定に失敗(回収を延期)");
+      } else {
+        herdrLive = listed
+          .filter((info) => info.alive && TAILII_SESSION_PATTERN.test(info.name))
+          .map((info) => info.name)
+          .sort();
+      }
+    } catch (error) {
+      herdrUnavailable = true;
+      log(`herdr 生存判定に失敗(回収を延期): ${String(error)}`);
     }
     for (const name of herdrLive) {
       await judge(
@@ -328,7 +344,8 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
     }
     // 生存 Tailii セッションが 0 なら空 server を回収する（tmux server の自動終了に対応）。
     // 判定は ops 側で pane 総数 0 のときだけ停止する（手動 pane があれば停止しない）。
-    if (herdrLive.length === 0) {
+    // 生存判定に失敗した tick は「0 件」ではないので停止を試みない。
+    if (herdrLive.length === 0 && !herdrUnavailable) {
       await herdrOps.stopServerIfEmpty?.();
     }
 
@@ -407,6 +424,10 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
   const liveSet = new Set([...live, ...herdrLive]);
   for (const name of listHeartbeatSessions(heartbeatDir)) {
     if (!liveSet.has(name)) {
+      // herdr の生存判定ができなかった tick では herdr backend のセッションを回収しない。
+      // 一時的な CLI 失敗を「消滅」と誤判定すると、実行中の会話が retire され（queue 破棄・
+      // 「Session disappeared」通知）、アプリ上は会話が消えたように見える。
+      if (herdrUnavailable && metadataStore.get(name)?.backend === "herdr") continue;
       removeHeartbeat(heartbeatDir, name);
       reclaimed.push(name);
     }
