@@ -465,6 +465,8 @@ async fn handle_exec(
             let mut stdout = child.stdout.take().context("child stdout missing")?;
 
             // クライアント→stdin。FIN で stdin を閉じて EOF を届ける。
+            let client_reset = Arc::new(tokio::sync::Notify::new());
+            let reset_signal = client_reset.clone();
             let mut recv = recv;
             let stdin_task = tokio::spawn(async move {
                 let mut buf = vec![0u8; CHUNK];
@@ -475,7 +477,16 @@ async fn handle_exec(
                                 break;
                             }
                         }
-                        Ok(None) | Err(_) => break,
+                        // FIN は「入力終了」。stdin だけ閉じ、stdout の読み出しは続ける
+                        // （入力を読み切ってから出力するコマンドを壊さない）。
+                        Ok(None) => break,
+                        // reset / 接続断はクライアント消失。engine のように stdout が
+                        // 静かなまま常駐するコマンドだと、通知しないと子が残り続け、
+                        // hub の購読者として居座って新しい接続を「2人目」にしてしまう。
+                        Err(_) => {
+                            reset_signal.notify_one();
+                            break;
+                        }
                     }
                 }
                 // drop(stdin) = プロセスへ EOF
@@ -485,13 +496,19 @@ async fn handle_exec(
             let mut client_gone = false;
             let mut buf = vec![0u8; CHUNK];
             loop {
-                match stdout.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if send.write_all(&buf[..n]).await.is_err() {
-                            client_gone = true;
-                            break;
+                tokio::select! {
+                    read = stdout.read(&mut buf) => match read {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if send.write_all(&buf[..n]).await.is_err() {
+                                client_gone = true;
+                                break;
+                            }
                         }
+                    },
+                    _ = client_reset.notified() => {
+                        client_gone = true;
+                        break;
                     }
                 }
             }

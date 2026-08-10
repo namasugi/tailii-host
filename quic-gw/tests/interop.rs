@@ -248,6 +248,51 @@ async fn pty_client_reset_hangs_up_session() {
 }
 
 #[tokio::test]
+async fn exec_client_reset_reaps_quiet_process() {
+    // 非 PTY exec でも、クライアント消失（reset）で常駐プロセスを回収することの回帰固定。
+    // engine は stdout が静かなまま常駐するため、旧実装（stdout の read だけを待つ）では
+    // reset に気づけず子が残り、hub の購読者として居座って新しいアプリ接続を同一会話の
+    // 「2 人目の購読者」にしてしまっていた（会話が更新されなくなる実障害の発火条件）。
+    let gw = start_gateway("execreset").await;
+    let (_endpoint, conn) = connect(&gw).await;
+
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    // pid を 1 行返してから沈黙する常駐プロセス。exec で sh 自身が sleep になる。
+    let header = format!(
+        "{{\"t\":\"exec\",\"v\":1,\"token\":\"{}\",\"cmd\":\"echo $$; exec sleep 300\"}}\n",
+        gw.token_b64
+    );
+    send.write_all(header.as_bytes()).await.unwrap();
+    let ok = read_line(&mut recv, HEADER_CAP).await.unwrap().unwrap();
+    assert!(ok.contains("\"ok\":true"), "unexpected response: {ok}");
+    let pid: libc::pid_t = read_line(&mut recv, HEADER_CAP)
+        .await
+        .unwrap()
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("child pid line");
+
+    // クライアント消失を模擬: 両方向を reset する（FIN ではない）。
+    send.reset(0u32.into()).unwrap();
+    let _ = recv.stop(0u32.into());
+
+    let mut reaped = false;
+    for _ in 0..100 {
+        // 送信できない = プロセス消滅（gateway が親なので zombie は wait 済み）。
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            reaped = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if !reaped {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    assert!(reaped, "quiet exec process survived client reset");
+}
+
+#[tokio::test]
 async fn pty_client_fin_hangs_up_session() {
     // クライアント FIN（正常クローズ）でも静かな PTY セッションを破棄することの回帰固定。
     // iOS の closeInteractiveShell（NWConnection.cancel）は QUIC 上では reset ではなく
