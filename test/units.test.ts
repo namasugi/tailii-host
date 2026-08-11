@@ -13,6 +13,7 @@ import { parsePermissionMode } from "../src/shared/permissionMode.js";
 import { resolveHostDisplayName } from "../src/shared/hostDisplayName.js";
 import {
   credentialFromKeychain,
+  credentialFromKeychainMirror,
   extractCredential,
   orderCandidates,
   parseMaskedClaudeProfile,
@@ -20,6 +21,7 @@ import {
   withClaudeOAuthCredential,
   type CredentialCommandRunner,
 } from "../src/services/planUsageFetcher.js";
+import { readKeychainMirror, writeKeychainMirror } from "../src/services/keychainMirror.js";
 import {
   bumpHeartbeat,
   listHeartbeatSessions,
@@ -530,6 +532,94 @@ describe("PlanUsageFetcher", () => {
     expect(refreshCalls).toBe(2);
     expect(attempted).toEqual(["expired", "renewed"]);
     expect(resolved?.value).toBe(1);
+  });
+
+  test("Keychain ミラー: 有効期限内だけ候補になり、期限切れ・期限不明・壊れは捨てる", () => {
+    const valid = '{"claudeAiOauth":{"accessToken":"mir","expiresAt":5000,"subscriptionType":"max"}}';
+    expect(credentialFromKeychainMirror(1_000, () => valid)).toEqual({
+      token: "mir",
+      expiresAtMs: 5_000,
+      subscriptionType: "max",
+    });
+    // 期限切れ: refresh に使えない読取専用コピーなので候補にしない。
+    expect(credentialFromKeychainMirror(6_000, () => valid)).toBeNull();
+    // 期限不明: 新鮮さを判定できないミラーは信用しない。
+    expect(
+      credentialFromKeychainMirror(1_000, () => '{"claudeAiOauth":{"accessToken":"m"}}'),
+    ).toBeNull();
+    expect(credentialFromKeychainMirror(1_000, () => "{{{")).toBeNull();
+    expect(credentialFromKeychainMirror(1_000, () => null)).toBeNull();
+  });
+
+  test("keychainMirror の write/read 往復（0600・trim・内容不変スキップ）", () => {
+    const dir = makeTempDir("keychain-mirror");
+    const mirrorPath = path.join(dir, "nested", "mirror.json");
+    const json = '{"claudeAiOauth":{"accessToken":"m","expiresAt":1}}';
+
+    writeKeychainMirror(json + "\n", mirrorPath);
+    expect(readKeychainMirror(mirrorPath)).toBe(json);
+    expect(fs.statSync(mirrorPath).mode & 0o777).toBe(0o600);
+
+    // 内容不変なら書き直さない（mtime 据え置き = churn しない）。
+    const before = fs.statSync(mirrorPath).mtimeMs;
+    writeKeychainMirror(json, mirrorPath);
+    expect(fs.statSync(mirrorPath).mtimeMs).toBe(before);
+
+    expect(readKeychainMirror(path.join(dir, "missing.json"))).toBeNull();
+  });
+
+  test("Keychain 系候補が有効なら file の期限切れ refresh は裏で行い応答を待たせない", async () => {
+    let refreshCalls = 0;
+    let refreshResolve: (() => void) | null = null;
+    const attempted: string[] = [];
+    const resolved = await withClaudeOAuthCredential(
+      async (token) => {
+        attempted.push(token);
+        return { kind: "success" as const, value: "ok" };
+      },
+      {
+        candidates: [
+          { token: "kc-valid", expiresAtMs: 9_000, source: "keychain" },
+          { token: "file-expired", expiresAtMs: 500, source: "file" },
+        ],
+        refreshFile: () =>
+          new Promise((resolve) => {
+            refreshCalls += 1;
+            refreshResolve = () => resolve({ accessToken: "healed", expiresAtMs: 9_999 });
+          }),
+        now: () => 1_000,
+      },
+    );
+
+    // refresh の完了を待たずに Keychain 候補で応答している（延命は裏で走行中）。
+    expect(resolved?.value).toBe("ok");
+    expect(resolved?.credential.token).toBe("kc-valid");
+    expect(attempted).toEqual(["kc-valid"]);
+    expect(refreshCalls).toBe(1);
+    refreshResolve?.();
+  });
+
+  test("Keychain 系候補も期限切れなら file refresh を待ってから試行する", async () => {
+    const attempted: string[] = [];
+    const resolved = await withClaudeOAuthCredential(
+      async (token) => {
+        attempted.push(token);
+        return token === "healed"
+          ? { kind: "success" as const, value: "ok" }
+          : { kind: "failure" as const };
+      },
+      {
+        candidates: [
+          { token: "mirror-expired", expiresAtMs: 700, source: "keychain-mirror" },
+          { token: "file-expired", expiresAtMs: 500, source: "file" },
+        ],
+        refreshFile: async () => ({ accessToken: "healed", expiresAtMs: 9_999 }),
+        now: () => 1_000,
+      },
+    );
+
+    expect(resolved?.value).toBe("ok");
+    expect(attempted[0]).toBe("healed");
   });
 
   test("401以外の失敗では refresh token を回さない", async () => {

@@ -1,7 +1,10 @@
 // planUsageFetcher.ts
 // tailii (TS host) — プラン使用状況の取得（Claude Code OAuth 使用量 API）
 // Swift 版 PlanUsageFetcher.swift の移植。
-// 認証は Mac 上の Claude Code が保存した OAuth トークン（Keychain → file の順、期限切れは後回し）。
+// 認証は Mac 上の Claude Code が保存した OAuth トークン
+// （Keychain → Keychain ミラー → file の順、期限切れは後回し）。
+// Keychain は sshd 文脈（SSH spawn の engine）から読めないため、GUI 文脈で読めたときに
+// ミラー（keychainMirror.ts）へ残し、SSH 文脈は有効期限内のミラーを第2候補として使う。
 // 取得不能・オフラインは null（usage 応答の plan 系フィールドは省略 = ベストエフォート）。
 // 秘密の扱い: アクセストークンは本プロセス内でのみ使い、ログ・チャネルへは載せない。
 
@@ -15,6 +18,7 @@ import {
   shouldRefreshClaudeCredential,
   type RefreshedClaudeCredential,
 } from "./claudeCredentialRefresh.js";
+import { readKeychainMirror, writeKeychainMirror } from "./keychainMirror.js";
 
 /**
  * プラン使用状況（5時間枠/7日枠/上位モデル週間枠の使用率とリセット時刻）。
@@ -59,9 +63,13 @@ export interface Credential {
   rateLimitTier?: string;
 }
 
-/** 認証源。SSH/file と GUI Keychain のアカウントを混同しないため候補と一緒に運ぶ。 */
+/**
+ * 認証源。SSH/file と GUI Keychain のアカウントを混同しないため候補と一緒に運ぶ。
+ * `keychain-mirror` は Keychain 不達文脈（SSH spawn の engine）が使う読取専用コピーで、
+ * refresh には決して使わない（ローテーションで GUI 側のログインを壊すため）。
+ */
 export interface SourcedCredential extends Credential {
-  source: "keychain" | "file";
+  source: "keychain" | "keychain-mirror" | "file";
 }
 
 /** OAuth API 1回分の結果。401だけを refresh/retry 対象として区別する。 */
@@ -313,19 +321,32 @@ async function prepareSourcedCredentials(
   const refreshFile = options.refreshFile ?? (() => refreshClaudeCredentialFile({ timeoutSeconds }));
   let candidates = options.candidates !== undefined
     ? [...options.candidates]
-    : await loadSourcedCredentialCandidates();
-  const hasKeychain = candidates.some((candidate) => candidate.source === "keychain");
+    : await loadSourcedCredentialCandidates(now());
   const fileIndex = candidates.findIndex((candidate) => candidate.source === "file");
 
+  // file 側セッションの延命: 期限切れなら Keychain の有無に関わらず refresh する。
+  // SSH 文脈（Keychain 不達）のフォールバック正本は file であり、Keychain が読める期間に
+  // 放置すると refresh token ごと失効して SSH 側だけが死ぬ（2026-08-10 実障害）。
+  // 今回の応答を Keychain/ミラーで賄えるときは、応答を待たせず裏で延命だけ行う。
   if (
-    !hasKeychain &&
     fileIndex >= 0 &&
     shouldRefreshClaudeCredential(candidates[fileIndex]!.expiresAtMs, now())
   ) {
-    const refreshed = await refreshFile();
-    if (refreshed !== null) {
-      onRefreshSuccess();
-      candidates[fileIndex] = sourcedFromRefresh(refreshed);
+    const servableWithoutFile = candidates.some(
+      (candidate) =>
+        candidate.source !== "file" &&
+        (candidate.expiresAtMs ?? Number.POSITIVE_INFINITY) > now(),
+    );
+    if (servableWithoutFile) {
+      // 裏の延命は本呼び出しへ影響させない（refreshAttempted も立てない。
+      // 401 時の再 refresh とはファイルロックで排他される）。
+      void refreshFile().catch(() => null);
+    } else {
+      const refreshed = await refreshFile();
+      if (refreshed !== null) {
+        onRefreshSuccess();
+        candidates[fileIndex] = sourcedFromRefresh(refreshed);
+      }
     }
   }
   // 同じ access token が Keychain/file の両方にある場合は、401時に refresh できる file 側を残す。
@@ -336,13 +357,50 @@ async function prepareSourcedCredentials(
   return orderCredentials(refreshableCandidates, now());
 }
 
-async function loadSourcedCredentialCandidates(): Promise<SourcedCredential[]> {
+async function loadSourcedCredentialCandidates(
+  nowMs: number = Date.now(),
+): Promise<SourcedCredential[]> {
   const candidates: SourcedCredential[] = [];
-  const keychain = await credentialFromKeychain();
-  if (keychain !== null) candidates.push({ ...keychain, source: "keychain" });
+  const keychainRaw = await rawCredentialJSONFromKeychain();
+  const keychain = keychainRaw !== null ? extractCredential(keychainRaw) : null;
+  if (keychainRaw !== null && keychain !== null) {
+    candidates.push({ ...keychain, source: "keychain" });
+    // GUI 文脈で読めた証をミラーへ残し、Keychain 不達の SSH 文脈が第2候補に使えるようにする。
+    writeKeychainMirror(keychainRaw);
+  } else {
+    const mirror = credentialFromKeychainMirror(nowMs);
+    if (mirror !== null) candidates.push({ ...mirror, source: "keychain-mirror" });
+  }
   const file = credentialFromFile();
   if (file !== null) candidates.push({ ...file, source: "file" });
   return candidates;
+}
+
+/**
+ * Keychain ミラーから有効期限内の候補だけを読む（純ロジック, TESTABLE）。
+ * 期限切れ・期限不明のミラーは捨てる — refresh に使えない読取専用コピーなので、
+ * 期限を過ぎた時点で無用どころか無駄な API 試行の種にしかならない。
+ */
+export function credentialFromKeychainMirror(
+  nowMs: number,
+  read: () => string | null = readKeychainMirror,
+): Credential | null {
+  const raw = read();
+  if (raw === null) return null;
+  const credential = extractCredential(raw);
+  if (credential === null) return null;
+  if ((credential.expiresAtMs ?? 0) <= nowMs) return null;
+  return credential;
+}
+
+/**
+ * Keychain を1回読んでミラーを温める（engine 起動時の fire-and-forget 用）。
+ * GUI 文脈（QUIC 接続の engine 等）でだけ成功し、SSH 文脈では静かに何もしない。
+ * これにより使用量シートを開かない日でも、QUIC 接続があるだけでミラーが新鮮に保たれる。
+ */
+export async function primeClaudeKeychainMirror(): Promise<void> {
+  const raw = await rawCredentialJSONFromKeychain();
+  if (raw !== null) writeKeychainMirror(raw);
 }
 
 function sourcedFromRefresh(refreshed: RefreshedClaudeCredential): SourcedCredential {
@@ -420,21 +478,32 @@ export async function credentialFromKeychain(
   runner: CredentialCommandRunner = runCredentialCommand,
   uid: number | null = typeof process.getuid === "function" ? process.getuid() : null,
 ): Promise<Credential | null> {
+  const raw = await rawCredentialJSONFromKeychain(runner, uid);
+  return raw === null ? null : extractCredential(raw);
+}
+
+/**
+ * Keychain から読めた生 JSON を返す（`extractCredential` が成立する応答だけを有効とする）。
+ * 生 JSON はミラー書込（`writeKeychainMirror`）へそのまま渡すために保持する。
+ */
+async function rawCredentialJSONFromKeychain(
+  runner: CredentialCommandRunner = runCredentialCommand,
+  uid: number | null = typeof process.getuid === "function" ? process.getuid() : null,
+): Promise<string | null> {
   const securityArgs = ["find-generic-password", "-s", "Claude Code-credentials", "-w"] as const;
 
   if (uid !== null) {
-    const shared = extractCredential(
-      (await runner("/bin/launchctl", [
-        "asuser",
-        String(uid),
-        "/usr/bin/security",
-        ...securityArgs,
-      ])) ?? "",
-    );
-    if (shared !== null) return shared;
+    const shared = (await runner("/bin/launchctl", [
+      "asuser",
+      String(uid),
+      "/usr/bin/security",
+      ...securityArgs,
+    ])) ?? "";
+    if (extractCredential(shared) !== null) return shared;
   }
 
-  return extractCredential((await runner("/usr/bin/security", securityArgs)) ?? "");
+  const direct = (await runner("/usr/bin/security", securityArgs)) ?? "";
+  return extractCredential(direct) !== null ? direct : null;
 }
 
 /**

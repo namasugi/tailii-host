@@ -51,7 +51,11 @@ import {
   type AccountIdentityProvider,
 } from "../services/accountIdentity.js";
 import { fetchHostVersions, type HostVersionsProvider } from "../services/hostVersions.js";
-import { fetchPlanUsage, type PlanUsageProvider } from "../services/planUsageFetcher.js";
+import {
+  fetchPlanUsage,
+  primeClaudeKeychainMirror,
+  type PlanUsageProvider,
+} from "../services/planUsageFetcher.js";
 import { PreviewServer } from "../services/previewServer.js";
 import {
   decodeControlMessage,
@@ -387,6 +391,11 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
   const resolvedModeTiming: ModeTiming = { ...DEFAULT_MODE_TIMING, ...modeTiming };
   const resolvedHeartbeatDir = heartbeatDir ?? defaultHeartbeatDir();
   const hubLink = injectedHubLink ?? connectHubSocket();
+  // GUI 文脈（QUIC 接続）で起動した engine は Keychain ミラーを温める（fire-and-forget）。
+  // 使用量シートを開かない日でも、QUIC 接続があるだけで SSH 文脈用の第2候補が新鮮に保たれる。
+  if (options.planUsage === undefined) {
+    void primeClaudeKeychainMirror().catch(() => {});
+  }
 
   // 出力の直列化（Node の Writable は書込順序を保証する）。
   const writer = new LineWriter(options.output);
