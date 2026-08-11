@@ -20,24 +20,58 @@ export interface SubagentTailerOptions {
   orphanGraceMs?: number;
   /** 孤児判定プローブの間隔（ms）。既定 30s。 */
   orphanProbeIntervalMs?: number;
+  /**
+   * エージェント孤児の settle に必要な「transcript 静止時間」（ms）。既定 120s。
+   * 大きな tool_use 入力のストリーミング中は transcript が無音になるため、
+   * コマンド側の猶予より長めに取る。
+   */
+  agentOrphanGraceMs?: number;
   /** output ファイルを開いているプロセスの有無（null=判定不能）。テスト差し替え用。 */
   probeOutputOpen?: (filePath: string) => Promise<boolean | null>;
+  /**
+   * セッション（claude プロセス）の生存判定。テスト・上位配線の差し替え用。
+   * true=生存確定 / false=死亡確定 / null=不明（生存扱い・安全側）。
+   * lastActivityMs はセッションの transcript 群が最後に更新された時刻（不明なら null）。
+   * 既定実装は defaultProbeSessionAlive を参照。
+   */
+  probeSessionAlive?: (sessionId: string, lastActivityMs: number | null) => Promise<boolean | null>;
+  /**
+   * 既定プローブが「argv 不一致 + transcript 静止」を死亡確定とみなす静止時間（ms）。
+   * 既定 6h。SendMessage 待機など「生きているが transcript が静かな」セッションを
+   * 誤って死亡扱いしないための余裕（実測の最長待機 ~3.8h より広い）。
+   * 誤判定しても transcript が伸びれば自動で running へ回復する。
+   */
+  sessionStaleMs?: number;
 }
 
 interface Meta {
   agentType: string;
   description: string;
-  toolUseId: string;
+  /**
+   * spawn 元 transcript の tool_use id。forked-skill エージェント（バックグラウンドの
+   * スラッシュコマンド実行。meta は toolUseId の代わりに name を持つ）には存在しない。
+   * null でも tail 対象にする — 親を tail しないと、その transcript に投函される
+   * 子の task-notification・親子関係が丸ごと見えなくなる。
+   */
+  toolUseId: string | null;
   spawnDepth: number;
+  /** meta に記録された起動元エージェント id（transcript 相関より優先する直接リンク）。 */
+  parentAgentId: string | null;
+  /** ユーザーが TaskStop 等で停止済み。通知は残らないため、これ自体が終了信号。 */
+  stoppedByUser: boolean;
 }
 
 interface TrackedNode {
   nodeId: string;
   meta: Meta;
   metaPath: string;
+  /** meta 再読込の契機（stoppedByUser は後から書かれる）。 */
+  metaMtimeMs: number;
   jsonlPath: string | null;
   firstJsonlTimestampMs: number | null;
   lastJsonlTimestampMs: number | null;
+  /** 自 transcript の最後の message 行が「text のみの assistant」= 最終レポートの形か。 */
+  finalReportMarker: boolean | null;
   currentActivity: string | null;
   lastKey: string | null;
 }
@@ -88,7 +122,13 @@ export class SubagentTailer {
   private readonly tailIndefinitely: boolean;
   private readonly orphanGraceMs: number;
   private readonly orphanProbeIntervalMs: number;
+  private readonly agentOrphanGraceMs: number;
   private readonly probeOutputOpen: (filePath: string) => Promise<boolean | null>;
+  private readonly probeSessionAlive: (
+    sessionId: string,
+    lastActivityMs: number | null,
+  ) => Promise<boolean | null>;
+  private readonly sessionStaleMs: number;
   private readonly jsonlPaths = new Map<string, string>();
   private readonly outputPaths = new Map<string, string>();
 
@@ -97,7 +137,11 @@ export class SubagentTailer {
     this.tailIndefinitely = options.tailIndefinitely ?? true;
     this.orphanGraceMs = options.orphanGraceMs ?? 60_000;
     this.orphanProbeIntervalMs = options.orphanProbeIntervalMs ?? 30_000;
+    this.agentOrphanGraceMs = options.agentOrphanGraceMs ?? 120_000;
     this.probeOutputOpen = options.probeOutputOpen ?? defaultProbeOutputOpen;
+    this.sessionStaleMs = options.sessionStaleMs ?? 6 * 60 * 60 * 1000;
+    this.probeSessionAlive = options.probeSessionAlive
+      ?? ((sessionId, lastActivityMs) => defaultProbeSessionAlive(sessionId, lastActivityMs, this.sessionStaleMs));
   }
 
   /** 現在 tail 中の nodeId から transcript 実体を引く。 */
@@ -147,11 +191,25 @@ export class SubagentTailer {
     // 通知が握り潰された背景コマンドの孤児判定（taskId → 終了扱いにした ts）。
     const bgOrphanTsByTaskId = new Map<string, number>();
     const bgFirstSeenMsByTaskId = new Map<string, number>();
+    // 通知が配達されえない背景エージェントの孤児判定（nodeId → settle 扱いにした ts）。
+    const agentOrphanTsByNodeId = new Map<string, number>();
+    // 死亡セッションの一括 sweep マーク。生存へ転じたら全破棄して回復できるよう、
+    // 通常の孤児 settle とは別に持つ。
+    const deadSweepByNodeId = new Map<string, { ts: number; status: SubagentNodeStatus }>();
+    // セッション transcript 群の最終更新（生存プローブの補助情報）。
+    let lastActivityTsMs: number | null = null;
+    // セッション（claude プロセス）の生存。false のみが「死亡確定」。null は生存扱い（安全側）。
+    let sessionAlive: boolean | null = null;
+    let lastSessionProbeMs = 0;
     let lastOrphanProbeMs = 0;
     let aggregateDirty = true;
 
+    let lastMetaRefreshMs = 0;
     while (!signal?.aborted) {
-      if (discoverMetaFiles(subagentsDir, tracked)) aggregateDirty = true;
+      // meta の stat/再読込は毎 tick やると重い（ノード数×50ms）。1秒ごとに間引く。
+      const refreshMetas = Date.now() - lastMetaRefreshMs >= 1_000;
+      if (refreshMetas) lastMetaRefreshMs = Date.now();
+      if (discoverMetaFiles(subagentsDir, tracked, refreshMetas)) aggregateDirty = true;
       for (const node of tracked.values()) {
         if (node.jsonlPath !== null) this.jsonlPaths.set(node.nodeId, node.jsonlPath);
       }
@@ -165,12 +223,16 @@ export class SubagentTailer {
           if (node !== null) {
             node.currentActivity = null;
             node.lastJsonlTimestampMs = null;
+            node.finalReportMarker = null;
           }
         }
         if (node !== null) node.firstJsonlTimestampMs = read.state.firstTimestampMs;
         if (read.lines.length > 0) aggregateDirty = true;
         for (const line of read.lines) {
           const lineTs = timestampMs(line);
+          if (lineTs !== null && (lastActivityTsMs === null || lineTs > lastActivityTsMs)) {
+            lastActivityTsMs = lineTs;
+          }
           if (read.state.firstTimestampMs === null && lineTs !== null) {
             read.state.firstTimestampMs = lineTs;
           }
@@ -219,6 +281,8 @@ export class SubagentTailer {
             });
           }
           if (node !== null) {
+            const marker = finalReportMarker(line);
+            if (marker !== null) node.finalReportMarker = marker;
             const activity = latestActivitySummary(line);
             if (activity !== null) node.currentActivity = activity;
           }
@@ -245,32 +309,175 @@ export class SubagentTailer {
         aggregateDirty = false;
       }
 
-      for (const node of tracked.values()) {
-        const result = resultByToolUseId.get(node.meta.toolUseId) ?? null;
-        let status: SubagentNodeStatus;
-        let ts: number;
+      const ownerOf = (node: TrackedNode): string | undefined => {
+        // meta の直接リンクを優先（forked-skill の子は transcript 相関では解決できない）。
+        const pid = node.meta.parentAgentId;
+        if (pid !== null && tracked.has(pid)) return pid;
+        const correlated = node.meta.toolUseId === null
+          ? undefined
+          : ownerByToolUseId.get(node.meta.toolUseId);
+        // 深さ1は起動元が main（root）と確定できる（forked-skill 親もここに落ちる）。
+        return correlated ?? (node.meta.spawnDepth <= 1 ? "root" : undefined);
+      };
+      const resolveAgentStatus = (node: TrackedNode): { status: SubagentNodeStatus; ts: number } => {
+        const result = node.meta.toolUseId === null
+          ? null
+          : resultByToolUseId.get(node.meta.toolUseId) ?? null;
         if (result !== null && !result.asyncLaunch) {
           // 同期実行: 親 transcript の tool_result が終了信号。
-          status = result.isError ? "error" : "completed";
-          ts = result.ts ?? node.firstJsonlTimestampMs ?? mtimeMs(node.metaPath);
-        } else {
-          // バックグラウンド実行（または結果未着）: task-notification が終了信号。
-          // 通知後に自分の transcript が伸びたら resume とみなし running へ戻す。
-          const notification = notificationByTaskId.get(node.nodeId) ?? null;
-          const resumedAfter = notification !== null && notification.ts !== null
-            && (node.lastJsonlTimestampMs ?? 0) > notification.ts;
-          if (notification !== null && !resumedAfter) {
-            status = notification.status === "completed" ? "completed" : "error";
-            ts = notification.ts ?? node.lastJsonlTimestampMs ?? mtimeMs(node.metaPath);
+          return {
+            status: result.isError ? "error" : "completed",
+            ts: result.ts ?? node.firstJsonlTimestampMs ?? mtimeMs(node.metaPath),
+          };
+        }
+        // バックグラウンド実行（または結果未着）: task-notification が終了信号。
+        // 通知後に自分の transcript が伸びたら resume とみなし running へ戻す。
+        const notification = notificationByTaskId.get(node.nodeId) ?? null;
+        const resumedAfter = notification !== null && notification.ts !== null
+          && (node.lastJsonlTimestampMs ?? 0) > notification.ts;
+        if (notification !== null && !resumedAfter) {
+          return {
+            status: notification.status === "completed" ? "completed" : "error",
+            ts: notification.ts ?? node.lastJsonlTimestampMs ?? mtimeMs(node.metaPath),
+          };
+        }
+        // ユーザー停止済み（TaskStop 等）。通知は残らないため meta の刻印が終了信号。
+        if (node.meta.stoppedByUser) {
+          return { status: "completed", ts: node.lastJsonlTimestampMs ?? mtimeMs(node.metaPath) };
+        }
+        // 通知が配達されえず孤児 settle 済みなら completed。settle 後に transcript が
+        // 伸びたら resume とみなしマークを破棄して running へ戻す（孤児検知で再評価される）。
+        const orphanTs = agentOrphanTsByNodeId.get(node.nodeId);
+        if (orphanTs !== undefined) {
+          if ((node.lastJsonlTimestampMs ?? 0) > orphanTs) {
+            agentOrphanTsByNodeId.delete(node.nodeId);
           } else {
-            status = "running";
-            ts = node.firstJsonlTimestampMs ?? mtimeMs(node.metaPath);
+            return { status: "completed", ts: orphanTs };
           }
         }
-        const parentNodeId = ownerByToolUseId.get(node.meta.toolUseId) ?? fallbackParent(node.meta.spawnDepth);
+        // 死亡セッションの sweep マーク。transcript が伸びたら破棄（誤判定からの回復）。
+        const sweep = deadSweepByNodeId.get(node.nodeId);
+        if (sweep !== undefined) {
+          if ((node.lastJsonlTimestampMs ?? 0) > sweep.ts) {
+            deadSweepByNodeId.delete(node.nodeId);
+          } else {
+            return { status: sweep.status, ts: sweep.ts };
+          }
+        }
+        return { status: "running", ts: node.firstJsonlTimestampMs ?? mtimeMs(node.metaPath) };
+      };
+
+      const nowMs = Date.now();
+      if (nowMs - lastSessionProbeMs >= this.orphanProbeIntervalMs) {
+        lastSessionProbeMs = nowMs;
+        sessionAlive = await this.probeSessionAlive(sessionId, lastActivityTsMs);
+      }
+
+      // 孤児判定（エージェント）: 背景エージェントの task-notification は「起動元の transcript に、
+      // 起動元が次に動くとき」に投函されるため、起動元が子より先に終端した・セッションが死んだ等で
+      // 配達が途絶えると二度と届かない。判定はセッション生存で二分する:
+      //
+      // [死亡確定 (sessionAlive === false)] このセッションの作業は何も動いていない。
+      //   静止時間が猶予を超えた running ノードを最終レポートの有無を問わず一括 settle する
+      //   （中断で tool_use のまま止まった木・同期起動の孤児もここで解消する）。
+      //
+      // [生存または不明] root（main）起動のノードは settle しない — 生きている main への
+      //   通知配達は途絶えないし、SendMessage 待機中の生存エージェントを「完了」に
+      //   してはならない。settle するのは「実信号（通知/同期結果/停止刻印/過去の settle）で
+      //   終端した起動元」に根ざした木だけ。条件:
+      //   - 背景起動（forked-skill、または async 起動 ack 済み）だが有効な完了信号がない
+      //   - 最後の message 行が「text のみの assistant」（最終レポート済み。再開注入の
+      //     user 行でマーカーが倒れるため、再開直後の長考中は候補にならない）
+      //   - transcript が agentOrphanGraceMs 以上静止（transcript 時刻起点なので
+      //     tail 張り直し直後でも古い孤児は即 settle できる）
+      //   - 直下に running かつ非候補の子（エージェント/背景コマンド）がいない（fixpoint。
+      //     子の通知で再開されうるため）
+      //   - 起動元が終端済み、または「終端済みに根ざして承認された候補」（承認は終端
+      //     アンカーからの伝播のみ。候補同士の相互承認では settle しないので、壊れた
+      //     meta の循環参照でも誤 settle しない）
+      const agentStatusById = new Map<string, SubagentNodeStatus>();
+      for (const node of tracked.values()) agentStatusById.set(node.nodeId, resolveAgentStatus(node).status);
+      const lastActivityMs = (node: TrackedNode): number =>
+        node.lastJsonlTimestampMs ?? mtimeMs(node.jsonlPath ?? node.metaPath);
+      if (sessionAlive === false) {
+        for (const node of tracked.values()) {
+          if (agentStatusById.get(node.nodeId) !== "running") continue;
+          if (deadSweepByNodeId.has(node.nodeId)) continue;
+          const lastTs = lastActivityMs(node);
+          if (lastTs <= 0 || nowMs - lastTs < this.agentOrphanGraceMs) continue;
+          deadSweepByNodeId.set(node.nodeId, {
+            ts: lastTs,
+            // 最終レポートの形で止まっていれば完了、tool_use のまま止まっていれば中断(error)。
+            status: node.finalReportMarker === true ? "completed" : "error",
+          });
+        }
+      } else {
+        // 生存（または不明）へ転じたら sweep 由来のマークは全破棄する。
+        // 死亡判定が誤りだった場合の回復経路（通常の孤児 settle は保持する）。
+        if (deadSweepByNodeId.size > 0) deadSweepByNodeId.clear();
+        const settleCandidates = new Set<string>();
+        for (const node of tracked.values()) {
+          if (agentStatusById.get(node.nodeId) !== "running") continue;
+          const result = node.meta.toolUseId === null
+            ? null
+            : resultByToolUseId.get(node.meta.toolUseId) ?? null;
+          const backgroundLaunch = node.meta.toolUseId === null || (result !== null && result.asyncLaunch);
+          if (!backgroundLaunch) continue;
+          if (node.finalReportMarker !== true) continue;
+          if (node.lastJsonlTimestampMs === null) continue;
+          if (nowMs - node.lastJsonlTimestampMs < this.agentOrphanGraceMs) continue;
+          settleCandidates.add(node.nodeId);
+        }
+        for (;;) {
+          const blockedOwners = new Set<string>();
+          for (const node of tracked.values()) {
+            if (agentStatusById.get(node.nodeId) !== "running") continue;
+            if (settleCandidates.has(node.nodeId)) continue;
+            const owner = ownerOf(node);
+            if (owner !== undefined) blockedOwners.add(owner);
+          }
+          for (const command of bgCommandByTaskId.values()) {
+            if (notificationByTaskId.has(command.taskId) || bgOrphanTsByTaskId.has(command.taskId)) continue;
+            blockedOwners.add(command.owner);
+          }
+          let changed = false;
+          for (const id of settleCandidates) {
+            if (!blockedOwners.has(id)) continue;
+            settleCandidates.delete(id);
+            changed = true;
+          }
+          if (!changed) break;
+        }
+        const approved = new Set<string>();
+        for (;;) {
+          let changed = false;
+          for (const id of settleCandidates) {
+            if (approved.has(id)) continue;
+            const node = tracked.get(id);
+            if (node === undefined) continue;
+            const ownerId = ownerOf(node);
+            if (ownerId === undefined || ownerId === "root") continue;
+            const ownerStatus = agentStatusById.get(ownerId);
+            if (ownerStatus !== "completed" && ownerStatus !== "error" && !approved.has(ownerId)) continue;
+            approved.add(id);
+            changed = true;
+          }
+          if (!changed) break;
+        }
+        for (const id of approved) {
+          const node = tracked.get(id);
+          if (node === undefined) continue;
+          agentOrphanTsByNodeId.set(id, lastActivityMs(node));
+        }
+      }
+
+      for (const node of tracked.values()) {
+        const { status, ts } = resolveAgentStatus(node);
+        const parentNodeId = ownerOf(node) ?? fallbackParent(node.meta.spawnDepth);
         const messageNode: SubagentNode = {
           nodeId: node.nodeId,
-          toolUseId: node.meta.toolUseId,
+          // forked-skill エージェントに tool_use はない。ワイヤ上は必須 string のため空で送る。
+          toolUseId: node.meta.toolUseId ?? "",
           parentNodeId,
           agentType: node.meta.agentType,
           label: node.meta.description,
@@ -285,11 +492,10 @@ export class SubagentTailer {
         yield { type: "subagent_node", v: PROTOCOL_V2, node: messageNode };
       }
 
-      // 孤児判定: task-notification は起動元エージェントが先に終了すると届かないまま
-      // 消えることがある（完了信号の消失）。output ファイルを開いているプロセスが
+      // 孤児判定（背景コマンド）: task-notification は起動元エージェントが先に終了すると
+      // 届かないまま消えることがある（完了信号の消失）。output ファイルを開いているプロセスが
       // いなければ「終了済みなのに通知が来ない孤児」として完了へ落とす。
       // 実行中のコマンドはシェルが output の fd を保持し続けるため誤爆しない。
-      const nowMs = Date.now();
       if (nowMs - lastOrphanProbeMs >= this.orphanProbeIntervalMs) {
         lastOrphanProbeMs = nowMs;
         for (const command of bgCommandByTaskId.values()) {
@@ -345,7 +551,11 @@ export class SubagentTailer {
   }
 }
 
-function discoverMetaFiles(dir: string, tracked: Map<string, TrackedNode>): boolean {
+function discoverMetaFiles(
+  dir: string,
+  tracked: Map<string, TrackedNode>,
+  refreshMetas: boolean,
+): boolean {
   let files: string[];
   try {
     files = fs.readdirSync(dir);
@@ -364,6 +574,18 @@ function discoverMetaFiles(dir: string, tracked: Map<string, TrackedNode>): bool
         existing.jsonlPath = jsonlPath;
         changed = true;
       }
+      // stoppedByUser は停止時に後から書き込まれるため、mtime 変化で meta を読み直す。
+      if (refreshMetas) {
+        const metaMtime = mtimeMs(existing.metaPath);
+        if (metaMtime !== existing.metaMtimeMs) {
+          existing.metaMtimeMs = metaMtime;
+          const meta = readMeta(existing.metaPath);
+          if (meta !== null) {
+            existing.meta = meta;
+            changed = true;
+          }
+        }
+      }
       continue;
     }
     const metaPath = path.join(dir, file);
@@ -373,9 +595,11 @@ function discoverMetaFiles(dir: string, tracked: Map<string, TrackedNode>): bool
       nodeId,
       meta,
       metaPath,
+      metaMtimeMs: mtimeMs(metaPath),
       jsonlPath: siblingJsonl(metaPath),
       firstJsonlTimestampMs: null,
       lastJsonlTimestampMs: null,
+      finalReportMarker: null,
       currentActivity: null,
       lastKey: null,
     });
@@ -390,7 +614,6 @@ function readMeta(metaPath: string): Meta | null {
     if (
       typeof parsed["agentType"] !== "string" ||
       typeof parsed["description"] !== "string" ||
-      typeof parsed["toolUseId"] !== "string" ||
       typeof parsed["spawnDepth"] !== "number"
     ) {
       return null;
@@ -398,8 +621,10 @@ function readMeta(metaPath: string): Meta | null {
     return {
       agentType: parsed["agentType"],
       description: parsed["description"],
-      toolUseId: parsed["toolUseId"],
+      toolUseId: typeof parsed["toolUseId"] === "string" ? parsed["toolUseId"] : null,
       spawnDepth: parsed["spawnDepth"],
+      parentAgentId: typeof parsed["parentAgentId"] === "string" ? parsed["parentAgentId"] : null,
+      stoppedByUser: parsed["stoppedByUser"] === true,
     };
   } catch {
     return null;
@@ -615,6 +840,34 @@ function extractTaskNotification(
   };
 }
 
+/**
+ * message 行の「最終レポートらしさ」を返す:
+ *   true  = text のみの assistant 行（サブエージェントはこの形で停止する）
+ *   false = それ以外の message 行（user 行・tool_use を含む assistant 行）
+ *   null  = message を持たない行（summary 等。判定を変えない）
+ * true のまま transcript が静止していればエージェントは停止済み。再開注入
+ * （task-notification / SendMessage）は user 行として届き false へ倒れるため、
+ * 再開直後の長考中を「最終レポート済み」と誤認しない。
+ */
+function finalReportMarker(line: string): boolean | null {
+  try {
+    const obj = JSON.parse(line) as Record<string, unknown>;
+    const message = obj["message"];
+    if (typeof message !== "object" || message === null) return null;
+    const rec = message as Record<string, unknown>;
+    const content = rec["content"];
+    if (content === undefined || content === null) return null;
+    if (rec["role"] !== "assistant") return false;
+    if (typeof content === "string") return true;
+    if (!Array.isArray(content)) return null;
+    return !content.some((block) =>
+      typeof block === "object" && block !== null
+      && (block as Record<string, unknown>)["type"] === "tool_use");
+  } catch {
+    return null;
+  }
+}
+
 function latestActivitySummary(line: string): string | null {
   const activities = extractToolActivities(messageContent(line));
   const latest = activities.at(-1);
@@ -720,6 +973,60 @@ function probeViaLsof(filePath: string): Promise<boolean | null> {
       // exit 1 = 開いているプロセスなし（ファイル消失も同じ扱いで孤児側に倒す）。
       // lsof 不在・タイムアウト等は判定不能として running 維持（安全側）。
       const code: unknown = (error as { code?: unknown }).code;
+      resolve(code === 1 ? false : null);
+    });
+  });
+}
+
+/** プロセスプローブ用の execFile 差し替え口（テスト用）。 */
+export type ProcessProbeExec = (
+  cmd: string,
+  args: string[],
+  callback: (error: (Error & { code?: unknown }) | null, stdout: string) => void,
+) => void;
+
+const defaultProbeExec: ProcessProbeExec = (cmd, args, callback) => {
+  execFile(cmd, args, { timeout: 10_000 }, (error, stdout) => {
+    callback(error as (Error & { code?: unknown }) | null, stdout ?? "");
+  });
+};
+
+/**
+ * セッションの claude プロセス生存を判定する。
+ *   1) argv にセッション id を持つプロセスがいれば生存確定（Tailii が張る engine は
+ *      `--session-id`/`--resume` で id を運ぶ）。
+ *   2) argv 不一致でも bare CLI（argv に id なし）の可能性が残るため、transcript が
+ *      staleMs 以内に更新されていれば「不明」（生存扱い）。
+ *   3) argv 不一致 かつ transcript が staleMs 以上静止しているときだけ「死亡確定」。
+ *      生きているのに静かなだけのセッションを誤判定しても、transcript が伸びれば
+ *      sweep マークは破棄され running へ回復する。
+ * プロセス名の照合（`lsof -c claude` 等）は使わない — macOS では CLI の comm が
+ * バージョン文字列（例 "2.1.226"）になるなど環境・バージョンで壊れるため。
+ * プローブ不能（pgrep 不在・タイムアウト等）は常に「不明」= 生存扱いへ倒す。
+ */
+export async function defaultProbeSessionAlive(
+  sessionId: string,
+  lastActivityMs: number | null,
+  staleMs: number,
+  exec: ProcessProbeExec = defaultProbeExec,
+): Promise<boolean | null> {
+  const byArgv = await probeArgvAlive(sessionId, exec);
+  if (byArgv === true) return true;
+  if (byArgv === null) return null;
+  if (lastActivityMs === null) return null;
+  return Date.now() - lastActivityMs >= staleMs ? false : null;
+}
+
+/** argv にセッション id を持つプロセスの有無。true / false / null(判定不能)。 */
+function probeArgvAlive(sessionId: string, exec: ProcessProbeExec): Promise<boolean | null> {
+  return new Promise((resolve) => {
+    exec("pgrep", ["-f", sessionId], (error, stdout) => {
+      if (error === null) {
+        resolve(stdout.trim().length > 0);
+        return;
+      }
+      // exit 1 = 一致なし。それ以外（pgrep 不在・タイムアウト等）は判定不能。
+      const code: unknown = error.code;
       resolve(code === 1 ? false : null);
     });
   });
