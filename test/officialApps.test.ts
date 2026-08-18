@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -7,6 +7,7 @@ import {
   OfficialAppsService,
   extractBannerClaudeUrl,
   extractClaudeRemoteDialogUrl,
+  isSupportedCliVersion,
   lastTranscriptRemoteControlEntry,
   parseCodexPairing,
   parseCodexStart,
@@ -686,6 +687,84 @@ describe("OfficialAppsService", () => {
       unavailableReason: "claude_stop_failed",
     });
     expect(backend.sentKeys).toEqual([["Up", "Up", "Enter"], ["Escape"]]);
+  });
+
+  test("CLI バージョンは下限のみゲート: 新しい版は許可し、下限未満・形式外は拒否する", () => {
+    // 完全一致リストは CLI 自動更新の度に「対応 CLI を確認できない」で止まった（2.1.234 で再発）。
+    expect(isSupportedCliVersion("claude", "2.1.215")).toBe(true);
+    expect(isSupportedCliVersion("claude", "2.1.234")).toBe(true);
+    expect(isSupportedCliVersion("claude", "2.1.999")).toBe(true);
+    expect(isSupportedCliVersion("claude", "2.2.0")).toBe(true);
+    expect(isSupportedCliVersion("claude", "3.0.0")).toBe(true);
+    expect(isSupportedCliVersion("claude", "2.1.214")).toBe(false);
+    expect(isSupportedCliVersion("claude", "2.0.999")).toBe(false);
+    expect(isSupportedCliVersion("claude", "1.9.9")).toBe(false);
+    expect(isSupportedCliVersion("claude", "2.1")).toBe(false);
+    expect(isSupportedCliVersion("claude", "latest")).toBe(false);
+    expect(isSupportedCliVersion("codex", "0.144.5")).toBe(true);
+    expect(isSupportedCliVersion("codex", "0.146.0")).toBe(true);
+    expect(isSupportedCliVersion("codex", "0.144.4")).toBe(false);
+    expect(isSupportedCliVersion("claude", "2.1.240-beta.1")).toBe(true);
+  });
+
+  test("未検証の新しい Claude CLI でも perform は進み、診断ログに unverified を残す", async () => {
+    const base = temporaryDirectory();
+    const backend = new FakeBackend(base);
+    const diagnosticLogPath = join(base, "official-app.log");
+    const service = new OfficialAppsService({
+      commandRunner: commandRunner({
+        "claude --version": { success: true, stdout: "2.1.999 (Claude Code)\n" },
+        "claude auth status --json": { success: true, stdout: claudeAuth() },
+      }),
+      actionLockPath: join(base, "action.lock"),
+      claudePollIntervalMs: 1,
+      claudeStartTimeoutMs: 20,
+      diagnosticLogPath,
+    });
+    const result = await service.perform(
+      {
+        session: "s",
+        provider: "claude",
+        sessionManager: backend,
+        canInjectClaudeCommand: true,
+        canMutateCodexDaemon: true,
+        claudeTranscriptPath: null,
+      },
+      "open",
+      true,
+      false,
+    );
+    expect(result).toMatchObject({ provider: "claude", outcome: "open" });
+    expect(readFileSync(diagnosticLogPath, "utf8")).toContain(
+      "provider version unverified provider=claude version=2.1.999",
+    );
+  });
+
+  test("下限未満の Claude CLI は official_cli_unavailable で止める", async () => {
+    const base = temporaryDirectory();
+    const backend = new FakeBackend(base);
+    const service = new OfficialAppsService({
+      commandRunner: commandRunner({
+        "claude --version": { success: true, stdout: "2.1.200 (Claude Code)\n" },
+        "claude auth status --json": { success: true, stdout: claudeAuth() },
+      }),
+      actionLockPath: join(base, "action.lock"),
+    });
+    const result = await service.perform(
+      {
+        session: "s",
+        provider: "claude",
+        sessionManager: backend,
+        canInjectClaudeCommand: true,
+        canMutateCodexDaemon: true,
+        claudeTranscriptPath: null,
+      },
+      "open",
+      true,
+      false,
+    );
+    expect(result.unavailableReason).toBe("official_cli_unavailable");
+    expect(backend.submitted).toEqual([]);
   });
 
   test("Claude busy 中は pane へ入力しない", async () => {

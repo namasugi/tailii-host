@@ -10,6 +10,11 @@ import * as path from "node:path";
 import { spawn } from "node:child_process";
 import type { SessionBackend } from "../backend/sessionBackend.js";
 import { defaultInjectedPath } from "../commands/launch.js";
+import {
+  MINIMUM_CLAUDE_CLI_VERSION,
+  MINIMUM_CODEX_CLI_VERSION,
+  versionAtLeast,
+} from "../shared/cliVersions.js";
 
 export type OfficialAppProvider = "claude" | "codex";
 export type OfficialAppAction = "open" | "repair" | "stop";
@@ -106,8 +111,15 @@ const MAX_IDENTIFIER_BYTES = 128;
 const MAX_PAIRING_CODE_BYTES = 2_048;
 const PROVIDER_COMMAND_TIMEOUT_MS = 22_000;
 const CLAUDE_AUTH_TIMEOUT_MS = 5_000;
-const SUPPORTED_CLAUDE_VERSIONS = new Set(["2.1.215", "2.1.218", "2.1.220"]);
-const SUPPORTED_CODEX_VERSIONS = new Set(["0.144.5", "0.145.0"]);
+// 公式アプリ連携に必要な最低 CLI バージョンは shared/cliVersions.ts（doctor と共有）。
+// CLI は自動更新されるため完全一致の許可リストは更新の度に「対応する公式 CLI の
+// バージョンを確認できませんでした」で停止していた（2.1.220 → 2.1.234 で再発）。
+// 以降は下限のみゲートし、新しい版は実行時検証（claude: pane マーカー + transcript
+// bridge_status + timeout、codex: remote-control JSON の strict parse）に委ねる。
+// 実機検証済みの版は VERIFIED_* に残し、未検証版で動いたときは診断ログに明記して
+// drift 調査の起点にする。
+const VERIFIED_CLAUDE_VERSIONS = new Set(["2.1.215", "2.1.218", "2.1.220", "2.1.234"]);
+const VERIFIED_CODEX_VERSIONS = new Set(["0.144.5", "0.145.0"]);
 
 // Remote Control が active と CLI が認識している最中に /remote-control を再実行すると、
 // 2.1.220 はバナーではなく modal dialog（Disconnect / Show QR / Continue）を開き、
@@ -158,6 +170,7 @@ export class OfficialAppsService {
   private readonly claudeReinjectAfterMs: number;
   private readonly diagnosticLogPath: string | null;
   private readonly codexRemoteControl: CodexRemoteControlClient | null;
+  private readonly unverifiedVersionLogged = new Set<string>();
 
   constructor(options: OfficialAppsOptions = {}) {
     this.claudePath = options.claudePath ?? "claude";
@@ -277,14 +290,21 @@ export class OfficialAppsService {
     const output = await this.runCommand(executable, ["--version"], CLAUDE_AUTH_TIMEOUT_MS);
     if (output?.success !== true) return null;
     const text = output.stdout.trim();
-    if (provider === "claude") {
-      const version = text.endsWith(" (Claude Code)")
-        ? text.slice(0, -" (Claude Code)".length)
-        : null;
-      return version !== null && SUPPORTED_CLAUDE_VERSIONS.has(version) ? version : null;
+    const version =
+      provider === "claude"
+        ? text.endsWith(" (Claude Code)")
+          ? text.slice(0, -" (Claude Code)".length)
+          : null
+        : text.startsWith("codex-cli ")
+          ? text.slice("codex-cli ".length)
+          : null;
+    if (version === null || !isSupportedCliVersion(provider, version)) return null;
+    const verified = provider === "claude" ? VERIFIED_CLAUDE_VERSIONS : VERIFIED_CODEX_VERSIONS;
+    if (!verified.has(version) && !this.unverifiedVersionLogged.has(`${provider}:${version}`)) {
+      this.unverifiedVersionLogged.add(`${provider}:${version}`);
+      this.diag(`provider version unverified provider=${provider} version=${version}`);
     }
-    const version = text.startsWith("codex-cli ") ? text.slice("codex-cli ".length) : null;
-    return version !== null && SUPPORTED_CODEX_VERSIONS.has(version) ? version : null;
+    return version;
   }
 
   private async claudeAuthReason(): Promise<string | null> {
@@ -732,6 +752,12 @@ async function captureOfficialPane(
   } catch {
     return null;
   }
+}
+
+/** 最低バージョン以上なら対応（上限なし。新版は実行時検証に委ねる）。形式外は非対応。 */
+export function isSupportedCliVersion(provider: OfficialAppProvider, version: string): boolean {
+  const minimum = provider === "claude" ? MINIMUM_CLAUDE_CLI_VERSION : MINIMUM_CODEX_CLI_VERSION;
+  return versionAtLeast(version, minimum) === true;
 }
 
 /**

@@ -18,6 +18,12 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { defaultInjectedPath } from "./launch.js";
 import { resolveSessionBackendKind } from "../backend/sessionBackend.js";
+import {
+  MINIMUM_CLAUDE_CLI_VERSION,
+  MINIMUM_CODEX_CLI_VERSION,
+  parseNumericVersion,
+  versionAtLeast,
+} from "../shared/cliVersions.js";
 
 // MARK: - ホストシム生成（テスタブル）
 
@@ -125,35 +131,10 @@ export interface DoctorCheck {
 
 /** Tailii が依存している／相互運用を確認済みの最低版。最新版追従ではなく互換性境界。 */
 export const MINIMUM_NODE_MAJOR = 20;
-export const MINIMUM_CLAUDE_CLI_VERSION = "2.1.215";
-export const MINIMUM_CODEX_CLI_VERSION = "0.144.5";
+export { MINIMUM_CLAUDE_CLI_VERSION, MINIMUM_CODEX_CLI_VERSION, parseNumericVersion, versionAtLeast };
 export const MINIMUM_HERDR_VERSION = "0.7.5";
 /** launchctl の応答がなくても診断全体を止めない上限。 */
 export const DOCTOR_QUIC_STATUS_TIMEOUT_MS = 2_000;
-
-/** `--version` の先頭に現れる数値版を比較用の整数列へ変換する。 */
-export function parseNumericVersion(raw: string | null): number[] | null {
-  if (raw === null) return null;
-  const match = /\d+(?:\.\d+)+/.exec(raw);
-  if (match === null) return null;
-  const parts = match[0].split(".").map(Number);
-  return parts.every(Number.isFinite) ? parts : null;
-}
-
-/** prerelease の飾りは無視し、数値成分だけで `actual >= minimum` を判定する。 */
-export function versionAtLeast(actual: string | null, minimum: string): boolean | null {
-  const left = parseNumericVersion(actual);
-  const right = parseNumericVersion(minimum);
-  if (left === null || right === null) return null;
-  const length = Math.max(left.length, right.length);
-  for (let index = 0; index < length; index += 1) {
-    const l = left[index] ?? 0;
-    const r = right[index] ?? 0;
-    if (l > r) return true;
-    if (l < r) return false;
-  }
-  return true;
-}
 
 /**
  * 診断用の短いバージョン取得。
