@@ -24,7 +24,8 @@ export function isQuestionDialogFrame(text: string): boolean {
     text.includes("Tab to switch questions") ||
     text.includes("Ready to submit your answers?") ||
     text.includes("Chat about this") ||
-    text.includes("Type something.") ||
+    // Other 行は単一選択 `Type something.` / multiSelect `Type something`（末尾ドット無し）。
+    text.includes("Type something") ||
     text.includes("to add notes")
   );
 }
