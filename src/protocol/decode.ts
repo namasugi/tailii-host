@@ -191,6 +191,14 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         rawMode === "default" || rawMode === "acceptEdits" || rawMode === "plan" || rawMode === "auto"
           ? rawMode
           : undefined;
+      // effort は既知 5 値のみ採用（claude 新規起動の --effort。起動前の工数選択）。未知/未指定は
+      // undefined（フラグ無し＝claude 既定）。
+      const rawEffort = optionalString(raw, "effort");
+      const effort =
+        rawEffort === "low" || rawEffort === "medium" || rawEffort === "high" ||
+        rawEffort === "xhigh" || rawEffort === "max"
+          ? rawEffort
+          : undefined;
       return compact({
         type, v,
         id: requireString(raw, "id"),
@@ -202,6 +210,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         agentType,
         model: optionalString(raw, "model"),
         permissionMode,
+        effort,
         codexModel: optionalString(raw, "codexModel"),
         codexSandbox,
         deferSubscribe: optionalBoolean(raw, "deferSubscribe"),

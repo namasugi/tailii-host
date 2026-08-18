@@ -8,6 +8,7 @@ import { describe, expect, test } from "vitest";
 import type { ControlMessage } from "../src/protocol.js";
 import {
   CONTEXT_STREAM_ID,
+  EFFORT_STREAM_ID,
   HISTORY_DONE_STREAM_ID,
   MODEL_STREAM_ID,
   TranscriptTailer,
@@ -289,6 +290,26 @@ describe("TranscriptTailer", () => {
     // <synthetic> を無視し、lastModel も汚さない（実モデル復帰時に重複マーカーを流さない）。
     expect(markers.map((m) => (m.type === "chat_output" ? m.text : ""))).toEqual([
       "claude-fable-5",
+    ]);
+  });
+
+  test("assistant 行のトップレベル effort が変わるたびに pc:effort マーカーを流す", async () => {
+    const p = writeTranscript([
+      '{"message":{"role":"assistant","content":[{"type":"text","text":"a"}]},"uuid":"a1","effort":"max"}',
+      '{"message":{"role":"assistant","content":[{"type":"text","text":"b"}]},"uuid":"a2","effort":"max"}',
+      // user 行の effort・未知値・非文字列は無視（lastEffort も汚さない）。
+      '{"type":"user","message":{"role":"user","content":"u"},"uuid":"u1","effort":"low"}',
+      '{"message":{"role":"assistant","content":[{"type":"text","text":"c"}]},"uuid":"a3","effort":"ultra"}',
+      '{"message":{"role":"assistant","content":[{"type":"text","text":"d"}]},"uuid":"a4","effort":7}',
+      '{"message":{"role":"assistant","content":[{"type":"text","text":"e"}]},"uuid":"a5","effort":"low"}',
+    ]);
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
+    const markers = (await collect(tailer.streamTranscript(p))).filter(
+      (m) => m.type === "chat_output" && m.streamId === EFFORT_STREAM_ID,
+    );
+    expect(markers).toEqual([
+      { type: "chat_output", v: 1, streamId: EFFORT_STREAM_ID, role: "system", text: "max", eof: true },
+      { type: "chat_output", v: 1, streamId: EFFORT_STREAM_ID, role: "system", text: "low", eof: true },
     ]);
   });
 

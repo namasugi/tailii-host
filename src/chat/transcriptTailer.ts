@@ -28,6 +28,15 @@ export const HISTORY_DONE_STREAM_ID = "pc:history-done";
 export const MODEL_STREAM_ID = "pc:model";
 /** 現在コンテキストトークン数通知マーカーの streamId（iOS 側 `ChatLogModel` と対で解釈する）。 */
 export const CONTEXT_STREAM_ID = "pc:context";
+/**
+ * 実効 reasoning effort 通知マーカーの streamId（iOS 側 `ChatLogModel` と対で解釈する）。
+ * claude は assistant 行のトップレベル `effort` に、その応答で実際に使った effort を記録する
+ * （`--effort` 起動値 / `/effort` 変更後の値。2.1.234 で確認）。iOS の工数バッジは楽観表示
+ * しか持たなかったので、これを権威として同期する。
+ */
+export const EFFORT_STREAM_ID = "pc:effort";
+/** claude の effort 既知値（未知値は通知しない）。 */
+const EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
 
 const MAX_COMMAND_CHARACTERS = 8_000;
 const MAX_DESCRIPTION_CHARACTERS = 2_000;
@@ -60,6 +69,8 @@ interface Turn {
   toolResultIds: string[];
   model: string | null;
   contextTokens: number | null;
+  /** assistant 行の実効 reasoning effort（トップレベル `effort`。既知値以外は null）。 */
+  effort: string | null;
   /** Skill ツール起動で注入されたスキル本文（該当ツールカードへ後付けする）。 */
   skillInjection?: { toolUseId: string; text: string };
 }
@@ -69,6 +80,7 @@ interface TailState {
   seq: number;
   lastModel: string | null;
   lastContextTokens: number | null;
+  lastEffort: string | null;
   activeQuestionIds: Set<string>;
   /** 本文待ちの Skill ツールカード（tool_use id → 発行済み activity）。 */
   pendingSkillActivities: Map<string, ToolActivity>;
@@ -181,6 +193,7 @@ export class TranscriptTailer {
         seq: 0,
         lastModel: null,
         lastContextTokens: null,
+        lastEffort: null,
         activeQuestionIds: new Set(),
         pendingSkillActivities: new Map(),
       };
@@ -328,6 +341,19 @@ function* emitLine(line: Buffer, state: TailState): Generator<ControlMessage, vo
     };
   }
 
+  // 実効 effort の通知: assistant 行の `effort` が変わったらマーカーを 1 通流す（工数バッジ同期）。
+  if (turn.effort !== null && turn.effort !== state.lastEffort) {
+    state.lastEffort = turn.effort;
+    yield {
+      type: "chat_output",
+      v: PROTOCOL_V1,
+      streamId: EFFORT_STREAM_ID,
+      role: "system",
+      text: turn.effort,
+      eof: true,
+    };
+  }
+
   // 現在コンテキストトークン数の通知: assistant ターンの `message.usage` 合計が変わったらマーカーを 1 通流す。
   if (turn.contextTokens !== null && turn.contextTokens !== state.lastContextTokens) {
     state.lastContextTokens = turn.contextTokens;
@@ -387,6 +413,7 @@ export function extractTurn(line: string): Turn | null {
       toolResultIds: [],
       model: null,
       contextTokens: null,
+      effort: null,
     };
   }
 
@@ -399,6 +426,7 @@ export function extractTurn(line: string): Turn | null {
       toolResultIds: [],
       model: null,
       contextTokens: null,
+      effort: null,
     };
     // Remote Control の activation 通知（bridge_status）。未接続から /remote-control で
     // 有効化したとき、可視信号はこの行だけ（TUI バナーは通常ターンに残らない）。
@@ -445,7 +473,10 @@ export function extractTurn(line: string): Turn | null {
   const toolResultIds = extractToolResultIds(rawContent);
   const model = typeof message?.["model"] === "string" ? (message["model"] as string) : null;
   const contextTokens = role === "assistant" ? extractContextTokens(message?.["usage"]) : null;
-  const turn: Turn = { id, role, text, toolActivities, questionPrompts, toolResultIds, model, contextTokens };
+  const rawEffort = rec["effort"];
+  const effort =
+    role === "assistant" && typeof rawEffort === "string" && EFFORT_LEVELS.has(rawEffort) ? rawEffort : null;
+  const turn: Turn = { id, role, text, toolActivities, questionPrompts, toolResultIds, model, contextTokens, effort };
   if (injectedSkill && typeof rec["sourceToolUseID"] === "string" && plainText.length > 0) {
     turn.skillInjection = { toolUseId: rec["sourceToolUseID"], text: plainText };
   }

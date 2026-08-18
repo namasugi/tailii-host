@@ -53,6 +53,9 @@ const CODEX_MODEL_SAFE = /^[A-Za-z0-9._-]+$/;
 /** claude の permission mode 既知値（--permission-mode に安全に渡せる値のみ）。 */
 const CLAUDE_PERMISSION_MODES = new Set(["default", "acceptEdits", "plan", "auto"]);
 
+/** claude の effort 既知値（--effort に安全に渡せる値のみ。claude 2.1.234 で確認）。 */
+const CLAUDE_EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
+
 /**
  * claude の resume/continue は古く大きいセッションで TUI 専用設問
  * `Resume from summary?` を出してブロックする。この設問は transcript にもフックにも乗らず
@@ -66,10 +69,12 @@ const CLAUDE_RESUME_THRESHOLD_ENV =
  * claude 新規起動の inner コマンドを組み立てる（起動前モデル/モード選択の反映）。
  * @param model 省略/不正文字は無視（アカウント既定モデル）。alias（'opus' 等）と完全 id の両方可。
  * @param permissionMode 既知 4 値のみ採用。"default" はフラグ無しと等価なので付けない。
+ * @param effort 既知 5 値のみ採用（起動前の工数選択。TUI 未起動のため `/effort` は届かない）。
  */
 export function claudeInnerCommand(opts: {
   model?: string | null;
   permissionMode?: string | null;
+  effort?: string | null;
 }): string {
   let cmd = DEFAULT_INNER_COMMAND;
   if (opts.model && CODEX_MODEL_SAFE.test(opts.model)) cmd += ` --model ${opts.model}`;
@@ -80,6 +85,7 @@ export function claudeInnerCommand(opts: {
   ) {
     cmd += ` --permission-mode ${opts.permissionMode}`;
   }
+  if (opts.effort && CLAUDE_EFFORT_LEVELS.has(opts.effort)) cmd += ` --effort ${opts.effort}`;
   return cmd;
 }
 

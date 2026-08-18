@@ -239,13 +239,14 @@ export const sessionHandlers: HandlerRegistry = {
     // session_start → launch() 結線。agentType でセッション毎に claude/codex を選ぶ
     //（未指定は host 既定 defaultAgent）。codex は agentType=codex 時の専用 launcher を使う。
     const sessionAgent: ChatAgent = message.agentType ?? ctx.defaultAgent;
-    // claude 新規起動でモデル/permission mode 指定があれば、その flags（--model /
-    // --permission-mode）を持つ launcher をその場で組む（起動前選択の反映）。
+    // claude 新規起動でモデル/permission mode/effort 指定があれば、その flags（--model /
+    // --permission-mode / --effort）を持つ launcher をその場で組む（起動前選択の反映）。
     // resume は元セッションの設定を継ぐため既定 launcher を使う。
     const perSessionClaudeLauncher =
       sessionAgent === "claude" &&
       message.resumeSessionId === undefined &&
-      (message.model !== undefined || message.permissionMode !== undefined)
+      (message.model !== undefined || message.permissionMode !== undefined ||
+        message.effort !== undefined)
         ? makeSessionLauncher({
             ...(ctx.metadataStore !== null && { store: ctx.metadataStore }),
             agent: "claude",
@@ -253,6 +254,7 @@ export const sessionHandlers: HandlerRegistry = {
             innerCommand: claudeInnerCommand({
               model: message.model ?? null,
               permissionMode: message.permissionMode ?? null,
+              effort: message.effort ?? null,
             }),
           })
         : null;

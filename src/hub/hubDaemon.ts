@@ -38,6 +38,7 @@ import {
   type ControlMessage,
 } from "../protocol.js";
 import { injectQuestionAnswers } from "./questionInjection.js";
+import { EFFORT_COMMAND_PATTERN, confirmEffortChangeDialog } from "./effortDialog.js";
 import { ImageService } from "../chat/imageService.js";
 import { listServeProcessesWithStatus } from "../services/serveService.js";
 
@@ -449,7 +450,17 @@ export async function runHubCommand(args: string[]): Promise<number> {
     questionInjector: (answers, session) => injectQuestionAnswers(answers, session, sessionBackend),
     // 本文+送信確定は backend 側の 1 操作に委ねる（herdr は本文+CR 単一コール必須。
     // 分割すると Ink のペースト取り込み窓に CR が飲まれ送信されない）。
-    chatInjector: (text, session) => sessionBackend.sendTextSubmit(session, text),
+    chatInjector: async (text, session) => {
+      await sessionBackend.sendTextSubmit(session, text);
+      // `/effort <level>` は会話途中だと確認ダイアログが挟まる（effort-dialog）。ユーザーの
+      // 明示操作なので出現したら Enter で承認し、切替を完了させる。
+      // ack（chat_send_result）を遅らせないよう待たずに流す（ダイアログ未出現時は 4s で諦める）。
+      if (EFFORT_COMMAND_PATTERN.test(text)) {
+        void confirmEffortChangeDialog(sessionBackend, session, { log }).catch((error: unknown) => {
+          log(`effort dialog 承認失敗 session=${session} error=${String(error)}`);
+        });
+      }
+    },
   });
   hub.restoreFromHeartbeats();
   hub.restorePendingQuestions();
