@@ -3,7 +3,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, test, vi } from "vitest";
-import { fileList, fileRead } from "../src/services/fileService.js";
+import { fileFetch, fileList, fileRead } from "../src/services/fileService.js";
 import { makeTempDir } from "./helpers.js";
 
 describe("fileService", () => {
@@ -81,5 +81,68 @@ describe("fileService", () => {
       kind: "image", imageBase64: "aW1hZ2U=", imageFormat: "png",
     });
     expect(thumbnailer).toHaveBeenCalledWith(imagePath, 1_024);
+  });
+});
+
+describe("fileFetch (file-download)", () => {
+  async function collect(
+    generator: AsyncGenerator<{ seq: number; data: string; eof: boolean; error?: string; size?: number; mime?: string; name?: string }>,
+  ) {
+    const chunks = [];
+    for await (const chunk of generator) chunks.push(chunk);
+    return chunks;
+  }
+
+  test("原本を chunkSize ごとに seq 昇順で配り、最終チャンクだけ eof", async () => {
+    const root = makeTempDir("file-fetch");
+    const filePath = path.join(root, "report.pdf");
+    const body = Buffer.from("0123456789abcdefXYZ");
+    fs.writeFileSync(filePath, body);
+
+    const chunks = await collect(fileFetch(filePath, { chunkSize: 8 }));
+    expect(chunks.map((chunk) => [chunk.seq, chunk.eof])).toEqual([[0, false], [1, false], [2, true]]);
+    expect(chunks.every((chunk) => chunk.size === body.length && chunk.name === "report.pdf")).toBe(true);
+    expect(chunks[0]?.mime).toBe("application/pdf");
+    const joined = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk.data, "base64")));
+    expect(joined.equals(body)).toBe(true);
+  });
+
+  test("空ファイルは data 空の 1 チャンク（eof）", async () => {
+    const root = makeTempDir("file-fetch-empty");
+    const filePath = path.join(root, "empty.bin");
+    fs.writeFileSync(filePath, "");
+    const chunks = await collect(fileFetch(filePath));
+    expect(chunks).toEqual([{ seq: 0, data: "", eof: true, mime: "application/octet-stream", name: "empty.bin", size: 0 }]);
+  });
+
+  test("相対パス・存在しない・ディレクトリ・上限超過は error 付き単一チャンク", async () => {
+    const root = makeTempDir("file-fetch-error");
+    fs.writeFileSync(path.join(root, "big.bin"), Buffer.alloc(32));
+    for (const [target, options] of [
+      ["relative.pdf", {}],
+      [path.join(root, "missing.pdf"), {}],
+      [root, {}],
+      [path.join(root, "big.bin"), { sizeLimit: 16 }],
+    ] as const) {
+      const chunks = await collect(fileFetch(target, options));
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0]).toMatchObject({ seq: 0, data: "", eof: true });
+      expect(chunks[0]?.error).toBeTruthy();
+      expect(chunks[0]?.size).toBeUndefined();
+    }
+  });
+
+  test("isCancelled が立つと以降のチャンクを打ち切る", async () => {
+    const root = makeTempDir("file-fetch-cancel");
+    const filePath = path.join(root, "long.bin");
+    fs.writeFileSync(filePath, Buffer.alloc(64, 1));
+    let cancelled = false;
+    let delivered = 0;
+    for await (const chunk of fileFetch(filePath, { chunkSize: 8, isCancelled: () => cancelled })) {
+      delivered += 1;
+      expect(chunk.eof).toBe(false);
+      if (delivered === 2) cancelled = true;
+    }
+    expect(delivered).toBe(2);
   });
 });

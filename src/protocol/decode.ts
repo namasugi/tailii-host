@@ -438,6 +438,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
     }
 
     case "image_fetch_request":
+    case "file_fetch_cancel":
     case "account_usage_request":
     case "question_dismiss":
     case "claude_session_list_request":
@@ -725,6 +726,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
 
     case "file_list_request":
     case "file_read_request":
+    case "file_fetch_request":
     case "git_status_request":
     case "git_branch_list_request":
     case "git_init_request":
@@ -776,6 +778,19 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         error: optionalString(raw, "error"),
       });
     }
+
+    case "file_fetch_response":
+      return compact({
+        type, v,
+        id: requireString(raw, "id"),
+        seq: requireNumber(raw, "seq"),
+        data: requireString(raw, "data"),
+        eof: requireBoolean(raw, "eof"),
+        mime: optionalString(raw, "mime"),
+        name: optionalString(raw, "name"),
+        size: optionalNumber(raw, "size"),
+        error: optionalString(raw, "error"),
+      });
 
     case "git_status_response":
       return compact({
@@ -1159,6 +1174,14 @@ function decodeToolActivity(raw: Raw): ToolActivity {
       return { content: requireString(obj, "content"), status: requireString(obj, "status") };
     });
   }
+  const filesValue = raw["files"];
+  let files: string[] | undefined;
+  if (filesValue !== undefined && filesValue !== null) {
+    if (!Array.isArray(filesValue) || filesValue.some((element) => typeof element !== "string")) {
+      throw new ProtocolDecodeError("missing-field", "files");
+    }
+    files = filesValue as string[];
+  }
   return compact<ToolActivity>({
     id: requireString(raw, "id"),
     name: requireString(raw, "name"),
@@ -1172,6 +1195,7 @@ function decodeToolActivity(raw: Raw): ToolActivity {
     description: optionalString(raw, "description"),
     descriptionTruncated: optionalBoolean(raw, "descriptionTruncated") ?? false,
     todos,
+    files,
   });
 }
 

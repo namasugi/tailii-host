@@ -46,6 +46,8 @@ export interface ToolActivity {
   description?: string;
   descriptionTruncated: boolean;
   todos?: ToolActivityTodo[];
+  /** SendUserFile が利用者へ渡したファイルの絶対パス一覧（他ツールは省略, additive, file-download）。 */
+  files?: string[];
 }
 
 export type SubagentNodeStatus = "running" | "completed" | "error";
@@ -159,6 +161,21 @@ export interface FileReadResult {
   truncated?: boolean;
   imageBase64?: string;
   imageFormat?: string;
+  error?: string;
+}
+
+/** file_fetch_response の 1 チャンク（サービス内部表現）。 */
+export interface FileFetchChunk {
+  seq: number;
+  data: string;
+  eof: boolean;
+  /** 原本の MIME（推定）。error 時は省略。 */
+  mime?: string;
+  /** 原本のファイル名（保存名の既定）。error 時は省略。 */
+  name?: string;
+  /** 原本の総バイト数（進捗表示用）。error 時は省略。 */
+  size?: number;
+  /** 取得失敗の理由。付くときは eof:true・data 空。 */
   error?: string;
 }
 
@@ -468,6 +485,12 @@ export type ControlMessage =
   | { type: "file_list_response"; v: number; id: string; path: string; entries: FileEntry[]; truncated: boolean }
   | { type: "file_read_request"; v: number; id: string; path: string }
   | ({ type: "file_read_response"; v: number; id: string } & FileReadResult)
+  /** ファイル原本のダウンロード要求（iOS→Mac, file-download）。`path` は絶対パス。 */
+  | { type: "file_fetch_request"; v: number; id: string; path: string }
+  /** ダウンロードの中止（iOS→Mac）。以降のチャンク配信を打ち切る。 */
+  | { type: "file_fetch_cancel"; v: number; id: string }
+  /** 原本の分割配信（Mac→iOS）。`seq` 昇順・最終チャンクで `eof:true`。失敗は `error` 付き単一チャンク。 */
+  | ({ type: "file_fetch_response"; v: number; id: string } & FileFetchChunk)
   | { type: "git_status_request"; v: number; id: string; path: string }
   | { type: "git_status_response"; v: number; id: string; isRepo: boolean; branch: string; upstream: string | null; ahead: number; behind: number; files: GitStatusFile[]; repoRoot?: string; diffAdditions?: number; diffDeletions?: number }
   | { type: "git_diff_request"; v: number; id: string; path: string; file?: string; staged?: boolean; commit?: string | null }

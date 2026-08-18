@@ -38,6 +38,13 @@ describe("golden roundtrip", () => {
     }
   });
 
+  it("file-download v1 golden 全行が byte-exact でラウンドトリップする", () => {
+    for (const line of goldenLines("file-download-v1.ndjson")) {
+      const decoded = decodeControlMessage(line);
+      expect(encodeControlMessage(decoded)).toBe(line);
+    }
+  });
+
   it("serve-list v1 golden 全行が byte-exact でラウンドトリップする", () => {
     for (const line of goldenLines("serve-list-v1.ndjson")) {
       const decoded = decodeControlMessage(line);

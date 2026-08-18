@@ -820,6 +820,15 @@ function buildSummary(toolName: string, toolInput: Record<string, unknown>): str
       if (typeof filePath === "string" && filePath.length > 0) return `Edit file: ${filePath}`;
       return "Edit a file";
     }
+    case "SendUserFile": {
+      // 成果物の受け渡し（file-download）。承認カードでどのファイルかが分かるようにする。
+      const files = Array.isArray(toolInput["files"])
+        ? (toolInput["files"] as unknown[]).filter((f): f is string => typeof f === "string" && f.length > 0)
+        : [];
+      if (files.length === 0) return "Send file to user";
+      const names = files.map((f) => f.split("/").pop() ?? f);
+      return `Send file: ${names.join(", ")}`;
+    }
     default:
       return `Run tool: ${toolName}`;
   }

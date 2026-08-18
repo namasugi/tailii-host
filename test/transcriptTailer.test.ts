@@ -449,6 +449,38 @@ describe("TranscriptTailer", () => {
     ]);
   });
 
+  test("SendUserFile は files/caption 付きの tool_activity になる（file-download）", async () => {
+    const line = JSON.stringify({
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "toolu_send",
+            name: "SendUserFile",
+            input: {
+              files: ["/Users/alice/tmp/報告書.pdf", "/Users/alice/tmp/data.csv"],
+              caption: "A4 の報告書と元データ",
+              status: "normal",
+              display: "attach",
+            },
+          },
+        ],
+      },
+      uuid: "s1",
+    });
+    const p = writeTranscript([line]);
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
+    const activities = (await collect(tailer.streamTranscript(p))).filter(
+      (m) => m.type === "tool_activity",
+    );
+    const activity = activities[0]!.type === "tool_activity" ? activities[0]!.activity : null;
+    expect(activity?.label).toBe("ファイルを送信 報告書.pdf ほか1件");
+    expect(activity?.file).toBe("/Users/alice/tmp/報告書.pdf");
+    expect(activity?.files).toEqual(["/Users/alice/tmp/報告書.pdf", "/Users/alice/tmp/data.csv"]);
+    expect(activity?.description).toBe("A4 の報告書と元データ");
+  });
+
   test("AskUserQuestion は question_prompt を送出し、tool_result で question_dismiss する", async () => {
     const ask = JSON.stringify({
       message: {

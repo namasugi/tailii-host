@@ -634,6 +634,31 @@ function makeToolActivity(id: string, name: string, input: Record<string, unknow
       if (argsCap.value !== null) activity.description = argsCap.value;
       return activity;
     }
+    case "SendUserFile": {
+      // Claude Code が成果物（PDF 等）を利用者へ渡すツール。input = { files: [abs], caption?, display? }。
+      // iOS はこのカードをダウンロード導線にする（file-download）。
+      const files = Array.isArray(input["files"])
+        ? (input["files"] as unknown[]).filter((f): f is string => typeof f === "string" && f.length > 0)
+        : [];
+      const captionCap = cap(str(input["caption"]), MAX_DESCRIPTION_CHARACTERS);
+      const first = files[0] ?? null;
+      const summary = first === null
+        ? null
+        : files.length > 1
+          ? `${displayPath(first, name)} ほか${files.length - 1}件`
+          : displayPath(first, name);
+      const activity: ToolActivity = {
+        id,
+        name,
+        label: summary === null ? "ファイルを送信" : `ファイルを送信 ${summary}`,
+        commandTruncated: false,
+        descriptionTruncated: captionCap.truncated,
+      };
+      if (first !== null) activity.file = first;
+      if (files.length > 0) activity.files = files;
+      if (captionCap.value !== null) activity.description = captionCap.value;
+      return activity;
+    }
     case "TodoWrite": {
       const todos = extractTodos(input["todos"]);
       const activity: ToolActivity = {

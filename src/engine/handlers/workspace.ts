@@ -3,10 +3,13 @@
 // ファイル一覧（git バッジ付き）/読み取り。
 
 import { dirCanCreate, dirChildren, dirCreate, dirList } from "../../services/dirLister.js";
-import { fileList, fileRead } from "../../services/fileService.js";
+import { fileFetch, fileList, fileRead } from "../../services/fileService.js";
 import { gitEntryStatuses } from "../../services/gitService.js";
 import { engineDiag, type HandlerRegistry } from "../context.js";
 import { collectSlashCommands } from "../slashCommands.js";
+
+/** 配信中の file_fetch（要求 id → 中止フラグ）。file_fetch_cancel で立て、配信ループが次チャンクで見る。 */
+const activeFileFetches = new Map<string, { cancelled: boolean }>();
 
 export const workspaceHandlers: HandlerRegistry = {
   slash_list_request: (message, ctx) => {
@@ -101,6 +104,39 @@ export const workspaceHandlers: HandlerRegistry = {
         entries: [], truncated: false,
       });
     }
+  },
+
+  file_fetch_request: (message, ctx) => {
+    const { writer, state } = ctx;
+    const v = state.negotiatedVersion;
+    engineDiag(`file_fetch_request id=${message.id} path=${message.path}`);
+    // 同一 id の再要求は前回を打ち切ってから始める（重複配信で seq が混ざるのを防ぐ）。
+    const previous = activeFileFetches.get(message.id);
+    if (previous !== undefined) previous.cancelled = true;
+    const control = { cancelled: false };
+    activeFileFetches.set(message.id, control);
+    // 読み取りループは engine の read loop（handleLine を直列 await）を塞がないよう
+    // 待たずに走らせる。中止要求（file_fetch_cancel）は並行して届く。
+    void (async () => {
+      try {
+        for await (const chunk of fileFetch(message.path, { isCancelled: () => control.cancelled })) {
+          if (control.cancelled) break;
+          await writer.writeWithBackpressure({ type: "file_fetch_response", v, id: message.id, ...chunk });
+        }
+      } catch (error) {
+        process.stderr.write(
+          `[tailii-host engine] file_fetch_response 書込失敗 id=${message.id}: ${String(error)}\n`,
+        );
+      } finally {
+        if (activeFileFetches.get(message.id) === control) activeFileFetches.delete(message.id);
+      }
+    })();
+  },
+
+  file_fetch_cancel: (message) => {
+    engineDiag(`file_fetch_cancel id=${message.id}`);
+    const control = activeFileFetches.get(message.id);
+    if (control !== undefined) control.cancelled = true;
   },
 
   file_read_request: async (message, ctx) => {

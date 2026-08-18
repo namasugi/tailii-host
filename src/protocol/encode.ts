@@ -44,6 +44,7 @@ function wireObject(message: ControlMessage): Raw {
       out["descriptionTruncated"] = activity.descriptionTruncated;
     }
     if (activity.todos !== undefined) out["todos"] = activity.todos;
+    if (activity.files !== undefined) out["files"] = activity.files;
   }
 
   if (message.type === "subagent_node") {

@@ -208,6 +208,30 @@ describe("Hook — PreToolUse 承認ゲート", () => {
     expect(spy.calls.length).toBe(0);
   });
 
+  it("SendUserFile の承認要求は summary にファイル名を載せる（file-download）", async () => {
+    socketPath = tempSocketPath("send-user-file");
+    listener = await startListener(socketPath);
+
+    const served = serveOnce(listener, (id, socket) => {
+      writeLine(socket, encodeDecision(id, "allow"));
+    });
+    const stdinData = Buffer.from(JSON.stringify({
+      session_id: "sess-abc",
+      tool_name: "SendUserFile",
+      tool_input: { files: ["/Users/alice/tmp/報告書.pdf", "/Users/alice/tmp/data.csv"], caption: "報告書" },
+      cwd: "/work/dir",
+    }));
+    const { exitCode } = await runHookCore({
+      stdinData, socketPath, deadlineSeconds: 5, notifier: new SpyNotifier().notifier,
+    });
+    const message = await served;
+
+    expect(exitCode).toBe(0);
+    if (message.type !== "approval_request") throw new Error("unreachable");
+    expect(message.tool).toBe("SendUserFile");
+    expect(message.summary).toBe("Send file: 報告書.pdf, data.csv");
+  });
+
   it("deny 決定（理由あり）→ permissionDecision deny + 理由", async () => {
     socketPath = tempSocketPath("deny");
     listener = await startListener(socketPath);

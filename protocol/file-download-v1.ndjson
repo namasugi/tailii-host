@@ -1,0 +1,7 @@
+{"id":"ff1","path":"/Users/alice/project/report.pdf","type":"file_fetch_request","v":1}
+{"data":"JVBERi0xLjQK","eof":false,"id":"ff1","mime":"application/pdf","name":"report.pdf","seq":0,"size":20,"type":"file_fetch_response","v":1}
+{"data":"JSVFT0YK","eof":true,"id":"ff1","mime":"application/pdf","name":"report.pdf","seq":1,"size":20,"type":"file_fetch_response","v":1}
+{"id":"ff1","type":"file_fetch_cancel","v":1}
+{"id":"ff2","path":"/Users/alice/project/missing.zip","type":"file_fetch_request","v":1}
+{"data":"","eof":true,"error":"Error: ENOENT: no such file or directory, stat '/Users/alice/project/missing.zip'","id":"ff2","seq":0,"type":"file_fetch_response","v":1}
+{"description":"A4 の報告書と元データ","descriptionTruncated":false,"file":"/Users/alice/tmp/報告書.pdf","files":["/Users/alice/tmp/報告書.pdf","/Users/alice/tmp/data.csv"],"id":"toolu_send","label":"ファイルを送信 報告書.pdf ほか1件","name":"SendUserFile","type":"tool_activity","v":1}

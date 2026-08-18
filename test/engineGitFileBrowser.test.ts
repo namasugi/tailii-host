@@ -177,3 +177,34 @@ describe("EngineControl — file/git browser", () => {
     await engine.teardown();
   });
 });
+
+describe("EngineControl — file_fetch (file-download)", () => {
+  test("file_fetch_request を分割 file_fetch_response に、失敗は error チャンクにする", async () => {
+    const root = fs.realpathSync(makeTempDir("engine-file-fetch"));
+    const body = Buffer.from("hello file download over ndjson");
+    fs.writeFileSync(path.join(root, "doc.pdf"), body);
+
+    const manager = new TmuxSessionManager({ runner: new MockTmuxRunner(() => ({ exitCode: 0, stdout: "", stderr: "" })).runner });
+    const engine = startEngine({ sessionManager: manager });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine(JSON.stringify({ type: "file_fetch_request", v: 1, id: "ff", path: path.join(root, "doc.pdf") }));
+    const first = decodeControlMessage(await engine.lines.nextOfType("file_fetch_response"));
+    expect(first).toMatchObject({
+      type: "file_fetch_response", id: "ff", seq: 0, eof: true,
+      mime: "application/pdf", name: "doc.pdf", size: body.length,
+    });
+    if (first.type !== "file_fetch_response") throw new Error("unreachable");
+    expect(Buffer.from(first.data, "base64").equals(body)).toBe(true);
+
+    engine.writeLine(JSON.stringify({ type: "file_fetch_request", v: 1, id: "ffx", path: path.join(root, "missing.pdf") }));
+    expect(decodeControlMessage(await engine.lines.nextOfType("file_fetch_response"))).toMatchObject({
+      type: "file_fetch_response", id: "ffx", seq: 0, eof: true, data: "",
+      error: expect.stringContaining("ENOENT"),
+    });
+
+    // 中止は無害（未知 id も含めて例外にしない）。
+    engine.writeLine(JSON.stringify({ type: "file_fetch_cancel", v: 1, id: "ff" }));
+    await engine.teardown();
+  });
+});
