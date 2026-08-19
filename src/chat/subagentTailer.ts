@@ -26,6 +26,15 @@ export interface SubagentTailerOptions {
    * コマンド側の猶予より長めに取る。
    */
   agentOrphanGraceMs?: number;
+  /**
+   * 最終行が「終端 stop_reason の無い text のみ assistant 行」= 暫定的な最終レポート形
+   * のときの静止猶予（ms）。既定 600s（agentOrphanGraceMs より短くは効かない）。
+   * サブエージェント transcript では、message 途中の text 行（後続の tool_use を生成中、
+   * 無音は実測最長 135s）が stop_reason null で書かれる一方、最終レポート行の 6〜30%
+   * （全体 11.7%）も null のまま（2.1.187〜2.1.234 まで版を問わず残る恒常的少数派）。null の
+   * 行はどちらとも取れないので、長い猶予でだけ settle する（互換シムではなく恒久的に必要）。
+   */
+  tentativeFinalGraceMs?: number;
   /** output ファイルを開いているプロセスの有無（null=判定不能）。テスト差し替え用。 */
   probeOutputOpen?: (filePath: string) => Promise<boolean | null>;
   /**
@@ -72,6 +81,17 @@ interface TrackedNode {
   lastJsonlTimestampMs: number | null;
   /** 自 transcript の最後の message 行が「text のみの assistant」= 最終レポートの形か。 */
   finalReportMarker: boolean | null;
+  /**
+   * finalReportMarker が true のとき、その行に終端の stop_reason（end_turn 等）が付いている
+   * （message 生成完了が確定している）か。false = 暫定形（tentativeFinalGraceMs を要する）。
+   */
+  finalDefinite: boolean;
+  /**
+   * 自 transcript の最後の message 行が API エラーで途絶えた assistant 行
+   * （`isApiErrorMessage: true`。text のみなので最終レポートの形に見える）か。
+   * 孤児 settle / 死亡 sweep で completed ではなく error に分けるための印。
+   */
+  apiErrorMarker: boolean;
   currentActivity: string | null;
   lastKey: string | null;
 }
@@ -88,6 +108,11 @@ interface TaskNotification {
   status: string;
   exitCode: number | null;
   ts: number | null;
+  /**
+   * TaskStop の停止 ack（"Successfully stopped task"）由来。明示的な停止は ts の前後に
+   * かかわらず killed/stopped 通知より優先する（静かな完了として扱う）。
+   */
+  stopAck?: boolean;
 }
 
 /** バックグラウンドコマンド（Bash run_in_background）の spawn 観測。 */
@@ -123,6 +148,7 @@ export class SubagentTailer {
   private readonly orphanGraceMs: number;
   private readonly orphanProbeIntervalMs: number;
   private readonly agentOrphanGraceMs: number;
+  private readonly tentativeFinalGraceMs: number;
   private readonly probeOutputOpen: (filePath: string) => Promise<boolean | null>;
   private readonly probeSessionAlive: (
     sessionId: string,
@@ -138,6 +164,7 @@ export class SubagentTailer {
     this.orphanGraceMs = options.orphanGraceMs ?? 60_000;
     this.orphanProbeIntervalMs = options.orphanProbeIntervalMs ?? 30_000;
     this.agentOrphanGraceMs = options.agentOrphanGraceMs ?? 120_000;
+    this.tentativeFinalGraceMs = Math.max(this.agentOrphanGraceMs, options.tentativeFinalGraceMs ?? 600_000);
     this.probeOutputOpen = options.probeOutputOpen ?? defaultProbeOutputOpen;
     this.sessionStaleMs = options.sessionStaleMs ?? 6 * 60 * 60 * 1000;
     this.probeSessionAlive = options.probeSessionAlive
@@ -191,8 +218,8 @@ export class SubagentTailer {
     // 通知が握り潰された背景コマンドの孤児判定（taskId → 終了扱いにした ts）。
     const bgOrphanTsByTaskId = new Map<string, number>();
     const bgFirstSeenMsByTaskId = new Map<string, number>();
-    // 通知が配達されえない背景エージェントの孤児判定（nodeId → settle 扱いにした ts）。
-    const agentOrphanTsByNodeId = new Map<string, number>();
+    // 通知が配達されえない背景エージェントの孤児判定（nodeId → settle 扱いにした ts/status）。
+    const agentOrphanByNodeId = new Map<string, { ts: number; status: SubagentNodeStatus }>();
     // 死亡セッションの一括 sweep マーク。生存へ転じたら全破棄して回復できるよう、
     // 通常の孤児 settle とは別に持つ。
     const deadSweepByNodeId = new Map<string, { ts: number; status: SubagentNodeStatus }>();
@@ -224,6 +251,8 @@ export class SubagentTailer {
             node.currentActivity = null;
             node.lastJsonlTimestampMs = null;
             node.finalReportMarker = null;
+            node.finalDefinite = false;
+            node.apiErrorMarker = false;
           }
         }
         if (node !== null) node.firstJsonlTimestampMs = read.state.firstTimestampMs;
@@ -269,20 +298,31 @@ export class SubagentTailer {
                 status: "completed",
                 exitCode: null,
                 ts: hit.ts ?? lineTs,
+                stopAck: true,
               });
             }
           }
-          const notification = extractTaskNotification(line);
-          if (notification !== null) {
+          for (const notification of extractTaskNotifications(line)) {
+            // 同じ task-id の通知は enqueue ログと配達行（user / attachment）の複数行に現れ、
+            // 再開→再停止で複数回起こる。ファイル横断の集約と同じく最新 ts の記録を採る
+            // （= 最後に起きた完了イベント）。TaskStop の ack は明示停止として常に優先。
+            const existing = read.state.notificationByTaskId.get(notification.taskId);
+            if (existing?.stopAck === true) continue;
+            const ts = notification.ts ?? lineTs;
+            if (existing !== undefined && (existing.ts ?? 0) > (ts ?? 0)) continue;
             read.state.notificationByTaskId.set(notification.taskId, {
               status: notification.status,
               exitCode: notification.exitCode,
-              ts: notification.ts ?? lineTs,
+              ts,
             });
           }
           if (node !== null) {
-            const marker = finalReportMarker(line);
-            if (marker !== null) node.finalReportMarker = marker;
+            const shape = messageShape(line);
+            if (shape !== null) {
+              node.finalReportMarker = shape.final;
+              node.finalDefinite = shape.definite;
+              node.apiErrorMarker = shape.apiError;
+            }
             const activity = latestActivitySummary(line);
             if (activity !== null) node.currentActivity = activity;
           }
@@ -300,7 +340,9 @@ export class SubagentTailer {
           for (const [id, result] of state.resultByToolUseId) resultByToolUseId.set(id, result);
           for (const [id, notification] of state.notificationByTaskId) {
             const existing = notificationByTaskId.get(id);
-            if (existing === undefined || (notification.ts ?? 0) >= (existing.ts ?? 0)) {
+            if (existing?.stopAck === true && notification.stopAck !== true) continue;
+            if (existing === undefined || notification.stopAck === true
+              || (notification.ts ?? 0) >= (existing.ts ?? 0)) {
               notificationByTaskId.set(id, notification);
             }
           }
@@ -331,7 +373,8 @@ export class SubagentTailer {
           };
         }
         // バックグラウンド実行（または結果未着）: task-notification が終了信号。
-        // 通知後に自分の transcript が伸びたら resume とみなし running へ戻す。
+        // 通知後に自分の transcript が伸びたら resume とみなし running へ戻す
+        // （再通知か、通知済み継続の settle（下記 notifiedContinuation）で再び終端する）。
         const notification = notificationByTaskId.get(node.nodeId) ?? null;
         const resumedAfter = notification !== null && notification.ts !== null
           && (node.lastJsonlTimestampMs ?? 0) > notification.ts;
@@ -345,14 +388,14 @@ export class SubagentTailer {
         if (node.meta.stoppedByUser) {
           return { status: "completed", ts: node.lastJsonlTimestampMs ?? mtimeMs(node.metaPath) };
         }
-        // 通知が配達されえず孤児 settle 済みなら completed。settle 後に transcript が
+        // 通知が配達されえず孤児 settle 済みなら終端。settle 後に transcript が
         // 伸びたら resume とみなしマークを破棄して running へ戻す（孤児検知で再評価される）。
-        const orphanTs = agentOrphanTsByNodeId.get(node.nodeId);
-        if (orphanTs !== undefined) {
-          if ((node.lastJsonlTimestampMs ?? 0) > orphanTs) {
-            agentOrphanTsByNodeId.delete(node.nodeId);
+        const orphan = agentOrphanByNodeId.get(node.nodeId);
+        if (orphan !== undefined) {
+          if ((node.lastJsonlTimestampMs ?? 0) > orphan.ts) {
+            agentOrphanByNodeId.delete(node.nodeId);
           } else {
-            return { status: "completed", ts: orphanTs };
+            return { status: orphan.status, ts: orphan.ts };
           }
         }
         // 死亡セッションの sweep マーク。transcript が伸びたら破棄（誤判定からの回復）。
@@ -387,7 +430,8 @@ export class SubagentTailer {
       //   終端した起動元」に根ざした木だけ。条件:
       //   - 背景起動（forked-skill、または async 起動 ack 済み）だが有効な完了信号がない
       //   - 最後の message 行が「text のみの assistant」（最終レポート済み。再開注入の
-      //     user 行でマーカーが倒れるため、再開直後の長考中は候補にならない）
+      //     user 行や生成途中の thinking 行でマーカーが倒れるため、再開直後の長考中・
+      //     長い最終レポートのストリーミング中は候補にならない）
       //   - transcript が agentOrphanGraceMs 以上静止（transcript 時刻起点なので
       //     tail 張り直し直後でも古い孤児は即 settle できる）
       //   - 直下に running かつ非候補の子（エージェント/背景コマンド）がいない（fixpoint。
@@ -395,27 +439,35 @@ export class SubagentTailer {
       //   - 起動元が終端済み、または「終端済みに根ざして承認された候補」（承認は終端
       //     アンカーからの伝播のみ。候補同士の相互承認では settle しないので、壊れた
       //     meta の循環参照でも誤 settle しない）
+      //   - 例外=「通知済み継続」: 完了通知が一度出た後に自 transcript が伸びたノードは、
+      //     起動元が root でも settle する。ハーネスは 1 回の走行につき最初の停止でしか
+      //     通知しないため、停止境界で自分の背景タスク通知（[SYSTEM NOTIFICATION]）を
+      //     受け取って続行した走行の 2 度目の停止には通知が来ない（実測: 通知後 3 分続行し
+      //     最終レポートで停止 → 20 時間「実行中」残留）。通知済み = 起動元へ完了が届いた
+      //     後なので、SendMessage 待機中の「未通知の生存エージェント」保護とは衝突しない。
+      //     coordinator 再開（SendMessage）なら再通知が数秒で届き、そちらの ts が優先される。
       const agentStatusById = new Map<string, SubagentNodeStatus>();
       for (const node of tracked.values()) agentStatusById.set(node.nodeId, resolveAgentStatus(node).status);
       const lastActivityMs = (node: TrackedNode): number =>
         node.lastJsonlTimestampMs ?? mtimeMs(node.jsonlPath ?? node.metaPath);
+      // 最終レポートの形で止まっていれば完了、API エラーで途絶えていれば error。
+      const settledStatus = (node: TrackedNode): SubagentNodeStatus =>
+        node.finalReportMarker === true && !node.apiErrorMarker ? "completed" : "error";
       if (sessionAlive === false) {
         for (const node of tracked.values()) {
           if (agentStatusById.get(node.nodeId) !== "running") continue;
           if (deadSweepByNodeId.has(node.nodeId)) continue;
           const lastTs = lastActivityMs(node);
           if (lastTs <= 0 || nowMs - lastTs < this.agentOrphanGraceMs) continue;
-          deadSweepByNodeId.set(node.nodeId, {
-            ts: lastTs,
-            // 最終レポートの形で止まっていれば完了、tool_use のまま止まっていれば中断(error)。
-            status: node.finalReportMarker === true ? "completed" : "error",
-          });
+          // tool_use のまま止まっていれば中断(error)。
+          deadSweepByNodeId.set(node.nodeId, { ts: lastTs, status: settledStatus(node) });
         }
       } else {
         // 生存（または不明）へ転じたら sweep 由来のマークは全破棄する。
         // 死亡判定が誤りだった場合の回復経路（通常の孤児 settle は保持する）。
         if (deadSweepByNodeId.size > 0) deadSweepByNodeId.clear();
         const settleCandidates = new Set<string>();
+        const notifiedContinuations = new Set<string>();
         for (const node of tracked.values()) {
           if (agentStatusById.get(node.nodeId) !== "running") continue;
           const result = node.meta.toolUseId === null
@@ -425,8 +477,14 @@ export class SubagentTailer {
           if (!backgroundLaunch) continue;
           if (node.finalReportMarker !== true) continue;
           if (node.lastJsonlTimestampMs === null) continue;
-          if (nowMs - node.lastJsonlTimestampMs < this.agentOrphanGraceMs) continue;
+          // stop_reason 無しの暫定的な最終行は「続きの tool_use を生成中」でもあり得るので長い猶予。
+          const graceMs = node.finalDefinite ? this.agentOrphanGraceMs : this.tentativeFinalGraceMs;
+          if (nowMs - node.lastJsonlTimestampMs < graceMs) continue;
           settleCandidates.add(node.nodeId);
+          const notification = notificationByTaskId.get(node.nodeId) ?? null;
+          if (notification !== null && notification.ts !== null && node.lastJsonlTimestampMs > notification.ts) {
+            notifiedContinuations.add(node.nodeId);
+          }
         }
         for (;;) {
           const blockedOwners = new Set<string>();
@@ -455,6 +513,12 @@ export class SubagentTailer {
             if (approved.has(id)) continue;
             const node = tracked.get(id);
             if (node === undefined) continue;
+            // 通知済み継続は起動元を問わず承認（起動元へは完了が届いている）。
+            if (notifiedContinuations.has(id)) {
+              approved.add(id);
+              changed = true;
+              continue;
+            }
             const ownerId = ownerOf(node);
             if (ownerId === undefined || ownerId === "root") continue;
             const ownerStatus = agentStatusById.get(ownerId);
@@ -467,7 +531,7 @@ export class SubagentTailer {
         for (const id of approved) {
           const node = tracked.get(id);
           if (node === undefined) continue;
-          agentOrphanTsByNodeId.set(id, lastActivityMs(node));
+          agentOrphanByNodeId.set(id, { ts: lastActivityMs(node), status: settledStatus(node) });
         }
       }
 
@@ -600,6 +664,8 @@ function discoverMetaFiles(
       firstJsonlTimestampMs: null,
       lastJsonlTimestampMs: null,
       finalReportMarker: null,
+      finalDefinite: false,
+      apiErrorMarker: false,
       currentActivity: null,
       lastKey: null,
     });
@@ -817,39 +883,120 @@ function extractBackgroundSpawns(line: string): { id: string; label: string }[] 
   return out;
 }
 
-/**
- * 親 transcript の `<task-notification>` 行（user メッセージの文字列 content）を解析する。
- * バックグラウンドのエージェント/コマンド共通の完了信号で、task-id はエージェントの
- * nodeId またはコマンドの taskId に一致する。
- */
-function extractTaskNotification(
-  line: string,
-): { taskId: string; status: string; exitCode: number | null; ts: number | null } | null {
-  const content = messageContent(line);
-  if (typeof content !== "string" || !content.includes("<task-notification>")) return null;
-  const taskId = /<task-id>([^<]+)<\/task-id>/.exec(content)?.[1];
-  if (taskId === undefined) return null;
-  const status = /<status>([^<]+)<\/status>/.exec(content)?.[1] ?? "completed";
-  const summary = /<summary>([^<]*)<\/summary>/.exec(content)?.[1] ?? "";
-  const exitCode = /exit code (\d+)/.exec(summary)?.[1];
-  return {
-    taskId,
-    status,
-    exitCode: exitCode === undefined ? null : Number(exitCode),
-    ts: timestampMs(line),
-  };
+interface TaskNotificationExtract {
+  taskId: string;
+  status: string;
+  exitCode: number | null;
+  ts: number | null;
 }
 
 /**
+ * `<task-notification>` ブロックを運ぶ行の本文を返す。配達形は 3 つ:
+ *   - user 行（文字列 content）: 起動元がターン境界で受け取った通知（ts ≈ 完了時刻）
+ *   - attachment(queued_command) 行: 起動元がターン中だったとき、次の tool_result 境界で
+ *     配達された通知（prompt に本文。user 行としては残らない。ts は enqueue 時刻）
+ *   - queue-operation 行（content）: ハーネスのキュー操作ログ。`enqueue` は完了時点で
+ *     配達より先に書かれる最速の信号。`remove` は配達後（実測で最大 268s 後）に書かれる
+ *     ログなので読まない — その ts を通知時刻に採ると、配達遅延の間に起きた再開
+ *     （SendMessage）を「通知より古い行」と誤認して completed に塗ってしまう。
+ */
+function notificationText(line: string): string | null {
+  try {
+    const obj = JSON.parse(line) as Record<string, unknown>;
+    if (obj["type"] === "attachment") {
+      const attachment = typeof obj["attachment"] === "object" && obj["attachment"] !== null
+        ? obj["attachment"] as Record<string, unknown>
+        : null;
+      if (attachment?.["type"] !== "queued_command") return null;
+      return typeof attachment["prompt"] === "string" ? attachment["prompt"] : null;
+    }
+    if (obj["type"] === "queue-operation") {
+      if (obj["operation"] !== "enqueue") return null;
+      return typeof obj["content"] === "string" ? obj["content"] : null;
+    }
+    const message = obj["message"];
+    if (typeof message === "object" && message !== null) {
+      const content = (message as Record<string, unknown>)["content"];
+      return typeof content === "string" ? content : null;
+    }
+    return typeof obj["content"] === "string" ? obj["content"] : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 行に含まれる `<task-notification>` を全て解析する（1 行に複数ブロックが束ねられる:
+ * 同時に終わった背景コマンド 2 件が 1 つの [SYSTEM NOTIFICATION] で届く等）。
+ * バックグラウンドのエージェント/コマンド共通の完了信号で、task-id はエージェントの
+ * nodeId またはコマンドの taskId に一致する。同じ封筒は完了以外にも使われる
+ * （Monitor の進捗 `<event>`、背景コマンドの「対話入力待ちらしい」ヒント）。それらは
+ * `<status>` を持たないので、`<status>` のないブロックは完了信号として扱わない。
+ */
+function extractTaskNotifications(line: string): TaskNotificationExtract[] {
+  const content = notificationText(line);
+  if (content === null || !content.includes("<task-notification>")) return [];
+  const ts = timestampMs(line);
+  const out: TaskNotificationExtract[] = [];
+  const blockPattern = /<task-notification>([\s\S]*?)(?:<\/task-notification>|$)/g;
+  for (const match of content.matchAll(blockPattern)) {
+    const block = match[1] ?? "";
+    const taskId = /<task-id>([^<]+)<\/task-id>/.exec(block)?.[1];
+    if (taskId === undefined) continue;
+    const status = /<status>([^<]+)<\/status>/.exec(block)?.[1];
+    if (status === undefined) continue;
+    const summary = /<summary>([^<]*)<\/summary>/.exec(block)?.[1] ?? "";
+    const exitCode = /exit code (\d+)/.exec(summary)?.[1];
+    out.push({
+      taskId,
+      status,
+      exitCode: exitCode === undefined ? null : Number(exitCode),
+      ts,
+    });
+  }
+  return out;
+}
+
+interface MessageShape {
+  /** 「最終レポートの形」= text のみの assistant 行（サブエージェントはこの形で停止する）。 */
+  final: boolean;
+  /**
+   * final のうち終端の stop_reason（end_turn / stop_sequence / max_tokens / refusal）が付いて
+   * いる（message の生成完了が確定している）もの。false は stop_reason null 等の暫定形:
+   * 「後続の tool_use を生成中の message 途中 text 行」か「null のまま書かれた最終レポート」。
+   */
+  definite: boolean;
+  /** API エラーで途絶えた assistant 行（`isApiErrorMessage: true`。text のみなので final に見える）。 */
+  apiError: boolean;
+}
+
+/** message の生成完了を示す stop_reason（これ以外は「続きがある」か「不明」）。 */
+const TERMINAL_STOP_REASONS: ReadonlySet<string> = new Set(["end_turn", "stop_sequence", "max_tokens", "refusal"]);
+/** 続きのブロック/ターンが確定している stop_reason（text のみ行でも最終レポートではない）。 */
+const CONTINUING_STOP_REASONS: ReadonlySet<string> = new Set(["tool_use", "pause_turn"]);
+
+/**
  * message 行の「最終レポートらしさ」を返す:
- *   true  = text のみの assistant 行（サブエージェントはこの形で停止する）
- *   false = それ以外の message 行（user 行・tool_use を含む assistant 行）
- *   null  = message を持たない行（summary 等。判定を変えない）
- * true のまま transcript が静止していればエージェントは停止済み。再開注入
+ *   final=true  = text のみの assistant 行（サブエージェントはこの形で停止する）
+ *   final=false = それ以外の message 行（user 行・tool_use を含む assistant 行・
+ *                 生成途中の thinking のみの assistant 行・stop_reason が「続きあり」の text 行）
+ *   null        = message を持たない行（summary 等。判定を変えない）
+ * final のまま transcript が静止していればエージェントは停止済み。再開注入
  * （task-notification / SendMessage）は user 行として届き false へ倒れるため、
  * 再開直後の長考中を「最終レポート済み」と誤認しない。
+ * claude は content ブロックを 1 行ずつ書く（実データ: サブエージェント側 assistant 2.4 万行中
+ * 複数ブロックは 1 行、main 側 4.0 万行中 0）。
+ * thinking ブロックの行は後続の text/tool_use をまだ生成中の印（最終行になるのは中断時だけ）
+ * なので final=false。text 行の stop_reason は:
+ *   - 終端（end_turn 等）→ definite（生成完了確定。確定形の猶予）
+ *   - tool_use / pause_turn → 続きの tool_use/ターンが確定 → final=false（message 途中の text 行を
+ *     main 側 writer はこの形で書く: main transcript で 3,685 行、サブエージェント側は 10 行。
+ *     99.9% が同一 message の tool_use 行に続かれ、最終行になった例は両側とも 0）
+ *   - null / 欠落 / 未知 → 暫定（サブエージェント側 writer は message 途中の text 行を null で
+ *     書く（無音の最長は実測 135s、>120s は 0.4%）。一方で null のまま書かれた最終レポートも
+ *     版を問わず 6〜30%（全体 11.7%）あり判別不能）→ 呼び出し側が長い猶予で扱う
  */
-function finalReportMarker(line: string): boolean | null {
+function messageShape(line: string): MessageShape | null {
   try {
     const obj = JSON.parse(line) as Record<string, unknown>;
     const message = obj["message"];
@@ -857,12 +1004,23 @@ function finalReportMarker(line: string): boolean | null {
     const rec = message as Record<string, unknown>;
     const content = rec["content"];
     if (content === undefined || content === null) return null;
-    if (rec["role"] !== "assistant") return false;
-    if (typeof content === "string") return true;
+    const notFinal: MessageShape = { final: false, definite: false, apiError: false };
+    if (rec["role"] !== "assistant") return notFinal;
+    const apiError = obj["isApiErrorMessage"] === true;
+    const stopReason = typeof rec["stop_reason"] === "string" ? rec["stop_reason"] : null;
+    if (stopReason !== null && CONTINUING_STOP_REASONS.has(stopReason)) return notFinal;
+    const definite = stopReason !== null && TERMINAL_STOP_REASONS.has(stopReason);
+    if (typeof content === "string") return { final: true, definite, apiError };
     if (!Array.isArray(content)) return null;
-    return !content.some((block) =>
+    const types = content.map((block) =>
       typeof block === "object" && block !== null
-      && (block as Record<string, unknown>)["type"] === "tool_use");
+        ? (block as Record<string, unknown>)["type"]
+        : undefined);
+    if (types.includes("tool_use")) return notFinal;
+    const thinkingOnly = types.length > 0
+      && types.every((type) => type === "thinking" || type === "redacted_thinking");
+    if (thinkingOnly) return notFinal;
+    return { final: true, definite, apiError };
   } catch {
     return null;
   }

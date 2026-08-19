@@ -3,7 +3,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, test } from "vitest";
-import type { ControlMessage } from "../src/protocol.js";
+import type { ControlMessage, SubagentNode } from "../src/protocol.js";
 import { defaultProbeSessionAlive, SubagentTailer, type ProcessProbeExec } from "../src/chat/subagentTailer.js";
 import { makeTempDir } from "./helpers.js";
 
@@ -602,6 +602,124 @@ describe("SubagentTailer", () => {
         ts: Date.parse("2026-07-28T07:45:00.000Z"),
       },
     });
+    ac.abort();
+  });
+
+  test("ターン中配達(attachment queued_command)の task-notification でも完了する", async () => {
+    const project = makeTempDir("subagent-tailer-queued-command-notify");
+    const sessionId = "66666666-7777-8888-9999-bbbbbbbbbbbb";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    const subagents = path.join(project, sessionId, "subagents");
+    fs.mkdirSync(subagents, { recursive: true });
+    fs.writeFileSync(
+      main,
+      [
+        JSON.stringify({
+          message: {
+            role: "assistant",
+            content: [{ type: "tool_use", id: "toolu_qc", name: "Agent", input: { description: "BG agent" } }],
+          },
+          timestamp: "2026-08-18T04:00:00.000Z",
+        }),
+        JSON.stringify({
+          message: {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: "toolu_qc", content: "Async agent launched successfully. agentId: qcagent …" }],
+          },
+          timestamp: "2026-08-18T04:00:00.500Z",
+        }),
+        // main がターン中だったため user 行ではなく attachment(queued_command) として配達された通知。
+        JSON.stringify({
+          type: "attachment",
+          attachment: {
+            type: "queued_command",
+            prompt: "<task-notification>\n<task-id>qcagent</task-id>\n<tool-use-id>toolu_qc</tool-use-id>\n<status>completed</status>\n<summary>Agent \"BG agent\" finished</summary>\n</task-notification>",
+          },
+          timestamp: "2026-08-18T04:13:19.727Z",
+        }),
+      ].join("\n") + "\n",
+    );
+    fs.writeFileSync(
+      path.join(subagents, "agent-qcagent.meta.json"),
+      JSON.stringify({ agentType: "Explore", description: "BG agent", toolUseId: "toolu_qc", spawnDepth: 1 }),
+    );
+    fs.writeFileSync(
+      path.join(subagents, "agent-qcagent.jsonl"),
+      JSON.stringify({
+        agentId: "qcagent",
+        isSidechain: true,
+        message: { role: "assistant", content: [{ type: "text", text: "最終レポート" }] },
+        timestamp: "2026-08-18T04:13:16.000Z",
+      }) + "\n",
+    );
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10 });
+    const gen = tailer.streamSession(main, ac.signal);
+    const completed = await nextOfType(gen, "subagent_node");
+    expect(completed).toMatchObject({
+      node: { nodeId: "qcagent", status: "completed", ts: Date.parse("2026-08-18T04:13:19.727Z") },
+    });
+    ac.abort();
+  });
+
+  test("1 行に束ねられた複数の task-notification を全て完了信号として読む", async () => {
+    const project = makeTempDir("subagent-tailer-multi-notify");
+    const sessionId = "66666666-7777-8888-9999-cccccccccccc";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    fs.mkdirSync(path.join(project, sessionId, "subagents"), { recursive: true });
+    const out1 = path.join(project, "tasks", "bm1.output");
+    const out2 = path.join(project, "tasks", "bm2.output");
+    const bgSpawn = (toolUseId: string, taskId: string, outputPath: string, description: string): string[] => [
+      JSON.stringify({
+        message: {
+          role: "assistant",
+          content: [{ type: "tool_use", id: toolUseId, name: "Bash", input: { command: "sleep 30", run_in_background: true, description } }],
+        },
+        timestamp: "2026-08-18T12:03:52.000Z",
+      }),
+      JSON.stringify({
+        message: {
+          role: "user",
+          content: [{
+            type: "tool_result",
+            tool_use_id: toolUseId,
+            content: `Command running in background with ID: ${taskId}. Output is being written to: ${outputPath}. You will be notified when it completes.`,
+          }],
+        },
+        timestamp: "2026-08-18T12:03:52.500Z",
+      }),
+    ];
+    fs.writeFileSync(
+      main,
+      [
+        ...bgSpawn("toolu_bm1", "bm1", out1, "Wait then recheck"),
+        ...bgSpawn("toolu_bm2", "bm2", out2, "Final wait"),
+        JSON.stringify({
+          type: "user",
+          isMeta: true,
+          origin: { kind: "task-notification" },
+          message: {
+            role: "user",
+            content: "[SYSTEM NOTIFICATION - NOT USER INPUT]\nThis is an automated background-task event, NOT a message from the user.\n\n<task-notification>\n<task-id>bm1</task-id>\n<status>failed</status>\n<summary>Background command \"Wait then recheck\" failed with exit code 1</summary>\n</task-notification>\n\n<task-notification>\n<task-id>bm2</task-id>\n<status>completed</status>\n<summary>Background command \"Final wait\" completed (exit code 0)</summary>\n</task-notification>",
+          },
+          timestamp: "2026-08-18T12:07:38.161Z",
+        }),
+      ].join("\n") + "\n",
+    );
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10, probeOutputOpen: () => Promise.resolve(true) });
+    const gen = tailer.streamSession(main, ac.signal);
+    const seen = new Map<string, { status: string; ts: number }>();
+    while (seen.size < 2) {
+      const message = await nextOfType(gen, "subagent_node");
+      if (message.type === "subagent_node" && message.node.status !== "running") {
+        seen.set(message.node.nodeId, { status: message.node.status, ts: message.node.ts });
+      }
+    }
+    expect(seen.get("bm1")).toEqual({ status: "error", ts: Date.parse("2026-08-18T12:07:38.161Z") });
+    expect(seen.get("bm2")).toEqual({ status: "completed", ts: Date.parse("2026-08-18T12:07:38.161Z") });
     ac.abort();
   });
 
@@ -1319,10 +1437,18 @@ describe("SubagentTailer agent orphan", () => {
     },
     timestamp: ts,
   });
+  // 最終レポート行（新しい CLI の形: 最終 text 行に stop_reason end_turn が付く）。
   const finalLine = (agentId: string, text: string, ts: string): Record<string, unknown> => ({
     agentId,
     isSidechain: true,
-    message: { role: "assistant", content: [{ type: "text", text }] },
+    message: { role: "assistant", content: [{ type: "text", text }], stop_reason: "end_turn" },
+    timestamp: ts,
+  });
+  // stop_reason null の text 行（古い CLI の最終レポート / 新しい CLI の message 途中 text）。
+  const tentativeTextLine = (agentId: string, text: string, ts: string): Record<string, unknown> => ({
+    agentId,
+    isSidechain: true,
+    message: { role: "assistant", content: [{ type: "text", text }], stop_reason: null },
     timestamp: ts,
   });
   const rootIdleLine = (ts: string): Record<string, unknown> => ({
@@ -1554,6 +1680,741 @@ describe("SubagentTailer agent orphan", () => {
     // 最後の行が user 行(長考中)の間は、猶予0でも再 settle しない。
     expect(await nextWithin(gen, 100)).toBeNull();
     ac.abort();
+  });
+
+  /**
+   * generator を単一の消費ループで回収する記録器。nextWithin のように途中で next() を
+   * 取りこぼさない（タイムアウトした next() は pending のまま次の emission を飲む）。
+   */
+  function recordNodes(gen: AsyncGenerator<ControlMessage, void, void>): {
+    latest: Map<string, SubagentNode>;
+    finished: Promise<void>;
+    until: (pred: (latest: Map<string, SubagentNode>) => boolean, timeoutMs?: number) => Promise<void>;
+  } {
+    const latest = new Map<string, SubagentNode>();
+    let notify: (() => void) | null = null;
+    const finished = (async () => {
+      for await (const message of gen) {
+        if (message.type !== "subagent_node") continue;
+        latest.set(message.node.nodeId, message.node);
+        notify?.();
+      }
+    })();
+    return {
+      latest,
+      finished,
+      async until(pred, timeoutMs = 5_000) {
+        const deadline = Date.now() + timeoutMs;
+        while (!pred(latest)) {
+          if (Date.now() > deadline) {
+            throw new Error(`条件未達のままタイムアウト: ${JSON.stringify([...latest.values()])}`);
+          }
+          await new Promise<void>((resolve) => {
+            notify = resolve;
+            setTimeout(resolve, 50);
+          });
+          notify = null;
+        }
+      },
+    };
+  }
+  const statusOf = (latest: Map<string, SubagentNode>, id: string): string | undefined => latest.get(id)?.status;
+
+  // 実測(2026-08-18 amidalite セッション): root 起動の checker が 12:07:38 に最終レポートで停止 →
+  // 12:07:40 に完了通知が main へ届く → 停止境界で自分の背景コマンド通知([SYSTEM NOTIFICATION])を
+  // 受けて続行し 12:10:34 に 2 度目の最終レポートで停止。2 度目の停止には通知が来ず、
+  // resumedAfter=running のまま 20 時間「実行中」残留した。
+  test("通知後に背景タスク通知の注入で続行し再通知が来ない root 起動エージェントは、最終レポート+静止で completed へ落ちる", async () => {
+    const main = writeSession("agent-notified-continuation", "00000000-0000-0000-0000-000000000008", [
+      spawnLine("toolu_nc", "QA checker", "2026-08-18T11:38:10.000Z"),
+      ackLine("toolu_nc", "ncagent", "2026-08-18T11:38:11.000Z"),
+      {
+        type: "user",
+        message: {
+          role: "user",
+          content: "<task-notification>\n<task-id>ncagent</task-id>\n<status>completed</status>\n<summary>Agent \"QA checker\" finished</summary>\n</task-notification>",
+        },
+        timestamp: "2026-08-18T12:07:40.091Z",
+      },
+      rootIdleLine("2026-08-18T12:12:26.000Z"),
+    ], [{
+      id: "ncagent",
+      meta: { agentType: "loop-engineering:checker", description: "QA checker", toolUseId: "toolu_nc", spawnDepth: 1 },
+      lines: [
+        finalLine("ncagent", "1 度目の最終レポート", "2026-08-18T12:07:38.091Z"),
+        {
+          agentId: "ncagent",
+          isSidechain: true,
+          isMeta: true,
+          origin: { kind: "task-notification" },
+          message: {
+            role: "user",
+            content: "[SYSTEM NOTIFICATION - NOT USER INPUT]\nThis is an automated background-task event, NOT a message from the user.\n\n<task-notification>\n<task-id>bztxkzo4g</task-id>\n<status>failed</status>\n<summary>Background command \"Wait then recheck UI agent\" failed with exit code 1</summary>\n</task-notification>",
+          },
+          timestamp: "2026-08-18T12:07:38.161Z",
+        },
+        finalLine("ncagent", "2 度目の最終レポート", "2026-08-18T12:10:34.579Z"),
+      ],
+    }]);
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10, agentOrphanGraceMs: 0 });
+    const rec = recordNodes(tailer.streamSession(main, ac.signal));
+    // 通知より新しい自 transcript 行がある(resumedAfter)が、最終レポート+静止なので settle する。
+    await rec.until((l) => statusOf(l, "ncagent") === "completed");
+    expect(rec.latest.get("ncagent")?.ts).toBe(Date.parse("2026-08-18T12:10:34.579Z"));
+    await sleep(150);
+    expect(statusOf(rec.latest, "ncagent")).toBe("completed");
+
+    // coordinator 再開(SendMessage)で running へ戻り、再通知が届けばその ts で完了する。
+    const childJsonl = path.join(path.dirname(main), path.basename(main, ".jsonl"), "subagents", "agent-ncagent.jsonl");
+    fs.appendFileSync(
+      childJsonl,
+      JSON.stringify({
+        agentId: "ncagent",
+        isSidechain: true,
+        isMeta: true,
+        origin: { kind: "coordinator" },
+        message: { role: "user", content: "The coordinator sent a message while you were working: 再検証して" },
+        timestamp: "2026-08-18T12:20:00.000Z",
+      }) + "\n",
+    );
+    await rec.until((l) => statusOf(l, "ncagent") === "running");
+    fs.appendFileSync(
+      childJsonl,
+      JSON.stringify(finalLine("ncagent", "再検証レポート", "2026-08-18T12:25:00.000Z")) + "\n",
+    );
+    fs.appendFileSync(
+      main,
+      JSON.stringify({
+        type: "user",
+        message: {
+          role: "user",
+          content: "<task-notification>\n<task-id>ncagent</task-id>\n<status>completed</status>\n<summary>Agent \"QA checker\" finished</summary>\n</task-notification>",
+        },
+        timestamp: "2026-08-18T12:25:02.000Z",
+      }) + "\n",
+    );
+    // settle(12:25:00) が先行しても本物の通知(12:25:02)が最終的に勝つ。
+    await rec.until((l) => l.get("ncagent")?.ts === Date.parse("2026-08-18T12:25:02.000Z"));
+    await sleep(150);
+    expect(rec.latest.get("ncagent")).toMatchObject({ status: "completed", ts: Date.parse("2026-08-18T12:25:02.000Z") });
+    ac.abort();
+    await rec.finished;
+  });
+
+  test("通知済み継続でも生成途中の thinking 行が最後なら settle せず、text 行が届いてから落ちる", async () => {
+    const thinkingLine = (agentId: string, ts: string): Record<string, unknown> => ({
+      agentId,
+      isSidechain: true,
+      message: {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "", signature: "x" }],
+        stop_reason: null,
+      },
+      timestamp: ts,
+    });
+    const main = writeSession("agent-notified-continuation-thinking", "00000000-0000-0000-0000-000000000012", [
+      spawnLine("toolu_nt", "QA checker", "2026-08-18T11:38:10.000Z"),
+      ackLine("toolu_nt", "ntagent", "2026-08-18T11:38:11.000Z"),
+      {
+        type: "user",
+        message: {
+          role: "user",
+          content: "<task-notification>\n<task-id>ntagent</task-id>\n<status>completed</status>\n<summary>Agent \"QA checker\" finished</summary>\n</task-notification>",
+        },
+        timestamp: "2026-08-18T12:07:40.091Z",
+      },
+    ], [{
+      id: "ntagent",
+      meta: { agentType: "loop-engineering:checker", description: "QA checker", toolUseId: "toolu_nt", spawnDepth: 1 },
+      lines: [
+        finalLine("ntagent", "1 度目の最終レポート", "2026-08-18T12:07:38.091Z"),
+        {
+          agentId: "ntagent",
+          isSidechain: true,
+          isMeta: true,
+          origin: { kind: "task-notification" },
+          message: { role: "user", content: "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>bq</task-id>\n<status>failed</status>\n</task-notification>" },
+          timestamp: "2026-08-18T12:07:38.161Z",
+        },
+        // 実データ: thinking ブロックの行が先に書かれ(stop_reason null)、長い text が 2 分後に書かれる。
+        thinkingLine("ntagent", "2026-08-18T12:08:40.658Z"),
+      ],
+    }]);
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10, agentOrphanGraceMs: 0 });
+    const rec = recordNodes(tailer.streamSession(main, ac.signal));
+    await rec.until((l) => statusOf(l, "ntagent") === "running");
+    await sleep(200);
+    expect(statusOf(rec.latest, "ntagent")).toBe("running");
+
+    const childJsonl = path.join(path.dirname(main), path.basename(main, ".jsonl"), "subagents", "agent-ntagent.jsonl");
+    fs.appendFileSync(
+      childJsonl,
+      JSON.stringify(finalLine("ntagent", "2 度目の最終レポート", "2026-08-18T12:10:34.579Z")) + "\n",
+    );
+    await rec.until((l) => statusOf(l, "ntagent") === "completed");
+    expect(rec.latest.get("ntagent")?.ts).toBe(Date.parse("2026-08-18T12:10:34.579Z"));
+    ac.abort();
+    await rec.finished;
+  });
+
+  test("通知済み継続の settle にも静止猶予が効く(最終行が新しいうちは running)", async () => {
+    const recentIso = new Date(Date.now() - 10_000).toISOString();
+    const main = writeSession("agent-notified-continuation-grace", "00000000-0000-0000-0000-000000000013", [
+      spawnLine("toolu_ng", "QA checker", "2026-08-18T11:38:10.000Z"),
+      ackLine("toolu_ng", "ngagent", "2026-08-18T11:38:11.000Z"),
+      {
+        type: "user",
+        message: {
+          role: "user",
+          content: "<task-notification>\n<task-id>ngagent</task-id>\n<status>completed</status>\n<summary>Agent \"QA checker\" finished</summary>\n</task-notification>",
+        },
+        timestamp: "2026-08-18T12:07:40.091Z",
+      },
+    ], [{
+      id: "ngagent",
+      meta: { agentType: "loop-engineering:checker", description: "QA checker", toolUseId: "toolu_ng", spawnDepth: 1 },
+      lines: [
+        finalLine("ngagent", "1 度目の最終レポート", "2026-08-18T12:07:38.091Z"),
+        {
+          agentId: "ngagent",
+          isSidechain: true,
+          isMeta: true,
+          origin: { kind: "task-notification" },
+          message: { role: "user", content: "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>bg</task-id>\n<status>completed</status>\n</task-notification>" },
+          timestamp: "2026-08-18T12:07:38.161Z",
+        },
+        finalLine("ngagent", "2 度目の最終レポート(10 秒前)", recentIso),
+      ],
+    }]);
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10, agentOrphanGraceMs: 60_000 });
+    const rec = recordNodes(tailer.streamSession(main, ac.signal));
+    await rec.until((l) => statusOf(l, "ngagent") === "running");
+    await sleep(300);
+    expect(statusOf(rec.latest, "ngagent")).toBe("running");
+    ac.abort();
+    await rec.finished;
+  });
+
+  // 実データ(8a0b487e/a4a59c6445e9c4feb): text 行(stop_reason null)の 134.8 秒後に 26.7KB の Write
+  // tool_use が書かれた。text 行は message 途中でもあり得るため、stop_reason 無しの暫定形は
+  // tentativeFinalGraceMs(既定 600s)まで settle しない。
+  test("stop_reason null の text 行(暫定形)は長い猶予まで settle せず、後続 tool_use → end_turn 最終行で落ちる", async () => {
+    const nowMs = Date.now();
+    const iso = (deltaMs: number): string => new Date(nowMs - deltaMs).toISOString();
+    const main = writeSession("agent-tentative-final", "00000000-0000-0000-0000-000000000014", [
+      spawnLine("toolu_tf", "Writer", "2026-08-18T11:38:10.000Z"),
+      ackLine("toolu_tf", "tfagent", "2026-08-18T11:38:11.000Z"),
+      {
+        type: "user",
+        message: {
+          role: "user",
+          content: "<task-notification>\n<task-id>tfagent</task-id>\n<status>completed</status>\n<summary>Agent \"Writer\" finished</summary>\n</task-notification>",
+        },
+        timestamp: "2026-08-18T12:07:40.091Z",
+      },
+    ], [{
+      id: "tfagent",
+      meta: { agentType: "general-purpose", description: "Writer", toolUseId: "toolu_tf", spawnDepth: 1 },
+      lines: [
+        finalLine("tfagent", "1 度目の最終レポート", "2026-08-18T12:07:38.091Z"),
+        {
+          agentId: "tfagent",
+          isSidechain: true,
+          isMeta: true,
+          origin: { kind: "coordinator" },
+          message: { role: "user", content: "The coordinator sent a message while you were working: 大きなファイルを書いて" },
+          timestamp: "2026-08-18T12:20:00.000Z",
+        },
+        // 200 秒前: message 途中の text 行（この後 26KB の Write tool_use を生成中）。
+        tentativeTextLine("tfagent", "ファイルを書きます", iso(200_000)),
+      ],
+    }]);
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({
+      ...aliveSession,
+      pollIntervalMs: 10,
+      agentOrphanGraceMs: 0,
+      tentativeFinalGraceMs: 600_000,
+    });
+    const rec = recordNodes(tailer.streamSession(main, ac.signal));
+    await rec.until((l) => statusOf(l, "tfagent") === "running");
+    await sleep(250);
+    // 通知済み継続 + 最終レポート形 + 猶予 0 でも、暫定形なので settle しない。
+    expect(statusOf(rec.latest, "tfagent")).toBe("running");
+
+    const childJsonl = path.join(path.dirname(main), path.basename(main, ".jsonl"), "subagents", "agent-tfagent.jsonl");
+    fs.appendFileSync(
+      childJsonl,
+      JSON.stringify({
+        agentId: "tfagent",
+        isSidechain: true,
+        message: {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "toolu_big_write", name: "Write", input: { file_path: "/tmp/x", content: "x" } }],
+          stop_reason: "tool_use",
+        },
+        timestamp: iso(60_000),
+      }) + "\n",
+    );
+    await sleep(150);
+    expect(statusOf(rec.latest, "tfagent")).toBe("running");
+
+    fs.appendFileSync(childJsonl, JSON.stringify(finalLine("tfagent", "書きました", iso(1_000))) + "\n");
+    await rec.until((l) => statusOf(l, "tfagent") === "completed");
+    ac.abort();
+    await rec.finished;
+  });
+
+  // 最終レポート行の 10〜30% は版を問わず stop_reason null のまま書かれる（2.1.234 でも）。
+  test("暫定形(stop_reason null)でも tentativeFinalGraceMs を超えて静止すれば settle する(null のまま書かれた最終レポート)", async () => {
+    const main = writeSession("agent-tentative-final-old", "00000000-0000-0000-0000-000000000015", [
+      spawnLine("toolu_to", "Old CLI agent", "2026-08-03T11:20:00.000Z"),
+      ackLine("toolu_to", "toagent", "2026-08-03T11:20:01.000Z"),
+      {
+        type: "user",
+        message: {
+          role: "user",
+          content: "<task-notification>\n<task-id>toagent</task-id>\n<status>completed</status>\n<summary>Agent \"Old CLI agent\" finished</summary>\n</task-notification>",
+        },
+        timestamp: "2026-08-03T11:23:00.000Z",
+      },
+    ], [{
+      id: "toagent",
+      meta: { agentType: "general-purpose", description: "Old CLI agent", toolUseId: "toolu_to", spawnDepth: 1 },
+      lines: [
+        tentativeTextLine("toagent", "1 度目", "2026-08-03T11:22:58.000Z"),
+        {
+          agentId: "toagent",
+          isSidechain: true,
+          isMeta: true,
+          origin: { kind: "task-notification" },
+          message: { role: "user", content: "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>bo</task-id>\n<status>completed</status>\n</task-notification>" },
+          timestamp: "2026-08-03T11:22:58.100Z",
+        },
+        // 実データ(797144fd/a6946c1bbe79e5a08, 2.1.220): 最終レポートが stop_reason null のまま。
+        tentativeTextLine("toagent", "BUILD SUCCEEDED、インストールも成功しました。", "2026-08-03T11:24:08.458Z"),
+      ],
+    }]);
+
+    const ac = new AbortController();
+    // 過去日時のフィクスチャなので 600s の暫定猶予は既に超えている（確定形の猶予 0 とは別経路）。
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10, agentOrphanGraceMs: 0, tentativeFinalGraceMs: 600_000 });
+    const rec = recordNodes(tailer.streamSession(main, ac.signal));
+    await rec.until((l) => statusOf(l, "toagent") === "completed");
+    expect(rec.latest.get("toagent")?.ts).toBe(Date.parse("2026-08-03T11:24:08.458Z"));
+    ac.abort();
+    await rec.finished;
+  });
+
+  // 実データ: text のみ行で stop_reason "tool_use" は 3,693 行、99.9% が同一 message の tool_use 行に
+  // 続かれ、最終行になった例は 0（main transcript の writer はこの形で message 途中行を書く）。
+  test("stop_reason \"tool_use\" の text 行は続きが確定しているので最終レポート扱いにしない", async () => {
+    const main = writeSession("agent-tool-use-stop-reason", "00000000-0000-0000-0000-000000000019", [
+      spawnLine("toolu_tu", "Writer", "2026-08-18T11:38:10.000Z"),
+      ackLine("toolu_tu", "tuagent", "2026-08-18T11:38:11.000Z"),
+      {
+        type: "user",
+        message: {
+          role: "user",
+          content: "<task-notification>\n<task-id>tuagent</task-id>\n<status>completed</status>\n<summary>Agent \"Writer\" finished</summary>\n</task-notification>",
+        },
+        timestamp: "2026-08-18T12:07:40.091Z",
+      },
+    ], [{
+      id: "tuagent",
+      meta: { agentType: "general-purpose", description: "Writer", toolUseId: "toolu_tu", spawnDepth: 1 },
+      lines: [
+        finalLine("tuagent", "1 度目の最終レポート", "2026-08-18T12:07:38.091Z"),
+        {
+          agentId: "tuagent",
+          isSidechain: true,
+          isMeta: true,
+          origin: { kind: "coordinator" },
+          message: { role: "user", content: "The coordinator sent a message while you were working: 続けて" },
+          timestamp: "2026-08-18T12:20:00.000Z",
+        },
+        {
+          agentId: "tuagent",
+          isSidechain: true,
+          message: { role: "assistant", content: [{ type: "text", text: "大きなファイルを書きます" }], stop_reason: "tool_use" },
+          timestamp: "2026-08-18T12:21:00.000Z",
+        },
+      ],
+    }]);
+
+    const ac = new AbortController();
+    // 両猶予 0 でも「続きあり」の text 行は候補にならない。
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10, agentOrphanGraceMs: 0, tentativeFinalGraceMs: 0 });
+    const rec = recordNodes(tailer.streamSession(main, ac.signal));
+    await rec.until((l) => statusOf(l, "tuagent") === "running");
+    await sleep(250);
+    expect(statusOf(rec.latest, "tuagent")).toBe("running");
+
+    const childJsonl = path.join(path.dirname(main), path.basename(main, ".jsonl"), "subagents", "agent-tuagent.jsonl");
+    fs.appendFileSync(childJsonl, JSON.stringify(finalLine("tuagent", "書きました", "2026-08-18T12:24:00.000Z")) + "\n");
+    await rec.until((l) => statusOf(l, "tuagent") === "completed");
+    expect(rec.latest.get("tuagent")?.ts).toBe(Date.parse("2026-08-18T12:24:00.000Z"));
+    ac.abort();
+    await rec.finished;
+  });
+
+  test("<status> を持たない task-notification ブロック(Monitor 進捗/対話待ちヒント)は完了信号にしない", async () => {
+    const outputPath = path.join(makeTempDir("status-less-out"), "bolijxtt4.output");
+    const main = writeSession("agent-status-less-notification", "00000000-0000-0000-0000-000000000016", [
+      {
+        message: {
+          role: "assistant",
+          content: [{
+            type: "tool_use",
+            id: "toolu_login",
+            name: "Bash",
+            input: { command: "npm login", run_in_background: true, description: "Start npm web login with pty" },
+          }],
+        },
+        timestamp: "2026-08-07T14:10:00.000Z",
+      },
+      {
+        message: {
+          role: "user",
+          content: [{
+            type: "tool_result",
+            tool_use_id: "toolu_login",
+            content: `Command running in background with ID: bolijxtt4. Output is being written to: ${outputPath}. You will be notified when it completes.`,
+          }],
+        },
+        timestamp: "2026-08-07T14:10:00.500Z",
+      },
+      // 実データの形: status 無し・summary のみ（対話入力待ちのヒント）。
+      {
+        type: "queue-operation",
+        operation: "enqueue",
+        content: `<task-notification>\n<task-id>bolijxtt4</task-id>\n<tool-use-id>toolu_login</tool-use-id>\n<output-file>${outputPath}</output-file>\n<summary>Background command "Start npm web login with pty" appears to be waiting for interactive input</summary>\n</task-notification>`,
+        timestamp: "2026-08-07T14:12:45.803Z",
+      },
+      // Monitor 進捗イベント（別 task-id、status 無し・event あり）。
+      {
+        type: "user",
+        message: {
+          role: "user",
+          content: "<task-notification>\n<task-id>bu2j6vhru</task-id>\n<summary>Monitor event: \"progress\"</summary>\n<event>line 1</event>\n</task-notification>",
+        },
+        timestamp: "2026-08-07T14:13:00.000Z",
+      },
+    ], []);
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10, probeOutputOpen: () => Promise.resolve(true) });
+    const rec = recordNodes(tailer.streamSession(main, ac.signal));
+    await rec.until((l) => statusOf(l, "bolijxtt4") === "running");
+    await sleep(200);
+    expect(statusOf(rec.latest, "bolijxtt4")).toBe("running");
+
+    fs.appendFileSync(
+      main,
+      JSON.stringify({
+        type: "queue-operation",
+        operation: "enqueue",
+        content: "<task-notification>\n<task-id>bolijxtt4</task-id>\n<status>completed</status>\n<summary>Background command \"Start npm web login with pty\" completed (exit code 0)</summary>\n</task-notification>",
+        timestamp: "2026-08-07T14:16:55.927Z",
+      }) + "\n",
+    );
+    await rec.until((l) => statusOf(l, "bolijxtt4") === "completed");
+    expect(rec.latest.get("bolijxtt4")?.ts).toBe(Date.parse("2026-08-07T14:16:55.927Z"));
+    ac.abort();
+    await rec.finished;
+  });
+
+  test("queue-operation の remove は通知として読まない(遅い remove が SendMessage 再開を隠さない)", async () => {
+    const main = writeSession("agent-remove-ignored", "00000000-0000-0000-0000-000000000017", [
+      spawnLine("toolu_rm", "Reviewer", "2026-08-10T14:00:00.000Z"),
+      ackLine("toolu_rm", "rmagent", "2026-08-10T14:00:01.000Z"),
+      {
+        type: "queue-operation",
+        operation: "enqueue",
+        content: "<task-notification>\n<task-id>rmagent</task-id>\n<status>completed</status>\n<summary>Agent \"Reviewer\" finished</summary>\n</task-notification>",
+        timestamp: "2026-08-10T14:30:44.872Z",
+      },
+      // main がターン中で配達が遅れ、remove は 3 分後。その間に SendMessage で再開している。
+      {
+        type: "queue-operation",
+        operation: "remove",
+        content: "<task-notification>\n<task-id>rmagent</task-id>\n<status>completed</status>\n<summary>Agent \"Reviewer\" finished</summary>\n</task-notification>",
+        timestamp: "2026-08-10T14:34:05.660Z",
+      },
+    ], [{
+      id: "rmagent",
+      meta: { agentType: "general-purpose", description: "Reviewer", toolUseId: "toolu_rm", spawnDepth: 1 },
+      lines: [
+        finalLine("rmagent", "最終レポート", "2026-08-10T14:30:44.000Z"),
+        {
+          agentId: "rmagent",
+          isSidechain: true,
+          isMeta: true,
+          origin: { kind: "coordinator" },
+          message: { role: "user", content: "The coordinator sent a message while you were working: 追加で確認して" },
+          timestamp: "2026-08-10T14:32:00.000Z",
+        },
+        {
+          agentId: "rmagent",
+          isSidechain: true,
+          message: {
+            role: "assistant",
+            content: [{ type: "tool_use", id: "toolu_rm_bash", name: "Bash", input: { command: "sleep 1" } }],
+            stop_reason: "tool_use",
+          },
+          timestamp: "2026-08-10T14:32:05.000Z",
+        },
+      ],
+    }]);
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10, agentOrphanGraceMs: 0 });
+    const rec = recordNodes(tailer.streamSession(main, ac.signal));
+    await rec.until((l) => statusOf(l, "rmagent") === "running");
+    await sleep(200);
+    expect(statusOf(rec.latest, "rmagent")).toBe("running");
+    ac.abort();
+    await rec.finished;
+  });
+
+  test("TaskStop の ack は killed 通知より優先する(ts の前後に依らず completed)", async () => {
+    const main = writeSession("agent-stop-ack-priority", "00000000-0000-0000-0000-000000000018", [
+      spawnLine("toolu_sk", "Killed agent", "2026-06-30T04:50:00.000Z"),
+      ackLine("toolu_sk", "skagent", "2026-06-30T04:50:01.000Z"),
+      {
+        message: {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "toolu_taskstop", name: "TaskStop", input: { task_id: "skagent" } }],
+        },
+        timestamp: "2026-06-30T04:59:20.600Z",
+      },
+      // ack が killed 通知より先の ts で書かれても、ack が勝つ。
+      {
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "toolu_taskstop", content: "Successfully stopped task: skagent" }],
+        },
+        timestamp: "2026-06-30T04:59:20.700Z",
+      },
+      {
+        type: "queue-operation",
+        operation: "enqueue",
+        content: "<task-notification>\n<task-id>skagent</task-id>\n<status>killed</status>\n<summary>Agent \"Killed agent\" was stopped by Claude</summary>\n</task-notification>",
+        timestamp: "2026-06-30T04:59:20.721Z",
+      },
+    ], [{
+      id: "skagent",
+      meta: { agentType: "general-purpose", description: "Killed agent", toolUseId: "toolu_sk", spawnDepth: 1 },
+      lines: [
+        {
+          agentId: "skagent",
+          isSidechain: true,
+          message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_sk_bash", name: "Bash", input: { command: "sleep 100" } }] },
+          timestamp: "2026-06-30T04:58:00.000Z",
+        },
+      ],
+    }]);
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10 });
+    const rec = recordNodes(tailer.streamSession(main, ac.signal));
+    await rec.until((l) => statusOf(l, "skagent") === "completed");
+    await sleep(150);
+    expect(rec.latest.get("skagent")).toMatchObject({ status: "completed", ts: Date.parse("2026-06-30T04:59:20.700Z") });
+    ac.abort();
+    await rec.finished;
+  });
+
+  test("通知済み継続でも running の子(背景コマンド)が残る間は settle せず、子の終端後に落ちる", async () => {
+    const outputPath = path.join(makeTempDir("agent-notified-continuation-child-out"), "bwait.output");
+    const main = writeSession("agent-notified-continuation-child", "00000000-0000-0000-0000-000000000009", [
+      spawnLine("toolu_ncc", "QA checker", "2026-08-18T11:38:10.000Z"),
+      ackLine("toolu_ncc", "nccagent", "2026-08-18T11:38:11.000Z"),
+      {
+        type: "user",
+        message: {
+          role: "user",
+          content: "<task-notification>\n<task-id>nccagent</task-id>\n<status>completed</status>\n<summary>Agent \"QA checker\" finished</summary>\n</task-notification>",
+        },
+        timestamp: "2026-08-18T12:07:40.091Z",
+      },
+    ], [{
+      id: "nccagent",
+      meta: { agentType: "loop-engineering:checker", description: "QA checker", toolUseId: "toolu_ncc", spawnDepth: 1 },
+      lines: [
+        finalLine("nccagent", "1 度目の最終レポート", "2026-08-18T12:07:38.091Z"),
+        {
+          agentId: "nccagent",
+          isSidechain: true,
+          isMeta: true,
+          origin: { kind: "task-notification" },
+          message: { role: "user", content: "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>bold1</task-id>\n<status>completed</status>\n</task-notification>" },
+          timestamp: "2026-08-18T12:07:38.161Z",
+        },
+        {
+          agentId: "nccagent",
+          isSidechain: true,
+          message: {
+            role: "assistant",
+            content: [{
+              type: "tool_use",
+              id: "toolu_wait",
+              name: "Bash",
+              input: { command: "sleep 600", run_in_background: true, description: "Wait for UI agent" },
+            }],
+          },
+          timestamp: "2026-08-18T12:08:00.000Z",
+        },
+        {
+          agentId: "nccagent",
+          isSidechain: true,
+          message: {
+            role: "user",
+            content: [{
+              type: "tool_result",
+              tool_use_id: "toolu_wait",
+              content: `Command running in background with ID: bwait. Output is being written to: ${outputPath}. You will be notified when it completes.`,
+            }],
+          },
+          timestamp: "2026-08-18T12:08:00.500Z",
+        },
+        finalLine("nccagent", "子を待つ", "2026-08-18T12:08:01.000Z"),
+      ],
+    }]);
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({
+      ...aliveSession,
+      pollIntervalMs: 10,
+      agentOrphanGraceMs: 0,
+      probeOutputOpen: () => Promise.resolve(true),
+    });
+    const rec = recordNodes(tailer.streamSession(main, ac.signal));
+    await rec.until((l) => statusOf(l, "nccagent") === "running" && statusOf(l, "bwait") === "running");
+    await sleep(150);
+    expect(statusOf(rec.latest, "nccagent")).toBe("running");
+
+    // 子の通知(enqueue ログ)が届けば親の通知済み継続も settle する。
+    fs.appendFileSync(
+      main,
+      JSON.stringify({
+        type: "queue-operation",
+        operation: "enqueue",
+        content: "<task-notification>\n<task-id>bwait</task-id>\n<status>completed</status>\n<summary>Background command \"Wait for UI agent\" completed (exit code 0)</summary>\n</task-notification>",
+        timestamp: "2026-08-18T12:18:00.000Z",
+      }) + "\n",
+    );
+    await rec.until((l) => statusOf(l, "bwait") === "completed" && statusOf(l, "nccagent") === "completed");
+    expect(rec.latest.get("nccagent")?.ts).toBe(Date.parse("2026-08-18T12:08:01.000Z"));
+    ac.abort();
+    await rec.finished;
+  });
+
+  test("未通知の root 起動エージェントは生存セッションでは従来どおり settle しない(通知済み継続の例外は通知後のみ)", async () => {
+    const main = writeSession("agent-unnotified-root", "00000000-0000-0000-0000-000000000010", [
+      spawnLine("toolu_un", "BG worker", "2026-08-18T11:00:00.000Z"),
+      ackLine("toolu_un", "unagent", "2026-08-18T11:00:01.000Z"),
+    ], [{
+      id: "unagent",
+      meta: { agentType: "Explore", description: "BG worker", toolUseId: "toolu_un", spawnDepth: 1 },
+      lines: [
+        finalLine("unagent", "中間レポート", "2026-08-18T11:05:00.000Z"),
+        {
+          agentId: "unagent",
+          isSidechain: true,
+          isMeta: true,
+          origin: { kind: "task-notification" },
+          message: { role: "user", content: "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>bx</task-id>\n<status>completed</status>\n</task-notification>" },
+          timestamp: "2026-08-18T11:05:01.000Z",
+        },
+        finalLine("unagent", "続きのレポート", "2026-08-18T11:06:00.000Z"),
+      ],
+    }]);
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10, agentOrphanGraceMs: 0 });
+    const gen = tailer.streamSession(main, ac.signal);
+    const running = await nextOfType(gen, "subagent_node");
+    expect(running).toMatchObject({ node: { nodeId: "unagent", status: "running" } });
+    expect(await nextWithin(gen, 100)).toBeNull();
+    ac.abort();
+  });
+
+  test("孤児 settle / 死亡 sweep は API エラーで途絶えた最終行を error に分ける", async () => {
+    const apiErrorLine = (agentId: string, ts: string): Record<string, unknown> => ({
+      agentId,
+      isSidechain: true,
+      isApiErrorMessage: true,
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment." }],
+        stop_reason: "stop_sequence",
+      },
+      timestamp: ts,
+    });
+    const main = writeSession("agent-api-error-settle", "00000000-0000-0000-0000-000000000011", [
+      spawnLine("toolu_ae", "Notified then died", "2026-08-18T16:00:00.000Z"),
+      ackLine("toolu_ae", "aeagent", "2026-08-18T16:00:01.000Z"),
+      {
+        type: "user",
+        message: {
+          role: "user",
+          content: "<task-notification>\n<task-id>aeagent</task-id>\n<status>completed</status>\n<summary>Agent \"Notified then died\" finished</summary>\n</task-notification>",
+        },
+        timestamp: "2026-08-18T16:05:00.000Z",
+      },
+      spawnLine("toolu_ae2", "Died unnotified", "2026-08-18T16:10:00.000Z"),
+      ackLine("toolu_ae2", "aedead", "2026-08-18T16:10:01.000Z"),
+    ], [
+      {
+        id: "aeagent",
+        meta: { agentType: "Explore", description: "Notified then died", toolUseId: "toolu_ae", spawnDepth: 1 },
+        lines: [
+          finalLine("aeagent", "最終レポート", "2026-08-18T16:04:58.000Z"),
+          {
+            agentId: "aeagent",
+            isSidechain: true,
+            isMeta: true,
+            origin: { kind: "task-notification" },
+            message: { role: "user", content: "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>bz</task-id>\n<status>completed</status>\n</task-notification>" },
+            timestamp: "2026-08-18T16:04:58.100Z",
+          },
+          apiErrorLine("aeagent", "2026-08-18T16:06:00.000Z"),
+        ],
+      },
+      {
+        id: "aedead",
+        meta: { agentType: "Explore", description: "Died unnotified", toolUseId: "toolu_ae2", spawnDepth: 1 },
+        lines: [apiErrorLine("aedead", "2026-08-18T16:12:00.000Z")],
+      },
+    ]);
+
+    // 生存セッション: 通知済み継続の API エラー終端は error で settle。未通知 root は据え置き。
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10, agentOrphanGraceMs: 0 });
+    const rec = recordNodes(tailer.streamSession(main, ac.signal));
+    await rec.until((l) => statusOf(l, "aeagent") === "error");
+    expect(rec.latest.get("aeagent")?.ts).toBe(Date.parse("2026-08-18T16:06:00.000Z"));
+    ac.abort();
+    await rec.finished;
+
+    // 死亡セッション: 未通知のまま API エラーで止まった root 起動も error で sweep。
+    const ac2 = new AbortController();
+    const dead = new SubagentTailer({
+      probeSessionAlive: () => Promise.resolve(false),
+      pollIntervalMs: 10,
+      agentOrphanGraceMs: 0,
+    });
+    const gen2 = dead.streamSession(main, ac2.signal);
+    await collectUntil(gen2, { aeagent: "error", aedead: "error" });
+    ac2.abort();
   });
 });
 
