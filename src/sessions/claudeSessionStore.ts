@@ -447,10 +447,23 @@ function extractMessageText(obj: Record<string, unknown>, maxLength: number): st
     raw = firstText(content);
   }
   if (raw === null) return null;
+  // harness が user ロールへ注入する <system-reminder> ブロック（リマインダ・記憶リコール等）は
+  // 本文から除去する。残りが空なら発話ではないので除外（前の実発話へ遡る）。
+  if (obj["type"] === "user" && raw.includes("<system-reminder>")) {
+    raw = raw.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gu, "");
+  }
   let text = raw.replaceAll("\n", " ").replaceAll("\r", " ").trim();
   if (!text) return null;
   // slash コマンドのメタ包み（`<command-…>` で始まる）は提示に向かないので除外。
   if (text.startsWith("<command-") || text.startsWith("<local-command")) return null;
+  // harness のバックグラウンドタスク通知（`<task-notification>…`、user ロールで記録される）や
+  // 画像添付後の寸法ノート（`[Image: original …]` だけの行）は発話ではないので除外
+  // （list-preview に生 XML が出ていた不具合の根治）。
+  if (obj["type"] === "user") {
+    if (text.includes("<task-notification>")) return null;
+    if (text.startsWith("[Image") && text.endsWith("]")) return null;
+    if (text.startsWith("Caveat: The messages below were generated")) return null;
+  }
   // シェルモード（`!cmd`）の記録。実行行はタイトル/プレビューに使えるので `!cmd` へ
   // 戻し、出力側（stdout/stderr）は提示に向かないので除外する。
   if (text.startsWith("<bash-stdout>") || text.startsWith("<bash-stderr>")) return null;

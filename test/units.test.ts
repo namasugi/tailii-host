@@ -944,6 +944,24 @@ describe("ClaudeSessionStore", () => {
     expect(list[0]?.title).toBe("!ls -la");
   });
 
+  test("harness 注入の task-notification / system-reminder / 画像寸法ノートは lastMessage に採用しない", () => {
+    const root = makeTempDir("claude-sessions-harness");
+    const slugDir = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slugDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(slugDir, "jjjjjjjj-1010.jsonl"),
+      '{"type":"user","cwd":"/tmp/proj","timestamp":"2026-01-01T00:00:00Z","message":{"content":"<system-reminder>\\nリマインダ\\n</system-reminder>\\n実際の質問"}}\n' +
+        '{"type":"assistant","timestamp":"2026-01-01T00:01:00Z","message":{"content":[{"type":"text","text":"最後の実応答"}]}}\n' +
+        '{"type":"user","timestamp":"2026-01-01T00:02:00Z","message":{"content":"[Image: original 1260x2736, displayed at 921x2000.]"}}\n' +
+        '{"type":"user","timestamp":"2026-01-01T00:03:00Z","message":{"content":"<system-reminder>\\nだけ\\n</system-reminder>"}}\n' +
+        '{"type":"user","timestamp":"2026-01-01T00:04:00Z","message":{"content":"<task-notification>\\n<task-id>a6cbe86f</task-id>\\n<status>completed</status>\\n</task-notification>"}}\n',
+    );
+    const list = new ClaudeSessionStore(root).list();
+    expect(list[0]?.lastMessage).toBe("最後の実応答");
+    expect(list[0]?.title).toBe("実際の質問");
+    expect(list[0]?.updatedAt).toBe(Math.floor(Date.parse("2026-01-01T00:04:00Z") / 1000));
+  });
+
   test("注入されたスキル本文は lastMessage/title に採用せず前後の実発話へ遡る", () => {
     const root = makeTempDir("claude-sessions-skill");
     const slugDir = path.join(root, "-tmp-proj");
