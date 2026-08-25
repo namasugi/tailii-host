@@ -83,6 +83,20 @@ export interface ClaudeOAuthResolution<T> {
   credential: Credential;
 }
 
+/**
+ * 認証解決の失敗分類。
+ * - `no_credentials`: 試せる候補が 1 つも無い（未ログイン / ミラー期限切れのみ）
+ * - `unauthorized`: 全候補が 401（期限切れ・失効。refresh も効かなかった）
+ * - `failure`: 通信断・5xx・応答不正が 1 件でもあった（ログイン状態は判定不能）
+ */
+export type ClaudeOAuthFailure = "no_credentials" | "unauthorized" | "failure";
+
+/** 認証解決の結果（成功なら resolution、失敗なら failure に分類）。 */
+export interface ClaudeOAuthOutcome<T> {
+  resolution: ClaudeOAuthResolution<T> | null;
+  failure: ClaudeOAuthFailure | null;
+}
+
 /** 共通認証実行器の注入点（テストは実 Keychain/file/token endpoint に触れない）。 */
 export interface ClaudeOAuthExecutionOptions {
   candidates?: readonly SourcedCredential[];
@@ -97,8 +111,30 @@ export type CredentialCommandRunner = (
   args: readonly string[],
 ) => Promise<string | null>;
 
-/** engine へ注入するフェッチャの型（テストは () => null を注入する）。 */
-export type PlanUsageProvider = () => Promise<PlanUsage | null>;
+/**
+ * 使用量取得の失敗分類（account_usage の理由文の出し分け用）。
+ * - `login_required`: 候補ゼロ、または全候補 401 → 「/login し直し」を案内できる
+ * - `unavailable`: 通信断・API 異常 → オフライン扱い（ログイン状態は不明）
+ */
+export type PlanUsageFailure = "login_required" | "unavailable";
+
+/** `fetchPlanUsage` の失敗結果（null ではなく理由を運ぶ）。 */
+export interface PlanUsageFailureResult {
+  failure: PlanUsageFailure;
+}
+
+/** provider の戻り値が失敗分類か（PlanUsage には `failure` キーが無い）。 */
+export function isPlanUsageFailure(
+  value: PlanUsage | PlanUsageFailureResult | null,
+): value is PlanUsageFailureResult {
+  return value !== null && "failure" in value;
+}
+
+/**
+ * engine へ注入するフェッチャの型（テストは () => null を注入する）。
+ * null は「理由不明の失敗」（旧来互換）。理由が分かるときは PlanUsageFailureResult を返す。
+ */
+export type PlanUsageProvider = () => Promise<PlanUsage | PlanUsageFailureResult | null>;
 
 /**
  * プラン使用状況を取得する（ベストエフォート・timeout 付き）。
@@ -107,8 +143,10 @@ export type PlanUsageProvider = () => Promise<PlanUsage | null>;
  * **実際に取得へ成功した候補の credentials JSON** から採る（どのアカウントの使用量かと
  * バッジ表示が一致する）。
  */
-export async function fetchPlanUsage(timeoutSeconds = 5): Promise<PlanUsage | null> {
-  const resolved = await withClaudeOAuthCredential(
+export async function fetchPlanUsage(
+  timeoutSeconds = 5,
+): Promise<PlanUsage | PlanUsageFailureResult> {
+  const outcome = await resolveClaudeOAuth(
     async (token): Promise<ClaudeOAuthAttempt<{ usage: PlanUsage; account: string | null }>> => {
       const usage = await fetchUsageOnce(token, timeoutSeconds);
       if (usage.kind !== "success") return usage;
@@ -118,7 +156,12 @@ export async function fetchPlanUsage(timeoutSeconds = 5): Promise<PlanUsage | nu
     },
     { timeoutSeconds },
   );
-  if (resolved === null) return null;
+  const resolved = outcome.resolution;
+  if (resolved === null) {
+    // 通信断が 1 件でも混じればログイン状態は断定できないので offline 扱い。
+    // 候補ゼロ・全候補 401 だけを「ログインし直し」に分類する。
+    return { failure: outcome.failure === "failure" ? "unavailable" : "login_required" };
+  }
   return {
     ...resolved.value.usage,
     subscriptionType: resolved.credential.subscriptionType ?? null,
@@ -282,6 +325,17 @@ export async function withClaudeOAuthCredential<T>(
   attempt: (token: string) => Promise<ClaudeOAuthAttempt<T>>,
   options: ClaudeOAuthExecutionOptions = {},
 ): Promise<ClaudeOAuthResolution<T> | null> {
+  return (await resolveClaudeOAuth(attempt, options)).resolution;
+}
+
+/**
+ * `withClaudeOAuthCredential` の失敗理由つき版。失敗を「候補ゼロ / 全候補 401 / 通信断あり」に
+ * 分類し、呼び出し側（使用量シート等）が「/login し直し」と「オフライン」を出し分けられるようにする。
+ */
+export async function resolveClaudeOAuth<T>(
+  attempt: (token: string) => Promise<ClaudeOAuthAttempt<T>>,
+  options: ClaudeOAuthExecutionOptions = {},
+): Promise<ClaudeOAuthOutcome<T>> {
   const now = options.now ?? (() => Date.now());
   const timeoutSeconds = options.timeoutSeconds ?? 5;
   const refreshFile = options.refreshFile ?? (() => refreshClaudeCredentialFile({ timeoutSeconds }));
@@ -290,11 +344,17 @@ export async function withClaudeOAuthCredential<T>(
     refreshAttempted = true;
   });
 
+  if (candidates.length === 0) return { resolution: null, failure: "no_credentials" };
+  let sawFailure = false;
   for (const candidate of candidates) {
     let result = await attempt(candidate.token);
     if (result.kind === "success") {
-      return { value: result.value, credential: withoutSource(candidate) };
+      return {
+        resolution: { value: result.value, credential: withoutSource(candidate) },
+        failure: null,
+      };
     }
+    if (result.kind === "failure") sawFailure = true;
     if (result.kind !== "unauthorized" || candidate.source !== "file" || refreshAttempted) {
       continue;
     }
@@ -306,10 +366,14 @@ export async function withClaudeOAuthCredential<T>(
     const retryCredential = sourcedFromRefresh(refreshed);
     result = await attempt(retryCredential.token);
     if (result.kind === "success") {
-      return { value: result.value, credential: withoutSource(retryCredential) };
+      return {
+        resolution: { value: result.value, credential: withoutSource(retryCredential) },
+        failure: null,
+      };
     }
+    if (result.kind === "failure") sawFailure = true;
   }
-  return null;
+  return { resolution: null, failure: sawFailure ? "failure" : "unauthorized" };
 }
 
 async function prepareSourcedCredentials(

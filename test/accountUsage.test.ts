@@ -3,6 +3,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   CLAUDE_ACCOUNT_USAGE_ERROR,
+  CLAUDE_ACCOUNT_USAGE_LOGIN_REQUIRED,
   CLAUDE_WINDOW_KEYS,
   CODEX_ACCOUNT_USAGE_ERROR,
   CODEX_WINDOW_KEYS,
@@ -31,7 +32,7 @@ import type {
   ControlMessage,
   HostVersions,
 } from "../src/protocol.js";
-import type { PlanUsage } from "../src/services/planUsageFetcher.js";
+import type { PlanUsage, PlanUsageFailureResult } from "../src/services/planUsageFetcher.js";
 
 /**
  * テスト基準時刻。フィクスチャの resetsAt は**すべてこれより未来**にしてある
@@ -70,12 +71,13 @@ const CODEX: CodexAccountUsage = {
 /** account_usage_request を 1 回処理し、書き出された応答と各 provider の呼び出し回数を返す。 */
 function makeHarness(options: {
   now: () => number;
-  plan: () => Promise<PlanUsage | null>;
+  plan: () => Promise<PlanUsage | PlanUsageFailureResult | null>;
   codex: () => Promise<CodexAccountUsage | null>;
   host?: () => Promise<HostVersions | null>;
   accounts?: () => Promise<AccountIdentities>;
   claudeTtlMs?: number;
   codexTtlMs?: number;
+  failureTtlMs?: number;
 }): {
   request: (id: string) => Promise<Extract<ControlMessage, { type: "account_usage_response" }>>;
   written: ControlMessage[];
@@ -89,6 +91,7 @@ function makeHarness(options: {
     now: options.now,
     ...(options.claudeTtlMs !== undefined && { claudeTtlMs: options.claudeTtlMs }),
     ...(options.codexTtlMs !== undefined && { codexTtlMs: options.codexTtlMs }),
+    ...(options.failureTtlMs !== undefined && { failureTtlMs: options.failureTtlMs }),
   });
   const ctx = {
     writer: { write: (message: ControlMessage) => { written.push(message); } },
@@ -302,6 +305,70 @@ describe("account_usage_request ハンドラ", () => {
     expect(response.codex).toBeUndefined();
     expect(response.claudeError).toBe(CLAUDE_ACCOUNT_USAGE_ERROR);
     expect(response.codexError).toBe(CODEX_ACCOUNT_USAGE_ERROR);
+  });
+
+  it("Claude の失敗分類 login_required は「/login し直し」の理由文を載せる", async () => {
+    const harness = makeHarness({
+      now: () => NOW_MS,
+      plan: async () => ({ failure: "login_required" }),
+      codex: async () => CODEX,
+    });
+    const response = await harness.request("au-lr");
+    expect(response.claude).toBeUndefined();
+    expect(response.claudeError).toBe(CLAUDE_ACCOUNT_USAGE_LOGIN_REQUIRED);
+    expect(response.codex).toEqual(expect.objectContaining({ planType: "plus" }));
+  });
+
+  it("Claude の失敗分類 unavailable は従来の理由文（オフライン含み）のまま", async () => {
+    const harness = makeHarness({
+      now: () => NOW_MS,
+      plan: async () => ({ failure: "unavailable" }),
+      codex: async () => null,
+    });
+    const response = await harness.request("au-un");
+    expect(response.claudeError).toBe(CLAUDE_ACCOUNT_USAGE_ERROR);
+  });
+
+  it("unavailable（通信断）と Codex の失敗は短い failureTtl の対象外（オフライン中の再試行連打をしない）", async () => {
+    let nowMs = NOW_MS;
+    const harness = makeHarness({
+      now: () => nowMs,
+      plan: async () => ({ failure: "unavailable" }),
+      codex: async () => null,
+      claudeTtlMs: 120_000,
+      codexTtlMs: 60_000,
+      failureTtlMs: 15_000,
+    });
+    await harness.request("u1");
+    nowMs += 30_000;
+    await harness.request("u2");
+    expect(harness.calls).toEqual({ plan: 1, codex: 1, host: 2 });
+  });
+
+  it("失敗エントリは短い failureTtlMs で切れ、成功後は通常 TTL に戻る（/login 直後の更新で復旧する）", async () => {
+    let nowMs = NOW_MS;
+    const results: Array<PlanUsage | PlanUsageFailureResult> = [{ failure: "login_required" }, PLAN];
+    const harness = makeHarness({
+      now: () => nowMs,
+      plan: async () => results.shift() ?? PLAN,
+      codex: async () => null,
+      claudeTtlMs: 120_000,
+      codexTtlMs: 60_000,
+      failureTtlMs: 15_000,
+    });
+    const first = await harness.request("f1");
+    expect(first.claudeError).toBe(CLAUDE_ACCOUNT_USAGE_LOGIN_REQUIRED);
+    nowMs += 10_000;
+    await harness.request("f2");
+    expect(harness.calls.plan).toBe(1); // 失敗 TTL 内は再取得しない
+    nowMs += 6_000;
+    const third = await harness.request("f3");
+    expect(harness.calls.plan).toBe(2); // 15s 経過で再取得 → 成功
+    expect(third.claude).toBeDefined();
+    expect(third.claudeError).toBeUndefined();
+    nowMs += 60_000;
+    await harness.request("f4");
+    expect(harness.calls.plan).toBe(2); // 成功は 120s TTL のまま
   });
 
   it("provider の例外は error 応答へ落とし、throw しない", async () => {

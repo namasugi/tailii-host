@@ -7,6 +7,7 @@ import * as path from "node:path";
 import { CodexRolloutTailer } from "../../codex/codexRolloutTailer.js";
 import { aggregateCodexUsage, type CodexUsage } from "../../codex/codexUsage.js";
 import { claudeProjectSlug } from "../../shared/paths.js";
+import { isPlanUsageFailure } from "../../services/planUsageFetcher.js";
 import { aggregateUsage, emptyUsageTotals } from "../../services/usageAggregator.js";
 import { TranscriptTailer } from "../../chat/transcriptTailer.js";
 import type { HandlerRegistry } from "../context.js";
@@ -73,7 +74,9 @@ export const usageHandlers: HandlerRegistry = {
       null,
     );
     const totals = transcript !== null ? aggregateUsage(transcript) : emptyUsageTotals();
-    const plan = await ctx.planUsage();
+    // 会話スコープの usage_response は plan 系フィールドを省略するだけ（理由文は account_usage が担う）。
+    const planResult = await ctx.planUsage();
+    const plan = isPlanUsageFailure(planResult) ? null : planResult;
     try {
       writer.write({
         type: "usage_response",

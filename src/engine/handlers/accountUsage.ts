@@ -17,6 +17,7 @@ import type {
   HostVersions,
 } from "../../protocol/messages.js";
 import type { AccountIdentities } from "../../services/accountIdentity.js";
+import { isPlanUsageFailure, type PlanUsageFailure } from "../../services/planUsageFetcher.js";
 import type { HandlerContext, HandlerRegistry } from "../context.js";
 
 /** Claude 側 TTL（ms）。使用量 API は分解能が粗く、2 分で十分新しい。 */
@@ -25,9 +26,24 @@ export const CLAUDE_ACCOUNT_USAGE_TTL_MS = 120_000;
 /** Codex 側 TTL（ms）。App Server 経由なので Claude より短くできる。 */
 export const CODEX_ACCOUNT_USAGE_TTL_MS = 60_000;
 
+/**
+ * Claude が `login_required`（候補ゼロ / 全候補 401）で失敗したときだけ使う短い TTL（ms）。
+ * `/login` し直しの直後にシートを更新して復旧を見せるため。通信断（unavailable）や Codex の
+ * 失敗は従来 TTL のまま（オフライン中に 15s ごとに候補×5s timeout や App Server 起動試行を
+ * 繰り返すと、アプリの RPC timeout 12s に対して応答が遅れる）。
+ */
+export const ACCOUNT_USAGE_FAILURE_TTL_MS = 15_000;
+
 /** Claude 側の取得失敗時に返す理由文（iOS はこれをそのままカードへ出す）。 */
 export const CLAUDE_ACCOUNT_USAGE_ERROR =
   "Claude の使用量を取得できませんでした（OAuth トークン無効またはオフライン）。";
+
+/**
+ * Claude のログインが切れている（候補ゼロ・全候補 401）ときの理由文。
+ * 「トークン無効またはオフライン」の二択を利用者に押し付けず、復旧手順（会話で /login）まで示す。
+ */
+export const CLAUDE_ACCOUNT_USAGE_LOGIN_REQUIRED =
+  "Claude のログインが切れています。会話で /login を実行してログインし直してください。";
 
 /** Codex 側の取得失敗時に返す理由文。 */
 export const CODEX_ACCOUNT_USAGE_ERROR =
@@ -38,12 +54,35 @@ export interface AccountUsageHandlerOptions {
   now?: () => number;
   claudeTtlMs?: number;
   codexTtlMs?: number;
+  /** 失敗エントリの TTL（既定 ACCOUNT_USAGE_FAILURE_TTL_MS）。 */
+  failureTtlMs?: number;
 }
 
-/** 1 agent 分の TTL メモ（成功なら value、失敗なら value=null）。 */
+/** 1 agent 分の TTL メモ（成功なら value、失敗なら value=null と分類 failure）。 */
 interface CacheEntry<T> {
   atMs: number;
   value: T | null;
+  /** 失敗の分類（分かるときだけ。null は理由不明 / 成功）。 */
+  failure: PlanUsageFailure | null;
+}
+
+/** キャッシュが TTL 内か（`login_required` の失敗エントリだけ短い failureTtlMs で判定する）。 */
+function cacheFresh<T>(
+  entry: CacheEntry<T> | null,
+  nowMs: number,
+  successTtlMs: number,
+  failureTtlMs: number,
+): entry is CacheEntry<T> {
+  if (entry === null) return false;
+  const ttl = entry.value === null && entry.failure === "login_required" ? failureTtlMs : successTtlMs;
+  return nowMs - entry.atMs < ttl;
+}
+
+/** Claude 側の失敗理由文（分類に応じて出し分け）。 */
+export function claudeAccountUsageErrorText(failure: PlanUsageFailure | null): string {
+  return failure === "login_required"
+    ? CLAUDE_ACCOUNT_USAGE_LOGIN_REQUIRED
+    : CLAUDE_ACCOUNT_USAGE_ERROR;
 }
 
 /**
@@ -62,33 +101,40 @@ export function createAccountUsageHandlers(
   const now = options.now ?? (() => Date.now());
   const claudeTtlMs = options.claudeTtlMs ?? CLAUDE_ACCOUNT_USAGE_TTL_MS;
   const codexTtlMs = options.codexTtlMs ?? CODEX_ACCOUNT_USAGE_TTL_MS;
+  const failureTtlMs = options.failureTtlMs ?? ACCOUNT_USAGE_FAILURE_TTL_MS;
 
   let claudeCache: CacheEntry<ClaudeAccountUsage> | null = null;
   let codexCache: CacheEntry<CodexAccountUsage> | null = null;
 
   async function loadClaude(ctx: HandlerContext): Promise<CacheEntry<ClaudeAccountUsage>> {
     const at = now();
-    if (claudeCache !== null && at - claudeCache.atMs < claudeTtlMs) return claudeCache;
+    if (cacheFresh(claudeCache, at, claudeTtlMs, failureTtlMs)) return claudeCache;
     let value: ClaudeAccountUsage | null = null;
+    let failure: PlanUsageFailure | null = null;
     try {
-      value = toClaudeAccountUsage(await ctx.planUsage());
+      const result = await ctx.planUsage();
+      if (isPlanUsageFailure(result)) {
+        failure = result.failure;
+      } else {
+        value = toClaudeAccountUsage(result);
+      }
     } catch {
       value = null;
     }
-    claudeCache = { atMs: at, value };
+    claudeCache = { atMs: at, value, failure };
     return claudeCache;
   }
 
   async function loadCodex(ctx: HandlerContext): Promise<CacheEntry<CodexAccountUsage>> {
     const at = now();
-    if (codexCache !== null && at - codexCache.atMs < codexTtlMs) return codexCache;
+    if (cacheFresh(codexCache, at, codexTtlMs, failureTtlMs)) return codexCache;
     let value: CodexAccountUsage | null = null;
     try {
       value = await ctx.codexAccountUsage();
     } catch {
       value = null;
     }
-    codexCache = { atMs: at, value };
+    codexCache = { atMs: at, value, failure: null };
     return codexCache;
   }
 
@@ -145,7 +191,7 @@ export function createAccountUsageHandlers(
           id: message.id,
           ...(claudeValue !== null
             ? { claude: claudeValue }
-            : { claudeError: CLAUDE_ACCOUNT_USAGE_ERROR }),
+            : { claudeError: claudeAccountUsageErrorText(claude.failure) }),
           ...(codexValue !== null
             ? { codex: codexValue }
             : { codexError: CODEX_ACCOUNT_USAGE_ERROR }),
