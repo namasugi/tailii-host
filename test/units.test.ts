@@ -18,6 +18,7 @@ import {
   orderCandidates,
   parseMaskedClaudeProfile,
   parsePlanUsage,
+  resolveClaudeOAuth,
   withClaudeOAuthCredential,
   type CredentialCommandRunner,
 } from "../src/services/planUsageFetcher.js";
@@ -37,7 +38,14 @@ import {
 } from "../src/sessions/sessionListService.js";
 import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
 import { resolveDefaultAgent } from "../src/engine/engine.js";
-import { TmuxFailedError, TmuxSessionManager } from "../src/backend/tmux.js";
+import {
+  loginCodeScreenState,
+  screenHasLoginCodePrompt,
+  screenInLoginFlow,
+  submitLoginCode,
+  TmuxFailedError,
+  TmuxSessionManager,
+} from "../src/backend/tmux.js";
 import { aggregateUsage } from "../src/services/usageAggregator.js";
 import { MockTmuxRunner, makeTempDir, makeTempStore, ok } from "./helpers.js";
 
@@ -483,6 +491,54 @@ describe("PlanUsageFetcher", () => {
     });
   });
 
+  test("resolveClaudeOAuth: 候補ゼロは no_credentials、全候補 401 は unauthorized に分類する", async () => {
+    const none = await resolveClaudeOAuth(
+      async () => ({ kind: "success" as const, value: 1 }),
+      { candidates: [], now: () => 1_000 },
+    );
+    expect(none).toEqual({ resolution: null, failure: "no_credentials" });
+
+    const unauthorized = await resolveClaudeOAuth(
+      async () => ({ kind: "unauthorized" as const }),
+      {
+        candidates: [
+          { token: "kc", expiresAtMs: 0, source: "keychain" },
+          { token: "file", expiresAtMs: 0, source: "file" },
+        ],
+        refreshFile: async () => null,
+        now: () => 1_000,
+      },
+    );
+    expect(unauthorized).toEqual({ resolution: null, failure: "unauthorized" });
+  });
+
+  test("resolveClaudeOAuth: 通信断が 1 件でも混じれば failure（ログイン切れと断定しない）", async () => {
+    const outcome = await resolveClaudeOAuth(
+      async (token) =>
+        token === "kc" ? { kind: "unauthorized" as const } : { kind: "failure" as const },
+      {
+        candidates: [
+          { token: "kc", expiresAtMs: 9_999, source: "keychain" },
+          { token: "file", expiresAtMs: 9_999, source: "file" },
+        ],
+        refreshFile: async () => null,
+        now: () => 1_000,
+      },
+    );
+    expect(outcome).toEqual({ resolution: null, failure: "failure" });
+  });
+
+  test("resolveClaudeOAuth: 成功時は resolution を返し failure は null", async () => {
+    const outcome = await resolveClaudeOAuth(
+      async () => ({ kind: "success" as const, value: "ok" }),
+      { candidates: [{ token: "kc", expiresAtMs: 9_999, source: "keychain" }], now: () => 1_000 },
+    );
+    expect(outcome).toEqual({
+      resolution: { value: "ok", credential: { token: "kc", expiresAtMs: 9_999 } },
+      failure: null,
+    });
+  });
+
   test("Keychain/file が同じ失効 token でも refresh 可能な file 候補を残す", async () => {
     let refreshCalls = 0;
     const resolved = await withClaudeOAuthCredential(
@@ -818,7 +874,7 @@ describe("TmuxSessionManager", () => {
     await mgr.sendKeys("s", ["hello"], true);
     await mgr.capturePane("s", { lines: 10 });
 
-    expect(runner.recorded[0]).toEqual(["send-keys", "-t", "%9", "-l", "hello"]);
+    expect(runner.recorded[0]).toEqual(["send-keys", "-t", "%9", "-l", "--", "hello"]);
     expect(runner.recorded[1]).toEqual(["capture-pane", "-p", "-t", "%9", "-S", "-10"]);
   });
 
@@ -1277,5 +1333,127 @@ describe("resolveHostDisplayName", () => {
         scutilComputerName: () => "unused",
       }),
     ).toBeUndefined();
+  });
+});
+
+describe("login-code 画面判定 / submitLoginCode（仮想時計）", () => {
+  const promptScreen = [
+    "❯ /login",
+    "  Login",
+    "  Browser didn't open? Use the url below to sign in (c to copy)",
+    "https://claude.com/cai/oauth/authorize?code=true",
+    "  Paste code here if prompted >",
+    "  Esc to cancel",
+  ].join("\n");
+  const echoed = (code: string) =>
+    promptScreen.replace("  Paste code here if prompted >", `  Paste code here if prompted > ****${code.slice(-6)}`);
+  const retryScreen = "  Login\n  OAuth error: Request failed with status code 400\n  Press Enter to retry.\n  Esc to cancel";
+  const methodScreen = "  Login\n  Select login method:\n  ❯ 1. Claude account with subscription\n    2. Anthropic Console account\n  Esc to cancel";
+  const acceptedScreen = "  ⎿  Login successful\n────────\n❯ \n────────\n  ⏸ manual mode on";
+  const pendingScreen = "  Login\n  Signing in…\n  Esc to cancel";
+
+  test("本文の引用（フッター無し / 末尾から遠い）では /login フロー中と判定しない", () => {
+    const quoted = "⏺ /login の画面では\n  Select login method:\n  と出て、下に Paste code here if prompted と表示されます\n" +
+      "❯ \n  ⏸ manual mode on";
+    expect(screenInLoginFlow(quoted)).toBe(false);
+    expect(screenHasLoginCodePrompt(quoted)).toBe(false);
+    const stale = promptScreen + "\n" + "⏺ 本文\n".repeat(14) + "❯ \n  ⏸ manual mode on";
+    expect(screenInLoginFlow(stale)).toBe(false);
+    expect(screenInLoginFlow(methodScreen)).toBe(true);
+    expect(screenInLoginFlow(retryScreen)).toBe(true);
+  });
+
+  test("受理は陽性証拠（Login successful / 入力欄の罫線ペア）でだけ判定し、方式選択や交換中は受理にしない", () => {
+    expect(loginCodeScreenState(acceptedScreen)).toBe("accepted");
+    expect(loginCodeScreenState("────────\n❯ \n────────\n  ⏸ manual mode on")).toBe("accepted");
+    expect(loginCodeScreenState(methodScreen)).toBe("method");
+    expect(loginCodeScreenState(pendingScreen)).toBe("pending");
+    expect(loginCodeScreenState(retryScreen)).toBe("retry");
+    expect(loginCodeScreenState(promptScreen)).toBe("prompt");
+  });
+
+  /** 仮想時計 + 画面シナリオで submitLoginCode を直接回す。 */
+  function makeOps(frames: string[], options: { swallowEnters?: number } = {}) {
+    let clock = 0;
+    let swallow = options.swallowEnters ?? 0;
+    let cursor = 0;
+    let typed = "";
+    let entered = false;
+    const sent: string[] = [];
+    const ops = {
+      capture: async () => {
+        if (!entered) return typed.length > 0 ? echoed(typed) : promptScreen;
+        const frame = frames[Math.min(cursor, frames.length - 1)] ?? pendingScreen;
+        cursor += 1;
+        return frame;
+      },
+      sendLiteral: async (text: string) => { typed += text; sent.push(`literal:${text}`); },
+      sendEnter: async () => {
+        sent.push("enter");
+        if (swallow > 0) swallow -= 1;
+        else entered = true;
+      },
+      delayMs: 0,
+      pollMs: 0,
+      settleMs: 1_000,
+      now: () => { clock += 400; return clock; },
+    };
+    return { ops, sent };
+  }
+
+  test("retry は settle 窓内なら CR を追加で撃たずに理由つきで throw", async () => {
+    const { ops, sent } = makeOps([pendingScreen, retryScreen]);
+    await expect(submitLoginCode("AbC#123", ops)).rejects.toThrow(/status code 400/);
+    expect(sent).toEqual(["literal:AbC#123", "enter"]);
+  });
+
+  test("CR が飲まれてコード欄が残るときだけ settle 後に CR を再送し、受理で終える", async () => {
+    // 1 発目の CR は飲まれる（画面は prompt のまま）→ settle 経過 → 再キャプチャ prompt → 2 発目 → 受理。
+    const { ops, sent } = makeOps([acceptedScreen], { swallowEnters: 1 });
+    await submitLoginCode("AbC#123", ops);
+    expect(sent).toEqual(["literal:AbC#123", "enter", "enter"]);
+  });
+
+  test("交換中（pending）が settle×2 を超えても確定しなければ throw し、方式選択へ戻れば別の理由で throw", async () => {
+    const { ops } = makeOps([pendingScreen]);
+    await expect(submitLoginCode("AbC#123", ops)).rejects.toThrow(/確認できませんでした/);
+    const back = makeOps([pendingScreen, methodScreen]);
+    await expect(submitLoginCode("AbC#123", back.ops)).rejects.toThrow(/方式選択に戻りました/);
+    expect(back.sent.filter((entry) => entry === "enter")).toHaveLength(1);
+  });
+});
+
+describe("login-code 成功後の継続待ち（Login successful. Press Enter to continue…）", () => {
+  const continueScreen = "❯ /login\n──────\n  Login\n  Logged in as n***@example.com\n  Login successful. Press Enter to continue…";
+  const acceptedScreen = "  ⎿  Login successful\n────────\n❯ \n────────\n  ⏸ manual mode on";
+  const promptScreen = "  Login\nhttps://claude.com/cai/oauth/authorize?code=true\n  Paste code here if prompted >\n  Esc to cancel";
+
+  test("継続待ちは continue に分類され、chat 注入の門番にも掛かる", () => {
+    expect(loginCodeScreenState(continueScreen)).toBe("continue");
+    expect(screenInLoginFlow(continueScreen)).toBe(true);
+    // 完了後の transcript 行（⎿ Login successful）+ 入力欄は accepted。
+    expect(loginCodeScreenState(acceptedScreen)).toBe("accepted");
+  });
+
+  test("submitLoginCode: 継続待ちを Enter で閉じて入力欄へ戻れば受理（失敗にしない）", async () => {
+    const sent: string[] = [];
+    let clock = 0;
+    let phase = 0; // 0=prompt(echo) 1=continue 2=accepted
+    let typed = "";
+    const ops = {
+      capture: async () => {
+        if (phase === 0) return typed.length > 0
+          ? promptScreen.replace("  Paste code here if prompted >", `  Paste code here if prompted > ****${typed.slice(-6)}`)
+          : promptScreen;
+        return phase === 1 ? continueScreen : acceptedScreen;
+      },
+      sendLiteral: async (text: string) => { typed += text; sent.push(`literal:${text}`); },
+      sendEnter: async () => { sent.push("enter"); phase += 1; },
+      delayMs: 0, pollMs: 0, settleMs: 1_000,
+      now: () => { clock += 400; return clock; },
+    };
+    await submitLoginCode("AbC#123", ops);
+    // コード確定の Enter + 継続待ちを閉じる Enter。
+    expect(sent).toEqual(["literal:AbC#123", "enter", "enter"]);
   });
 });

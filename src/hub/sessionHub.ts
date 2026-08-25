@@ -24,6 +24,7 @@ import type { ChatAgent } from "../chat/chatTailController.js";
 import type { PanePreviewMode } from "./panePreviewPump.js";
 import type { QuestionAnswer } from "../protocol.js";
 import { PROTOCOL_V1, PROTOCOL_V2 } from "../protocol.js";
+import { LoginCodeError } from "../backend/tmux.js";
 import { CodexAppServerManager } from "../codex/codexAppServer.js";
 import {
   CodexNativeTurnController,
@@ -52,6 +53,8 @@ export interface HubTail {
 export interface HubPreviewPump {
   start(session: string, mode?: PanePreviewMode, opts?: { emitInitial?: boolean }): void;
   stop(): void;
+  /** 前面購読者の参加時に、直近の入力待ちフレームを再送する（任意実装）。 */
+  resendLastIfInteractive?(): void;
 }
 
 export type HubTailFactory = (
@@ -840,6 +843,9 @@ export class SessionHub {
       } else {
         this.syncPreview(session, actor);
       }
+      // 会話を開き直したとき（pump は一覧 watch で稼働中）、静止した入力待ちダイアログの
+      // フレームは変化しないので再送しないと転写カードが出ない。
+      if (preview && !wasPreview) actor.previewPump?.resendLastIfInteractive?.();
       // preview=false 中に engine が route できなかった image/subagent event を、同じ
       // subscriber の前面昇格時にも afterSeq から回収する。既存購読だからと no-op にしない。
       if (!existing.backfilling && afterSeq !== undefined) {
@@ -863,6 +869,7 @@ export class SessionHub {
     }
     // 初回 backfill が同期的に多数の行を生成する前に pane capture を開始する。
     this.syncPreview(session, actor);
+    if (preview) actor.previewPump?.resendLastIfInteractive?.();
     if (first) {
       this.startSharedTail(session, actor, newerThanMs ?? null);
       // processing 完了で一度 unsubscribe された後も、actor の replay buffer が残る間は
@@ -1587,14 +1594,24 @@ export class SessionHub {
           if (this.actors.get(session) !== actor) continue;
           actor.injectingChatMessageIds.delete(message.clientMessageId);
           actor.pendingChatMessages.delete(message.clientMessageId);
-          actor.uncertainChatMessages.set(message.clientMessageId, message);
+          // `/login` 中の門番（LoginCodeError）は 1 キーも送る前の確定拒否 = 非配達が確定している。
+          // uncertain（配送不明）に積むと削除不能・後続ブロックのゾンビになるので、失敗として
+          // そのまま片付ける。それ以外の注入失敗は従来どおり配送不明として明示再送に倒す。
+          const rejectedBeforeSend = error instanceof LoginCodeError;
+          if (rejectedBeforeSend) {
+            removeOrderedID(actor.chatOrder, message.clientMessageId);
+          } else {
+            actor.uncertainChatMessages.set(message.clientMessageId, message);
+          }
           this.persistChatReceipts();
+          // 利用者向け文言だけを出す（`String(error)` は `LoginCodeError: …` と型名が前置される）。
+          const userText = rejectedBeforeSend && error instanceof Error ? error.message : String(error);
           for (const waiter of entry.waiters) {
             this.sendTo(waiter.client, {
-              type: "chat_send_result", id: waiter.id, status: "failed", error: String(error),
+              type: "chat_send_result", id: waiter.id, status: "failed", error: userText,
             });
           }
-          this.publishCodexMarker(session, `chat-send-error-${message.id}`, `⚠️ メッセージ送信失敗: ${String(error)}`);
+          this.publishCodexMarker(session, `chat-send-error-${message.id}`, `⚠️ メッセージ送信失敗: ${userText}`);
           this.options.log?.(`chat 注入失敗 session=${session}: ${String(error)}`);
         } finally {
           this.injectionsInFlight -= 1;

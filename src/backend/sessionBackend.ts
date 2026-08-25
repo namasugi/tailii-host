@@ -37,6 +37,11 @@ export interface SessionBackend {
    * （分割すると Ink のペースト取り込み窓に CR が飲まれ送信されない。実測 2026-07-22）。
    */
   sendTextSubmit(name: string, text: string): Promise<void>;
+  /**
+   * `/login` の OAuth コードをコード入力欄へ渡して確定する（login_code_send）。
+   * コード入力待ちの画面でなければ何も送らず throw する。
+   */
+  sendLoginCode(name: string, code: string): Promise<void>;
   capturePane(name: string, options?: CapturePaneOptions): Promise<string>;
   agentProcessAlive(name: string): Promise<boolean>;
   /**
@@ -129,6 +134,10 @@ export class CompositeSessionBackend implements SessionBackend {
 
   sendTextSubmit(name: string, text: string): Promise<void> {
     return this.backendFor(name).sendTextSubmit(name, text);
+  }
+
+  sendLoginCode(name: string, code: string): Promise<void> {
+    return this.backendFor(name).sendLoginCode(name, code);
   }
 
   capturePane(name: string, options: CapturePaneOptions = {}): Promise<string> {

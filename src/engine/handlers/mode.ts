@@ -5,7 +5,15 @@
 import { parsePermissionMode } from "../../shared/permissionMode.js";
 import { sleep } from "../../shared/sleep.js";
 import type { SessionBackend } from "../../backend/sessionBackend.js";
-import { engineDiag, writeError, type HandlerRegistry, type ModeTiming } from "../context.js";
+import { loginCodeErrorMessage } from "../../backend/tmux.js";
+import type { ControlMessage } from "../../protocol.js";
+import {
+  engineDiag,
+  writeError,
+  type HandlerContext,
+  type HandlerRegistry,
+  type ModeTiming,
+} from "../context.js";
 
 export const modeHandlers: HandlerRegistry = {
   mode_get: async (message, ctx) => {
@@ -118,7 +126,54 @@ export const modeHandlers: HandlerRegistry = {
       });
     }
   },
+
+  login_code_send: async (message, ctx) => {
+    // 結果確定まで最大 ~10s 待つ（OAuth 交換の待ち）。engine の read loop は handler を直列 await
+    // するため、ここで待つと chat_send / interrupt / pane_preview が全部止まる。起動だけして
+    // 応答は非同期に write する（writer は直列化済み）。
+    void runLoginCodeSend(message, ctx);
+  },
 };
+
+async function runLoginCodeSend(
+  message: Extract<ControlMessage, { type: "login_code_send" }>,
+  ctx: HandlerContext,
+): Promise<void> {
+  {
+    const { writer, state, sessionManager } = ctx;
+    const v = state.negotiatedVersion;
+    // `/login` の OAuth コードをコード入力待ちの画面へ渡す（login-code）。通常の chat 注入は
+    // 入力欄検証・C-u クリアでコード欄を壊すため、backend の専用経路（literal + Enter）で送る。
+    // コードは一度きりの認可コードなので diag ログには長さだけ載せる。
+    engineDiag(
+      `login_code_send id=${message.id} session=${message.session} len=${message.code.length}`,
+    );
+    if (!LOGIN_CODE_PATTERN.test(message.code)) {
+      writer.write({
+        type: "login_code_send_result", v, id: message.id,
+        ok: false, error: "ログインコードの形式が不正です",
+      });
+      return;
+    }
+    try {
+      await sessionManager.sendLoginCode(message.session, message.code);
+      writer.write({ type: "login_code_send_result", v, id: message.id, ok: true, error: null });
+    } catch (error) {
+      // backend の生エラー（tmux の args 等）はコード本文を含みうるので、ログにも応答にも
+      // 利用者向け文言だけを載せる。
+      const text = loginCodeErrorMessage(error);
+      engineDiag(`login_code_send 失敗 id=${message.id}: ${text}`);
+      writer.write({ type: "login_code_send_result", v, id: message.id, ok: false, error: text });
+    }
+  }
+}
+
+/**
+ * login_code_send が受理するコード形式。書式は Claude Code 側の仕様（手動コールバックの
+ * `<code>#<state>`）で host が握っていないため文字種を狭めず、literal 送出で危険な
+ * 空白・改行・制御文字（ESC 等）だけを落とす（印字可能 ASCII のみ、512 文字以内）。
+ */
+const LOGIN_CODE_PATTERN = /^[\x21-\x7e]{1,512}$/;
 
 /**
  * pane_key_send が受理する制御キー（tmux 互換キー名）。テキスト注入経路には使わせない。

@@ -1,0 +1,4 @@
+{"code":"AbC123-xyz_789#StAtE456-abc","id":"lc1","session":"s-1a2b3c4d","type":"login_code_send","v":1}
+{"error":null,"id":"lc1","ok":true,"type":"login_code_send_result","v":1}
+{"code":"AbC123-xyz_789#StAtE456-abc","id":"lc2","session":"s-1a2b3c4d","type":"login_code_send","v":1}
+{"error":"login code prompt not visible","id":"lc2","ok":false,"type":"login_code_send_result","v":1}

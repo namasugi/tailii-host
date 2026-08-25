@@ -85,6 +85,13 @@ describe("golden roundtrip", () => {
     }
   });
 
+  it("login-code v1 golden 全行が byte-exact でラウンドトリップする", () => {
+    for (const line of goldenLines("login-code-v1.ndjson")) {
+      const decoded = decodeControlMessage(line);
+      expect(encodeControlMessage(decoded)).toBe(line);
+    }
+  });
+
   it("session-title v1 golden 全行が byte-exact でラウンドトリップする", () => {
     for (const line of goldenLines("session-title-v1.ndjson")) {
       const decoded = decodeControlMessage(line);

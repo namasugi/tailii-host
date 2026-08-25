@@ -29,6 +29,12 @@ export interface PanePreviewPumpOptions {
   onPermissionMode?: (mode: string) => void;
   /** 診断ログ（選択ダイアログフレームの emit 遷移など。既定は無効）。 */
   log?: (message: string) => void;
+  /**
+   * 初回 capture を送るかの判定（emitInitial=false のとき）。静止した入力待ちダイアログ
+   * （選択 / /login）で始まる pane は、変化しないため従来の「初回は黙って基準保持」だと
+   * 会話を開き直しても転写カードが出ない（2026-08-25 実障害）。
+   */
+  emitInitialIf?: (text: string) => boolean;
 }
 
 /** tmux pane の画面内容が変化したときだけ pane_preview を流す。 */
@@ -52,6 +58,7 @@ export class PanePreviewPump {
   private mode: PanePreviewMode = "claude_status";
   private readonly onPermissionMode: ((mode: string) => void) | null;
   private readonly log: ((message: string) => void) | null;
+  private readonly emitInitialIf: ((text: string) => boolean) | null;
   private lastPermissionMode: string | null = null;
   private lastEmittedDialog = false;
   private emitInitial = false;
@@ -66,6 +73,22 @@ export class PanePreviewPump {
     this.protocolVersion = options.protocolVersion ?? (() => PROTOCOL_V2);
     this.onPermissionMode = options.onPermissionMode ?? null;
     this.log = options.log ?? null;
+    this.emitInitialIf = options.emitInitialIf ?? null;
+  }
+
+  /**
+   * 直近フレームを再送する（前面購読者の（再）参加時）。pump が動いていても pane が静止して
+   * いれば変化フレームは出ないため、入力待ちダイアログの転写が開き直しで出ない。
+   * 送るのは `emitInitialIf` が真のフレームだけ（静止 pane の古い status 行で誤点灯しない）。
+   */
+  resendLastIfInteractive(): void {
+    const session = this.session;
+    const text = this.lastText;
+    if (session === null || text === null || this.emitInitialIf === null) return;
+    if (!this.emitInitialIf(text)) return;
+    this.lastChangeAt = Date.now();
+    this.inactiveSent = false;
+    this.emitActive(session, text, Date.now(), this.mode);
   }
 
   /**
@@ -155,7 +178,8 @@ export class PanePreviewPump {
           // Codex は接続時点ですでに turn が進行中の場合があるため、初回 capture も送り、
           // iOS 側で現在の処理中ステータスだけを抽出する。
           // emitInitial 指定時（処理中会話の watch 開始）は Claude も初回から送る。
-          if ((mode === "codex_terminal" || this.emitInitial) && text.trim().length > 0) {
+          const interactive = this.emitInitialIf !== null && this.emitInitialIf(text);
+          if ((mode === "codex_terminal" || this.emitInitial || interactive) && text.trim().length > 0) {
             this.lastChangeAt = now;
             this.inactiveSent = false;
             this.queueActive(session, text, now, mode);

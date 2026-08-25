@@ -2005,7 +2005,7 @@ describe("EngineControl — 横断制御チャネル", () => {
     expect(await waitForCommand(runner, ["send-keys", "-t", "work", "2"])).toBe(true);
     // Other（Type something.）: 行の数字キー → literal 入力 → Enter。
     expect(await waitForCommand(runner, ["send-keys", "-t", "work", "3"])).toBe(true);
-    expect(await waitForCommand(runner, ["send-keys", "-t", "work", "-l", "custom"])).toBe(true);
+    expect(await waitForCommand(runner, ["send-keys", "-t", "work", "-l", "--", "custom"])).toBe(true);
     expect(await waitForCommand(runner, ["send-keys", "-t", "work", "Enter"])).toBe(true);
     // 2 問以上は最終問も単一選択でもレビュー画面へ進むため、Submit answers の 1 が必要。
     expect(await waitForCommand(runner, ["send-keys", "-t", "work", "1"])).toBe(true);

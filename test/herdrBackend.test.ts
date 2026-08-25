@@ -25,7 +25,11 @@ import {
   resolveSessionBackendKind,
 } from "../src/backend/sessionBackend.js";
 import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
-import { extractClaudeInputBox, TmuxSessionManager } from "../src/backend/tmux.js";
+import {
+  extractClaudeInputBox,
+  screenHasLoginCodePrompt,
+  TmuxSessionManager,
+} from "../src/backend/tmux.js";
 import { makeTempDir, MockTmuxRunner, ok } from "./helpers.js";
 
 /** 記録付きモック herdr ランナー。 */
@@ -503,6 +507,180 @@ describe("HerdrSessionManager", () => {
     ]);
   });
 
+  /** 実測 claude 2.1.241 の `/login` コード入力待ち画面（URL は Ink がハード改行する）。 */
+  const loginCodeScreen = [
+    "❯ /login",
+    "──────────────────────────────────────────",
+    "  Login",
+    "  Browser didn't open? Use the url below to sign in (c to copy)",
+    "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=",
+    "code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=user%3Aprofile",
+    "  Paste code here if prompted >",
+    "  Esc to cancel",
+  ].join("\n");
+
+  test("sendTextSubmit: /login のコード入力待ち中は本文を注入せず明示エラーで拒否する", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const { runner } = makeSubmitHarness({ plainScreen: loginCodeScreen });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    // 通常経路はフォールバックの `❯ /login` 行を未送信テキストと誤認して Enter・反映検証失敗で
+    // C-u 連打とコード欄を壊すため、何も送らずに chat_send を失敗させる。
+    await expect(manager.sendTextSubmit("s-a", "こんにちは")).rejects.toThrow(/\/login の途中/);
+    expect(submitSends(runner)).toEqual([]);
+  });
+
+  /** 誤コード送信後の画面（実測 2.1.241）。コード欄は消え retry 待ちになる。 */
+  const loginRetryScreen = [
+    "❯ /login",
+    "  Login",
+    "  OAuth error: Request failed with status code 400",
+    "  Press Enter to retry.",
+    "  Esc to cancel",
+  ].join("\n");
+
+  /** 方式選択画面（実測 2.1.241。フッターは Esc to cancel のみ）。 */
+  const loginMethodScreen = [
+    "❯ /login",
+    "  Login",
+    "  Select login method:",
+    "  ❯ 1. Claude account with subscription · Pro, Max, Team, or Enterprise",
+    "    2. Anthropic Console account · API usage billing",
+    "  Esc to cancel",
+  ].join("\n");
+
+  /**
+   * コード欄の状態機械: CR を受けるとコード欄が消える（swallow 回数分は飲む）。
+   * `afterSubmit` で受理後の画面（既定=通常の入力欄 / retry 画面で OAuth 拒否を再現）を選ぶ。
+   */
+  /** 受理後の画面（実測: `⎿  Login successful` + 通常入力欄の罫線ペア）。 */
+  const loginAcceptedScreen = [
+    "  ⎿  Login successful",
+    "",
+    "────────────────────────",
+    "❯ ",
+    "────────────────────────",
+    "  ⏸ manual mode on",
+  ].join("\n");
+
+  function makeLoginCodeRunner(swallowEnters = 0, afterSubmit = loginAcceptedScreen) {
+    let submitted = false;
+    let swallow = swallowEnters;
+    let typed = "";
+    const runner = new MockHerdrRunner((args) => {
+      if (args[0] === "pane" && args[1] === "list") return herdrOk(paneListJson([{ pane_id: "w4:p2" }]));
+      if (args[0] === "pane" && args[1] === "read") {
+        if (submitted) return herdrOk(afterSubmit);
+        // コード欄は末尾 6 文字以外をマスクしてエコーする（実測）。
+        const masked = typed.length > 0 ? " " + "*".repeat(Math.max(0, typed.length - 6)) + typed.slice(-6) : "";
+        return herdrOk(loginCodeScreen.replace("  Paste code here if prompted >", `  Paste code here if prompted >${masked}`));
+      }
+      if (args[0] === "pane" && args[1] === "send-text" && args[3] === "\r") {
+        if (swallow > 0) swallow -= 1;
+        else submitted = true;
+      } else if (args[0] === "pane" && args[1] === "send-text") {
+        typed += String(args[3]);
+      }
+      return herdrOk("");
+    });
+    return runner;
+  }
+
+  test("sendTextSubmit: /login の方式選択・retry 画面でも本文を注入せず拒否する（選択リスト/再試行の誤操作防止）", async () => {
+    for (const screen of [loginMethodScreen, loginRetryScreen]) {
+      const store = makeStore();
+      store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+      const { runner } = makeSubmitHarness({ plainScreen: screen });
+      const manager = new HerdrSessionManager({
+        runner: runner.runner, store,
+        submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+        readyTimeoutMs: 5000, readyPollMs: 0,
+      });
+      await expect(manager.sendTextSubmit("s-a", "こんにちは")).rejects.toThrow(/\/login の途中/);
+      expect(submitSends(runner)).toEqual([]);
+    }
+  });
+
+  test("sendLoginCode: OAuth 拒否（Press Enter to retry）は理由つきで throw し、余分な CR で retry を押さない", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const runner = makeLoginCodeRunner(0, loginRetryScreen);
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store, submitDelayMs: 0, loginPollMs: 0, loginSettleMs: 0,
+    });
+    await expect(manager.sendLoginCode("s-a", "WrOnG#code")).rejects.toThrow(/status code 400/);
+    expect(submitSends(runner)).toEqual([
+      ["pane", "send-text", "w4:p2", "WrOnG#code"],
+      ["pane", "send-text", "w4:p2", "\r"],
+    ]);
+  });
+
+  test("sendLoginCode: 本文がコード欄に反映されなければ CR を撃たずに throw する（切り詰めたコードを焼かない）", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const { runner } = makeSubmitHarness({ plainScreen: loginCodeScreen }); // エコーしない画面
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store, submitDelayMs: 0, loginPollMs: 0, loginSettleMs: 0,
+    });
+    await expect(manager.sendLoginCode("s-a", "AbC123")).rejects.toThrow(/反映されませんでした/);
+    expect(submitSends(runner).filter((args) => args[3] === "\r")).toEqual([]);
+  });
+
+  test("sendLoginCode: CR を 2 回送ってもコード欄が残れば ok を返さず throw する", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const runner = makeLoginCodeRunner(99);
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store, submitDelayMs: 0, loginPollMs: 0, loginSettleMs: 0,
+    });
+    await expect(manager.sendLoginCode("s-a", "AbC123")).rejects.toThrow(/受理されませんでした/);
+    expect(submitSends(runner).filter((args) => args[3] === "\r")).toHaveLength(2);
+  });
+
+  test("sendLoginCode: コード入力待ち画面へ literal + CR を送り、コード欄が消えたら終える", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const runner = makeLoginCodeRunner();
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store, submitDelayMs: 0, loginPollMs: 0, loginSettleMs: 0,
+    });
+    await manager.sendLoginCode("s-a", "AbC123-xyz#StAtE456");
+    expect(submitSends(runner)).toEqual([
+      ["pane", "send-text", "w4:p2", "AbC123-xyz#StAtE456"],
+      ["pane", "send-text", "w4:p2", "\r"],
+    ]);
+  });
+
+  test("sendLoginCode: CR が飲まれてコード欄が残れば 1 回だけ CR を再送する", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const runner = makeLoginCodeRunner(1);
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store, submitDelayMs: 0, loginPollMs: 0, loginSettleMs: 0,
+    });
+    await manager.sendLoginCode("s-a", "AbC123");
+    expect(submitSends(runner)).toEqual([
+      ["pane", "send-text", "w4:p2", "AbC123"],
+      ["pane", "send-text", "w4:p2", "\r"],
+      ["pane", "send-text", "w4:p2", "\r"],
+    ]);
+  });
+
+  test("sendLoginCode: コード入力待ちでなければ何も送らず throw する", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const { runner } = makeSubmitHarness({});
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store, submitDelayMs: 0, loginPollMs: 0, loginSettleMs: 0,
+    });
+    await expect(manager.sendLoginCode("s-a", "AbC123")).rejects.toThrow(/入力待ちではありません/);
+    expect(submitSends(runner)).toEqual([]);
+  });
+
   test("sendTextSubmit: 本文反映を検証し、CR が飲まれたら CR を再送する", async () => {
     const store = makeStore();
     store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
@@ -701,6 +879,9 @@ describe("HerdrSessionManager", () => {
     // チャット本文の引用（文中・箇条書き・かぎ括弧）は検出しない。
     expect(screenHasSelectionFooter("  - ダイアログ表示中（\"Enter to select\"）は再送しない")).toBe(false);
     expect(screenHasSelectionFooter("フッターに「Enter to select」が出ます")).toBe(false);
+    // /login のコード入力待ち（実測 2.1.241）も行頭一致だけを採用する。
+    expect(screenHasLoginCodePrompt("  Paste code here if prompted >\n  Esc to cancel")).toBe(true);
+    expect(screenHasLoginCodePrompt("本文で「Paste code here if prompted」に触れただけ")).toBe(false);
   });
 
   test("sendTextSubmit: 注入前にダイアログが開いていたら Esc で閉じてから本文を流す", async () => {
@@ -1056,7 +1237,7 @@ describe("TmuxSessionManager と herdr メタの分離", () => {
     expect(state.shellMode).toBe(false);
     expect(runner.recorded.filter((args) => args[0] === "send-keys")).toEqual([
       ["send-keys", "-t", "s-t", "BSpace"],
-      ["send-keys", "-t", "s-t", "-l", "こんにちは"],
+      ["send-keys", "-t", "s-t", "-l", "--", "こんにちは"],
       ["send-keys", "-t", "s-t", "Enter"],
     ]);
   });
@@ -1070,7 +1251,7 @@ describe("TmuxSessionManager と herdr メタの分離", () => {
     await manager.sendTextSubmit("s-t", "こんにちは");
 
     expect(runner.recorded.filter((args) => args[0] === "send-keys")).toEqual([
-      ["send-keys", "-t", "s-t", "-l", "こんにちは"],
+      ["send-keys", "-t", "s-t", "-l", "--", "こんにちは"],
       ["send-keys", "-t", "s-t", "Enter"],
     ]);
   });

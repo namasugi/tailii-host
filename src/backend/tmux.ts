@@ -132,6 +132,281 @@ function isInputPlaceholder(text: string): boolean {
   return text.startsWith("Message @") && text.endsWith("…");
 }
 
+/**
+ * `/login` の OAuth コード入力待ち行（実測 claude 2.1.241: `Paste code here if prompted >`）。
+ * ブラウザで取得したコードを貼る唯一の入力面で、通常の入力欄（罫線ペア）は描画されない。
+ */
+export const LOGIN_CODE_PROMPT_MARKER = "Paste code here if prompted";
+
+/**
+ * `/login` でコード送信が失敗した後の再試行待ち行（実測 2.1.241:
+ * `OAuth error: Request failed with status code 400` の下に `Press Enter to retry.`）。
+ */
+export const LOGIN_RETRY_MARKER = "Press Enter to retry";
+
+/** `/login` 方式選択（`Select login method:`）のタイトル行（実測 2.1.241。フッターは `Esc to cancel` のみ）。 */
+export const LOGIN_METHOD_MARKER = "Select login method";
+
+/**
+ * 成功後の継続待ち画面（CLI 2.1.241 の文字列 `Login successful. Press Enter to continue…`。
+ * 入力欄は無く、Enter / Esc で閉じて通常の入力欄へ戻る）。
+ * 2026-08-25 実障害: この画面を知らず「交換中」として 10s 待って失敗を返し、利用者がキャンセル
+ * （Esc）すると閉じてログイン済みになる、という逆転が起きた。
+ */
+export const LOGIN_CONTINUE_MARKER = "to continue";
+
+/** ダイアログ行が pane 末尾（最後の非空行）からこの行数以内にあるときだけ「生きている」とみなす。 */
+const LOGIN_TAIL_WINDOW = 12;
+
+/**
+ * `marker` で始まる行が、生きたダイアログとして画面にあるか（TESTABLE 内部）。
+ * 会話本文が同じ文言を行頭に含むだけ（Ink の折り返し・/login の説明文）で発火しないよう、
+ * (a) 末尾 LOGIN_TAIL_WINDOW 行以内 (b) 直下 `footerReach` 行以内に `Esc to cancel` フッター、
+ * の 2 条件を課す（iOS 側 ClaudeLoginPromptParser.isLiveDialogLine と同じ規則）。
+ */
+function liveDialogLineIndex(lines: string[], marker: string, footerReach: number): number | null {
+  let lastContent = -1;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if ((lines[index] ?? "").trim().length > 0) {
+      lastContent = index;
+      break;
+    }
+  }
+  if (lastContent < 0) return null;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (!(lines[index] ?? "").trim().startsWith(marker)) continue;
+    if (lastContent - index > LOGIN_TAIL_WINDOW) return null;
+    const end = Math.min(lines.length, index + 1 + footerReach);
+    for (let below = index + 1; below < end; below += 1) {
+      if ((lines[below] ?? "").trim().toLowerCase().startsWith("esc to cancel")) return index;
+    }
+    return null;
+  }
+  return null;
+}
+
+/** 画面が `/login` のコード入力待ちか（TESTABLE）。chat 注入の門番と login_code_send の前提確認に使う。 */
+export function screenHasLoginCodePrompt(screen: string): boolean {
+  return liveDialogLineIndex(screen.split("\n"), LOGIN_CODE_PROMPT_MARKER, 3) !== null;
+}
+
+function screenHasLoginRetry(screen: string): boolean {
+  return liveDialogLineIndex(screen.split("\n"), LOGIN_RETRY_MARKER, 3) !== null;
+}
+
+function screenHasLoginMethodSelect(screen: string): boolean {
+  // タイトル行と Esc フッターの間に選択肢（最大 3 行 + 空行）が入る。
+  return liveDialogLineIndex(screen.split("\n"), LOGIN_METHOD_MARKER, 8) !== null;
+}
+
+/** 成功後の継続待ち（`Login successful. Press Enter to continue…`）が pane 末尾付近にあるか。 */
+export function screenHasLoginContinue(screen: string): boolean {
+  const lines = screen.split("\n");
+  let lastContent = -1;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if ((lines[index] ?? "").trim().length > 0) {
+      lastContent = index;
+      break;
+    }
+  }
+  if (lastContent < 0) return false;
+  for (let index = lastContent; index >= Math.max(0, lastContent - LOGIN_TAIL_WINDOW); index -= 1) {
+    const text = (lines[index] ?? "").trim().toLowerCase();
+    if (text.includes("login successful") && text.includes(LOGIN_CONTINUE_MARKER)) return true;
+    if (text.startsWith("press enter to continue")) return true;
+  }
+  return false;
+}
+
+/**
+ * 画面が `/login` フローのどこか（方式選択 / コード入力待ち / 失敗後の再試行待ち）にいるか（TESTABLE）。
+ * chat 注入の門番用。コード欄以外の 2 画面も、通常本文 + Enter が選択リストや retry を
+ * 押してしまうため同じく拒否する。
+ */
+export function screenInLoginFlow(screen: string): boolean {
+  return screenHasLoginCodePrompt(screen) || screenHasLoginRetry(screen)
+    || screenHasLoginMethodSelect(screen) || screenHasLoginContinue(screen);
+}
+
+/**
+ * コード送出後の画面の判定:
+ * - `prompt`: コード欄がまだある（CR 取りこぼし or 交換前）
+ * - `retry`: OAuth 拒否（`Press Enter to retry`）
+ * - `method`: 方式選択へ戻った（Esc / retry を押した等。受理ではない）
+ * - `continue`: 成功後の継続待ち（`Login successful. Press Enter to continue…`）— ログインは完了
+ * - `accepted`: **陽性証拠**あり — 通常入力欄（罫線ペア）の復帰
+ * - `pending`: どれでもない（交換中）。「コード欄が無い」だけでは受理にしない。
+ */
+export type LoginCodeScreenState = "prompt" | "retry" | "method" | "continue" | "accepted" | "pending";
+
+export function loginCodeScreenState(screen: string): LoginCodeScreenState {
+  if (screenHasLoginCodePrompt(screen)) return "prompt";
+  if (screenHasLoginRetry(screen)) return "retry";
+  if (screenHasLoginMethodSelect(screen)) return "method";
+  if (screenHasLoginContinue(screen)) return "continue";
+  const lines = screen.split("\n");
+  const tail = lines.slice(-LOGIN_TAIL_WINDOW - 8);
+  const rules = tail.filter((line) => isInputBoxRuleLine(line.trim())).length;
+  if (rules >= 2) return "accepted";
+  return "pending";
+}
+
+/**
+ * retry 画面の理由行。`OAuth error` で始まる行（末尾窓内の最後のもの）だけを採用する。
+ * 直上行フォールバックは持たない（コードをエコーしたコード欄の行が理由として result / ログへ
+ * 漏れる）。念のためコード欄マーカーを含む行は採用しない。
+ */
+export function loginCodeErrorLine(screen: string): string | null {
+  const lines = screen.split("\n").map((line) => line.trim());
+  const tail = lines.slice(-LOGIN_TAIL_WINDOW - 8);
+  for (let index = tail.length - 1; index >= 0; index -= 1) {
+    const text = tail[index] ?? "";
+    if (text.startsWith("OAuth error") && !text.includes(LOGIN_CODE_PROMPT_MARKER)) {
+      return text.slice(0, 200);
+    }
+  }
+  return null;
+}
+
+/**
+ * login-code 経路の失敗（利用者へそのまま出せる文言だけを message に持つ）。
+ * コード本文を含む生の backend エラー（tmux の args 等）を result / diag に流さないための型。
+ * chat 注入の門番（1 キーも送る前の確定拒否）にも使う — hub はこの型を「未送出の失敗」として
+ * uncertain（配送不明）に積まない。
+ */
+export class LoginCodeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LoginCodeError";
+  }
+}
+
+/** login_code_send が拒否するメッセージ（コード入力待ちでない）。 */
+export const LOGIN_CODE_PROMPT_NOT_VISIBLE =
+  "Claude はログインコードの入力待ちではありません（/login を実行してから送ってください）";
+
+/** retry 画面で login_code_send されたときの案内。 */
+export const LOGIN_CODE_RETRY_PENDING =
+  "Claude は再試行待ちです。「もう一度」を押してから、新しいコードを送ってください";
+
+/** chat 注入が `/login` フロー中の画面を検出したときの拒否文言（hub が会話本文へそのまま出す）。 */
+export const CHAT_BLOCKED_BY_LOGIN_PROMPT =
+  "Claude が /login の途中です。転写カードから操作するか、キャンセルしてから送ってください";
+
+/** コード送出は届いたが、待ってもコード欄が消えない（CR 取りこぼし・TUI 停止）。 */
+export const LOGIN_CODE_NOT_ACCEPTED =
+  "コードが Claude に受理されませんでした（もう一度送るか、Mac 側の画面を確認してください）";
+
+/** コード本文がコード欄に反映されなかった（send-text 取りこぼし）。CR は撃たない。 */
+export const LOGIN_CODE_NOT_ECHOED =
+  "コードが入力欄に反映されませんでした（もう一度送ってください）";
+
+/** 交換が長引き、受理も拒否も確定しなかった。 */
+export const LOGIN_CODE_UNSETTLED =
+  "ログインの結果を確認できませんでした（Mac 側の画面を確認してください）";
+
+/** login_code_send の失敗を利用者向け文言へ写す（コード本文・内部 args を漏らさない）。 */
+export function loginCodeErrorMessage(error: unknown): string {
+  if (error instanceof LoginCodeError) return error.message;
+  const name = error instanceof Error ? error.name : "Error";
+  return `コードの送出に失敗しました（${name}）`;
+}
+
+/** backend 非依存の login-code 送出手順の注入点。 */
+export interface LoginCodeSubmitOps {
+  /** 画面（判定不能は null）。 */
+  capture: () => Promise<string | null>;
+  sendLiteral: (text: string) => Promise<void>;
+  sendEnter: () => Promise<void>;
+  /** 本文→CR の間隔（Ink の取り込み窓。実測 300ms 未満で CR が飲まれる）。 */
+  delayMs: number;
+  /** 画面ポーリング間隔。 */
+  pollMs: number;
+  /** CR 1 回あたり、コード欄が消えるのを待つ上限。交換中（pending）はこの 2 倍まで待つ。 */
+  settleMs: number;
+  now?: () => number;
+}
+
+/** コード欄に本文が反映されたか（入力は末尾 6 文字以外マスク表示される実測に合わせ、末尾で照合）。 */
+export function loginCodeEchoed(screen: string, code: string): boolean {
+  const lines = screen.split("\n");
+  const index = liveDialogLineIndex(lines, LOGIN_CODE_PROMPT_MARKER, 3);
+  if (index === null) return false;
+  const probe = code.slice(-Math.min(6, code.length));
+  return (lines[index] ?? "").includes(probe);
+}
+
+/**
+ * `/login` のコードを送出し、結果を画面で確定させる（tmux / herdr 共通, TESTABLE）。
+ * - 送出前にコード欄が無ければ何も送らず throw（retry 画面は専用の案内）
+ * - 本文送出後、コード欄へのエコーを確認してから CR（反映していなければ CR を撃たず throw —
+ *   切り詰めたコードを送ってワンタイムコードを焼かない）
+ * - CR 後は `loginCodeScreenState` で待つ。retry / method は即 throw（余分な CR で retry を
+ *   押さない）。accepted（陽性証拠）で受理。prompt が settleMs 残れば **再キャプチャして prompt
+ *   のときだけ** CR を 1 回再送。pending は settleMs×2 まで待ち、確定しなければ throw。
+ *   暗黙の ok は返さない。
+ */
+export async function submitLoginCode(code: string, ops: LoginCodeSubmitOps): Promise<void> {
+  const now = ops.now ?? (() => Date.now());
+  const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+  const initial = await ops.capture();
+  const initialState = initial === null ? "pending" : loginCodeScreenState(initial);
+  if (initialState === "retry") throw new LoginCodeError(LOGIN_CODE_RETRY_PENDING);
+  if (initialState !== "prompt") throw new LoginCodeError(LOGIN_CODE_PROMPT_NOT_VISIBLE);
+
+  await ops.sendLiteral(code);
+  await sleep(ops.delayMs);
+  let echoed = false;
+  for (let attempt = 0; attempt < 2 && !echoed; attempt += 1) {
+    if (attempt > 0) await sleep(ops.pollMs);
+    const screen = await ops.capture();
+    echoed = screen !== null && loginCodeEchoed(screen, code);
+  }
+  if (!echoed) throw new LoginCodeError(LOGIN_CODE_NOT_ECHOED);
+
+  const start = now();
+  const pendingDeadline = start + ops.settleMs * 2;
+  let entersSent = 0;
+  let continueEnters = 0;
+  let state: LoginCodeScreenState = "prompt";
+  while (true) {
+    if (state === "prompt") {
+      if (entersSent >= 2) throw new LoginCodeError(LOGIN_CODE_NOT_ACCEPTED);
+      await ops.sendEnter();
+      entersSent += 1;
+    } else if (state === "continue") {
+      // ログインは完了している。継続待ちを Enter で閉じて入力欄へ戻す（最大 2 回）。閉じられなくても
+      // 失敗にはしない（iOS 側は成功画面を「続ける」カードとして転写できる）。
+      if (continueEnters >= 2) return;
+      await ops.sendEnter();
+      continueEnters += 1;
+    }
+    const attemptDeadline = now() + ops.settleMs;
+    for (;;) {
+      await sleep(ops.pollMs);
+      const screen = await ops.capture();
+      state = screen === null ? "pending" : loginCodeScreenState(screen);
+      if (state === "retry") {
+        const reason = screen === null ? null : loginCodeErrorLine(screen);
+        throw new LoginCodeError(
+          `コードが拒否されました${reason !== null ? `（${reason}）` : ""}。もう一度サインインしてください`,
+        );
+      }
+      if (state === "method") {
+        throw new LoginCodeError("ログインが中断され、方式選択に戻りました。/login をやり直してください");
+      }
+      if (state === "accepted") return;
+      if (state === "continue") break;
+      if (state === "prompt" && now() >= attemptDeadline) break;
+      if (state === "pending" && now() >= pendingDeadline) {
+        // 継続待ちを閉じた後の描画遅延なら成功として扱う（継続画面を一度でも見ている）。
+        if (continueEnters > 0) return;
+        throw new LoginCodeError(LOGIN_CODE_UNSETTLED);
+      }
+    }
+  }
+}
+
 /** 入力欄の行群を「モード記号 + 本文」へ分解する。 */
 function splitInputPrompt(bodyLines: string[]): ClaudeInputBox {
   const body = [...bodyLines];
@@ -193,6 +468,8 @@ export class TmuxSessionManager {
   private readonly runner: TmuxCommandRunner;
   readonly store: SessionMetadataStore;
   private readonly captureLines: number;
+  /** login-code 送出の待ち時間（テスト注入用）。 */
+  private readonly loginTiming: { delayMs: number; pollMs: number; settleMs: number };
   private readonly protocolVersion: number;
 
   constructor(options: {
@@ -200,11 +477,17 @@ export class TmuxSessionManager {
     store?: SessionMetadataStore;
     captureLines?: number;
     protocolVersion?: number;
+    loginTiming?: { delayMs?: number; pollMs?: number; settleMs?: number };
   } = {}) {
     this.runner = options.runner ?? processTmuxCommandRunner();
     this.store = options.store ?? new SessionMetadataStore();
     this.captureLines = options.captureLines ?? 50;
     this.protocolVersion = options.protocolVersion ?? PROTOCOL_V1;
+    this.loginTiming = {
+      delayMs: options.loginTiming?.delayMs ?? 150,
+      pollMs: options.loginTiming?.pollMs ?? 250,
+      settleMs: options.loginTiming?.settleMs ?? 5_000,
+    };
   }
 
   /**
@@ -319,11 +602,20 @@ export class TmuxSessionManager {
    * literal 送出 → 150ms（Ink 再描画待ち）→ Enter。
    */
   async sendTextSubmit(name: string, text: string): Promise<void> {
+    // 1 回の capture で「/login フロー中か」と「残存テキスト」を判定する（chat 毎の capture を増やさない）。
+    const screen = await this.captureVisibleScreenOrNull(name);
+    // `/login` フロー中（方式選択 / コード入力待ち / retry）は通常の入力欄が無く、注入した本文が
+    // 選択リストやコード欄へ入る。明示エラーで chat_send を失敗させる（コードは login_code_send、
+    // 再試行/中断は pane_key_send の専用経路）。
+    if (screen !== null && screenInLoginFlow(screen)) {
+      throw new LoginCodeError(CHAT_BLOCKED_BY_LOGIN_PROMPT);
+    }
     // 中断（停止）直後は claude が queued メッセージを入力欄へ書き戻す。残存したまま
     // 注入すると今回の本文がその後ろへ連結され 1 メッセージになる（実機FB 2026-07-29）。
     // 残存は先に Enter で独立メッセージとして送信し切ってから注入する。空入力への
     // Enter は no-op なので誤検出は無害（herdr 側 sendTextSubmit と同じ防御）。
-    if (await this.inputBoxHasPendingText(name)) {
+    const box = screen === null ? null : extractClaudeInputBox(screen);
+    if (box !== null && box.text.length > 0) {
       await this.sendKeys(name, ["Enter"]);
       await new Promise((resolve) => setTimeout(resolve, 300));
     }
@@ -335,6 +627,32 @@ export class TmuxSessionManager {
     await this.sendKeys(name, [text], true);
     await new Promise((resolve) => setTimeout(resolve, 150));
     await this.sendKeys(name, ["Enter"]);
+  }
+
+  /**
+   * `/login` の OAuth コードを入力欄へ渡して確定する（login_code_send）。
+   * コード入力待ちの画面でなければ何も送らず throw する（誤って通常入力欄へ
+   * コードが本文として送信されるのを防ぐ）。literal 送出 → 150ms → Enter は
+   * sendTextSubmit と同じ Ink の取り込み間隔。
+   */
+  async sendLoginCode(name: string, code: string): Promise<void> {
+    await submitLoginCode(code, {
+      capture: () => this.captureVisibleScreenOrNull(name),
+      sendLiteral: (text) => this.sendKeys(name, [text], true),
+      sendEnter: () => this.sendKeys(name, ["Enter"]),
+      delayMs: this.loginTiming.delayMs,
+      pollMs: this.loginTiming.pollMs,
+      settleMs: this.loginTiming.settleMs,
+    });
+  }
+
+  /** 画面キャプチャ（判定不能=capture 失敗は null）。 */
+  private async captureVisibleScreenOrNull(name: string): Promise<string | null> {
+    try {
+      return await this.captureVisibleScreen(name);
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -355,15 +673,6 @@ export class TmuxSessionManager {
     }
   }
 
-  /** 入力欄に未送信テキストが残っているか。判定不能は false。 */
-  private async inputBoxHasPendingText(name: string): Promise<boolean> {
-    try {
-      const box = extractClaudeInputBox(await this.captureVisibleScreen(name));
-      return box !== null && box.text.length > 0;
-    } catch {
-      return false;
-    }
-  }
 
   /**
    * 入力欄判定用に **viewport 全体**を取る（末尾 N 行で切らない）。
@@ -392,7 +701,9 @@ export class TmuxSessionManager {
     validateSessionName(name);
     if (keys.length === 0) return;
     const args = ["send-keys", "-t", this.paneTarget(name)];
-    if (literal) args.push("-l");
+    // literal は `--` で引数終端を明示する（先頭が `-` の本文 — base64url の OAuth コード等 —
+    // を tmux がフラグと誤認して `unknown flag` で失敗する）。
+    if (literal) args.push("-l", "--");
     args.push(...keys);
     const result = await this.runner(args);
     if (result.exitCode !== 0) {

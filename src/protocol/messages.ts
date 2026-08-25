@@ -434,6 +434,13 @@ export type ControlMessage =
   | { type: "pane_choice_send_result"; v: number; id: string; ok: boolean; error: string | null }
   | { type: "pane_key_send"; v: number; id: string; session: string; key: string }
   | { type: "pane_key_send_result"; v: number; id: string; ok: boolean; error: string | null }
+  /**
+   * `/login` の OAuth コード送出要求（iOS→host, login-code）。転写カードのコード欄から、
+   * 通常の chat 注入（入力欄検証・C-u クリアつき）を通さず、コード入力待ちの画面へ
+   * literal + Enter で渡す。host はコード入力待ちでなければ ok=false で拒否する。
+   */
+  | { type: "login_code_send"; v: number; id: string; session: string; code: string }
+  | { type: "login_code_send_result"; v: number; id: string; ok: boolean; error: string | null }
   /** 会話カスタムタイトルの端末表示追随（iOS→host, session-title）。空 title は解除=セッション名へ戻す。 */
   | { type: "session_title_set"; v: number; id: string; session: string; title: string }
   | { type: "session_title_set_result"; v: number; id: string; ok: boolean; error: string | null }

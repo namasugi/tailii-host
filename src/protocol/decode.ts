@@ -584,8 +584,17 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         key: requireString(raw, "key"),
       };
 
+    case "login_code_send":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        session: requireString(raw, "session"),
+        code: requireString(raw, "code"),
+      };
+
     case "pane_choice_send_result":
     case "pane_key_send_result":
+    case "login_code_send_result":
     case "session_title_set_result":
     case "codex_thread_title_set_result":
       return {

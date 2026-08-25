@@ -646,7 +646,7 @@ describe("Engine — アイドルライフサイクル/ページング", () => {
     expect(resp).toContain('"id":"PC1"');
     expect(resp).toContain('"ok":true');
     const recorded = runner.recorded.map((cmd) => JSON.stringify(cmd));
-    expect(recorded).toContain(JSON.stringify(["send-keys", "-t", "work", "-l", "2"]));
+    expect(recorded).toContain(JSON.stringify(["send-keys", "-t", "work", "-l", "--", "2"]));
     expect(recorded).toContain(JSON.stringify(["send-keys", "-t", "work", "Enter"]));
 
     await engine.teardown();
@@ -723,6 +723,104 @@ describe("Engine — アイドルライフサイクル/ページング", () => {
     expect(sendKeyCalls).toEqual([]);
 
     await engine.teardown();
+  });
+
+  // MARK: 追加: login_code_send（/login の OAuth コード注入 — chat 注入を通さない専用経路）
+
+  /** 実測 claude 2.1.241 の `/login` コード入力待ち画面。 */
+  const LOGIN_CODE_SCREEN = [
+    "❯ /login",
+    "  Login",
+    "  Browser didn't open? Use the url below to sign in (c to copy)",
+    "https://claude.com/cai/oauth/authorize?code=true",
+    "  Paste code here if prompted >",
+    "  Esc to cancel",
+    "",
+  ].join("\n");
+
+  test("login_code_send はコード入力待ちの pane へ literal + Enter を注入し ok を返す", async () => {
+    // 本文はコード欄にエコーされ、CR を受けたら受理画面（Login successful + 入力欄）になる。
+    let submitted = false;
+    let typed = "";
+    const runner = new MockTmuxRunner((args) => {
+      if (args[0] === "capture-pane") {
+        if (submitted) return ok("  ⎿  Login successful\n────────\n❯ \n────────\n  ⏸ manual mode on\n");
+        return ok(LOGIN_CODE_SCREEN.replace("  Paste code here if prompted >", `  Paste code here if prompted > ${typed}`));
+      }
+      if (args[0] === "send-keys" && args.at(-1) === "Enter") submitted = true;
+      else if (args[0] === "send-keys" && args.includes("-l")) typed += String(args.at(-1));
+      return ok("");
+    });
+    const mgr = new TmuxSessionManager({
+      runner: runner.runner, store: makeTempStore(),
+      loginTiming: { delayMs: 0, pollMs: 0, settleMs: 0 },
+    });
+    const engine = startEngine({ sessionManager: mgr });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine(
+      '{"code":"AbC123-xyz_789#StAtE456","id":"LC1","session":"work","type":"login_code_send","v":1}',
+    );
+    const resp = await engine.lines.nextOfType("login_code_send_result");
+    expect(resp).toContain('"id":"LC1"');
+    expect(resp).toContain('"ok":true');
+    const recorded = runner.recorded.map((cmd) => JSON.stringify(cmd));
+    expect(recorded).toContain(
+      JSON.stringify(["send-keys", "-t", "work", "-l", "--", "AbC123-xyz_789#StAtE456"]),
+    );
+    expect(recorded).toContain(JSON.stringify(["send-keys", "-t", "work", "Enter"]));
+
+    await engine.teardown();
+  });
+
+  test("login_code_send は形式外のコード（空白・改行）を拒否し注入しない", async () => {
+    const runner = new MockTmuxRunner((args) =>
+      args[0] === "capture-pane" ? ok(LOGIN_CODE_SCREEN) : ok(""),
+    );
+    const mgr = new TmuxSessionManager({ runner: runner.runner, store: makeTempStore() });
+    const engine = startEngine({ sessionManager: mgr });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine(
+      '{"code":"rm -rf /\\n","id":"LC2","session":"work","type":"login_code_send","v":1}',
+    );
+    const resp = await engine.lines.nextOfType("login_code_send_result");
+    expect(resp).toContain('"id":"LC2"');
+    expect(resp).toContain('"ok":false');
+    expect(runner.recorded.filter((cmd) => cmd[0] === "send-keys")).toEqual([]);
+
+    await engine.teardown();
+  });
+
+  test("login_code_send はコード入力待ちでない pane には注入せず ok=false を返す", async () => {
+    const runner = new MockTmuxRunner((args) =>
+      args[0] === "capture-pane" ? ok("❯ \n  ⏸ manual mode on\n") : ok(""),
+    );
+    const mgr = new TmuxSessionManager({
+      runner: runner.runner, store: makeTempStore(),
+      loginTiming: { delayMs: 0, pollMs: 0, settleMs: 0 },
+    });
+    const engine = startEngine({ sessionManager: mgr });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine(
+      '{"code":"AbC123","id":"LC3","session":"work","type":"login_code_send","v":1}',
+    );
+    const resp = await engine.lines.nextOfType("login_code_send_result");
+    expect(resp).toContain('"ok":false');
+    expect(resp).toContain("入力待ちではありません");
+    expect(runner.recorded.filter((cmd) => cmd[0] === "send-keys")).toEqual([]);
+
+    await engine.teardown();
+  });
+
+  test("tmux sendTextSubmit は /login フロー中（コード入力待ち）の本文注入を拒否し、何も送らない", async () => {
+    const runner = new MockTmuxRunner((args) =>
+      args[0] === "capture-pane" ? ok(LOGIN_CODE_SCREEN) : ok(""),
+    );
+    const mgr = new TmuxSessionManager({ runner: runner.runner, store: makeTempStore() });
+    await expect(mgr.sendTextSubmit("work", "こんにちは")).rejects.toThrow(/\/login の途中/);
+    expect(runner.recorded.filter((cmd) => cmd[0] === "send-keys")).toEqual([]);
   });
 
   test("mode_set は BTab 後の再描画中を default と誤認せず明示マーカーまで待つ", async () => {

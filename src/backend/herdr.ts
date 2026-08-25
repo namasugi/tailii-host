@@ -28,9 +28,13 @@ import {
   validateSessionName,
 } from "../sessions/sessionMetadataStore.js";
 import {
+  CHAT_BLOCKED_BY_LOGIN_PROMPT,
   extractClaudeInputBox,
   inputBoxIsShellMode,
+  LoginCodeError,
   paneCommandLooksLikeAgent,
+  screenInLoginFlow,
+  submitLoginCode,
   type CapturePaneOptions,
   type ClaudeInputBox,
   type ReattachResult,
@@ -351,6 +355,9 @@ export class HerdrSessionManager {
   /** 注入前の claude 検出待ちの上限/間隔 ms（テスト注入用）。 */
   private readonly readyTimeoutMs: number;
   private readonly readyPollMs: number;
+  /** login-code 送出後にコード欄の消滅を待つポーリング間隔 / 上限 ms（テスト注入用）。 */
+  private readonly loginPollMs: number;
+  private readonly loginSettleMs: number;
 
   constructor(options: {
     runner?: HerdrCommandRunner;
@@ -363,6 +370,8 @@ export class HerdrSessionManager {
     clearKeyDelayMs?: number;
     readyTimeoutMs?: number;
     readyPollMs?: number;
+    loginPollMs?: number;
+    loginSettleMs?: number;
   } = {}) {
     this.runner = options.runner ?? processHerdrCommandRunner();
     this.store = options.store ?? new SessionMetadataStore();
@@ -374,6 +383,8 @@ export class HerdrSessionManager {
     this.clearKeyDelayMs = options.clearKeyDelayMs ?? 150;
     this.readyTimeoutMs = options.readyTimeoutMs ?? 10_000;
     this.readyPollMs = options.readyPollMs ?? 300;
+    this.loginPollMs = options.loginPollMs ?? 250;
+    this.loginSettleMs = options.loginSettleMs ?? 5_000;
   }
 
   /**
@@ -570,9 +581,19 @@ export class HerdrSessionManager {
     // 残らない）。herdr の claude 検出（agent_status が unknown を抜けるまで）を注入の
     // 準備完了ゲートにする。working（処理中の queue 入力）も注入可。判定不能は fail-open。
     await this.waitForAgentReady(name);
+    // `/login` のコード入力待ち中は通常の入力欄が無く、以降の入力欄検証・C-u クリアが
+    // コード欄を壊す（フォールバックの `❯ /login` 行を未送信テキストと誤認して Enter、
+    // 反映検証に失敗して C-u 連打 → throw）。明示エラーで chat_send を失敗させ、コードは
+    // login_code_send、中断は pane_key_send Escape の専用経路に任せる。
+    // 選択ダイアログ判定と同じ 1 回のキャプチャで判定する（事前確認の read 回数を増やさない）。
+    const dialogWindow = await this.captureDialogWindow(name);
+    // `/login` フロー中（方式選択 / コード入力待ち / retry）は本文が選択リストやコード欄へ入る。
+    if (dialogWindow !== null && screenInLoginFlow(dialogWindow)) {
+      throw new LoginCodeError(CHAT_BLOCKED_BY_LOGIN_PROMPT);
+    }
     // 選択ダイアログ（/remote-control 等）が開いたままだと本文がダイアログに食われる。
     // 注入前に Esc で閉じてから入力欄へ流す（Mac 側で手動 Esc するのと同じ操作）。
-    if (await this.selectionDialogVisible(name)) {
+    if (dialogWindow !== null && screenHasSelectionFooter(dialogWindow)) {
       await this.sendKeys(name, ["Escape"]);
       await new Promise((resolve) => setTimeout(resolve, 300));
     }
@@ -643,6 +664,25 @@ export class HerdrSessionManager {
       if (await this.selectionDialogVisible(name)) return;
       if (!(await this.inputBoxHasPendingText(name))) return;
     }
+  }
+
+  /**
+   * `/login` の OAuth コードをコード入力欄へ渡して確定する（login_code_send）。
+   * コード入力待ちの画面（`Paste code here if prompted >`）でなければ何も送らず throw する
+   * （通常入力欄へコードが本文として流れるのを防ぐ）。本文→CR は sendTextSubmit と同じ
+   * 間隔で送り、CR が飲まれてコード欄が残っていれば 1 回だけ CR を再送する
+   * （成功=入力欄復帰・失敗=`Press Enter to retry` のどちらでもコード欄は消える）。
+   */
+  async sendLoginCode(name: string, code: string): Promise<void> {
+    // 判定窓は chat 側の門番（captureDialogWindow）と揃える（同じ画面で片方だけ拒否しない）。
+    await submitLoginCode(code, {
+      capture: () => this.captureDialogWindow(name),
+      sendLiteral: (text) => this.sendKeys(name, [text], true),
+      sendEnter: () => this.sendKeys(name, ["Enter"]),
+      delayMs: this.submitDelayMs,
+      pollMs: this.loginPollMs,
+      settleMs: this.loginSettleMs,
+    });
   }
 
   /**
@@ -726,10 +766,16 @@ export class HerdrSessionManager {
    * 不要な Esc で入力欄の打ちかけを「送信されないまま」消してしまう）。
    */
   private async selectionDialogVisible(name: string): Promise<boolean> {
+    const window = await this.captureDialogWindow(name);
+    return window !== null && screenHasSelectionFooter(window);
+  }
+
+  /** ダイアログ判定用の末尾 30 行窓（capture 失敗=判定不能は null）。 */
+  private async captureDialogWindow(name: string): Promise<string | null> {
     try {
-      return screenHasSelectionFooter(await this.capturePane(name, { lines: 30 }));
+      return await this.capturePane(name, { lines: 30 });
     } catch {
-      return false;
+      return null;
     }
   }
 

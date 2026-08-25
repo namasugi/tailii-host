@@ -24,7 +24,8 @@ import { SessionHub } from "./sessionHub.js";
 import { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
 import { abortableSleep } from "../shared/sleep.js";
 import { resolveHubSocketPath } from "../shared/socketPath.js";
-import { processTmuxCommandRunner } from "../backend/tmux.js";
+import { processTmuxCommandRunner, screenInLoginFlow } from "../backend/tmux.js";
+import { screenHasSelectionFooter } from "../backend/herdr.js";
 import { readPackageVersion } from "../shared/version.js";
 import { ChatTailController } from "../chat/chatTailController.js";
 import { TranscriptTailer } from "../chat/transcriptTailer.js";
@@ -446,6 +447,8 @@ export async function runHubCommand(args: string[]): Promise<number> {
       onPermissionMode,
       ...(pollIntervalMs !== undefined ? { pollIntervalMs } : {}),
       log,
+      // 静止した入力待ちダイアログ（選択 / /login）は初回フレームから送る（開き直しで転写カードを出す）。
+      emitInitialIf: (text) => screenHasSelectionFooter(text) || screenInLoginFlow(text),
     }),
     questionInjector: (answers, session) => injectQuestionAnswers(answers, session, sessionBackend),
     // 本文+送信確定は backend 側の 1 操作に委ねる（herdr は本文+CR 単一コール必須。
