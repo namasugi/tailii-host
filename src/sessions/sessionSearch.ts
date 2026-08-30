@@ -3,6 +3,7 @@
 
 import * as fs from "node:fs";
 import type { ClaudeSessionInfo, SessionSearchResult } from "../protocol.js";
+import { stripInjectedReminderBlocks, stripReminderTagBlocks } from "../shared/harnessReminder.js";
 
 export interface SessionSearchSource {
   list(): ClaudeSessionInfo[];
@@ -41,7 +42,9 @@ export function searchClaudeSessions(
   query: string,
   options: SessionSearchOptions = {},
 ): SessionSearchResponse {
-  const normalizedQuery = query.trim().toLocaleLowerCase();
+  // 本文側（extractMessageText）と同じ空白正規化を掛ける。全角スペース（iOS 日本語キーボードの
+  // 既定）や連続空白で区切った複数語クエリも、本文の空白 1 つに畳んだ形へ揃えて照合する。
+  const normalizedQuery = query.trim().replaceAll(/\s+/gu, " ").toLocaleLowerCase();
   if (normalizedQuery.length === 0) {
     return { results: [], stats: { scannedFiles: 0, truncated: false } };
   }
@@ -138,24 +141,29 @@ function extractMessageText(obj: Record<string, unknown>): string | null {
   const message = obj["message"];
   if (typeof message !== "object" || message === null) return null;
   const content = (message as Record<string, unknown>)["content"];
+  // harness 注入の <system-reminder>（user 行のリマインダ / assistant text 末尾の背景通知）は
+  // 検索対象にもスニペットにも出さない（生 XML の混入と、通知本文でのヒットを防ぐ）。
+  const strip = obj["type"] === "assistant" ? stripInjectedReminderBlocks : stripReminderTagBlocks;
   const parts: string[] = [];
   if (typeof content === "string") {
-    parts.push(content);
+    parts.push(strip(content));
   } else if (Array.isArray(content)) {
     for (const element of content) {
       if (typeof element === "string") {
-        parts.push(element);
+        parts.push(strip(element));
       } else if (typeof element === "object" && element !== null) {
         const block = element as Record<string, unknown>;
         const blockType = block["type"];
         const text = block["text"];
         if ((blockType === undefined || blockType === "text") && typeof text === "string") {
-          parts.push(text);
+          parts.push(strip(text));
         }
       }
     }
   }
-  const text = parts.join(" ").replaceAll("\r", " ").replaceAll("\n", " ").trim();
+  // 除去で空になった部分や段落区切りが二重空白にならないよう、照合前に空白を 1 つに畳む
+  // （makeSnippet の整形と同じ正規化。二重空白のままだと複数語のクエリが外れる）。
+  const text = parts.filter((part) => part.length > 0).join(" ").replaceAll(/\s+/gu, " ").trim();
   return text.length > 0 ? text : null;
 }
 

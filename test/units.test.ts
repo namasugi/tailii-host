@@ -31,6 +31,7 @@ import {
   writeHeartbeat,
 } from "../src/sessions/heartbeat.js";
 import { searchClaudeSessions } from "../src/sessions/sessionSearch.js";
+import { stripInjectedReminderBlocks, stripReminderTagBlocks } from "../src/shared/harnessReminder.js";
 import {
   SessionListService,
   decodeSessionListCursor,
@@ -1018,6 +1019,42 @@ describe("ClaudeSessionStore", () => {
     expect(list[0]?.updatedAt).toBe(Math.floor(Date.parse("2026-01-01T00:04:00Z") / 1000));
   });
 
+  test("assistant text 末尾へ追記された harness 注入（停止境界の背景通知）は lastMessage から除去する", () => {
+    const root = makeTempDir("claude-sessions-assistant-reminder");
+    const slugDir = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slugDir, { recursive: true });
+    // 実データ形（2.1.251）: 本文 + "\n\n<system-reminder>\n…<task-notification>…<result>…</system-reminder>\n"
+    const injected =
+      "\\n\\n<system-reminder>\\nAgent a917aa8b1463e31d4 completed. Read the result at /tmp/a917.output — do not paste any of the output verbatim into your reply.\\n\\n" +
+      "<task-notification>\\n<task-id>a917aa8b1463e31d4</task-id>\\n<status>completed</status>\\n<result>\\n# REFUTE — v1.2\\n</result>\\n</task-notification>\\n</system-reminder>\\n";
+    fs.writeFileSync(
+      path.join(slugDir, "kkkkkkkk-1111.jsonl"),
+      '{"type":"user","cwd":"/tmp/proj","timestamp":"2026-01-01T00:00:00Z","message":{"content":"実際の質問"}}\n' +
+        // 本文 + 注入ブロック → 本文だけを採用する。
+        `{"type":"assistant","timestamp":"2026-01-01T00:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"Both checkers are running; I'll loop.${injected}"}]}}\n` +
+        // 注入ブロックだけの text → 採用せず前の実応答へ遡る。
+        '{"type":"assistant","timestamp":"2026-01-01T00:02:00Z","message":{"role":"assistant","content":[{"type":"text","text":"<system-reminder>\\nMonitor event:\\nprogress\\n</system-reminder>\\n"}]}}\n' +
+        // 本文中の引用（行頭でない）には反応しない。
+        '{"type":"assistant","timestamp":"2026-01-01T00:03:00Z","message":{"role":"assistant","content":[{"type":"text","text":"- `<system-reminder>…</system-reminder>` ブロックを除去"}]}}\n',
+    );
+    const list = new ClaudeSessionStore(root).list();
+    expect(list[0]?.lastMessage).toBe("- `<system-reminder>…</system-reminder>` ブロックを除去");
+    expect(list[0]?.title).toBe("実際の質問");
+
+    // 末尾が注入だけの応答なら、本文付きの応答（注入は除去済み）へ遡る。
+    const root2 = makeTempDir("claude-sessions-assistant-reminder-only");
+    const slugDir2 = path.join(root2, "-tmp-proj2");
+    fs.mkdirSync(slugDir2, { recursive: true });
+    fs.writeFileSync(
+      path.join(slugDir2, "kkkkkkkk-2222.jsonl"),
+      '{"type":"user","cwd":"/tmp/proj2","timestamp":"2026-01-01T00:00:00Z","message":{"content":"実際の質問"}}\n' +
+        `{"type":"assistant","timestamp":"2026-01-01T00:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"Both checkers are running; I'll loop.${injected}"}]}}\n` +
+        '{"type":"assistant","timestamp":"2026-01-01T00:02:00Z","message":{"role":"assistant","content":[{"type":"text","text":"<system-reminder>\\nMonitor event:\\nprogress\\n</system-reminder>\\n"}]}}\n',
+    );
+    const list2 = new ClaudeSessionStore(root2).list();
+    expect(list2[0]?.lastMessage).toBe("Both checkers are running; I'll loop.");
+  });
+
   test("注入されたスキル本文は lastMessage/title に採用せず前後の実発話へ遡る", () => {
     const root = makeTempDir("claude-sessions-skill");
     const slugDir = path.join(root, "-tmp-proj");
@@ -1183,7 +1220,126 @@ describe("ClaudeSessionStore", () => {
 
 // MARK: - session_search
 
+describe("harnessReminder", () => {
+  const injected = "<system-reminder>\nAgent x completed.\n\n<task-notification>\n<task-id>x</task-id>\n<status>completed</status>\n<result>\n# report\n</result>\n</task-notification>\n</system-reminder>\n";
+
+  test("assistant text 末尾の注入ブロックを落とし、前の空行も残さない", () => {
+    expect(stripInjectedReminderBlocks(`本文。\n\n${injected}`)).toBe("本文。");
+  });
+
+  test("複数ブロックの間の本文を段落区切り 1 つで保つ", () => {
+    const text = `A\n\n<system-reminder>\nMonitor event:\nx\n</system-reminder>\n\nB\n\n<system-reminder>\nMonitor event:\ny\n</system-reminder>\n`;
+    expect(stripInjectedReminderBlocks(text)).toBe("A\n\nB");
+  });
+
+  test("<result> に同じ書式が引用されても入れ子として外側まで落とす", () => {
+    const text = "本文。\n\n<system-reminder>\nAgent x completed.\n<task-notification>\n<result>\n引用:\n<system-reminder>\nこの形\n</system-reminder>\nです。\n</result>\n</task-notification>\n</system-reminder>\n\n続き。";
+    expect(stripInjectedReminderBlocks(text)).toBe("本文。\n\n続き。");
+  });
+
+  test("不一致の閉じ行 </security-reminder> でも閉じ、閉じが無ければ末尾まで落とす", () => {
+    expect(stripInjectedReminderBlocks("前。\n\n<system-reminder>\nAgent y completed.\n</security-reminder>\n後。")).toBe("前。\n\n後。");
+    expect(stripInjectedReminderBlocks("前。\n\n<system-reminder>\nAgent z completed.\n<result>\n切れた")).toBe("前。");
+  });
+
+  test("fence 内の例示・文中の引用・行末の開きタグには反応せず、本文の空行も触らない", () => {
+    const fenced = "書式:\n\n```\n<system-reminder>\nMonitor event:\nx\n</system-reminder>\n```\n\n以上。";
+    expect(stripInjectedReminderBlocks(`${fenced}\n\n${injected}`)).toBe(fenced);
+    const quoted = "- `<system-reminder>…</system-reminder>` ブロックを除去";
+    expect(stripInjectedReminderBlocks(quoted)).toBe(quoted);
+    expect(stripInjectedReminderBlocks("末尾に開きタグだけ\n<system-reminder>")).toBe("末尾に開きタグだけ\n<system-reminder>");
+    const body = "見出し\n\n\n\n```\nl1\n\n\n\nl2\n```";
+    expect(stripInjectedReminderBlocks(`${body}\n\n\n${injected}\n\n末尾。\n`)).toBe(`${body}\n\n末尾。\n`);
+  });
+
+  test("ブロック内の \\r 付き行（Monitor 中継の進捗バー等）でも閉じ行を見失わず続きを残す", () => {
+    const text = "監視中です。\n\n<system-reminder>\nMonitor event:\n[####  ] 40%\r\n</system-reminder>\n\nビルドが通りました。";
+    expect(stripInjectedReminderBlocks(text)).toBe("監視中です。\n\nビルドが通りました。");
+    expect(stripInjectedReminderBlocks("前\r\n\n<system-reminder>\nx\n</system-reminder>\n後")).toBe("前\r\n\n後");
+  });
+
+  test("CRLF で書かれた注入ブロックも本体で比較して除去し、\\r 付きの fence 行も fence として扱う", () => {
+    expect(stripInjectedReminderBlocks("a\r\n\r\n<system-reminder>\r\nnote\r\n</system-reminder>\r\n\r\ncontinuation")).toBe("a\r\n\ncontinuation");
+    const fenced = "```\r\n<system-reminder>\nx\ny";
+    expect(stripInjectedReminderBlocks(fenced)).toBe(fenced);
+  });
+
+  test("fence は CommonMark 規則で追う（4 連内の ``` は閉じない / ~~~ は ``` を閉じない / 閉じ行の info string 不可）", () => {
+    const nested = "書式:\n\n````\n```\n````\n\n続き。";
+    expect(stripInjectedReminderBlocks(`${nested}\n\n${injected}`)).toBe(nested);
+    const cross = "```\ncode\n~~~\nmore\n```\n\n以上。";
+    expect(stripInjectedReminderBlocks(`${cross}\n\n${injected}`)).toBe(cross);
+    const info = "```swift\nlet a = 1\n```\n\n以上。";
+    expect(stripInjectedReminderBlocks(`${info}\n\n${injected}`)).toBe(info);
+    // 開いたままの fence の後ろは対象外（停止境界ではモデルの fence は閉じている前提）。
+    const unclosed = "```\ncode";
+    expect(stripInjectedReminderBlocks(`${unclosed}\n\n${injected}`)).toBe(`${unclosed}\n\n${injected}`);
+  });
+
+  test("注入だけの text は空になり、user 形の <system-reminder> は最短一致で落とす", () => {
+    expect(stripInjectedReminderBlocks(injected)).toBe("");
+    expect(stripReminderTagBlocks("質問<system-reminder>\nメモ\n</system-reminder>です")).toBe("質問です");
+    expect(stripReminderTagBlocks("<system-reminder> の言及だけ")).toBe("<system-reminder> の言及だけ");
+  });
+});
+
 describe("searchClaudeSessions", () => {
+  test("harness 注入（assistant 末尾の背景通知 / user のリマインダ）は検索対象にもスニペットにも出さない", () => {
+    const root = makeTempDir("session-search-reminder");
+    const slug = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slug, { recursive: true });
+    fs.writeFileSync(
+      path.join(slug, "rrrrrrrr-search.jsonl"),
+      [
+        JSON.stringify({ type: "user", cwd: "/tmp/proj", timestamp: "2026-01-01T00:00:00Z", message: { content: "調べて<system-reminder>\nリマインダ needle-user\n</system-reminder>" } }),
+        JSON.stringify({ type: "assistant", timestamp: "2026-01-01T00:01:00Z", message: { role: "assistant", content: [{ type: "text", text: "本文 needle-body\n\n<system-reminder>\nAgent x completed.\n<task-notification>\n<result>\nneedle-injected\n</result>\n</task-notification>\n</system-reminder>\n" }] } }),
+      ].join("\n") + "\n",
+    );
+    const store = new ClaudeSessionStore(root);
+
+    expect(searchClaudeSessions(store, "needle-injected").results).toEqual([]);
+    expect(searchClaudeSessions(store, "needle-user").results).toEqual([]);
+    const hit = searchClaudeSessions(store, "needle-body").results;
+    expect(hit).toHaveLength(1);
+    expect(hit[0]?.snippet).toBe("本文 needle-body");
+  });
+
+  test("注入ブロックや段落区切りを挟んだ複数語クエリも空白 1 つに畳んで照合する", () => {
+    const root = makeTempDir("session-search-spacing");
+    const slug = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slug, { recursive: true });
+    fs.writeFileSync(
+      path.join(slug, "ssssssss-search.jsonl"),
+      [
+        JSON.stringify({ type: "user", cwd: "/tmp/proj", timestamp: "2026-01-01T00:00:00Z", message: { content: "質問" } }),
+        JSON.stringify({ type: "assistant", timestamp: "2026-01-01T00:01:00Z", message: { role: "assistant", content: [
+          { type: "text", text: "前半 alpha\n\n<system-reminder>\nMonitor event:\nx\n</system-reminder>\n\nbeta 後半" },
+          { type: "text", text: "<system-reminder>\nMonitor event:\ny\n</system-reminder>\n" },
+          { type: "text", text: "gamma" },
+        ] } }),
+      ].join("\n") + "\n",
+    );
+    const hit = searchClaudeSessions(new ClaudeSessionStore(root), "alpha beta").results;
+    expect(hit).toHaveLength(1);
+    expect(hit[0]?.snippet).toBe("前半 alpha beta 後半 gamma");
+    // クエリ側も同じ正規化: 全角スペース / 連続空白で区切っても同じヒット。
+    expect(searchClaudeSessions(new ClaudeSessionStore(root), "alpha\u3000beta").results).toHaveLength(1);
+    expect(searchClaudeSessions(new ClaudeSessionStore(root), "  alpha   beta ").results).toHaveLength(1);
+  });
+
+  test("全角スペースで区切られた本文も、半角/全角どちらのクエリでもヒットする", () => {
+    const root = makeTempDir("session-search-ideographic-space");
+    const slug = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slug, { recursive: true });
+    fs.writeFileSync(
+      path.join(slug, "iiiiiiii-search.jsonl"),
+      JSON.stringify({ type: "user", cwd: "/tmp/proj", timestamp: "2026-01-01T00:00:00Z", message: { content: "マスコット\u3000しっぽ を直して" } }) + "\n",
+    );
+    const store = new ClaudeSessionStore(root);
+    expect(searchClaudeSessions(store, "マスコット\u3000しっぽ").results).toHaveLength(1);
+    expect(searchClaudeSessions(store, "マスコット しっぽ").results).toHaveLength(1);
+  });
+
   test("user/assistant 本文を大文字小文字無視で検索し snippet 付きで updatedAt 降順に返す", () => {
     const root = makeTempDir("session-search");
     const slugA = path.join(root, "-Users-alice-proj-a");

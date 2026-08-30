@@ -9,6 +9,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ClaudeSessionInfo } from "../protocol.js";
 import { isInsideBase } from "../shared/paths.js";
+import { stripInjectedReminderBlocks, stripReminderTagBlocks } from "../shared/harnessReminder.js";
 import { isInjectedSkillContent } from "../shared/skillInjection.js";
 
 /** タイトル抽出の最大長（先頭 ~60 字）。 */
@@ -449,9 +450,12 @@ function extractMessageText(obj: Record<string, unknown>, maxLength: number): st
   if (raw === null) return null;
   // harness が user ロールへ注入する <system-reminder> ブロック（リマインダ・記憶リコール等）は
   // 本文から除去する。残りが空なら発話ではないので除外（前の実発話へ遡る）。
-  if (obj["type"] === "user" && raw.includes("<system-reminder>")) {
-    raw = raw.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gu, "");
-  }
+  if (obj["type"] === "user") raw = stripReminderTagBlocks(raw);
+  // Claude Code 2.1.251 以降、ターン中に完了した背景タスクの通知（<task-notification> 全文）や
+  // Monitor イベントは assistant text の末尾へ行頭形の <system-reminder> ブロックとして追記される
+  // （停止境界の背景通知注入。user 行としては残らない）。プレビューへ生 XML を出さないよう除去し、
+  // 残りが空なら前の実応答へ遡る（規則は shared/harnessReminder.ts）。
+  if (obj["type"] === "assistant") raw = stripInjectedReminderBlocks(raw);
   let text = raw.replaceAll("\n", " ").replaceAll("\r", " ").trim();
   if (!text) return null;
   // slash コマンドのメタ包み（`<command-…>` で始まる）は提示に向かないので除外。

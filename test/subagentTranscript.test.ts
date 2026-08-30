@@ -38,6 +38,34 @@ describe("parseSubagentTranscript", () => {
     });
   });
 
+  it("harness 注入の <system-reminder>（assistant 末尾の背景通知 / user のリマインダ）を表示しない", () => {
+    const fixture = [
+      JSON.stringify({ type: "user", message: { role: "user", content: "調べて\n<system-reminder>\nリマインダ\n</system-reminder>\n" } }),
+      JSON.stringify({ type: "assistant", message: { role: "assistant", content: [
+        { type: "text", text: "確認します。\n\n<system-reminder>\nAgent x completed.\n<task-notification>\n<result>\n# report\n</result>\n</task-notification>\n</system-reminder>\n" },
+      ] } }),
+      JSON.stringify({ type: "assistant", message: { role: "assistant", content: [
+        { type: "text", text: "<system-reminder>\nMonitor event:\nprogress\n</system-reminder>\n" },
+      ] } }),
+    ].join("\n");
+
+    expect(parseSubagentTranscript(fixture).entries).toEqual([
+      { role: "user", text: "調べて" },
+      { role: "assistant", text: "確認します。" },
+    ]);
+  });
+
+  it("入れ子 Agent の最終レポート（tool_result）に付いた注入ブロックも表示しない", () => {
+    const fixture = JSON.stringify({ type: "user", message: { role: "user", content: [
+      { type: "tool_result", content: "子のレポート。\n\n<system-reminder>\nAgent c completed.\n<task-notification>\n<result>\n孫のレポート\n</result>\n</task-notification>\n</system-reminder>\n" },
+      { type: "tool_result", content: "<system-reminder>\nMonitor event:\nprogress\n</system-reminder>\n" },
+    ] } });
+
+    expect(parseSubagentTranscript(fixture).entries).toEqual([
+      { role: "tool", text: "子のレポート。", kind: "tool_result" },
+    ]);
+  });
+
   it("timestamp 欠落時は ts を省略する", () => {
     const fixture = JSON.stringify({
       type: "assistant",

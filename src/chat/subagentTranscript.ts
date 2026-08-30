@@ -7,6 +7,7 @@ import {
   rolloutPatchApplyActivities,
   rolloutResponseItemToolActivities,
 } from "../codex/codexToolActivity.js";
+import { stripInjectedReminderBlocks, stripReminderTagBlocks } from "../shared/harnessReminder.js";
 
 const MAX_ENTRIES = 200;
 const MAX_TOOL_TEXT = 1_000;
@@ -81,13 +82,24 @@ export function parseSubagentTranscript(jsonl: string): SubagentTranscriptResult
     const role = message?.["role"] ?? record["type"];
     if (role !== "user" && role !== "assistant") continue;
     const content = message?.["content"] ?? record["content"];
-    if (typeof content === "string" && content) all.push(entry(role, content, ts));
+    // harness 注入の <system-reminder>（user 行のリマインダ / assistant text 末尾の背景通知）は
+    // 表示しない。除去で空になった text は行にしない。
+    const strip = (raw: string): string => {
+      const text = role === "assistant" ? stripInjectedReminderBlocks(raw) : stripReminderTagBlocks(raw);
+      // 除去した場合だけ、残った末尾の改行を落とす（触っていない本文はそのまま）。
+      return text === raw ? raw : text.trimEnd();
+    };
+    if (typeof content === "string" && content) {
+      const text = strip(content);
+      if (text.trim()) all.push(entry(role, text, ts));
+    }
     if (!Array.isArray(content)) continue;
     for (const rawBlock of content) {
       const block = object(rawBlock);
       if (block === null) continue;
       if (block["type"] === "text" && typeof block["text"] === "string" && block["text"]) {
-        all.push(entry(role, block["text"], ts));
+        const text = strip(block["text"]);
+        if (text.trim()) all.push(entry(role, text, ts));
       }
       if (block["type"] === "tool_use" && typeof block["name"] === "string") {
         const input = snippet(block["input"], MAX_TOOL_INPUT);
@@ -96,8 +108,11 @@ export function parseSubagentTranscript(jsonl: string): SubagentTranscriptResult
         ));
       }
       if (block["type"] === "tool_result") {
-        const result = toolResultText(block["content"]);
-        if (result) all.push(entry("tool", truncate(result, MAX_TOOL_TEXT), ts, "tool_result"));
+        // 入れ子の Agent の最終レポートは tool_result で届く。そこにも停止境界の注入が付き得る。
+        const raw = toolResultText(block["content"]);
+        const stripped = stripInjectedReminderBlocks(raw);
+        const result = stripped === raw ? raw : stripped.trimEnd();
+        if (result.trim()) all.push(entry("tool", truncate(result, MAX_TOOL_TEXT), ts, "tool_result"));
       }
     }
   }
