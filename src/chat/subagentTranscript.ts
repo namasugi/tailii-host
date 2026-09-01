@@ -83,14 +83,22 @@ export function parseSubagentTranscript(jsonl: string): SubagentTranscriptResult
     if (role !== "user" && role !== "assistant") continue;
     const content = message?.["content"] ?? record["content"];
     // harness 注入の <system-reminder>（user 行のリマインダ / assistant text 末尾の背景通知）は
-    // 表示しない。除去で空になった text は行にしない。
-    const strip = (raw: string): string => {
+    // 表示せず、user 行で届く通知封筒はコンパクトな 1 行に畳む。除去で空になった text は行にしない。
+    const present = (raw: string): string => {
+      // harness のバックグラウンドタスク通知（user 行で届く <task-notification> 封筒）は、
+      // チャット面（iOS present()）と同じく生 XML を出さずコンパクトな 1 行に畳む。
+      // 判定は strip 前の raw に対して封筒の形を要求する（タグに言及しただけの委任
+      // プロンプトを潰さない。<system-reminder> に包まれた封筒も畳む）。
+      if (role === "user" && isNotificationEnvelope(raw)) {
+        const status = /<status>([^<]*)<\/status>/u.exec(raw)?.[1]?.trim() ?? "";
+        return status === "" ? "⚙️ バックグラウンドタスク通知" : `⚙️ バックグラウンドタスク通知（${status}）`;
+      }
       const text = role === "assistant" ? stripInjectedReminderBlocks(raw) : stripReminderTagBlocks(raw);
       // 除去した場合だけ、残った末尾の改行を落とす（触っていない本文はそのまま）。
       return text === raw ? raw : text.trimEnd();
     };
     if (typeof content === "string" && content) {
-      const text = strip(content);
+      const text = present(content);
       if (text.trim()) all.push(entry(role, text, ts));
     }
     if (!Array.isArray(content)) continue;
@@ -98,7 +106,7 @@ export function parseSubagentTranscript(jsonl: string): SubagentTranscriptResult
       const block = object(rawBlock);
       if (block === null) continue;
       if (block["type"] === "text" && typeof block["text"] === "string" && block["text"]) {
-        const text = strip(block["text"]);
+        const text = present(block["text"]);
         if (text.trim()) all.push(entry(role, text, ts));
       }
       if (block["type"] === "tool_use" && typeof block["name"] === "string") {
@@ -255,6 +263,18 @@ function parseTimestamp(value: unknown): number | undefined {
   if (typeof value !== "string") return undefined;
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/**
+ * harness のバックグラウンドタスク通知封筒か。`[SYSTEM NOTIFICATION` 前置、または
+ * 「raw 先頭（<system-reminder> 包みは 1 枚めくった先頭）が `<task-notification>` 行 +
+ * 閉じた `<task-id>`」を要求する（実測の封筒は全て先頭一致）。本文中でタグに言及した
+ * だけの委任プロンプトや、封筒を丸ごと貼り込んだプロンプト（途中に現れる）には一致しない。
+ */
+function isNotificationEnvelope(raw: string): boolean {
+  if (raw.startsWith("[SYSTEM NOTIFICATION")) return true;
+  const head = raw.startsWith("<system-reminder>\n") ? raw.slice("<system-reminder>\n".length) : raw;
+  return /^<task-notification>\r?\n/u.test(head) && /<task-id>[^<\n]+<\/task-id>/u.test(raw);
 }
 
 function entry(

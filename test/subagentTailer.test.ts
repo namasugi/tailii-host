@@ -605,6 +605,189 @@ describe("SubagentTailer", () => {
     ac.abort();
   });
 
+  test("停止境界注入(assistant text 内の system-reminder)の task-notification でも完了する", async () => {
+    const project = makeTempDir("subagent-tailer-inline-notify");
+    const sessionId = "77777777-8888-9999-aaaa-bbbbbbbbbbbb";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    const subagents = path.join(project, sessionId, "subagents");
+    fs.mkdirSync(subagents, { recursive: true });
+
+    fs.writeFileSync(
+      main,
+      [
+        JSON.stringify({
+          message: {
+            role: "assistant",
+            content: [
+              { type: "tool_use", id: "toolu_inline", name: "Agent", input: { description: "BG agent" } },
+            ],
+          },
+          timestamp: "2026-08-29T21:10:00.000Z",
+        }),
+        JSON.stringify({
+          message: {
+            role: "user",
+            content: [{
+              type: "tool_result",
+              tool_use_id: "toolu_inline",
+              content: "Async agent launched successfully. agentId: bgi …",
+            }],
+          },
+          timestamp: "2026-08-29T21:10:00.300Z",
+        }),
+        // fence 内で書式を引用しただけの assistant 行は完了信号にしない（門番の検証）。
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "書式:\n\n```\n<system-reminder>\n<task-notification>\n<task-id>bgi</task-id>\n<status>completed</status>\n</task-notification>\n</system-reminder>\n```\n待機します。" }],
+          },
+          timestamp: "2026-08-29T21:11:00.000Z",
+        }),
+      ].join("\n") + "\n",
+    );
+    fs.writeFileSync(
+      path.join(subagents, "agent-bgi.meta.json"),
+      JSON.stringify({
+        agentType: "Explore",
+        description: "BG agent",
+        toolUseId: "toolu_inline",
+        spawnDepth: 1,
+      }),
+    );
+    fs.writeFileSync(
+      path.join(subagents, "agent-bgi.jsonl"),
+      JSON.stringify({
+        agentId: "bgi",
+        isSidechain: true,
+        message: { role: "user", content: "start" },
+        timestamp: "2026-08-29T21:10:01.000Z",
+      }) + "\n",
+    );
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10 });
+    const gen = tailer.streamSession(main, ac.signal);
+
+    const running = await nextOfType(gen, "subagent_node");
+    expect(running).toMatchObject({ node: { nodeId: "bgi", status: "running" } });
+
+    // 停止境界注入: 完了通知は user 行に残らず、assistant text 末尾の
+    // <system-reminder> ブロック内 <task-notification> として届く（2.1.251 実測形）。
+    fs.appendFileSync(
+      main,
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{
+            type: "text",
+            text: "Both checkers are running; I'll loop.\n\n<system-reminder>\nAgent bgi completed. Read the result at /tmp/bgi.output — do not paste any of the output verbatim into your reply.\n\n<task-notification>\n<task-id>bgi</task-id>\n<tool-use-id>toolu_inline</tool-use-id>\n<agent-type>loop-engineering:checker</agent-type>\n<status>completed</status>\n<summary>Agent <em>BG agent</em> subagent</summary>\n<result>\n# report\n</result>\n</task-notification>\n</system-reminder>\n",
+          }],
+        },
+        timestamp: "2026-08-29T21:12:00.000Z",
+      }) + "\n",
+    );
+
+    const done = await nextOfType(gen, "subagent_node");
+    expect(done).toMatchObject({ node: { nodeId: "bgi", status: "completed" } });
+    ac.abort();
+  });
+
+  test("enqueue の正確な ts を停止境界注入の重複配達で前進させない（再開中は running のまま）", async () => {
+    const project = makeTempDir("subagent-tailer-enqueue-authority");
+    const sessionId = "88888888-9999-aaaa-bbbb-cccccccccccc";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    const subagents = path.join(project, sessionId, "subagents");
+    fs.mkdirSync(subagents, { recursive: true });
+
+    const envelope = "<task-notification>\n<task-id>bge</task-id>\n<status>completed</status>\n<summary>Agent \"BG agent\" finished</summary>\n</task-notification>";
+    fs.writeFileSync(
+      main,
+      [
+        JSON.stringify({
+          message: {
+            role: "assistant",
+            content: [
+              { type: "tool_use", id: "toolu_enq", name: "Agent", input: { description: "BG agent" } },
+            ],
+          },
+          timestamp: "2026-08-29T21:10:00.000Z",
+        }),
+        JSON.stringify({
+          message: {
+            role: "user",
+            content: [{
+              type: "tool_result",
+              tool_use_id: "toolu_enq",
+              content: "Async agent launched successfully. agentId: bge …",
+            }],
+          },
+          timestamp: "2026-08-29T21:10:00.300Z",
+        }),
+        // 完了時点（T0）の enqueue が正確な通知 ts。
+        JSON.stringify({
+          type: "queue-operation",
+          operation: "enqueue",
+          content: envelope,
+          timestamp: "2026-08-29T21:11:00.000Z",
+        }),
+        // 配達は停止境界（T0+120s）までずれ込み、assistant text へ注入される。
+        // この重複で ts を前進させると、間に起きた再開（下の子 transcript 追記）を
+        // 「通知より古い」と誤認して completed に塗ってしまう。
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            role: "assistant",
+            content: [{
+              type: "text",
+              text: `Waiting.\n\n<system-reminder>\nAgent bge completed.\n\n${envelope}\n</system-reminder>\n`,
+            }],
+          },
+          timestamp: "2026-08-29T21:13:00.000Z",
+        }),
+      ].join("\n") + "\n",
+    );
+    fs.writeFileSync(
+      path.join(subagents, "agent-bge.meta.json"),
+      JSON.stringify({
+        agentType: "Explore",
+        description: "BG agent",
+        toolUseId: "toolu_enq",
+        spawnDepth: 1,
+      }),
+    );
+    // 子 transcript は enqueue（T0）の後・配達（T0+120s）の前に追記されている = 再開中。
+    fs.writeFileSync(
+      path.join(subagents, "agent-bge.jsonl"),
+      [
+        JSON.stringify({
+          agentId: "bge",
+          isSidechain: true,
+          message: { role: "user", content: "start" },
+          timestamp: "2026-08-29T21:10:01.000Z",
+        }),
+        JSON.stringify({
+          agentId: "bge",
+          isSidechain: true,
+          message: { role: "user", content: "resume 指示" },
+          timestamp: "2026-08-29T21:11:30.000Z",
+        }),
+      ].join("\n") + "\n",
+    );
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10 });
+    const gen = tailer.streamSession(main, ac.signal);
+
+    const running = await nextOfType(gen, "subagent_node");
+    expect(running).toMatchObject({ node: { nodeId: "bge", status: "running" } });
+    // enqueue ts（21:11:00）< 子の最終行（21:11:30）なので再開中 = running のまま。
+    // 注入形の重複（21:13:00）が ts を前進させると completed が湧いてしまう。
+    expect(await nextWithin(gen, 100)).toBeNull();
+    ac.abort();
+  });
+
   test("ターン中配達(attachment queued_command)の task-notification でも完了する", async () => {
     const project = makeTempDir("subagent-tailer-queued-command-notify");
     const sessionId = "66666666-7777-8888-9999-bbbbbbbbbbbb";

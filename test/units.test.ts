@@ -31,7 +31,7 @@ import {
   writeHeartbeat,
 } from "../src/sessions/heartbeat.js";
 import { searchClaudeSessions } from "../src/sessions/sessionSearch.js";
-import { stripInjectedReminderBlocks, stripReminderTagBlocks } from "../src/shared/harnessReminder.js";
+import { injectedReminderBodies, stripInjectedReminderBlocks, stripReminderTagBlocks } from "../src/shared/harnessReminder.js";
 import {
   SessionListService,
   decodeSessionListCursor,
@@ -1274,6 +1274,17 @@ describe("harnessReminder", () => {
     // 開いたままの fence の後ろは対象外（停止境界ではモデルの fence は閉じている前提）。
     const unclosed = "```\ncode";
     expect(stripInjectedReminderBlocks(`${unclosed}\n\n${injected}`)).toBe(`${unclosed}\n\n${injected}`);
+  });
+
+  test("injectedReminderBodies は注入ブロックの中身だけを出現順に返す（引用・fence 内は返さない）", () => {
+    const text = "A\n\n<system-reminder>\nAgent x completed.\n<task-notification>\n<task-id>x</task-id>\n<status>completed</status>\n</task-notification>\n</system-reminder>\n\nB\n\n<system-reminder>\nMonitor event:\nprogress\n</system-reminder>\n";
+    expect(injectedReminderBodies(text)).toEqual([
+      "Agent x completed.\n<task-notification>\n<task-id>x</task-id>\n<status>completed</status>\n</task-notification>",
+      "Monitor event:\nprogress",
+    ]);
+    expect(injectedReminderBodies("- `<system-reminder>…</system-reminder>` の引用")).toEqual([]);
+    expect(injectedReminderBodies("```\n<system-reminder>\nx\n</system-reminder>\n```")).toEqual([]);
+    expect(injectedReminderBodies("前。\n\n<system-reminder>\n切れた\n<result>\n末尾まで")).toEqual(["切れた\n<result>\n末尾まで"]);
   });
 
   test("注入だけの text は空になり、user 形の <system-reminder> は最短一致で落とす", () => {

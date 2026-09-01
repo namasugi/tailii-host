@@ -66,6 +66,40 @@ describe("parseSubagentTranscript", () => {
     ]);
   });
 
+  it("user 行で届く従来形の <task-notification> はコンパクトな 1 行に畳む（生 XML を出さない）", () => {
+    const fixture = [
+      JSON.stringify({ type: "user", message: { role: "user", content: "[SYSTEM NOTIFICATION - NOT USER INPUT]\nThis is an automated background-task event, NOT a message from the user.\n<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n<summary>Background command finished</summary>\n</task-notification>" } }),
+      // <status> の無い封筒（Monitor 進捗ヒント等）は状態なしの 1 行。
+      JSON.stringify({ type: "user", message: { role: "user", content: "<task-notification>\n<task-id>b2</task-id>\n<summary>Monitor event: progress</summary>\n<event>50%</event>\n</task-notification>" } }),
+    ].join("\n");
+
+    expect(parseSubagentTranscript(fixture).entries).toEqual([
+      { role: "user", text: "⚙️ バックグラウンドタスク通知（completed）" },
+      { role: "user", text: "⚙️ バックグラウンドタスク通知" },
+    ]);
+  });
+
+  it("タグに言及しただけの委任プロンプトは畳まず全文を残す（封筒の形だけを畳む）", () => {
+    // 実データ形: この機能を開発するセッションの checker プロンプトは <task-notification> や
+    // <task-id>…</task-id> を本文中に含む。封筒（行全体のタグ）ではないので潰してはいけない。
+    const prompt = "You are the CHECKER. The harness delivers <task-notification> blocks with <task-id>bgi</task-id> and <status>completed</status> inline — verify the parser.";
+    // 封筒を丸ごと貼り込んだプロンプト（先頭でない）も潰さない。
+    const pasted = "手順:\n\n```\n<task-notification>\n<task-id>x</task-id>\n<status>completed</status>\n</task-notification>\n```\n\nこれを判定して。";
+    const wrapped = "<system-reminder>\n<task-notification>\n<task-id>w1</task-id>\n<status>failed</status>\n</task-notification>\n</system-reminder>";
+    const fixture = [
+      JSON.stringify({ type: "user", message: { role: "user", content: prompt } }),
+      JSON.stringify({ type: "user", message: { role: "user", content: pasted } }),
+      // <system-reminder> に包まれた封筒は畳む（iOS チャット面と同じ）。
+      JSON.stringify({ type: "user", message: { role: "user", content: wrapped } }),
+    ].join("\n");
+
+    expect(parseSubagentTranscript(fixture).entries).toEqual([
+      { role: "user", text: prompt },
+      { role: "user", text: pasted },
+      { role: "user", text: "⚙️ バックグラウンドタスク通知（failed）" },
+    ]);
+  });
+
   it("timestamp 欠落時は ts を省略する", () => {
     const fixture = JSON.stringify({
       type: "assistant",

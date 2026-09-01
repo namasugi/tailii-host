@@ -1,6 +1,7 @@
 // harness（Claude Code）が transcript へ注入する <system-reminder> ブロックの除去。
 // 会話一覧プレビュー（claudeSessionStore）・会話検索スニペット（sessionSearch）・
-// サブエージェント transcript ビューア（subagentTranscript）で共有する。会話画面の
+// サブエージェント transcript ビューア（subagentTranscript）で共有し、subagentTailer は
+// injectedReminderBodies で注入ブロック内の完了通知を読む（表示以外の唯一の利用者）。会話画面の
 // 転写は iOS 側 ChatLogModel.present() が行い、assistant 形（stripInjectedReminderBlocks）は
 // 同じ規則。user 形は iOS（閉じ無しを末尾まで落とす）と違い、閉じタグまでの最短一致だけ。
 
@@ -37,9 +38,25 @@ export function stripReminderTagBlocks(text: string): string {
  *   （CRLF 混在や Monitor が中継した `\r` 付き出力でも開き/閉じを見失わない）。
  */
 export function stripInjectedReminderBlocks(text: string): string {
-  if (!text.includes(`${OPEN_TAG}\n`) && !text.includes(`${OPEN_TAG}\r\n`)) return text;
+  return scanInjectedReminderBlocks(text)?.stripped ?? text;
+}
+
+/**
+ * 注入ブロックの中身（開き/閉じ行を除く）を出現順に返す（無ければ空配列）。
+ * subagentTailer が「停止境界の背景通知注入」で届く `<task-notification>` を完了信号として
+ * 読むために使う。開始判定は strip と同じ門番（行頭 + 直後改行・fence 外・入れ子追跡）なので、
+ * モデルが本文や fence 内で引用した通知には反応しない。
+ */
+export function injectedReminderBodies(text: string): string[] {
+  return scanInjectedReminderBlocks(text)?.bodies ?? [];
+}
+
+function scanInjectedReminderBlocks(text: string): { stripped: string; bodies: string[] } | null {
+  if (!text.includes(`${OPEN_TAG}\n`) && !text.includes(`${OPEN_TAG}\r\n`)) return null;
   const lines = text.split("\n");
   const kept: string[] = [];
+  const bodies: string[] = [];
+  let body: string[] = [];
   let openFence: { marker: string; length: number } | null = null;
   let depth = 0;
   let afterBlock = false;
@@ -48,8 +65,17 @@ export function stripInjectedReminderBlocks(text: string): string {
     const line = lines[index] ?? "";
     const core = line.endsWith("\r") ? line.slice(0, -1) : line;
     if (depth > 0) {
-      if (core === OPEN_TAG) depth += 1;
-      else if (CLOSER_LINE.test(core)) depth -= 1;
+      if (core === OPEN_TAG) {
+        depth += 1;
+      } else if (CLOSER_LINE.test(core)) {
+        depth -= 1;
+        if (depth === 0) {
+          bodies.push(body.join("\n"));
+          body = [];
+          continue;
+        }
+      }
+      body.push(line);
       continue;
     }
     if (openFence === null && core === OPEN_TAG && index + 1 < lines.length) {
@@ -74,7 +100,8 @@ export function stripInjectedReminderBlocks(text: string): string {
     }
     kept.push(line);
   }
-  return removedAny ? kept.join("\n") : text;
+  if (depth > 0) bodies.push(body.join("\n"));
+  return removedAny ? { stripped: kept.join("\n"), bodies } : null;
 }
 
 function isBlankLine(line: string): boolean {

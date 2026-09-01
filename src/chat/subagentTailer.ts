@@ -8,6 +8,7 @@ import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { PROTOCOL_V2, type ControlMessage, type SubagentNode, type SubagentNodeStatus, type ToolActivity } from "../protocol.js";
+import { injectedReminderBodies } from "../shared/harnessReminder.js";
 import { abortableSleep } from "../shared/sleep.js";
 import { extractToolActivities, TranscriptTailer } from "./transcriptTailer.js";
 
@@ -113,6 +114,11 @@ interface TaskNotification {
    * かかわらず killed/stopped 通知より優先する（静かな完了として扱う）。
    */
   stopAck?: boolean;
+  /**
+   * queue-operation enqueue 由来（ts = 完了時点の正確な時刻）。同じ完了イベントの遅い
+   * 配達行（user / assistant 注入形）で ts を前進させない権威フラグ。
+   */
+  enqueue?: boolean;
 }
 
 /** バックグラウンドコマンド（Bash run_in_background）の spawn 観測。 */
@@ -303,17 +309,26 @@ export class SubagentTailer {
             }
           }
           for (const notification of extractTaskNotifications(line)) {
-            // 同じ task-id の通知は enqueue ログと配達行（user / attachment）の複数行に現れ、
-            // 再開→再停止で複数回起こる。ファイル横断の集約と同じく最新 ts の記録を採る
-            // （= 最後に起きた完了イベント）。TaskStop の ack は明示停止として常に優先。
+            // 同じ task-id の通知は enqueue ログと配達行（user / attachment / assistant 注入形）の
+            // 複数行に現れ、再開→再停止で複数回起こる。ファイル横断の集約と同じく最新 ts の
+            // 記録を採る（= 最後に起きた完了イベント）。TaskStop の ack は明示停止として常に優先。
             const existing = read.state.notificationByTaskId.get(notification.taskId);
             if (existing?.stopAck === true) continue;
             const ts = notification.ts ?? lineTs;
             if (existing !== undefined && (existing.ts ?? 0) > (ts ?? 0)) continue;
+            // enqueue（完了時点の正確な ts）を、同じ完了イベントの遅い配達 ts で前進させない。
+            // 配達は停止境界までずれ込むため、その間の再開（自 transcript の追記）を「通知より
+            // 古い」と誤認して running のエージェントを completed に塗ってしまう。再完了は新しい
+            // enqueue が先に書かれるので latest-wins のまま拾える。
+            if (existing !== undefined && existing.enqueue === true && !notification.enqueue
+              && existing.status === notification.status && existing.exitCode === notification.exitCode) {
+              continue;
+            }
             read.state.notificationByTaskId.set(notification.taskId, {
               status: notification.status,
               exitCode: notification.exitCode,
               ts,
+              ...(notification.enqueue ? { enqueue: true } : {}),
             });
           }
           if (node !== null) {
@@ -341,6 +356,13 @@ export class SubagentTailer {
           for (const [id, notification] of state.notificationByTaskId) {
             const existing = notificationByTaskId.get(id);
             if (existing?.stopAck === true && notification.stopAck !== true) continue;
+            // per-file と同じ規則: enqueue の正確な ts を、同じ完了イベントの遅い配達 ts で
+            // 前進させない。
+            if (existing?.enqueue === true && notification.enqueue !== true
+              && notification.stopAck !== true
+              && existing.status === notification.status && existing.exitCode === notification.exitCode) {
+              continue;
+            }
             if (existing === undefined || notification.stopAck === true
               || (notification.ts ?? 0) >= (existing.ts ?? 0)) {
               notificationByTaskId.set(id, notification);
@@ -888,10 +910,13 @@ interface TaskNotificationExtract {
   status: string;
   exitCode: number | null;
   ts: number | null;
+  /** queue-operation enqueue 行由来（ts が完了時点の正確な時刻）。 */
+  enqueue: boolean;
 }
 
 /**
- * `<task-notification>` ブロックを運ぶ行の本文を返す。配達形は 3 つ:
+ * `<task-notification>` ブロックを運ぶ行の本文と出所（enqueue = 完了時点の正確な ts を
+ * 持つ）を返す。配達形は 4 つ:
  *   - user 行（文字列 content）: 起動元がターン境界で受け取った通知（ts ≈ 完了時刻）
  *   - attachment(queued_command) 行: 起動元がターン中だったとき、次の tool_result 境界で
  *     配達された通知（prompt に本文。user 行としては残らない。ts は enqueue 時刻）
@@ -899,8 +924,11 @@ interface TaskNotificationExtract {
  *     配達より先に書かれる最速の信号。`remove` は配達後（実測で最大 268s 後）に書かれる
  *     ログなので読まない — その ts を通知時刻に採ると、配達遅延の間に起きた再開
  *     （SendMessage）を「通知より古い行」と誤認して completed に塗ってしまう。
+ *   - assistant 行の text ブロック末尾（`<system-reminder>` 包み。Claude Code 2.1.251〜の
+ *     停止境界注入）: 通知が user 行に残らない配達形。行頭形ブロックの中身だけを返す
+ *     （引用・fence 内には反応しない。ts は assistant 行 ≈ 配達時刻）。
  */
-function notificationText(line: string): string | null {
+function notificationText(line: string): { text: string; enqueue: boolean } | null {
   try {
     const obj = JSON.parse(line) as Record<string, unknown>;
     if (obj["type"] === "attachment") {
@@ -908,18 +936,35 @@ function notificationText(line: string): string | null {
         ? obj["attachment"] as Record<string, unknown>
         : null;
       if (attachment?.["type"] !== "queued_command") return null;
-      return typeof attachment["prompt"] === "string" ? attachment["prompt"] : null;
+      return typeof attachment["prompt"] === "string" ? { text: attachment["prompt"], enqueue: false } : null;
     }
     if (obj["type"] === "queue-operation") {
       if (obj["operation"] !== "enqueue") return null;
-      return typeof obj["content"] === "string" ? obj["content"] : null;
+      return typeof obj["content"] === "string" ? { text: obj["content"], enqueue: true } : null;
     }
     const message = obj["message"];
     if (typeof message === "object" && message !== null) {
       const content = (message as Record<string, unknown>)["content"];
-      return typeof content === "string" ? content : null;
+      if (typeof content === "string") return { text: content, enqueue: false };
+      // 停止境界の背景通知注入（Claude Code 2.1.251〜）: 通知が user 行に残らず、直前の
+      // assistant text ブロック末尾へ <system-reminder> として追記される。行頭形ブロックの
+      // 中身だけを通知本文として読む（表示側の除去と同じ門番なので、モデルが本文や fence
+      // 内で引用した <task-notification> には反応しない）。
+      if (obj["type"] === "assistant" && Array.isArray(content)) {
+        const joined = content
+          .flatMap((block) => {
+            if (typeof block !== "object" || block === null) return [];
+            const rec = block as Record<string, unknown>;
+            return rec["type"] === "text" && typeof rec["text"] === "string" ? [rec["text"]] : [];
+          })
+          .join("\n");
+        if (!joined.includes("<task-notification>")) return null;
+        const bodies = injectedReminderBodies(joined);
+        return bodies.length > 0 ? { text: bodies.join("\n"), enqueue: false } : null;
+      }
+      return null;
     }
-    return typeof obj["content"] === "string" ? obj["content"] : null;
+    return typeof obj["content"] === "string" ? { text: obj["content"], enqueue: false } : null;
   } catch {
     return null;
   }
@@ -934,8 +979,9 @@ function notificationText(line: string): string | null {
  * `<status>` を持たないので、`<status>` のないブロックは完了信号として扱わない。
  */
 function extractTaskNotifications(line: string): TaskNotificationExtract[] {
-  const content = notificationText(line);
-  if (content === null || !content.includes("<task-notification>")) return [];
+  const carried = notificationText(line);
+  if (carried === null || !carried.text.includes("<task-notification>")) return [];
+  const content = carried.text;
   const ts = timestampMs(line);
   const out: TaskNotificationExtract[] = [];
   const blockPattern = /<task-notification>([\s\S]*?)(?:<\/task-notification>|$)/g;
@@ -952,6 +998,7 @@ function extractTaskNotifications(line: string): TaskNotificationExtract[] {
       status,
       exitCode: exitCode === undefined ? null : Number(exitCode),
       ts,
+      enqueue: carried.enqueue,
     });
   }
   return out;
