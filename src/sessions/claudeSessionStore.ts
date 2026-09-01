@@ -10,6 +10,7 @@ import * as path from "node:path";
 import type { ClaudeSessionInfo } from "../protocol.js";
 import { isInsideBase } from "../shared/paths.js";
 import { stripInjectedReminderBlocks, stripReminderTagBlocks } from "../shared/harnessReminder.js";
+import { crossSessionPreviewLine, presentCrossSessionMessage } from "../shared/crossSession.js";
 import { isInjectedSkillContent } from "../shared/skillInjection.js";
 
 /** タイトル抽出の最大長（先頭 ~60 字）。 */
@@ -448,6 +449,12 @@ function extractMessageText(obj: Record<string, unknown>, maxLength: number): st
     raw = firstText(content);
   }
   if (raw === null) return null;
+  // 別セッションからのメッセージ封筒（<cross-session-message>）は、生 XML を出さず
+  // 「⇄ 送信元名: 本文」へ転写する（タイトル/プレビュー共通。規則は shared/crossSession.ts）。
+  if (obj["type"] === "user") {
+    const peer = presentCrossSessionMessage(raw);
+    if (peer !== null) raw = crossSessionPreviewLine(peer);
+  }
   // harness が user ロールへ注入する <system-reminder> ブロック（リマインダ・記憶リコール等）は
   // 本文から除去する。残りが空なら発話ではないので除外（前の実発話へ遡る）。
   if (obj["type"] === "user") raw = stripReminderTagBlocks(raw);

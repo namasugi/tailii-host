@@ -32,6 +32,7 @@ import {
 } from "../src/sessions/heartbeat.js";
 import { searchClaudeSessions } from "../src/sessions/sessionSearch.js";
 import { injectedReminderBodies, stripInjectedReminderBlocks, stripReminderTagBlocks } from "../src/shared/harnessReminder.js";
+import { presentCrossSessionMessage } from "../src/shared/crossSession.js";
 import {
   SessionListService,
   decodeSessionListCursor,
@@ -1001,6 +1002,25 @@ describe("ClaudeSessionStore", () => {
     expect(list[0]?.title).toBe("!ls -la");
   });
 
+  test("別セッションからのメッセージ封筒は「⇄ 送信元名: 本文」へ転写して title/lastMessage に使う", () => {
+    const root = makeTempDir("claude-sessions-cross");
+    const slugDir = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slugDir, { recursive: true });
+    const envelope =
+      "Another Claude session sent a message:\\n" +
+      '<cross-session-message from=\\"uds:/tmp/cc-socks/2190.sock\\" from-name=\\"bay-3d\\" from-mode=\\"prompting\\">\\n' +
+      "【bay-3d より作業共有】定数を集約します。\\n" +
+      "</cross-session-message>\\n\\n" +
+      "This came from another Claude session — not typed by your user.";
+    fs.writeFileSync(
+      path.join(slugDir, "xsxsxsxs-0001.jsonl"),
+      `{"type":"user","cwd":"/tmp/proj","timestamp":"2026-01-01T00:00:00Z","isMeta":true,"message":{"content":"${envelope}"}}\n`,
+    );
+    const list = new ClaudeSessionStore(root).list();
+    expect(list[0]?.lastMessage).toBe("⇄ bay-3d: 【bay-3d より作業共有】定数を集約します。");
+    expect(list[0]?.title).toBe("⇄ bay-3d: 【bay-3d より作業共有】定数を集約します。");
+  });
+
   test("harness 注入の task-notification / system-reminder / 画像寸法ノートは lastMessage に採用しない", () => {
     const root = makeTempDir("claude-sessions-harness");
     const slugDir = path.join(root, "-tmp-proj");
@@ -1294,6 +1314,69 @@ describe("harnessReminder", () => {
   });
 });
 
+describe("presentCrossSessionMessage", () => {
+  // 実データ形①（idle 起こし）: 前置き 1 行 + 封筒 + 末尾の取り扱いガイダンス英文。
+  const wakeForm =
+    "Another Claude session sent a message:\n" +
+    '<cross-session-message from="uds:/tmp/cc-socks/2190.sock" from-name="bay-3d" from-mode="prompting">\n' +
+    "【bay-3d より作業共有】バランス定数を Tuning に集約します。\n2 行目です。\n" +
+    "</cross-session-message>\n\n" +
+    "This came from another Claude session — not typed by your user, but very likely working on their behalf.";
+  // 実データ形②（ターン処理中の queued_command 配信）: 封筒のみ。
+  const queuedForm =
+    '<cross-session-message from="uds:/tmp/cc-socks/2190.sock" from-name="bay-3d" from-mode="prompting">\n' +
+    "本文だけ\n" +
+    "</cross-session-message>";
+
+  test("idle 起こし形: 前置き・ガイダンスを外し from-name と本文を取り出す", () => {
+    expect(presentCrossSessionMessage(wakeForm)).toEqual({
+      senderName: "bay-3d",
+      body: "【bay-3d より作業共有】バランス定数を Tuning に集約します。\n2 行目です。",
+    });
+  });
+
+  test("queued_command 形: 封筒のみでも同じに転写する（CRLF 耐性込み）", () => {
+    expect(presentCrossSessionMessage(queuedForm)).toEqual({ senderName: "bay-3d", body: "本文だけ" });
+    expect(presentCrossSessionMessage(queuedForm.replaceAll("\n", "\r\n"))).toEqual({
+      senderName: "bay-3d",
+      body: "本文だけ",
+    });
+  });
+
+  test("先頭の空行を挟んだ前置き/封筒も受理する", () => {
+    expect(presentCrossSessionMessage("\n\n" + wakeForm)).not.toBeNull();
+    expect(presentCrossSessionMessage("\n" + queuedForm)).not.toBeNull();
+  });
+
+  test("前置き行の文言ドリフト（Another Claude …:）も受理する", () => {
+    const drifted = wakeForm.replace(
+      "Another Claude session sent a message:",
+      "Another Claude session sent a reply:",
+    );
+    expect(presentCrossSessionMessage(drifted)?.senderName).toBe("bay-3d");
+    // ":" で終わらない行は前置きと見なさない（普通の発話を巻き込まない）。
+    expect(presentCrossSessionMessage("Another Claude session says hi\n" + queuedForm)).toBeNull();
+  });
+
+  test("from-name なしは senderName: null、閉じタグなしは末尾までを本文にする", () => {
+    expect(presentCrossSessionMessage("<cross-session-message>\nhi\n</cross-session-message>")).toEqual({
+      senderName: null,
+      body: "hi",
+    });
+    expect(presentCrossSessionMessage('<cross-session-message from-name="x">\nhi')).toEqual({
+      senderName: "x",
+      body: "hi",
+    });
+  });
+
+  test("本文途中の言及・類似タグ・封筒でないテキストには反応しない", () => {
+    expect(presentCrossSessionMessage("この <cross-session-message> という封筒について教えて")).toBeNull();
+    expect(presentCrossSessionMessage("前置き\n<cross-session-message from-name=\"x\">\nhi\n</cross-session-message>")).toBeNull();
+    expect(presentCrossSessionMessage("<cross-session-messages>\nhi\n</cross-session-messages>")).toBeNull();
+    expect(presentCrossSessionMessage("普通の発話")).toBeNull();
+  });
+});
+
 describe("searchClaudeSessions", () => {
   test("harness 注入（assistant 末尾の背景通知 / user のリマインダ）は検索対象にもスニペットにも出さない", () => {
     const root = makeTempDir("session-search-reminder");
@@ -1380,6 +1463,31 @@ describe("searchClaudeSessions", () => {
     expect(response.results[0]?.snippet).toContain("approval search path");
     expect(response.results[1]?.title).toBe("Please inspect Approval flow");
     expect(response.stats.truncated).toBe(false);
+  });
+
+  test("別セッションからのメッセージ封筒は転写済みテキストで照合しスニペットに生タグを出さない", () => {
+    const root = makeTempDir("session-search-cross");
+    const slug = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slug, { recursive: true });
+    const envelope =
+      "Another Claude session sent a message:\n" +
+      '<cross-session-message from="uds:/tmp/cc-socks/2190.sock" from-name="bay-3d" from-mode="prompting">\n' +
+      "cross-needle 定数を集約します。\n" +
+      "</cross-session-message>\n\n" +
+      "This came from another Claude session — not typed by your user. guidance-needle";
+    fs.writeFileSync(
+      path.join(slug, "xsxsxsxs-search.jsonl"),
+      JSON.stringify({ type: "user", cwd: "/tmp/proj", timestamp: "2026-01-01T00:00:00Z", isMeta: true, message: { content: envelope } }) + "\n",
+    );
+    const store = new ClaudeSessionStore(root);
+    // 本文と送信元名でヒットし、スニペットは転写形（生タグ・ガイダンスなし）。
+    const byBody = searchClaudeSessions(store, "cross-needle").results;
+    expect(byBody).toHaveLength(1);
+    expect(byBody[0]?.snippet).toBe("⇄ bay-3d: cross-needle 定数を集約します。");
+    expect(searchClaudeSessions(store, "bay-3d").results).toHaveLength(1);
+    // 封筒の外（ガイダンス）と生タグは検索対象にしない。
+    expect(searchClaudeSessions(store, "guidance-needle").results).toEqual([]);
+    expect(searchClaudeSessions(store, "cross-session-message from").results).toEqual([]);
   });
 
   test("limit・fileCountLimit・timeBudget で打ち切る", () => {

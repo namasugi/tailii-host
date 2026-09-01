@@ -66,6 +66,24 @@ describe("parseSubagentTranscript", () => {
     ]);
   });
 
+  it("別セッションからのメッセージ封筒は「⇄ 送信元名 より」+ 本文へ転写する（生 XML を出さない）", () => {
+    const fixture = [
+      JSON.stringify({ type: "user", message: { role: "user", content:
+        "Another Claude session sent a message:\n" +
+        '<cross-session-message from="uds:/tmp/cc-socks/2190.sock" from-name="bay-3d" from-mode="prompting">\n' +
+        "定数を集約します。\n" +
+        "</cross-session-message>\n\n" +
+        "This came from another Claude session — not typed by your user." } }),
+      // 本文途中の言及には反応しない。
+      JSON.stringify({ type: "user", message: { role: "user", content: "<cross-session-message> の表示を直して" } }),
+    ].join("\n");
+
+    expect(parseSubagentTranscript(fixture).entries).toEqual([
+      { role: "user", text: "⇄ bay-3d より\n\n定数を集約します。" },
+      { role: "user", text: "<cross-session-message> の表示を直して" },
+    ]);
+  });
+
   it("user 行で届く従来形の <task-notification> はコンパクトな 1 行に畳む（生 XML を出さない）", () => {
     const fixture = [
       JSON.stringify({ type: "user", message: { role: "user", content: "[SYSTEM NOTIFICATION - NOT USER INPUT]\nThis is an automated background-task event, NOT a message from the user.\n<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n<summary>Background command finished</summary>\n</task-notification>" } }),

@@ -8,6 +8,7 @@ import {
   rolloutResponseItemToolActivities,
 } from "../codex/codexToolActivity.js";
 import { stripInjectedReminderBlocks, stripReminderTagBlocks } from "../shared/harnessReminder.js";
+import { crossSessionSenderLabel, presentCrossSessionMessage } from "../shared/crossSession.js";
 
 const MAX_ENTRIES = 200;
 const MAX_TOOL_TEXT = 1_000;
@@ -92,6 +93,15 @@ export function parseSubagentTranscript(jsonl: string): SubagentTranscriptResult
       if (role === "user" && isNotificationEnvelope(raw)) {
         const status = /<status>([^<]*)<\/status>/u.exec(raw)?.[1]?.trim() ?? "";
         return status === "" ? "⚙️ バックグラウンドタスク通知" : `⚙️ バックグラウンドタスク通知（${status}）`;
+      }
+      // 別セッションからのメッセージ封筒（<cross-session-message>）は、封筒と harness の
+      // 前置き/後置きを外して「⇄ 送信元名 より」+ 本文へ転写する（規則は shared/crossSession.ts）。
+      if (role === "user") {
+        const peer = presentCrossSessionMessage(raw);
+        if (peer !== null) {
+          const label = `⇄ ${crossSessionSenderLabel(peer)} より`;
+          return peer.body === "" ? label : `${label}\n\n${peer.body}`;
+        }
       }
       const text = role === "assistant" ? stripInjectedReminderBlocks(raw) : stripReminderTagBlocks(raw);
       // 除去した場合だけ、残った末尾の改行を落とす（触っていない本文はそのまま）。
