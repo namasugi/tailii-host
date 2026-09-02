@@ -1024,6 +1024,7 @@ describe("Hook — 待機延長・retry-connect（Req 8.1/8.2/8.3）", () => {
         type: "session_processing",
         session: "sess-relay",
         state: "active",
+        event: "PreToolUse",
       });
       const socket = await relay.nextConnection();
       const reader = new SocketLineReader(socket);
@@ -1065,6 +1066,7 @@ describe("Hook — 待機延長・retry-connect（Req 8.1/8.2/8.3）", () => {
         type: "session_processing",
         session: "sess-life",
         state: "active",
+        event: "UserPromptSubmit",
       });
       expect(exitCode).toBe(0);
       // UserPromptSubmit の stdout はコンテキスト注入されるため必ず無出力。
@@ -1096,6 +1098,7 @@ describe("Hook — 待機延長・retry-connect（Req 8.1/8.2/8.3）", () => {
         type: "session_processing",
         session: "sess-life",
         state: "done",
+        event: "Stop",
       });
       expect(exitCode).toBe(0);
       expect(stdout).toBe("");

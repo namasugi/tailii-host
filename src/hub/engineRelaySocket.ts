@@ -16,11 +16,14 @@ export type RemotePendingMessage =
  * protocol.ts には載せない。iOS へは転送しない）。
  * - active: UserPromptSubmit / PreToolUse / PostToolUse（ハートビート）
  * - done:   Stop（応答完了）
+ * - event:  発火した hook 名（任意）。Hub は UserPromptSubmit だけをターン開始の権威とし、
+ *           Pre/PostToolUse は継続（中断直後の遅着は残響として無視）と解釈する。旧 hook は省略。
  */
 export type SessionProcessingMessage = {
   type: "session_processing";
   session: string;
   state: "active" | "done";
+  event?: string;
 };
 
 /**
@@ -125,7 +128,8 @@ function decodeEngineRelayLine(line: string): EngineRelayMessage | null {
         const session = record["session"];
         const state = record["state"];
         if (typeof session === "string" && session.length > 0 && (state === "active" || state === "done")) {
-          return { type: "session_processing", session, state };
+          const event = record["event"];
+          return { type: "session_processing", session, state, ...(typeof event === "string" ? { event } : {}) };
         }
         return null;
       }

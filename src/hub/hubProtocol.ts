@@ -383,9 +383,10 @@ function parseRecord(line: string): Record<string, unknown> | null {
 function decodeProcessing(record: Record<string, unknown>): SessionProcessingMessage | null {
   const session = record["session"];
   const state = record["state"];
+  const event = record["event"];
   return record["type"] === "session_processing" && typeof session === "string" && session.length > 0 &&
     (state === "active" || state === "done")
-    ? { type: "session_processing", session, state }
+    ? { type: "session_processing", session, state, ...(typeof event === "string" ? { event } : {}) }
     : null;
 }
 

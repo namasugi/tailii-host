@@ -292,7 +292,7 @@ async function notifySessionProcessing(
   }
   if (options.engineRelaySocketPath === null) return;
   try {
-    const message = { type: "session_processing", session, state } as const;
+    const message = { type: "session_processing", session, state, event } as const;
     // best-effort・短予算（60ms）: engine 不在時にゲート/監査を遅らせない。
     if (options.engineRelaySocketPath !== undefined) {
       await sendSessionProcessingToEngine(message, options.engineRelaySocketPath, 60);

@@ -37,6 +37,13 @@ describe("hubProtocol session lifecycle", () => {
     const message: HubClientMessage = { type: "session_retire", session: "work" };
     expect(decodeHubClientLine(encodeHubMessage(message))).toEqual(message);
     expect(decodeHubClientLine('{"type":"session_retire","session":""}')).toBeNull();
+    // session_processing の event（hook 名）は文字列のときだけ通し、無ければ付けない。
+    expect(decodeHubClientLine('{"type":"session_processing","session":"s","state":"active","event":"PreToolUse"}'))
+      .toEqual({ type: "session_processing", session: "s", state: "active", event: "PreToolUse" });
+    expect(decodeHubClientLine('{"type":"session_processing","session":"s","state":"done"}'))
+      .toEqual({ type: "session_processing", session: "s", state: "done" });
+    expect(decodeHubClientLine('{"type":"session_processing","session":"s","state":"active","event":7}'))
+      .toEqual({ type: "session_processing", session: "s", state: "active" });
   });
 });
 
