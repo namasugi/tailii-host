@@ -12,6 +12,7 @@ import {
   HISTORY_DONE_STREAM_ID,
   MODEL_STREAM_ID,
   TranscriptTailer,
+  findTrailingInterruptMarkerMs,
   questionsFromToolInput,
 } from "../src/chat/transcriptTailer.js";
 import { makeTempDir } from "./helpers.js";
@@ -48,6 +49,93 @@ describe("TranscriptTailer", () => {
     expect(messages.filter((message) => message.type === "chat_output")).toEqual([
       { type: "chat_output", v: 1, streamId: "new", role: "assistant", text: "停止中の追記", eof: true },
     ]);
+  });
+
+  test("中断確定マーカーは timestamp 付きの lifecycle として観測者へ通知する（不明行は通知しない）", async () => {
+    const p = writeTranscript([
+      JSON.stringify({ type: "user", timestamp: "2026-09-02T03:45:40.331Z", uuid: "u1",
+        message: { role: "user", content: [{ type: "text", text: "[Request interrupted by user]" }] },
+        interruptedMessageId: "msg_1" }),
+      JSON.stringify({ type: "user", timestamp: "2026-09-02T03:46:00.000Z", uuid: "u2",
+        message: { role: "user", content: "[Request interrupted by user for tool use]" } }),
+      // timestamp 不明の中断行は履歴/ライブを区別できないため通知しない。
+      JSON.stringify({ type: "user", uuid: "u3",
+        message: { role: "user", content: "[Request interrupted by user]" } }),
+      // 本文中の引用（ピア封筒など）は行頭一致に外れるので通知しない。
+      JSON.stringify({ type: "user", timestamp: "2026-09-02T03:47:00.000Z", uuid: "u4",
+        message: { role: "user", content: "さっき [Request interrupted by user] と出た" } }),
+      JSON.stringify({ type: "assistant", timestamp: "2026-09-02T03:48:00.000Z", uuid: "a1",
+        message: { role: "assistant", content: [{ type: "text", text: "[Request interrupted by user]" }] } }),
+    ]);
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
+    const events: unknown[] = [];
+    tailer.setTurnLifecycleObserver((event) => events.push(event));
+    const messages = await collect(tailer.streamTranscript(p));
+    expect(events).toEqual([
+      { kind: "interrupted", atMs: Date.parse("2026-09-02T03:45:40.331Z") },
+      { kind: "interrupted", atMs: Date.parse("2026-09-02T03:46:00.000Z") },
+    ]);
+    // 表示用の chat_output は従来どおり流れる（iOS 側の「停止中」解除権威）。
+    expect(messages.filter((m) => m.type === "chat_output" && m.role === "user")).toHaveLength(4);
+  });
+
+  test("newerThanMs より古い中断マーカーは lifecycle にも流れない（再接続 backfill の限界）", async () => {
+    const dir = makeTempDir("tailer-interrupt-newer");
+    fs.writeFileSync(path.join(dir, "s.jsonl"), [
+      JSON.stringify({ type: "user", timestamp: "2026-09-02T03:45:40.000Z", uuid: "old",
+        message: { role: "user", content: "[Request interrupted by user]" } }),
+      JSON.stringify({ type: "user", timestamp: "2026-09-02T03:50:00.000Z", uuid: "new",
+        message: { role: "user", content: "[Request interrupted by user]" } }),
+    ].join("\n") + "\n");
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
+    const events: unknown[] = [];
+    tailer.setTurnLifecycleObserver((event) => events.push(event));
+    await collect(tailer.streamProjectDir(dir, "s", Date.parse("2026-09-02T03:46:00.000Z")));
+    expect(events).toEqual([{ kind: "interrupted", atMs: Date.parse("2026-09-02T03:50:00.000Z") }]);
+  });
+
+  test("findTrailingInterruptMarkerMs は最後の発話が中断マーカーのときだけ timestamp を返す", () => {
+    const marker = (ts: string) => JSON.stringify({ type: "user", timestamp: ts, uuid: `m-${ts}`,
+      message: { role: "user", content: [{ type: "text", text: "[Request interrupted by user for tool use]" }] } });
+    const prompt = (ts: string, text = "次") => JSON.stringify({ type: "user", timestamp: ts, uuid: `p-${ts}`,
+      message: { role: "user", content: text } });
+    const assistant = JSON.stringify({ type: "assistant", timestamp: "2026-09-02T04:00:00.000Z", uuid: "a",
+      message: { role: "assistant", content: [{ type: "text", text: "[Request interrupted by user]" }] } });
+    const toolResult = JSON.stringify({ type: "user", timestamp: "2026-09-02T04:00:01.000Z", uuid: "tr",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: "x" }] } });
+    const cost = JSON.stringify({ type: "cost-state", totalCostUSD: 1 });
+    const at = Date.parse("2026-09-02T03:45:40.331Z");
+    expect(findTrailingInterruptMarkerMs(writeTranscript([
+      prompt("2026-09-02T03:40:00.000Z"), marker("2026-09-02T03:45:40.331Z"), assistant, toolResult, cost,
+    ]))).toBe(at);
+    // マーカー後に発話（queued_command 形も含む）があれば null。
+    expect(findTrailingInterruptMarkerMs(writeTranscript([
+      marker("2026-09-02T03:45:40.331Z"), prompt("2026-09-02T03:46:00.000Z"),
+    ]))).toBeNull();
+    expect(findTrailingInterruptMarkerMs(writeTranscript([
+      marker("2026-09-02T03:45:40.331Z"),
+      JSON.stringify({ type: "attachment", timestamp: "2026-09-02T03:46:00.000Z", uuid: "q",
+        attachment: { type: "queued_command", prompt: "キュー済み" } }),
+    ]))).toBeNull();
+    // ローカルコマンド記録（type=system）はターンを始めないので、マーカーを隠さない。
+    expect(findTrailingInterruptMarkerMs(writeTranscript([
+      marker("2026-09-02T03:45:40.331Z"),
+      JSON.stringify({ type: "system", subtype: "local_command", timestamp: "2026-09-02T03:46:00.000Z", uuid: "lc",
+        content: "<command-name>/effort</command-name>" }),
+    ]))).toBe(at);
+    // 本文中の引用・timestamp 無し・不在ファイルは null。
+    expect(findTrailingInterruptMarkerMs(writeTranscript([prompt("2026-09-02T03:46:00.000Z", "さっき [Request interrupted by user]")]))).toBeNull();
+    expect(findTrailingInterruptMarkerMs(writeTranscript([
+      JSON.stringify({ type: "user", uuid: "n", message: { role: "user", content: "[Request interrupted by user]" } }),
+    ]))).toBeNull();
+    expect(findTrailingInterruptMarkerMs(path.join(makeTempDir("tailer-missing"), "none.jsonl"))).toBeNull();
+    // 末尾だけ読む: 上限より前の部分に何があっても最後の発話で判定する。
+    const big = writeTranscript([prompt("2026-09-02T03:00:00.000Z", "x".repeat(4000)), marker("2026-09-02T03:45:40.331Z")]);
+    expect(findTrailingInterruptMarkerMs(big, 1024)).toBe(at);
+    // 窓の先頭がちょうど行境界でも、その完全な行（最終行）を捨てない。
+    const markerLine = marker("2026-09-02T03:45:40.331Z");
+    const exact = writeTranscript([prompt("2026-09-02T03:00:00.000Z"), markerLine]);
+    expect(findTrailingInterruptMarkerMs(exact, markerLine.length + 1)).toBe(at);
   });
 
   test("assistant/user ターンを 1 ターン = 1 chat_output（eof:true）で流す", async () => {

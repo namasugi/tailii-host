@@ -26,6 +26,12 @@ export interface Heartbeat {
   state: HeartbeatState;
   /** 書き込み契機(デバッグ用)。判定には使わない。 */
   event?: string;
+  /**
+   * 処理開始（最後の active 信号）の時刻(Unix ms)。Hub の `processingSinceMs` の永続化で、
+   * bump は保持する。Hub 再起動後に transcript の中断マーカーが現ターンのものかを判定する
+   * 根拠（ts は毎 tick bump されるため開始時刻には使えない）。旧形式・hook 書込では無い。
+   */
+  sinceMs?: number;
 }
 
 /** 既定のハートビート置き場(`~/.tailii/heartbeat`)。 */
@@ -42,13 +48,14 @@ function heartbeatPath(dir: string, session: string): string {
 export function readHeartbeat(dir: string, session: string): Heartbeat | null {
   try {
     const raw = fs.readFileSync(heartbeatPath(dir, session), "utf8");
-    const parsed = JSON.parse(raw) as { ts?: unknown; state?: unknown; event?: unknown };
+    const parsed = JSON.parse(raw) as { ts?: unknown; state?: unknown; event?: unknown; sinceMs?: unknown };
     if (typeof parsed.ts !== "number" || !Number.isFinite(parsed.ts)) return null;
     if (parsed.state !== "active" && parsed.state !== "idle") return null;
     return {
       ts: parsed.ts,
       state: parsed.state,
       ...(typeof parsed.event === "string" ? { event: parsed.event } : {}),
+      ...(typeof parsed.sinceMs === "number" && Number.isFinite(parsed.sinceMs) ? { sinceMs: parsed.sinceMs } : {}),
     };
   } catch {
     return null;
@@ -69,7 +76,7 @@ export function writeHeartbeat(
 }
 
 /**
- * ts だけ更新する(state は既存値を保持、不在時は fallbackState)。
+ * ts だけ更新する(state と sinceMs は既存値を保持、不在時は fallbackState)。
  * チャット表示中 ticker / daemon の bump 代行用。
  */
 export function bumpHeartbeat(
@@ -84,6 +91,7 @@ export function bumpHeartbeat(
     ts: now,
     state: existing?.state ?? fallbackState,
     event,
+    ...(existing?.sinceMs !== undefined ? { sinceMs: existing.sinceMs } : {}),
   });
 }
 

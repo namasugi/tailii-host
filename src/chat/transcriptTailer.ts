@@ -38,6 +38,80 @@ export const EFFORT_STREAM_ID = "pc:effort";
 /** claude の effort 既知値（未知値は通知しない）。 */
 const EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
 
+/**
+ * 利用者の中断確定マーカー（claude が transcript に user 行として記録する
+ * "[Request interrupted by user]" / "[Request interrupted by user for tool use]"）。
+ * iOS 側 `ChatLogModel` は同じ文字列を `contains` で「停止中」解除に使うが、host は処理中状態
+ * （権威）を落とす側なので行頭一致に絞り、ピア封筒などの本文引用では反応しない。
+ */
+const INTERRUPT_MARKER_PREFIX = "[Request interrupted by user";
+
+/** user ターン本文が中断確定マーカーか（行頭一致。本文中の引用は除外する）。 */
+function isClaudeInterruptMarker(text: string): boolean {
+  return text.trimStart().startsWith(INTERRUPT_MARKER_PREFIX);
+}
+
+/**
+ * transcript 末尾を読み、最後の user 発話（本文のある user ターン）が中断確定マーカーなら
+ * その行の timestamp(ms) を返す。マーカーの後に新しい発話があれば null（=ターン進行中の
+ * 可能性）。Hub 再起動時の復元で「再起動前に中断済みで放置された会話」を処理中に戻さない
+ * ために使う（engine の再接続購読は newerThanMs 付きで履歴マーカーを流さないため、tail
+ * 経由では観測できない）。本文の無い user 行（tool_result / 画像のみ / スキル注入）と
+ * ローカルコマンド記録（type=system の `/effort` `/rename` 等。ターンを始めない）は発話と
+ * みなさない。画像のみの発話で始まった進行中ターンは稀に idle 判定になり得るが、次の hook
+ * （PreToolUse 等）の active で数秒後に自己修復する。末尾 tailBytes だけを読むので、それより
+ * 長い最終行は解釈できず null（=処理中のまま）に倒れる。
+ */
+export function findTrailingInterruptMarkerMs(transcriptPath: string, tailBytes = 256 * 1024): number | null {
+  let fd: number;
+  try {
+    fd = fs.openSync(transcriptPath, "r");
+  } catch {
+    return null;
+  }
+  try {
+    const size = fs.fstatSync(fd).size;
+    const start = Math.max(0, size - tailBytes);
+    // 1 バイト手前から読み、窓の先頭が行境界なら先頭要素は空文字になる（完全な行を捨てない）。
+    const readStart = start > 0 ? start - 1 : 0;
+    const buffer = Buffer.alloc(size - readStart);
+    const read = fs.readSync(fd, buffer, 0, buffer.length, readStart);
+    const lines = buffer.subarray(0, read).toString("utf8").split("\n");
+    if (start > 0) lines.shift(); // 途中から読んだ先頭の欠け行（または境界の空要素）を捨てる。
+    let last: { interrupt: boolean; atMs: number } | null = null;
+    for (const raw of lines) {
+      const line = raw.replaceAll("\r", "");
+      if (!line) continue;
+      if (isSystemRecordLine(line)) continue;
+      const turn = extractTurn(line);
+      if (turn === null || turn.role !== "user" || turn.text.length === 0) continue;
+      last = { interrupt: isClaudeInterruptMarker(turn.text), atMs: lineTimestampMs(Buffer.from(line, "utf8")) };
+    }
+    if (last === null || !last.interrupt || !Number.isFinite(last.atMs)) return null;
+    return last.atMs;
+  } catch {
+    return null;
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      // 二重 close 等は無視。
+    }
+  }
+}
+
+/**
+ * transcript 由来の claude ターン権威ライフサイクル。Claude Code の Stop hook は利用者の中断では
+ * 発火しないため、hook だけを見ている hub の処理中状態がターン終了後も残る。中断マーカーを
+ * timestamp 付きで観測し、hub が「処理開始より後のマーカー」だけを処理完了へ写像する
+ * （codex の `CodexTurnLifecycleEvent` と同型の副チャネル）。
+ */
+export interface ClaudeTurnLifecycleEvent {
+  kind: "interrupted";
+  /** transcript 行の timestamp（Unix ms）。履歴再生で流れる過去ターンのマーカーを除外する根拠。 */
+  atMs: number;
+}
+
 const MAX_COMMAND_CHARACTERS = 8_000;
 const MAX_DESCRIPTION_CHARACTERS = 2_000;
 const MAX_DIFF_FIELD_CHARACTERS = 24_000;
@@ -84,6 +158,8 @@ interface TailState {
   activeQuestionIds: Set<string>;
   /** 本文待ちの Skill ツールカード（tool_use id → 発行済み activity）。 */
   pendingSkillActivities: Map<string, ToolActivity>;
+  /** ターン権威ライフサイクルの観測者（hub が処理中状態の補完に使う）。 */
+  onLifecycle: ((event: ClaudeTurnLifecycleEvent) => void) | null;
 }
 
 /** claude セッショントランスクリプト（JSONL）の tail 実装。 */
@@ -92,12 +168,18 @@ export class TranscriptTailer {
   private readonly tailDeadlineMs: number | null;
   private readonly tailIndefinitely: boolean;
   private readonly emitReplayDoneMarker: boolean;
+  private lifecycleObserver: ((event: ClaudeTurnLifecycleEvent) => void) | null = null;
 
   constructor(options: TranscriptTailerOptions = {}) {
     this.pollIntervalMs = options.pollIntervalMs ?? 50;
     this.tailDeadlineMs = options.tailDeadlineMs ?? null;
     this.tailIndefinitely = options.tailIndefinitely ?? false;
     this.emitReplayDoneMarker = options.emitReplayDoneMarker ?? false;
+  }
+
+  /** ターン権威ライフサイクル（中断マーカー等）の観測者を登録する。以後に開始した tail から有効。 */
+  setTurnLifecycleObserver(observer: ((event: ClaudeTurnLifecycleEvent) => void) | null): void {
+    this.lifecycleObserver = observer;
   }
 
   /** `path` の JSONL を頭から読み、assistant/user ターンを chat_output として流す。 */
@@ -196,6 +278,7 @@ export class TranscriptTailer {
         lastEffort: null,
         activeQuestionIds: new Set(),
         pendingSkillActivities: new Map(),
+        onLifecycle: this.lifecycleObserver,
       };
       const start = Date.now();
       let announcedReplayDone = false;
@@ -281,12 +364,30 @@ function lineTimestampMs(line: Buffer): number {
   return Number.NEGATIVE_INFINITY;
 }
 
+/** type=system の記録行か（ローカルコマンド記録など。extractTurn は表示用に user 扱いへ写す）。 */
+function isSystemRecordLine(line: string): boolean {
+  try {
+    const parsed = JSON.parse(line) as { type?: unknown };
+    return parsed.type === "system";
+  } catch {
+    return false;
+  }
+}
+
 /** 1 行（JSONL）をパースし、生成メッセージを列挙する。解釈できない行はスキップ。 */
 function* emitLine(line: Buffer, state: TailState): Generator<ControlMessage, void, void> {
   const text = line.toString("utf8").replaceAll("\r", "");
   if (!text) return;
   const turn = extractTurn(text);
   if (turn === null) return;
+
+  // 中断確定マーカー: ターン終了の権威（Stop hook は中断で発火しない）。表示用の chat_output
+  // とは別に、行の timestamp 付きで観測者へ通知する。timestamp 不明行は履歴/ライブを区別
+  // できないため通知しない（誤って進行中ターンを終了扱いにしない側へ倒す）。
+  if (state.onLifecycle !== null && turn.role === "user" && isClaudeInterruptMarker(turn.text)) {
+    const atMs = lineTimestampMs(line);
+    if (Number.isFinite(atMs)) state.onLifecycle({ kind: "interrupted", atMs });
+  }
 
   for (const prompt of turn.questionPrompts) {
     if (state.activeQuestionIds.has(prompt.id)) continue;

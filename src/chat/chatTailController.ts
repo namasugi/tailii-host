@@ -10,7 +10,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { LineWriter } from "../shared/lineWriter.js";
 import type { ImageService } from "./imageService.js";
-import { TranscriptTailer } from "./transcriptTailer.js";
+import { TranscriptTailer, type ClaudeTurnLifecycleEvent } from "./transcriptTailer.js";
 import { SubagentTailer } from "./subagentTailer.js";
 import {
   readBackgroundOutput,
@@ -64,6 +64,8 @@ export class ChatTailController {
     agent?: ChatAgent;
     codexTailer?: CodexRolloutTailer;
     onCodexTurnLifecycle?: (event: CodexTurnLifecycleEvent) => void;
+    /** claude の transcript 由来ライフサイクル（中断マーカー）。hub が処理中状態の補完に使う。 */
+    onClaudeTurnLifecycle?: (event: ClaudeTurnLifecycleEvent) => void;
   }) {
     this.writer = options.writer;
     this.tailer = options.tailer;
@@ -77,6 +79,9 @@ export class ChatTailController {
       options.codexTailer ?? new CodexRolloutTailer({ tailIndefinitely: true, emitReplayDoneMarker: true });
     if (options.onCodexTurnLifecycle !== undefined) {
       this.codexTailer.setTurnLifecycleObserver(options.onCodexTurnLifecycle);
+    }
+    if (options.onClaudeTurnLifecycle !== undefined) {
+      this.tailer.setTurnLifecycleObserver(options.onClaudeTurnLifecycle);
     }
   }
 

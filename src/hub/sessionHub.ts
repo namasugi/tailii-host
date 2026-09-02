@@ -4,9 +4,10 @@
 import type { ReaperTickOptions, ReaperTickResult } from "./reaper.js";
 import { reaperTick } from "./reaper.js";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { bumpHeartbeat, listHeartbeatSessions, readHeartbeat, writeHeartbeat } from "../sessions/heartbeat.js";
-import { ensureDirectory0700 } from "../shared/paths.js";
+import { claudeProjectSlug, ensureDirectory0700 } from "../shared/paths.js";
 import type { EngineRelayMessage } from "./engineRelaySocket.js";
 import {
   decodeHubClientLine,
@@ -19,7 +20,11 @@ import type {
   QuestionPromptQuestion,
   SubagentTranscriptEntry,
 } from "../protocol.js";
-import { HISTORY_DONE_STREAM_ID } from "../chat/transcriptTailer.js";
+import {
+  HISTORY_DONE_STREAM_ID,
+  findTrailingInterruptMarkerMs,
+  type ClaudeTurnLifecycleEvent,
+} from "../chat/transcriptTailer.js";
 import type { ChatAgent } from "../chat/chatTailController.js";
 import type { PanePreviewMode } from "./panePreviewPump.js";
 import type { QuestionAnswer } from "../protocol.js";
@@ -60,6 +65,7 @@ export interface HubPreviewPump {
 export type HubTailFactory = (
   write: (payload: ControlMessage) => void,
   onCodexTurnLifecycle?: (event: CodexTurnLifecycleEvent) => void,
+  onClaudeTurnLifecycle?: (event: ClaudeTurnLifecycleEvent) => void,
 ) => HubTail;
 export type HubPreviewPumpFactory = (
   write: (payload: ControlMessage) => void,
@@ -71,6 +77,16 @@ export type HubPreviewPumpFactory = (
 export type SessionHubOptions = Omit<ReaperTickOptions, "now"> & {
   /** Unix 秒。テストでは固定時計を注入する。 */
   now?: () => number;
+  /**
+   * Unix ms。処理開始時刻と transcript 行 timestamp の比較用（既定 Date.now）。`now`（秒）から
+   * 派生させると境界が最大 999ms 早まり、中断直後の再送信でマーカーが新ターンを落とす。
+   */
+  nowMs?: () => number;
+  /**
+   * 復元時に照合する claude transcript の場所（テスト注入用）。既定は
+   * `~/.claude/projects/<slug>/<claudeSessionId>.jsonl`。null は照合しない。
+   */
+  transcriptPathFor?: (meta: SessionMeta) => string | null;
   tailFactory?: HubTailFactory;
   previewPumpFactory?: HubPreviewPumpFactory;
   replayLimit?: number;
@@ -129,6 +145,14 @@ interface SessionActor {
     restoredAfterInjectionFailure?: boolean;
   } | null;
   processingSince: number | null;
+  /**
+   * 現ターンの開始時刻（Unix ms）= UserPromptSubmit（または復元時刻）を hub が受けた時刻。
+   * Pre/PostToolUse の継続 active では進めない（マーカーより後に遅着した継続 hook で境界が
+   * マーカーを追い越すと、中断が棄却されて停止ボタンが残る）。
+   */
+  processingSinceMs: number | null;
+  /** 中断マーカーで done にした時刻（Unix ms）。直後に遅着する継続 hook の active を残響として無視する。 */
+  lastInterruptDoneMs: number | null;
   focusedBy: Set<object>;
   subscribers: Map<object, SubscriberState>;
   nextServerSeq: number;
@@ -160,12 +184,29 @@ interface SessionActor {
   codexDrainBlocked: boolean;
 }
 
+/** 中断マーカーで done にした後、継続 hook（Pre/PostToolUse）の遅着 active を残響として無視する窓（ms）。 */
+const LATE_HOOK_AFTER_INTERRUPT_MS = 3_000;
+
+/** ターンを始めない継続 hook か（新ターンの権威は UserPromptSubmit のみ）。 */
+function isContinuationHookEvent(event: string | undefined): boolean {
+  return event === "PreToolUse" || event === "PostToolUse";
+}
+
+/** 既定の claude transcript 解決（`~/.claude/projects/<slug>/<sessionId>.jsonl`）。ID 未記録は null。 */
+function defaultTranscriptPathFor(meta: SessionMeta): string | null {
+  // 他の tail open と同じ優先順（providerSessionId → claudeSessionId）。別会話を照合しない。
+  const sessionId = meta.providerSessionId ?? meta.claudeSessionId;
+  if (sessionId === undefined || sessionId.length === 0) return null;
+  return path.join(os.homedir(), ".claude", "projects", claudeProjectSlug(meta.cwd), `${sessionId}.jsonl`);
+}
+
 export class SessionHub {
   private readonly clients = new Map<object, (line: string) => void>();
   /** 一覧 Mission Control の watcher（処理中会話全体の pane_preview 配信先）。 */
   private readonly previewWatchers = new Set<object>();
   readonly actors = new Map<string, SessionActor>();
   private readonly now: () => number;
+  private readonly nowMs: () => number;
   private readonly replayLimit: number;
   private injectionsInFlight = 0;
   private codexStartsInFlight = 0;
@@ -176,6 +217,7 @@ export class SessionHub {
 
   constructor(private readonly options: SessionHubOptions) {
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
+    this.nowMs = options.nowMs ?? (() => Date.now());
     this.replayLimit = options.replayLimit ?? 500;
   }
 
@@ -206,8 +248,46 @@ export class SessionHub {
       // 鮮度切れの active はクラッシュ残骸。復元すると tick の bump で計時が止まるため捨てる
       // (稼働中の hub は毎 tick bump しているので、直前まで生きていた heartbeat は必ず新しい)。
       if (this.now() - heartbeat.ts >= this.options.timeoutSeconds) continue;
-      this.actor(session).processingSince = heartbeat.ts;
+      // 再起動前に利用者が中断して放置した会話は Stop hook が無く active のまま残る。engine の
+      // 再接続購読は newerThanMs 付きで履歴のマーカーを流さないため、tail 経由では二度と
+      // 観測できない。transcript 末尾を直接照合し、最後の発話が開始以降の中断マーカーなら
+      // 処理中に戻さず idle へ確定する。
+      const trailingInterruptMs = this.trailingInterruptMarkerMs(session);
+      if (trailingInterruptMs !== null && (heartbeat.sinceMs === undefined || trailingInterruptMs >= heartbeat.sinceMs)) {
+        // 再起動中に hook が新ターンの active を書いた直後なら上書きしない（読んだ内容と同じときだけ倒す）。
+        const latest = readHeartbeat(this.options.heartbeatDir, session);
+        const unchanged = latest !== null && latest.ts === heartbeat.ts && latest.state === heartbeat.state &&
+          latest.event === heartbeat.event && latest.sinceMs === heartbeat.sinceMs;
+        if (!unchanged) {
+          // 消えていた（kill 後の掃除）場合も再生成しない。
+          this.options.log?.(`restore: heartbeat が更新されたため中断判定を見送る session=${session}`);
+        } else {
+          try {
+            writeHeartbeat(this.options.heartbeatDir, session,
+              { ts: this.now(), state: "idle", event: "restore-interrupted" });
+          } catch (error) { this.options.log?.(`heartbeat 書込失敗: ${String(error)}`); }
+          this.options.log?.(`restore: 中断済みのため処理中を復元しない session=${session}`);
+          continue;
+        }
+      }
+      const actor = this.actor(session);
+      actor.processingSince = heartbeat.ts;
+      // 真の開始時刻は heartbeat の sinceMs（applyProcessing が書き、bump が保持する）。ts は
+      // 毎 tick bump されるので使えない。無ければ（hook 直書きの heartbeat・旧形式）復元時刻を
+      // 境界にする: 再起動前の中断は上の transcript 照合が担い、再起動後の中断は必ずこれより
+      // 新しい。null（全採用）にすると、開き直しの全履歴再生で流れる過去ターンのマーカーが
+      // 進行中ターンを落とす。
+      actor.processingSinceMs = heartbeat.sinceMs ?? this.nowMs();
     }
+  }
+
+  /** 復元時の照合用: transcript 末尾の中断マーカー timestamp（claude 会話のみ。不明は null）。 */
+  private trailingInterruptMarkerMs(session: string): number | null {
+    const meta = this.options.metadataStore.get(session);
+    if (meta === null || meta.agent === "codex") return null;
+    const transcriptPath = (this.options.transcriptPathFor ?? defaultTranscriptPathFor)(meta);
+    if (transcriptPath === null) return null;
+    return findTrailingInterruptMarkerMs(transcriptPath);
   }
 
   /** 永続化済み設問を復元する。App Server の request handle は再起動を越せないため TUI のみ対象。 */
@@ -353,7 +433,9 @@ export class SessionHub {
       this.setPendingQuestion(message.session, actor, message.event === "prompt"
         ? { id: message.id, questions: message.questions ?? [], answerRoute: "tui" } : null);
       if (message.event === "dismiss") void this.drainChatQueue(message.session, actor);
-    } else if (message.type === "session_processing") this.applyProcessing(message.session, message.state);
+    } else if (message.type === "session_processing") {
+      if (!this.applyProcessing(message.session, message.state, message.event)) return;
+    }
     this.broadcast(message);
   }
 
@@ -699,7 +781,7 @@ export class SessionHub {
       if (actor?.runtimeClaim?.client === client) actor.runtimeClaim = null;
       return;
     }
-    this.applyProcessing(message.session, message.state);
+    if (!this.applyProcessing(message.session, message.state, message.event)) return;
     this.broadcast(message);
   }
 
@@ -937,9 +1019,13 @@ export class SessionHub {
       return;
     }
     if (this.options.tailFactory === undefined) return;
-    const tail = this.options.tailFactory((payload) => {
-      this.publishConversationEvent(session, actor, payload);
-    });
+    const tail = this.options.tailFactory(
+      (payload) => {
+        this.publishConversationEvent(session, actor, payload);
+      },
+      undefined,
+      (event) => this.handleClaudeTurnLifecycle(session, actor, event),
+    );
     actor.tail = tail;
     tail.open(meta.cwd, meta.providerSessionId ?? meta.claudeSessionId ?? null, newerThanMs, meta.agent ?? "claude");
   }
@@ -1372,7 +1458,8 @@ export class SessionHub {
   private actor(session: string): SessionActor {
     let actor = this.actors.get(session);
     if (actor === undefined) {
-      actor = { pendingQuestion: null, processingSince: null, focusedBy: new Set(), subscribers: new Map(),
+      actor = { pendingQuestion: null, processingSince: null, processingSinceMs: null, lastInterruptDoneMs: null,
+        focusedBy: new Set(), subscribers: new Map(),
         nextServerSeq: 1, replayBuffer: [], tail: null, tailRetryTimer: null,
         previewPump: null, backfillTails: new Map(),
         seenClientMessageIds: new Set(), deliveredChatMessageIds: new Map(),
@@ -1781,14 +1868,75 @@ export class SessionHub {
     });
   }
 
-  private applyProcessing(session: string, state: "active" | "done"): void {
+  /**
+   * transcript の中断確定マーカーで処理完了を補完する。Claude Code の Stop hook は利用者の中断
+   * （Esc / Ctrl-C）では発火しないため、hook だけでは処理中状態がターン終了後も残り、iOS は
+   * 会話を開き直す・再接続するたびに停止ボタン/処理中表示を張り直してしまう（実機 09-02）。
+   * 共有 tail は購読の張り直しで履歴から再生されるため、マーカーの timestamp が現ターンの
+   * 処理開始時刻以降のものだけを採用する（過去ターンのマーカーで進行中ターンを落とさない）。
+   *
+   * 時刻の比較根拠: `processingSinceMs` は UserPromptSubmit hook を hub が受信した時刻（ターン
+   * 開始。継続 hook では進めない）。中断→即再送信（実測 10〜200ms 後）でも、新ターンの hook
+   * 受信は必ずマーカー書込より後（同一マシンの時計・因果順）なので、マーカーは新ターンの開始
+   * より古く見えて棄却される。tail がマーカーを hook より先に届けた場合は前ターンを done に
+   * し、直後の UserPromptSubmit で active に戻る。中断直後に遅着する Pre/PostToolUse の active
+   * は `applyProcessing` が残響として無視する。
+   *
+   * 副作用は hook の Stop と同じ `applyProcessing("done")` 一式（heartbeat idle。設問提示中なら
+   * その dismiss と chat queue の drain）。中断はターン終了なので Stop 後と同じ振る舞い。
+   */
+  private handleClaudeTurnLifecycle(session: string, actor: SessionActor, event: ClaudeTurnLifecycleEvent): void {
+    if (event.kind !== "interrupted") return;
+    if (this.actors.get(session) !== actor) return;
+    if (actor.processingSince === null) return;
+    if (this.options.metadataStore.get(session)?.agent === "codex") return;
+    if (actor.processingSinceMs !== null && event.atMs < actor.processingSinceMs) return;
+    this.options.log?.(`interrupt marker で処理完了を補完 session=${session}`);
+    actor.lastInterruptDoneMs = this.nowMs();
+    this.applyProcessing(session, "done");
+    this.broadcast({ type: "session_processing", session, state: "done" });
+  }
+
+  /**
+   * 処理中状態を反映する。戻り値 false は「中断済みターンの残響として無視した」（呼び手は
+   * broadcast しない）。`event` は hook 名（relay 由来。codex controller / 旧 hook は undefined）。
+   */
+  private applyProcessing(session: string, state: "active" | "done", event?: string): boolean {
     const actor = this.actor(session);
-    actor.processingSince = state === "active" ? this.now() : null;
+    if (state === "active") {
+      // 中断直後に遅着する継続 hook（Pre/PostToolUse）は中断済みターンの残響。hook は別プロセス
+      // 起動+relay で 100〜300ms 遅れるため、マーカー書込より後に届き得る。採用すると Stop hook の
+      // 無いターンが永久に処理中へ戻る（停止ボタン再点灯）。新ターンの開始は UserPromptSubmit
+      // だけが権威（中断→即再送信は通常どおり active）。
+      if (isContinuationHookEvent(event) && actor.processingSince === null && actor.lastInterruptDoneMs !== null &&
+        this.nowMs() - actor.lastInterruptDoneMs < LATE_HOOK_AFTER_INTERRUPT_MS) {
+        this.options.log?.(`audit late-hook-after-interrupt ignored session=${session} event=${event}`);
+        // hook が直書きした active の heartbeat も戻す（reaper の bump 代行で不死化させない）。
+        // ただし heartbeat がその hook の書込のままのときだけ。別の書込（新ターンの
+        // UserPromptSubmit 等）に置き換わっていれば触らない（生きたターンの reaper 保護を剥がさない）。
+        try {
+          const latest = readHeartbeat(this.options.heartbeatDir, session);
+          if (latest !== null && latest.state === "active" && latest.event === event) {
+            writeHeartbeat(this.options.heartbeatDir, session, { ts: this.now(), state: "idle", event: "late-hook-after-interrupt" });
+          }
+        } catch (error) { this.options.log?.(`heartbeat 書込失敗: ${String(error)}`); }
+        return false;
+      }
+      actor.processingSince = this.now();
+      // ターン開始は UserPromptSubmit で確定し、継続 hook では進めない（未確定なら今）。
+      actor.processingSinceMs =
+        event === "UserPromptSubmit" || actor.processingSinceMs === null ? this.nowMs() : actor.processingSinceMs;
+    } else {
+      actor.processingSince = null;
+      actor.processingSinceMs = null;
+    }
     // 一覧 watch 中は処理開始/完了で pump を起動/停止する（前面購読とは独立）。
     this.syncPreview(session, actor);
     try {
       writeHeartbeat(this.options.heartbeatDir, session, { ts: this.now(), state: state === "active" ? "active" : "idle",
-        event: state === "active" ? "hub-processing" : "hub-processing-done" });
+        event: state === "active" ? "hub-processing" : "hub-processing-done",
+        // 再起動後の中断マーカー照合用に開始時刻を残す（bump は保持する）。
+        ...(actor.processingSinceMs !== null ? { sinceMs: actor.processingSinceMs } : {}) });
     } catch (error) { this.options.log?.(`heartbeat 書込失敗: ${String(error)}`); }
     if (state === "done" && actor.pendingQuestion !== null) {
       const id = actor.pendingQuestion.id;
@@ -1796,6 +1944,7 @@ export class SessionHub {
       this.broadcast({ type: "question_event", session, event: "dismiss", id });
       void this.drainChatQueue(session, actor);
     }
+    return true;
   }
 
   private bumpSafe(session: string, event: string, fallbackState: "active" | "idle" = "idle"): void {

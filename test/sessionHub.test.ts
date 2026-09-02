@@ -4,7 +4,7 @@ import { describe, expect, test, vi } from "vitest";
 import { decodeHubServerLine } from "../src/hub/hubProtocol.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { readHeartbeat, writeHeartbeat } from "../src/sessions/heartbeat.js";
+import { bumpHeartbeat, readHeartbeat, writeHeartbeat } from "../src/sessions/heartbeat.js";
 import { SessionHub, type HubTail } from "../src/hub/sessionHub.js";
 import { HISTORY_DONE_STREAM_ID } from "../src/chat/transcriptTailer.js";
 import { codexCommandActivity, toolActivityMessage } from "../src/codex/codexToolActivity.js";
@@ -1109,6 +1109,208 @@ describe("SessionHub actor", () => {
     expect(hub.actors.get("work")?.processingSince).toBeNull();
     expect(hub.actors.get("work")?.pendingQuestion).toBeNull();
     expect(received).toContainEqual({ type: "question_event", session: "work", event: "dismiss", id: "q1" });
+  });
+
+  test("transcript の中断マーカーは処理開始以降のものだけ処理完了へ写像する（Stop hook 不発の補完）", () => {
+    let now = 100;
+    const metadataStore = makeTempStore();
+    metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0, providerSessionId: "provider-1" });
+    const heartbeatDir = makeTempDir("session-hub-interrupt");
+    const lifecycles: Array<(event: { kind: "interrupted"; atMs: number }) => void> = [];
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir, metadataStore, timeoutSeconds: 1800,
+      now: () => now, nowMs: () => now * 1000 + 250,
+      tailFactory: (_write, _codex, onClaudeTurnLifecycle) => {
+        if (onClaudeTurnLifecycle !== undefined) lifecycles.push(onClaudeTurnLifecycle);
+        return { open() {}, stop() {} };
+      },
+    });
+    const client = {};
+    const received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "conversation_subscribe", session: "work" }));
+    expect(lifecycles).toHaveLength(1);
+    const interrupt = lifecycles[0]!;
+
+    hub.handleRelayMessage({ type: "session_processing", session: "work", state: "active" });
+    expect(hub.actors.get("work")?.processingSince).toBe(100);
+    // 開始時刻は ms 精度で heartbeat にも残す（再起動後の照合用。bump しても保持）。
+    expect(readHeartbeat(heartbeatDir, "work")?.sinceMs).toBe(100_250);
+    received.length = 0;
+
+    // 履歴再生で流れる過去ターンのマーカー（処理開始 100_250ms より前）は無視する。
+    // 中断→即再送信（マーカーが新ターンの hook 受信より数十 ms 前）も同じ境界で棄却される。
+    interrupt({ kind: "interrupted", atMs: 99_500 });
+    interrupt({ kind: "interrupted", atMs: 100_200 });
+    expect(hub.actors.get("work")?.processingSince).toBe(100);
+    expect(received).toEqual([]);
+
+    // 現ターンの中断（処理開始以降）は done へ写像し、engine へ broadcast・heartbeat も idle に落とす。
+    now = 130;
+    interrupt({ kind: "interrupted", atMs: 125_000 });
+    expect(hub.actors.get("work")?.processingSince).toBeNull();
+    expect(received).toContainEqual({ type: "session_processing", session: "work", state: "done" });
+    expect(readHeartbeat(heartbeatDir, "work")?.state).toBe("idle");
+
+    // 処理中でなければ何もしない（重複 done を流さない）。
+    received.length = 0;
+    interrupt({ kind: "interrupted", atMs: 126_000 });
+    expect(received).toEqual([]);
+  });
+
+  test("復元後は heartbeat の sinceMs（無ければ復元時刻）以降の中断マーカーだけを採用する", () => {
+    const heartbeatDir = makeTempDir("hub-restore-since");
+    const metadataStore = makeTempStore();
+    metadataStore.put({ name: "with-since", cwd: "/tmp/a", createdAt: 0 });
+    metadataStore.put({ name: "legacy", cwd: "/tmp/b", createdAt: 0 });
+    // ts は tick の bump で進んでいる（=開始時刻ではない）。sinceMs が真の開始時刻。
+    writeHeartbeat(heartbeatDir, "with-since", { ts: 100, state: "active", event: "hub-processing", sinceMs: 60_000 });
+    // hook 直書き（sinceMs 無し）: 復元時刻 100_000ms を境界にする。
+    writeHeartbeat(heartbeatDir, "legacy", { ts: 100, state: "active", event: "PreToolUse" });
+    // 共有 tail は open(cwd) で会話を識別できるので cwd 別に lifecycle callback を控える。
+    const perCwd = new Map<string, (event: { kind: "interrupted"; atMs: number }) => void>();
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir, metadataStore, timeoutSeconds: 1800,
+      now: () => 100, nowMs: () => 100_000,
+      tailFactory: (_write, _codex, onClaudeTurnLifecycle) => ({
+        open(cwd) { if (onClaudeTurnLifecycle) perCwd.set(cwd, onClaudeTurnLifecycle); },
+        stop() {},
+      }),
+    });
+    hub.restoreFromHeartbeats();
+    expect(hub.actors.get("with-since")?.processingSinceMs).toBe(60_000);
+    expect(hub.actors.get("legacy")?.processingSinceMs).toBe(100_000);
+    const client = {};
+    hub.registerClient(client, () => {});
+    for (const session of ["with-since", "legacy"]) {
+      hub.handleClientMessage(client, JSON.stringify({ type: "conversation_subscribe", session }));
+    }
+    // sinceMs（60s）より前の履歴マーカーは棄却、以降は採用。
+    perCwd.get("/tmp/a")!({ kind: "interrupted", atMs: 59_000 });
+    expect(hub.actors.get("with-since")?.processingSince).toBe(100);
+    perCwd.get("/tmp/a")!({ kind: "interrupted", atMs: 61_000 });
+    expect(hub.actors.get("with-since")?.processingSince).toBeNull();
+    // 開き直しの全履歴再生で流れる過去ターンのマーカー（進行中ターンより前）は進行中ターンを落とさない。
+    perCwd.get("/tmp/b")!({ kind: "interrupted", atMs: 99_999 });
+    expect(hub.actors.get("legacy")?.processingSince).toBe(100);
+    perCwd.get("/tmp/b")!({ kind: "interrupted", atMs: 100_000 });
+    expect(hub.actors.get("legacy")?.processingSince).toBeNull();
+  });
+
+  test("ターン開始は UserPromptSubmit だけが進め、継続 hook（Pre/PostToolUse）はマーカーより後に遅着しても境界を動かさない", () => {
+    let nowMs = 1_000_000;
+    const metadataStore = makeTempStore();
+    metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0 });
+    const heartbeatDir = makeTempDir("hub-turn-start");
+    let interrupt: ((event: { kind: "interrupted"; atMs: number }) => void) | undefined;
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir, metadataStore, timeoutSeconds: 1800,
+      now: () => Math.floor(nowMs / 1000), nowMs: () => nowMs,
+      tailFactory: (_write, _codex, onClaudeTurnLifecycle) => ({ open() { interrupt = onClaudeTurnLifecycle; }, stop() {} }),
+    });
+    const client = {};
+    const received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "conversation_subscribe", session: "work" }));
+    hub.handleRelayMessage({ type: "session_processing", session: "work", state: "active", event: "UserPromptSubmit" });
+    expect(hub.actors.get("work")?.processingSinceMs).toBe(1_000_000);
+    // ツール実行中の継続 hook は開始時刻を進めない（heartbeat の sinceMs も据え置き）。
+    nowMs = 1_005_200;
+    hub.handleRelayMessage({ type: "session_processing", session: "work", state: "active", event: "PostToolUse" });
+    expect(hub.actors.get("work")?.processingSinceMs).toBe(1_000_000);
+    expect(readHeartbeat(heartbeatDir, "work")?.sinceMs).toBe(1_000_000);
+    // PostToolUse の受信（1_005_200）より前に書かれたマーカー（1_005_080）でも中断として採用する。
+    received.length = 0;
+    interrupt!({ kind: "interrupted", atMs: 1_005_080 });
+    expect(hub.actors.get("work")?.processingSince).toBeNull();
+    expect(received).toContainEqual({ type: "session_processing", session: "work", state: "done" });
+    // 中断直後に遅着した継続 hook の active は残響として無視し、broadcast もしない。hook が直書きした
+    // active の heartbeat はその hook の書込のままなら idle へ戻す。
+    received.length = 0;
+    nowMs = 1_005_400;
+    writeHeartbeat(heartbeatDir, "work", { ts: 1005, state: "active", event: "PreToolUse" });
+    hub.handleRelayMessage({ type: "session_processing", session: "work", state: "active", event: "PreToolUse" });
+    expect(hub.actors.get("work")?.processingSince).toBeNull();
+    expect(received).toEqual([]);
+    expect(readHeartbeat(heartbeatDir, "work")).toMatchObject({ state: "idle", event: "late-hook-after-interrupt" });
+    // 別の書込（新ターンの UserPromptSubmit 直書き）に置き換わっていれば触らない（reaper 保護を剥がさない）。
+    writeHeartbeat(heartbeatDir, "work", { ts: 1005, state: "active", event: "UserPromptSubmit" });
+    hub.handleRelayMessage({ type: "session_processing", session: "work", state: "active", event: "PostToolUse" });
+    expect(hub.actors.get("work")?.processingSince).toBeNull();
+    expect(readHeartbeat(heartbeatDir, "work")).toMatchObject({ state: "active", event: "UserPromptSubmit" });
+    // 新しい発話（UserPromptSubmit）は直後でも新ターンとして採用する。
+    hub.handleRelayMessage({ type: "session_processing", session: "work", state: "active", event: "UserPromptSubmit" });
+    expect(hub.actors.get("work")?.processingSinceMs).toBe(1_005_400);
+    expect(received).toContainEqual({ type: "session_processing", session: "work", state: "active", event: "UserPromptSubmit" });
+    hub.handleRelayMessage({ type: "session_processing", session: "work", state: "done", event: "Stop" });
+    // 窓（3s）を過ぎた継続 hook は通常どおり採用する（UserPromptSubmit の relay 欠落時の回復路）。
+    nowMs = 1_010_000;
+    interrupt!({ kind: "interrupted", atMs: 1_009_000 }); // 処理中でないので no-op（lastInterruptDoneMs も更新しない）
+    hub.handleRelayMessage({ type: "session_processing", session: "work", state: "active", event: "PreToolUse" });
+    expect(hub.actors.get("work")?.processingSince).toBe(1010);
+  });
+
+  test("復元時に transcript 末尾が開始以降の中断マーカーなら処理中に戻さず idle へ確定する", () => {
+    const heartbeatDir = makeTempDir("hub-restore-transcript");
+    const transcriptDir = makeTempDir("hub-restore-transcript-jsonl");
+    const metadataStore = makeTempStore();
+    for (const name of ["interrupted", "resumed", "no-id"]) {
+      metadataStore.put({ name, cwd: `/tmp/${name}`, createdAt: 0,
+        ...(name === "no-id" ? {} : { claudeSessionId: `id-${name}` }) });
+      writeHeartbeat(heartbeatDir, name, { ts: 100, state: "active", event: "hub-processing", sinceMs: 50_000 });
+    }
+    const marker = (ts: string) => JSON.stringify({ type: "user", timestamp: ts, uuid: `m-${ts}`,
+      message: { role: "user", content: [{ type: "text", text: "[Request interrupted by user]" }] } });
+    const prompt = (ts: string) => JSON.stringify({ type: "user", timestamp: ts, uuid: `p-${ts}`,
+      message: { role: "user", content: "続けて" } });
+    const toolResult = JSON.stringify({ type: "user", timestamp: "1970-01-01T00:01:05.000Z", uuid: "tr",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] } });
+    // 開始 50s 以降の中断で終わっている（末尾の tool_result 行は発話ではない）。
+    fs.writeFileSync(path.join(transcriptDir, "id-interrupted.jsonl"),
+      [prompt("1970-01-01T00:00:51.000Z"), marker("1970-01-01T00:01:00.000Z"), toolResult].join("\n") + "\n");
+    // 中断後に新しい発話がある = 進行中の可能性。復元する。
+    fs.writeFileSync(path.join(transcriptDir, "id-resumed.jsonl"),
+      [marker("1970-01-01T00:01:00.000Z"), prompt("1970-01-01T00:01:10.000Z")].join("\n") + "\n");
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir, metadataStore, timeoutSeconds: 1800, now: () => 100,
+      transcriptPathFor: (meta) => meta.claudeSessionId ? path.join(transcriptDir, `${meta.claudeSessionId}.jsonl`) : null,
+    });
+    hub.restoreFromHeartbeats();
+    expect(hub.actors.has("interrupted")).toBe(false);
+    expect(readHeartbeat(heartbeatDir, "interrupted")).toMatchObject({ state: "idle", ts: 100 });
+    expect(hub.actors.get("resumed")?.processingSince).toBe(100);
+    expect(hub.actors.get("no-id")?.processingSince).toBe(100);
+  });
+
+  test("復元の中断判定中に hook が heartbeat を更新していたら idle へ倒さず復元する", () => {
+    const heartbeatDir = makeTempDir("hub-restore-race");
+    const transcriptDir = makeTempDir("hub-restore-race-jsonl");
+    const metadataStore = makeTempStore();
+    metadataStore.put({ name: "racy", cwd: "/tmp/racy", createdAt: 0, claudeSessionId: "id-racy" });
+    writeHeartbeat(heartbeatDir, "racy", { ts: 100, state: "active", event: "hub-processing", sinceMs: 50_000 });
+    fs.writeFileSync(path.join(transcriptDir, "id-racy.jsonl"), JSON.stringify({ type: "user",
+      timestamp: "1970-01-01T00:01:00.000Z", uuid: "m",
+      message: { role: "user", content: "[Request interrupted by user]" } }) + "\n");
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir, metadataStore, timeoutSeconds: 1800, now: () => 100,
+      transcriptPathFor: (meta) => {
+        // 照合の最中に hook が新ターンの active を直書きした状況を再現する。
+        writeHeartbeat(heartbeatDir, "racy", { ts: 101, state: "active", event: "UserPromptSubmit" });
+        return path.join(transcriptDir, `${meta.claudeSessionId}.jsonl`);
+      },
+    });
+    hub.restoreFromHeartbeats();
+    expect(hub.actors.get("racy")?.processingSince).toBe(100);
+    expect(readHeartbeat(heartbeatDir, "racy")).toMatchObject({ ts: 101, state: "active" });
+  });
+
+  test("heartbeat の bump は sinceMs を保持する", () => {
+    const heartbeatDir = makeTempDir("hub-heartbeat-since");
+    writeHeartbeat(heartbeatDir, "s", { ts: 10, state: "active", event: "hub-processing", sinceMs: 9_500 });
+    bumpHeartbeat(heartbeatDir, "s", 20, "daemon-agent-alive", "active");
+    expect(readHeartbeat(heartbeatDir, "s")).toEqual({ ts: 20, state: "active", event: "daemon-agent-alive", sinceMs: 9_500 });
+    writeHeartbeat(heartbeatDir, "s", { ts: 30, state: "idle", event: "hook" });
+    expect(readHeartbeat(heartbeatDir, "s")?.sinceMs).toBeUndefined();
   });
 
   test("active heartbeat から processingSince を復元する（codex と鮮度切れは除外）", () => {
