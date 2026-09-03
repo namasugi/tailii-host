@@ -30,6 +30,7 @@ import {
 import {
   CHAT_BLOCKED_BY_LOGIN_PROMPT,
   extractClaudeInputBox,
+  inputBoxHasRealPendingText,
   inputBoxIsShellMode,
   LoginCodeError,
   paneCommandLooksLikeAgent,
@@ -814,11 +815,22 @@ export class HerdrSessionManager {
    */
   private async inputBoxHasPendingText(name: string): Promise<boolean> {
     try {
-      const box = extractClaudeInputBox(await this.captureVisibleScreen(name));
-      return box !== null && box.text.length > 0;
+      // ANSI で取り、薄字（faint）のプロンプト提案/プレースホルダーを実テキストと数えない
+      // （実障害 2026-09-03: 提案を残留テキストと誤認し Enter で勝手に送信していた）。
+      return inputBoxHasRealPendingText(await this.captureVisibleScreenAnsi(name));
     } catch {
       return false;
     }
+  }
+
+  /** 入力欄判定用に viewport 全体を ANSI 付きで取る（faint 属性で提案/プレースホルダーを見分ける）。 */
+  private async captureVisibleScreenAnsi(name: string): Promise<string> {
+    validateSessionName(name);
+    const target = await this.paneTarget(name);
+    if (target === null) {
+      throw new HerdrFailedError(["pane", "read", name], 1, "pane not found");
+    }
+    return this.readPane(target, ["--source", "visible", "--format", "ansi"]);
   }
 
   /**

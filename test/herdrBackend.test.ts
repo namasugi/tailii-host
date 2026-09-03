@@ -27,6 +27,7 @@ import {
 import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
 import {
   extractClaudeInputBox,
+  inputBoxHasRealPendingText,
   screenHasLoginCodePrompt,
   TmuxSessionManager,
 } from "../src/backend/tmux.js";
@@ -1304,7 +1305,11 @@ describe("TmuxSessionManager と herdr メタの分離", () => {
     const captures = runner.recorded.filter((args) => args[0] === "capture-pane");
     expect(captures.length).toBeGreaterThan(0);
     for (const args of captures) {
-      expect(args).toEqual(["capture-pane", "-p", "-t", "s-t"]);
+      // text 版（判定/ログ用）と ANSI 版（faint でプロンプト提案を見分ける -e 付き）の
+      // どちらでも良いが、いずれも viewport のみ（`-S` スクロールバック無し）であること。
+      const isPlain = JSON.stringify(args) === JSON.stringify(["capture-pane", "-p", "-t", "s-t"]);
+      const isAnsi = JSON.stringify(args) === JSON.stringify(["capture-pane", "-p", "-e", "-t", "s-t"]);
+      expect(isPlain || isAnsi).toBe(true);
       expect(args).not.toContain("-S");
     }
   });
@@ -1531,5 +1536,64 @@ describe("launchCore herdr backend", () => {
     expect(await launchCore(launchOptions(dir, store, runner))).toBe(1);
     expect(recorded).toContainEqual(["pane", "close", "w9:p7"]);
     expect(store.get("s-h")).toBeNull();
+  });
+});
+
+
+// ANSI(faint)でプロンプト提案/プレースホルダーを実テキストと見分ける（inputBoxHasRealPendingText）。
+// 提案は Enter で即送信されるため、残留 flush 判定がこれを実テキストと誤認すると勝手に
+// 送信されてしまう（実障害 2026-09-03）。実測の ANSI 構造（herdr pane read --format ansi）:
+//   提案:   ❯␠ESC[0m ESC[2m<本文>ESC[0m   … 本文が faint(SGR 2)
+//   実入力: ❯␠<本文>                         … faint 無し
+describe("inputBoxHasRealPendingText (faint = 提案/プレースホルダーは実テキスト扱いしない)", () => {
+  const ESC = "\u001b";
+  const RULE = "─".repeat(40);
+  const RESET = ESC + "[0m";
+  const FAINT = ESC + "[2m";
+  const box = (bodyLines: string[]) => [RULE, ...bodyLines, RULE].join("\n");
+
+  test("薄字のプロンプト提案は実テキストではない", () => {
+    const screen = box([`❯ ${RESET}${FAINT}resilient-chat-sync-tasks.md のフォローアップを見せて${RESET}`]);
+    expect(inputBoxHasRealPendingText(screen)).toBe(false);
+  });
+
+  test("薄字プレースホルダー(Press up to edit queued messages)は実テキストではない", () => {
+    const screen = box([`❯ ${FAINT}Press up to edit queued messages${RESET}`]);
+    expect(inputBoxHasRealPendingText(screen)).toBe(false);
+  });
+
+  test("空の入力欄は実テキストではない", () => {
+    expect(inputBoxHasRealPendingText(box(["❯ "]))).toBe(false);
+    expect(inputBoxHasRealPendingText(box(["❯ "]))).toBe(false);
+  });
+
+  test("利用者の未送信テキスト(faint 無し)は実テキストと判定する", () => {
+    expect(inputBoxHasRealPendingText(box(["❯ 本物の本文"]))).toBe(true);
+  });
+
+  test("色付き(bright white)の実テキストは faint ではないので実テキスト扱い", () => {
+    const screen = box([`❯ ${ESC}[38;2;255;255;255mテスト${RESET}`]);
+    expect(inputBoxHasRealPendingText(screen)).toBe(true);
+  });
+
+  test("中断後の queued 書き戻し(faint 無し・複数行)は実テキスト扱い", () => {
+    const screen = box(["❯ 1行目の本文", "  2行目の本文"]);
+    expect(inputBoxHasRealPendingText(screen)).toBe(true);
+  });
+
+  test("罫線が無い画面は最後の ❯ 行で判定する(実テキスト/提案)", () => {
+    expect(inputBoxHasRealPendingText("会話本文\n❯ 実テキスト")).toBe(true);
+    expect(inputBoxHasRealPendingText(`会話本文\n❯ ${FAINT}提案${RESET}`)).toBe(false);
+  });
+
+  test("入力欄が見つからない画面は false(fail-open)", () => {
+    expect(inputBoxHasRealPendingText("何も無い画面")).toBe(false);
+  });
+
+  test("実テキストの直後に薄字ヒントが混じっても実テキスト有りと判定する", () => {
+    // 提案は空入力時のみ描画されるため実際には共存しないが、保守的に「faint でない可視文字が
+    // 1 つでもあれば実テキスト有り」を保証する。
+    const screen = box([`❯ 本文${FAINT} hint${RESET}`]);
+    expect(inputBoxHasRealPendingText(screen)).toBe(true);
   });
 });

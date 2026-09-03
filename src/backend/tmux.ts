@@ -132,6 +132,126 @@ function isInputPlaceholder(text: string): boolean {
   return text.startsWith("Message @") && text.endsWith("…");
 }
 
+/** SGR カラー/属性エスケープ（`ESC[…m`）を除いた素のテキスト。 */
+function stripSgr(line: string): string {
+  // eslint-disable-next-line no-control-regex
+  return line.replace(/\[[0-9;]*m/g, "");
+}
+
+/**
+ * claude TUI の「プロンプト提案」（2.1.25x 頃〜。空の入力欄に薄字で次の一手を提示し、
+ * → / Tab で採用、Enter で即送信される）と空入力プレースホルダーは、いずれも通常の
+ * 未送信テキストと**同じ入力欄位置**に描画される。`--format text`（SGR 除去済み）では
+ * 本文と区別できないため、注入の残留 flush 判定・送信確定ループがこれらを実テキストと
+ * 誤認し、Enter で提案をそのまま送信してしまう（実障害 2026-09-03: iPhone 送信のたびに
+ * AI の提案文が勝手に送られ、送信が壊れる）。
+ *
+ * 決定的シグナル: 提案もプレースホルダーも本文が SGR 2（faint/薄字）で描画される。
+ * 利用者入力・中断時の queued 書き戻しは faint ではない（実測 herdr `pane read --format
+ * ansi` 2026-09-03: 提案は 本文が ESC[2m 包み、実テキストは faint 無し）。
+ *
+ * ANSI 画面から入力欄本文を切り出し、本文の可視文字がすべて faint なら「実テキスト無し」
+ * とみなす（＝提案/プレースホルダー）。faint でない可視文字が 1 つでもあれば実テキスト有り。
+ * 判定不能（罫線が見つからない・本文空）は false。
+ */
+export function inputBoxHasRealPendingText(ansiScreen: string): boolean {
+  const rawLines = ansiScreen.split("\n").map((line) => line.replace(/\r$/, ""));
+  const stripped = rawLines.map((line) => stripSgr(line).trim());
+
+  // 罫線ペアで入力欄領域を特定する（extractClaudeInputBox と同じ規則を SGR 除去後の行へ）。
+  let bottom = -1;
+  for (let index = stripped.length - 1; index >= 0; index -= 1) {
+    if (isInputBoxRuleLine(stripped[index] ?? "")) {
+      bottom = index;
+      break;
+    }
+  }
+  let top = -1;
+  for (let index = bottom - 1; index >= 0; index -= 1) {
+    if (isInputBoxRuleLine(stripped[index] ?? "")) {
+      top = index;
+      break;
+    }
+  }
+  let bodyRaw: string[];
+  if (top >= 0 && bottom > top) {
+    bodyRaw = rawLines.slice(top + 1, bottom);
+  } else {
+    // 罫線が無い画面は最後の `❯` 行 1 行だけを入力欄とみなす（extractClaudeInputBox と同型）。
+    let sigilIndex = -1;
+    for (let index = stripped.length - 1; index >= 0; index -= 1) {
+      if ((stripped[index] ?? "").startsWith("❯")) {
+        sigilIndex = index;
+        break;
+      }
+    }
+    if (sigilIndex < 0) return false;
+    bodyRaw = [rawLines[sigilIndex] ?? ""];
+  }
+
+  // プレースホルダー（文言一致）は faint 検出の前に空扱いする（後方互換・二重の安全網）。
+  const box = extractClaudeInputBox(stripped.join("\n"));
+  if (box === null || box.text.length === 0) return false;
+
+  return !bodyIsFaintOnly(bodyRaw);
+}
+
+/**
+ * 入力欄本文（ANSI 付き raw 行）の可視文字がすべて faint（SGR 2）か。
+ * SGR 状態を文字送りで追い（0 = 全リセット / 2 = faint on / 22 = faint off）、
+ * 空白・モード記号（`❯ › !`）以外の可視文字だけを評価する。可視文字が 1 つも無ければ false。
+ */
+function bodyIsFaintOnly(bodyRaw: string[]): boolean {
+  const ESC = "";
+  const NBSP = " ";
+  let faint = false;
+  let sawPrintable = false;
+  let allFaint = true;
+  for (const line of bodyRaw) {
+    let index = 0;
+    while (index < line.length) {
+      if (line[index] === ESC && line[index + 1] === "[") {
+        // eslint-disable-next-line no-control-regex
+        const match = /^\[([0-9;]*)m/.exec(line.slice(index));
+        if (match) {
+          const params = match[1] ?? "";
+          const codes = params === "" ? [0] : params.split(";").map((code) => Number(code));
+          // SGR を左から評価する。38/48（前景/背景色）は 2;r;g;b または 5;n の
+          // サブパラメータを従えるため、その分を読み飛ばす（`38;2;255;255;255` の `2` を
+          // faint(SGR 2) と誤認しない — この取り違えが色付き実テキストの誤判定原因だった）。
+          for (let cursor = 0; cursor < codes.length; cursor += 1) {
+            const code = codes[cursor];
+            if (code === 38 || code === 48) {
+              const mode = codes[cursor + 1];
+              cursor += mode === 2 ? 4 : mode === 5 ? 2 : 1;
+              continue;
+            }
+            if (code === 0 || code === 22) faint = false;
+            else if (code === 2) faint = true;
+          }
+          index += match[0].length;
+          continue;
+        }
+      }
+      const ch = line[index] ?? "";
+      // 空白・NBSP・モード記号は本文の可視性判定から除外する（記号の色は faint とは限らない）。
+      if (
+        ch !== " " &&
+        ch !== NBSP &&
+        ch !== "\t" &&
+        ch !== "❯" &&
+        ch !== "›" &&
+        ch !== "!"
+      ) {
+        sawPrintable = true;
+        if (!faint) allFaint = false;
+      }
+      index += 1;
+    }
+  }
+  return sawPrintable && allFaint;
+}
+
 /**
  * `/login` の OAuth コード入力待ち行（実測 claude 2.1.241: `Paste code here if prompted >`）。
  * ブラウザで取得したコードを貼る唯一の入力面で、通常の入力欄（罫線ペア）は描画されない。
@@ -614,8 +734,10 @@ export class TmuxSessionManager {
     // 注入すると今回の本文がその後ろへ連結され 1 メッセージになる（実機FB 2026-07-29）。
     // 残存は先に Enter で独立メッセージとして送信し切ってから注入する。空入力への
     // Enter は no-op なので誤検出は無害（herdr 側 sendTextSubmit と同じ防御）。
-    const box = screen === null ? null : extractClaudeInputBox(screen);
-    if (box !== null && box.text.length > 0) {
+    // 判定は ANSI で行い、薄字（faint）のプロンプト提案/プレースホルダーを実テキストと
+    // 数えない（実障害 2026-09-03: 提案を残留と誤認し Enter で勝手に送信していた）。
+    const ansiScreen = await this.captureVisibleScreenAnsiOrNull(name);
+    if (ansiScreen !== null && inputBoxHasRealPendingText(ansiScreen)) {
       await this.sendKeys(name, ["Enter"]);
       await new Promise((resolve) => setTimeout(resolve, 300));
     }
@@ -689,6 +811,22 @@ export class TmuxSessionManager {
     if (result.exitCode !== 0) {
       throw new TmuxFailedError(args, result.exitCode, result.stderr);
     }
+    const lines = result.stdout.split("\n");
+    while (lines.length > 0 && (lines[lines.length - 1] ?? "").trim() === "") {
+      lines.pop();
+    }
+    return lines.join("\n");
+  }
+
+  /**
+   * viewport 全体を ANSI エスケープ付き（`capture-pane -e`）で取る。faint（SGR 2）属性で
+   * プロンプト提案/プレースホルダーを実テキストと見分けるのに使う（inputBoxHasRealPendingText）。
+   * 判定不能=capture 失敗は null（fail-open）。
+   */
+  private async captureVisibleScreenAnsiOrNull(name: string): Promise<string | null> {
+    const args = ["capture-pane", "-p", "-e", "-t", this.paneTarget(name)];
+    const result = await this.runner(args);
+    if (result.exitCode !== 0) return null;
     const lines = result.stdout.split("\n");
     while (lines.length > 0 && (lines[lines.length - 1] ?? "").trim() === "") {
       lines.pop();
