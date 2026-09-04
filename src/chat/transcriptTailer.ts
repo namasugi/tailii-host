@@ -21,6 +21,7 @@ import {
 } from "../protocol.js";
 import { isInjectedSkillContent } from "../shared/skillInjection.js";
 import { abortableSleep } from "../shared/sleep.js";
+import { systemNoticeText } from "../shared/systemNotice.js";
 
 /** 履歴再生完了マーカーの streamId（iOS 側 `ChatLogModel` と対で解釈する）。 */
 export const HISTORY_DONE_STREAM_ID = "pc:history-done";
@@ -540,6 +541,11 @@ export function extractTurn(line: string): Turn | null {
     if (rec["subtype"] === "local_command" && content.includes("<")) {
       return { ...emptyTurn, role: "user", text: content };
     }
+    // 利用者に意味のある通知（モデル自動切替 / API エラー / 会話圧縮 / warning・error 級）を
+    // 日本語の system 注記へ（system-notice）。握り潰すと「理由なくモデルが変わった」ように
+    // 見える（2026-09-04 実障害: model_refusal_fallback）。転写規則は shared/systemNotice.ts。
+    const notice = systemNoticeText(rec);
+    if (notice !== null) return { ...emptyTurn, role: "system", text: notice };
     return null;
   }
 

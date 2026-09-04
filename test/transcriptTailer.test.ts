@@ -331,6 +331,26 @@ describe("TranscriptTailer", () => {
     ]);
   });
 
+  test("system 通知（モデル自動切替 / 圧縮 / warning 級）を日本語の system 注記として流し、派生行は落とす（system-notice）", async () => {
+    const p = writeTranscript([
+      // 実測 2026-09-03: Fable 5.1 のセーフガード退け → Opus 4.8 へ自動フォールバック。
+      '{"type":"system","subtype":"model_refusal_fallback","level":"warning","content":"Fable 5.1\'s safeguards flagged this message. Switched to Opus 4.8.","originalModel":"claude-fable-5-1","fallbackModel":"claude-opus-4-8","apiRefusalCategory":"cyber","uuid":"mf1"}',
+      '{"type":"system","subtype":"compact_boundary","level":"info","content":"Conversation compacted","compactMetadata":{"trigger":"auto","preTokens":1000,"postTokens":100},"uuid":"cb1"}',
+      '{"type":"system","subtype":"informational","level":"warning","content":"Remote Control disconnected — /login","uuid":"rc1"}',
+      // 派生・内部情報は流さない。
+      '{"type":"system","subtype":"turn_duration","content":"5s","uuid":"td1"}',
+      '{"type":"system","subtype":"away_summary","content":"要約","uuid":"as1"}',
+    ]);
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
+    const chats = (await collect(tailer.streamTranscript(p))).filter((m) => m.type === "chat_output");
+    expect(chats.map((m) => (m.type === "chat_output" ? [m.streamId, m.role, m.text] : null))).toEqual([
+      ["mf1", "system",
+        "⚠️ セーフガードにより Fable 5.1 が応答を退けたため、Opus 4.8 へ切り替えました（判定: cyber）。以降この会話は Opus 4.8 で応答します。/model で変更できます。"],
+      ["cb1", "system", "🧹 会話を自動で圧縮しました（1,000 → 100 tokens）。これより前の詳細は要約に置き換わっています。"],
+      ["rc1", "system", "⚠️ Remote Control disconnected — /login"],
+    ]);
+  });
+
   test("uuid が無いターンは連番 streamId（turn-N）を振る", async () => {
     const p = writeTranscript(['{"type":"user","message":{"role":"user","content":"x"}}']);
     const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
