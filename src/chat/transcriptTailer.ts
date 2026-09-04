@@ -21,7 +21,12 @@ import {
 } from "../protocol.js";
 import { isInjectedSkillContent } from "../shared/skillInjection.js";
 import { abortableSleep } from "../shared/sleep.js";
-import { systemNoticeText } from "../shared/systemNotice.js";
+import {
+  createSystemNoticeContext,
+  fallbackBlockNotice,
+  systemNoticeText,
+  type SystemNoticeContext,
+} from "../shared/systemNotice.js";
 
 /** 履歴再生完了マーカーの streamId（iOS 側 `ChatLogModel` と対で解釈する）。 */
 export const HISTORY_DONE_STREAM_ID = "pc:history-done";
@@ -156,6 +161,8 @@ interface TailState {
   lastModel: string | null;
   lastContextTokens: number | null;
   lastEffort: string | null;
+  /** system 注記の連投・重複抑止（api_error の再試行 / 同一警告 / fallback 二重告知, system-notice）。 */
+  noticeCtx: SystemNoticeContext;
   activeQuestionIds: Set<string>;
   /** 本文待ちの Skill ツールカード（tool_use id → 発行済み activity）。 */
   pendingSkillActivities: Map<string, ToolActivity>;
@@ -277,6 +284,7 @@ export class TranscriptTailer {
         lastModel: null,
         lastContextTokens: null,
         lastEffort: null,
+        noticeCtx: createSystemNoticeContext(),
         activeQuestionIds: new Set(),
         pendingSkillActivities: new Map(),
         onLifecycle: this.lifecycleObserver,
@@ -379,7 +387,7 @@ function isSystemRecordLine(line: string): boolean {
 function* emitLine(line: Buffer, state: TailState): Generator<ControlMessage, void, void> {
   const text = line.toString("utf8").replaceAll("\r", "");
   if (!text) return;
-  const turn = extractTurn(text);
+  const turn = extractTurn(text, state.noticeCtx);
   if (turn === null) return;
 
   // 中断確定マーカー: ターン終了の権威（Stop hook は中断で発火しない）。表示用の chat_output
@@ -485,7 +493,7 @@ function* emitLine(line: Buffer, state: TailState): Generator<ControlMessage, vo
 }
 
 /** JSONL の 1 行から assistant/user ターンを寛容に抽出する（形式依存を 1 関数に集約）。 */
-export function extractTurn(line: string): Turn | null {
+export function extractTurn(line: string, ctx?: SystemNoticeContext): Turn | null {
   let obj: unknown;
   try {
     obj = JSON.parse(line);
@@ -544,7 +552,7 @@ export function extractTurn(line: string): Turn | null {
     // 利用者に意味のある通知（モデル自動切替 / API エラー / 会話圧縮 / warning・error 級）を
     // 日本語の system 注記へ（system-notice）。握り潰すと「理由なくモデルが変わった」ように
     // 見える（2026-09-04 実障害: model_refusal_fallback）。転写規則は shared/systemNotice.ts。
-    const notice = systemNoticeText(rec);
+    const notice = systemNoticeText(rec, ctx);
     if (notice !== null) return { ...emptyTurn, role: "system", text: notice };
     return null;
   }
@@ -583,6 +591,19 @@ export function extractTurn(line: string): Turn | null {
   const rawEffort = rec["effort"];
   const effort =
     role === "assistant" && typeof rawEffort === "string" && EFFORT_LEVELS.has(rawEffort) ? rawEffort : null;
+  // モデル自動切替の実時刻告知: assistant 行の `fallback` ブロック（from/to）は切替の瞬間に
+  // 書かれ、フォールバック先の最初のツール実行より前に位置する。本文もツールも無いこの行を
+  // system 注記へ転写する（model は残して pc:model マーカーも同じ行で切り替える）。後から
+  // 来る system/model_refusal_fallback は ctx で重複告知を抑える（system-notice）。
+  if (role === "assistant" && text.length === 0 && toolActivities.length === 0) {
+    const fallbackNotice = fallbackBlockNotice(rawContent, ctx);
+    if (fallbackNotice !== null) {
+      return {
+        id, role: "system", text: fallbackNotice,
+        toolActivities: [], questionPrompts: [], toolResultIds: [], model, contextTokens, effort,
+      };
+    }
+  }
   const turn: Turn = { id, role, text, toolActivities, questionPrompts, toolResultIds, model, contextTokens, effort };
   if (injectedSkill && typeof rec["sourceToolUseID"] === "string" && plainText.length > 0) {
     turn.skillInjection = { toolUseId: rec["sourceToolUseID"], text: plainText };

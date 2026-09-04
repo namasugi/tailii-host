@@ -346,9 +346,32 @@ describe("TranscriptTailer", () => {
     expect(chats.map((m) => (m.type === "chat_output" ? [m.streamId, m.role, m.text] : null))).toEqual([
       ["mf1", "system",
         "⚠️ セーフガードにより Fable 5.1 が応答を退けたため、Opus 4.8 へ切り替えました（判定: cyber）。以降この会話は Opus 4.8 で応答します。/model で変更できます。"],
-      ["cb1", "system", "🧹 会話を自動で圧縮しました（1,000 → 100 tokens）。これより前の詳細は要約に置き換わっています。"],
+      ["cb1", "system", "🧹 会話を自動で圧縮しました（1,000 → 100 tokens）。Claude 側の文脈は要約に置き換わりました（アプリの表示はそのまま）。"],
       ["rc1", "system", "⚠️ Remote Control disconnected — /login"],
     ]);
+  });
+
+  test("assistant 行の fallback ブロックで切替を実時刻に告知し、pc:model も同じ行で切り替え、遅れて来る system 行は重複させない（system-notice）", async () => {
+    const p = writeTranscript([
+      '{"type":"assistant","message":{"role":"assistant","model":"claude-fable-5-1","content":[{"type":"text","text":"最初の応答"}]},"uuid":"a1"}',
+      // 実測 2026-09-03 09:17:54: 切替の瞬間。本文もツールも無い fallback ブロックだけの行。
+      '{"type":"assistant","message":{"role":"assistant","model":"claude-opus-4-8","content":[{"type":"fallback","from":{"model":"claude-fable-5-1"},"to":{"model":"claude-opus-4-8"}}]},"uuid":"fb1"}',
+      '{"type":"assistant","message":{"role":"assistant","model":"claude-opus-4-8","content":[{"type":"text","text":"Opus の応答"}]},"uuid":"a2"}',
+      // 09:18:32: 38 秒遅れて書かれる system 行。同じ from→to なので二重告知しない。
+      '{"type":"system","subtype":"model_refusal_fallback","level":"warning","content":"…","originalModel":"claude-fable-5-1","fallbackModel":"claude-opus-4-8","apiRefusalCategory":"cyber","uuid":"mf1"}',
+    ]);
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
+    const chats = (await collect(tailer.streamTranscript(p))).filter((m) => m.type === "chat_output");
+    const rows = chats.map((m) => (m.type === "chat_output" ? [m.streamId, m.role, m.text] : null));
+    expect(rows).toEqual([
+      ["pc:model", "system", "claude-fable-5-1"],
+      ["a1", "assistant", "最初の応答"],
+      // 切替告知は Opus の最初の応答より前、pc:model の切替と同じ行で出る。
+      ["pc:model", "system", "claude-opus-4-8"],
+      ["fb1", "system", "⚠️ Fable 5.1 が応答を退けたため、Opus 4.8 へ切り替えました。以降この会話は Opus 4.8 で応答します。/model で変更できます。"],
+      ["a2", "assistant", "Opus の応答"],
+    ]);
+    expect(rows.some((r) => r?.[0] === "mf1")).toBe(false);
   });
 
   test("uuid が無いターンは連番 streamId（turn-N）を振る", async () => {
