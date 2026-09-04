@@ -29,6 +29,7 @@ import {
   extractClaudeInputBox,
   extractInputBoxSuggestion,
   inputBoxHasRealPendingText,
+  inputBoxRealText,
   screenHasLoginCodePrompt,
   TmuxSessionManager,
 } from "../src/backend/tmux.js";
@@ -1643,5 +1644,41 @@ describe("extractInputBoxSuggestion (薄字の提案本文だけを取り出す)
 
   test("入力欄が無い画面 → null", () => {
     expect(extractInputBoxSuggestion("何も無い画面")).toBeNull();
+  });
+});
+
+
+// inputBoxRealText: 実テキスト(薄字提案/プレースホルダー除外)の tri-state。null=入力欄不明・
+// ""=空 or 提案/プレースホルダー・それ以外=実テキスト。clearInputBox の空判定と
+// inputBoxContainsText の probe 照合が提案を実テキストと誤認するのを塞ぐ土台（S2 修正）。
+describe("inputBoxRealText (提案/プレースホルダーを除いた実テキストの tri-state)", () => {
+  const ESC = "\u001b";
+  const RULE = "─".repeat(40);
+  const RESET = ESC + "[0m";
+  const FAINT = ESC + "[2m";
+  const box = (bodyLines: string[]) => [RULE, ...bodyLines, RULE, "  auto mode on"].join("\n");
+
+  test("入力欄が見つからない画面は null", () => {
+    expect(inputBoxRealText("何も無い画面")).toBeNull();
+  });
+
+  test("空の入力欄は ''", () => {
+    expect(inputBoxRealText(box(["❯ "]))).toBe("");
+  });
+
+  test("薄字プロンプト提案は '' (実テキスト無し)", () => {
+    expect(inputBoxRealText(box([`❯ ${RESET}${FAINT}次の一手の提案${RESET}`]))).toBe("");
+  });
+
+  test("薄字プレースホルダーは '' (実テキスト無し)", () => {
+    expect(inputBoxRealText(box([`❯ ${FAINT}Press up to edit queued messages${RESET}`]))).toBe("");
+  });
+
+  test("実テキスト(faint 無し)はそのまま返す", () => {
+    expect(inputBoxRealText(box(["❯ 本物の下書き"]))).toBe("本物の下書き");
+  });
+
+  test("色付き(bright)実テキストも返す(truecolor の 2 を faint と誤認しない)", () => {
+    expect(inputBoxRealText(box([`❯ ${ESC}[38;2;255;255;255m色付き下書き${RESET}`]))).toBe("色付き下書き");
   });
 });
