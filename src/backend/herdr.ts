@@ -31,6 +31,7 @@ import {
   CHAT_BLOCKED_BY_LOGIN_PROMPT,
   extractClaudeInputBox,
   inputBoxHasRealPendingText,
+  inputBoxRealText,
   inputBoxIsShellMode,
   LoginCodeError,
   paneCommandLooksLikeAgent,
@@ -694,8 +695,11 @@ export class HerdrSessionManager {
    */
   private async inputBoxContainsText(name: string, probe: string): Promise<boolean> {
     try {
-      const box = extractClaudeInputBox(await this.captureVisibleScreen(name));
-      return box !== null && inputBoxTextIncludesProbe(box.text, probe);
+      // ANSI で取り、薄字プロンプト提案/プレースホルダーを実テキストと数えない
+      // （提案が probe を含むと偽陽性で「反映済み」→ 空入力+提案への Enter で提案を
+      //   送信していた, prompt-suggestion-chip / 2026-09-04 レビュー指摘）。
+      const realText = inputBoxRealText(await this.captureVisibleScreenAnsi(name));
+      return realText !== null && inputBoxTextIncludesProbe(realText, probe);
     } catch {
       return false;
     }
@@ -724,15 +728,17 @@ export class HerdrSessionManager {
         // 走査すると、チャット本文に残る閉じたダイアログの転写（「Enter to select」行）を
         // 誤検出して、クリアできる場面でも常に諦めてしまう（08-03 の窓設計と同じ理由）。
         if (await this.selectionDialogVisible(name)) return false;
-        const box = extractClaudeInputBox(await this.captureVisibleScreen(name));
-        if (box === null) return false;
-        if (box.text.replace(/\s+/g, "").length === 0) return true;
+        // 薄字プロンプト提案は「実テキスト無し」= 空扱い（C-u で消えないのに非空判定して
+        // 15 回撃ち込み失敗へ退化するのを塞ぐ, prompt-suggestion-chip）。null = 入力欄不明。
+        const realText = inputBoxRealText(await this.captureVisibleScreenAnsi(name));
+        if (realText === null) return false;
+        if (realText.replace(/\s+/g, "").length === 0) return true;
         await this.sendKeys(name, [KILL_LINE_SEQUENCE], true);
         await new Promise((resolve) => setTimeout(resolve, this.clearKeyDelayMs));
       }
       // 上限到達時も最後の C-u の結果は未観測なので、最終状態を見てから判定する。
-      const box = extractClaudeInputBox(await this.captureVisibleScreen(name));
-      return box !== null && box.text.replace(/\s+/g, "").length === 0;
+      const realText = inputBoxRealText(await this.captureVisibleScreenAnsi(name));
+      return realText !== null && realText.replace(/\s+/g, "").length === 0;
     } catch {
       return false;
     }

@@ -380,23 +380,23 @@ describe("PanePreviewPump", () => {
 
     pump.start("work");
     await flushMicrotasks();
-    // 空入力の初回: 提案なし("")を一度だけ配信（null=未配信からの変化）。
+    // 空入力の初回（未配信 null → 提案なし ""）は流さない（購読開始のたびの無駄打ち回避）。
     await vi.advanceTimersByTimeAsync(10);
-    expect(suggestions().map((m) => m.text)).toEqual([""]);
+    expect(suggestions().map((m) => m.text)).toEqual([]);
 
     // 提案が現れたら本文を配信する。
     ansi = suggestionScreen("READMEを要約して");
     await vi.advanceTimersByTimeAsync(10);
-    expect(suggestions().map((m) => m.text)).toEqual(["", "READMEを要約して"]);
+    expect(suggestions().map((m) => m.text)).toEqual(["READMEを要約して"]);
 
     // 変化がなければ再配信しない。
     await vi.advanceTimersByTimeAsync(10);
-    expect(suggestions().map((m) => m.text)).toEqual(["", "READMEを要約して"]);
+    expect(suggestions().map((m) => m.text)).toEqual(["READMEを要約して"]);
 
     // 提案が消えたらクリア("")を配信する。
     ansi = emptyScreen;
     await vi.advanceTimersByTimeAsync(10);
-    expect(suggestions().map((m) => m.text)).toEqual(["", "READMEを要約して", ""]);
+    expect(suggestions().map((m) => m.text)).toEqual(["READMEを要約して", ""]);
 
     pump.stop();
   });

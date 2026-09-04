@@ -319,7 +319,12 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
     const payload = decodeHubControlPayload(record["payload"]);
     if (payload === null) return null;
     if (record["type"] === "conversation_pane_preview") {
-      return payload.type === "pane_preview" ? { type: record["type"], session, payload } : null;
+      // pane_preview 封筒は pane_preview 本体に加え、pump が同じ writer で流す input_suggestion
+      // （プロンプト提案チップ）も運ぶ。ここを pane_preview 限定にすると提案が hub→engine 境界で
+      // 落ち、iOS に届かない（prompt-suggestion-chip 配信の実体）。
+      return payload.type === "pane_preview" || payload.type === "input_suggestion"
+        ? { type: record["type"], session, payload }
+        : null;
     }
     if (record["type"] === "conversation_mode") {
       return payload.type === "mode_set_response" ? { type: record["type"], session, payload } : null;

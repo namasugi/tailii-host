@@ -135,7 +135,7 @@ function isInputPlaceholder(text: string): boolean {
 /** SGR カラー/属性エスケープ（`ESC[…m`）を除いた素のテキスト。 */
 function stripSgr(line: string): string {
   // eslint-disable-next-line no-control-regex
-  return line.replace(/\[[0-9;]*m/g, "");
+  return line.replace(/\u001b\[[0-9;]*m/g, "");
 }
 
 /**
@@ -157,6 +157,19 @@ function stripSgr(line: string): string {
 export function inputBoxHasRealPendingText(ansiScreen: string): boolean {
   const analysis = analyzeInputBox(ansiScreen);
   return analysis !== null && analysis.text.length > 0 && !analysis.faintOnly;
+}
+
+/**
+ * 入力欄の「実テキスト」（薄字プロンプト提案・プレースホルダーを除いた未送信本文）を返す。
+ * `null` = 入力欄が見つからない（罫線が窓外・描画崩れ）、`""` = 空 or 提案/プレースホルダー、
+ * それ以外 = 実テキスト。text capture の box.text を使う判定（clearInputBox の空判定・
+ * inputBoxContainsText の probe 照合）が提案を実テキストと誤認するのを塞ぐため、ANSI から
+ * faint を見て実テキストだけを取り出す（prompt-suggestion-chip）。
+ */
+export function inputBoxRealText(ansiScreen: string): string | null {
+  const analysis = analyzeInputBox(ansiScreen);
+  if (analysis === null) return null;
+  return analysis.faintOnly ? "" : analysis.text;
 }
 
 /**
@@ -223,7 +236,7 @@ function analyzeInputBox(ansiScreen: string): { text: string; faintOnly: boolean
  * 空白・モード記号（`❯ › !`）以外の可視文字だけを評価する。可視文字が 1 つも無ければ false。
  */
 function bodyIsFaintOnly(bodyRaw: string[]): boolean {
-  const ESC = "";
+  const ESC = "\u001b";
   const NBSP = " ";
   let faint = false;
   let sawPrintable = false;
@@ -233,7 +246,7 @@ function bodyIsFaintOnly(bodyRaw: string[]): boolean {
     while (index < line.length) {
       if (line[index] === ESC && line[index + 1] === "[") {
         // eslint-disable-next-line no-control-regex
-        const match = /^\[([0-9;]*)m/.exec(line.slice(index));
+        const match = /^\u001b\[([0-9;]*)m/.exec(line.slice(index));
         if (match) {
           const params = match[1] ?? "";
           const codes = params === "" ? [0] : params.split(";").map((code) => Number(code));
@@ -845,14 +858,20 @@ export class TmuxSessionManager {
    * 判定不能=capture 失敗は null（fail-open）。
    */
   private async captureVisibleScreenAnsiOrNull(name: string): Promise<string | null> {
-    const args = ["capture-pane", "-p", "-e", "-t", this.paneTarget(name)];
-    const result = await this.runner(args);
-    if (result.exitCode !== 0) return null;
-    const lines = result.stdout.split("\n");
-    while (lines.length > 0 && (lines[lines.length - 1] ?? "").trim() === "") {
-      lines.pop();
+    // 判定不能は fail-open で null（残留 flush 判定を止めない）。exitCode≠0 だけでなく
+    // runner の reject（spawn 失敗など）も握る（text 側 captureVisibleScreenOrNull と同じ約束）。
+    try {
+      const args = ["capture-pane", "-p", "-e", "-t", this.paneTarget(name)];
+      const result = await this.runner(args);
+      if (result.exitCode !== 0) return null;
+      const lines = result.stdout.split("\n");
+      while (lines.length > 0 && (lines[lines.length - 1] ?? "").trim() === "") {
+        lines.pop();
+      }
+      return lines.join("\n");
+    } catch {
+      return null;
     }
-    return lines.join("\n");
   }
 
   /** SessionBackend: プロンプト提案抽出用の viewport ANSI キャプチャ（失敗は throw）。 */

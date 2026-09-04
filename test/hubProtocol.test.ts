@@ -267,3 +267,35 @@ describe("hubProtocol conversation event", () => {
     });
   });
 });
+
+describe("hubProtocol pane_preview 封筒", () => {
+  test("input_suggestion payload を pane_preview 封筒で往復する（prompt-suggestion-chip）", () => {
+    // pump は input_suggestion を conversation_pane_preview 封筒で流す。封筒 decode が
+    // pane_preview 限定だと提案が hub→engine 境界で落ちて iOS に届かない（S1 レビュー指摘）。
+    const envelope: HubServerMessage = {
+      type: "conversation_pane_preview",
+      session: "work",
+      payload: { type: "input_suggestion", v: 2, session: "work", text: "READMEを要約して" },
+    };
+    const decoded = decodeHubServerLine(encodeHubMessage(envelope));
+    expect(decoded).toEqual(envelope);
+  });
+
+  test("pane_preview payload も従来どおり封筒で往復する", () => {
+    const envelope: HubServerMessage = {
+      type: "conversation_pane_preview",
+      session: "work",
+      payload: { type: "pane_preview", v: 2, session: "work", seq: 3, active: true, text: "…" },
+    };
+    expect(decodeHubServerLine(encodeHubMessage(envelope))).toEqual(envelope);
+  });
+
+  test("pane_preview 封筒は無関係な payload 型を落とす", () => {
+    const line = JSON.stringify({
+      type: "conversation_pane_preview",
+      session: "work",
+      payload: { type: "chat_output", v: 2, streamId: "x", role: "assistant", text: "y", eof: true },
+    });
+    expect(decodeHubServerLine(line)).toBeNull();
+  });
+});

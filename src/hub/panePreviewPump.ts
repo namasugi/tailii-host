@@ -244,10 +244,13 @@ export class PanePreviewPump {
         try {
           const ansi = await this.captureSuggestion(session);
           const suggestion = extractInputBoxSuggestion(ansi) ?? "";
-          if (suggestion !== this.lastSuggestion) {
-            this.lastSuggestion = suggestion;
+          // 未配信（null）から「提案なし("")」への遷移は流さない（購読開始のたびの無駄打ちを避ける）。
+          // 以降は変化時だけ流す。baseline は常に更新して後続の遷移検出を成立させる。
+          const firstEmptyBaseline = this.lastSuggestion === null && suggestion === "";
+          if (suggestion !== this.lastSuggestion && !firstEmptyBaseline) {
             this.emitSuggestion(session, suggestion);
           }
+          this.lastSuggestion = suggestion;
         } catch {
           // capture 失敗は無視（次周期で再試行。提案は補助機能なので表に出さない）。
         }
