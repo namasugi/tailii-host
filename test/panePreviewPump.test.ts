@@ -354,4 +354,66 @@ describe("PanePreviewPump", () => {
 
     pump.stop();
   });
+
+  test("captureSuggestion: 薄字の提案を input_suggestion として変化時だけ流す（prompt-suggestion-chip）", async () => {
+    vi.useFakeTimers();
+    const ESC = "\u001b";
+    const RULE = "─".repeat(40);
+    const suggestionScreen = (body: string) =>
+      [RULE, `❯ ${ESC}[0m${ESC}[2m${body}${ESC}[0m`, RULE, "  auto mode on"].join("\n");
+    const emptyScreen = [RULE, "❯ ", RULE, "  auto mode on"].join("\n");
+
+    let ansi = emptyScreen;
+    const { writer, messages } = memoryWriter();
+    const pump = new PanePreviewPump({
+      writer,
+      capture: async () => "static",
+      captureSuggestion: async () => ansi,
+      pollIntervalMs: 10,
+      suggestionIntervalMs: 10,
+      protocolVersion: () => 2,
+    });
+
+    const suggestions = () =>
+      messages().filter((m): m is Extract<ControlMessage, { type: "input_suggestion" }> =>
+        m.type === "input_suggestion");
+
+    pump.start("work");
+    await flushMicrotasks();
+    // 空入力の初回: 提案なし("")を一度だけ配信（null=未配信からの変化）。
+    await vi.advanceTimersByTimeAsync(10);
+    expect(suggestions().map((m) => m.text)).toEqual([""]);
+
+    // 提案が現れたら本文を配信する。
+    ansi = suggestionScreen("READMEを要約して");
+    await vi.advanceTimersByTimeAsync(10);
+    expect(suggestions().map((m) => m.text)).toEqual(["", "READMEを要約して"]);
+
+    // 変化がなければ再配信しない。
+    await vi.advanceTimersByTimeAsync(10);
+    expect(suggestions().map((m) => m.text)).toEqual(["", "READMEを要約して"]);
+
+    // 提案が消えたらクリア("")を配信する。
+    ansi = emptyScreen;
+    await vi.advanceTimersByTimeAsync(10);
+    expect(suggestions().map((m) => m.text)).toEqual(["", "READMEを要約して", ""]);
+
+    pump.stop();
+  });
+
+  test("captureSuggestion 未指定なら input_suggestion を流さない", async () => {
+    vi.useFakeTimers();
+    const { writer, messages } = memoryWriter();
+    const pump = new PanePreviewPump({
+      writer,
+      capture: async () => "static",
+      pollIntervalMs: 10,
+      protocolVersion: () => 2,
+    });
+    pump.start("work");
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(50);
+    expect(messages().some((m) => m.type === "input_suggestion")).toBe(false);
+    pump.stop();
+  });
 });

@@ -155,6 +155,28 @@ function stripSgr(line: string): string {
  * 判定不能（罫線が見つからない・本文空）は false。
  */
 export function inputBoxHasRealPendingText(ansiScreen: string): boolean {
+  const analysis = analyzeInputBox(ansiScreen);
+  return analysis !== null && analysis.text.length > 0 && !analysis.faintOnly;
+}
+
+/**
+ * claude TUI のプロンプト提案文を取り出す（提案チップ表示用）。
+ * 入力欄本文が薄字(faint)のみ かつ 既知プレースホルダーでない非空テキストのときだけ、その
+ * 本文を返す（＝提案）。空・実テキスト（利用者入力/中断書き戻し）・プレースホルダーは null。
+ * inputBoxHasRealPendingText と同じ解析(analyzeInputBox)を共有し、判定を一貫させる。
+ */
+export function extractInputBoxSuggestion(ansiScreen: string): string | null {
+  const analysis = analyzeInputBox(ansiScreen);
+  if (analysis === null || analysis.text.length === 0) return null;
+  return analysis.faintOnly ? analysis.text : null;
+}
+
+/**
+ * ANSI 画面から入力欄本文の可視テキスト（既知プレースホルダーは "" へ、extractClaudeInputBox
+ * 準拠）と「本文がすべて薄字(faint)か」を返す。罫線ペア or 末尾 `❯` 行で領域を特定する
+ * （extractClaudeInputBox と同型）。入力欄が見つからなければ null。
+ */
+function analyzeInputBox(ansiScreen: string): { text: string; faintOnly: boolean } | null {
   const rawLines = ansiScreen.split("\n").map((line) => line.replace(/\r$/, ""));
   const stripped = rawLines.map((line) => stripSgr(line).trim());
 
@@ -185,15 +207,14 @@ export function inputBoxHasRealPendingText(ansiScreen: string): boolean {
         break;
       }
     }
-    if (sigilIndex < 0) return false;
+    if (sigilIndex < 0) return null;
     bodyRaw = [rawLines[sigilIndex] ?? ""];
   }
 
-  // プレースホルダー（文言一致）は faint 検出の前に空扱いする（後方互換・二重の安全網）。
+  // プレースホルダー（文言一致）は "" 扱い（extractClaudeInputBox が担保・後方互換）。
   const box = extractClaudeInputBox(stripped.join("\n"));
-  if (box === null || box.text.length === 0) return false;
-
-  return !bodyIsFaintOnly(bodyRaw);
+  if (box === null) return null;
+  return { text: box.text, faintOnly: bodyIsFaintOnly(bodyRaw) };
 }
 
 /**
@@ -827,6 +848,21 @@ export class TmuxSessionManager {
     const args = ["capture-pane", "-p", "-e", "-t", this.paneTarget(name)];
     const result = await this.runner(args);
     if (result.exitCode !== 0) return null;
+    const lines = result.stdout.split("\n");
+    while (lines.length > 0 && (lines[lines.length - 1] ?? "").trim() === "") {
+      lines.pop();
+    }
+    return lines.join("\n");
+  }
+
+  /** SessionBackend: プロンプト提案抽出用の viewport ANSI キャプチャ（失敗は throw）。 */
+  async captureVisibleAnsi(name: string): Promise<string> {
+    validateSessionName(name);
+    const args = ["capture-pane", "-p", "-e", "-t", this.paneTarget(name)];
+    const result = await this.runner(args);
+    if (result.exitCode !== 0) {
+      throw new TmuxFailedError(args, result.exitCode, result.stderr);
+    }
     const lines = result.stdout.split("\n");
     while (lines.length > 0 && (lines[lines.length - 1] ?? "").trim() === "") {
       lines.pop();

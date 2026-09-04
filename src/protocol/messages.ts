@@ -423,6 +423,11 @@ export type ControlMessage =
       /** 省略時は従来の Claude ステータス表示。Codex のみ terminal capture を指定する。 */
       mode?: "codex_terminal";
     }
+  /**
+   * claude TUI のプロンプト提案（空入力に薄字で出る次の一手）を前面会話へ配信する（host→iOS,
+   * prompt-suggestion-chip）。`text` 空文字は提案なし（チップを隠す）。foreground 購読者にだけ届く。
+   */
+  | { type: "input_suggestion"; v: number; session: string; text: string }
   /** 一覧 Mission Control: 有効な間、処理中会話すべての pane_preview を配信する（iOS→host）。 */
   | { type: "session_preview_watch"; v: number; enabled: boolean }
   /**

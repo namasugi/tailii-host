@@ -43,6 +43,11 @@ export interface SessionBackend {
    */
   sendLoginCode(name: string, code: string): Promise<void>;
   capturePane(name: string, options?: CapturePaneOptions): Promise<string>;
+  /**
+   * viewport 全体を ANSI エスケープ付きで取る（faint 属性でプロンプト提案/プレースホルダーを
+   * 実テキストと見分ける用。inputBoxHasRealPendingText / extractInputBoxSuggestion）。
+   */
+  captureVisibleAnsi(name: string): Promise<string>;
   agentProcessAlive(name: string): Promise<boolean>;
   /**
    * 会話カスタムタイトルの端末表示追随（session-title）。herdr はタブラベルへ反映、
@@ -142,6 +147,10 @@ export class CompositeSessionBackend implements SessionBackend {
 
   capturePane(name: string, options: CapturePaneOptions = {}): Promise<string> {
     return this.backendFor(name).capturePane(name, options);
+  }
+
+  captureVisibleAnsi(name: string): Promise<string> {
+    return this.backendFor(name).captureVisibleAnsi(name);
   }
 
   agentProcessAlive(name: string): Promise<boolean> {

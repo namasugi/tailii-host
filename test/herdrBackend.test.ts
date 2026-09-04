@@ -27,6 +27,7 @@ import {
 import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
 import {
   extractClaudeInputBox,
+  extractInputBoxSuggestion,
   inputBoxHasRealPendingText,
   screenHasLoginCodePrompt,
   TmuxSessionManager,
@@ -1595,5 +1596,52 @@ describe("inputBoxHasRealPendingText (faint = 提案/プレースホルダーは
     // 1 つでもあれば実テキスト有り」を保証する。
     const screen = box([`❯ 本文${FAINT} hint${RESET}`]);
     expect(inputBoxHasRealPendingText(screen)).toBe(true);
+  });
+});
+
+
+// プロンプト提案文の抽出（extractInputBoxSuggestion）。薄字(faint)の提案本文だけを返し、
+// 実テキスト・プレースホルダー・空は null（prompt-suggestion-chip）。
+describe("extractInputBoxSuggestion (薄字の提案本文だけを取り出す)", () => {
+  const ESC = "\u001b";
+  const RULE = "─".repeat(40);
+  const RESET = ESC + "[0m";
+  const FAINT = ESC + "[2m";
+  const box = (bodyLines: string[]) => [RULE, ...bodyLines, RULE, "  auto mode on"].join("\n");
+
+  test("薄字の提案本文を返す", () => {
+    const screen = box([`❯ ${RESET}${FAINT}resilient-chat-sync-tasks.md のフォローアップを見せて${RESET}`]);
+    expect(extractInputBoxSuggestion(screen)).toBe("resilient-chat-sync-tasks.md のフォローアップを見せて");
+  });
+
+  test("実テキスト(faint 無し)は提案ではない → null", () => {
+    expect(extractInputBoxSuggestion(box(["❯ 本物の下書き"]))).toBeNull();
+  });
+
+  test("プレースホルダー(Press up to edit queued messages)は提案ではない → null", () => {
+    expect(extractInputBoxSuggestion(box([`❯ ${FAINT}Press up to edit queued messages${RESET}`]))).toBeNull();
+  });
+
+  test("空の入力欄 → null", () => {
+    expect(extractInputBoxSuggestion(box(["❯ "]))).toBeNull();
+  });
+
+  test("色付き(bright)実テキスト → null", () => {
+    const screen = box([`❯ ${ESC}[38;2;255;255;255m色付き下書き${RESET}`]);
+    expect(extractInputBoxSuggestion(screen)).toBeNull();
+  });
+
+  test("複数行に折り返した薄字提案は結合して返す", () => {
+    const screen = box([`❯ ${FAINT}前半の提案テキスト${RESET}`, `  ${FAINT}後半の提案テキスト${RESET}`]);
+    expect(extractInputBoxSuggestion(screen)).toBe("前半の提案テキスト\n後半の提案テキスト");
+  });
+
+  test("罫線が無い画面でも末尾 ❯ 行の薄字提案を返す", () => {
+    expect(extractInputBoxSuggestion(`会話本文\n❯ ${FAINT}次の一手の提案${RESET}`)).toBe("次の一手の提案");
+    expect(extractInputBoxSuggestion("会話本文\n❯ 実テキスト")).toBeNull();
+  });
+
+  test("入力欄が無い画面 → null", () => {
+    expect(extractInputBoxSuggestion("何も無い画面")).toBeNull();
   });
 });

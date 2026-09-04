@@ -3,6 +3,7 @@
 
 import type { LineWriter } from "../shared/lineWriter.js";
 import { parsePermissionMode } from "../shared/permissionMode.js";
+import { extractInputBoxSuggestion } from "../backend/tmux.js";
 import { PROTOCOL_V2 } from "../protocol.js";
 import { abortableSleep } from "../shared/sleep.js";
 
@@ -29,6 +30,14 @@ export interface PanePreviewPumpOptions {
   onPermissionMode?: (mode: string) => void;
   /** 診断ログ（選択ダイアログフレームの emit 遷移など。既定は無効）。 */
   log?: (message: string) => void;
+  /**
+   * プロンプト提案抽出用の viewport ANSI キャプチャ（省略時は提案配信しない）。
+   * claude_status モードのときだけ `suggestionIntervalMs` 間隔で呼び、薄字(faint)の提案文を
+   * 抽出して変化時に `input_suggestion` を流す（prompt-suggestion-chip）。
+   */
+  captureSuggestion?: (session: string) => Promise<string>;
+  /** 提案抽出のポーリング間隔（ms）。既定 1000ms（提案はターン間 idle 時のみ現れるため低頻度で足りる）。 */
+  suggestionIntervalMs?: number;
   /**
    * 初回 capture を送るかの判定（emitInitial=false のとき）。静止した入力待ちダイアログ
    * （選択 / /login）で始まる pane は、変化しないため従来の「初回は黙って基準保持」だと
@@ -59,6 +68,11 @@ export class PanePreviewPump {
   private readonly onPermissionMode: ((mode: string) => void) | null;
   private readonly log: ((message: string) => void) | null;
   private readonly emitInitialIf: ((text: string) => boolean) | null;
+  private readonly captureSuggestion: ((session: string) => Promise<string>) | null;
+  private readonly suggestionIntervalMs: number;
+  /** 直近に配信した提案文（null=未配信・"" =提案なし）。変化時だけ流す。 */
+  private lastSuggestion: string | null = null;
+  private lastSuggestionAt = 0;
   private lastPermissionMode: string | null = null;
   private lastEmittedDialog = false;
   private emitInitial = false;
@@ -74,6 +88,8 @@ export class PanePreviewPump {
     this.onPermissionMode = options.onPermissionMode ?? null;
     this.log = options.log ?? null;
     this.emitInitialIf = options.emitInitialIf ?? null;
+    this.captureSuggestion = options.captureSuggestion ?? null;
+    this.suggestionIntervalMs = options.suggestionIntervalMs ?? 1000;
   }
 
   /**
@@ -114,6 +130,8 @@ export class PanePreviewPump {
     this.hasEmitted = false;
     this.active = false;
     this.inactiveSent = false;
+    this.lastSuggestion = null;
+    this.lastSuggestionAt = 0;
     const ac = new AbortController();
     this.abortController = ac;
     this.task = this.run(session, mode, ac.signal);
@@ -128,6 +146,12 @@ export class PanePreviewPump {
     if (this.session !== null && this.active && !this.inactiveSent) {
       this.emit(this.session, false, "");
     }
+    // 提案チップを残さないよう、離脱時に提案があればクリアを一度流す。
+    if (this.session !== null && this.lastSuggestion !== null && this.lastSuggestion !== "") {
+      this.emitSuggestion(this.session, "");
+    }
+    this.lastSuggestion = null;
+    this.lastSuggestionAt = 0;
     this.session = null;
     this.mode = "claude_status";
     this.emitInitial = false;
@@ -210,8 +234,33 @@ export class PanePreviewPump {
         this.active = false;
       }
 
+      // プロンプト提案（薄字ゴースト）の抽出・配信（claude_status のみ・低頻度・変化時だけ）。
+      if (
+        mode === "claude_status" &&
+        this.captureSuggestion !== null &&
+        now - this.lastSuggestionAt >= this.suggestionIntervalMs
+      ) {
+        this.lastSuggestionAt = now;
+        try {
+          const ansi = await this.captureSuggestion(session);
+          const suggestion = extractInputBoxSuggestion(ansi) ?? "";
+          if (suggestion !== this.lastSuggestion) {
+            this.lastSuggestion = suggestion;
+            this.emitSuggestion(session, suggestion);
+          }
+        } catch {
+          // capture 失敗は無視（次周期で再試行。提案は補助機能なので表に出さない）。
+        }
+      }
+
       await abortableSleep(this.pollIntervalMs(), signal);
     }
+  }
+
+  private emitSuggestion(session: string, text: string): void {
+    const v = this.protocolVersion();
+    if (v < PROTOCOL_V2) return;
+    this.writer.write({ type: "input_suggestion", v, session, text });
   }
 
   private queueActive(session: string, text: string, now: number, mode: PanePreviewMode): void {

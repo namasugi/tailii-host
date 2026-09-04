@@ -565,6 +565,13 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
       });
     }
 
+    case "input_suggestion":
+      return {
+        type, v,
+        session: requireString(raw, "session"),
+        text: requireString(raw, "text"),
+      };
+
     case "session_preview_watch":
       return { type, v, enabled: requireBoolean(raw, "enabled") };
 

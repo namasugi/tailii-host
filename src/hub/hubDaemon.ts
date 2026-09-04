@@ -445,6 +445,8 @@ export async function runHubCommand(args: string[]): Promise<number> {
     previewPumpFactory: (write, onPermissionMode, pollIntervalMs) => new PanePreviewPump({
       writer: controlMessageCallbackWriter(write),
       capture: (session) => sessionBackend.capturePane(session, { lines: 60, joinWrappedLines: true }),
+      // プロンプト提案（薄字ゴースト）抽出用の viewport ANSI キャプチャ（prompt-suggestion-chip）。
+      captureSuggestion: (session) => sessionBackend.captureVisibleAnsi(session),
       onPermissionMode,
       ...(pollIntervalMs !== undefined ? { pollIntervalMs } : {}),
       log,

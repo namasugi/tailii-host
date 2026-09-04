@@ -833,6 +833,11 @@ export class HerdrSessionManager {
     return this.readPane(target, ["--source", "visible", "--format", "ansi"]);
   }
 
+  /** SessionBackend: プロンプト提案抽出用の viewport ANSI キャプチャ。 */
+  captureVisibleAnsi(name: string): Promise<string> {
+    return this.captureVisibleScreenAnsi(name);
+  }
+
   /**
    * 指定セッションの pane へキー/テキストを送出する。
    * literal はテキスト送出。非 literal は herdr が受理するキー名のみ send-keys、
