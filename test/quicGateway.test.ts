@@ -43,8 +43,12 @@ describe("resolveQuicGatewayBinary", () => {
     const fake = path.join(dir, "tailii-quic-gw");
     fs.writeFileSync(fake, "#!/bin/sh\n", { mode: 0o755 });
     const resolved = resolveQuicGatewayBinary({ PATH: dir });
-    // モノレポ開発機ではローカル cargo ビルドが先に解決されることを許容する。
-    expect(resolved === fake || (resolved ?? "").includes("quic-gw/target/")).toBe(true);
+    // PATH は最後の解決先なので、先に解決しうる経路（モノレポ開発機のローカル cargo ビルド /
+    // 依存として導入済みの prebuilt パッケージ = CI）を許容する。どれも無い環境でのみ fake になる。
+    const earlierSources = ["quic-gw/target/", "@tailii/quic-gw-darwin-"];
+    expect(
+      resolved === fake || earlierSources.some((marker) => (resolved ?? "").includes(marker)),
+    ).toBe(true);
   });
 });
 
