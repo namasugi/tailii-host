@@ -409,6 +409,46 @@ describe("CodexRolloutTailer.streamForCwd（有限 tail）", () => {
     ]);
   });
 
+  test("MCP / Codex の失敗と警告を system 注記へ写像し、MCP 成功は流さない", async () => {
+    const root = makeTempDir("codex-stream-notices");
+    const cwd = makeTempDir("codex-stream-notices-cwd");
+    writeRollout(root, "2026/09/06", "r.jsonl", cwd, [
+      JSON.stringify({ type: "event_msg", payload: {
+        type: "mcp_tool_call_end", call_id: "mcp-failed",
+        invocation: { server: "drive", tool: "search", arguments: {} },
+        result: { Err: "permission denied" },
+      } }),
+      JSON.stringify({ type: "event_msg", payload: {
+        type: "mcp_tool_call_end", call_id: "mcp-tool-error",
+        invocation: { server: "calendar", tool: "create", arguments: {} },
+        result: { Ok: { isError: true, content: [{ type: "text", text: "invalid date" }] } },
+      } }),
+      JSON.stringify({ type: "event_msg", payload: {
+        type: "mcp_tool_call_end", call_id: "mcp-ok",
+        invocation: { server: "drive", tool: "list", arguments: {} },
+        result: { Ok: { isError: false, content: [{ type: "text", text: "ok" }] } },
+      } }),
+      JSON.stringify({ type: "event_msg", payload: {
+        type: "stream_error", turn_id: "turn-1", message: "connection lost",
+        retry_attempt: 1, max_retries: 3,
+      } }),
+      JSON.stringify({ type: "event_msg", payload: {
+        type: "warning", turn_id: "turn-1", message: "context is nearly full",
+      } }),
+    ]);
+    const tailer = new CodexRolloutTailer({ sessionsRoot: root, tailDeadlineMs: 0 });
+    const msgs = await collect(tailer, cwd);
+    const notices = msgs.flatMap((message) =>
+      message.type === "chat_output" && message.role === "system" ? [message.text] : []);
+
+    expect(notices).toEqual([
+      "❌ MCP「drive / search」エラー: permission denied",
+      "❌ MCP「calendar / create」エラー: invalid date",
+      "⚠️ Codex エラー（自動再試行中）: connection lost",
+      "⚠️ Codex 警告: context is nearly full",
+    ]);
+  });
+
   test("turn_context は利用中モデルマーカーを変化時だけ流す", async () => {
     const root = makeTempDir("codex-model");
     const cwd = makeTempDir("codex-model-cwd");

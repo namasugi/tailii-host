@@ -28,6 +28,11 @@ import {
   toolActivityMessage,
 } from "./codexToolActivity.js";
 import { CodexSubagentTracker } from "./codexSubagentTracker.js";
+import {
+  codexAppServerSystemNotice,
+  codexMcpItemErrorNotice,
+  codexSystemNoticeContentKey,
+} from "./codexSystemNotice.js";
 
 const TITLE_GENERATION_MAX_ATTEMPTS = 3;
 const TITLE_GENERATION_RETRY_BASE_MS = 250;
@@ -244,9 +249,11 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     for (const item of opened.thread.initialItems ?? []) {
       const id = item["id"];
       if (typeof id === "string" && id.length > 0) itemIds.add(id);
-      const payload = codexItemToChatOutput(item);
-      const key = payload === null ? null : chatContentKey(payload);
-      if (key !== null) contentCounts.set(key, (contentCounts.get(key) ?? 0) + 1);
+      const payloads = [codexItemToChatOutput(item), codexMcpItemErrorNotice(item)?.payload];
+      for (const payload of payloads) {
+        const key = payload === null || payload === undefined ? null : chatContentKey(payload);
+        if (key !== null) contentCounts.set(key, (contentCounts.get(key) ?? 0) + 1);
+      }
     }
     return {
       itemIds,
@@ -550,6 +557,12 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     const lifecycleMatchesThread =
       typeof notificationThreadId !== "string" || notificationThreadId === threadId;
     const current = this.open.get(session);
+    const systemNotice = current?.threadId === threadId && lifecycleMatchesThread
+      ? codexAppServerSystemNotice(notification.method, params)
+      : null;
+    if (systemNotice !== null) {
+      this.onChatItem({ session, itemId: systemNotice.itemId, payload: systemNotice.payload });
+    }
     if (current?.threadId === threadId && notification.method === "thread/started") {
       const startedThread = asRecord(params?.["thread"]);
       if (startedThread !== null) {
@@ -595,6 +608,10 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       if (notification.method === "item/completed" && item !== null && typeof id === "string") {
         const payload = codexItemToChatOutput(item);
         if (payload !== null) this.onChatItem({ session, itemId: id, payload });
+        const mcpNotice = current?.threadId === threadId ? codexMcpItemErrorNotice(item) : null;
+        if (mcpNotice !== null) {
+          this.onChatItem({ session, itemId: mcpNotice.itemId, payload: mcpNotice.payload });
+        }
         // コマンド実行 / ファイル変更は tool_activity カードとして別 itemId で流す
         // （同一 item から chat 本文と tool カードの両方が出ることは無いが、dedup 集合を分ける）。
         codexItemToolActivities(item).forEach((activity, index) => {
@@ -797,6 +814,8 @@ export function chatContentKey(payload: ControlMessage): string | null {
   if (payload.type === "tool_activity") {
     return toolActivityContentKey(payload.activity);
   }
+  const noticeKey = codexSystemNoticeContentKey(payload);
+  if (noticeKey !== null) return noticeKey;
   if (payload.type !== "chat_output" || (payload.role !== "user" && payload.role !== "assistant")) {
     return null;
   }

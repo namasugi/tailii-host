@@ -22,6 +22,7 @@ import {
   rolloutResponseItemToolActivities,
   toolActivityMessage,
 } from "./codexToolActivity.js";
+import { codexRolloutSystemNotice } from "./codexSystemNotice.js";
 
 /** 履歴再生完了マーカーの streamId（claude 側と共通。iOS `ChatLogModel` と対で解釈）。 */
 export const HISTORY_DONE_STREAM_ID = "pc:history-done";
@@ -427,6 +428,7 @@ function readRolloutMeta(rolloutPath: string): { id: string | null; cwd: string 
  *     - agent_message（commentary / final_answer）→ assistant ロールの chat_output
  *     - token_count   → コンテキストトークン数／窓マーカー
  *     - patch_apply_end → ファイル変更カード（tool_activity, codex-tool-cards）
+ *     - mcp_tool_call_end / error / warning → system 注記
  *   - `response_item`:
  *     - custom_tool_call "exec" / function_call "exec_command" → コマンド実行カード
  *     - function_call "update_plan" → プラン更新カード
@@ -506,6 +508,12 @@ export function* emitLine(line: Buffer, state: TailState): Generator<ControlMess
   const payload = record.payload;
   if (typeof payload !== "object" || payload === null) return;
   const kind = (payload as { type?: unknown }).type;
+
+  const systemNotice = codexRolloutSystemNotice(payload as Record<string, unknown>);
+  if (systemNotice !== null) {
+    yield systemNotice.payload;
+    return;
+  }
 
   if (kind === "patch_apply_end") {
     for (const activity of rolloutPatchApplyActivities(payload as Record<string, unknown>)) {

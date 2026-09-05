@@ -118,6 +118,53 @@ describe("CodexNativeTurnController", () => {
     ]);
   });
 
+  test("MCP item と App Server の error / warning 通知を system 注記として流す", async () => {
+    const thread = new FakeThread();
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const chats: { session: string; itemId: string; payload: unknown }[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return thread; } },
+      onChatItem: (event) => chats.push(event),
+    });
+    await controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" });
+
+    openOptions?.onNotification?.({ method: "item/completed", params: {
+      threadId: "thread-1",
+      item: {
+        id: "mcp-1", type: "mcpToolCall", server: "drive", tool: "search",
+        status: "failed", error: { message: "permission denied" },
+      },
+    } });
+    openOptions?.onNotification?.({ method: "mcpServer/startupStatus/updated", params: {
+      threadId: "thread-1", name: "notion", status: "failed", error: "handshake failed",
+    } });
+    openOptions?.onNotification?.({ method: "error", params: {
+      threadId: "thread-1", turnId: "turn-1", willRetry: true,
+      error: { message: "connection lost" },
+    } });
+    openOptions?.onNotification?.({ method: "warning", params: {
+      threadId: "thread-1", message: "context is nearly full",
+    } });
+    // 別 thread 宛ての通知はこの会話へ混ぜない。
+    openOptions?.onNotification?.({ method: "warning", params: {
+      threadId: "thread-other", message: "not for this thread",
+    } });
+
+    const texts = chats.flatMap((event) => {
+      const payload = event.payload as { type?: string; role?: string; text?: string };
+      return payload.type === "chat_output" && payload.role === "system" && payload.text
+        ? [payload.text]
+        : [];
+    });
+    expect(texts).toEqual([
+      "❌ MCP「drive / search」エラー: permission denied",
+      "❌ MCP サーバー「notion」の起動に失敗しました: handshake failed",
+      "⚠️ Codex エラー（自動再試行中）: connection lost",
+      "⚠️ Codex 警告: context is nearly full",
+    ]);
+    expect(chats[0]?.itemId).toBe("mcp-1");
+  });
+
   test("turn/plan/updated をプラン tool_activity として流す", async () => {
     const thread = new FakeThread();
     let openOptions: CodexAppServerThreadOptions | null = null;
