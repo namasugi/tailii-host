@@ -9,9 +9,11 @@ import {
   extractClaudeRemoteDialogUrl,
   isSupportedCliVersion,
   lastTranscriptRemoteControlEntry,
+  parseClaudeAuth,
   parseCodexPairing,
   parseCodexStart,
   statusBarShowsRemoteControl,
+  unknownClaudeAuthKeys,
   validClaudeUrl,
   type OfficialCommandRunner,
 } from "../src/services/officialApps.js";
@@ -148,6 +150,71 @@ function claudeAuth(): string {
     subscriptionType: "max",
   });
 }
+
+/** 2.1.260 実出力の形（analyticsDisabled / projectsDirectory が追加された）。 */
+function claudeAuth2_1_260(): string {
+  return JSON.stringify({
+    loggedIn: true,
+    authMethod: "claude.ai",
+    apiProvider: "firstParty",
+    analyticsDisabled: false,
+    projectsDirectory: "/Users/person/.claude/projects",
+    email: "person@example.com",
+    orgId: "org_1",
+    orgName: "Example",
+    subscriptionType: "max",
+  });
+}
+
+describe("parseClaudeAuth", () => {
+  test("2.1.220 形と 2.1.260 形の両方を受理する", () => {
+    expect(parseClaudeAuth(claudeAuth())).toEqual({
+      loggedIn: true,
+      authMethod: "claude.ai",
+      apiProvider: "firstParty",
+    });
+    expect(parseClaudeAuth(claudeAuth2_1_260())).toEqual({
+      loggedIn: true,
+      authMethod: "claude.ai",
+      apiProvider: "firstParty",
+    });
+    expect(unknownClaudeAuthKeys(claudeAuth2_1_260())).toEqual([]);
+  });
+
+  test("将来の未知キーは無視し、drift ログ用に列挙できる", () => {
+    const text = JSON.stringify({
+      loggedIn: true,
+      authMethod: "claude.ai",
+      apiProvider: "firstParty",
+      zzFuture: { nested: true },
+      aaFuture: 1,
+    });
+    expect(parseClaudeAuth(text)).toEqual({
+      loggedIn: true,
+      authMethod: "claude.ai",
+      apiProvider: "firstParty",
+    });
+    expect(unknownClaudeAuthKeys(text)).toEqual(["aaFuture", "zzFuture"]);
+  });
+
+  test("ログアウト中は authMethod/apiProvider が無くても loggedIn=false として受理する", () => {
+    expect(parseClaudeAuth(JSON.stringify({ loggedIn: false }))).toEqual({
+      loggedIn: false,
+      authMethod: "",
+      apiProvider: "",
+    });
+  });
+
+  test("判定キーが欠ける・型が違う・JSON でない場合は null", () => {
+    expect(parseClaudeAuth(JSON.stringify({ authMethod: "claude.ai" }))).toBeNull();
+    expect(parseClaudeAuth(JSON.stringify({ loggedIn: "yes" }))).toBeNull();
+    expect(parseClaudeAuth(JSON.stringify({ loggedIn: true, authMethod: "claude.ai" }))).toBeNull();
+    expect(parseClaudeAuth(JSON.stringify({ loggedIn: true, authMethod: "", apiProvider: "x" }))).toBeNull();
+    expect(parseClaudeAuth(JSON.stringify([1]))).toBeNull();
+    expect(parseClaudeAuth("not json")).toBeNull();
+    expect(unknownClaudeAuthKeys("not json")).toEqual([]);
+  });
+});
 
 function codexStart(): string {
   return JSON.stringify({
@@ -738,6 +805,44 @@ describe("OfficialAppsService", () => {
     expect(readFileSync(diagnosticLogPath, "utf8")).toContain(
       "provider version unverified provider=claude version=2.1.999",
     );
+  });
+
+  test("2.1.260 形の auth status（未知キー付き）でも perform は進み、未知キーは診断ログに 1 回だけ残す", async () => {
+    const base = temporaryDirectory();
+    const backend = new FakeBackend(base);
+    const diagnosticLogPath = join(base, "official-app.log");
+    const withFuture = JSON.stringify({
+      ...(JSON.parse(claudeAuth2_1_260()) as Record<string, unknown>),
+      futureKey: "x",
+    });
+    const service = new OfficialAppsService({
+      commandRunner: commandRunner({
+        "claude --version": { success: true, stdout: "2.1.260 (Claude Code)\n" },
+        "claude auth status --json": { success: true, stdout: withFuture },
+      }),
+      actionLockPath: join(base, "action.lock"),
+      claudePollIntervalMs: 1,
+      claudeStartTimeoutMs: 20,
+      diagnosticLogPath,
+    });
+    const context = {
+      session: "s",
+      provider: "claude" as const,
+      sessionManager: backend,
+      canInjectClaudeCommand: true,
+      canMutateCodexDaemon: true,
+      claudeTranscriptPath: null,
+    };
+    expect(await service.perform(context, "open", true, false)).toMatchObject({
+      provider: "claude",
+      outcome: "open",
+    });
+    expect(await service.perform(context, "open", true, false)).toMatchObject({
+      provider: "claude",
+    });
+    const log = readFileSync(diagnosticLogPath, "utf8");
+    expect(log).not.toContain("claude_auth_status_invalid");
+    expect(log.split("claude auth status unknown keys=futureKey").length - 1).toBe(1);
   });
 
   test("下限未満の Claude CLI は official_cli_unavailable で止める", async () => {

@@ -171,6 +171,7 @@ export class OfficialAppsService {
   private readonly diagnosticLogPath: string | null;
   private readonly codexRemoteControl: CodexRemoteControlClient | null;
   private readonly unverifiedVersionLogged = new Set<string>();
+  private unknownAuthKeysLogged = false;
 
   constructor(options: OfficialAppsOptions = {}) {
     this.claudePath = options.claudePath ?? "claude";
@@ -316,6 +317,11 @@ export class OfficialAppsService {
     if (output?.success !== true) return "claude_auth_status_failed";
     const auth = parseClaudeAuth(output.stdout);
     if (auth === null) return "claude_auth_status_invalid";
+    const unknownKeys = unknownClaudeAuthKeys(output.stdout);
+    if (unknownKeys.length > 0 && !this.unknownAuthKeysLogged) {
+      this.unknownAuthKeysLogged = true;
+      this.diag(`claude auth status unknown keys=${unknownKeys.join(",")}`);
+    }
     if (!auth.loggedIn) return "claude_login_required";
     if (auth.authMethod !== "claude.ai" || auth.apiProvider !== "firstParty") {
       return "claude_subscription_login_required";
@@ -946,33 +952,54 @@ interface ClaudeAuth {
   apiProvider: string;
 }
 
-function parseClaudeAuth(text: string): ClaudeAuth | null {
-  const value = parseStrictObject(text, [
-    "loggedIn",
-    "authMethod",
-    "apiProvider",
-    "email",
-    "orgId",
-    "orgName",
-    "subscriptionType",
-  ]);
-  if (value === null) return null;
-  if (
-    typeof value["loggedIn"] !== "boolean" ||
-    !boundedText(value["authMethod"]) ||
-    !boundedText(value["apiProvider"]) ||
-    !boundedText(value["email"], 512) ||
-    !boundedText(value["orgId"], 512) ||
-    !boundedText(value["orgName"], 512) ||
-    !boundedText(value["subscriptionType"])
-  ) {
+/**
+ * `claude auth status --json` の判定に使うキー。これ以外のキーは**許容して無視**する。
+ *
+ * 2.1.260 で `analyticsDisabled` / `projectsDirectory` が追加され、完全一致の strict parse が
+ * `claude_auth_status_invalid` で全滅した（バージョン許可リストと同じ「CLI 更新起因の劣化」）。
+ * 判定に使わない情報キーの増減で連携が止まるのは本末転倒なので、使うキーだけ型検証する。
+ * 未知キーは drift 調査の起点として official-app.log に 1 回だけ記録する。
+ */
+const CLAUDE_AUTH_KNOWN_KEYS: readonly string[] = [
+  "loggedIn",
+  "authMethod",
+  "apiProvider",
+  "email",
+  "orgId",
+  "orgName",
+  "subscriptionType",
+  "analyticsDisabled",
+  "projectsDirectory",
+];
+
+export function parseClaudeAuth(text: string): ClaudeAuth | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
     return null;
   }
-  return {
-    loggedIn: value["loggedIn"],
-    authMethod: value["authMethod"],
-    apiProvider: value["apiProvider"],
-  };
+  if (!isRecord(value)) return null;
+  const loggedIn = value["loggedIn"];
+  if (typeof loggedIn !== "boolean") return null;
+  const authMethod = value["authMethod"];
+  const apiProvider = value["apiProvider"];
+  // ログアウト中は authMethod / apiProvider が省略され得るので loggedIn だけで判定する。
+  if (!loggedIn) return { loggedIn: false, authMethod: "", apiProvider: "" };
+  if (!boundedText(authMethod) || !boundedText(apiProvider)) return null;
+  return { loggedIn: true, authMethod, apiProvider };
+}
+
+/** 判定に関与しない未知キー（drift ログ用）。 */
+export function unknownClaudeAuthKeys(text: string): string[] {
+  try {
+    const value: unknown = JSON.parse(text);
+    if (!isRecord(value)) return [];
+    const known = new Set(CLAUDE_AUTH_KNOWN_KEYS);
+    return Object.keys(value).filter((key) => !known.has(key)).sort();
+  } catch {
+    return [];
+  }
 }
 
 type CodexConnectionStatus = "connected" | "connecting";

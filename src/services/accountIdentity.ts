@@ -12,7 +12,9 @@
 //
 // 取得元:
 //   - Claude … `claude auth status --json` の `email`（2.1.220 実測。キーは camelCase で
-//     `loggedIn` / `authMethod` / `apiProvider` / `email` / `subscriptionType`）。
+//     `loggedIn` / `authMethod` / `apiProvider` / `email` / `subscriptionType`。2.1.260 で
+//     `analyticsDisabled` / `projectsDirectory` が追加された。キー追加は今後もあり得るので
+//     officialApps 側も使うキーだけ検証する）。
 //   - Codex  … `~/.codex/auth.json` の `tokens.id_token` の claims `email`。
 //
 // アカウント切替はまれなので、hostVersions と同じ**プロセス内キャッシュ**で 1 回だけ取る。
