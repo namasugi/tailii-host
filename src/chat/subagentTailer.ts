@@ -94,6 +94,12 @@ interface TrackedNode {
    */
   apiErrorMarker: boolean;
   currentActivity: string | null;
+  /**
+   * 自 transcript の assistant 行 `message.model`（サブエージェントが実際に使ったモデル）。
+   * 最初の assistant 行が書かれるまで null。同一走行内での自動フォールバック等で変われば
+   * 最新行の値へ追随する。
+   */
+  model: string | null;
   lastKey: string | null;
 }
 
@@ -259,6 +265,9 @@ export class SubagentTailer {
             node.finalReportMarker = null;
             node.finalDefinite = false;
             node.apiErrorMarker = false;
+            // model は「一度判明したら消えない」。truncate 直後の再読込で assistant 行が
+            // まだ無い tick に model 無しのノードを配信しないよう、直前値を保持する
+            // （再読込で別の値が出れば最新行が勝つ）。
           }
         }
         if (node !== null) node.firstJsonlTimestampMs = read.state.firstTimestampMs;
@@ -337,6 +346,7 @@ export class SubagentTailer {
               node.finalReportMarker = shape.final;
               node.finalDefinite = shape.definite;
               node.apiErrorMarker = shape.apiError;
+              if (shape.model !== null) node.model = shape.model;
             }
             const activity = latestActivitySummary(line);
             if (activity !== null) node.currentActivity = activity;
@@ -571,6 +581,7 @@ export class SubagentTailer {
           status,
           currentActivity: status === "running" ? node.currentActivity : null,
           ts,
+          ...(node.model !== null ? { model: node.model } : {}),
         };
         const key = stableNodeKey(messageNode);
         if (key === node.lastKey) continue;
@@ -689,6 +700,7 @@ function discoverMetaFiles(
       finalDefinite: false,
       apiErrorMarker: false,
       currentActivity: null,
+      model: null,
       lastKey: null,
     });
     changed = true;
@@ -1015,6 +1027,11 @@ interface MessageShape {
   definite: boolean;
   /** API エラーで途絶えた assistant 行（`isApiErrorMessage: true`。text のみなので final に見える）。 */
   apiError: boolean;
+  /**
+   * assistant 行の `message.model`（サブエージェントが実際に使ったモデルの slug）。
+   * user 行・`<synthetic>`（API エラー等でハーネスが合成した行）は null。
+   */
+  model: string | null;
 }
 
 /** message の生成完了を示す stop_reason（これ以外は「続きがある」か「不明」）。 */
@@ -1051,13 +1068,14 @@ function messageShape(line: string): MessageShape | null {
     const rec = message as Record<string, unknown>;
     const content = rec["content"];
     if (content === undefined || content === null) return null;
-    const notFinal: MessageShape = { final: false, definite: false, apiError: false };
-    if (rec["role"] !== "assistant") return notFinal;
+    if (rec["role"] !== "assistant") return { final: false, definite: false, apiError: false, model: null };
+    const model = executionModel(rec["model"]);
+    const notFinal: MessageShape = { final: false, definite: false, apiError: false, model };
     const apiError = obj["isApiErrorMessage"] === true;
     const stopReason = typeof rec["stop_reason"] === "string" ? rec["stop_reason"] : null;
     if (stopReason !== null && CONTINUING_STOP_REASONS.has(stopReason)) return notFinal;
     const definite = stopReason !== null && TERMINAL_STOP_REASONS.has(stopReason);
-    if (typeof content === "string") return { final: true, definite, apiError };
+    if (typeof content === "string") return { final: true, definite, apiError, model };
     if (!Array.isArray(content)) return null;
     const types = content.map((block) =>
       typeof block === "object" && block !== null
@@ -1067,10 +1085,20 @@ function messageShape(line: string): MessageShape | null {
     const thinkingOnly = types.length > 0
       && types.every((type) => type === "thinking" || type === "redacted_thinking");
     if (thinkingOnly) return notFinal;
-    return { final: true, definite, apiError };
+    return { final: true, definite, apiError, model };
   } catch {
     return null;
   }
+}
+
+/**
+ * assistant 行 `message.model` の値を実行モデルの slug として読む。
+ * `<synthetic>` 等の `<` 始まり（ハーネス合成行の印）と空文字は実行モデルではないので null。
+ */
+function executionModel(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length === 0 || trimmed.startsWith("<") ? null : trimmed;
 }
 
 function latestActivitySummary(line: string): string | null {
@@ -1282,5 +1310,6 @@ function stableNodeKey(node: SubagentNode): string {
     node.currentActivity ?? null,
     node.ts,
     node.kind ?? null,
+    node.model ?? null,
   ]);
 }

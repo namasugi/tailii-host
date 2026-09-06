@@ -2737,3 +2737,107 @@ describe("SubagentTailer session liveness", () => {
     await expect(defaultProbeSessionAlive("sid", oldTs, staleMs, fake({ error: "ENOENT" }))).resolves.toBe(null);
   });
 });
+
+describe("SubagentTailer モデル", () => {
+  test("サブエージェント transcript の assistant 行から実行モデルを読み、<synthetic> は無視する", async () => {
+    const project = makeTempDir("subagent-tailer-model");
+    const sessionId = "11111111-2222-3333-4444-666666666666";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    const subagents = path.join(project, sessionId, "subagents");
+    fs.mkdirSync(subagents, { recursive: true });
+    fs.writeFileSync(
+      main,
+      JSON.stringify({
+        message: {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "toolu_model", name: "Agent", input: { description: "Review", model: "sonnet" } },
+          ],
+        },
+        timestamp: "2026-09-07T01:00:00.000Z",
+      }) + "\n",
+    );
+    fs.writeFileSync(
+      path.join(subagents, "agent-modelchild.meta.json"),
+      JSON.stringify({
+        agentType: "loop-engineering:checker",
+        description: "Review",
+        toolUseId: "toolu_model",
+        spawnDepth: 1,
+      }),
+    );
+    const jsonl = path.join(subagents, "agent-modelchild.jsonl");
+    fs.writeFileSync(
+      jsonl,
+      JSON.stringify({
+        agentId: "modelchild",
+        isSidechain: true,
+        type: "user",
+        message: { role: "user", content: "start" },
+        timestamp: "2026-09-07T01:00:01.000Z",
+      }) + "\n",
+    );
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10 });
+    const gen = tailer.streamSession(main, ac.signal);
+
+    // 最初の assistant 行が書かれるまで model は載らない（tool_use input の "sonnet" は別名なので採らない）。
+    const running = await nextOfType(gen, "subagent_node");
+    expect(running).toMatchObject({ node: { nodeId: "modelchild", status: "running" } });
+    expect((running as { node: SubagentNode }).node.model).toBeUndefined();
+
+    fs.appendFileSync(
+      jsonl,
+      JSON.stringify({
+        agentId: "modelchild",
+        isSidechain: true,
+        type: "assistant",
+        message: {
+          role: "assistant",
+          model: "claude-sonnet-5",
+          content: [{ type: "text", text: "調査します" }],
+          stop_reason: "tool_use",
+        },
+        timestamp: "2026-09-07T01:00:02.000Z",
+      }) + "\n",
+    );
+    const withModel = await nextOfType(gen, "subagent_node");
+    expect(withModel).toMatchObject({
+      node: { nodeId: "modelchild", status: "running", model: "claude-sonnet-5" },
+    });
+
+    // ハーネス合成行（API エラー等）の "<synthetic>" は実行モデルではない。
+    fs.appendFileSync(
+      jsonl,
+      JSON.stringify({
+        agentId: "modelchild",
+        isSidechain: true,
+        type: "assistant",
+        isApiErrorMessage: true,
+        message: {
+          role: "assistant",
+          model: "<synthetic>",
+          content: [{ type: "text", text: "API Error" }],
+          stop_reason: "stop_sequence",
+        },
+        timestamp: "2026-09-07T01:00:03.000Z",
+      }) + "\n",
+    );
+    fs.appendFileSync(
+      main,
+      JSON.stringify({
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "toolu_model", content: "done" }],
+        },
+        timestamp: "2026-09-07T01:00:04.000Z",
+      }) + "\n",
+    );
+    const completed = await nextOfType(gen, "subagent_node");
+    expect(completed).toMatchObject({
+      node: { nodeId: "modelchild", status: "completed", model: "claude-sonnet-5" },
+    });
+    ac.abort();
+  });
+});

@@ -1271,6 +1271,7 @@ function decodeSubagentNode(raw: Raw): SubagentNode {
     currentActivity: optionalNullableString(raw, "currentActivity"),
     ts: requireNumber(raw, "ts"),
     kind,
+    model: optionalNullableString(raw, "model"),
   });
 }
 

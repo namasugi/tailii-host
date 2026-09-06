@@ -7,6 +7,8 @@ interface ThreadMetadata {
   depth: number | null;
   label: string | null;
   agentType: string | null;
+  /** 子 thread の `model`（thread/started の Thread。未ロード等で null になり得る）。 */
+  model: string | null;
 }
 
 /**
@@ -17,6 +19,8 @@ interface ThreadMetadata {
 export class CodexSubagentTracker {
   private readonly metadata = new Map<string, ThreadMetadata>();
   private readonly nodes = new Map<string, SubagentNode>();
+  /** ノード生成前に届いた子 thread のモデル変更（thread/started や spawn item で採用する）。 */
+  private readonly pendingModels = new Map<string, string>();
 
   constructor(private readonly rootThreadId: string) {}
 
@@ -36,6 +40,7 @@ export class CodexSubagentTracker {
         sourceMetadata.agentNickname,
         stringValue(thread["agentNickname"]),
       ),
+      model: stringValue(thread["model"]),
     };
     this.metadata.set(nodeId, metadata);
 
@@ -45,6 +50,7 @@ export class CodexSubagentTracker {
       depth: metadata.depth,
       label: metadata.label,
       agentType: metadata.agentType,
+      model: metadata.model,
       // thread/started は子 turn の開始直前に idle/notLoaded を持つことがある。
       // lifecycle 開始通知そのものを running とし、以後の status/changed で終端させる。
       status: threadStartedStatus(thread["status"]),
@@ -75,6 +81,25 @@ export class CodexSubagentTracker {
       status: threadStatus(rawStatus, this.nodes.get(threadId)!.status),
       currentActivity: null,
     }, timestampMs, true);
+  }
+
+  /**
+   * 子 thread のモデル変更（thread/settings/updated / model/rerouted）。未知の thread・root は無視。
+   * 以後の collab item（wait 等は model null）が thread/started 時点の古い値へ戻さないよう、
+   * metadata の model も置き換える。
+   */
+  ingestThreadModel(threadId: string, rawModel: unknown, nowMs: number): SubagentNode[] {
+    const model = stringValue(rawModel);
+    if (model === null || threadId === this.rootThreadId) return [];
+    const existing = this.nodes.get(threadId);
+    if (existing === undefined) {
+      // ノード未生成なら保留し、生成時（thread/started / spawn item）に既知値として採る。
+      this.pendingModels.set(threadId, model);
+      return [];
+    }
+    const metadata = this.metadata.get(threadId);
+    if (metadata !== undefined) metadata.model = model;
+    return this.upsert(threadId, { status: existing.status, model }, nowMs);
   }
 
   ingestThreadClosed(threadId: string, nowMs: number): SubagentNode[] {
@@ -122,7 +147,13 @@ export class CodexSubagentTracker {
         parentThreadId,
         depth,
         label: metadata?.label ?? existingLabel ?? prompt,
-        agentType: metadata?.agentType ?? existingAgentType ?? stringValue(item["model"]),
+        // role / nickname が無いノードの種別は既定の "Codex"（upsert）。model は専用欄で出すので
+        // 種別へ流用しない（流用すると UI の副題「種別 · モデル」で同じ slug が 2 回並ぶ）。
+        agentType: metadata?.agentType ?? existingAgentType,
+        // model を採るのは spawnAgent（spawn 時の要求モデル）だけ。wait / sendInput 等の item に
+        // model が入る版でも子のモデルを親側の値で上書きしない。子 thread 自身の申告
+        // （thread/started）を優先し、null は upsert で既知値を保持する。
+        model: metadata?.model ?? (tool === "spawnAgent" ? stringValue(item["model"]) : null),
         status: mappedStatus,
         currentActivity: mappedStatus === "running" ? stateMessage : null,
       }, nowMs));
@@ -156,6 +187,7 @@ export class CodexSubagentTracker {
       depth?: number | null;
       label?: string | null;
       agentType?: string | null;
+      model?: string | null;
       status: SubagentNodeStatus;
       currentActivity?: string | null;
     },
@@ -169,6 +201,10 @@ export class CodexSubagentTracker {
     );
     const statusChanged = existing !== undefined && existing.status !== update.status;
     const ts = existing === undefined || statusChanged || replaceTimestamp ? nowMs : existing.ts;
+    // 生成時に保留中のモデル変更があれば既知値として採る（thread/started の申告があればそちらが新しい）。
+    const pendingModel = existing === undefined ? (this.pendingModels.get(nodeId) ?? null) : null;
+    this.pendingModels.delete(nodeId);
+    const model = update.model ?? existing?.model ?? pendingModel;
     const node: SubagentNode = {
       nodeId,
       toolUseId: update.toolUseId ?? existing?.toolUseId ?? `thread:${nodeId}`,
@@ -181,6 +217,7 @@ export class CodexSubagentTracker {
         ? (update.currentActivity ?? existing?.currentActivity ?? null)
         : null,
       ts,
+      ...(model !== null ? { model } : {}),
     };
     if (existing !== undefined && stableNodeKey(existing) === stableNodeKey(node)) return [];
     this.nodes.set(nodeId, node);
@@ -310,6 +347,7 @@ function stableNodeKey(node: SubagentNode): string {
     node.status,
     node.currentActivity ?? null,
     node.ts,
+    node.model ?? null,
   ]);
 }
 

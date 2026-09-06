@@ -65,6 +65,11 @@ export interface SubagentNode {
   ts: number;
   /** "command" = バックグラウンドコマンド（Bash run_in_background）。省略時はエージェント。 */
   kind?: "command";
+  /**
+   * 実行モデルの slug（Claude: サブエージェント transcript の assistant 行 `message.model` /
+   * Codex: 子 thread の `model`、無ければ spawnAgent の `model`）。判明するまで省略。
+   */
+  model?: string | null;
 }
 
 /** セッション一覧応答の 1 要素。 */

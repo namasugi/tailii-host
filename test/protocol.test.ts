@@ -491,7 +491,19 @@ describe("decode 詳細", () => {
       depth: 1,
       status: "running",
       ts: 1783016361453,
+      model: "claude-opus-5",
     });
+  });
+
+  it("v2 subagent_node は model 省略時に undefined で復元する", () => {
+    const line = goldenLines("approval-protocol-v2.ndjson").find((entry) =>
+      entry.includes('"type":"subagent_node"') && entry.includes('"kind":"command"')
+    );
+    expect(line).toBeDefined();
+    const decoded = decodeControlMessage(line!);
+    if (decoded.type !== "subagent_node") throw new Error("subagent_node を期待");
+    expect(decoded.node.model).toBeUndefined();
+    expect("model" in decoded.node).toBe(false);
   });
 
   it("subagent transcript entry の optional ts/kind を検証して復元する", () => {
@@ -659,6 +671,33 @@ describe("encode 詳細", () => {
     ).toBe(
       '{"agentType":"general-purpose","depth":1,"label":"調査","nodeId":"agent-a","parentNodeId":null,"status":"running","toolUseId":"toolu-a","ts":1000,"type":"subagent_node","v":2}',
     );
+  });
+
+  it("subagent_node の model は指定時のみ canonical key order で載せる", () => {
+    expect(
+      encodeControlMessage({
+        type: "subagent_node",
+        v: 2,
+        node: {
+          nodeId: "agent-a",
+          toolUseId: "toolu-a",
+          parentNodeId: "root",
+          agentType: "general-purpose",
+          label: "調査",
+          depth: 1,
+          status: "running",
+          ts: 1000,
+          model: "claude-sonnet-5",
+        },
+      }),
+    ).toBe(
+      '{"agentType":"general-purpose","depth":1,"label":"調査","model":"claude-sonnet-5","nodeId":"agent-a","parentNodeId":"root","status":"running","toolUseId":"toolu-a","ts":1000,"type":"subagent_node","v":2}',
+    );
+    const decoded = decodeControlMessage(
+      '{"agentType":"general-purpose","depth":1,"label":"調査","model":"claude-sonnet-5","nodeId":"agent-a","parentNodeId":"root","status":"running","toolUseId":"toolu-a","ts":1000,"type":"subagent_node","v":2}',
+    );
+    if (decoded.type !== "subagent_node") throw new Error("subagent_node を期待");
+    expect(decoded.node.model).toBe("claude-sonnet-5");
   });
 
   it("session_search_request/response は v2 と canonical key order でエンコードする", () => {
