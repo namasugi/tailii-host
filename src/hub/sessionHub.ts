@@ -135,6 +135,18 @@ interface CodexLiveState {
   scanContentCounts: Map<string, number>;
   fallbackBaselineCounts: Map<string, number>;
   disconnected: boolean;
+  /**
+   * この会話へ最後に配信した `pc:model` の値。App Server 通知（onModel）と rollout の
+   * turn_context は同じ「実際に使うモデル」を別経路で伝えるため、同値は 1 回に畳む。
+   */
+  lastModel: string | null;
+  /** 購読時点の thread のモデル（thread/resume 応答）。初回 backfill 完了後に配信する。 */
+  subscribedModel: string | null;
+  /**
+   * fallback-scan（切断後の rollout 再走査）で最後に見た `pc:model`。再走査は履歴を頭から
+   * 読み直すため、途中の旧モデルを配信せず走査完了時に最新値だけを配る。
+   */
+  scanLastModel: string | null;
 }
 interface SessionActor {
   pendingQuestion: {
@@ -1047,6 +1059,9 @@ export class SessionHub {
       scanContentCounts: new Map(),
       fallbackBaselineCounts: new Map(),
       disconnected: false,
+      lastModel: null,
+      subscribedModel: null,
+      scanLastModel: null,
     };
     actor.codexLive = state;
     const controller = this.ensureCodexTurnController();
@@ -1060,10 +1075,13 @@ export class SessionHub {
         if (actor.codexLive !== state || actor.subscribers.size === 0) return;
         state.initialItemIds = snapshot.itemIds;
         state.initialContentCounts = snapshot.contentCounts;
+        // 会話を開いていない間の /model や設定変更は thread/settings/updated が誰にも届かない。
+        // resume 応答の現在モデルを backfill 完了後に配信し、開き直しで表示を実体へ揃える。
+        state.subscribedModel = snapshot.model ?? null;
         if (!snapshot.liveSubscribed) {
           this.options.log?.(
-            "Codex App Server は未materialize threadをlive購読できないため、rollout fallbackへ移行" +
-            (snapshot.liveSubscriptionError ? `（thread/resume: ${snapshot.liveSubscriptionError}）` : ""),
+            `Codex App Server の履歴スナップショットが読めない（turn 前の未materialize か履歴読み取り失敗）ため、rollout fallbackへ移行 session=${session} thread=${threadId}` +
+            (snapshot.liveSubscriptionError ? `（理由: ${snapshot.liveSubscriptionError}）` : ""),
           );
           this.startCodexFallback(session, actor, cwd, threadId, newerThanMs, false);
           return;
@@ -1095,12 +1113,29 @@ export class SessionHub {
         if (actor.codexLive !== state) return;
         const isHistoryDone = payload.type === "chat_output" && payload.streamId === HISTORY_DONE_STREAM_ID;
         const contentKey = chatContentKey(payload);
+        const isModelMarker = payload.type === "chat_output" && payload.streamId === CODEX_MODEL_STREAM_ID;
+
+        // rollout の turn_context は「その turn で実際に使ったモデル」の唯一の記録。live 中も
+        // fallback 中も本文とは独立に通し、App Server 通知（onModel）と同値なら畳む。
+        // token 系 marker は App Server の tokenUsage と意味が異なるため従来どおり混ぜない。
+        if (isModelMarker && state.phase !== "backfill") {
+          if (state.phase === "fallback-scan") {
+            // 再走査は履歴を頭から読み直す。旧 turn のモデルを一度配って戻すのではなく、
+            // 走査完了時に最後の値だけを配る。
+            state.scanLastModel = payload.text;
+            return;
+          }
+          this.publishCodexModelMarker(session, actor, state, payload.text);
+          return;
+        }
 
         if (state.phase === "live") return; // 正常時の live 本文は App Server のみ。
 
         if (state.phase === "fallback-scan") {
           if (isHistoryDone) {
             state.phase = "fallback-live";
+            this.publishCodexModelMarker(session, actor, state, state.scanLastModel);
+            state.scanLastModel = null;
             return; // 通常 backfill の pc:history-done を再送しない。
           }
           if (contentKey === null) return; // fallback の model/token marker は controller 系統と混ぜない。
@@ -1122,7 +1157,13 @@ export class SessionHub {
         // item ID が無いため、同文は Set ではなく occurrence count で照合する。
         this.publishConversationEvent(session, actor, payload);
         if (contentKey !== null) incrementCount(state.publishedContentCounts, contentKey);
+        if (isModelMarker) state.lastModel = payload.text;
         if (!isHistoryDone) return;
+        // 履歴末尾の turn_context より新しい設定変更（turn 未実行）は rollout に無い。
+        // 購読時の thread モデルで上書きする（同値なら畳む）。fallback でも resume が
+        // 成立していれば同じ。
+        const subscribedModel = state.subscribedModel;
+        state.subscribedModel = null;
         if (state.disconnected) {
           // fallback 確定前に届いた App Server item は、この継続 rollout と同じ内容を
           // 別 streamId で持ち得る。rollout を唯一の一次ソースにした時点で破棄し、
@@ -1137,6 +1178,7 @@ export class SessionHub {
           // 欠落時に terminal event（task_complete / turn_aborted）を観測できず、
           // 処理中状態を自己修復できない。
         }
+        this.publishCodexModelMarker(session, actor, state, subscribedModel);
       },
       (event) => {
         if (actor.codexLive !== state || event.state !== "done") return;
@@ -1242,6 +1284,7 @@ export class SessionHub {
     state.disconnected = true;
     state.buffered.length = 0;
     state.scanContentCounts.clear();
+    state.scanLastModel = null;
     state.fallbackBaselineCounts = new Map(state.publishedContentCounts);
     this.openCodexRollout(session, actor, cwd, threadId, newerThanMs);
   }
@@ -1335,6 +1378,14 @@ export class SessionHub {
           if (event.serverSeq <= boundarySeq) continue;
           this.sendTo(client, { type: "conversation_event", session, ...event });
         }
+      }
+      // 後から加わった client の履歴には、turn を伴わない設定変更（境界前に配信済みの
+      // thread/settings/updated）が含まれない。会話の現在モデルを最後に 1 回添えて揃える。
+      const currentModel = actor.codexLive?.lastModel ?? null;
+      if (currentModel !== null) {
+        this.sendTo(client, {
+          type: "conversation_event", session, serverSeq: 0, payload: codexModelMarker(currentModel),
+        });
       }
     };
     // 進捗は「最後に 1 行流れた時刻」で測る。履歴行ごとに setTimeout を張り替えると
@@ -1722,6 +1773,7 @@ export class SessionHub {
       ((options: CodexNativeTurnControllerOptions) => new CodexNativeTurnController(options));
     this.codexTurnController = create({
       appServer,
+      log: (message) => this.options.log?.(message),
       onProcessing: (session, state) => {
         if (state === "active") this.activeCodexTurns.add(session);
         else this.activeCodexTurns.delete(session);
@@ -1865,9 +1917,29 @@ export class SessionHub {
 
   private publishCodexMarker(session: string, streamId: string, text: string): void {
     const actor = this.actor(session);
+    if (streamId === CODEX_MODEL_STREAM_ID && actor.codexLive !== null) {
+      this.publishCodexModelMarker(session, actor, actor.codexLive, text);
+      return;
+    }
     this.publishConversationEvent(session, actor, {
       type: "chat_output" as const, v: PROTOCOL_V1, streamId, role: "system" as const, text, eof: true,
     });
+  }
+
+  /**
+   * 利用中モデルの marker を、直前に配信した値と異なるときだけ配信する。App Server 通知
+   * （thread/settings/updated / model/rerouted）・rollout の turn_context・購読時の
+   * thread モデルは同じ値を別経路で運ぶため、ここで 1 本に畳む。
+   */
+  private publishCodexModelMarker(
+    session: string,
+    actor: SessionActor,
+    state: CodexLiveState,
+    model: string | null,
+  ): void {
+    if (model === null || model.length === 0 || state.lastModel === model) return;
+    state.lastModel = model;
+    this.publishConversationEvent(session, actor, codexModelMarker(model));
   }
 
   /**
@@ -2256,6 +2328,14 @@ function sameCodexRetry(
     (left.approvalPolicy ?? null) === (right.approvalPolicy ?? null) &&
     left.sandbox === right.sandbox &&
     left.threadId === right.threadId && left.cwd === right.cwd;
+}
+
+/** 利用中モデル通知（`pc:model`）の conversation_event payload。 */
+function codexModelMarker(model: string): ControlMessage {
+  return {
+    type: "chat_output", v: PROTOCOL_V1, streamId: CODEX_MODEL_STREAM_ID,
+    role: "system", text: model, eof: true,
+  };
 }
 
 function incrementCount(counts: Map<string, number>, key: string): void {

@@ -3,6 +3,7 @@
 import { describe, expect, test } from "vitest";
 import {
   codexAppServerSystemNotice,
+  codexDeprecationNoticeLogLine,
   codexMcpItemErrorNotice,
   codexRolloutSystemNotice,
   codexSystemNoticeContentKey,
@@ -83,6 +84,31 @@ describe("codexSystemNotice", () => {
       threadId: "thread-1", name: "notion", status: "failed", error: "handshake failed",
       failureReason: null,
     })?.payload.text).toBe("❌ MCP サーバー「notion」の起動に失敗しました: handshake failed");
+  });
+
+  test("deprecationNotice は利用者向け注記にせず、診断ログ 1 行へ正規化する", () => {
+    // codex 0.153.4 が全履歴 hydration を呼んだ接続へ返す通知（実障害 2026-09-06 でチャットに出た）。
+    const params = {
+      summary: "Full-history hydration is deprecated for paginated threads; use `excludeTurns: true`, " +
+        "then page with `thread/turns/list` and `thread/items/list`.",
+      details: null,
+    };
+    expect(codexAppServerSystemNotice("deprecationNotice", params)).toBeNull();
+    expect(codexDeprecationNoticeLogLine(params)).toBe(
+      "Codex App Server 非推奨通知（利用者には表示しない）: Full-history hydration is deprecated for " +
+      "paginated threads; use `excludeTurns: true`, then page with `thread/turns/list` and `thread/items/list`.",
+    );
+    expect(codexDeprecationNoticeLogLine({ summary: "legacy feature", details: "use x\ninstead" }))
+      .toBe("Codex App Server 非推奨通知（利用者には表示しない）: legacy feature — use x instead");
+    expect(codexDeprecationNoticeLogLine({ summary: "  ", details: "x" })).toBeNull();
+    expect(codexDeprecationNoticeLogLine(null)).toBeNull();
+    // ログ 1 行の上限（400 文字）で切る。
+    expect(codexDeprecationNoticeLogLine({ summary: "x".repeat(500), details: null }))
+      .toBe(`Codex App Server 非推奨通知（利用者には表示しない）: ${"x".repeat(400)}…`);
+    // config の問題は利用者が直せるので従来どおり注記にする。
+    expect(codexAppServerSystemNotice("configWarning", {
+      summary: "unknown key `foo`", details: "in ~/.codex/config.toml",
+    })?.payload.text).toBe("⚠️ Codex 設定警告: unknown key `foo` — in ~/.codex/config.toml");
   });
 
   test("同じ stream error の自動再試行は同じ streamId へ畳み、上限到達は別注記にする", () => {

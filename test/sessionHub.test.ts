@@ -1969,6 +1969,8 @@ describe("SessionHub conversation stream", () => {
 function makeCodexStreamingHub(options: {
   subscribeFails?: boolean;
   liveSubscribed?: boolean;
+  /** 購読時に App Server が返す thread の現在モデル（thread/resume 応答）。 */
+  model?: string | null;
 } = {}) {
   const metadataStore = makeTempStore();
   metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0,
@@ -1989,7 +1991,8 @@ function makeCodexStreamingHub(options: {
       ? async () => { throw new Error("app server unavailable"); }
       : async () => ({ itemIds: new Set(["history-item"]),
           contentCounts: new Map([["assistant\u0000履歴", 1]]),
-          liveSubscribed: options.liveSubscribed ?? true }),
+          liveSubscribed: options.liveSubscribed ?? true,
+          model: options.model ?? null }),
     startTurn: async () => "turn-1",
     reconcileCompletedTurn,
     closeSession: vi.fn(),
@@ -2098,7 +2101,7 @@ describe("SessionHub Codex App Server live stream", () => {
     expect(received.filter((message) => message?.payload?.text === "履歴")).toHaveLength(2);
   });
 
-  test("App Server 不達時は rollout を history 後も tail し、live marker は抑止する", async () => {
+  test("App Server 不達時は rollout を history 後も tail し、model marker は通す", async () => {
     const { hub, writes, tails } = makeCodexStreamingHub({ subscribeFails: true });
     const client = {}, received: any[] = [];
     subscribe(hub, client, received);
@@ -2106,11 +2109,93 @@ describe("SessionHub Codex App Server live stream", () => {
     writes[0]!(chat("assistant", "履歴", "codex-turn-1"));
     writes[0]!(chat("system", "", HISTORY_DONE_STREAM_ID));
     writes[0]!(chat("assistant", "fallback live", "codex-turn-2"));
-    writes[0]!(chat("system", "gpt-duplicate", "pc:model"));
+    // fallback 中は rollout の turn_context が実際に使うモデルの唯一の記録。同値は 1 回。
+    writes[0]!(chat("system", "gpt-fallback", "pc:model"));
+    writes[0]!(chat("system", "gpt-fallback", "pc:model"));
+    // token 系 marker は App Server の tokenUsage と意味が違うので従来どおり混ぜない。
+    writes[0]!(chat("system", "123", "pc:context"));
 
     expect(tails[0]!.stopped).toBe(false);
     expect(received.filter((message) => message?.payload?.text === "fallback live")).toHaveLength(1);
-    expect(received.filter((message) => message?.payload?.text === "gpt-duplicate")).toHaveLength(0);
+    expect(received.filter((message) => message?.payload?.text === "gpt-fallback")).toHaveLength(1);
+    expect(received.filter((message) => message?.payload?.streamId === "pc:context")).toHaveLength(0);
+  });
+
+  // 会話を開いていない間の /model・設定変更は thread/settings/updated が誰にも届かない。
+  // 購読時の thread モデル（thread/resume 応答）を backfill 完了後に配信して開き直しで揃える。
+  test("購読時の thread モデルを backfill 後に配信し、同値の marker は経路をまたいで 1 回に畳む", async () => {
+    const { hub, writes, getCallbacks } = makeCodexStreamingHub({ model: "gpt-current" });
+    const client = {}, received: any[] = [];
+    subscribe(hub, client, received);
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+    const models = () => received.flatMap((message) =>
+      message?.payload?.streamId === "pc:model" ? [message.payload.text] : []);
+
+    writes[0]!(chat("system", "gpt-old", "pc:model")); // 履歴の turn_context（最後の turn は旧モデル）
+    writes[0]!(chat("assistant", "履歴", "codex-turn-1"));
+    writes[0]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+    expect(models()).toEqual(["gpt-old", "gpt-current"]);
+
+    // live 中: 新 turn の turn_context は通し、App Server 通知と同値なら畳む。
+    writes[0]!(chat("system", "gpt-current", "pc:model"));
+    expect(models()).toEqual(["gpt-old", "gpt-current"]);
+    getCallbacks().onModel?.("work", "gpt-new");
+    writes[0]!(chat("system", "gpt-new", "pc:model"));
+    expect(models()).toEqual(["gpt-old", "gpt-current", "gpt-new"]);
+    writes[0]!(chat("system", "gpt-turn", "pc:model"));
+    expect(models()).toEqual(["gpt-old", "gpt-current", "gpt-new", "gpt-turn"]);
+
+    // 後から加わった client の履歴には turn を伴わない設定変更が無い。現在モデルを最後に添える。
+    const late = {}, lateReceived: any[] = [];
+    subscribe(hub, late, lateReceived);
+    await vi.waitFor(() => expect(writes).toHaveLength(2));
+    writes[1]!(chat("system", "gpt-old", "pc:model"));
+    writes[1]!(chat("assistant", "履歴", "codex-turn-1"));
+    writes[1]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+    const lateModels = lateReceived.flatMap((message) =>
+      message?.payload?.streamId === "pc:model" ? [message.payload.text] : []);
+    expect(lateModels.at(-1)).toBe("gpt-turn");
+    expect(lateReceived.at(-1)).toMatchObject({ type: "conversation_event", serverSeq: 0,
+      payload: { streamId: "pc:model", text: "gpt-turn" } });
+  });
+
+  test("切断後の rollout 再走査は途中の旧モデルを配らず、走査完了時に最新値だけを 1 回配る", async () => {
+    const { hub, writes, getCallbacks } = makeCodexStreamingHub({ model: "gpt-current" });
+    const client = {}, received: any[] = [];
+    subscribe(hub, client, received);
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+    const models = () => received.flatMap((message) =>
+      message?.payload?.streamId === "pc:model" ? [message.payload.text] : []);
+    writes[0]!(chat("system", "gpt-old", "pc:model"));
+    writes[0]!(chat("assistant", "履歴", "codex-turn-1"));
+    writes[0]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+    expect(models()).toEqual(["gpt-old", "gpt-current"]);
+
+    getCallbacks().onDisconnect?.("work", new Error("closed"));
+    await vi.waitFor(() => expect(writes).toHaveLength(2));
+    // 再走査: 旧 turn の marker → 履歴 → 切断中に進んだ新 turn の marker → EOF。
+    writes[1]!(chat("system", "gpt-old", "pc:model"));
+    writes[1]!(chat("assistant", "履歴", "codex-turn-1"));
+    writes[1]!(chat("system", "gpt-current", "pc:model"));
+    writes[1]!(chat("system", "gpt-rescan-latest", "pc:model"));
+    expect(models()).toEqual(["gpt-old", "gpt-current"]); // 走査中は配らない
+    writes[1]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+    expect(models()).toEqual(["gpt-old", "gpt-current", "gpt-rescan-latest"]);
+    // fallback-live に入った後の turn_context はそのまま通す（同値は畳む）。
+    writes[1]!(chat("system", "gpt-rescan-latest", "pc:model"));
+    writes[1]!(chat("system", "gpt-after", "pc:model"));
+    expect(models()).toEqual(["gpt-old", "gpt-current", "gpt-rescan-latest", "gpt-after"]);
+  });
+
+  test("旧 App Server（購読時モデル不明）は購読時配信をしない", async () => {
+    const { hub, writes } = makeCodexStreamingHub({ model: null });
+    const client = {}, received: any[] = [];
+    subscribe(hub, client, received);
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+    writes[0]!(chat("system", "gpt-old", "pc:model"));
+    writes[0]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+    expect(received.flatMap((message) =>
+      message?.payload?.streamId === "pc:model" ? [message.payload.text] : [])).toEqual(["gpt-old"]);
   });
 
   test("未materialize threadは rollout を history 後も tail して初回turnをライブ反映する", async () => {

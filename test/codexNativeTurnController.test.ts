@@ -165,6 +165,55 @@ describe("CodexNativeTurnController", () => {
     expect(chats[0]?.itemId).toBe("mcp-1");
   });
 
+  test("deprecationNotice は chat へ流さず、同文はログへ 1 回だけ記録する", async () => {
+    const thread = new FakeThread();
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const chats: { session: string; itemId: string; payload: unknown }[] = [];
+    const logs: string[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return thread; } },
+      onChatItem: (event) => chats.push(event),
+      log: (message) => logs.push(message),
+    });
+    await controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" });
+
+    const params = {
+      summary: "Full-history hydration is deprecated for paginated threads; use `excludeTurns: true`, " +
+        "then page with `thread/turns/list` and `thread/items/list`.",
+      details: null,
+    };
+    openOptions?.onNotification?.({ method: "deprecationNotice", params });
+    openOptions?.onNotification?.({ method: "deprecationNotice", params });
+    openOptions?.onNotification?.({ method: "deprecationNotice", params: { summary: "another", details: null } });
+
+    expect(chats).toEqual([]);
+    expect(logs).toEqual([
+      "Codex App Server 非推奨通知（利用者には表示しない）: Full-history hydration is deprecated for " +
+      "paginated threads; use `excludeTurns: true`, then page with `thread/turns/list` and `thread/items/list`.",
+      "Codex App Server 非推奨通知（利用者には表示しない）: another",
+    ]);
+  });
+
+  test("deprecationNotice の記憶は 64 件で打ち切り、以後は同文でも再記録する（有界）", async () => {
+    const thread = new FakeThread();
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const logs: string[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return thread; } },
+      log: (message) => logs.push(message),
+    });
+    await controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" });
+
+    for (let index = 0; index < 64; index += 1) {
+      openOptions?.onNotification?.({ method: "deprecationNotice", params: { summary: `n-${index}`, details: null } });
+    }
+    openOptions?.onNotification?.({ method: "deprecationNotice", params: { summary: "n-0", details: null } });
+    expect(logs).toHaveLength(64); // 64 件までは同文を記録しない
+    openOptions?.onNotification?.({ method: "deprecationNotice", params: { summary: "n-64", details: null } });
+    openOptions?.onNotification?.({ method: "deprecationNotice", params: { summary: "n-0", details: null } });
+    expect(logs).toHaveLength(66); // 上限到達で記憶を空にするため n-0 は再記録される
+  });
+
   test("turn/plan/updated をプラン tool_activity として流す", async () => {
     const thread = new FakeThread();
     let openOptions: CodexAppServerThreadOptions | null = null;
@@ -205,7 +254,7 @@ describe("CodexNativeTurnController", () => {
 
     openOptions?.onNotification?.({ method: "thread/started", params: { thread: {
       // thread/started 時点では最初の user message が未永続化で preview が空になり得る。
-      id: "thread-child", parentThreadId: "thread-root", preview: "",
+      id: "thread-child", parentThreadId: "thread-root", preview: "", model: "gpt-5.6-terra",
       agentRole: "explorer", agentNickname: "maple", status: { type: "active", activeFlags: [] },
       source: { subAgent: { thread_spawn: {
         parent_thread_id: "thread-root", depth: 1, agent_path: null,
@@ -241,14 +290,15 @@ describe("CodexNativeTurnController", () => {
     expect(nodes[0]).toMatchObject({ type: "subagent_node", v: 2, node: {
       nodeId: "thread-child", toolUseId: "thread:thread-child", parentNodeId: "root",
       agentType: "explorer", label: "Codex sub-agent", depth: 1, status: "running",
+      model: "gpt-5.6-terra",
     } });
     expect(nodes[1]).toMatchObject({ node: {
       nodeId: "thread-child", toolUseId: "collab-spawn", status: "running",
-      label: "型安全性を調査する", currentActivity: "関連箇所を検索中",
+      label: "型安全性を調査する", currentActivity: "関連箇所を検索中", model: "gpt-5.6-terra",
     } });
     expect(nodes[2]).toMatchObject({ node: {
       nodeId: "thread-child", toolUseId: "collab-spawn", status: "completed",
-      currentActivity: null,
+      currentActivity: null, model: "gpt-5.6-terra",
     } });
     expect(chats.map((event) => event.itemId)).toEqual([
       "subagent:thread-child:0", "subagent:thread-child:1", "subagent:thread-child:2",
@@ -268,6 +318,7 @@ describe("CodexNativeTurnController", () => {
     openOptions?.onNotification?.({ method: "item/completed", params: { item: {
       id: "spawn-parent", type: "collabAgentToolCall", tool: "spawnAgent", status: "completed",
       senderThreadId: "thread-root", receiverThreadIds: ["thread-parent"], prompt: "親タスク",
+      model: "gpt-5.6-sol",
       agentsStates: { "thread-parent": { status: "running", message: null } },
     } } });
     openOptions?.onNotification?.({ method: "item/completed", params: { item: {
@@ -286,19 +337,189 @@ describe("CodexNativeTurnController", () => {
     expect(payloads).toHaveLength(3);
     expect(payloads[0]?.node).toMatchObject({
       nodeId: "thread-parent", parentNodeId: "root", depth: 1, status: "running",
+      model: "gpt-5.6-sol",
     });
     expect(payloads[1]?.node).toMatchObject({
       nodeId: "thread-child", parentNodeId: "thread-parent", depth: 2, status: "running",
     });
+    // spawn item に model が無く thread/started も未着なら未判明（省略）のまま。
+    expect(payloads[1]?.node["model"]).toBeUndefined();
     expect(payloads[2]?.node).toMatchObject({
       nodeId: "thread-child", parentNodeId: "thread-parent", depth: 2, status: "error",
     });
+  });
+
+  test("Codex 子 thread のモデル変更を subagent_node へ反映し、親会話のモデルには混ぜない", async () => {
+    const thread = new FakeThread();
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const chats: { payload: unknown }[] = [];
+    const models: string[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return thread; } },
+      onChatItem: (event) => chats.push(event),
+      onModel: (session, model) => models.push(`${session}:${model}`),
+    });
+    await controller.subscribeSession({ session: "work", threadId: "thread-root", cwd: "/tmp/work" });
+
+    openOptions?.onNotification?.({ method: "thread/started", params: { thread: {
+      id: "thread-child", parentThreadId: "thread-root", preview: "", model: "gpt-5.6-terra",
+      agentRole: "explorer", status: { type: "active", activeFlags: [] },
+    } } });
+    openOptions?.onNotification?.({ method: "thread/settings/updated", params: {
+      threadId: "thread-child", threadSettings: { model: "gpt-5.6-luna" },
+    } });
+    openOptions?.onNotification?.({ method: "model/rerouted", params: {
+      threadId: "thread-child", fromModel: "gpt-5.6-luna", toModel: "gpt-5.6-sol",
+    } });
+    // 未知 thread / threadId 無しのモデル変更は無視する。
+    openOptions?.onNotification?.({ method: "model/rerouted", params: {
+      threadId: "thread-unknown", toModel: "ignored",
+    } });
+    openOptions?.onNotification?.({ method: "model/rerouted", params: { toModel: "ignored" } });
+    // 以後の wait item（model null）が thread/started 時点の古い値へ戻さない。
+    openOptions?.onNotification?.({ method: "item/completed", params: { threadId: "thread-root", item: {
+      id: "collab-wait", type: "collabAgentToolCall", tool: "wait", status: "completed",
+      senderThreadId: "thread-root", receiverThreadIds: ["thread-child"], prompt: null, model: null,
+      agentsStates: { "thread-child": { status: "running", message: "継続中" } },
+    } } });
+
+    const nodes = chats.map((event) => event.payload).filter((payload): payload is {
+      type: "subagent_node";
+      node: Record<string, unknown>;
+    } => typeof payload === "object" && payload !== null &&
+      (payload as Record<string, unknown>)["type"] === "subagent_node");
+    expect(nodes.map((payload) => payload.node["model"])).toEqual([
+      "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-sol",
+    ]);
+    expect(nodes.map((payload) => payload.node["status"])).toEqual([
+      "running", "running", "running", "running",
+    ]);
+    expect(nodes.at(-1)?.node).toMatchObject({ agentType: "explorer", currentActivity: "継続中" });
+    expect(models).toEqual([]);
+  });
+
+  test("role / nickname の無い Codex サブエージェントは種別 Codex + model で送る（種別へ流用しない）", async () => {
+    const thread = new FakeThread();
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const chats: { payload: unknown }[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return thread; } },
+      onChatItem: (event) => chats.push(event),
+    });
+    await controller.subscribeSession({ session: "work", threadId: "thread-root", cwd: "/tmp/work" });
+
+    openOptions?.onNotification?.({ method: "item/completed", params: { threadId: "thread-root", item: {
+      id: "collab-spawn", type: "collabAgentToolCall", tool: "spawnAgent", status: "completed",
+      senderThreadId: "thread-root", receiverThreadIds: ["thread-plain"], prompt: "調査",
+      model: "gpt-5.6-terra",
+      agentsStates: { "thread-plain": { status: "running", message: null } },
+    } } });
+
+    const payload = chats[0]?.payload as { type: string; node: Record<string, unknown> } | undefined;
+    expect(payload?.node).toMatchObject({
+      nodeId: "thread-plain", agentType: "Codex", model: "gpt-5.6-terra", label: "調査",
+    });
+  });
+
+  test("Codex 再オープンでは thread/read の model を子ノードへ復元する（spawn item に model が無くても）", async () => {
+    const thread = Object.assign(new FakeThread(), {
+      initialItems: [{
+        id: "spawn-history", type: "collabAgentToolCall", tool: "spawnAgent", status: "completed",
+        senderThreadId: "thread-root", receiverThreadIds: ["thread-history"], prompt: "履歴を調査",
+        agentsStates: { "thread-history": { status: "completed", message: "完了" } },
+      }],
+      readThreadStatus: async (threadId: string) => {
+        expect(threadId).toBe("thread-history");
+        return { status: { type: "idle" }, timestampMs: 1_000, model: "gpt-5.6-terra" };
+      },
+    });
+    const chats: { payload: unknown }[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => thread },
+      onChatItem: (event) => chats.push(event),
+    });
+
+    await controller.subscribeSession({ session: "work", threadId: "thread-root", cwd: "/tmp/work" });
+
+    const nodes = chats
+      .map((event) => event.payload as { type: string; node: Record<string, unknown> })
+      .filter((payload) => payload.type === "subagent_node");
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0]?.node).toMatchObject({
+      nodeId: "thread-history", status: "completed", ts: 1_000, model: "gpt-5.6-terra",
+    });
+  });
+
+  test("wait / sendInput item の model は子ノードのモデルに採らない", async () => {
+    const thread = new FakeThread();
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const chats: { payload: unknown }[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return thread; } },
+      onChatItem: (event) => chats.push(event),
+    });
+    await controller.subscribeSession({ session: "work", threadId: "thread-root", cwd: "/tmp/work" });
+
+    openOptions?.onNotification?.({ method: "item/completed", params: { threadId: "thread-root", item: {
+      id: "collab-spawn", type: "collabAgentToolCall", tool: "spawnAgent", status: "completed",
+      senderThreadId: "thread-root", receiverThreadIds: ["thread-w"], prompt: "調査",
+      model: "gpt-5.6-terra",
+      agentsStates: { "thread-w": { status: "running", message: null } },
+    } } });
+    openOptions?.onNotification?.({ method: "item/completed", params: { threadId: "thread-root", item: {
+      id: "collab-wait", type: "collabAgentToolCall", tool: "wait", status: "completed",
+      senderThreadId: "thread-root", receiverThreadIds: ["thread-w"], prompt: null,
+      model: "gpt-5.6-sol",
+      agentsStates: { "thread-w": { status: "running", message: "待機中" } },
+    } } });
+
+    const nodes = chats
+      .map((event) => event.payload as { type: string; node: Record<string, unknown> })
+      .filter((payload) => payload.type === "subagent_node");
+    expect(nodes.map((payload) => payload.node["model"])).toEqual(["gpt-5.6-terra", "gpt-5.6-terra"]);
+    expect(nodes.at(-1)?.node).toMatchObject({ currentActivity: "待機中" });
+  });
+
+  test("ノード生成前に届いた子 thread のモデル変更は保留し、生成時に採る（thread/started の申告が優先）", async () => {
+    const thread = new FakeThread();
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const chats: { payload: unknown }[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return thread; } },
+      onChatItem: (event) => chats.push(event),
+    });
+    await controller.subscribeSession({ session: "work", threadId: "thread-root", cwd: "/tmp/work" });
+
+    openOptions?.onNotification?.({ method: "thread/settings/updated", params: {
+      threadId: "thread-early", threadSettings: { model: "gpt-5.6-luna" },
+    } });
+    openOptions?.onNotification?.({ method: "thread/settings/updated", params: {
+      threadId: "thread-late", threadSettings: { model: "gpt-5.6-luna" },
+    } });
+    expect(chats).toHaveLength(0);
+    openOptions?.onNotification?.({ method: "thread/started", params: { thread: {
+      id: "thread-early", parentThreadId: "thread-root", preview: "", model: null,
+      agentRole: "explorer", status: { type: "active", activeFlags: [] },
+    } } });
+    openOptions?.onNotification?.({ method: "thread/started", params: { thread: {
+      id: "thread-late", parentThreadId: "thread-root", preview: "", model: "gpt-5.6-terra",
+      agentRole: "explorer", status: { type: "active", activeFlags: [] },
+    } } });
+
+    const nodes = chats
+      .map((event) => event.payload as { type: string; node: Record<string, unknown> })
+      .filter((payload) => payload.type === "subagent_node");
+    expect(nodes.map((payload) => [payload.node["nodeId"], payload.node["model"]])).toEqual([
+      ["thread-early", "gpt-5.6-luna"],
+      ["thread-late", "gpt-5.6-terra"],
+    ]);
   });
 
   test("Codex 会話の再購読時も initial collab item から完了済み workflow を復元する", async () => {
     const thread = Object.assign(new FakeThread(), { initialItems: [{
       id: "spawn-history", type: "collabAgentToolCall", tool: "spawnAgent", status: "completed",
       senderThreadId: "thread-root", receiverThreadIds: ["thread-history"], prompt: "履歴を調査",
+      model: "gpt-5.6-terra",
       agentsStates: { "thread-history": { status: "completed", message: "完了" } },
     }] });
     const chats: { itemId: string; payload: unknown }[] = [];
@@ -312,7 +533,7 @@ describe("CodexNativeTurnController", () => {
     expect(chats).toEqual([expect.objectContaining({
       itemId: "subagent:thread-history:0",
       payload: expect.objectContaining({ type: "subagent_node", v: 2, node: expect.objectContaining({
-        nodeId: "thread-history", label: "履歴を調査", status: "completed",
+        nodeId: "thread-history", label: "履歴を調査", status: "completed", model: "gpt-5.6-terra",
       }) }),
     })]);
   });
@@ -902,6 +1123,22 @@ describe("CodexNativeTurnController", () => {
     expect(thread.interrupts).toEqual(["turn-resumed"]);
   });
 
+  test("subscribeSession は購読時の thread モデルを snapshot に含める", async () => {
+    const withModel = Object.assign(new FakeThread(), { model: "gpt-current" });
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => withModel },
+    });
+    await expect(controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" }))
+      .resolves.toMatchObject({ model: "gpt-current" });
+
+    // 旧 App Server（応答に model が無い）は null で、Hub は購読時配信を行わない。
+    const legacy = new CodexNativeTurnController({
+      appServer: { openThread: async () => new FakeThread() },
+    });
+    await expect(legacy.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" }))
+      .resolves.toMatchObject({ model: null });
+  });
+
   test("App Server の利用中モデルと token usage を session callback へ反映する", async () => {
     const thread = new FakeThread();
     let openOptions: CodexAppServerThreadOptions | null = null;
@@ -929,6 +1166,11 @@ describe("CodexNativeTurnController", () => {
     openOptions?.onNotification?.({
       method: "thread/settings/updated",
       params: { threadId: "thread-1", threadSettings: { model: "gpt-5.6-sol" } },
+    });
+    // 子 thread（サブエージェント）の設定更新は親会話のモデル表示に反映しない。
+    openOptions?.onNotification?.({
+      method: "thread/settings/updated",
+      params: { threadId: "thread-1-child", threadSettings: { model: "ignored-child-model" } },
     });
     openOptions?.onNotification?.({
       method: "model/rerouted",

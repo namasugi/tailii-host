@@ -205,7 +205,12 @@ export async function runEngineCommand(args: string[]): Promise<number> {
   });
   // per-session: agentType=codex のセッション用に codex launcher / resume launcher を用意する。
   // codex は resume 未対応のため既定コマンドで新規起動する（新しい rollout を tail）。
-  const codexAppServer = new CodexAppServerManager();
+  const codexAppServer = new CodexAppServerManager({
+    // 版ずれ診断・履歴スナップショットの fallback 理由を engine 経路でも残す（hub は hub.log）。
+    log: (message) => {
+      process.stderr.write(`[tailii-host engine] ${message}\n`);
+    },
+  });
   const codexLauncher = makeSessionLauncher({
     store,
     agent: "codex",
@@ -578,6 +583,9 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
       };
       codexTurnController = new CodexNativeTurnController({
         appServer: codexAppServer,
+        log: (message) => {
+          process.stderr.write(`[tailii-host engine] ${message}\n`);
+        },
         onProcessing: (session, processingState) => {
           hubLink.send({
             type: "session_processing",

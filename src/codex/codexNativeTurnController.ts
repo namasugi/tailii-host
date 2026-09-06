@@ -30,12 +30,15 @@ import {
 import { CodexSubagentTracker } from "./codexSubagentTracker.js";
 import {
   codexAppServerSystemNotice,
+  codexDeprecationNoticeLogLine,
   codexMcpItemErrorNotice,
   codexSystemNoticeContentKey,
 } from "./codexSystemNotice.js";
 
 const TITLE_GENERATION_MAX_ATTEMPTS = 3;
 const TITLE_GENERATION_RETRY_BASE_MS = 250;
+/** 記録済み deprecationNotice 文言の保持上限。 */
+const DEPRECATION_NOTICE_LOG_CAP = 64;
 
 export interface CodexNativeApproval {
   id: string;
@@ -73,6 +76,8 @@ export interface CodexNativeTurnControllerOptions {
     attempts: number;
     error: string | null;
   }) => void;
+  /** 診断ログ（hub.log）。App Server の deprecationNotice など利用者へ見せない通知を記録する。 */
+  log?: (message: string) => void;
 }
 
 export interface CodexTurnControllerRuntime {
@@ -105,10 +110,12 @@ export interface CodexTurnControllerRuntime {
 export interface CodexThreadClient {
   readonly initialItems?: readonly Record<string, unknown>[];
   readonly initialActiveTurnId?: string | null;
-  /** false は rollout 未生成で thread/resume が成立せず、live 通知を保証できない接続。 */
+  /** false は turn 履歴が未生成で購読時の履歴スナップショットが読めず、live 通知を保証できない接続。 */
   readonly liveSubscriptionReady?: boolean;
   /** liveSubscriptionReady=false の理由（診断ログ用）。 */
   readonly liveSubscriptionError?: string | null;
+  /** 購読時点の thread のモデル（thread/resume / thread/start 応答）。不明なら null。 */
+  readonly model?: string | null;
   /**
    * 保存済み thread から現在の turn ID を読み直す。
    * undefined は rollout 未生成で、App Server からまだ確認できない状態を表す。
@@ -118,6 +125,8 @@ export interface CodexThreadClient {
   readThreadStatus?(threadId: string): Promise<{
     status: unknown;
     timestampMs?: number;
+    /** 子 thread の実行モデル（thread/read の Thread.model）。無ければ省略。 */
+    model?: string;
   } | undefined>;
   startTurn(
     text: string,
@@ -140,8 +149,14 @@ export interface CodexSubscriptionSnapshot {
   contentCounts: ReadonlyMap<string, number>;
   /** false の場合、Hub は初回 turn を rollout の継続 tail で表示する。 */
   liveSubscribed: boolean;
-  /** liveSubscribed=false の理由（thread/resume の失敗文言）。 */
+  /** liveSubscribed=false の理由（履歴読み取りの失敗文言）。 */
   liveSubscriptionError?: string | null;
+  /**
+   * 購読時点で thread に設定されているモデル。Hub は履歴 backfill の後に `pc:model` として
+   * 配信し、会話を開いていない間の変更（thread/settings/updated が届かない）を開き直しで
+   * 反映する。null は不明（未materialize で resume が成立しない・旧 App Server）。
+   */
+  model?: string | null;
 }
 
 export interface CodexAppServerThreadRuntime {
@@ -226,6 +241,9 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
   private readonly onChatItem: NonNullable<CodexNativeTurnControllerOptions["onChatItem"]>;
   private readonly onDisconnect: NonNullable<CodexNativeTurnControllerOptions["onDisconnect"]>;
   private readonly onThreadTitle: NonNullable<CodexNativeTurnControllerOptions["onThreadTitle"]>;
+  private readonly log: (message: string) => void;
+  /** 同文の deprecationNotice は process 内で 1 回だけ記録する（thread を開くたびに届く）。 */
+  private readonly loggedDeprecationNotices = new Set<string>();
   private readonly open = new Map<string, OpenThread>();
   private readonly pendingUserInput = new Map<string, PendingUserInput>();
 
@@ -240,6 +258,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     this.onChatItem = options.onChatItem ?? (() => {});
     this.onDisconnect = options.onDisconnect ?? (() => {});
     this.onThreadTitle = options.onThreadTitle ?? (() => {});
+    this.log = options.log ?? (() => {});
   }
 
   async subscribeSession(options: {
@@ -264,6 +283,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       contentCounts,
       liveSubscribed: opened.thread.liveSubscriptionReady !== false,
       liveSubscriptionError: opened.thread.liveSubscriptionError ?? null,
+      model: opened.thread.model ?? null,
     };
   }
 
@@ -525,6 +545,13 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
           snapshot.status,
           snapshot.timestampMs ?? Date.now(),
         ));
+        // 子 thread 自身の model を権威にする（spawn item に model が無い版・要求 slug と実モデルが
+        // 食い違う場合でも、live の thread/started と同じ表示に揃える）。
+        restoredSubagents.push(...opened.subagents.ingestThreadModel(
+          nodeId,
+          snapshot.model,
+          snapshot.timestampMs ?? Date.now(),
+        ));
       }
     }
     if (opened.activeTurnId === null) {
@@ -555,6 +582,19 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     notification: CodexAppServerNotification,
   ): void {
     const params = asRecord(notification.params);
+    if (notification.method === "deprecationNotice") {
+      // 開発者向け通知（API の非推奨・config の旧機能）は chat へ流さず、同文は 1 回だけログする。
+      const line = codexDeprecationNoticeLogLine(params);
+      if (line !== null && !this.loggedDeprecationNotices.has(line)) {
+        // 通知の種類は少数の定数文言だが、可変値を含む版に備えて記憶は有界にする。
+        if (this.loggedDeprecationNotices.size >= DEPRECATION_NOTICE_LOG_CAP) {
+          this.loggedDeprecationNotices.clear();
+        }
+        this.loggedDeprecationNotices.add(line);
+        this.log(line);
+      }
+      return;
+    }
     const notificationThreadId = params?.["threadId"];
     // App Server が接続をまたいで通知する版でも、別 thread の lifecycle が
     // このセッションの activeTurnId と processing 状態を上書きしないようにする。
@@ -666,13 +706,26 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       }
     }
     if (notification.method === "thread/settings/updated") {
+      // 子 thread（サブエージェント）の設定更新は親会話のモデル表示に混ぜず、該当ノードへ反映する。
+      // threadId 無し（旧版）は従来どおり自 thread として扱う。
+      const settingsThreadId = params?.["threadId"];
       const settings = asRecord(params?.["threadSettings"]);
       const model = settings?.["model"];
-      if (typeof model === "string" && model.length > 0) this.onModel(session, model);
+      if (typeof model === "string" && model.length > 0) {
+        if (typeof settingsThreadId !== "string" || settingsThreadId === threadId) {
+          this.onModel(session, model);
+        } else {
+          this.applySubagentModel(session, threadId, settingsThreadId, model);
+        }
+      }
     }
-    if (notification.method === "model/rerouted" && params?.["threadId"] === threadId) {
-      const model = params["toModel"];
-      if (typeof model === "string" && model.length > 0) this.onModel(session, model);
+    if (notification.method === "model/rerouted") {
+      const reroutedThreadId = params?.["threadId"];
+      const model = params?.["toModel"];
+      if (typeof reroutedThreadId === "string" && typeof model === "string" && model.length > 0) {
+        if (reroutedThreadId === threadId) this.onModel(session, model);
+        else this.applySubagentModel(session, threadId, reroutedThreadId, model);
+      }
     }
     if (notification.method === "thread/tokenUsage/updated") {
       const tokenUsage = asRecord(params?.["tokenUsage"]);
@@ -686,6 +739,22 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
         );
       }
     }
+  }
+
+  /** 子 thread（サブエージェント）のモデル変更を workflow ノードへ反映する。未知の thread は無視。 */
+  private applySubagentModel(
+    session: string,
+    threadId: string,
+    childThreadId: string,
+    model: string,
+  ): void {
+    const current = this.open.get(session);
+    if (current?.threadId !== threadId) return;
+    this.publishSubagentNodes(
+      session,
+      current,
+      current.subagents.ingestThreadModel(childThreadId, model, Date.now()),
+    );
   }
 
   private publishSubagentNodes(

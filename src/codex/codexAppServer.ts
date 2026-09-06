@@ -16,6 +16,12 @@ const THREAD_TITLE_PROMPT_MAX_LENGTH = 2_000;
 const THREAD_TITLE_MAX_LENGTH = 36;
 const THREAD_TITLE_FALLBACK_MAX_LENGTH = 60;
 const DEFAULT_TITLE_GENERATION_TIMEOUT_MS = 30_000;
+/** thread/items/list の 1 ページ当たり件数（server は 1..100 に clamp する。turns/list は常に limit 1）。 */
+const THREAD_HISTORY_PAGE_LIMIT = 100;
+/** 履歴ページングの上限ページ数（100 件 × 2000 ページ）。cursor が進まない版でも無限ループしない。 */
+const THREAD_HISTORY_MAX_PAGES = 2_000;
+/** タイトル生成で最初の user prompt を探す上限ページ数（paginated の thread/items/list）。 */
+const THREAD_TITLE_PROMPT_MAX_PAGES = 4;
 const THREAD_TITLE_OUTPUT_SCHEMA = {
   type: "object",
   properties: {
@@ -295,15 +301,21 @@ export class CodexAppServerThread {
     readonly initialItems: readonly Record<string, unknown>[],
     readonly initialActiveTurnId: string | null,
     /**
-     * この接続で thread/resume（または作成元 bootstrap）が成功し、live 通知を受け取れるか。
-     * rollout 未生成の新規 thread は resume に失敗するため false。呼び出し側は初回 turn の
-     * 表示を rollout tail へフォールバックし、通知が来ない接続を live 権威にしない。
+     * この接続で thread/resume と履歴スナップショットの読み取り（または作成元 bootstrap）が
+     * 成功し、live 通知を受け取れるか。turn 履歴が未生成の新規 thread は false。呼び出し側は
+     * 初回 turn の表示を rollout tail へフォールバックし、この接続を live 権威にしない。
      */
     readonly liveSubscriptionReady: boolean,
     private readonly connection: CodexAppServerConnection,
     private readonly cwd: string | null,
-    /** liveSubscriptionReady=false の理由（thread/resume の失敗文言）。ログ診断用。 */
+    /** liveSubscriptionReady=false の理由（履歴読み取りの失敗文言）。ログ診断用。 */
     readonly liveSubscriptionError: string | null = null,
+    /**
+     * 購読時点で thread に設定されているモデル（thread/resume または作成元 thread/start の
+     * 応答 `thread.model`）。null は応答に含まれない旧 App Server。Hub はこれを `pc:model`
+     * として配信し、会話を開いていない間に変更されたモデルも開き直しで反映する。
+     */
+    readonly model: string | null = null,
   ) {}
 
   async startTurn(
@@ -340,29 +352,26 @@ export class CodexAppServerThread {
   async readActiveTurnId(): Promise<string | null | undefined> {
     for (let attempt = 1; ; attempt += 1) {
       try {
-        const response = await this.connection.request(
-          "thread/read",
-          {
-            threadId: this.threadId,
-            includeTurns: true,
-          },
-          attempt === 1 ? undefined : CodexAppServerThread.activeTurnReadRetryTimeoutMs,
-        );
-        return extractActiveTurnId(response);
+        // 最新 turn だけを読む（turn は直列なので、実行中なら必ず末尾）。全履歴 hydration
+        // （thread/read includeTurns:true）は paginated thread で非推奨のため使わない。
+        const turns = await listThreadTurns(this.connection, this.threadId, {
+          limit: 1,
+          sortDirection: "desc",
+          itemsView: "notLoaded",
+          all: false,
+          timeoutMs: attempt === 1 ? undefined : CodexAppServerThread.activeTurnReadRetryTimeoutMs,
+        });
+        return activeTurnIdOfTurns(turns);
       } catch (error) {
-        // thread/read は副作用が無い。未 materialize thread の初回送信と
+        // thread/turns/list は副作用が無い。未 materialize thread の初回送信と
         // 別セッションの処理が共有 App Server 上で重なった場合のみ、
         // 5秒 timeout を有界リトライする。turn/start / turn/steer は受理済みか
         // 不明なため、この自動リトライの対象にしない。
-        if (isRequestTimeout(error, "thread/read")) {
+        if (isRequestTimeout(error, "thread/turns/list")) {
           if (attempt >= CodexAppServerThread.activeTurnReadMaxAttempts) throw error;
           continue;
         }
-        // 全履歴 hydration（includeTurns）は paginated thread で非推奨（codex 0.153.4+）。
-        // 対応版ではページ API で最新 turn の状態だけを読む（turn 無しなら null=idle）。
-        const latest = await this.readLatestTurnStatus();
-        if (latest !== undefined) return latest;
-        // 新規 thread の最初の rollout 行がまだ無い間は、idle とは断定できない。
+        // 新規 thread の最初の turn 記録がまだ無い間は、idle とは断定できない。
         // controller は手元の ID を維持するか、初回 turn/start へ進む。判定は既知文言に加えて
         // thread メタデータの可読性（文言非依存）で行う。判定文言の網羅漏れで新規会話が
         // 全滅した実障害（2026-09-06）の再発防止。
@@ -375,29 +384,14 @@ export class CodexAppServerThread {
   }
 
   /**
-   * `thread/turns/list`（codex 0.153+）で最新 turn を 1 件読む。
-   * inProgress なら turn ID、それ以外（turn 無しを含む）は null。未対応版・未 materialize・
-   * timeout は undefined（呼び出し側が別の判定へ進む）。
+   * 親履歴で欠落する sub-agent の終端状態を、子 thread 自身から読み直す。
+   * Thread の `model`（ロード中は現在の設定値、未ロードなら最後に永続化された値）も返し、
+   * 再オープン時に spawn item へ model が無い版でも実行モデルを復元できるようにする。
    */
-  private async readLatestTurnStatus(): Promise<string | null | undefined> {
-    try {
-      const response = objectRecord(await this.connection.request(
-        "thread/turns/list",
-        { threadId: this.threadId, limit: 1, sortDirection: "desc", itemsView: "notLoaded" },
-        CodexAppServerThread.activeTurnReadRetryTimeoutMs,
-      ));
-      const data = response?.["data"];
-      if (!Array.isArray(data)) return undefined;
-      return extractActiveTurnId({ thread: { turns: data } });
-    } catch {
-      return undefined;
-    }
-  }
-
-  /** 親履歴で欠落する sub-agent の終端状態を、子 thread 自身から読み直す。 */
   async readThreadStatus(threadId: string): Promise<{
     status: unknown;
     timestampMs?: number;
+    model?: string;
   } | undefined> {
     for (let attempt = 1; attempt <= CodexAppServerThread.activeTurnReadMaxAttempts; attempt += 1) {
       try {
@@ -411,9 +405,11 @@ export class CodexAppServerThread {
         const timestampMs = codexTimestampMs(
           thread["createdAt"] ?? thread["updatedAt"] ?? thread["recencyAt"],
         );
+        const model = thread["model"];
         return {
           status: thread["status"],
           ...(timestampMs === undefined ? {} : { timestampMs }),
+          ...(typeof model === "string" && model.length > 0 ? { model } : {}),
         };
       } catch (error) {
         if (isRequestTimeout(error, "thread/read") &&
@@ -531,6 +527,19 @@ async function readCodexSecurityDefaults(
   return { approvalPolicy, approvalsReviewer, sandbox };
 }
 
+/**
+ * 利用者設定（config.toml 階層）の既定モデル。config/read の `config.model` で、TUI の
+ * `/model` で保存した値も含む現在値を読む。未設定・旧 App Server・失敗時は null。
+ */
+async function readCodexConfiguredModel(connection: CodexAppServerConnection): Promise<string | null> {
+  try {
+    const response = objectRecord(await connection.request("config/read", { includeLayers: false }));
+    return stringValue(objectRecord(response?.["config"])?.["model"]);
+  } catch {
+    return null;
+  }
+}
+
 function objectRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -603,6 +612,8 @@ export class CodexAppServerManager {
   private readonly startupLockPath: string;
   /** 最初の turn 前（rollout 未作成）の thread を生存させる作成元購読。openThread が引き継ぐ。 */
   private readonly bootstrapConnections = new Map<string, CodexAppServerConnection>();
+  /** thread/start 応答の model。bootstrap 接続を引き継ぐ openThread が購読時のモデルとして返す。 */
+  private readonly bootstrapThreadModels = new Map<string, string | null>();
   private readonly log: ((message: string) => void) | null;
   private readonly readCliVersion: () => Promise<string | null>;
   private cliVersionPromise: Promise<string | null> | null = null;
@@ -805,6 +816,7 @@ export class CodexAppServerManager {
       // remote TUI/thread/resume が "no rollout found" になる。openThread まで保持して引き継ぐ。
       this.bootstrapConnections.get(threadId)?.close();
       this.bootstrapConnections.set(threadId, connection);
+      this.bootstrapThreadModels.set(threadId, threadModel(response));
       succeeded = true;
       return threadId;
     } finally {
@@ -912,6 +924,20 @@ export class CodexAppServerManager {
         }
       } while (cursor !== null);
 
+      // model/list の isDefault は preset（サーバ側の推奨既定）で、利用者が config.toml に
+      // 書いた model とは別物。thread/start に model を渡さない新規会話は config の model で
+      // 起動するため、一覧に含まれる限りそちらを isDefault にして「既定」の表示と実体を揃える。
+      const configuredDefault = await readCodexConfiguredModel(connection);
+      const visibleModelIds = new Set(
+        rawModels.flatMap((raw) => {
+          if (raw["hidden"] === true) return [];
+          const id = stringValue(raw["model"]) ?? stringValue(raw["id"]);
+          return id === null ? [] : [id];
+        }),
+      );
+      const effectiveDefault =
+        configuredDefault !== null && visibleModelIds.has(configuredDefault) ? configuredDefault : null;
+
       // model/list がAPIキャッシュを更新した後に読む。App Serverの公開Model型には
       // context windowが無いため、同じCodex API応答の永続キャッシュから実効値を結合する。
       const cachedWindows = readModelContextWindows(path.join(this.codexHome, "models_cache.json"));
@@ -938,7 +964,7 @@ export class CodexAppServerManager {
           ...(contextWindow !== undefined ? { contextWindow } : {}),
           ...(defaultReasoningEffort !== null ? { defaultReasoningEffort } : {}),
           ...(supportedReasoningEfforts.length > 0 ? { supportedReasoningEfforts } : {}),
-          isDefault: raw["isDefault"] === true,
+          isDefault: effectiveDefault !== null ? model === effectiveDefault : raw["isDefault"] === true,
         }];
       });
     } finally {
@@ -965,6 +991,10 @@ export class CodexAppServerManager {
     await this.ensureRunning();
     const bootstrap = this.bootstrapConnections.get(options.threadId) ?? null;
     if (bootstrap !== null) this.bootstrapConnections.delete(options.threadId);
+    // 作成元接続を引き継ぐ場合は thread/start 応答の model を購読時のモデルとして使う。
+    let model: string | null =
+      bootstrap !== null ? this.bootstrapThreadModels.get(options.threadId) ?? null : null;
+    this.bootstrapThreadModels.delete(options.threadId);
     const connection = bootstrap ?? (await this.connect(this.socketPath));
     const removeNotification = connection.onNotification((notification) => {
       options.onNotification?.(notification);
@@ -989,25 +1019,46 @@ export class CodexAppServerManager {
       if (bootstrap === null) {
         await connection.initialize();
         try {
-          const response = await connection.request("thread/resume", {
+          // 全履歴 hydration（excludeTurns:false）は paginated thread で非推奨（codex 0.153.4+ は
+          // 呼び出した接続へ deprecationNotice を返す）。resume はメタデータだけにし、
+          // Hub の rollout backfill と live 通知の境界に使う履歴 item と実行中 turn は
+          // ページ API で読む（readThreadHistorySnapshot）。購読開始（resume）と履歴読み取りの
+          // 間に完了した item は snapshot と live 通知の両方に現れるが、Hub は snapshot item を
+          // rollout の occurrence と照合して 1 回だけ出す（flushCodexBuffer）。
+          const resumed = await connection.request("thread/resume", {
             threadId: options.threadId,
-            // Hub の rollout backfill と live 通知の厳密な境界に履歴 item ID を使う。
-            excludeTurns: false,
+            excludeTurns: true,
           });
-          initialItems = extractThreadItems(response);
-          initialActiveTurnId = extractActiveTurnId(response);
+          // thread の現在モデルは resume 応答が権威。履歴読み取りが失敗する未materialize
+          // thread（turn 前）でも resume 自体は成立するため、snapshot より先に確定する。
+          model = threadModel(resumed) ?? model;
+          const snapshot = await readThreadHistorySnapshotWithRetry(
+            connection,
+            options.threadId,
+            threadHistoryMode(resumed),
+          );
+          initialItems = snapshot.items;
+          initialActiveTurnId = snapshot.activeTurnId;
           liveSubscriptionReady = true;
         } catch (error) {
-          // thread/start から最初の user turn まで rollout は未作成で、別接続からの
-          // thread/resume は "no rollout found" になる。ただし共有 App Server 内の
-          // live thread 自体は存在し、この接続から turn/start を直接送れば materialize
-          // できる。engine と Session Hub は別プロセスなので、この場合だけ履歴ゼロとして
-          // 接続を維持し、最初の turn/start へ進ませる。判定は文言一致に加えて
-          // メタデータ読み取りの可否（文言非依存）で行う。
+          // thread/start から最初の user turn まで turn 履歴は未作成で、別接続からの
+          // 履歴読み取りは "no rollout found" / "list_turns is not supported yet" になる。
+          // ただし共有 App Server 内の live thread 自体は存在し、この接続から turn/start を
+          // 直接送れば materialize できる。engine と Session Hub は別プロセスなので、
+          // この場合だけ履歴ゼロとして接続を維持し、最初の turn/start へ進ませる
+          // （resume 自体が成立していても live 権威にはせず、従来どおり rollout fallback）。
+          // 判定は文言一致に加えてメタデータ読み取りの可否（文言非依存）で行う。
           if (!(await confirmThreadHistoryUnavailable(connection, options.threadId, error))) {
             throw error;
           }
           liveSubscriptionError = String(error);
+          // 正常な turn 前（既知文言）と、materialize 済み thread の履歴読み取り失敗（要調査:
+          // 会話を開くたびに rollout fallback へ落ち続ける）を hub.log で区別できるようにする。
+          this.log?.(
+            isUnmaterializedThreadError(error, options.threadId)
+              ? `Codex thread ${options.threadId} は turn 前の未materialize（正常）: 履歴スナップショット無しで rollout fallback`
+              : `Codex thread ${options.threadId} の履歴スナップショットを読めず rollout fallback（要調査）: ${liveSubscriptionError}`,
+          );
         }
       }
       return new CodexAppServerThread(
@@ -1018,6 +1069,7 @@ export class CodexAppServerManager {
         connection,
         options.cwd ?? null,
         liveSubscriptionError,
+        model,
       );
     } catch (error) {
       removeNotification();
@@ -1119,9 +1171,10 @@ async function readThreadTitleTarget(
 ): Promise<{ name: string | null; prompt: string }> {
   let response: unknown;
   try {
+    // 名前はメタデータだけの read で読む（includeTurns:true は paginated thread で非推奨）。
     response = await connection.request("thread/read", {
       threadId,
-      includeTurns: true,
+      includeTurns: false,
     });
   } catch (error) {
     // 作成直後は初回 turn/start 応答後もしばらく rollout が空の場合がある。
@@ -1141,9 +1194,17 @@ async function readThreadTitleTarget(
   }
   const name =
     typeof rawName === "string" && rawName.trim().length > 0 ? rawName.trim() : null;
-  const firstUserPrompt = extractThreadItems(response)
-    .map(extractUserMessageText)
-    .find((value): value is string => value !== null && value.trim().length > 0);
+  // 命名済みなら呼び出し側は生成しないので、履歴の読み取り（追加 RPC）はしない。
+  if (name !== null) return { name, prompt: fallbackPrompt };
+  // 最初の user prompt は保存済み履歴を権威にする（TUI attach / resume の競合で
+  // controller の入力が後続メッセージになっていても、新規会話の命名を落とさない）。
+  let firstUserPrompt: string | null = null;
+  try {
+    firstUserPrompt = await readFirstUserPrompt(connection, threadId, threadHistoryMode(response));
+  } catch (error) {
+    // 初回 turn/start 応答後も turn 履歴の flush までは読めない場合がある。
+    if (!(await confirmThreadHistoryUnavailable(connection, threadId, error))) throw error;
+  }
   return {
     name,
     prompt: firstUserPrompt ?? fallbackPrompt,
@@ -1325,8 +1386,9 @@ function normalizeFallbackThreadTitle(raw: string): string {
 
 /**
  * codex 0.153.4+ の `historyMode: "paginated"` thread は、turn が 1 件も無い間
- * `thread/read includeTurns:true` と `thread/resume` を JSON-RPC -32601 でこの文言のまま拒否する
- * （thread id を含まない）。turn/start 自体は受理され、最初の turn 以降は両 RPC とも成功する。
+ * `thread/turns/list`（および全履歴 hydration の `thread/read includeTurns:true` /
+ * `thread/resume excludeTurns:false`）を JSON-RPC -32601 でこの文言のまま拒否する
+ * （thread id を含まない）。turn/start 自体は受理され、最初の turn 以降は成功する。
  */
 const PAGINATED_THREAD_TURNS_UNAVAILABLE = "list_turns is not supported yet";
 
@@ -1374,8 +1436,8 @@ function probeCodexCliVersion(codexPath: string): Promise<string | null> {
 const THREAD_METADATA_PROBE_TIMEOUT_MS = 2_000;
 
 /**
- * turn 履歴の読み取り（thread/resume / thread/read includeTurns:true）の失敗が
- * 「turn 履歴が未生成・未対応」なのかを、エラー文言に依存せず判定する。
+ * turn 履歴の読み取り（thread/turns/list。旧: thread/resume / thread/read includeTurns:true）の
+ * 失敗が「turn 履歴が未生成・未対応」なのかを、エラー文言に依存せず判定する。
  *
  * 1. 既知の文言（isUnmaterializedThreadError）なら即 true。
  * 2. timeout は接続が刺さっている可能性があるため false（呼び出し側の有界リトライに委ねる）。
@@ -1456,38 +1518,290 @@ function parseRemoteControlPairing(value: unknown): CodexRemoteControlPairing | 
   };
 }
 
-function extractThreadItems(response: unknown): Record<string, unknown>[] {
+/** thread の履歴保存方式。0.153.4+ は応答の `thread.historyMode` で判別でき、旧版は欠落（legacy）。 */
+type CodexThreadHistoryMode = "paginated" | "legacy";
+
+/** thread/resume・thread/read 応答の `thread.historyMode`。欠落や未知の値は legacy 扱い。 */
+function threadHistoryMode(response: unknown): CodexThreadHistoryMode {
+  const thread = objectRecord(objectRecord(response)?.["thread"]);
+  return thread?.["historyMode"] === "paginated" ? "paginated" : "legacy";
+}
+
+interface ThreadHistoryPageOptions {
+  /** 1 ページの件数。server は 1..100 に clamp する。 */
+  limit: number;
+  sortDirection: "asc" | "desc";
+  /** true なら nextCursor が尽きるまで続きのページも読む。 */
+  all: boolean;
+  timeoutMs?: number;
+}
+
+interface ThreadTurnsListOptions extends ThreadHistoryPageOptions {
+  itemsView: "notLoaded" | "summary" | "full";
+}
+
+/**
+ * host 側で検出した応答形・上限の異常（data 欠落、未知の item 形、turns 欠落、ページ上限）。
+ * server の一時障害ではなく恒久的なので、読み直しの対象にしない。
+ */
+class CodexHistoryShapeError extends Error {}
+
+/**
+ * cursor ページングの共通ループ。応答形が違う（data が配列でない）版は成功として扱わず throw する
+ * （「履歴ゼロなのに live 権威」という誤った状態を作らない。呼び出し側は未 materialize 判定→
+ * rollout fallback へ進む）。cursor が進まない・既出 cursor へ戻る（循環）・空ページ・上限ページ数・
+ * `until` 成立で打ち切り、無限ループしない。壊れた cursor のページは取り込んだうえで打ち切る
+ * （重複は呼び出し側が id で排除する）。
+ */
+async function pageThreadHistory(
+  connection: CodexAppServerConnection,
+  method: "thread/turns/list" | "thread/items/list",
+  threadId: string,
+  params: Record<string, unknown>,
+  options: ThreadHistoryPageOptions,
+  collect: (data: unknown[]) => void,
+  until: () => boolean = () => false,
+): Promise<void> {
+  let cursor: string | null = null;
+  const visited = new Set<string>();
+  for (let page = 1; page <= THREAD_HISTORY_MAX_PAGES; page += 1) {
+    const response = objectRecord(await connection.request(
+      method,
+      {
+        threadId,
+        limit: options.limit,
+        sortDirection: options.sortDirection,
+        ...params,
+        ...(cursor === null ? {} : { cursor }),
+      },
+      options.timeoutMs,
+    ));
+    const data = response?.["data"];
+    if (!Array.isArray(data)) {
+      throw new CodexHistoryShapeError(
+        `Codex App Server ${method} response omitted data for thread ${threadId}`,
+      );
+    }
+    collect(data);
+    const rawNext = response?.["nextCursor"];
+    const next = typeof rawNext === "string" && rawNext.length > 0 ? rawNext : null;
+    if (!options.all || next === null || visited.has(next) || data.length === 0 || until()) return;
+    visited.add(next);
+    cursor = next;
+  }
+  throw new CodexHistoryShapeError(
+    `Codex App Server ${method} exceeded ${THREAD_HISTORY_MAX_PAGES} pages for thread ${threadId}`,
+  );
+}
+
+/** id 付き要素の重複（同じページを返し続ける壊れた cursor 等）を排除する。id 無しは常に採用。 */
+function rememberId(seen: Set<string>, id: unknown): boolean {
+  if (typeof id !== "string" || id.length === 0) return true;
+  if (seen.has(id)) return false;
+  seen.add(id);
+  return true;
+}
+
+/**
+ * `thread/turns/list` で turn を読む。サポート下限の codex 0.144.5 から itemsView 付きで利用できる。
+ * 用途は turn 状態の読み取り（desc, limit 1, notLoaded）に限る。履歴の hydration には使わない
+ * （readThreadHistorySnapshot）: `itemsView:"full"` は server 側で「旧 client が thread/items/list へ
+ * 移行するまでの互換経路」とされ、legacy thread の turns/list は itemsView に関わらず
+ * リクエスト毎に rollout 全体を再生する（server 実装）。
+ */
+async function listThreadTurns(
+  connection: CodexAppServerConnection,
+  threadId: string,
+  options: ThreadTurnsListOptions,
+): Promise<Record<string, unknown>[]> {
+  const turns: Record<string, unknown>[] = [];
+  const seen = new Set<string>();
+  await pageThreadHistory(
+    connection,
+    "thread/turns/list",
+    threadId,
+    { itemsView: options.itemsView },
+    options,
+    (data) => {
+      for (const turn of data) {
+        const record = objectRecord(turn);
+        if (record !== null && rememberId(seen, record["id"])) turns.push(record);
+      }
+    },
+  );
+  return turns;
+}
+
+/**
+ * `thread/items/list`（paginated thread 専用。legacy thread は -32601 `not supported yet`）で
+ * item を読む。応答の data は turn を跨いだ時系列順（asc）。0.153.4 は `{ turnId, item }` の
+ * 封筒、サポート下限 0.144.5 の protocol は素の ThreadItem 配列なので両方を受け、どちらでもない
+ * 形（非空ページで採用 0 件）は throw する（無言の空履歴で live 権威にしない）。
+ * `until` が true を返した時点で続きのページを読まない。
+ */
+async function listThreadItems(
+  connection: CodexAppServerConnection,
+  threadId: string,
+  options: ThreadHistoryPageOptions,
+  until: (items: readonly Record<string, unknown>[], pages: number) => boolean = () => false,
+): Promise<Record<string, unknown>[]> {
+  const items: Record<string, unknown>[] = [];
+  const seen = new Set<string>();
+  let pages = 0;
+  await pageThreadHistory(
+    connection,
+    "thread/items/list",
+    threadId,
+    {},
+    options,
+    (data) => {
+      pages += 1;
+      let accepted = 0;
+      for (const entry of data) {
+        const record = objectRecord(entry);
+        const item = objectRecord(record?.["item"]) ??
+          (typeof record?.["type"] === "string" ? record : null);
+        if (item === null) continue;
+        accepted += 1;
+        if (rememberId(seen, item["id"])) items.push(item);
+      }
+      if (data.length > 0 && accepted === 0) {
+        throw new CodexHistoryShapeError(
+          `Codex App Server thread/items/list returned items of unknown shape for thread ${threadId}`,
+        );
+      }
+    },
+    () => until(items, pages),
+  );
+  return items;
+}
+
+/**
+ * thread/read includeTurns:true 応答の `thread.turns`。protocol 上は常に配列（他の応答では空配列）
+ * なので、欠落は応答形の違いとして throw する（無言の空履歴で live 権威にしない）。
+ */
+function turnsOfThreadResponse(response: unknown): Record<string, unknown>[] {
+  const turns = objectRecord(objectRecord(response)?.["thread"])?.["turns"];
+  if (!Array.isArray(turns)) {
+    throw new CodexHistoryShapeError(
+      "Codex App Server thread/read includeTurns:true response omitted thread.turns",
+    );
+  }
+  return turns
+    .map(objectRecord)
+    .filter((turn): turn is Record<string, unknown> => turn !== null);
+}
+
+/**
+ * 購読直後の履歴スナップショット（Hub の rollout backfill と live 通知の境界に使う item 列と、
+ * 別 client が開始した実行中 turn）を、非推奨でない API だけで読む。
+ * - paginated（codex 0.153.4+ の新規 thread）: server の案内どおり turn 状態は `thread/turns/list`
+ *   （desc, limit 1, notLoaded）、item は `thread/items/list`（asc）で読む。turn 前は最初の
+ *   `thread/turns/list` が `list_turns is not supported yet` で失敗し、呼び出し側が未 materialize
+ *   判定へ進む。item 列は全履歴 hydration（server の paginated_thread_full_turns）と同じ
+ *   （0.153.4 実測）。
+ * - legacy（rollout 保存の旧 thread）: `thread/items/list` は未対応（-32601）。全履歴 hydration
+ *   `thread/read includeTurns:true` は legacy では非推奨でなく（server の通知は paginated 限定）、
+ *   rollout を 1 回再生するだけで済む。`thread/turns/list itemsView:full` はページ毎に rollout
+ *   全体を再生する（server 実装）ため使わない。
+ */
+async function readThreadHistorySnapshot(
+  connection: CodexAppServerConnection,
+  threadId: string,
+  historyMode: CodexThreadHistoryMode,
+): Promise<{ items: Record<string, unknown>[]; activeTurnId: string | null }> {
+  if (historyMode === "paginated") {
+    const latest = await listThreadTurns(connection, threadId, {
+      limit: 1,
+      sortDirection: "desc",
+      itemsView: "notLoaded",
+      all: false,
+    });
+    const items = await listThreadItems(connection, threadId, {
+      limit: THREAD_HISTORY_PAGE_LIMIT,
+      sortDirection: "asc",
+      all: true,
+    });
+    return { items, activeTurnId: activeTurnIdOfTurns(latest) };
+  }
+  const turns = turnsOfThreadResponse(
+    await connection.request("thread/read", { threadId, includeTurns: true }),
+  );
+  return { items: itemsOfTurns(turns), activeTurnId: activeTurnIdOfTurns(turns) };
+}
+
+/**
+ * 履歴スナップショットの読み取りを、ページング中の一時的な失敗（例: compaction で cursor の
+ * anchor turn が消えた `invalid cursor`）に備えて 1 回だけやり直す。timeout（接続が刺さっている
+ * 可能性）、未 materialize の既知文言（turn 前は何度読んでも同じ）、host 側で検出した応答形・
+ * 上限の異常（恒久的）は再試行しない。
+ */
+async function readThreadHistorySnapshotWithRetry(
+  connection: CodexAppServerConnection,
+  threadId: string,
+  historyMode: CodexThreadHistoryMode,
+): Promise<{ items: Record<string, unknown>[]; activeTurnId: string | null }> {
+  try {
+    return await readThreadHistorySnapshot(connection, threadId, historyMode);
+  } catch (error) {
+    if (!(error instanceof Error) ||
+      error instanceof CodexHistoryShapeError ||
+      error.message.startsWith("Codex App Server request timed out") ||
+      isUnmaterializedThreadError(error, threadId)) {
+      throw error;
+    }
+    return readThreadHistorySnapshot(connection, threadId, historyMode);
+  }
+}
+
+/** 命名用に最初の user prompt を保存済み履歴から読む（無ければ null）。 */
+async function readFirstUserPrompt(
+  connection: CodexAppServerConnection,
+  threadId: string,
+  historyMode: CodexThreadHistoryMode,
+): Promise<string | null> {
+  if (historyMode === "legacy") {
+    // legacy は rollout を 1 回で読む（readThreadHistorySnapshot と同じ理由）。全 turn を走査する。
+    const response = await connection.request("thread/read", { threadId, includeTurns: true });
+    return firstUserPromptOfItems(itemsOfTurns(turnsOfThreadResponse(response)));
+  }
+  // paginated は先頭から user prompt が見つかるまで（上限ページ数まで）読む。
+  const items = await listThreadItems(
+    connection,
+    threadId,
+    { limit: THREAD_HISTORY_PAGE_LIMIT, sortDirection: "asc", all: true },
+    (collected, pages) =>
+      pages >= THREAD_TITLE_PROMPT_MAX_PAGES || firstUserPromptOfItems(collected) !== null,
+  );
+  return firstUserPromptOfItems(items);
+}
+
+function firstUserPromptOfItems(items: readonly Record<string, unknown>[]): string | null {
+  return items
+    .map(extractUserMessageText)
+    .find((value): value is string => value !== null && value.trim().length > 0) ?? null;
+}
+
+/** turn 一覧に含まれる item を時系列順に平坦化する。 */
+function itemsOfTurns(turns: readonly Record<string, unknown>[]): Record<string, unknown>[] {
   const result: Record<string, unknown>[] = [];
-  if (typeof response !== "object" || response === null) return result;
-  const thread = (response as Record<string, unknown>)["thread"];
-  if (typeof thread !== "object" || thread === null) return result;
-  const turns = (thread as Record<string, unknown>)["turns"];
-  if (!Array.isArray(turns)) return result;
   for (const turn of turns) {
-    if (typeof turn !== "object" || turn === null) continue;
-    const items = (turn as Record<string, unknown>)["items"];
+    const items = turn["items"];
     if (!Array.isArray(items)) continue;
     for (const item of items) {
-      if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
-      result.push(item as Record<string, unknown>);
+      const record = objectRecord(item);
+      if (record !== null) result.push(record);
     }
   }
   return result;
 }
 
-/** thread/resume が返す turn 一覧から、別 client が開始した実行中 turn を復元する。 */
-function extractActiveTurnId(response: unknown): string | null {
-  if (typeof response !== "object" || response === null) return null;
-  const thread = (response as Record<string, unknown>)["thread"];
-  if (typeof thread !== "object" || thread === null) return null;
-  const turns = (thread as Record<string, unknown>)["turns"];
-  if (!Array.isArray(turns)) return null;
+/** turn 一覧から、別 client が開始した実行中 turn を復元する（末尾から最初の inProgress）。 */
+function activeTurnIdOfTurns(turns: readonly Record<string, unknown>[]): string | null {
   for (let index = turns.length - 1; index >= 0; index -= 1) {
     const turn = turns[index];
-    if (typeof turn !== "object" || turn === null || Array.isArray(turn)) continue;
-    const record = turn as Record<string, unknown>;
-    if (record["status"] !== "inProgress") continue;
-    const id = record["id"];
+    if (turn === undefined || turn["status"] !== "inProgress") continue;
+    const id = turn["id"];
     if (typeof id === "string" && id.length > 0) return id;
   }
   return null;
@@ -1499,6 +1813,12 @@ function defaultLaunch(executable: string, args: string[], env: NodeJS.ProcessEn
     // readiness probeが最終的な構造化エラーを返すため、EventEmitterの未処理errorだけ防ぐ。
   });
   child.unref();
+}
+
+/** thread/start / thread/resume 応答の `thread.model`。無ければ null（旧 App Server）。 */
+function threadModel(response: unknown): string | null {
+  const thread = objectRecord(objectRecord(response)?.["thread"]);
+  return stringValue(thread?.["model"]);
 }
 
 function extractThreadId(response: unknown): string | null {

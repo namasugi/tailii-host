@@ -9,6 +9,7 @@ import { PROTOCOL_V1, type ControlMessage } from "../protocol.js";
 const NOTICE_STREAM_PREFIX = "codex-notice-";
 const NOTICE_DETAIL_LIMIT = 240;
 const NOTICE_NAME_LIMIT = 80;
+const DEPRECATION_LOG_LIMIT = 400;
 
 export interface CodexSystemNotice {
   /** App Server live item の重複排除キー。ThreadItem 由来なら生の item id を使う。 */
@@ -152,16 +153,33 @@ export function codexAppServerSystemNotice(
     return notice(`${method}:${detail}`, `${method}:${detail}`, `⚠️ ${label}: ${detail}`);
   }
 
-  if (method === "configWarning" || method === "deprecationNotice") {
+  // deprecationNotice には 2 系統ある: (a) client（Tailii host）の API 利用への通知（呼び出した
+  // 接続だけに届く。実障害 2026-09-06: 「⚠️ Codex 非推奨機能: Full-history hydration is deprecated
+  // for paginated threads…」がチャットに出た）、(b) config.toml の旧 feature 利用への通知（session
+  // 開始時に配信）。どちらも動作は継続する情報通知で、(a) は利用者に無関係、(b) も会話の場で
+  // 対処するものではないため chat へは流さず、codexDeprecationNoticeLogLine で hub.log へ記録する
+  // （configWarning は設定の問題そのものを伝えるので従来どおり注記）。
+  if (method === "configWarning") {
     const summary = nonEmptyString(params["summary"]);
     if (summary === null) return null;
     const details = nonEmptyString(params["details"]);
     const body = clip(details === null ? summary : `${summary} — ${details}`, NOTICE_DETAIL_LIMIT);
-    const label = method === "configWarning" ? "Codex 設定警告" : "Codex 非推奨機能";
-    return notice(`${method}:${body}`, `${method}:${body}`, `⚠️ ${label}: ${body}`);
+    return notice(`${method}:${body}`, `${method}:${body}`, `⚠️ Codex 設定警告: ${body}`);
   }
 
   return null;
+}
+
+/** App Server `deprecationNotice` を診断ログ 1 行へ正規化する。表示用ではない。 */
+export function codexDeprecationNoticeLogLine(
+  params: Record<string, unknown> | null,
+): string | null {
+  if (params === null) return null;
+  const summary = nonEmptyString(params["summary"]);
+  if (summary === null) return null;
+  const details = nonEmptyString(params["details"]);
+  const body = clip(details === null ? summary : `${summary} — ${details}`, DEPRECATION_LOG_LIMIT);
+  return `Codex App Server 非推奨通知（利用者には表示しない）: ${body}`;
 }
 
 function mcpErrorText(serverValue: unknown, toolValue: unknown, detailValue: string | null): string {
