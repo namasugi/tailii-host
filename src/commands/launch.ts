@@ -368,13 +368,31 @@ export function codexRemoteResumeCommand(
   // model/sandbox/approval は thread/start/thread/resume の App Server 側を権威にする。
   // TUI の resume 引数で `-a never` 等を再指定すると native approval 設定を上書きするため、
   // remote TUI は同一 thread の表示クライアントとして必要最小限の引数だけで接続する。
-  // thread/start 直後は最初の user turn まで rollout が存在せず、running thread でも TUI の
-  // thread/resume は `no rollout found` になる。tmux pane を生かしたまま rollout 生成を待ち、
-  // App Server turn/start が materialize した直後に TUI を同じ thread へ接続する。
+  // thread/start 直後は最初の user turn まで TUI の thread/resume が成立しない（旧版は
+  // `no rollout found`、0.153.4+ の paginated thread は `list_turns is not supported yet`）。
+  // 0.153.4+ は hub の thread/read を契機に turn より前でも session_meta だけの rollout を書くため、
+  // ファイルの存在ではなく最初の turn 記録（event_msg `task_started`。tailer の処理中判定と同じ
+  // マーカー）が書かれるまで pane を生かしたまま待ち、その後に TUI を同じ thread へ接続する。
+  // 実行中 turn への attach は問題なく、進行中の出力もそのまま描画される（0.153.4 実測）。
+  // シェル変数を使わないのは、herdr の `zsh -lc '<inner>'` / tmux の `sh -c` どちらでも
+  // 外側の展開に依存しないため。
+  // 待機マーカーは task_started（event_msg）と turn_context（response 直前の文脈記録）のどちらか。
+  // 版によって記録名が変わっても、下の再試行ループが bootstrap 失敗を吸収する。
   const sessionsRoot = '"${CODEX_HOME:-$HOME/.codex}/sessions"';
-  const waitForRollout =
-    `while ! find ${sessionsRoot} -type f -name '*${sessionId}*.jsonl' -print -quit 2>/dev/null | grep -q .; do sleep 0.2; done`;
-  return `${waitForRollout}; exec codex resume --remote ${remoteEndpoint} --no-alt-screen ${sessionId}`;
+  const waitForFirstTurn =
+    `while ! find ${sessionsRoot} -type f -name '*${sessionId}*.jsonl'` +
+    ` -exec grep -q -e '"task_started"' -e '"turn_context"' {} \\; -print -quit 2>/dev/null | grep -q .;` +
+    " do sleep 0.2; done";
+  // TUI の bootstrap 失敗（起動 15 秒未満の非 0 終了）は 2 秒間隔で最大 20 回やり直す。
+  // App Server の判定文言や rollout の記録名が版で変わっても、TUI が一度失敗しただけで
+  // pane ごと消える（pane not found 連打・ライブビュー消失）事態にしない。長時間動いた後の
+  // 終了（利用者操作・kill）は再試行しない。exec せず shell を親に残すのはこのループのため。
+  const resume = `codex resume --remote ${remoteEndpoint} --no-alt-screen ${sessionId}`;
+  const retryBootstrap =
+    `n=0; while :; do s=$(date +%s); ${resume}; rc=$?;` +
+    " if [ $rc -ne 0 ] && [ $(( $(date +%s) - s )) -lt 15 ] && [ $n -lt 20 ];" +
+    " then n=$((n+1)); sleep 2; continue; fi; exit $rc; done";
+  return `${waitForFirstTurn}; ${retryBootstrap}`;
 }
 
 /**

@@ -426,12 +426,17 @@ describe("launchCore（codex モード）", () => {
     expect(providerSessionId).toBe("thread-new");
     const newCall = recorded.find((c) => c.args[0] === "new");
     // App Server共有threadへのremote resume + inline scrollback。Codex hook は付けない。
+    // rollout ファイルの存在ではなく最初の turn 記録（task_started / turn_context）を待ってから
+    // TUI を接続し、bootstrap 失敗（短時間の非 0 終了）は有界に再試行する。
     expect(newCall?.args[4]).toContain(
-      "-name '*thread-new*.jsonl' -print -quit 2>/dev/null | grep -q .; do sleep 0.2; done",
+      "-name '*thread-new*.jsonl' -exec grep -q -e '\"task_started\"' -e '\"turn_context\"' {} \\;" +
+      " -print -quit 2>/dev/null | grep -q .; do sleep 0.2; done",
     );
     expect(newCall?.args[4]).toContain(
-      "; exec codex resume --remote unix:// --no-alt-screen thread-new",
+      "; n=0; while :; do s=$(date +%s); codex resume --remote unix:// --no-alt-screen thread-new; rc=$?;",
     );
+    expect(newCall?.args[4]).toContain("[ $n -lt 20 ]; then n=$((n+1)); sleep 2; continue; fi; exit $rc; done");
+    expect(newCall?.args[4]).not.toContain("exec codex resume");
     expect(store.get("cdx2")?.providerSessionId).toBe("thread-new");
   });
 
@@ -454,7 +459,7 @@ describe("launchCore（codex モード）", () => {
     // remote resume + 信頼オーバーライド。App Server 経路では hook は付けない。
     expect(newCall?.args[4]).toContain("-name '*abc-123*.jsonl'");
     expect(newCall?.args[4]).toContain(
-      "; exec codex resume --remote unix:// --no-alt-screen abc-123",
+      "; n=0; while :; do s=$(date +%s); codex resume --remote unix:// --no-alt-screen abc-123; rc=$?;",
     );
     expect(newCall?.args[4]).not.toContain("CLAUDE_CODE_RESUME_THRESHOLD_MINUTES");
     expect(newCall?.args[4]).not.toContain("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD");
