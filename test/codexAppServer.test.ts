@@ -889,9 +889,249 @@ describe("CodexAppServerManager", () => {
     expect(connection.requests.map((request) => request.method)).toEqual([
       "thread/resume",
       "thread/read",
+      "thread/turns/list", // includeTurns 失敗後はページ API を先に試す（未対応なら素通り）
       "turn/start",
     ]);
     expect(connection.closed).toBe(0);
+  });
+
+  test("paginated thread(codex 0.153.4+)の turn 前 `list_turns is not supported yet` も未materializeとして最初のturnを開始する", async () => {
+    const probe = new FakeConnection();
+    const connection = new FakeConnection("thread-paginated");
+    connection.request = async (method, params) => {
+      connection.requests.push({ method, params });
+      // historyMode=paginated の live thread は turn が無い間、thread/resume と
+      // thread/read includeTurns:true が JSON-RPC -32601 でこの文言を返す（thread id を含まない）。
+      if (method === "thread/resume" || method === "thread/read") {
+        throw new Error("list_turns is not supported yet");
+      }
+      if (method === "turn/start") return { turn: { id: "turn-first" } };
+      return {};
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-paginated"),
+      connect: async () => probe.closed === 0 ? probe : connection,
+      launch: () => {},
+    });
+
+    const thread = await manager.openThread({ threadId: "thread-paginated" });
+    expect(thread.initialItems).toEqual([]);
+    expect(thread.initialActiveTurnId).toBeNull();
+    expect(thread.liveSubscriptionReady).toBe(false);
+    await expect(thread.readActiveTurnId()).resolves.toBeUndefined();
+    await expect(thread.startTurn("first", "client-first")).resolves.toBe("turn-first");
+    expect(connection.requests.map((request) => request.method)).toEqual([
+      "thread/resume",
+      "thread/read",
+      "thread/turns/list", // includeTurns 失敗後はページ API を先に試す（未対応なら素通り）
+      "turn/start",
+    ]);
+    expect(connection.closed).toBe(0);
+  });
+
+  test("未materialize文言の method 部分（thread/turns/list 等）が違っても同じ thread id なら未materializeとして扱う", async () => {
+    const probe = new FakeConnection();
+    const connection = new FakeConnection("thread-variant");
+    connection.request = async (method, params) => {
+      connection.requests.push({ method, params });
+      if (method === "thread/resume") {
+        throw new Error("no rollout found for thread id thread-variant");
+      }
+      if (method === "thread/read") {
+        throw new Error(
+          "thread thread-variant is not materialized yet; " +
+          "thread/turns/list is unavailable before first user message",
+        );
+      }
+      if (method === "turn/start") return { turn: { id: "turn-first" } };
+      return {};
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-variant"),
+      connect: async () => probe.closed === 0 ? probe : connection,
+      launch: () => {},
+    });
+
+    const thread = await manager.openThread({ threadId: "thread-variant" });
+    await expect(thread.readActiveTurnId()).resolves.toBeUndefined();
+    await expect(thread.startTurn("first", "client-first")).resolves.toBe("turn-first");
+  });
+
+  test("別 thread id の未materialize文言や無関係な not supported エラーは伝播する", async () => {
+    const probe = new FakeConnection();
+    const connection = new FakeConnection("thread-other");
+    connection.request = async (method, params) => {
+      connection.requests.push({ method, params });
+      if (method === "thread/resume") {
+        throw new Error("thread thread-someone-else is not materialized yet; includeTurns is unavailable before first user message");
+      }
+      return {};
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-other"),
+      connect: async () => probe.closed === 0 ? probe : connection,
+      launch: () => {},
+    });
+    await expect(manager.openThread({ threadId: "thread-other" })).rejects.toThrow(
+      "thread thread-someone-else is not materialized yet",
+    );
+    expect(connection.closed).toBe(1);
+
+    const connection2 = new FakeConnection("thread-unsupported");
+    connection2.request = async (method, params) => {
+      connection2.requests.push({ method, params });
+      if (method === "thread/resume") throw new Error("thread/timeline/list is not supported yet");
+      return {};
+    };
+    const probe2 = new FakeConnection();
+    const manager2 = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-unsupported"),
+      connect: async () => probe2.closed === 0 ? probe2 : connection2,
+      launch: () => {},
+    });
+    await expect(manager2.openThread({ threadId: "thread-unsupported" })).rejects.toThrow(
+      "thread/timeline/list is not supported yet",
+    );
+  });
+
+  test("未知の文言でも thread メタデータが読めれば未materializeとして扱い、理由を保持して最初のturnを開始する", async () => {
+    const probe = new FakeConnection();
+    const connection = new FakeConnection("thread-unknown-wording");
+    connection.request = async (method, params) => {
+      connection.requests.push({ method, params });
+      const includeTurns = (params as { includeTurns?: boolean } | null)?.includeTurns;
+      // 将来の版で文言が変わった想定。メタデータだけの read は応答する。
+      if (method === "thread/resume") throw new Error("turn history hydration failed (future wording)");
+      if (method === "thread/read" && includeTurns === true) {
+        throw new Error("some brand new error text");
+      }
+      if (method === "thread/read") return { thread: { id: "thread-unknown-wording", status: { type: "idle" }, turns: [] } };
+      if (method === "thread/turns/list") throw new Error("method not found");
+      if (method === "turn/start") return { turn: { id: "turn-first" } };
+      return {};
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-unknown-wording"),
+      connect: async () => probe.closed === 0 ? probe : connection,
+      launch: () => {},
+    });
+
+    const thread = await manager.openThread({ threadId: "thread-unknown-wording" });
+    expect(thread.liveSubscriptionReady).toBe(false);
+    expect(thread.liveSubscriptionError).toContain("future wording");
+    await expect(thread.readActiveTurnId()).resolves.toBeUndefined();
+    await expect(thread.startTurn("first", "client-first")).resolves.toBe("turn-first");
+    expect(connection.requests.map((request) => request.method)).toEqual([
+      "thread/resume",
+      "thread/read", // 文言非依存の確認（includeTurns:false）
+      "thread/read", // includeTurns:true
+      "thread/turns/list",
+      "thread/read", // 文言非依存の確認（includeTurns:false）
+      "turn/start",
+    ]);
+    expect(connection.closed).toBe(0);
+  });
+
+  test("thread メタデータも読めない失敗は未materializeとみなさず伝播する", async () => {
+    const probe = new FakeConnection();
+    const connection = new FakeConnection("thread-gone");
+    connection.request = async (method, params) => {
+      connection.requests.push({ method, params });
+      if (method === "thread/resume") throw new Error("some brand new error text");
+      if (method === "thread/read") throw new Error("thread not loaded: thread-gone");
+      return {};
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-gone"),
+      connect: async () => probe.closed === 0 ? probe : connection,
+      launch: () => {},
+    });
+    await expect(manager.openThread({ threadId: "thread-gone" })).rejects.toThrow(
+      "some brand new error text",
+    );
+    expect(connection.closed).toBe(1);
+  });
+
+  test("thread/read timeout は文言非依存の確認をせず、従来どおり有界リトライ後に伝播する", async () => {
+    const probe = new FakeConnection();
+    const connection = new FakeConnection("thread-timeout-probe");
+    connection.request = async (method, params) => {
+      connection.requests.push({ method, params });
+      if (method === "thread/resume") throw new Error("no rollout found for thread id thread-timeout-probe");
+      if (method === "thread/read") throw new Error("Codex App Server request timed out: thread/read");
+      return {};
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-timeout-probe"),
+      connect: async () => probe.closed === 0 ? probe : connection,
+      launch: () => {},
+    });
+    const thread = await manager.openThread({ threadId: "thread-timeout-probe" });
+    await expect(thread.readActiveTurnId()).rejects.toThrow("timed out: thread/read");
+    expect(connection.requests.filter((request) => request.method === "thread/turns/list")).toEqual([]);
+    expect(connection.requests.filter((request) =>
+      request.method === "thread/read" &&
+      (request.params as { includeTurns?: boolean }).includeTurns === false,
+    )).toEqual([]);
+  });
+
+  test("includeTurns 非対応でも thread/turns/list から実行中 turn を読み steer へ回せる", async () => {
+    const probe = new FakeConnection();
+    const connection = new FakeConnection("thread-paged");
+    let latestStatus = "inProgress";
+    connection.request = async (method, params) => {
+      connection.requests.push({ method, params });
+      const includeTurns = (params as { includeTurns?: boolean } | null)?.includeTurns;
+      if (method === "thread/resume") throw new Error("list_turns is not supported yet");
+      if (method === "thread/read" && includeTurns === true) throw new Error("list_turns is not supported yet");
+      if (method === "thread/turns/list") {
+        expect(params).toEqual({ threadId: "thread-paged", limit: 1, sortDirection: "desc", itemsView: "notLoaded" });
+        return { data: [{ id: "turn-live", status: latestStatus, items: [], itemsView: "notLoaded" }] };
+      }
+      return {};
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-paged"),
+      connect: async () => probe.closed === 0 ? probe : connection,
+      launch: () => {},
+    });
+    const thread = await manager.openThread({ threadId: "thread-paged" });
+    await expect(thread.readActiveTurnId()).resolves.toBe("turn-live");
+    latestStatus = "completed";
+    await expect(thread.readActiveTurnId()).resolves.toBeNull();
+  });
+
+  test("App Server daemon と codex CLI の版ずれを 1 回だけログする", async () => {
+    const logs: string[] = [];
+    const connection = new FakeConnection("thread-version");
+    connection.initialize = async () => ({ userAgent: "tailii_host/0.150.0 (Mac OS 26.5; arm64) unknown" });
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-version"),
+      connect: async () => connection,
+      launch: () => {},
+      log: (message) => logs.push(message),
+      cliVersion: async () => "0.153.4",
+    });
+    expect(await manager.connectIfRunning()).toBe(connection);
+    expect(await manager.connectIfRunning()).toBe(connection);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain("0.150.0");
+    expect(logs[0]).toContain("0.153.4");
+
+    const same = new FakeConnection("thread-version-same");
+    same.initialize = async () => ({ userAgent: "tailii_host/0.153.4 (Mac OS 26.5; arm64) unknown" });
+    const sameLogs: string[] = [];
+    const sameManager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-version-same"),
+      connect: async () => same,
+      launch: () => {},
+      log: (message) => sameLogs.push(message),
+      cliVersion: async () => "0.153.4",
+    });
+    await sameManager.connectIfRunning();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(sameLogs).toEqual([]);
   });
 
   test("未materialize threadのthread/read timeoutは有界リトライして回復する", async () => {

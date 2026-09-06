@@ -1062,7 +1062,8 @@ export class SessionHub {
         state.initialContentCounts = snapshot.contentCounts;
         if (!snapshot.liveSubscribed) {
           this.options.log?.(
-            "Codex App Server は未materialize threadをlive購読できないため、rollout fallbackへ移行",
+            "Codex App Server は未materialize threadをlive購読できないため、rollout fallbackへ移行" +
+            (snapshot.liveSubscriptionError ? `（thread/resume: ${snapshot.liveSubscriptionError}）` : ""),
           );
           this.startCodexFallback(session, actor, cwd, threadId, newerThanMs, false);
           return;
@@ -1715,7 +1716,8 @@ export class SessionHub {
 
   private ensureCodexTurnController(): CodexTurnControllerRuntime {
     if (this.codexTurnController !== null) return this.codexTurnController;
-    const appServer = (this.options.codexAppServerFactory ?? (() => new CodexAppServerManager()))();
+    const appServer = (this.options.codexAppServerFactory ??
+      (() => new CodexAppServerManager({ ...(this.options.log ? { log: this.options.log } : {}) })))();
     const create = this.options.codexTurnControllerFactory ??
       ((options: CodexNativeTurnControllerOptions) => new CodexNativeTurnController(options));
     this.codexTurnController = create({

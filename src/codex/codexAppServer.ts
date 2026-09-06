@@ -1,7 +1,7 @@
 // codexAppServer.ts
 // Tailii host が共有 Codex App Server を再利用・起動し、thread ID を先に確定する最小クライアント。
 
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as net from "node:net";
@@ -87,7 +87,8 @@ export interface CodexAppServerThreadOptions {
 
 /** テスト差し替え可能なApp Server 1接続分。 */
 export interface CodexAppServerConnection {
-  initialize(): Promise<void>;
+  /** initialize 応答（`userAgent` 等）を返す。診断用で、void を返す実装でもよい。 */
+  initialize(): Promise<unknown>;
   request(method: string, params: unknown, timeoutMs?: number): Promise<unknown>;
   onNotification(handler: (notification: CodexAppServerNotification) => void): () => void;
   onServerRequest(handler: (request: CodexAppServerRequest) => void): () => void;
@@ -169,12 +170,13 @@ class WebSocketCodexAppServerConnection implements CodexAppServerConnection {
     });
   }
 
-  async initialize(): Promise<void> {
-    await this.request("initialize", {
+  async initialize(): Promise<unknown> {
+    const response = await this.request("initialize", {
       clientInfo: { name: "tailii_host", title: "Tailii Host", version: "0.1.1" },
       capabilities: { experimentalApi: true },
     });
     this.notify("initialized", undefined);
+    return response;
   }
 
   request(method: string, params: unknown, timeoutMs?: number): Promise<unknown> {
@@ -300,6 +302,8 @@ export class CodexAppServerThread {
     readonly liveSubscriptionReady: boolean,
     private readonly connection: CodexAppServerConnection,
     private readonly cwd: string | null,
+    /** liveSubscriptionReady=false の理由（thread/resume の失敗文言）。ログ診断用。 */
+    readonly liveSubscriptionError: string | null = null,
   ) {}
 
   async startTurn(
@@ -346,18 +350,47 @@ export class CodexAppServerThread {
         );
         return extractActiveTurnId(response);
       } catch (error) {
-        // 新規 thread の最初の rollout 行がまだ無い間は、idle とは断定できない。
-        // controller は手元の ID を維持するか、初回 turn/start へ進む。
-        if (isUnmaterializedThreadError(error, this.threadId)) return undefined;
         // thread/read は副作用が無い。未 materialize thread の初回送信と
         // 別セッションの処理が共有 App Server 上で重なった場合のみ、
         // 5秒 timeout を有界リトライする。turn/start / turn/steer は受理済みか
         // 不明なため、この自動リトライの対象にしない。
-        if (!isRequestTimeout(error, "thread/read") ||
-          attempt >= CodexAppServerThread.activeTurnReadMaxAttempts) {
-          throw error;
+        if (isRequestTimeout(error, "thread/read")) {
+          if (attempt >= CodexAppServerThread.activeTurnReadMaxAttempts) throw error;
+          continue;
         }
+        // 全履歴 hydration（includeTurns）は paginated thread で非推奨（codex 0.153.4+）。
+        // 対応版ではページ API で最新 turn の状態だけを読む（turn 無しなら null=idle）。
+        const latest = await this.readLatestTurnStatus();
+        if (latest !== undefined) return latest;
+        // 新規 thread の最初の rollout 行がまだ無い間は、idle とは断定できない。
+        // controller は手元の ID を維持するか、初回 turn/start へ進む。判定は既知文言に加えて
+        // thread メタデータの可読性（文言非依存）で行う。判定文言の網羅漏れで新規会話が
+        // 全滅した実障害（2026-09-06）の再発防止。
+        if (await confirmThreadHistoryUnavailable(this.connection, this.threadId, error)) {
+          return undefined;
+        }
+        throw error;
       }
+    }
+  }
+
+  /**
+   * `thread/turns/list`（codex 0.153+）で最新 turn を 1 件読む。
+   * inProgress なら turn ID、それ以外（turn 無しを含む）は null。未対応版・未 materialize・
+   * timeout は undefined（呼び出し側が別の判定へ進む）。
+   */
+  private async readLatestTurnStatus(): Promise<string | null | undefined> {
+    try {
+      const response = objectRecord(await this.connection.request(
+        "thread/turns/list",
+        { threadId: this.threadId, limit: 1, sortDirection: "desc", itemsView: "notLoaded" },
+        CodexAppServerThread.activeTurnReadRetryTimeoutMs,
+      ));
+      const data = response?.["data"];
+      if (!Array.isArray(data)) return undefined;
+      return extractActiveTurnId({ thread: { turns: data } });
+    } catch {
+      return undefined;
     }
   }
 
@@ -525,6 +558,10 @@ export interface CodexAppServerManagerOptions {
   pollIntervalMs?: number;
   startupTimeoutMs?: number;
   titleGenerationTimeoutMs?: number;
+  /** 診断ログ（daemon と CLI の版ずれ等）。 */
+  log?: (message: string) => void;
+  /** `codex --version` の代替（テスト用）。null は不明。 */
+  cliVersion?: () => Promise<string | null>;
 }
 
 /** thread/list の公開スキーマから一覧表示に必要なフィールドだけを保持する。 */
@@ -566,6 +603,11 @@ export class CodexAppServerManager {
   private readonly startupLockPath: string;
   /** 最初の turn 前（rollout 未作成）の thread を生存させる作成元購読。openThread が引き継ぐ。 */
   private readonly bootstrapConnections = new Map<string, CodexAppServerConnection>();
+  private readonly log: ((message: string) => void) | null;
+  private readonly readCliVersion: () => Promise<string | null>;
+  private cliVersionPromise: Promise<string | null> | null = null;
+  /** 版ずれは同じ組み合わせにつき 1 回だけログする。 */
+  private lastVersionMismatch: string | null = null;
 
   constructor(options: CodexAppServerManagerOptions = {}) {
     this.codexHome = options.codexHome ?? path.join(os.homedir(), ".codex");
@@ -582,6 +624,31 @@ export class CodexAppServerManager {
     this.titleGenerationTimeoutMs =
       options.titleGenerationTimeoutMs ?? DEFAULT_TITLE_GENERATION_TIMEOUT_MS;
     this.startupLockPath = path.join(path.dirname(this.socketPath), "tailii-start.lock");
+    this.log = options.log ?? null;
+    this.readCliVersion = options.cliVersion ?? (() => probeCodexCliVersion(this.codexPath));
+  }
+
+  /**
+   * initialize 応答の `userAgent`（`<client>/<server 版> (...)`）から daemon の版を読み、
+   * `codex --version` と食い違えばログに残す。共有 daemon は detached spawn で生き残るため、
+   * codex 更新後も旧バイナリが App Server を提供し続ける（2026-07-23 実障害）。他クライアントも
+   * 使う daemon を勝手には再起動せず、原因究明の手掛かりとして版ずれを可視化する。
+   */
+  private noteServerVersion(initializeResponse: unknown): void {
+    if (this.log === null) return;
+    const serverVersion = extractServerVersion(initializeResponse);
+    if (serverVersion === null) return;
+    this.cliVersionPromise ??= this.readCliVersion().catch(() => null);
+    void this.cliVersionPromise.then((cliVersion) => {
+      if (cliVersion === null || cliVersion === serverVersion) return;
+      const key = `${serverVersion}->${cliVersion}`;
+      if (this.lastVersionMismatch === key) return;
+      this.lastVersionMismatch = key;
+      this.log?.(
+        `Codex App Server daemon の版 ${serverVersion} が codex CLI ${cliVersion} と一致しない` +
+        "（旧 daemon が残っている可能性。App Server 経由の操作が失敗するなら daemon を kill して再 spawn）",
+      );
+    });
   }
 
   /** serverを再利用または排他的に起動し、利用可能になるまで待つ。 */
@@ -628,7 +695,7 @@ export class CodexAppServerManager {
     let connection: CodexAppServerConnection | null = null;
     try {
       connection = await this.connect(this.socketPath, requestTimeoutMs);
-      await connection.initialize();
+      this.noteServerVersion(await connection.initialize());
       return connection;
     } catch {
       connection?.close();
@@ -918,6 +985,7 @@ export class CodexAppServerManager {
       let initialItems: Record<string, unknown>[] = [];
       let initialActiveTurnId: string | null = null;
       let liveSubscriptionReady = bootstrap !== null;
+      let liveSubscriptionError: string | null = null;
       if (bootstrap === null) {
         await connection.initialize();
         try {
@@ -934,8 +1002,12 @@ export class CodexAppServerManager {
           // thread/resume は "no rollout found" になる。ただし共有 App Server 内の
           // live thread 自体は存在し、この接続から turn/start を直接送れば materialize
           // できる。engine と Session Hub は別プロセスなので、この場合だけ履歴ゼロとして
-          // 接続を維持し、最初の turn/start へ進ませる。
-          if (!isUnmaterializedThreadError(error, options.threadId)) throw error;
+          // 接続を維持し、最初の turn/start へ進ませる。判定は文言一致に加えて
+          // メタデータ読み取りの可否（文言非依存）で行う。
+          if (!(await confirmThreadHistoryUnavailable(connection, options.threadId, error))) {
+            throw error;
+          }
+          liveSubscriptionError = String(error);
         }
       }
       return new CodexAppServerThread(
@@ -945,6 +1017,7 @@ export class CodexAppServerManager {
         liveSubscriptionReady,
         connection,
         options.cwd ?? null,
+        liveSubscriptionError,
       );
     } catch (error) {
       removeNotification();
@@ -1053,7 +1126,7 @@ async function readThreadTitleTarget(
   } catch (error) {
     // 作成直後は初回 turn/start 応答後もしばらく rollout が空の場合がある。
     // controller から渡された最初の入力を使い、既存 name だけ thread/list で保護する。
-    if (!isUnmaterializedThreadError(error, threadId)) throw error;
+    if (!(await confirmThreadHistoryUnavailable(connection, threadId, error))) throw error;
     return {
       name: await readThreadNameFromList(connection, threadId),
       prompt: fallbackPrompt,
@@ -1250,16 +1323,89 @@ function normalizeFallbackThreadTitle(raw: string): string {
   return title.slice(0, THREAD_TITLE_FALLBACK_MAX_LENGTH);
 }
 
+/**
+ * codex 0.153.4+ の `historyMode: "paginated"` thread は、turn が 1 件も無い間
+ * `thread/read includeTurns:true` と `thread/resume` を JSON-RPC -32601 でこの文言のまま拒否する
+ * （thread id を含まない）。turn/start 自体は受理され、最初の turn 以降は両 RPC とも成功する。
+ */
+const PAGINATED_THREAD_TURNS_UNAVAILABLE = "list_turns is not supported yet";
+
+/**
+ * thread/start 直後（最初の user turn 前）の読み取り失敗を、App Server の版ごとの文言から判定する。
+ * - `no rollout found for thread id <id>`: rollout ファイル未作成
+ * - `thread <id> is not materialized yet; <method> is unavailable before first user message`:
+ *   method 部分は `includeTurns` / `thread/turns/list` など版で異なるため前方一致
+ * - `failed to read session metadata ... is empty`: session_meta 行の flush 前
+ * - `list_turns is not supported yet`: paginated thread の turn 前（0.153.4 実測）
+ */
 function isUnmaterializedThreadError(error: unknown, threadId: string): boolean {
   if (!(error instanceof Error)) return false;
-  if (error.message === `no rollout found for thread id ${threadId}`) return true;
-  const notMaterializedYet =
-    `thread ${threadId} is not materialized yet; ` +
-    "includeTurns is unavailable before first user message";
-  if (error.message === notMaterializedYet) return true;
-  return error.message.includes(threadId) &&
-    error.message.includes("failed to read session metadata") &&
-    error.message.endsWith("is empty");
+  const { message } = error;
+  if (message === `no rollout found for thread id ${threadId}`) return true;
+  if (message.startsWith(`thread ${threadId} is not materialized yet;`)) return true;
+  if (message === PAGINATED_THREAD_TURNS_UNAVAILABLE) return true;
+  return message.includes(threadId) &&
+    message.includes("failed to read session metadata") &&
+    message.endsWith("is empty");
+}
+
+/** initialize 応答の userAgent `tailii_host/0.153.4 (...)` から server の数値版を取り出す。 */
+function extractServerVersion(initializeResponse: unknown): string | null {
+  const userAgent = objectRecord(initializeResponse)?.["userAgent"];
+  if (typeof userAgent !== "string") return null;
+  const match = /^[^\s/]+\/(\d+(?:\.\d+)+)/.exec(userAgent);
+  return match?.[1] ?? null;
+}
+
+/** `codex --version`（例: `codex-cli 0.153.4`）の数値版。取れなければ null。 */
+function probeCodexCliVersion(codexPath: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(codexPath, ["--version"], { timeout: 5_000 }, (error, stdout) => {
+      if (error) {
+        resolve(null);
+        return;
+      }
+      resolve(/\d+(?:\.\d+)+/.exec(String(stdout))?.[0] ?? null);
+    });
+  });
+}
+
+/** 文言非依存判定で使う、メタデータだけの thread/read の期限。 */
+const THREAD_METADATA_PROBE_TIMEOUT_MS = 2_000;
+
+/**
+ * turn 履歴の読み取り（thread/resume / thread/read includeTurns:true）の失敗が
+ * 「turn 履歴が未生成・未対応」なのかを、エラー文言に依存せず判定する。
+ *
+ * 1. 既知の文言（isUnmaterializedThreadError）なら即 true。
+ * 2. timeout は接続が刺さっている可能性があるため false（呼び出し側の有界リトライに委ねる）。
+ * 3. それ以外は、メタデータだけの `thread/read includeTurns:false` を短い期限で試す。
+ *    live thread は最初の turn 前でも（rollout 未作成でも）これに応答する一方、存在しない
+ *    thread は `thread not loaded` 等で失敗する。応答があれば thread は App Server から
+ *    見えており、履歴 hydration だけが不可＝turn/start へ進んでよい状態と判断する。
+ *
+ * App Server の文言は版ごとに変わる（no rollout found → not materialized yet →
+ * list_turns is not supported yet）。文言の網羅漏れで新規会話が全滅しないための安全側判定。
+ */
+async function confirmThreadHistoryUnavailable(
+  connection: CodexAppServerConnection,
+  threadId: string,
+  error: unknown,
+): Promise<boolean> {
+  if (isUnmaterializedThreadError(error, threadId)) return true;
+  if (!(error instanceof Error)) return false;
+  if (error.message.startsWith("Codex App Server request timed out")) return false;
+  try {
+    const response = objectRecord(await connection.request(
+      "thread/read",
+      { threadId, includeTurns: false },
+      THREAD_METADATA_PROBE_TIMEOUT_MS,
+    ));
+    const thread = objectRecord(response?.["thread"]);
+    return thread !== null && thread["id"] === threadId;
+  } catch {
+    return false;
+  }
 }
 
 function parseRemoteControlStatus(value: unknown): CodexRemoteControlStatus | null {

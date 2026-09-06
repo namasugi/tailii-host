@@ -107,6 +107,8 @@ export interface CodexThreadClient {
   readonly initialActiveTurnId?: string | null;
   /** false は rollout 未生成で thread/resume が成立せず、live 通知を保証できない接続。 */
   readonly liveSubscriptionReady?: boolean;
+  /** liveSubscriptionReady=false の理由（診断ログ用）。 */
+  readonly liveSubscriptionError?: string | null;
   /**
    * 保存済み thread から現在の turn ID を読み直す。
    * undefined は rollout 未生成で、App Server からまだ確認できない状態を表す。
@@ -138,6 +140,8 @@ export interface CodexSubscriptionSnapshot {
   contentCounts: ReadonlyMap<string, number>;
   /** false の場合、Hub は初回 turn を rollout の継続 tail で表示する。 */
   liveSubscribed: boolean;
+  /** liveSubscribed=false の理由（thread/resume の失敗文言）。 */
+  liveSubscriptionError?: string | null;
 }
 
 export interface CodexAppServerThreadRuntime {
@@ -259,6 +263,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       itemIds,
       contentCounts,
       liveSubscribed: opened.thread.liveSubscriptionReady !== false,
+      liveSubscriptionError: opened.thread.liveSubscriptionError ?? null,
     };
   }
 
