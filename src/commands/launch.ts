@@ -377,21 +377,24 @@ export function codexRemoteResumeCommand(
   // シェル変数を使わないのは、herdr の `zsh -lc '<inner>'` / tmux の `sh -c` どちらでも
   // 外側の展開に依存しないため。
   // 待機マーカーは task_started（event_msg）と turn_context（response 直前の文脈記録）のどちらか。
+  // 記録種別の位置（`"type":"…"`）に固定し、session_meta の指示文など本文中に同じ語が現れても
+  // 誤発火しないようにする（rollout は compact JSON。コロン後の空白は許容）。
   // 版によって記録名が変わっても、下の再試行ループが bootstrap 失敗を吸収する。
   const sessionsRoot = '"${CODEX_HOME:-$HOME/.codex}/sessions"';
   const waitForFirstTurn =
     `while ! find ${sessionsRoot} -type f -name '*${sessionId}*.jsonl'` +
-    ` -exec grep -q -e '"task_started"' -e '"turn_context"' {} \\; -print -quit 2>/dev/null | grep -q .;` +
-    " do sleep 0.2; done";
-  // TUI の bootstrap 失敗（起動 15 秒未満の非 0 終了）は 2 秒間隔で最大 20 回やり直す。
-  // App Server の判定文言や rollout の記録名が版で変わっても、TUI が一度失敗しただけで
-  // pane ごと消える（pane not found 連打・ライブビュー消失）事態にしない。長時間動いた後の
-  // 終了（利用者操作・kill）は再試行しない。exec せず shell を親に残すのはこのループのため。
+    ` -exec grep -Eq -e '"type": ?"task_started"' -e '"type": ?"turn_context"' {} \\; -print -quit 2>/dev/null` +
+    " | grep -q .; do sleep 0.2; done";
+  // TUI の bootstrap 失敗（起動 15 秒未満の非 0 終了）はやり直す: 20 回までは 2 秒間隔、その後は
+  // 15 秒間隔で pane が生きている限り続ける。App Server の判定文言や rollout の記録名が版で
+  // 変わっても、TUI が一度失敗しただけで pane ごと消える（pane not found 連打・ライブビュー消失）
+  // 事態にしない。長時間動いた後の終了（利用者操作・kill）は再試行しない。exec せず shell を
+  // 親に残すのはこのループのため。
   const resume = `codex resume --remote ${remoteEndpoint} --no-alt-screen ${sessionId}`;
   const retryBootstrap =
     `n=0; while :; do s=$(date +%s); ${resume}; rc=$?;` +
-    " if [ $rc -ne 0 ] && [ $(( $(date +%s) - s )) -lt 15 ] && [ $n -lt 20 ];" +
-    " then n=$((n+1)); sleep 2; continue; fi; exit $rc; done";
+    " if [ $rc -ne 0 ] && [ $(( $(date +%s) - s )) -lt 15 ];" +
+    " then n=$((n+1)); if [ $n -le 20 ]; then sleep 2; else sleep 15; fi; continue; fi; exit $rc; done";
   return `${waitForFirstTurn}; ${retryBootstrap}`;
 }
 

@@ -427,15 +427,19 @@ describe("launchCore（codex モード）", () => {
     const newCall = recorded.find((c) => c.args[0] === "new");
     // App Server共有threadへのremote resume + inline scrollback。Codex hook は付けない。
     // rollout ファイルの存在ではなく最初の turn 記録（task_started / turn_context）を待ってから
-    // TUI を接続し、bootstrap 失敗（短時間の非 0 終了）は有界に再試行する。
+    // TUI を接続し、bootstrap 失敗（短時間の非 0 終了）は再試行する。
     expect(newCall?.args[4]).toContain(
-      "-name '*thread-new*.jsonl' -exec grep -q -e '\"task_started\"' -e '\"turn_context\"' {} \\;" +
-      " -print -quit 2>/dev/null | grep -q .; do sleep 0.2; done",
+      "-name '*thread-new*.jsonl' -exec grep -Eq -e '\"type\": ?\"task_started\"'" +
+      " -e '\"type\": ?\"turn_context\"' {} \\; -print -quit 2>/dev/null | grep -q .; do sleep 0.2; done",
     );
     expect(newCall?.args[4]).toContain(
       "; n=0; while :; do s=$(date +%s); codex resume --remote unix:// --no-alt-screen thread-new; rc=$?;",
     );
-    expect(newCall?.args[4]).toContain("[ $n -lt 20 ]; then n=$((n+1)); sleep 2; continue; fi; exit $rc; done");
+    // 起動 15 秒未満の非 0 終了だけ再試行（20 回までは 2 秒、以後 15 秒間隔で継続）。
+    expect(newCall?.args[4]).toContain(
+      "if [ $rc -ne 0 ] && [ $(( $(date +%s) - s )) -lt 15 ]; then n=$((n+1));" +
+      " if [ $n -le 20 ]; then sleep 2; else sleep 15; fi; continue; fi; exit $rc; done",
+    );
     expect(newCall?.args[4]).not.toContain("exec codex resume");
     expect(store.get("cdx2")?.providerSessionId).toBe("thread-new");
   });
