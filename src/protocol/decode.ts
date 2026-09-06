@@ -250,6 +250,28 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         }),
       };
 
+    case "codex_model_set_request":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        session: requireString(raw, "session"),
+        model: requireString(raw, "model"),
+      };
+
+    case "codex_model_set_response": {
+      const status = requireString(raw, "status");
+      if (status !== "updated" && status !== "failed") {
+        throw new ProtocolDecodeError("missing-field", "status");
+      }
+      return compact({
+        type, v,
+        id: requireString(raw, "id"),
+        model: requireString(raw, "model"),
+        status,
+        error: optionalString(raw, "error"),
+      });
+    }
+
     case "claude_model_list_request":
       return { type, v, id: requireString(raw, "id") };
 

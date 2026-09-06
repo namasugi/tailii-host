@@ -26,6 +26,43 @@ export const codexHandlers: HandlerRegistry = {
     }
   },
 
+  codex_model_set_request: async (message, ctx) => {
+    const { writer, state, metadataStore } = ctx;
+    const v = state.negotiatedVersion;
+    const meta = metadataStore?.get(message.session) ?? null;
+    const threadId = meta?.providerSessionId ?? null;
+    if (ctx.codexAppServer === null || meta?.agent !== "codex" || threadId === null) {
+      writer.write({
+        type: "codex_model_set_response",
+        v,
+        id: message.id,
+        model: message.model,
+        status: "failed",
+        error: "Codex App Server thread が見つかりません。",
+      });
+      return;
+    }
+    try {
+      await ctx.codexAppServer.setThreadModel(threadId, message.model);
+      writer.write({
+        type: "codex_model_set_response",
+        v,
+        id: message.id,
+        model: message.model,
+        status: "updated",
+      });
+    } catch (error) {
+      writer.write({
+        type: "codex_model_set_response",
+        v,
+        id: message.id,
+        model: message.model,
+        status: "failed",
+        error: String(error),
+      });
+    }
+  },
+
   codex_turn_start: async (message, ctx) => {
     const { writer, state, metadataStore } = ctx;
     const v = state.negotiatedVersion;

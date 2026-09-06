@@ -858,4 +858,42 @@ describe("encode 詳細", () => {
       ],
     });
   });
+
+  it("codex_model_set は thread の後続 turn 用モデル変更を往復する", () => {
+    const request = encodeControlMessage({
+      type: "codex_model_set_request",
+      v: 2,
+      id: "model-set-1",
+      session: "codex-work",
+      model: "gpt-6-astra",
+    });
+    expect(request).toBe(
+      '{"id":"model-set-1","model":"gpt-6-astra","session":"codex-work","type":"codex_model_set_request","v":2}',
+    );
+    expect(decodeControlMessage(request)).toEqual({
+      type: "codex_model_set_request",
+      v: 2,
+      id: "model-set-1",
+      session: "codex-work",
+      model: "gpt-6-astra",
+    });
+
+    const response = encodeControlMessage({
+      type: "codex_model_set_response",
+      v: 2,
+      id: "model-set-1",
+      model: "gpt-6-astra",
+      status: "updated",
+    });
+    expect(response).toBe(
+      '{"id":"model-set-1","model":"gpt-6-astra","status":"updated","type":"codex_model_set_response","v":2}',
+    );
+    expect(decodeControlMessage(response)).toEqual({
+      type: "codex_model_set_response",
+      v: 2,
+      id: "model-set-1",
+      model: "gpt-6-astra",
+      status: "updated",
+    });
+  });
 });

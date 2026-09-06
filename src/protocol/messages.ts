@@ -387,6 +387,8 @@ export type ControlMessage =
   | { type: "session_idle_hint"; v: number; id: string; name: string }
   | { type: "codex_model_list_request"; v: number; id: string }
   | { type: "codex_model_list_response"; v: number; id: string; models: CodexModelInfo[] }
+  | { type: "codex_model_set_request"; v: number; id: string; session: string; model: string }
+  | { type: "codex_model_set_response"; v: number; id: string; model: string; status: "updated" | "failed"; error?: string }
   | { type: "claude_model_list_request"; v: number; id: string }
   | { type: "claude_model_list_response"; v: number; id: string; models: ClaudeModelInfo[] }
   | { type: "official_app_status_request"; v: number; id: string; session: string; provider: OfficialAppProvider }

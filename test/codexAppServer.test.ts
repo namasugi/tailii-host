@@ -1168,4 +1168,22 @@ describe("CodexAppServerManager", () => {
     ]);
     expect(connections.at(-1)?.closed).toBe(1);
   });
+
+  test("thread/settings/update で後続turnのモデルを変更する", async () => {
+    const connection = new FakeConnection("thread-1");
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-model-set"),
+      connect: async () => connection,
+      launch: () => {},
+    });
+
+    await manager.setThreadModel("thread-1", "gpt-6-astra");
+
+    expect(connection.initialized).toBe(2);
+    expect(connection.requests).toContainEqual({
+      method: "thread/settings/update",
+      params: { threadId: "thread-1", model: "gpt-6-astra" },
+    });
+    expect(connection.closed).toBe(2);
+  });
 });

@@ -879,6 +879,20 @@ export class CodexAppServerManager {
     }
   }
 
+  /** 指定threadの後続turnで使うモデルをApp Serverの設定APIへ反映する。 */
+  async setThreadModel(threadId: string, model: string): Promise<void> {
+    if (threadId.length === 0) throw new Error("Codex thread ID must not be empty");
+    if (model.length === 0) throw new Error("Codex model must not be empty");
+    await this.ensureRunning();
+    const connection = await this.connect(this.socketPath);
+    try {
+      await connection.initialize();
+      await connection.request("thread/settings/update", { threadId, model });
+    } finally {
+      connection.close();
+    }
+  }
+
   /** 既存 thread を購読する長寿命接続を開く。turn と native approval はこの接続を流れる。 */
   async openThread(options: CodexAppServerThreadOptions): Promise<CodexAppServerThread> {
     await this.ensureRunning();

@@ -1822,6 +1822,62 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
+  test("codex_model_set_request は会話threadの後続turn用モデルを更新する", async () => {
+    const store = makeTempStore();
+    store.put({
+      name: "codex-work",
+      cwd: "/tmp/codex-work",
+      createdAt: 1,
+      agent: "codex",
+      providerSessionId: "thread-123",
+    });
+    const manager = new CodexAppServerManager();
+    const setThreadModel = vi.spyOn(manager, "setThreadModel").mockResolvedValue();
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store),
+      metadataStore: store,
+      codexAppServer: manager,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine(
+      '{"id":"model-set-1","model":"gpt-6-astra","session":"codex-work","type":"codex_model_set_request","v":2}',
+    );
+
+    expect(await engine.lines.nextOfType("codex_model_set_response")).toBe(
+      '{"id":"model-set-1","model":"gpt-6-astra","status":"updated","type":"codex_model_set_response","v":2}',
+    );
+    expect(setThreadModel).toHaveBeenCalledWith("thread-123", "gpt-6-astra");
+    await engine.teardown();
+  });
+
+  test("codex_model_set_request は対象thread不在を失敗応答にする", async () => {
+    const manager = new CodexAppServerManager();
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({
+      sessionManager: makeManager(runner),
+      codexAppServer: manager,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine(
+      '{"id":"model-set-2","model":"gpt-6-astra","session":"missing","type":"codex_model_set_request","v":2}',
+    );
+
+    expect(decodeControlMessage(
+      await engine.lines.nextOfType("codex_model_set_response"),
+    )).toEqual({
+      type: "codex_model_set_response",
+      v: 2,
+      id: "model-set-2",
+      model: "gpt-6-astra",
+      status: "failed",
+      error: "Codex App Server thread が見つかりません。",
+    });
+    await engine.teardown();
+  });
+
   test("codex_thread_title_set は App Server の正式名を更新し結果を返す", async () => {
     const manager = new CodexAppServerManager();
     const setThreadName = vi.spyOn(manager, "setThreadName").mockResolvedValue();
