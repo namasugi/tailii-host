@@ -50,6 +50,7 @@ import {
 } from "../src/backend/tmux.js";
 import { aggregateUsage } from "../src/services/usageAggregator.js";
 import { MockTmuxRunner, makeTempDir, makeTempStore, ok } from "./helpers.js";
+import { sessionInfoFromMeta } from "../src/engine/context.js";
 
 // MARK: - resolveDefaultAgent（host 側エージェント切替）
 
@@ -824,11 +825,43 @@ describe("TmuxSessionManager", () => {
     store.put({ name: "live", cwd: "/tmp/live", createdAt: 0 });
     const runner = new MockTmuxRunner((args) => (args[0] === "ls" ? ok("live\nunknown\n") : ok("")));
     const mgr = new TmuxSessionManager({ runner: runner.runner, store });
+    // backend は tmux も明示する（iOS は欄なしを「未申告」として既知値を保持する）。
     expect(await mgr.list()).toEqual([
-      { name: "dead", cwd: "/tmp/dead", alive: false },
-      { name: "live", cwd: "/tmp/live", alive: true },
-      { name: "unknown", cwd: "", alive: true },
+      { name: "dead", cwd: "/tmp/dead", alive: false, backend: "tmux" },
+      { name: "live", cwd: "/tmp/live", alive: true, backend: "tmux" },
+      { name: "unknown", cwd: "", alive: true, backend: "tmux" },
     ]);
+  });
+
+  test("herdr メタと同名の tmux セッションが生存していても tmux 行として申告しない", async () => {
+    // backend 切替前の tmux セッションが同名で生き残る（reaper の idle 回収まで）。ここで
+    // backend:"tmux" を確定申告すると Composite の tmux 優先マージで herdr 行が消える。
+    const store = makeTempStore();
+    store.put({ name: "cs-abc", cwd: "/tmp/abc", createdAt: 0, backend: "herdr", herdrPaneId: "w4:p2" });
+    store.put({ name: "cs-tmux", cwd: "/tmp/t", createdAt: 0 });
+    const runner = new MockTmuxRunner((args) => (args[0] === "ls" ? ok("cs-abc\ncs-tmux\n") : ok("")));
+    const mgr = new TmuxSessionManager({ runner: runner.runner, store });
+    expect(await mgr.list()).toEqual([
+      { name: "cs-tmux", cwd: "/tmp/t", alive: true, backend: "tmux" },
+    ]);
+  });
+
+  test("reattach（生存）は backend:\"tmux\" を明示した info を返す", async () => {
+    // tmux 会話の本線経路。iOS は欄なしを「未申告」として既知値を保持するため、tmux も明示する。
+    const store = makeTempStore();
+    store.put({ name: "live", cwd: "/tmp/live", createdAt: 0 });
+    const runner = new MockTmuxRunner((args) => {
+      if (args[0] === "ls") return ok("live\n");
+      if (args[0] === "display-message") return ok("claude\n");
+      if (args[0] === "capture-pane") return ok("recent\n");
+      return ok("");
+    });
+    const mgr = new TmuxSessionManager({ runner: runner.runner, store });
+    expect(await mgr.reattach("live")).toEqual({
+      kind: "attached",
+      info: { name: "live", cwd: "/tmp/live", alive: true, backend: "tmux" },
+      recentOutput: "recent",
+    });
   });
 
   test("`no server running` は空集合として扱う（エラーにしない）", async () => {
@@ -1730,5 +1763,31 @@ describe("login-code 成功後の継続待ち（Login successful. Press Enter to
     await submitLoginCode("AbC#123", ops);
     // コード確定の Enter + 継続待ちを閉じる Enter。
     expect(sent).toEqual(["literal:AbC#123", "enter", "enter"]);
+  });
+});
+
+// MARK: - sessionInfoFromMeta（メタ由来の単発 session_list_response 行）
+
+describe("sessionInfoFromMeta", () => {
+  test("メタが読めれば backend を明示し（未記録 = tmux）、読めないときだけ欄を省く", () => {
+    const store = makeTempStore();
+    store.put({ name: "t", cwd: "/tmp/t", createdAt: 0, claudeSessionId: "sid-t" });
+    store.put({
+      name: "h", cwd: "/tmp/h", createdAt: 0, backend: "herdr", herdrPaneId: "w4:p2",
+      agent: "codex", providerSessionId: "thr-1",
+    });
+    expect(sessionInfoFromMeta(store, "t", "/fallback")).toEqual({
+      name: "t", cwd: "/tmp/t", alive: true, backend: "tmux",
+      claudeSessionId: "sid-t", providerSessionId: "sid-t",
+    });
+    expect(sessionInfoFromMeta(store, "h", "/fallback")).toEqual({
+      name: "h", cwd: "/tmp/h", alive: true, backend: "herdr", agent: "codex", providerSessionId: "thr-1",
+    });
+    // メタ不在（一時的な読取失敗を含む）は種別不明: tmux と断定すると iOS が「申告あり」として
+    // 既知の herdr を巻き戻すので、欄を省いて未申告にする。
+    expect(sessionInfoFromMeta(store, "missing", "/fallback")).toEqual({
+      name: "missing", cwd: "/fallback", alive: true,
+    });
+    expect(sessionInfoFromMeta(null, "x", "/fallback")).toEqual({ name: "x", cwd: "/fallback", alive: true });
   });
 });

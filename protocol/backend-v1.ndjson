@@ -5,3 +5,4 @@
 {"backend":"herdr","error":null,"id":"bk3","ok":true,"type":"backend_set_response","v":1}
 {"backend":"tmux","error":"herdr が見つかりません（~/.local/bin/herdr）。導入後に切り替えてください。","id":"bk4","ok":false,"type":"backend_set_response","v":1}
 {"id":"bk5","sessions":[{"alive":true,"backend":"herdr","cwd":"/Users/alice/project","name":"s-abc123"}],"type":"session_list_response","v":1}
+{"id":"bk6","sessions":[{"alive":true,"backend":"tmux","cwd":"/Users/alice/project","name":"cs-def456"}],"type":"session_list_response","v":1}

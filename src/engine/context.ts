@@ -308,6 +308,37 @@ export async function officialAppRuntimeContext(
   };
 }
 
+/**
+ * メタデータ由来の SessionInfo（launcher 成功直後など、list を引かずに 1 件だけ応答する経路用）。
+ *
+ * backend はメタが読めた場合は常に明示する（backend 欄未記録のメタ = tmux launcher 由来 =
+ * tmux）。iOS は `session_list_response` の各行で backend 欄が無い行を「host 未申告」として
+ * 既知の観測値を保持するため、reattach の resume 再起動応答が欄なしだと herdr 会話のバッジが
+ * tmux に見えたまま固定される（2026-09-06 実機で発症）。逆に、メタ自体が読めない
+ * （不在・一時的な読取失敗 = 種別不明）ときは tmux と断定せず欄を省く: 断定すると iOS が
+ * 「申告あり」として既知の herdr を巻き戻す。launcher が権威記録した解決後 cwd
+ * （deleted-worktree-resume の repo ルート振替を含む）を優先し、未記録なら呼び出し側の cwd を使う。
+ */
+export function sessionInfoFromMeta(
+  store: SessionMetadataStore | null,
+  name: string,
+  fallbackCwd: string,
+): SessionInfo {
+  const meta = store?.get(name) ?? null;
+  const agent = meta?.agent;
+  const providerSessionId =
+    meta?.providerSessionId ?? (agent !== "codex" ? meta?.claudeSessionId : undefined);
+  return {
+    name,
+    cwd: meta?.cwd ?? fallbackCwd,
+    alive: true,
+    ...(meta !== null ? { backend: meta.backend ?? "tmux" } : {}),
+    ...(meta?.claudeSessionId !== undefined ? { claudeSessionId: meta.claudeSessionId } : {}),
+    ...(agent !== undefined ? { agent } : {}),
+    ...(providerSessionId !== undefined ? { providerSessionId } : {}),
+  };
+}
+
 /** session_list_response の worktree 掃除結果フィールド（session_kill 応答に同乗）。 */
 export interface WorktreeResponseFields {
   worktreePath: string;

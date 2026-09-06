@@ -652,8 +652,16 @@ export class TmuxSessionManager {
    */
   async list(): Promise<SessionInfo[]> {
     const alive = await this.liveSessionNames();
+    const allMetas = this.store.all();
     // herdr backend のメタは HerdrSessionManager が列挙する（Composite で和を取る）。
-    const metas = this.store.all().filter((meta) => meta.backend !== "herdr");
+    const metas = allMetas.filter((meta) => meta.backend !== "herdr");
+    // herdr 担当の名前は tmux の生存集合からも外す。backend 切替前の同名 tmux セッションが
+    // 生き残っている間（reaper の idle 回収まで）、ここが backend:"tmux" を確定申告すると
+    // Composite の tmux 優先マージで正しい herdr 行（メタ = ルーティング権威）が消え、
+    // iOS の観測が tmux に固定される（cwd/会話 id も欠けて稼働中ピルの join からも落ちる）。
+    const herdrNames = new Set(
+      allMetas.filter((meta) => meta.backend === "herdr").map((meta) => meta.name),
+    );
 
     const cwdByName = new Map<string, string>();
     const claudeSessionIdByName = new Map<string, string>();
@@ -668,13 +676,16 @@ export class TmuxSessionManager {
       if (providerSessionId !== undefined) providerSessionIdByName.set(meta.name, providerSessionId);
     }
 
-    const names = new Set<string>(alive);
+    const names = new Set<string>([...alive].filter((name) => !herdrNames.has(name)));
     for (const meta of metas) names.add(meta.name);
 
+    // backend は tmux も常に明示する。iOS は欄なしを「host 未申告」として既知の観測値を
+    // 保持するため、欄の省略を tmux の意味に使わない（session-backend）。
     const infos: SessionInfo[] = [...names].map((name) => ({
       name,
       cwd: cwdByName.get(name) ?? "",
       alive: alive.has(name),
+      backend: "tmux" as const,
       ...(claudeSessionIdByName.has(name) ? { claudeSessionId: claudeSessionIdByName.get(name)! } : {}),
       ...(agentByName.has(name) ? { agent: agentByName.get(name)! } : {}),
       ...(providerSessionIdByName.has(name)
@@ -716,7 +727,7 @@ export class TmuxSessionManager {
     }
     const cwd = this.store.get(name)?.cwd ?? "";
     const recent = await this.capturePane(name);
-    return { kind: "attached", info: { name, cwd, alive: true }, recentOutput: recent };
+    return { kind: "attached", info: { name, cwd, alive: true, backend: "tmux" }, recentOutput: recent };
   }
 
   /** pane 内のエージェント生存判定。tmux エラーや空出力は二重起動を避けて true に倒す。 */

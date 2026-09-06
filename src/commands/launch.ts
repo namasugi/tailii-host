@@ -11,6 +11,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { CodexAppServerManager, type CodexThreadStartOptions } from "../codex/codexAppServer.js";
 import {
+  HERDR_LAUNCH_GRACE_SECONDS,
   HERDR_TAILII_SESSION,
   defaultHerdrPath,
   parseHerdrForegroundCommand,
@@ -516,6 +517,10 @@ export async function launchCore(options: {
   };
 
   // --- 2.5. 既存の「死んだ」同名セッションを掃除する（同名再利用を可能にする） ---
+  // herdr と違い起動直後の猶予は設けない: tmux は `new-session -d -s <name> '<inner>'` で
+  // コマンドを直接走らせる（対話シェルへのタイプ注入も rc 読込も無い）ため、前面がシェルに
+  // 見える窓は claude の exec までの数十 ms に限られ、iOS の reattach（prepare ack の
+  // 0.5〜1 秒後）と競合しない。
   if ((await runTmux(["has-session", "-t", session])).code === 0) {
     const panes = await runTmux(["list-panes", "-t", session, "-F", "#{pane_dead}"]);
     const hasLive = panes.out.split("\n").some((line) => line.trim() === "0");
@@ -654,19 +659,28 @@ async function launchHerdrPane(options: {
 
   // --- 2. 既存 pane の解決と stale 掃除（tmux の dead-session 掃除に対応） ---
   const panes = parseHerdrPaneList(paneList.out);
-  const recordedPaneId = store.get(session)?.herdrPaneId;
+  const recordedMeta = store.get(session);
+  const recordedPaneId = recordedMeta?.herdrPaneId;
   let existing =
     (recordedPaneId !== undefined ? panes.find((pane) => pane.paneId === recordedPaneId) : undefined) ??
     panes.find((pane) => pane.label === session) ??
     null;
   if (existing !== null && agent === "claude") {
     // Claude が終了してシェルだけ残った pane は入力先として無効なので閉じて作り直す。
-    const info = await runHerdr(["pane", "process-info", "--pane", existing.paneId]);
-    const hasAgent =
-      info.code !== 0 || paneCommandLooksLikeAgent(parseHerdrForegroundCommand(info.out));
-    if (!hasAgent) {
-      await runHerdr(["pane", "close", existing.paneId]);
-      existing = null;
+    // ただし launch 直後の猶予窓（HERDR_LAUNCH_GRACE_SECONDS, メタ createdAt 起点）は
+    // 起動中でシェル前面に見えるため閉じない（HerdrSessionManager.agentProcessAlive と
+    // 同じ規約。連打・再接続直後の二重 prepare で起動中の pane を殺して作り直さない）。
+    const launchedAt = recordedMeta?.createdAt;
+    const elapsed = launchedAt !== undefined ? now() - launchedAt : -1;
+    const withinGrace = elapsed >= 0 && elapsed < HERDR_LAUNCH_GRACE_SECONDS;
+    if (!withinGrace) {
+      const info = await runHerdr(["pane", "process-info", "--pane", existing.paneId]);
+      const hasAgent =
+        info.code !== 0 || paneCommandLooksLikeAgent(parseHerdrForegroundCommand(info.out));
+      if (!hasAgent) {
+        await runHerdr(["pane", "close", existing.paneId]);
+        existing = null;
+      }
     }
   }
 
@@ -715,11 +729,15 @@ async function launchHerdrPane(options: {
   }
 
   // --- cwd と backend を権威記録（tmux 版の store.put と同じ役割） ---
+  // createdAt は実際に pane を起動した時刻。既存 pane の再利用では保つ（猶予窓の起点を
+  // 再利用のたびに更新すると、シェル化した pane を 20 秒ごとに開き直す限り窓が閉じず
+  // 自己修復（stale 掃除→再起動）が永遠に走らない）。同名重複の新旧判定（liveSessionJoin）
+  // にとっても「同じ pane は同じ時刻」が正しい。
   try {
     store.put({
       name: session,
       cwd: dir,
-      createdAt: now(),
+      createdAt: existing !== null && recordedMeta !== null ? recordedMeta.createdAt : now(),
       backend: "herdr",
       ...(agent === "codex" ? { agent } : {}),
       ...(agent === "claude" && options.claudeSessionId

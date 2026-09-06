@@ -5,6 +5,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, test } from "vitest";
 import {
+  HERDR_LAUNCH_GRACE_SECONDS,
   HerdrFailedError,
   HerdrSessionManager,
   inputBoxTextIncludesProbe,
@@ -1054,6 +1055,53 @@ describe("HerdrSessionManager", () => {
     expect(await make({ exitCode: 1, stdout: "", stderr: "x" }).agentProcessAlive("s-a")).toBe(true);
   });
 
+  test("agentProcessAlive: launch 直後の猶予窓ではシェル前面を起動中として生存扱い", async () => {
+    // pane 作成 → 初期シェル → `exec zsh -lc` → claude exec の間は前面がシェルに見える。
+    // 窓内（createdAt が HERDR_LAUNCH_GRACE_SECONDS 未満前）は true、窓外は従来どおり false。
+    const store = makeStore();
+    const now = 10_000;
+    store.put({ name: "s-fresh", cwd: "/a", createdAt: now - 3, backend: "herdr", herdrPaneId: "w4:p2" });
+    store.put({
+      name: "s-old", cwd: "/b", createdAt: now - HERDR_LAUNCH_GRACE_SECONDS, backend: "herdr",
+      herdrPaneId: "w4:p3",
+    });
+    const runner = new MockHerdrRunner((args) => {
+      if (args[1] === "list") {
+        return herdrOk(paneListJson([{ pane_id: "w4:p2" }, { pane_id: "w4:p3" }]));
+      }
+      if (args[1] === "process-info") return herdrOk(processInfoJson("zsh"));
+      return herdrOk("");
+    });
+    const manager = new HerdrSessionManager({ runner: runner.runner, store, now: () => now });
+    expect(await manager.agentProcessAlive("s-fresh")).toBe(true);
+    expect(await manager.agentProcessAlive("s-old")).toBe(false);
+    // 時計の巻き戻り（createdAt が未来）は窓外: 猶予が恒久化しない。
+    store.put({ name: "s-future", cwd: "/c", createdAt: now + 5, backend: "herdr", herdrPaneId: "w4:p2" });
+    expect(await manager.agentProcessAlive("s-future")).toBe(false);
+  });
+
+  test("reattach: launch 直後のシェル前面 pane は掃除せず attached（2026-09-06 実機回帰）", async () => {
+    // iOS は prepare ack の直後に reattach を送る。起動中の pane を「シェル化＝死亡」と
+    // 誤判定して pane close → resume 再起動すると、二重起動と backend 欄無し応答を招く。
+    const store = makeStore();
+    const now = 20_000;
+    store.put({ name: "s-boot", cwd: "/work", createdAt: now - 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const runner = new MockHerdrRunner((args) => {
+      if (args[1] === "list") return herdrOk(paneListJson([{ pane_id: "w4:p2", label: "s-boot" }]));
+      if (args[1] === "process-info") return herdrOk(processInfoJson("zsh"));
+      if (args[1] === "read") return herdrOk("booting\n");
+      return herdrOk("");
+    });
+    const manager = new HerdrSessionManager({ runner: runner.runner, store, now: () => now });
+    const result = await manager.reattach("s-boot");
+    expect(result).toEqual({
+      kind: "attached",
+      info: { name: "s-boot", cwd: "/work", alive: true, backend: "herdr" },
+      recentOutput: "booting",
+    });
+    expect(runner.recorded).not.toContainEqual(["pane", "close", "w4:p2"]);
+  });
+
   test("reattach: pane 不在は session_not_found、シェル化 pane は掃除して再起動導線へ", async () => {
     const store = makeStore();
     store.put({ name: "s-gone", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p9" });
@@ -1468,6 +1516,45 @@ describe("launchCore herdr backend", () => {
     );
     expect(recorded.some((call) => call.args[0] === "tab" && call.args[1] === "create")).toBe(true);
     expect(store.get("s-h")?.herdrPaneId).toBe("w9:p7");
+    // 作り直しでは createdAt（猶予の起点）を起動時刻へ更新する（自己修復の要）。
+    expect(store.get("s-h")?.createdAt).toBe(42);
+  });
+
+  test("createdAt が未来（時計巻き戻り）の pane は猶予窓外として掃除する", async () => {
+    const dir = makeTempDir("herdr-launch-clock");
+    const store = makeStore();
+    // launchOptions の now は 42。createdAt=50 は負の経過 = 窓外。
+    store.put({ name: "s-h", cwd: dir, createdAt: 50, backend: "herdr", herdrPaneId: "w9:p1" });
+    const { runner, recorded } = herdrProcessRunner({
+      panes: [{ pane_id: "w9:p1", label: "s-h" }],
+      processName: "zsh",
+    });
+
+    expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
+    expect(recorded).toContainEqual(expect.objectContaining({ args: ["pane", "close", "w9:p1"] }));
+    expect(store.get("s-h")?.herdrPaneId).toBe("w9:p7");
+    expect(store.get("s-h")?.createdAt).toBe(42);
+  });
+
+  test("launch 直後の猶予窓ではシェル前面の pane も起動中として再利用する", async () => {
+    // 連打・再接続直後の二重 prepare（同名 session_start）。起動中の pane を「シェル化」と
+    // 誤判定して閉じると、起動しかけた claude を殺して作り直す（二重起動の温床）。
+    const dir = makeTempDir("herdr-launch-grace");
+    const store = makeStore();
+    // launchOptions の now は 42。createdAt=30 は猶予窓（20s）内。
+    store.put({ name: "s-h", cwd: dir, createdAt: 30, backend: "herdr", herdrPaneId: "w9:p1" });
+    const { runner, recorded } = herdrProcessRunner({
+      panes: [{ pane_id: "w9:p1", label: "s-h" }],
+      processName: "zsh",
+    });
+
+    expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
+    expect(recorded.some((call) => call.args[0] === "pane" && call.args[1] === "close")).toBe(false);
+    expect(recorded.some((call) => call.args[0] === "tab" && call.args[1] === "create")).toBe(false);
+    expect(store.get("s-h")?.herdrPaneId).toBe("w9:p1");
+    // 再利用では createdAt（猶予の起点）を更新しない: 更新すると開き直すたびに窓が延び、
+    // 本当にシェル化した pane の自己修復（窓外での掃除→再起動）が永遠に走らない。
+    expect(store.get("s-h")?.createdAt).toBe(30);
   });
 
   test("tailii セッションサーバー不在なら detached 起動して待つ", async () => {

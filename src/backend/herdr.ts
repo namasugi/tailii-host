@@ -80,6 +80,15 @@ export function herdrInstalled(herdrPath: string = defaultHerdrPath()): boolean 
 const HERDR_TIMEOUT_MS = 15_000;
 
 /**
+ * 起動直後の生存判定猶予（秒）。`tab create` → pane の初期シェル → `exec zsh -lc` → claude exec
+ * の間は `pane process-info` の前面がシェル名に見える。この窓で「シェルだけ＝死亡」と判定すると、
+ * 直後の reattach（iOS は prepare ack の約 0.5〜1 秒後に送る）が生きた pane を閉じて resume
+ * 再起動し、二重起動と backend 欄無しの応答（iOS で herdr 会話が tmux 表示）を招く
+ * （2026-09-06 実機で発症）。窓内のシェル前面は「起動中」として生存扱いにする。
+ */
+export const HERDR_LAUNCH_GRACE_SECONDS = 20;
+
+/**
  * 実 herdr を起動する既定ランナー。herdr 非0 exit は throw せず結果で表現する。
  * `sessionName`（既定 tailii）を `--session` として全コマンドに前置する。
  */
@@ -360,6 +369,8 @@ export class HerdrSessionManager {
   /** login-code 送出後にコード欄の消滅を待つポーリング間隔 / 上限 ms（テスト注入用）。 */
   private readonly loginPollMs: number;
   private readonly loginSettleMs: number;
+  /** 現在時刻（Unix 秒）。起動直後の猶予判定に使う（テスト注入用）。 */
+  private readonly now: () => number;
 
   constructor(options: {
     runner?: HerdrCommandRunner;
@@ -374,6 +385,7 @@ export class HerdrSessionManager {
     readyPollMs?: number;
     loginPollMs?: number;
     loginSettleMs?: number;
+    now?: () => number;
   } = {}) {
     this.runner = options.runner ?? processHerdrCommandRunner();
     this.store = options.store ?? new SessionMetadataStore();
@@ -387,6 +399,7 @@ export class HerdrSessionManager {
     this.readyPollMs = options.readyPollMs ?? 300;
     this.loginPollMs = options.loginPollMs ?? 250;
     this.loginSettleMs = options.loginSettleMs ?? 5_000;
+    this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
   }
 
   /**
@@ -524,11 +537,26 @@ export class HerdrSessionManager {
       const result = await this.runner(["pane", "process-info", "--pane", target]);
       if (result.exitCode !== 0) return true;
       const command = parseHerdrForegroundCommand(result.stdout);
-      // zsh -lc 起動の実行中は前面が `zsh` に見える瞬間があるため、空/シェル名のみ死亡扱い。
-      return paneCommandLooksLikeAgent(command);
+      // 空/シェル名のみ死亡候補（空は判定不能なので安全側 true）。
+      if (paneCommandLooksLikeAgent(command)) return true;
+      // zsh -lc 起動の実行中は前面が `zsh` に見える。launch 直後の猶予窓では「起動中」とみなし、
+      // 生きた pane を閉じて再起動する誤判定を防ぐ（HERDR_LAUNCH_GRACE_SECONDS）。
+      return this.launchedWithinGrace(name);
     } catch {
       return true;
     }
+  }
+
+  /**
+   * メタの createdAt（launch 時刻。launcher は pane 再利用時に更新しない）が猶予窓内か。
+   * 未記録は窓外（従来どおりの判定）。時計の巻き戻りで経過が負になった場合も窓外に倒し、
+   * 猶予が恒久化しないようにする。
+   */
+  private launchedWithinGrace(name: string): boolean {
+    const createdAt = this.store.get(name)?.createdAt;
+    if (createdAt === undefined) return false;
+    const elapsed = this.now() - createdAt;
+    return elapsed >= 0 && elapsed < HERDR_LAUNCH_GRACE_SECONDS;
   }
 
   /**

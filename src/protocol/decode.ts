@@ -162,8 +162,8 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
                   ? "claude"
                   : undefined,
             providerSessionId: optionalString(obj, "providerSessionId"),
-            // 未知値は未指定（= tmux 相当）へ倒す（後方互換）。
-            backend: optionalString(obj, "backend") === "herdr" ? "herdr" : undefined,
+            // tmux も明示値として保持する（欄なし = 未申告。iOS 側の復号と同じ規約, session-backend）。
+            backend: decodeSessionBackend(optionalString(obj, "backend")),
             displayTitle: optionalString(obj, "displayTitle"),
           });
         }),
@@ -1168,6 +1168,11 @@ function requireHostUpdateStatus(raw: Raw): HostUpdateStatus {
     throw new ProtocolDecodeError("missing-field", "status");
   }
   return status;
+}
+
+/** `SessionInfo.backend` の復号: "tmux" / "herdr" のみ採用し、それ以外（欄なし・未知値）は undefined。 */
+function decodeSessionBackend(raw: string | undefined): "tmux" | "herdr" | undefined {
+  return raw === "tmux" || raw === "herdr" ? raw : undefined;
 }
 
 function requireBackendKind(raw: Raw): TerminalBackendKind {

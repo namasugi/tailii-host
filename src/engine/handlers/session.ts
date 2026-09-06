@@ -17,6 +17,7 @@ import {
   claimRuntime,
   emitPendingQuestion,
   engineDiag,
+  sessionInfoFromMeta,
   subscribeConversation,
   waitForLiveSession,
   writeError,
@@ -94,18 +95,9 @@ export const sessionHandlers: HandlerRegistry = {
           }
           if (res.exitCode === 0) {
             // launcher は worktree 削除済み resume で cwd を repo ルートへ振り替え得る
-            // （deleted-worktree-resume）ため、応答は起動後の権威記録 cwd を返す。
-            const launchedCwd = metadataStore?.get(message.name)?.cwd ?? meta.cwd;
-            const info: SessionInfo = {
-              name: message.name,
-              cwd: launchedCwd,
-              alive: true,
-              ...(meta.agent !== undefined ? { agent: meta.agent } : {}),
-              ...(providerSessionId !== null ? { providerSessionId } : {}),
-              ...(meta.claudeSessionId !== undefined
-                ? { claudeSessionId: meta.claudeSessionId }
-                : {}),
-            };
+            // （deleted-worktree-resume）ため、応答は起動後の権威記録メタ（cwd / backend /
+            // 会話 id）から組む。backend を欠くと iOS が herdr 会話を tmux 表示する。
+            const info = sessionInfoFromMeta(metadataStore, message.name, meta.cwd);
             writeSessionListResponse(writer, v, message.id, [info], null);
             subscribeConversation(ctx, message.name);
             await emitPendingQuestion(ctx, message.name);
@@ -373,20 +365,7 @@ export const sessionHandlers: HandlerRegistry = {
           // launcher 成功後の一覧取得失敗は、下のメタデータ由来 1 件へ縮退する。
         }
         if (adopted === undefined) {
-          const meta = metadataStore?.get(message.name) ?? null;
-          adopted = {
-            name: message.name,
-            cwd: meta?.cwd ?? message.cwd,
-            alive: true,
-            ...(meta?.backend === "herdr" ? { backend: "herdr" as const } : {}),
-            ...(meta?.claudeSessionId !== undefined
-              ? { claudeSessionId: meta.claudeSessionId }
-              : {}),
-            ...(meta?.agent !== undefined ? { agent: meta.agent } : {}),
-            ...(meta?.providerSessionId !== undefined
-              ? { providerSessionId: meta.providerSessionId }
-              : {}),
-          };
+          adopted = sessionInfoFromMeta(metadataStore, message.name, message.cwd);
         }
         writeSessionListResponse(writer, v, message.id, [adopted], null, message.name);
         return;
@@ -395,11 +374,12 @@ export const sessionHandlers: HandlerRegistry = {
         const sessions = await sessionManager.list();
         writeSessionListResponse(writer, v, message.id, sessions, null, message.name);
       } catch {
-        // 起動自体は成功しているため、一覧取得失敗時は当該セッション単独で応答する。
+        // 起動自体は成功しているため、一覧取得失敗時は当該セッション単独で応答する
+        // （backend はメタから明示する）。
         try {
           writeSessionListResponse(
             writer, v, message.id,
-            [{ name: message.name, cwd: message.cwd, alive: true }], null, message.name,
+            [sessionInfoFromMeta(metadataStore, message.name, message.cwd)], null, message.name,
           );
         } catch {
           // 書込失敗は握り潰す（Swift 版 try? と同じ）。

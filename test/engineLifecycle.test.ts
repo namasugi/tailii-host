@@ -206,9 +206,48 @@ describe("Engine — アイドルライフサイクル/ページング", () => {
     const msg = decodeControlMessage(line);
     if (msg.type !== "session_list_response") throw new Error(`応答型不一致: ${msg.type}`);
     expect(msg.id).toBe("R2");
-    expect(msg.sessions).toEqual([{ name: "resumed", cwd: "/tmp/resumed", alive: true }]);
+    // resume 再起動応答も backend を明示する（メタ未記録 = tmux）。
+    expect(msg.sessions).toEqual([
+      { name: "resumed", cwd: "/tmp/resumed", alive: true, backend: "tmux" },
+    ]);
     expect(resumeCalls.map((c) => c.name)).toEqual(["resumed"]);
     expect(resumeCalls[0]?.cwd).toBe("/tmp/resumed");
+
+    await engine.teardown();
+  });
+
+  test("herdr メタの reattach resume 再起動応答は backend=herdr と会話 id を載せる（session-backend）", async () => {
+    // 2026-09-06 実機: 起動直後の herdr pane が reattach で不在扱いになり resume 再起動した
+    // 応答に backend 欄が無く、iOS が herdr 会話を tmux 表示のまま固定した回帰。
+    // tmux 側 manager は herdr メタを列挙・reattach しない（不在扱い）ので、engine の
+    // resume 再起動経路に入る。launcher mock はメタを書き換えないため、応答は記録済み
+    // メタ（backend/claudeSessionId/providerSessionId）から組まれることを確認する。
+    const store = makeTempStore();
+    store.put({
+      name: "s-herdr", cwd: "/tmp/herdr", createdAt: 0, backend: "herdr",
+      herdrPaneId: "w4:p2", claudeSessionId: "sid-herdr", providerSessionId: "sid-herdr",
+    });
+    const runner = new MockTmuxRunner(() => ok(""));
+    const mgr = new TmuxSessionManager({ runner: runner.runner, store });
+    const resume: EngineLauncher = async () => ({ exitCode: 0, errorText: "" });
+
+    const engine = startEngine({
+      sessionManager: mgr,
+      metadataStore: store,
+      launcher: resume,
+      resumeLauncher: resume,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"id":"R-herdr","name":"s-herdr","type":"session_reattach","v":1}');
+    const line = await engine.lines.nextOfType("session_list_response");
+    const msg = decodeControlMessage(line);
+    if (msg.type !== "session_list_response") throw new Error(`応答型不一致: ${msg.type}`);
+    expect(msg.id).toBe("R-herdr");
+    expect(msg.sessions).toEqual([{
+      name: "s-herdr", cwd: "/tmp/herdr", alive: true, backend: "herdr",
+      claudeSessionId: "sid-herdr", providerSessionId: "sid-herdr",
+    }]);
 
     await engine.teardown();
   });
