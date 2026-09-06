@@ -39,7 +39,12 @@ import {
   type ControlMessage,
 } from "../protocol.js";
 import { injectQuestionAnswers } from "./questionInjection.js";
-import { EFFORT_COMMAND_PATTERN, confirmEffortChangeDialog } from "./effortDialog.js";
+import {
+  EFFORT_COMMAND_PATTERN,
+  MODEL_COMMAND_PATTERN,
+  confirmEffortChangeDialog,
+  confirmModelSwitchDialog,
+} from "./effortDialog.js";
 import { ImageService } from "../chat/imageService.js";
 import { listServeProcessesWithStatus } from "../services/serveService.js";
 
@@ -464,6 +469,14 @@ export async function runHubCommand(args: string[]): Promise<number> {
       if (EFFORT_COMMAND_PATTERN.test(text)) {
         void confirmEffortChangeDialog(sessionBackend, session, { log }).catch((error: unknown) => {
           log(`effort dialog 承認失敗 session=${session} error=${String(error)}`);
+        });
+      }
+      // `/model <slug>` も同型の確認ダイアログ（`Switch model?`）が挟まる。herdr backend では
+      // iOS の pane_preview 自動 Yes（入力 PTY）が claude へ届かないため host が承認する
+      // （model-switch-dialog, 2026-09-06 実障害: 開き直した会話でモデル変更が未反映）。
+      if (MODEL_COMMAND_PATTERN.test(text)) {
+        void confirmModelSwitchDialog(sessionBackend, session, { log }).catch((error: unknown) => {
+          log(`model dialog 承認失敗 session=${session} error=${String(error)}`);
         });
       }
     },
