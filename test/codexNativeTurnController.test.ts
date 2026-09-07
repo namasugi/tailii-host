@@ -505,6 +505,13 @@ describe("CodexNativeTurnController", () => {
       id: "thread-late", parentThreadId: "thread-root", preview: "", model: "gpt-5.6-terra",
       agentRole: "explorer", status: { type: "active", activeFlags: [] },
     } } });
+    // 保留から採った子自身の申告は、後続の spawnAgent item の要求 slug で巻き戻らない。
+    openOptions?.onNotification?.({ method: "item/completed", params: { threadId: "thread-root", item: {
+      id: "collab-spawn-early", type: "collabAgentToolCall", tool: "spawnAgent", status: "completed",
+      senderThreadId: "thread-root", receiverThreadIds: ["thread-early"], prompt: "早い子",
+      model: "gpt-5.6-terra",
+      agentsStates: { "thread-early": { status: "running", message: "開始" } },
+    } } });
 
     const nodes = chats
       .map((event) => event.payload as { type: string; node: Record<string, unknown> })
@@ -512,6 +519,132 @@ describe("CodexNativeTurnController", () => {
     expect(nodes.map((payload) => [payload.node["nodeId"], payload.node["model"]])).toEqual([
       ["thread-early", "gpt-5.6-luna"],
       ["thread-late", "gpt-5.6-terra"],
+      ["thread-early", "gpt-5.6-luna"],
+    ]);
+    expect(nodes.at(-1)?.node).toMatchObject({ currentActivity: "開始", toolUseId: "collab-spawn-early" });
+  });
+
+  test("保留モデルは spawnAgent item がノードを新規生成する経路でも採られる（到着順に依らない）", async () => {
+    const thread = new FakeThread();
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const chats: { payload: unknown }[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return thread; } },
+      onChatItem: (event) => chats.push(event),
+    });
+    await controller.subscribeSession({ session: "work", threadId: "thread-root", cwd: "/tmp/work" });
+
+    const spawn = (receiver: string, id: string) => ({
+      id, type: "collabAgentToolCall", tool: "spawnAgent", status: "completed",
+      senderThreadId: "thread-root", receiverThreadIds: [receiver], prompt: "調査",
+      model: "gpt-5.6-sol",
+      agentsStates: { [receiver]: { status: "running", message: null } },
+    });
+    // A: 子の settings/updated → 親の SpawnEnd（spawn item）が先にノードを作る。
+    openOptions?.onNotification?.({ method: "thread/settings/updated", params: {
+      threadId: "thread-a", threadSettings: { model: "gpt-5.6-terra" },
+    } });
+    openOptions?.onNotification?.({ method: "item/completed", params: { threadId: "thread-root", item: spawn("thread-a", "spawn-a") } });
+    openOptions?.onNotification?.({ method: "item/completed", params: { threadId: "thread-root", item: {
+      id: "wait-a", type: "collabAgentToolCall", tool: "wait", status: "completed",
+      senderThreadId: "thread-root", receiverThreadIds: ["thread-a"], prompt: null, model: null,
+      agentsStates: { "thread-a": { status: "running", message: "待機中" } },
+    } } });
+    // B: 間に subAgentActivity(started) が挟まる順序でも同じ結果になる。
+    openOptions?.onNotification?.({ method: "thread/settings/updated", params: {
+      threadId: "thread-b", threadSettings: { model: "gpt-5.6-terra" },
+    } });
+    openOptions?.onNotification?.({ method: "item/started", params: { threadId: "thread-root", item: {
+      id: "activity-b", type: "subAgentActivity", kind: "started", agentThreadId: "thread-b", agentPath: "/root/b_task",
+    } } });
+    openOptions?.onNotification?.({ method: "item/completed", params: { threadId: "thread-root", item: spawn("thread-b", "spawn-b") } });
+
+    const nodes = chats
+      .map((event) => event.payload as { type: string; node: Record<string, unknown> })
+      .filter((payload) => payload.type === "subagent_node");
+    expect(nodes.map((payload) => [payload.node["nodeId"], payload.node["model"]])).toEqual([
+      ["thread-a", "gpt-5.6-terra"],
+      ["thread-a", "gpt-5.6-terra"],
+      ["thread-b", "gpt-5.6-terra"],
+      ["thread-b", "gpt-5.6-terra"],
+    ]);
+  });
+
+  test("再オープン後に再生された spawn item の要求 slug は thread/read の実モデルを上書きしない", async () => {
+    const spawnItem = {
+      id: "spawn-history", type: "collabAgentToolCall", tool: "spawnAgent", status: "completed",
+      senderThreadId: "thread-root", receiverThreadIds: ["thread-history"], prompt: "履歴を調査",
+      model: "gpt-5.6-sol",
+      agentsStates: { "thread-history": { status: "completed", message: "完了" } },
+    };
+    const thread = Object.assign(new FakeThread(), {
+      initialItems: [spawnItem],
+      readThreadStatus: async () => ({ status: { type: "idle" }, timestampMs: 1_000, model: "gpt-5.6-terra" }),
+    });
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const chats: { payload: unknown }[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return thread; } },
+      onChatItem: (event) => chats.push(event),
+    });
+    await controller.subscribeSession({ session: "work", threadId: "thread-root", cwd: "/tmp/work" });
+    // resume〜snapshot の窓で完了した spawn の item/completed が buffered 再生で届く形。
+    openOptions?.onNotification?.({ method: "item/completed", params: { threadId: "thread-root", item: spawnItem } });
+
+    const nodes = chats
+      .map((event) => event.payload as { type: string; node: Record<string, unknown> })
+      .filter((payload) => payload.type === "subagent_node");
+    expect(nodes.map((payload) => payload.node["model"])).toEqual(["gpt-5.6-terra"]);
+    expect(nodes[0]?.node).toMatchObject({ nodeId: "thread-history", status: "completed", ts: 1_000 });
+  });
+
+  test("保留モデルは上限付きで turn 完了時に破棄され、無関係な thread の分が溜まり続けない", async () => {
+    const thread = new FakeThread();
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const chats: { payload: unknown }[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return thread; } },
+      onChatItem: (event) => chats.push(event),
+    });
+    await controller.subscribeSession({ session: "work", threadId: "thread-root", cwd: "/tmp/work" });
+
+    for (let index = 1; index <= 40; index += 1) {
+      openOptions?.onNotification?.({ method: "thread/settings/updated", params: {
+        threadId: `thread-p${index}`, threadSettings: { model: `m${index}` },
+      } });
+    }
+    expect(chats).toHaveLength(0);
+    // 最古（p1）は上限（32）で捨てられ、最新（p40）は残る。
+    openOptions?.onNotification?.({ method: "thread/started", params: { thread: {
+      id: "thread-p1", parentThreadId: "thread-root", preview: "", model: null,
+      status: { type: "active", activeFlags: [] },
+    } } });
+    openOptions?.onNotification?.({ method: "thread/started", params: { thread: {
+      id: "thread-p40", parentThreadId: "thread-root", preview: "", model: null,
+      status: { type: "active", activeFlags: [] },
+    } } });
+    // turn 完了で残りの保留は全て破棄される。
+    openOptions?.onNotification?.({ method: "thread/settings/updated", params: {
+      threadId: "thread-q", threadSettings: { model: "mq" },
+    } });
+    openOptions?.onNotification?.({ method: "turn/completed", params: {
+      threadId: "thread-root", turn: { id: "turn-1", status: "completed" },
+    } });
+    openOptions?.onNotification?.({ method: "thread/started", params: { thread: {
+      id: "thread-q", parentThreadId: "thread-root", preview: "", model: null,
+      status: { type: "active", activeFlags: [] },
+    } } });
+
+    const nodes = chats
+      .map((event) => event.payload as { type: string; node: Record<string, unknown> })
+      .filter((payload) => payload.type === "subagent_node");
+    // turn 完了の settle でも既知の model は保持される（p40 の 2 件目）。
+    expect(nodes.map((payload) => [payload.node["nodeId"], payload.node["model"] ?? null])).toEqual([
+      ["thread-p1", null],
+      ["thread-p40", "m40"],
+      ["thread-p1", null],
+      ["thread-p40", "m40"],
+      ["thread-q", null],
     ]);
   });
 

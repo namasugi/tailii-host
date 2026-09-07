@@ -19,8 +19,13 @@ interface ThreadMetadata {
 export class CodexSubagentTracker {
   private readonly metadata = new Map<string, ThreadMetadata>();
   private readonly nodes = new Map<string, SubagentNode>();
-  /** ノード生成前に届いた子 thread のモデル変更（thread/started や spawn item で採用する）。 */
+  /**
+   * ノード生成前に届いた子 thread のモデル変更（thread/started や spawn item で採用する）。
+   * App Server は他 root の thread/settings/updated も全接続へ届けるため、無関係な id が
+   * 溜まり続けないよう上限付き（最古から捨てる）で、turn 完了時に全て破棄する。
+   */
   private readonly pendingModels = new Map<string, string>();
+  private static readonly pendingModelCap = 32;
 
   constructor(private readonly rootThreadId: string) {}
 
@@ -94,7 +99,13 @@ export class CodexSubagentTracker {
     const existing = this.nodes.get(threadId);
     if (existing === undefined) {
       // ノード未生成なら保留し、生成時（thread/started / spawn item）に既知値として採る。
+      this.pendingModels.delete(threadId);
       this.pendingModels.set(threadId, model);
+      while (this.pendingModels.size > CodexSubagentTracker.pendingModelCap) {
+        const oldest = this.pendingModels.keys().next().value;
+        if (oldest === undefined) break;
+        this.pendingModels.delete(oldest);
+      }
       return [];
     }
     const metadata = this.metadata.get(threadId);
@@ -108,6 +119,9 @@ export class CodexSubagentTracker {
   }
 
   settleRunning(status: SubagentNodeStatus, nowMs: number): SubagentNode[] {
+    // turn 完了時点で、その turn に spawn された子は thread/started 済み（保留は消化済み）。
+    // 残っているのは他 root 等の無関係な分なので破棄する。
+    this.pendingModels.clear();
     const updates: SubagentNode[] = [];
     for (const [nodeId, node] of this.nodes) {
       if (node.status !== "running") continue;
@@ -150,10 +164,13 @@ export class CodexSubagentTracker {
         // role / nickname が無いノードの種別は既定の "Codex"（upsert）。model は専用欄で出すので
         // 種別へ流用しない（流用すると UI の副題「種別 · モデル」で同じ slug が 2 回並ぶ）。
         agentType: metadata?.agentType ?? existingAgentType,
-        // model を採るのは spawnAgent（spawn 時の要求モデル）だけ。wait / sendInput 等の item に
-        // model が入る版でも子のモデルを親側の値で上書きしない。子 thread 自身の申告
-        // （thread/started）を優先し、null は upsert で既知値を保持する。
-        model: metadata?.model ?? (tool === "spawnAgent" ? stringValue(item["model"]) : null),
+        // model は子 thread 自身の申告（thread/started・settings/rerouted・thread/read。既知値と、
+        // ノード未生成のうちに届いた保留分）を優先し、無いときだけ spawnAgent の要求モデルを採る。
+        // 子の settings/rerouted と親の SpawnEnd は別 listener から届くため到着順は保証されず、
+        // spawn item が先にノードを作る経路でも保留分を捨てない（upsert が保留を消費する）。
+        // wait / sendInput 等の item に model が入る版でも、親側の値で子のモデルを上書きしない。
+        model: metadata?.model ?? existing?.model ?? this.pendingModels.get(nodeId)
+          ?? (tool === "spawnAgent" ? stringValue(item["model"]) : null),
         status: mappedStatus,
         currentActivity: mappedStatus === "running" ? stateMessage : null,
       }, nowMs));
