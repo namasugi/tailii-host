@@ -118,6 +118,21 @@ export function extractClaudeInputBox(screen: string): ClaudeInputBox | null {
 }
 
 /**
+ * claude TUI の入力欄（composer）が描画済みか（起動中の pane との区別, boot-gate）。
+ *
+ * claude プロセスは起動していても、TUI が入力欄を描くまでには（host 負荷次第で）数秒〜
+ * 10 秒超の窓がある。その間の画面は初期シェルのプロンプト／`exec zsh -lc …` のエコー／
+ * 起動バナー（`╭…╮` の角付き枠）だけで、入力欄の罫線（`─` の連続行）は 1 本も無い。
+ * 罫線が 1 本でも見えれば TUI は描画済み（composer は本文の罫線と同じフレームで描かれ、
+ * スクロールで上側の罫線が窓外に出ても下側は残る）。`❯` だけの画面はシェルプロンプトの
+ * 可能性があるため描画済みとみなさない（`extractClaudeInputBox` の ❯ フォールバックは
+ * 描画済み前提の判定にだけ使う）。
+ */
+export function claudeInputBoxRendered(screen: string): boolean {
+  return screen.split("\n").some((line) => isInputBoxRuleLine(stripSgr(line).trim()));
+}
+
+/**
  * 入力が空のとき claude TUI が入力欄へ薄字で出すプレースホルダ（実測 2.1.220）。
  * 未送信テキストと誤認すると、シェルモード離脱（空入力の Backspace）に入れず
  * 通常メッセージがシェルコマンドとして実行される（実機フレーム 2026-08-03）。

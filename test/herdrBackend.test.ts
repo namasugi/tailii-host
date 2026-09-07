@@ -368,6 +368,8 @@ describe("HerdrSessionManager", () => {
     openDialogOnText?: boolean;
     /** pane read が常にこの画面を返す（罫線なし=入力欄不可視の再現）。 */
     plainScreen?: string;
+    /** 最初の N 回の pane read は起動中の画面（入力欄の罫線なし）を返す（TUI 起動待ちの再現, boot-gate）。 */
+    bootReads?: number;
   } = {}) {
     const state = {
       input: options.initialInput ?? "",
@@ -377,7 +379,17 @@ describe("HerdrSessionManager", () => {
       swallowEnters: options.swallowEnters ?? 0,
       statusReads: 0,
       hideInputReads: options.hideInputReads ?? 0,
+      bootReads: options.bootReads ?? 0,
     };
+    // 起動中の画面: 初期シェルのプロンプト + launcher がタイプした exec 行 + 起動バナー
+    // （角付き枠。入力欄の罫線 `─…` は無い）。
+    const bootScreen = [
+      "namasugi@macbook-air ~ % exec zsh -lc 'claude --session-id 0000 --settings {}'",
+      "╭──────────────────────────────╮",
+      "│ ✻ Welcome to Claude Code!    │",
+      "╰──────────────────────────────╯",
+      "",
+    ].join("\n");
     const dialogScreen = [
       "   Remote Control",
       "     Disconnect this session",
@@ -451,6 +463,10 @@ describe("HerdrSessionManager", () => {
         return herdrOk("");
       }
       if (args[0] === "pane" && args[1] === "read") {
+        if (state.bootReads > 0) {
+          state.bootReads -= 1;
+          return herdrOk(bootScreen);
+        }
         if (options.plainScreen !== undefined) return herdrOk(options.plainScreen);
         if (state.dialogOpen) return herdrOk(dialogScreen);
         const rule = "─".repeat(40);
@@ -764,9 +780,10 @@ describe("HerdrSessionManager", () => {
   test("sendTextSubmit: 描画遅延の偽陰性で再投入するときは先に C-u で入力欄を空にする（初回送信二重化の根因②）", async () => {
     const store = makeStore();
     store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
-    // 事前確認（ダイアログ/残存/シェルモード）の 3 read + attempt1 の反映検証 2 read までは
-    // 入力欄が空描画（ブート直後の TUI 描画遅延を模す）。
-    const { runner, state } = makeSubmitHarness({ hideInputReads: 5 });
+    // 事前確認（描画ゲート/ダイアログ/残存/シェルモード）の 4 read + attempt1 の反映検証
+    // 2 read までは入力欄が空描画（ブート直後の TUI 描画遅延を模す。罫線はあるので描画
+    // ゲートは通る）。
+    const { runner, state } = makeSubmitHarness({ hideInputReads: 6 });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
       submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
@@ -841,23 +858,63 @@ describe("HerdrSessionManager", () => {
     ).toHaveLength(1);
   });
 
-  test("sendTextSubmit: 入力欄が見えない画面では clearInputBox が書き込まず throw する", async () => {
+  test("sendTextSubmit: 入力欄が見えない画面では 1 キーも打たずに throw する（boot-gate）", async () => {
     const store = makeStore();
     store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
-    // 罫線のない画面（描画崩れ/罫線が窓外）: 入力欄を特定できない。
+    // 罫線のない画面（描画崩れ/罫線が窓外/起動中）: 入力欄を特定できない。
+    // 旧実装は本文を打ってから throw していた（打った本文は TUI に残留 → 明示再送で二重ターン）。
     const { runner } = makeSubmitHarness({ plainScreen: "ただのシェル出力\n$ " });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
       submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
-      readyTimeoutMs: 5000, readyPollMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0, inputBoxReadyTimeoutMs: 0,
     });
     await expect(manager.sendTextSubmit("s-a", "見えない本文")).rejects.toThrow(
-      /did not reach the input box/,
+      /input box not rendered yet; nothing was typed/,
     );
-    expect(runner.recorded.some((args) => args[1] === "send-text" && args[3] === "\u0015")).toBe(false);
-    expect(
-      runner.recorded.filter((args) => args[1] === "send-text" && args[3] === "見えない本文"),
-    ).toHaveLength(1);
+    expect(submitSends(runner)).toEqual([]);
+  });
+
+  test("sendTextSubmit: 起動中（入力欄未描画）の pane には打たず、入力欄が描画されてから 1 回だけ注入する（boot-gate）", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    // 実機 2026-09-07: 新規会話の初回送信。herdr の agent 検出は通過済みだが TUI はまだ
+    // 起動バナーだけ（host 高負荷で数秒〜10 秒超）。
+    const { runner, state } = makeSubmitHarness({ bootReads: 3 });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0, inputBoxReadyTimeoutMs: 5000,
+    });
+    await manager.sendTextSubmit("s-a", "はじめまして");
+    const firstBodyIndex = runner.recorded.findIndex(
+      (args) => args[1] === "send-text" && args[3] === "はじめまして",
+    );
+    const readsBeforeBody = runner.recorded
+      .slice(0, firstBodyIndex)
+      .filter((args) => args[0] === "pane" && args[1] === "read").length;
+    // 起動中の 3 読みは打たずに待ち、描画後の読み（4 回目以降）を経てから本文を打つ。
+    expect(readsBeforeBody).toBeGreaterThanOrEqual(4);
+    expect(submitSends(runner)).toEqual([
+      ["pane", "send-text", "w4:p2", "はじめまして"],
+      ["pane", "send-text", "w4:p2", "\r"],
+    ]);
+    expect(state.input).toBe("");
+  });
+
+  test("sendTextSubmit: 入力欄が上限まで描画されなければ 1 キーも打たずに throw する（残留→明示再送の二重ターンを作らない）", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const { runner } = makeSubmitHarness({ bootReads: 1000 });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0, inputBoxReadyTimeoutMs: 0,
+    });
+    await expect(manager.sendTextSubmit("s-a", "はじめまして")).rejects.toThrow(
+      /input box not rendered yet; nothing was typed/,
+    );
+    expect(submitSends(runner)).toEqual([]);
   });
 
   test("sendTextSubmit: 送出が選択ダイアログを開いたら Enter を再送しない（誤 Continue 防止）", async () => {

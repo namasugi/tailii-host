@@ -29,6 +29,7 @@ import {
 } from "../sessions/sessionMetadataStore.js";
 import {
   CHAT_BLOCKED_BY_LOGIN_PROMPT,
+  claudeInputBoxRendered,
   extractClaudeInputBox,
   inputBoxHasRealPendingText,
   inputBoxRealText,
@@ -366,6 +367,8 @@ export class HerdrSessionManager {
   /** 注入前の claude 検出待ちの上限/間隔 ms（テスト注入用）。 */
   private readonly readyTimeoutMs: number;
   private readonly readyPollMs: number;
+  /** 注入前の入力欄描画待ちの上限 ms（起動直後の TUI へ打たない, boot-gate。テスト注入用）。 */
+  private readonly inputBoxReadyTimeoutMs: number;
   /** login-code 送出後にコード欄の消滅を待つポーリング間隔 / 上限 ms（テスト注入用）。 */
   private readonly loginPollMs: number;
   private readonly loginSettleMs: number;
@@ -383,6 +386,7 @@ export class HerdrSessionManager {
     clearKeyDelayMs?: number;
     readyTimeoutMs?: number;
     readyPollMs?: number;
+    inputBoxReadyTimeoutMs?: number;
     loginPollMs?: number;
     loginSettleMs?: number;
     now?: () => number;
@@ -397,6 +401,11 @@ export class HerdrSessionManager {
     this.clearKeyDelayMs = options.clearKeyDelayMs ?? 150;
     this.readyTimeoutMs = options.readyTimeoutMs ?? 10_000;
     this.readyPollMs = options.readyPollMs ?? 300;
+    // 起動直後の TUI（Node 起動〜入力欄描画）は host 負荷で 10 秒を超えることがある（実測
+    // 2026-09-07: load average 200 超で新規会話の初回送信が起動中の pane へ打たれた）。
+    // 上限はアプリの chat_send ACK 予算（18s）より長くてよい: 超過分はアプリの明示再送が
+    // hub の同一 clientMessageId 待ちへ合流し、二重注入にはならない。
+    this.inputBoxReadyTimeoutMs = options.inputBoxReadyTimeoutMs ?? 20_000;
     this.loginPollMs = options.loginPollMs ?? 250;
     this.loginSettleMs = options.loginSettleMs ?? 5_000;
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
@@ -611,6 +620,19 @@ export class HerdrSessionManager {
     // 残らない）。herdr の claude 検出（agent_status が unknown を抜けるまで）を注入の
     // 準備完了ゲートにする。working（処理中の queue 入力）も注入可。判定不能は fail-open。
     await this.waitForAgentReady(name);
+    // 入力欄が描画されるまで 1 キーも打たない（boot-gate）。起動中の TUI に打った本文は
+    // 反映検証では見えない（偽陰性）のに TUI 側には保持され、入力欄が現れた時点で残留する。
+    // 旧実装はここで throw → アプリの明示再送 → 冒頭の残留 flush（Enter）が残留分を独立送信
+    // → 本文を再注入、で同一本文が 2 ターン届いていた（2026-09-07 実機: 新規会話の初回送信が
+    // 「⚠️ 送信失敗」表示のうえ二重）。上限まで現れなければ何も打たずに throw し、明示再送
+    // （=fresh な注入）に倒す。
+    if (!(await this.waitForInputBoxRendered(name))) {
+      throw new HerdrFailedError(
+        ["pane", "send-text", name],
+        1,
+        "input box not rendered yet; nothing was typed (claude TUI 起動中 / 入力欄不可視)",
+      );
+    }
     // `/login` のコード入力待ち中は通常の入力欄が無く、以降の入力欄検証・C-u クリアが
     // コード欄を壊す（フォールバックの `❯ /login` 行を未送信テキストと誤認して Enter、
     // 反映検証に失敗して C-u 連打 → throw）。明示エラーで chat_send を失敗させ、コードは
@@ -837,6 +859,26 @@ export class HerdrSessionManager {
         return; // herdr 不在等は fail-open（呼び出し側の送出エラーで顕在化させる）
       }
       if (Date.now() > deadline) return; // タイムアウトも fail-open
+      await new Promise((resolve) => setTimeout(resolve, this.readyPollMs));
+    }
+  }
+
+  /**
+   * claude TUI の入力欄（composer）が描画されるまで待つ（boot-gate）。
+   * `waitForAgentReady` は claude プロセスの起動（herdr の agent 検出）を見るだけで、TUI が
+   * 入力欄を描くまでの窓（起動バナー／初期シェルのエコーだけの画面）は通過してしまう。
+   * 入力欄の罫線が見えるか、後続の門番が扱う画面（`/login` フロー・選択ダイアログ）に
+   * なったら true。capture 不能は fail-open（後続の判定・送出エラーで顕在化させる）。
+   * 上限まで現れなければ false（呼び出し側は 1 キーも打たずに throw する）。
+   */
+  private async waitForInputBoxRendered(name: string): Promise<boolean> {
+    const deadline = Date.now() + this.inputBoxReadyTimeoutMs;
+    for (;;) {
+      const window = await this.captureDialogWindow(name);
+      if (window === null) return true;
+      if (claudeInputBoxRendered(window)) return true;
+      if (screenInLoginFlow(window) || screenHasSelectionFooter(window)) return true;
+      if (Date.now() >= deadline) return false;
       await new Promise((resolve) => setTimeout(resolve, this.readyPollMs));
     }
   }
