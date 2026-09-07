@@ -271,6 +271,17 @@ export async function runHookCore(options: RunHookOptions): Promise<HookRunResul
  * ファイルも更新する（失敗は握り潰し＝ゲート/監査へ影響させない）。
  * `engineRelaySocketPath: null` は「送らない」明示指定（テスト密閉用）。
  */
+/**
+ * hook の発火時刻（Unix ms）。Claude Code は hook を event 発生時に spawn するため、node の起動遅延
+ * （実測 100〜300ms）を含む `Date.now()` ではなく、process.uptime() を差し引いた「プロセス開始時刻」が
+ * event 発生時刻に最も近い。Hub はこれを transcript のターン終端行（中断確定 / API エラー）の
+ * timestamp と比べ、「終端より前に発火した hook = 既に終わったターンの遅着」を判定する
+ * （late-hook-before-turn-end）。同一マシンの時計なので transcript 側と直接比較できる。
+ */
+function hookSpawnedAtMs(): number {
+  return Date.now() - Math.round(process.uptime() * 1000);
+}
+
 async function notifySessionProcessing(
   options: RunHookOptions,
   session: string,
@@ -292,7 +303,7 @@ async function notifySessionProcessing(
   }
   if (options.engineRelaySocketPath === null) return;
   try {
-    const message = { type: "session_processing", session, state, event } as const;
+    const message = { type: "session_processing", session, state, event, atMs: hookSpawnedAtMs() } as const;
     // best-effort・短予算（60ms）: engine 不在時にゲート/監査を遅らせない。
     if (options.engineRelaySocketPath !== undefined) {
       await sendSessionProcessingToEngine(message, options.engineRelaySocketPath, 60);

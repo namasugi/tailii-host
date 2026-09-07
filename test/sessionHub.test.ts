@@ -1158,6 +1158,235 @@ describe("SessionHub actor", () => {
     expect(received).toEqual([]);
   });
 
+  test("API エラー終端マーカー（使用量上限 429 等）も処理開始以降のものだけ処理完了へ写像する", () => {
+    // 実機 2026-09-07: 「You've hit your session limit」で止まった会話は Stop hook が発火せず、hub が
+    // 処理中のまま残る → 停止ボタン点灯・背景購読の継続（開き直しても履歴再生が走らず送信が queued
+    // で止まる）・reaper の計時停止。中断マーカーと同じ副チャネルで done へ写像する。
+    let now = 100;
+    const log = vi.fn();
+    const metadataStore = makeTempStore();
+    metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0, providerSessionId: "provider-1" });
+    const heartbeatDir = makeTempDir("session-hub-api-error");
+    const lifecycles: Array<(event: { kind: "interrupted" | "api_error"; atMs: number }) => void> = [];
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir, metadataStore, timeoutSeconds: 1800,
+      now: () => now, nowMs: () => now * 1000 + 250, log,
+      tailFactory: (_write, _codex, onClaudeTurnLifecycle) => {
+        if (onClaudeTurnLifecycle !== undefined) lifecycles.push(onClaudeTurnLifecycle);
+        return { open() {}, stop() {} };
+      },
+    });
+    const client = {};
+    const received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "conversation_subscribe", session: "work" }));
+    const lifecycle = lifecycles[0]!;
+    hub.handleRelayMessage({ type: "session_processing", session: "work", state: "active" });
+    expect(hub.actors.get("work")?.processingSince).toBe(100);
+    received.length = 0;
+
+    // 開き直しの全履歴再生で流れる過去ターンの終端行（処理開始 100_250ms より前）は無視する。
+    lifecycle({ kind: "api_error", atMs: 100_200 });
+    expect(hub.actors.get("work")?.processingSince).toBe(100);
+    expect(received).toEqual([]);
+
+    // 現ターンの終端（Stop hook は発火しない）→ done を配信し heartbeat も idle。
+    now = 125;
+    lifecycle({ kind: "api_error", atMs: 125_000 });
+    expect(hub.actors.get("work")?.processingSince).toBeNull();
+    expect(received).toContainEqual({ type: "session_processing", session: "work", state: "done" });
+    expect(readHeartbeat(heartbeatDir, "work")?.state).toBe("idle");
+    expect(log).toHaveBeenCalledWith("api-error marker で処理完了を補完 session=work");
+
+    // 処理中でなければ done を流さない（終端時刻だけ覚える）。
+    received.length = 0;
+    lifecycle({ kind: "api_error", atMs: 126_000 });
+    expect(received).toEqual([]);
+    expect(hub.actors.get("work")?.lastTurnEndMs).toBe(126_000);
+    // API エラーは中断用の 3 秒残響窓を武装しない（自動 dequeue / task-notification の再開を握り潰さない）。
+    expect(hub.actors.get("work")?.lastInterruptDoneMs).toBeNull();
+  });
+
+  test("発火時刻付き hook はターン終端マーカーとの前後で採否を決める（連続 API エラー・遅着 PostToolUse・自動再開）", () => {
+    // 実測 2026-09-06 d62be8b1: api error(t=48.688s) → 69ms 後に queued 発話が自動 dequeue（ターン N+1）→
+    // 1.15s 後に再び api error。hook は別プロセス起動 + relay で遅れるため、tail が 2 本目のマーカーを
+    // N+1 の UserPromptSubmit より先に届け得る。hook の発火時刻（プロセス開始時刻）で判定する。
+    let nowMs = 1_000_000;
+    const metadataStore = makeTempStore();
+    metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0 });
+    const heartbeatDir = makeTempDir("hub-hook-fired-at");
+    const log = vi.fn();
+    let lifecycle: ((event: { kind: "interrupted" | "api_error"; atMs: number }) => void) | undefined;
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir, metadataStore, timeoutSeconds: 1800, log,
+      now: () => Math.floor(nowMs / 1000), nowMs: () => nowMs,
+      tailFactory: (_write, _codex, onClaudeTurnLifecycle) => ({ open() { lifecycle = onClaudeTurnLifecycle; }, stop() {} }),
+    });
+    const client = {};
+    const received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "conversation_subscribe", session: "work" }));
+    const relay = (state: "active" | "done", event: string, atMs?: number) =>
+      hub.handleRelayMessage({ type: "session_processing", session: "work", state, event, ...(atMs !== undefined ? { atMs } : {}) });
+
+    // ターン N: 発話（hook 発火 1_000_000）→ 処理中。
+    relay("active", "UserPromptSubmit", 1_000_000);
+    expect(hub.actors.get("work")?.processingSince).toBe(1000);
+    // ターン N が api error で終端（transcript 1_048_688）→ done。
+    nowMs = 1_048_750;
+    lifecycle!({ kind: "api_error", atMs: 1_048_688 });
+    expect(hub.actors.get("work")?.processingSince).toBeNull();
+    // ターン N+1（自動 dequeue。発話 1_048_757 で hook 発火）も api error で終端（1_049_910）。tail が
+    // 先に届け、hook の relay はその後に遅着する。
+    lifecycle!({ kind: "api_error", atMs: 1_049_910 });
+    expect(hub.actors.get("work")?.lastTurnEndMs).toBe(1_049_910);
+    received.length = 0;
+    nowMs = 1_050_100;
+    writeHeartbeat(heartbeatDir, "work", { ts: 1050, state: "active", event: "UserPromptSubmit" });
+    relay("active", "UserPromptSubmit", 1_048_757);
+    // 終端（1_049_910）より前に発火した hook = 既に終わったターン → 処理中へ戻さず、hook が直書きした
+    // heartbeat も idle へ戻す。broadcast もしない。
+    expect(hub.actors.get("work")?.processingSince).toBeNull();
+    expect(received).toEqual([]);
+    expect(readHeartbeat(heartbeatDir, "work")).toMatchObject({ state: "idle", event: "late-hook-before-turn-end" });
+    expect(log).toHaveBeenCalledWith(
+      "audit late-hook-before-turn-end ignored session=work event=UserPromptSubmit firedAtMs=1048757 turnEndMs=1049910",
+    );
+    // 即応答の 429 と競合して遅着した前ターンの PostToolUse（発火 1_049_800）も同様に無視する。
+    relay("active", "PostToolUse", 1_049_800);
+    expect(hub.actors.get("work")?.processingSince).toBeNull();
+    // 終端より後に発火した継続 hook（task-notification による自動再開。UserPromptSubmit は出ない）は
+    // API エラー後なら即採用する（API エラーは 3 秒窓を武装しない）。
+    nowMs = 1_050_500;
+    relay("active", "PreToolUse", 1_050_400);
+    expect(hub.actors.get("work")?.processingSince).toBe(1050);
+    expect(received).toContainEqual({
+      type: "session_processing", session: "work", state: "active", event: "PreToolUse", atMs: 1_050_400,
+    });
+    relay("done", "Stop", 1_051_000);
+    expect(hub.actors.get("work")?.processingSince).toBeNull();
+
+    // 古さの上限: 終端より 3 秒超前に発火した hook は「遅着」では説明できない（配送遅延は高々数秒）ので
+    // 採用する。queued 発話の UserPromptSubmit が enqueue 時に発火する版でも、生きたターンを idle に
+    // 固定しない。
+    nowMs = 1_056_000;
+    lifecycle!({ kind: "api_error", atMs: 1_055_000 });
+    relay("active", "UserPromptSubmit", 1_049_000); // 終端の 6 秒前に発火
+    expect(hub.actors.get("work")?.processingSince).toBe(1056);
+    relay("done", "Stop", 1_056_500);
+
+    // 中断: 発火時刻の有無に関わらず 3 秒窓は保つ（Esc で abort されたツールの PostToolUse は
+    // マーカーの数百 ms 後に発火し得る）。窓を過ぎれば採用する。
+    nowMs = 1_060_000;
+    relay("active", "UserPromptSubmit", 1_059_900);
+    nowMs = 1_061_050;
+    lifecycle!({ kind: "interrupted", atMs: 1_061_000 });
+    expect(hub.actors.get("work")?.processingSince).toBeNull();
+    expect(hub.actors.get("work")?.lastInterruptDoneMs).toBe(1_061_050);
+    nowMs = 1_061_300;
+    relay("active", "PostToolUse", 1_061_200); // 終端の 200ms 後 → 残響
+    expect(hub.actors.get("work")?.processingSince).toBeNull();
+    nowMs = 1_061_900;
+    relay("active", "PreToolUse", 1_061_800); // 終端の 800ms 後でも窓内 → 残響
+    expect(hub.actors.get("work")?.processingSince).toBeNull();
+    nowMs = 1_064_100;
+    relay("active", "PreToolUse", 1_064_000); // 窓（3 秒）を過ぎた → 採用
+    expect(hub.actors.get("work")?.processingSince).toBe(1064);
+    relay("done", "Stop", 1_064_500);
+
+    // 遅着 Stop: queued 発話の自動 dequeue で前ターンの Stop と新ターンの UserPromptSubmit がほぼ同時に
+    // 発火し、到着順が入れ替わっても現ターンを落とさない（発火時刻を現ターンの開始発火時刻と比べる）。
+    nowMs = 1_070_300;
+    relay("active", "UserPromptSubmit", 1_070_100);
+    expect(hub.actors.get("work")?.turnStartFiredAtMs).toBe(1_070_100);
+    received.length = 0;
+    relay("done", "Stop", 1_070_050); // 前ターンの Stop（開始より前に発火）
+    expect(hub.actors.get("work")?.processingSince).toBe(1070);
+    expect(received).toEqual([]);
+    // 短いターンの正規の Stop（UserPromptSubmit の hub 到着より前に発火し得る）は採用する。
+    relay("done", "Stop", 1_070_150);
+    expect(hub.actors.get("work")?.processingSince).toBeNull();
+    expect(hub.actors.get("work")?.turnStartFiredAtMs).toBeNull();
+  });
+
+  test("終端マーカーより後に発話が transcript に現れていれば、終端より前に発火した UserPromptSubmit も新ターンとして採用する", () => {
+    // queued 発話の UserPromptSubmit が enqueue 時に発火する版への保険: 発火時刻だけでは
+    // 「終わったターンの遅着」と区別できないので、transcript の発話観測（turn_start）を権威にする。
+    let nowMs = 1_000_000;
+    const metadataStore = makeTempStore();
+    metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0 });
+    const heartbeatDir = makeTempDir("hub-turn-start-rescue");
+    let lifecycle: ((event: { kind: "interrupted" | "api_error" | "turn_start"; atMs: number }) => void) | undefined;
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir, metadataStore, timeoutSeconds: 1800,
+      now: () => Math.floor(nowMs / 1000), nowMs: () => nowMs,
+      tailFactory: (_write, _codex, onClaudeTurnLifecycle) => ({ open() { lifecycle = onClaudeTurnLifecycle; }, stop() {} }),
+    });
+    const client = {};
+    hub.registerClient(client, () => {});
+    hub.handleClientMessage(client, JSON.stringify({ type: "conversation_subscribe", session: "work" }));
+    const relay = (state: "active" | "done", event: string, atMs?: number) =>
+      hub.handleRelayMessage({ type: "session_processing", session: "work", state, event, ...(atMs !== undefined ? { atMs } : {}) });
+
+    // ターン N: 発話 → 処理中 → 2 秒後に api error で終端。
+    lifecycle!({ kind: "turn_start", atMs: 1_000_000 });
+    relay("active", "UserPromptSubmit", 1_000_050);
+    nowMs = 1_002_100;
+    lifecycle!({ kind: "api_error", atMs: 1_002_000 });
+    expect(hub.actors.get("work")?.processingSince).toBeNull();
+    // 発話の観測が無いまま、終端より前（1 秒前）に発火した UserPromptSubmit が届く → 遅着として無視。
+    nowMs = 1_002_300;
+    relay("active", "UserPromptSubmit", 1_001_000);
+    expect(hub.actors.get("work")?.processingSince).toBeNull();
+    // 終端の後に新しい発話が transcript に現れた（queued 発話の dequeue）→ 同じ hook でも採用する。
+    lifecycle!({ kind: "turn_start", atMs: 1_002_050 });
+    relay("active", "UserPromptSubmit", 1_001_000);
+    expect(hub.actors.get("work")?.processingSince).toBe(1002);
+    // 継続 hook には発話観測の救済を適用しない（前ターンのツールの遅着は依然として残響）。
+    relay("done", "Stop", 1_002_500);
+    nowMs = 1_003_100;
+    lifecycle!({ kind: "api_error", atMs: 1_003_000 });
+    lifecycle!({ kind: "turn_start", atMs: 1_003_050 });
+    relay("active", "PostToolUse", 1_002_900);
+    expect(hub.actors.get("work")?.processingSince).toBeNull();
+  });
+
+  test("遅着 Stop を無視したとき、Stop hook が直書きした idle の heartbeat を現ターンの active へ戻す", () => {
+    let nowMs = 1_000_000;
+    const metadataStore = makeTempStore();
+    metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0 });
+    const heartbeatDir = makeTempDir("hub-late-stop-heartbeat");
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir, metadataStore, timeoutSeconds: 1800,
+      now: () => Math.floor(nowMs / 1000), nowMs: () => nowMs,
+    });
+    hub.handleRelayMessage({ type: "session_processing", session: "work", state: "active", event: "UserPromptSubmit", atMs: 1_000_000 });
+    expect(readHeartbeat(heartbeatDir, "work")).toMatchObject({ state: "active", sinceMs: 1_000_000 });
+    // 前ターンの Stop hook（発火 999_900）が relay より先に heartbeat を idle で直書きしてから遅着。
+    nowMs = 1_000_400;
+    writeHeartbeat(heartbeatDir, "work", { ts: 1000, state: "idle", event: "Stop" });
+    hub.handleRelayMessage({ type: "session_processing", session: "work", state: "done", event: "Stop", atMs: 999_900 });
+    expect(hub.actors.get("work")?.processingSince).toBe(1000);
+    expect(readHeartbeat(heartbeatDir, "work")).toMatchObject({ state: "active", event: "hub-processing", sinceMs: 1_000_000 });
+    // 別の書込に置き換わっていれば触らない。
+    writeHeartbeat(heartbeatDir, "work", { ts: 1000, state: "active", event: "PreToolUse" });
+    hub.handleRelayMessage({ type: "session_processing", session: "work", state: "done", event: "Stop", atMs: 999_950 });
+    expect(readHeartbeat(heartbeatDir, "work")).toMatchObject({ state: "active", event: "PreToolUse" });
+  });
+
+  test("retire は購読者へ conversation_retired を送り、engine が背景購読の台帳を同期できるようにする", () => {
+    const { hub } = makeHub();
+    const subscriber = {}, bystander = {};
+    const subscriberReceived: unknown[] = [], bystanderReceived: unknown[] = [];
+    hub.registerClient(subscriber, (line) => subscriberReceived.push(decodeHubServerLine(line)));
+    hub.registerClient(bystander, (line) => bystanderReceived.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(subscriber, JSON.stringify({ type: "conversation_subscribe", session: "work", preview: false }));
+    hub.handleClientMessage(bystander, JSON.stringify({ type: "session_retire", session: "work" }));
+    expect(subscriberReceived).toContainEqual({ type: "conversation_retired", session: "work" });
+    expect(bystanderReceived.some((m) => (m as { type?: string }).type === "conversation_retired")).toBe(false);
+    expect(hub.actors.has("work")).toBe(false);
+  });
+
   test("復元後は heartbeat の sinceMs（無ければ復元時刻）以降の中断マーカーだけを採用する", () => {
     const heartbeatDir = makeTempDir("hub-restore-since");
     const metadataStore = makeTempStore();
@@ -1280,6 +1509,39 @@ describe("SessionHub actor", () => {
     expect(readHeartbeat(heartbeatDir, "interrupted")).toMatchObject({ state: "idle", ts: 100 });
     expect(hub.actors.get("resumed")?.processingSince).toBe(100);
     expect(hub.actors.get("no-id")?.processingSince).toBe(100);
+  });
+
+  test("復元時に transcript 末尾が開始以降の API エラー終端なら処理中に戻さず idle へ確定する", () => {
+    const heartbeatDir = makeTempDir("hub-restore-api-error");
+    const transcriptDir = makeTempDir("hub-restore-api-error-jsonl");
+    const metadataStore = makeTempStore();
+    for (const name of ["rate-limited", "resumed-after-limit"]) {
+      metadataStore.put({ name, cwd: `/tmp/${name}`, createdAt: 0, claudeSessionId: `id-${name}` });
+      // 実機 2026-09-07: 制限到達で止まった会話は tick の bump（daemon-agent-alive）で active のまま残っていた。
+      writeHeartbeat(heartbeatDir, name, { ts: 100, state: "active", event: "daemon-agent-alive", sinceMs: 50_000 });
+    }
+    const prompt = (ts: string) => JSON.stringify({ type: "user", timestamp: ts, uuid: `p-${ts}`,
+      message: { role: "user", content: "続けて" } });
+    const apiError = (ts: string) => JSON.stringify({ type: "assistant", timestamp: ts, uuid: `e-${ts}`,
+      message: { model: "<synthetic>", role: "assistant",
+        content: [{ type: "text", text: "You've hit your session limit · resets 2am (Asia/Tokyo)" }] },
+      error: "rate_limit", isApiErrorMessage: true, apiErrorStatus: 429 });
+    const turnDuration = JSON.stringify({ type: "system", subtype: "turn_duration", durationMs: 1,
+      timestamp: "1970-01-01T00:01:00.100Z", uuid: "td" });
+    // 開始 50s 以降に使用量上限で止まったまま（Stop hook 不発）放置された会話。
+    fs.writeFileSync(path.join(transcriptDir, "id-rate-limited.jsonl"),
+      [prompt("1970-01-01T00:00:51.000Z"), apiError("1970-01-01T00:01:00.000Z"), turnDuration].join("\n") + "\n");
+    // 制限解除後に再送信された = 進行中の可能性。復元する。
+    fs.writeFileSync(path.join(transcriptDir, "id-resumed-after-limit.jsonl"),
+      [apiError("1970-01-01T00:01:00.000Z"), prompt("1970-01-01T00:01:10.000Z")].join("\n") + "\n");
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir, metadataStore, timeoutSeconds: 1800, now: () => 100,
+      transcriptPathFor: (meta) => meta.claudeSessionId ? path.join(transcriptDir, `${meta.claudeSessionId}.jsonl`) : null,
+    });
+    hub.restoreFromHeartbeats();
+    expect(hub.actors.has("rate-limited")).toBe(false);
+    expect(readHeartbeat(heartbeatDir, "rate-limited")).toMatchObject({ state: "idle", ts: 100 });
+    expect(hub.actors.get("resumed-after-limit")?.processingSince).toBe(100);
   });
 
   test("復元の中断判定中に hook が heartbeat を更新していたら idle へ倒さず復元する", () => {

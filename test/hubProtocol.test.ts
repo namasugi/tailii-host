@@ -44,6 +44,17 @@ describe("hubProtocol session lifecycle", () => {
       .toEqual({ type: "session_processing", session: "s", state: "done" });
     expect(decodeHubClientLine('{"type":"session_processing","session":"s","state":"active","event":7}'))
       .toEqual({ type: "session_processing", session: "s", state: "active" });
+    // 発火時刻（atMs）は有限数のときだけ通す（旧 hook の省略・不正値は落とす）。
+    expect(decodeHubClientLine('{"type":"session_processing","session":"s","state":"active","event":"PreToolUse","atMs":1700000000000}'))
+      .toEqual({ type: "session_processing", session: "s", state: "active", event: "PreToolUse", atMs: 1_700_000_000_000 });
+    expect(decodeHubClientLine('{"type":"session_processing","session":"s","state":"active","atMs":"now"}'))
+      .toEqual({ type: "session_processing", session: "s", state: "active" });
+  });
+
+  test("conversation_retired（購読消滅通知）を往復し空セッション名を拒否する", () => {
+    const message: HubServerMessage = { type: "conversation_retired", session: "work" };
+    expect(decodeHubServerLine(encodeHubMessage(message))).toEqual(message);
+    expect(decodeHubServerLine('{"type":"conversation_retired","session":""}')).toBeNull();
   });
 });
 

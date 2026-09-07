@@ -123,6 +123,12 @@ export interface HandlerContext {
   processingSessions: Map<string, number>;
   /** 一覧・別画面でも差分同期を続けるフォーカス外会話。 */
   backgroundChatSessions: Set<string>;
+  /**
+   * フォーカス外会話の背景購読を開始する（engine 本体の閉包。LRU 上限・冪等な `conversation_subscribe`・
+   * unwatch 猶予タイマーの取消を 1 箇所に集約する）。handler が台帳へ直接 add して購読を送る経路を
+   * 残すと、上限や冪等性の規則がここと食い違うため、降格はすべてこの閉包を通す。
+   */
+  watchBackgroundSession: (session: string) => void;
   /** Hub 世代内で iOS へ連続配送済みの最後の conversation seq。 */
   lastServerSeq: Map<string, number>;
   /** Codex モデル一覧を取得する共有 App Server。 */
@@ -159,18 +165,27 @@ export async function emitPendingQuestion(ctx: HandlerContext, session: string):
   });
 }
 
+/**
+ * 前面から外れた処理中会話を背景購読へ降格する（`subscribeConversation` の前会話処理と
+ * `session_idle_hint` で共用）。engine 本体の閉包（LRU 上限・冪等購読・猶予タイマー取消を集約）に
+ * 委ねる。呼び手は先に `activeChatSession.name` を更新しておく（閉包は前面会話に対しては何もしない）。
+ */
+export function demoteToBackgroundSubscription(ctx: HandlerContext, session: string): void {
+  ctx.watchBackgroundSession(session);
+}
+
 export function subscribeConversation(ctx: HandlerContext, session: string, newerThanMs?: number): void {
   const previous = ctx.activeChatSession.name;
+  // 前会話の降格より先に前面を更新する（背景購読の閉包は前面会話には何もしないため）。
+  ctx.activeChatSession.name = session;
   if (previous !== null && previous !== session) {
     if (ctx.processingSessions.has(previous)) {
-      ctx.backgroundChatSessions.add(previous);
-      ctx.hubLink.send({ type: "conversation_subscribe", session: previous, preview: false });
+      demoteToBackgroundSubscription(ctx, previous);
     } else {
       ctx.backgroundChatSessions.delete(previous);
       ctx.hubLink.send({ type: "conversation_unsubscribe", session: previous });
     }
   }
-  ctx.activeChatSession.name = session;
   ctx.backgroundChatSessions.delete(session);
   ctx.hubLink.send({ type: "conversation_subscribe", session,
     ...(newerThanMs !== undefined

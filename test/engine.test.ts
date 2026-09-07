@@ -84,6 +84,210 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
+  test("処理中の非前面会話は hook ごとの session_processing(active) で背景購読を再送しない（全履歴 backfill 嵐の根治）", async () => {
+    // 実測 2026-09-07: ツール呼び出しのたびに hub が active を配信し、engine が毎回 conversation_subscribe を
+    // 再送 → Hub は既存購読者の afterSeq 回収（背景中は床値で固定）で全履歴 backfill → 1 会話で毎分 70 回超の
+    // tail 再起動・249 行 × 回数の再送が iOS へ流れていた。
+    const store = makeTempStore();
+    store.put({ name: "bg-work", cwd: "/tmp/bg-work", createdAt: 1, agent: "claude" });
+    const log = vi.fn();
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir: makeTempDir("bg-subscribe-once-hub"),
+      metadataStore: store, timeoutSeconds: 1_800, log,
+    });
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("bg-work\n") : ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner, store), metadataStore: store, hub });
+    await engine.lines.nextOfType("channel_hello");
+
+    // PreToolUse / PostToolUse のたびに hub は active を配信する（同値でも畳まない）。
+    for (let i = 0; i < 3; i += 1) {
+      hub.handleRelayMessage({ type: "session_processing", session: "bg-work", state: "active" });
+      await engine.lines.nextOfType("session_processing_state");
+    }
+    // probe の応答で hub link の送出完了を同期する。
+    engine.writeLine('{"id":"probe1","type":"image_fetch_request","v":2}');
+    await engine.lines.nextOfType("error");
+    const subscribes = log.mock.calls.filter(
+      ([message]) => typeof message === "string" && message.startsWith("audit subscribe session=bg-work"),
+    );
+    expect(subscribes).toHaveLength(1);
+    expect(hub.actors.get("bg-work")?.subscribers.size).toBe(1);
+    await engine.teardown();
+  });
+
+  test("処理中会話からの離脱（session_idle_hint）は背景購読を残す（即時 unsubscribe で engine と Hub が食い違わない）", async () => {
+    const store = makeTempStore();
+    store.put({ name: "work", cwd: "/tmp/work", createdAt: 1, agent: "claude" });
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir: makeTempDir("idle-hint-bg-hub"),
+      metadataStore: store, timeoutSeconds: 1_800,
+    });
+    hub.handleRelayMessage({ type: "session_processing", session: "work", state: "active" });
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("work\n") : ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner, store), metadataStore: store, hub });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine('{"id":"open","name":"work","type":"session_reattach","v":2}');
+    await engine.lines.nextOfType("session_list_response");
+    await engine.lines.nextOfType("session_processing_state");
+    expect(hub.actors.get("work")?.subscribers.size).toBe(1);
+
+    engine.writeLine('{"id":"H1","name":"work","type":"session_idle_hint","v":2}');
+    engine.writeLine('{"id":"probe1","type":"image_fetch_request","v":2}');
+    await engine.lines.nextOfType("error");
+    // 前面購読は背景購読（preview=false）へ降格するだけで、購読自体は残る（処理中ログの同期が続く）。
+    const actor = hub.actors.get("work");
+    expect(actor?.subscribers.size).toBe(1);
+    expect([...(actor?.subscribers.values() ?? [])].every((state) => state.preview === false)).toBe(true);
+    await engine.teardown();
+  });
+
+  test("Hub の retire（kill / demote / reclaim）後は次の処理中通知で背景購読を張り直す", async () => {
+    const store = makeTempStore();
+    store.put({ name: "bg-work", cwd: "/tmp/bg-work", createdAt: 1, agent: "claude" });
+    const log = vi.fn();
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir: makeTempDir("bg-retire-hub"),
+      metadataStore: store, timeoutSeconds: 1_800, log,
+    });
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("bg-work\n") : ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner, store), metadataStore: store, hub });
+    await engine.lines.nextOfType("channel_hello");
+    hub.handleRelayMessage({ type: "session_processing", session: "bg-work", state: "active" });
+    await engine.lines.nextOfType("session_processing_state");
+    engine.writeLine('{"id":"probe1","type":"image_fetch_request","v":2}');
+    await engine.lines.nextOfType("error");
+    expect(hub.actors.get("bg-work")?.subscribers.size).toBe(1);
+
+    // reaper の demote 等と同じ集約点（retireSession）で actor と購読が消える → engine へ conversation_retired。
+    hub.handleClientMessage({}, JSON.stringify({ type: "session_retire", session: "bg-work" }));
+    engine.writeLine('{"id":"probe2","type":"image_fetch_request","v":2}');
+    await engine.lines.nextOfType("error");
+    expect(hub.actors.has("bg-work")).toBe(false);
+
+    // 同名で再び処理中になった（例: 端末側で claude を起動し直した）→ 台帳が同期済みなので再購読する。
+    hub.handleRelayMessage({ type: "session_processing", session: "bg-work", state: "active" });
+    await engine.lines.nextOfType("session_processing_state");
+    engine.writeLine('{"id":"probe3","type":"image_fetch_request","v":2}');
+    await engine.lines.nextOfType("error");
+    const subscribes = log.mock.calls.filter(
+      ([message]) => typeof message === "string" && message.startsWith("audit subscribe session=bg-work"),
+    );
+    expect(subscribes).toHaveLength(2);
+    expect(hub.actors.get("bg-work")?.subscribers.size).toBe(1);
+    await engine.teardown();
+  });
+
+  test("Hub の retire 後、前面会話はその場では張り直さず（heartbeat 蘇生 → tick ごとの retire ループを避ける）、次の処理中通知で 1 回だけ境界付きで張り直す", async () => {
+    const projectsRoot = makeTempDir("retire-active-projects");
+    const cwd = makeTempDir("retire-active-cwd");
+    const dir = path.join(projectsRoot, fs.realpathSync.native(cwd).replaceAll("/", "-"));
+    fs.mkdirSync(dir, { recursive: true });
+    const transcript = path.join(dir, "id-work.jsonl");
+    fs.writeFileSync(transcript, [
+      JSON.stringify({ type: "user", timestamp: "2026-09-07T00:00:00.000Z", uuid: "u1",
+        message: { role: "user", content: "古い発話" } }),
+      JSON.stringify({ type: "assistant", timestamp: "2026-09-07T00:00:01.000Z", uuid: "a1",
+        message: { role: "assistant", content: [{ type: "text", text: "古い応答" }] } }),
+    ].join("\n") + "\n");
+    const store = makeTempStore();
+    store.put({ name: "work", cwd, createdAt: 1, agent: "claude", claudeSessionId: "id-work" });
+    const log = vi.fn();
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("work\n") : ok(""));
+    // 本物の tail factory は harness が組む hub にだけ付く（hub を注入すると tail は無い）。
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store), metadataStore: store, hubLog: log, chatTailProjectsRoot: projectsRoot,
+    });
+    const hub = engine.hub;
+    await engine.lines.nextOfType("channel_hello");
+    // 開く → 履歴（2 行）が前面へ流れる = 最終転送時刻が記録される。
+    engine.writeLine('{"id":"open","name":"work","type":"session_reattach","v":2}');
+    await engine.lines.nextOfType("session_list_response");
+    for (;;) {
+      const line = await engine.lines.nextOfType("chat_output");
+      if (line.includes("pc:history-done")) break;
+    }
+    // 開いたまま retire（agent プロセス死亡等）→ 前面購読は張り直さない（actor も heartbeat も蘇生しない）。
+    hub.handleClientMessage({}, JSON.stringify({ type: "session_retire", session: "work" }));
+    engine.writeLine('{"id":"probe1","type":"image_fetch_request","v":2}');
+    await engine.lines.nextOfType("error");
+    const subscribesFor = (preview: "true" | "false") => log.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.startsWith(`audit subscribe session=work preview=${preview}`));
+    expect(subscribesFor("true")).toHaveLength(1);
+    expect(hub.actors.has("work")).toBe(false);
+
+    // 同名で処理中になった（端末側で claude を起動し直した = hook が動いた）→ 開いたままの前面会話を
+    // 1 回だけ張り直す。Hub 世代内の seq は消えているので最終転送時刻を境界にする（全履歴再生を避ける）。
+    hub.handleRelayMessage({ type: "session_processing", session: "work", state: "active" });
+    await engine.lines.nextOfType("session_processing_state");
+    engine.writeLine('{"id":"probe2","type":"image_fetch_request","v":2}');
+    await engine.lines.nextOfType("error");
+    const foreground = subscribesFor("true");
+    expect(foreground).toHaveLength(2);
+    expect(foreground[1]).toMatch(/newerThanMs=\d+/);
+    expect(hub.actors.get("work")?.subscribers.size).toBe(1);
+    // 以後の処理中通知（hook ごと）では張り直さない（1 回だけ）。
+    hub.handleRelayMessage({ type: "session_processing", session: "work", state: "active" });
+    await engine.lines.nextOfType("session_processing_state");
+    engine.writeLine('{"id":"probe3","type":"image_fetch_request","v":2}');
+    await engine.lines.nextOfType("error");
+    expect(subscribesFor("true")).toHaveLength(2);
+    await engine.teardown();
+  });
+
+  test("処理中会話からの離脱で背景購読を落とさない（done の 2 秒猶予中に開き直して再び処理中にした後・猶予経過後も）", async () => {
+    const store = makeTempStore();
+    store.put({ name: "work", cwd: "/tmp/work", createdAt: 1, agent: "claude" });
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir: makeTempDir("idle-hint-timer-hub"),
+      metadataStore: store, timeoutSeconds: 1_800,
+    });
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("work\n") : ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner, store), metadataStore: store, hub });
+    await engine.lines.nextOfType("channel_hello");
+    // 背景で処理中 → done（unwatch の 2 秒猶予タイマーが立つ）。
+    hub.handleRelayMessage({ type: "session_processing", session: "work", state: "active" });
+    await engine.lines.nextOfType("session_processing_state");
+    hub.handleRelayMessage({ type: "session_processing", session: "work", state: "done" });
+    await engine.lines.nextOfType("session_processing_state");
+    // 猶予中に開く（前面へ）→ 再び処理中 → 離脱（背景購読へ降格）。
+    engine.writeLine('{"id":"open","name":"work","type":"session_reattach","v":2}');
+    await engine.lines.nextOfType("session_list_response");
+    hub.handleRelayMessage({ type: "session_processing", session: "work", state: "active" });
+    await engine.lines.nextOfType("session_processing_state");
+    engine.writeLine('{"id":"H1","name":"work","type":"session_idle_hint","v":2}');
+    engine.writeLine('{"id":"probe1","type":"image_fetch_request","v":2}');
+    await engine.lines.nextOfType("error");
+    expect(hub.actors.get("work")?.subscribers.size).toBe(1);
+    // 猶予（2 秒）を過ぎても購読は残る（離脱の末尾で無条件に unsubscribe していた旧実装の退行防止）。
+    await new Promise((resolve) => setTimeout(resolve, 2_300));
+    expect(hub.actors.get("work")?.subscribers.size).toBe(1);
+    await engine.teardown();
+  }, 10_000);
+
+  test("Hub の retire で処理中の読みモデルも落とし、iOS へ処理完了を通知する", async () => {
+    const store = makeTempStore();
+    store.put({ name: "work", cwd: "/tmp/work", createdAt: 1, agent: "claude" });
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir: makeTempDir("retire-processing-hub"),
+      metadataStore: store, timeoutSeconds: 1_800,
+    });
+    hub.handleRelayMessage({ type: "session_processing", session: "work", state: "active" });
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("work\n") : ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner, store), metadataStore: store, hub });
+    await engine.lines.nextOfType("channel_hello");
+    // 開いている会話（前面購読）が処理中のまま retire（demote: agent プロセス死亡等）される。
+    engine.writeLine('{"id":"open","name":"work","type":"session_reattach","v":2}');
+    await engine.lines.nextOfType("session_list_response");
+    expect(decodeControlMessage(await engine.lines.nextOfType("session_processing_state")))
+      .toEqual({ type: "session_processing_state", v: 2, session: "work", active: true });
+    hub.handleClientMessage({}, JSON.stringify({ type: "session_retire", session: "work" }));
+    // retire は done を broadcast しないが、conversation_retired を受けた engine が処理中を落として通知する。
+    expect(decodeControlMessage(await engine.lines.nextOfType("session_processing_state")))
+      .toEqual({ type: "session_processing_state", v: 2, session: "work", active: false });
+    await engine.teardown();
+  });
+
   test("一覧 watch 有効中だけ非前面会話の pane_preview を iOS へリレーする", async () => {
     const store = makeTempStore();
     store.put({ name: "bg-work", cwd: "/tmp/bg-work", createdAt: 1, agent: "claude" });

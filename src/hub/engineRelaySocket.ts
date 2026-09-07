@@ -18,12 +18,16 @@ export type RemotePendingMessage =
  * - done:   Stop（応答完了）
  * - event:  発火した hook 名（任意）。Hub は UserPromptSubmit だけをターン開始の権威とし、
  *           Pre/PostToolUse は継続（中断直後の遅着は残響として無視）と解釈する。旧 hook は省略。
+ * - atMs:   hook の発火時刻（Unix ms。hook プロセスの開始時刻 = node 起動遅延を含まない, 任意）。
+ *           Hub は transcript のターン終端行の timestamp と比べ、終端より前に発火した hook を
+ *           既に終わったターンの遅着として無視する（late-hook-before-turn-end）。旧 hook は省略。
  */
 export type SessionProcessingMessage = {
   type: "session_processing";
   session: string;
   state: "active" | "done";
   event?: string;
+  atMs?: number;
 };
 
 /**
@@ -129,7 +133,12 @@ function decodeEngineRelayLine(line: string): EngineRelayMessage | null {
         const state = record["state"];
         if (typeof session === "string" && session.length > 0 && (state === "active" || state === "done")) {
           const event = record["event"];
-          return { type: "session_processing", session, state, ...(typeof event === "string" ? { event } : {}) };
+          const atMs = record["atMs"];
+          return {
+            type: "session_processing", session, state,
+            ...(typeof event === "string" ? { event } : {}),
+            ...(typeof atMs === "number" && Number.isFinite(atMs) ? { atMs } : {}),
+          };
         }
         return null;
       }

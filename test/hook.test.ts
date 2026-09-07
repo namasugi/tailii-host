@@ -1025,6 +1025,8 @@ describe("Hook — 待機延長・retry-connect（Req 8.1/8.2/8.3）", () => {
         session: "sess-relay",
         state: "active",
         event: "PreToolUse",
+        // 発火時刻（hook プロセスの開始時刻）。Hub の遅着 hook 判定（late-hook-before-turn-end）に使う。
+        atMs: expect.any(Number),
       });
       const socket = await relay.nextConnection();
       const reader = new SocketLineReader(socket);
@@ -1067,7 +1069,10 @@ describe("Hook — 待機延長・retry-connect（Req 8.1/8.2/8.3）", () => {
         session: "sess-life",
         state: "active",
         event: "UserPromptSubmit",
+        atMs: expect.any(Number),
       });
+      // 発火時刻はプロセス開始時刻（node 起動遅延を含めない）なので、送出時刻より前。
+      expect((JSON.parse(line) as { atMs: number }).atMs).toBeLessThanOrEqual(Date.now());
       expect(exitCode).toBe(0);
       // UserPromptSubmit の stdout はコンテキスト注入されるため必ず無出力。
       expect(stdout).toBe("");
@@ -1099,6 +1104,7 @@ describe("Hook — 待機延長・retry-connect（Req 8.1/8.2/8.3）", () => {
         session: "sess-life",
         state: "done",
         event: "Stop",
+        atMs: expect.any(Number),
       });
       expect(exitCode).toBe(0);
       expect(stdout).toBe("");

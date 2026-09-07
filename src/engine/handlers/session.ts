@@ -15,6 +15,7 @@ import type { SessionInfo } from "../../protocol.js";
 import {
   activateOrTouchSession,
   claimRuntime,
+  demoteToBackgroundSubscription,
   emitPendingQuestion,
   engineDiag,
   sessionInfoFromMeta,
@@ -185,8 +186,8 @@ export const sessionHandlers: HandlerRegistry = {
     if (ctx.activeChatSession.name === message.name) {
       ctx.activeChatSession.name = null;
       if (ctx.processingSessions.has(message.name)) {
-        ctx.backgroundChatSessions.add(message.name);
-        ctx.hubLink.send({ type: "conversation_subscribe", session: message.name, preview: false });
+        // 背景購読へ降格（engine 本体の閉包経由: LRU 上限・冪等購読・猶予タイマー取消を 1 箇所に集約）。
+        demoteToBackgroundSubscription(ctx, message.name);
       } else {
         ctx.hubLink.send({ type: "conversation_unsubscribe", session: message.name });
       }
@@ -204,8 +205,13 @@ export const sessionHandlers: HandlerRegistry = {
         });
       }
     }
-    // focus の有無にかかわらず、指定 session の離脱時刻を Hub に記録する。
-    ctx.hubLink.send({ type: "conversation_unsubscribe", session: message.name });
+    // focus の有無にかかわらず、指定 session の離脱時刻を Hub に記録する。ただし処理中会話を背景
+    // 購読へ降格した直後（または hub_state で処理中と判り watch した直後）は送らない: Hub の
+    // unsubscribe は購読自体を落とすため、engine の backgroundChatSessions と Hub の購読が食い違い、
+    // 次の hook で再購読 → 全履歴 backfill を繰り返す嵐の一因になっていた（2026-09-07）。
+    if (!ctx.backgroundChatSessions.has(message.name)) {
+      ctx.hubLink.send({ type: "conversation_unsubscribe", session: message.name });
+    }
   },
 
   session_title_set: async (message, ctx) => {

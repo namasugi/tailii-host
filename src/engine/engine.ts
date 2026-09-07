@@ -434,6 +434,8 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
   // serverSeq=0 は transcript/rollout の履歴 backfill。完了マーカー前に Hub 世代が
   // 変わった場合は時刻境界を使わず全履歴を再開し、古い未配送行を落とさない。
   const historyBackfillSessions = new Set<string>();
+  /** retire された前面会話。次の処理中通知（claude が実際に動いた証拠）で 1 回だけ前面購読を張り直す。 */
+  const pendingForegroundResubscribe = new Set<string>();
   const backgroundUnwatchTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const unwatchBackgroundSession = (session: string): void => {
     const timer = backgroundUnwatchTimers.get(session);
@@ -449,18 +451,30 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     if (timer !== undefined) clearTimeout(timer);
     backgroundUnwatchTimers.delete(session);
     if (activeChatSession.name === session) return;
-    if (!backgroundChatSessions.has(session) && backgroundChatSessions.size >= 16) {
+    const alreadyWatching = backgroundChatSessions.has(session);
+    if (!alreadyWatching && backgroundChatSessions.size >= 16) {
       const oldest = backgroundChatSessions.values().next().value as string | undefined;
       if (oldest !== undefined) unwatchBackgroundSession(oldest);
     }
     backgroundChatSessions.add(session);
     if (!subscribe) return;
+    // 処理中会話の hook（PreToolUse / PostToolUse）ごとに session_processing(active) が届くが、Hub の
+    // 購読は 1 回で足りる（unwatch 猶予中の再 active も購読は生きている）。購読済みで再送すると Hub は
+    // 「既存購読者の afterSeq 回収」を行い、背景中は afterSeq が床値で止まるため replay buffer を
+    // 外れた途端に全履歴 backfill になる — ツール呼び出しのたびに全履歴が iOS へ再送される嵐
+    // （実測 2026-09-07: 1 会話で毎分 70 回超の tail 再起動、249 行 × 回数の再送）。
+    if (alreadyWatching) return;
+    // Hub 世代内の seq が無い（retire 後の再購読等）場合は、最終転送時刻を境界にして全履歴再生を避ける
+    // （再接続の backfill と同じ規則: 転送遅延ぶん 5 秒重ねる）。
+    const forwardedAtMs = lastForwardedAtMs.get(session);
     hubLink.send({
       type: "conversation_subscribe",
       session,
       ...(newerThanMs !== undefined
         ? { newerThanMs }
-        : lastServerSeq.has(session) ? { afterSeq: lastServerSeq.get(session)! } : {}),
+        : lastServerSeq.has(session)
+          ? { afterSeq: lastServerSeq.get(session)! }
+          : forwardedAtMs !== undefined ? { newerThanMs: Math.max(0, forwardedAtMs - 5_000) } : {}),
       preview: false,
     });
   };
@@ -550,6 +564,19 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
       if (message.state === "active") {
         processingSessions.set(message.session, now);
         watchBackgroundSession(message.session);
+        // retire された前面会話が再び処理中になった（同じ pane で claude が再起動した）→ 前面購読を
+        // 1 回だけ張り直す（境界は最終転送時刻 − 5 秒）。開いたまま無音になるのを防ぐ。
+        if (activeChatSession.name === message.session && pendingForegroundResubscribe.delete(message.session)) {
+          // 履歴 backfill の途中で retire された会話は境界を付けない（切れた履歴を取り直す。
+          // 再接続の requiresFullBackfill と同じ規則）。
+          const forwardedAtMs = historyBackfillSessions.has(message.session)
+            ? undefined : lastForwardedAtMs.get(message.session);
+          hubLink.send({
+            type: "conversation_subscribe", session: message.session,
+            ...(forwardedAtMs !== undefined ? { newerThanMs: Math.max(0, forwardedAtMs - 5_000) } : {}),
+            preview: true,
+          });
+        }
       } else {
         processingSessions.delete(message.session);
         finishWatchingBackgroundSession(message.session);
@@ -689,6 +716,38 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
         catch (error) { process.stderr.write(`[tailii-host engine] pane_preview 書込失敗: ${String(error)}\n`); }
         return;
       }
+      if (message.type === "conversation_retired") {
+        // Hub 側で actor が retire（kill / demote / reclaim）され、この engine の購読も消えた。背景購読の
+        // 台帳から外し、次の session_processing(active) で再購読できるようにする（背景購読は冪等化して
+        // おり、台帳に残ったままだと再送しない）。seq / floor も Hub 世代内の値なので捨てる。
+        const timer = backgroundUnwatchTimers.get(message.session);
+        if (timer !== undefined) clearTimeout(timer);
+        backgroundUnwatchTimers.delete(message.session);
+        backgroundChatSessions.delete(message.session);
+        lastServerSeq.delete(message.session);
+        backgroundReplayFloors.delete(message.session);
+        // historyBackfillSessions は消さない: 履歴 backfill 途中で retire された会話は「次に世代が変わったら
+        // 全履歴を再送する」旗として残す（消すと切れた履歴が二度と配送されない）。
+        // retire は処理完了（done）を broadcast しないため、読みモデルの処理中も自分で落として iOS へ
+        // 通知する（開いている会話の停止ボタン / 一覧の処理中表示が永久に残らないように）。
+        if (processingSessions.delete(message.session)) {
+          try {
+            writer.write({
+              type: "session_processing_state", v: state.negotiatedVersion,
+              session: message.session, active: false,
+            });
+          } catch (error) {
+            process.stderr.write(`[tailii-host engine] session_processing_state 書込失敗: ${String(error)}\n`);
+          }
+        }
+        // 前面会話でも、ここでは購読を張り直さない: 即時の再購読は Hub に actor を作り直し、heartbeat を
+        // 蘇生（chat-open bump）させ、死んだ pane への preview pump / tail を再起動する → 次の tick で
+        // 再び retire（kill / reclaim）→ 再購読… の無限ループになる（tick が retire を設けた理由そのもの）。
+        // 代わりに「次の処理中通知（hook = claude が実際に動いている）で 1 回だけ張り直す」と記録する
+        // （同じ pane で claude が再起動した場合の復帰。死んだ agent は hook を出さないのでループしない）。
+        if (activeChatSession.name === message.session) pendingForegroundResubscribe.add(message.session);
+        return;
+      }
       if (message.type === "conversation_liveness") {
         // live-pill Phase 2: 一覧 watch 中のみ「稼働中ピルを外して一覧を取り直せ」を送る。
         // 前面会話の例外は要らない（チャット面は自身の生存を別経路で知る）。
@@ -770,6 +829,9 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
         backgroundReplayFloors.clear();
         historyBackfillSessions.clear();
       }
+      // 再接続の購読ループ（下）が前面会話も張り直すので、retire 起因の張り直し予約は世代の変化に
+      // 関わらず不要になる（残すと hook の active で二重に購読する）。
+      pendingForegroundResubscribe.clear();
       // hello snapshot を権威状態として扱う。切断中に完了した会話をローカル Map に
       // active のまま残すと、一覧の処理中表示と背景購読が永久に残ってしまう。ただし
       // processingSessions を送らない旧 Hub は「空」ではなく「snapshot 非対応」なので、
@@ -930,6 +992,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           listPreviewWatch,
           processingSessions,
           backgroundChatSessions,
+          watchBackgroundSession,
           lastServerSeq,
           codexAppServer,
           codexTurnController,

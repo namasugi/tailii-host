@@ -22,7 +22,7 @@ import type {
 } from "../protocol.js";
 import {
   HISTORY_DONE_STREAM_ID,
-  findTrailingInterruptMarkerMs,
+  findTrailingTurnEndMarkerMs,
   type ClaudeTurnLifecycleEvent,
 } from "../chat/transcriptTailer.js";
 import type { ChatAgent } from "../chat/chatTailController.js";
@@ -165,6 +165,23 @@ interface SessionActor {
   processingSinceMs: number | null;
   /** 中断マーカーで done にした時刻（Unix ms）。直後に遅着する継続 hook の active を残響として無視する。 */
   lastInterruptDoneMs: number | null;
+  /**
+   * transcript で観測した最新のターン終端行（中断確定 / API エラー）の timestamp（Unix ms）。処理中で
+   * なくても更新する。発火時刻（`atMs`）付きの hook がこれより前（かつ LATE_HOOK_MAX_AGE_MS 以内）に
+   * 発火していれば、既に終わったターンの遅着 hook として無視する（late-hook-before-turn-end）。
+   */
+  lastTurnEndMs: number | null;
+  /**
+   * 現ターンを開始した UserPromptSubmit hook の発火時刻（Unix ms。旧 hook は null）。これより前に
+   * 発火した Stop（前ターンの遅着 done）で現ターンを落とさない（late-stop-before-turn-start）。
+   */
+  turnStartFiredAtMs: number | null;
+  /**
+   * transcript で観測した最新の発話行（type=user の本文行）の timestamp（Unix ms）。終端マーカーより
+   * 後に発話が現れていれば、終端より前に発火した UserPromptSubmit でも新ターン（queued 発話の
+   * dequeue）として採用する（transcript を権威にして生きたターンを idle に固定しない）。
+   */
+  lastTurnStartMs: number | null;
   focusedBy: Set<object>;
   subscribers: Map<object, SubscriberState>;
   nextServerSeq: number;
@@ -198,6 +215,13 @@ interface SessionActor {
 
 /** 中断マーカーで done にした後、継続 hook（Pre/PostToolUse）の遅着 active を残響として無視する窓（ms）。 */
 const LATE_HOOK_AFTER_INTERRUPT_MS = 3_000;
+/**
+ * 発火時刻付き hook を「既に終わったターンの遅着」とみなす古さの上限（ms）。hook は発火から
+ * 100〜300ms（高負荷でも数秒）で relay に届くので、終端マーカーよりそれ以上前に発火した hook が
+ * マーカーの後に届くことは無い。上限を切らないと、queued 発話の UserPromptSubmit が enqueue 時に
+ * 発火する版が現れた場合に、数秒後の dequeue で始まる生きたターンを idle に固定してしまう。
+ */
+const LATE_HOOK_MAX_AGE_MS = 3_000;
 
 /** ターンを始めない継続 hook か（新ターンの権威は UserPromptSubmit のみ）。 */
 function isContinuationHookEvent(event: string | undefined): boolean {
@@ -293,13 +317,16 @@ export class SessionHub {
     }
   }
 
-  /** 復元時の照合用: transcript 末尾の中断マーカー timestamp（claude 会話のみ。不明は null）。 */
+  /**
+   * 復元時の照合用: transcript 末尾のターン終端マーカー（中断確定 / API エラー終端）の timestamp
+   * （claude 会話のみ。不明は null）。
+   */
   private trailingInterruptMarkerMs(session: string): number | null {
     const meta = this.options.metadataStore.get(session);
     if (meta === null || meta.agent === "codex") return null;
     const transcriptPath = (this.options.transcriptPathFor ?? defaultTranscriptPathFor)(meta);
     if (transcriptPath === null) return null;
-    return findTrailingInterruptMarkerMs(transcriptPath);
+    return findTrailingTurnEndMarkerMs(transcriptPath);
   }
 
   /** 永続化済み設問を復元する。App Server の request handle は再起動を越せないため TUI のみ対象。 */
@@ -446,7 +473,7 @@ export class SessionHub {
         ? { id: message.id, questions: message.questions ?? [], answerRoute: "tui" } : null);
       if (message.event === "dismiss") void this.drainChatQueue(message.session, actor);
     } else if (message.type === "session_processing") {
-      if (!this.applyProcessing(message.session, message.state, message.event)) return;
+      if (!this.applyProcessing(message.session, message.state, message.event, message.atMs)) return;
     }
     this.broadcast(message);
   }
@@ -793,7 +820,7 @@ export class SessionHub {
       if (actor?.runtimeClaim?.client === client) actor.runtimeClaim = null;
       return;
     }
-    if (!this.applyProcessing(message.session, message.state, message.event)) return;
+    if (!this.applyProcessing(message.session, message.state, message.event, message.atMs)) return;
     this.broadcast(message);
   }
 
@@ -898,12 +925,19 @@ export class SessionHub {
     actor.uncertainCodexMessages.clear();
     actor.deletedCodexMessageIds.clear();
     actor.pendingQuestion = null;
+    const retiredSubscribers = [...actor.subscribers.keys()];
     actor.focusedBy.clear();
     actor.subscribers.clear();
 
     this.actors.delete(session);
     this.persistPendingQuestions();
     this.persistChatReceipts();
+    // 購読者（engine）へ購読消滅を知らせる（背景購読の台帳同期。一覧向け liveness とは別経路）。
+    // actor を消した後に送る: 受け手が同期的に再購読（前面会話の張り直し）しても、消える直前の
+    // 古い actor に付いて一緒に捨てられないように（新しい actor が生成される）。
+    for (const subscriber of retiredSubscribers) {
+      this.sendTo(subscriber, { type: "conversation_retired", session });
+    }
   }
 
   private subscribe(client: object, session: string, afterSeq: number | undefined,
@@ -1511,6 +1545,7 @@ export class SessionHub {
     let actor = this.actors.get(session);
     if (actor === undefined) {
       actor = { pendingQuestion: null, processingSince: null, processingSinceMs: null, lastInterruptDoneMs: null,
+        lastTurnEndMs: null, turnStartFiredAtMs: null, lastTurnStartMs: null,
         focusedBy: new Set(), subscribers: new Map(),
         nextServerSeq: 1, replayBuffer: [], tail: null, tailRetryTimer: null,
         previewPump: null, backfillTails: new Map(),
@@ -1960,49 +1995,121 @@ export class SessionHub {
    * その dismiss と chat queue の drain）。中断はターン終了なので Stop 後と同じ振る舞い。
    */
   private handleClaudeTurnLifecycle(session: string, actor: SessionActor, event: ClaudeTurnLifecycleEvent): void {
-    if (event.kind !== "interrupted") return;
+    // API エラー終端（使用量上限 429「You've hit your session limit」等）も中断と同じ扱い: Stop hook が
+    // 発火しないままターンが終わるため、hub の処理中状態がそのまま残る（実機 2026-09-07: 制限到達後の
+    // 会話が停止ボタン点灯のまま固まり、開き直しても履歴再生が走らず送信が queued で止まった）。
     if (this.actors.get(session) !== actor) return;
-    if (actor.processingSince === null) return;
     if (this.options.metadataStore.get(session)?.agent === "codex") return;
+    if (event.kind === "turn_start") {
+      // 発話の観測（履歴再生も含めて最新値を保つ）。処理中状態は動かさない（権威は hook）。
+      actor.lastTurnStartMs = Math.max(actor.lastTurnStartMs ?? 0, event.atMs);
+      return;
+    }
+    if (event.kind !== "interrupted" && event.kind !== "api_error") return;
+    if (actor.processingSince === null) {
+      // 処理中でなくても終端の時刻は覚える: 終端より前に発火した hook（別プロセス起動 + relay で遅着する
+      // UserPromptSubmit / Pre・PostToolUse）は既に終わったターンの残響として無視する
+      // （late-hook-before-turn-end）。連続 API エラー（実測 2026-09-06: エラー行の 69ms 後に queued 発話が
+      // 自動 dequeue され 1.15s 後に再びエラー）で 2 本目のマーカーが新ターンの hook より先に届いても、
+      // その hook の発火時刻はマーカーより古いので処理中へ戻さない。
+      actor.lastTurnEndMs = Math.max(actor.lastTurnEndMs ?? 0, event.atMs);
+      return;
+    }
     if (actor.processingSinceMs !== null && event.atMs < actor.processingSinceMs) return;
-    this.options.log?.(`interrupt marker で処理完了を補完 session=${session}`);
-    actor.lastInterruptDoneMs = this.nowMs();
+    this.options.log?.(
+      `${event.kind === "api_error" ? "api-error" : "interrupt"} marker で処理完了を補完 session=${session}`,
+    );
+    actor.lastTurnEndMs = Math.max(actor.lastTurnEndMs ?? 0, event.atMs);
+    // 3 秒の残響窓（発火時刻を持たない旧 hook 向けのフォールバック）は利用者の中断だけに武装する。
+    // API エラー後は queued 発話の自動 dequeue や task-notification の再開が数十 ms で始まり得る
+    // （実測 51〜69ms）ため、窓を張ると生きた新ターンの継続 hook を握り潰して idle へ書き戻す。
+    if (event.kind === "interrupted") actor.lastInterruptDoneMs = this.nowMs();
     this.applyProcessing(session, "done");
     this.broadcast({ type: "session_processing", session, state: "done" });
+  }
+
+  /** 遅着 hook が直書きした active の heartbeat を idle へ戻す（その hook の書込のままのときだけ）。 */
+  private revertLateHookHeartbeat(session: string, event: string | undefined, reason: string): void {
+    // 別の書込（新ターンの UserPromptSubmit 等）に置き換わっていれば触らない（生きたターンの reaper
+    // 保護を剥がさない）。
+    try {
+      const latest = readHeartbeat(this.options.heartbeatDir, session);
+      if (latest !== null && latest.state === "active" && latest.event === event) {
+        writeHeartbeat(this.options.heartbeatDir, session, { ts: this.now(), state: "idle", event: reason });
+      }
+    } catch (error) { this.options.log?.(`heartbeat 書込失敗: ${String(error)}`); }
   }
 
   /**
    * 処理中状態を反映する。戻り値 false は「中断済みターンの残響として無視した」（呼び手は
    * broadcast しない）。`event` は hook 名（relay 由来。codex controller / 旧 hook は undefined）。
    */
-  private applyProcessing(session: string, state: "active" | "done", event?: string): boolean {
+  private applyProcessing(session: string, state: "active" | "done", event?: string, atMs?: number): boolean {
     const actor = this.actor(session);
     if (state === "active") {
+      // 発火時刻付きの hook（hook プロセスの開始時刻。node 起動遅延を含まない）が transcript の最新の
+      // ターン終端（中断確定 / API エラー）より前（かつ配送遅延として説明できる古さ）なら、既に終わった
+      // ターンの遅着 hook。UserPromptSubmit でも同じ（連続 API エラーで自動 dequeue されたターンの hook
+      // が、その終端マーカーより後に届く実測）。処理中（新ターン確定後）に届く古い hook は処理中を
+      // 続けるだけなので無視しない。
+      // UserPromptSubmit は、終端マーカーより後に新しい発話が transcript に現れていれば新ターン
+      // （queued 発話の dequeue）として採用する。発火時刻だけでは「終わったターンの遅着」と
+      // 「enqueue 時に発火して dequeue まで待った発話」を区別できないため、transcript を権威にする。
+      const newerTurnObserved = actor.lastTurnStartMs !== null && actor.lastTurnEndMs !== null &&
+        actor.lastTurnStartMs > actor.lastTurnEndMs;
+      if (actor.processingSince === null && atMs !== undefined && actor.lastTurnEndMs !== null &&
+        atMs < actor.lastTurnEndMs && actor.lastTurnEndMs - atMs <= LATE_HOOK_MAX_AGE_MS &&
+        !(event === "UserPromptSubmit" && newerTurnObserved)) {
+        this.options.log?.(
+          `audit late-hook-before-turn-end ignored session=${session} event=${event} firedAtMs=${atMs} turnEndMs=${actor.lastTurnEndMs}`,
+        );
+        // hook が直書きした active の heartbeat も戻す（reaper の bump 代行で不死化させない）。
+        this.revertLateHookHeartbeat(session, event, "late-hook-before-turn-end");
+        return false;
+      }
       // 中断直後に遅着する継続 hook（Pre/PostToolUse）は中断済みターンの残響。hook は別プロセス
       // 起動+relay で 100〜300ms 遅れるため、マーカー書込より後に届き得る。採用すると Stop hook の
       // 無いターンが永久に処理中へ戻る（停止ボタン再点灯）。新ターンの開始は UserPromptSubmit
-      // だけが権威（中断→即再送信は通常どおり active）。
+      // だけが権威（中断→即再送信は通常どおり active）。発火時刻の有無に関わらず 3 秒窓を保つ
+      // （Esc で abort されたツールの PostToolUse がマーカーの数百 ms 後に発火し得るため、発火時刻で
+      // 窓を狭めない。実機 09-02 の根治を退行させない）。
       if (isContinuationHookEvent(event) && actor.processingSince === null && actor.lastInterruptDoneMs !== null &&
         this.nowMs() - actor.lastInterruptDoneMs < LATE_HOOK_AFTER_INTERRUPT_MS) {
         this.options.log?.(`audit late-hook-after-interrupt ignored session=${session} event=${event}`);
-        // hook が直書きした active の heartbeat も戻す（reaper の bump 代行で不死化させない）。
-        // ただし heartbeat がその hook の書込のままのときだけ。別の書込（新ターンの
-        // UserPromptSubmit 等）に置き換わっていれば触らない（生きたターンの reaper 保護を剥がさない）。
-        try {
-          const latest = readHeartbeat(this.options.heartbeatDir, session);
-          if (latest !== null && latest.state === "active" && latest.event === event) {
-            writeHeartbeat(this.options.heartbeatDir, session, { ts: this.now(), state: "idle", event: "late-hook-after-interrupt" });
-          }
-        } catch (error) { this.options.log?.(`heartbeat 書込失敗: ${String(error)}`); }
+        this.revertLateHookHeartbeat(session, event, "late-hook-after-interrupt");
         return false;
       }
       actor.processingSince = this.now();
       // ターン開始は UserPromptSubmit で確定し、継続 hook では進めない（未確定なら今）。
+      if (event === "UserPromptSubmit") actor.turnStartFiredAtMs = atMs ?? null;
       actor.processingSinceMs =
         event === "UserPromptSubmit" || actor.processingSinceMs === null ? this.nowMs() : actor.processingSinceMs;
     } else {
+      // 前ターンの Stop が新ターンの UserPromptSubmit より後に届いた（queued 発話の自動 dequeue で
+      // 両 hook がほぼ同時に発火し、到着順が入れ替わる）場合、現ターンを落とさない
+      // （late-stop-before-turn-start）。発火時刻は現ターンの UserPromptSubmit の発火時刻と比べる
+      // （hub 到着時刻と比べると、短いターンの正規の Stop が UserPromptSubmit の到着前に発火して
+      // 誤って捨てられる）。
+      if (atMs !== undefined && actor.turnStartFiredAtMs !== null && atMs < actor.turnStartFiredAtMs) {
+        this.options.log?.(
+          `audit late-stop-before-turn-start ignored session=${session} event=${event} firedAtMs=${atMs} turnStartMs=${actor.turnStartFiredAtMs}`,
+        );
+        // Stop hook は relay より先に heartbeat を idle で直書きする（sinceMs も落ちる）。無視した Stop の
+        // 書込のままなら現ターンの active（開始時刻付き）へ戻す（hub 再起動時の復元と reaper 保護を
+        // 失わないように）。別の書込に置き換わっていれば触らない。
+        try {
+          const latest = readHeartbeat(this.options.heartbeatDir, session);
+          if (latest !== null && latest.state === "idle" && latest.event === event) {
+            writeHeartbeat(this.options.heartbeatDir, session, { ts: this.now(), state: "active",
+              event: "hub-processing",
+              ...(actor.processingSinceMs !== null ? { sinceMs: actor.processingSinceMs } : {}) });
+          }
+        } catch (error) { this.options.log?.(`heartbeat 書込失敗: ${String(error)}`); }
+        return false;
+      }
       actor.processingSince = null;
       actor.processingSinceMs = null;
+      actor.turnStartFiredAtMs = null;
     }
     // 一覧 watch 中は処理開始/完了で pump を起動/停止する（前面購読とは独立）。
     this.syncPreview(session, actor);

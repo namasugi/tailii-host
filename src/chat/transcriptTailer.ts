@@ -58,17 +58,41 @@ function isClaudeInterruptMarker(text: string): boolean {
 }
 
 /**
- * transcript 末尾を読み、最後の user 発話（本文のある user ターン）が中断確定マーカーなら
- * その行の timestamp(ms) を返す。マーカーの後に新しい発話があれば null（=ターン進行中の
- * 可能性）。Hub 再起動時の復元で「再起動前に中断済みで放置された会話」を処理中に戻さない
- * ために使う（engine の再接続購読は newerThanMs 付きで履歴マーカーを流さないため、tail
- * 経由では観測できない）。本文の無い user 行（tool_result / 画像のみ / スキル注入）と
- * ローカルコマンド記録（type=system の `/effort` `/rename` 等。ターンを始めない）は発話と
- * みなさない。画像のみの発話で始まった進行中ターンは稀に idle 判定になり得るが、次の hook
+ * API エラー終端行か（claude が transcript に記録する合成 assistant 行。`isApiErrorMessage: true`、
+ * model は `<synthetic>`。実測 2026-09-07: 使用量上限 `error: "rate_limit"` 429「You've hit your
+ * session limit · resets 2am」/ `server_error` 529 Overloaded / `authentication_failed` 403
+ * 「Please run /login」）。この行が書かれた時点でターンは終わっており TUI は入力待ちに戻るが、
+ * Stop hook はこの終わり方では発火しない（利用者の中断と同じ）。
+ * キー名の部分一致で前置フィルタしてから JSON で確認する（毎行の parse 二重化を避ける。値や
+ * 空白の書式には依存させない — 書式変更で判定が無言で失効しないように）。
+ */
+function isApiErrorAssistantLine(text: string): boolean {
+  // 引用符込みでキー名を探す（本文中に同名文字列を含む巨大 tool_result 行で parse を走らせない）。
+  if (!text.includes('"isApiErrorMessage"')) return false;
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (typeof parsed !== "object" || parsed === null) return false;
+    const record = parsed as Record<string, unknown>;
+    return record["type"] === "assistant" && record["isApiErrorMessage"] === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * transcript 末尾を読み、最後のターン記録が「ターン終端マーカー」ならその行の timestamp(ms) を
+ * 返す。終端マーカー = 利用者の中断確定（user 行）/ API エラー終端（`isApiErrorMessage` の
+ * assistant 行）。マーカーの後に新しい発話（本文のある user ターン）があれば null（=ターン進行中
+ * の可能性）。Hub 再起動時の復元で「再起動前に中断済み / 使用量上限で止まったまま放置された会話」
+ * を処理中に戻さないために使う（engine の再接続購読は newerThanMs 付きで履歴マーカーを流さない
+ * ため、tail 経由では観測できない）。本文の無い user 行（tool_result / 画像のみ / スキル注入）と
+ * ローカルコマンド記録（`/effort` `/rename` `/model` 等。type=system の旧形も、現行の type=user
+ * `<command-name>` 形も。ターンを始めない）、isMeta の注記（`[Image: …]` 等）、AskUserQuestion の回答
+ * （tool_result 由来）は発話とみなさない（`userLineKind`）。画像のみの発話で始まった進行中ターンは稀に idle 判定になり得るが、次の hook
  * （PreToolUse 等）の active で数秒後に自己修復する。末尾 tailBytes だけを読むので、それより
  * 長い最終行は解釈できず null（=処理中のまま）に倒れる。
  */
-export function findTrailingInterruptMarkerMs(transcriptPath: string, tailBytes = 256 * 1024): number | null {
+export function findTrailingTurnEndMarkerMs(transcriptPath: string, tailBytes = 256 * 1024): number | null {
   let fd: number;
   try {
     fd = fs.openSync(transcriptPath, "r");
@@ -84,16 +108,27 @@ export function findTrailingInterruptMarkerMs(transcriptPath: string, tailBytes 
     const read = fs.readSync(fd, buffer, 0, buffer.length, readStart);
     const lines = buffer.subarray(0, read).toString("utf8").split("\n");
     if (start > 0) lines.shift(); // 途中から読んだ先頭の欠け行（または境界の空要素）を捨てる。
-    let last: { interrupt: boolean; atMs: number } | null = null;
+    let last: { turnEnd: boolean; atMs: number } | null = null;
     for (const raw of lines) {
       const line = raw.replaceAll("\r", "");
       if (!line) continue;
       if (isSystemRecordLine(line)) continue;
+      if (isApiErrorAssistantLine(line)) {
+        // timestamp 不明の終端行は判定材料にしない（直前の有効な中断マーカーを null で潰さない）。
+        const atMs = lineTimestampMs(Buffer.from(line, "utf8"));
+        if (Number.isFinite(atMs)) last = { turnEnd: true, atMs };
+        continue;
+      }
       const turn = extractTurn(line);
       if (turn === null || turn.role !== "user" || turn.text.length === 0) continue;
-      last = { interrupt: isClaudeInterruptMarker(turn.text), atMs: lineTimestampMs(Buffer.from(line, "utf8")) };
+      // 発話でない user 形の記録（isMeta 注記・ローカルコマンド記録・tool_result 由来の本文）はターンを
+      // 始めないので、直前の終端マーカーを隠さない。attachment（吸収された queued 発話）は従来どおり
+      // 進行中の証拠として数える。
+      const kind = userLineKind(line);
+      if (kind === "meta" || kind === "local-command" || kind === "tool-result") continue;
+      last = { turnEnd: isClaudeInterruptMarker(turn.text), atMs: lineTimestampMs(Buffer.from(line, "utf8")) };
     }
-    if (last === null || !last.interrupt || !Number.isFinite(last.atMs)) return null;
+    if (last === null || !last.turnEnd || !Number.isFinite(last.atMs)) return null;
     return last.atMs;
   } catch {
     return null;
@@ -106,14 +141,24 @@ export function findTrailingInterruptMarkerMs(transcriptPath: string, tailBytes 
   }
 }
 
+/** 旧名（中断マーカーのみ）の互換エイリアス。判定は終端マーカー全般（中断 + API エラー）へ広がっている。 */
+export const findTrailingInterruptMarkerMs = findTrailingTurnEndMarkerMs;
+
 /**
- * transcript 由来の claude ターン権威ライフサイクル。Claude Code の Stop hook は利用者の中断では
- * 発火しないため、hook だけを見ている hub の処理中状態がターン終了後も残る。中断マーカーを
- * timestamp 付きで観測し、hub が「処理開始より後のマーカー」だけを処理完了へ写像する
- * （codex の `CodexTurnLifecycleEvent` と同型の副チャネル）。
+ * transcript 由来の claude ターン権威ライフサイクル。Claude Code の Stop hook は利用者の中断と
+ * API エラー終端（使用量上限 429 等）では発火しないため、hook だけを見ている hub の処理中状態が
+ * ターン終了後も残る。終端マーカーを timestamp 付きで観測し、hub が「処理開始より後のマーカー」
+ * だけを処理完了へ写像する（codex の `CodexTurnLifecycleEvent` と同型の副チャネル）。
  */
 export interface ClaudeTurnLifecycleEvent {
-  kind: "interrupted";
+  /**
+   * `interrupted` = 利用者の中断確定 user 行 / `api_error` = `isApiErrorMessage` の合成 assistant 行 /
+   * `turn_start` = 本物の user 発話行（type=user で text 本文があり、isMeta 注記・ローカルコマンド記録
+   * `<command-name>` 等・tool_result 由来・attachment・system 記録を除く。`userLineKind`）。
+   * `turn_start` は「終端マーカーより後に新しい発話が transcript に現れたか」の観測用で、hub の
+   * 処理中状態を直接は動かさない（権威は hook）。
+   */
+  kind: "interrupted" | "api_error" | "turn_start";
   /** transcript 行の timestamp（Unix ms）。履歴再生で流れる過去ターンのマーカーを除外する根拠。 */
   atMs: number;
 }
@@ -375,11 +420,79 @@ function lineTimestampMs(line: Buffer): number {
 
 /** type=system の記録行か（ローカルコマンド記録など。extractTurn は表示用に user 扱いへ写す）。 */
 function isSystemRecordLine(line: string): boolean {
+  return rawRecordType(line) === "system";
+}
+
+/**
+ * user 形の記録の種別。ターン境界の判定（発話の観測 / 末尾の終端判定）で「本物の発話」だけを
+ * 数えるために使う。実 transcript（2.1.26x）では type=user の行に発話以外が混ざる:
+ * - `isMeta`: 画像注記 `[Image: …]`・`<local-command-caveat>`・エージェント継続プロンプト
+ * - ローカルコマンド記録: `<command-name>/model</command-name>` / `<local-command-stdout>`（type=system
+ *   だった時期もあるが現行は type=user）
+ * - tool_result のみ（AskUserQuestion の回答は toolUseResult から本文化されるが発話ではない）
+ * - `attachment`（ターン途中で吸収された queued 発話）
+ */
+type UserLineKind = "utterance" | "attachment" | "meta" | "local-command" | "tool-result" | "other";
+
+/**
+ * ローカルコマンド記録の本文先頭。`<command-name>` 先頭の形が `/model` `/effort` 等のローカル
+ * コマンド（ターンを始めない）。`<command-message>` 先頭の形はプロンプト展開系のスラッシュコマンド
+ * （`/hq:brief` 等 = 本物のターン開始）で、実 transcript 169 本の観測ではタグ順がこの区別に対応
+ * している（2026-09-07）。順序の仮定が崩れた版が出たら `<command-name>` の中身で判定に変える。
+ */
+const LOCAL_COMMAND_BODY_PREFIXES = ["<command-name>", "<local-command-stdout>", "<local-command-caveat>"];
+/**
+ * `isMeta: true` の user 行のうち「注記」（ターンを始めない）の本文先頭。isMeta は一律に注記では
+ * なく、cross-session の起こし（`Another Claude session sent a message:`）や監視系の自動再開
+ * プロンプトも isMeta で書かれ、これらはターンを始める本物の発話（実 transcript で確認）。
+ */
+const META_ANNOTATION_BODY_PREFIXES = [
+  "[Image:", "<local-command-caveat>", "Base directory for this skill:", "Your tool call was malformed",
+];
+
+function userLineKind(line: string): UserLineKind {
+  try {
+    const parsed = JSON.parse(line) as unknown;
+    if (typeof parsed !== "object" || parsed === null) return "other";
+    const record = parsed as Record<string, unknown>;
+    if (record["type"] === "attachment") return "attachment";
+    if (record["type"] !== "user") return "other";
+    const message = record["message"];
+    if (typeof message !== "object" || message === null) return "other";
+    const content = (message as Record<string, unknown>)["content"];
+    let body = "";
+    if (typeof content === "string") {
+      body = content;
+    } else if (Array.isArray(content)) {
+      body = content
+        .map((block) => (typeof block === "object" && block !== null &&
+          (block as Record<string, unknown>)["type"] === "text" &&
+          typeof (block as Record<string, unknown>)["text"] === "string"
+          ? ((block as Record<string, unknown>)["text"] as string) : ""))
+        .join("");
+    }
+    const trimmed = body.trim();
+    if (trimmed.length === 0) return "tool-result";
+    if (record["isMeta"] === true) {
+      // スキル本文の注入（sourceToolUseID 付き）と既知の注記だけを「注記」にする。それ以外の isMeta
+      // （cross-session の起こし・自動再開プロンプト）はターンを始める発話として扱う。
+      if (typeof record["sourceToolUseID"] === "string") return "meta";
+      if (META_ANNOTATION_BODY_PREFIXES.some((prefix) => trimmed.startsWith(prefix))) return "meta";
+    }
+    if (LOCAL_COMMAND_BODY_PREFIXES.some((prefix) => trimmed.startsWith(prefix))) return "local-command";
+    return "utterance";
+  } catch {
+    return "other";
+  }
+}
+
+/** JSONL 記録の生の `type`（user / assistant / attachment / system …）。解釈不能は null。 */
+function rawRecordType(line: string): string | null {
   try {
     const parsed = JSON.parse(line) as { type?: unknown };
-    return parsed.type === "system";
+    return typeof parsed.type === "string" ? parsed.type : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -387,15 +500,33 @@ function isSystemRecordLine(line: string): boolean {
 function* emitLine(line: Buffer, state: TailState): Generator<ControlMessage, void, void> {
   const text = line.toString("utf8").replaceAll("\r", "");
   if (!text) return;
+  // API エラー終端（使用量上限 429 / 529 / 認証失敗）: 中断と同じくターン終了の権威。表示用の
+  // 行解釈（extractTurn）とは独立に判定する（表示側で落とされてもターン終了は見逃さない）。
+  // 実機 2026-09-07: 「You've hit your session limit」で止まった会話が hub では処理中のまま残り、
+  // 停止ボタン点灯・背景購読の継続（開き直しても履歴再生が走らず host 経路が配線されない）・
+  // reaper の計時停止を招いていた。
+  if (state.onLifecycle !== null && isApiErrorAssistantLine(text)) {
+    const atMs = lineTimestampMs(line);
+    if (Number.isFinite(atMs)) state.onLifecycle({ kind: "api_error", atMs });
+  }
   const turn = extractTurn(text, state.noticeCtx);
   if (turn === null) return;
 
   // 中断確定マーカー: ターン終了の権威（Stop hook は中断で発火しない）。表示用の chat_output
   // とは別に、行の timestamp 付きで観測者へ通知する。timestamp 不明行は履歴/ライブを区別
   // できないため通知しない（誤って進行中ターンを終了扱いにしない側へ倒す）。
-  if (state.onLifecycle !== null && turn.role === "user" && isClaudeInterruptMarker(turn.text)) {
+  if (state.onLifecycle !== null && turn.role === "user" && turn.text.length > 0) {
     const atMs = lineTimestampMs(line);
-    if (Number.isFinite(atMs)) state.onLifecycle({ kind: "interrupted", atMs });
+    if (Number.isFinite(atMs)) {
+      if (isClaudeInterruptMarker(turn.text)) {
+        state.onLifecycle({ kind: "interrupted", atMs });
+      } else if (userLineKind(text) === "utterance") {
+        // 新しい発話の観測（本物の発話だけ。queued_command attachment はターン途中の吸収、isMeta 注記・
+        // ローカルコマンド記録・tool_result はターンを始めない）。hub は「終端マーカーより後に発話が
+        // 現れた」証拠として、遅着した UserPromptSubmit を捨てるかの判断に使う。
+        state.onLifecycle({ kind: "turn_start", atMs });
+      }
+    }
   }
 
   for (const prompt of turn.questionPrompts) {

@@ -107,12 +107,16 @@ export interface EngineHarness {
   /** input を EOF にして engine の完了を待つ（Swift 版 teardown と対）。 */
   teardown(): Promise<void>;
   done: Promise<void>;
+  /** engine が接続している Session Hub（注入した hub、または harness が組んだ hub）。 */
+  hub: SessionHub;
 }
 
 export function startEngine(
   options: Omit<RunEngineOptions, "input" | "output"> & {
     planUsage?: RunEngineOptions["planUsage"];
     hub?: SessionHub;
+    /** harness が hub を組むときの log（`audit …` 行の観測用）。注入 hub には適用しない。 */
+    hubLog?: (message: string) => void;
     /** Session Hub の本物 tail factory を組むテスト用 projects root。 */
     chatTailProjectsRoot?: string;
   },
@@ -123,7 +127,7 @@ export function startEngine(
   const rl = readline.createInterface({ input: output, crlfDelay: Number.POSITIVE_INFINITY });
   rl.on("line", (line) => lines.push(line));
 
-  const { chatTailProjectsRoot, hub: injectedHub, ...engineOptions } = options;
+  const { chatTailProjectsRoot, hub: injectedHub, hubLog, ...engineOptions } = options;
   const callbackWriter = (write: (message: ControlMessage) => void): LineWriter => {
     const stream = new PassThrough();
     const reader = readline.createInterface({ input: stream, crlfDelay: Number.POSITIVE_INFINITY });
@@ -135,6 +139,7 @@ export function startEngine(
     heartbeatDir: options.heartbeatDir ?? makeTempDir("hub-heartbeat"),
     metadataStore: options.metadataStore ?? makeTempStore(),
     timeoutSeconds: 1800,
+    ...(hubLog !== undefined ? { log: hubLog } : {}),
     questionInjector: (answers, session) => injectQuestionAnswers(answers, session, options.sessionManager),
     ...(options.codexTurnController !== undefined && options.codexTurnController !== null ? {
       codexAppServerFactory: () => ({ openThread: async () => { throw new Error("unused test app server"); } }),
@@ -177,6 +182,7 @@ export function startEngine(
     writeLine: (line) => input.write(line + "\n"),
     lines,
     done,
+    hub,
     teardown: async () => {
       input.end();
       await done.catch(() => {});

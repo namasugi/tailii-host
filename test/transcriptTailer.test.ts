@@ -13,6 +13,7 @@ import {
   MODEL_STREAM_ID,
   TranscriptTailer,
   findTrailingInterruptMarkerMs,
+  findTrailingTurnEndMarkerMs,
   questionsFromToolInput,
 } from "../src/chat/transcriptTailer.js";
 import { makeTempDir } from "./helpers.js";
@@ -74,9 +75,139 @@ describe("TranscriptTailer", () => {
     expect(events).toEqual([
       { kind: "interrupted", atMs: Date.parse("2026-09-02T03:45:40.331Z") },
       { kind: "interrupted", atMs: Date.parse("2026-09-02T03:46:00.000Z") },
+      // 本文のある通常の user 発話は「発話の観測」として流れる（引用文は中断マーカーではない）。
+      { kind: "turn_start", atMs: Date.parse("2026-09-02T03:47:00.000Z") },
     ]);
     // 表示用の chat_output は従来どおり流れる（iOS 側の「停止中」解除権威）。
     expect(messages.filter((m) => m.type === "chat_output" && m.role === "user")).toHaveLength(4);
+  });
+
+  test("API エラー終端行（isApiErrorMessage の合成 assistant 行）も timestamp 付き lifecycle として通知する", async () => {
+    // 実測 2026-09-06/07: 使用量上限（rate_limit 429）/ 過負荷（server_error 529）は model "<synthetic>"
+    // の assistant 行として記録され、その時点でターンは終わる（Stop hook は発火しない）。
+    const apiError = (ts: string | null, text: string, error: string) => JSON.stringify({
+      type: "assistant", ...(ts === null ? {} : { timestamp: ts }), uuid: `e-${error}-${ts ?? "none"}`,
+      message: { model: "<synthetic>", role: "assistant", stop_reason: "stop_sequence",
+        content: [{ type: "text", text }] },
+      error, isApiErrorMessage: true, apiErrorStatus: error === "rate_limit" ? 429 : 529,
+    });
+    const p = writeTranscript([
+      JSON.stringify({ type: "user", timestamp: "2026-09-06T15:35:35.000Z", uuid: "u1",
+        message: { role: "user", content: "続けて" } }),
+      // ターン途中で吸収された queued 発話（attachment）とローカルコマンド記録（system）は発話の
+      // 観測（turn_start）にしない。tool_result だけの user 行も本文が無いので対象外。
+      JSON.stringify({ type: "attachment", timestamp: "2026-09-06T15:40:00.000Z", uuid: "q1",
+        attachment: { type: "queued_command", prompt: "吸収された発話" } }),
+      JSON.stringify({ type: "system", subtype: "local_command", timestamp: "2026-09-06T15:41:00.000Z", uuid: "lc",
+        content: "<command-name>/effort</command-name>" }),
+      JSON.stringify({ type: "user", timestamp: "2026-09-06T15:42:00.000Z", uuid: "tr",
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: "x" }] } }),
+      // 実 transcript（2.1.26x）で type=user として現れる「発話でない行」も turn_start にしない:
+      // isMeta の画像注記、ローカルコマンド記録 3 形（command-name / stdout / caveat）、AskUserQuestion の
+      // 回答（tool_result + toolUseResult）。これらは claude 停止中にも書かれる（/model 等）ため、発話と
+      // 数えると終端後の遅着 UserPromptSubmit を誤って採用する。
+      JSON.stringify({ type: "user", isMeta: true, timestamp: "2026-09-06T15:43:00.000Z", uuid: "img",
+        message: { role: "user", content: "[Image: original 944x2048, displayed at 922x2000.]" } }),
+      JSON.stringify({ type: "user", timestamp: "2026-09-06T15:44:00.000Z", uuid: "cmd",
+        message: { role: "user", content: "<command-name>/model</command-name>\n<command-message>model</command-message>" } }),
+      JSON.stringify({ type: "user", timestamp: "2026-09-06T15:44:01.000Z", uuid: "out",
+        message: { role: "user", content: "<local-command-stdout>Set model to opus</local-command-stdout>" } }),
+      JSON.stringify({ type: "user", isMeta: true, timestamp: "2026-09-06T15:44:02.000Z", uuid: "cav",
+        message: { role: "user", content: "<local-command-caveat>Caveat: …</local-command-caveat>" } }),
+      JSON.stringify({ type: "user", timestamp: "2026-09-06T15:45:00.000Z", uuid: "ans",
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "q", content: "answered" }] },
+        toolUseResult: { questions: [{ question: "続ける?" }], answers: { "続ける?": "はい" } } }),
+      // isMeta でも本物の発話は turn_start にする: cross-session の起こし・監視系の自動再開プロンプト。
+      JSON.stringify({ type: "user", isMeta: true, timestamp: "2026-09-06T15:46:00.000Z", uuid: "wake",
+        message: { role: "user", content: "Another Claude session sent a message:\n<cross-session-message from=\"peer\">進めて</cross-session-message>" } }),
+      JSON.stringify({ type: "user", isMeta: true, timestamp: "2026-09-06T15:47:00.000Z", uuid: "cont",
+        message: { role: "user", content: "Check whether the briefing agent finished; if so, continue." } }),
+      apiError("2026-09-06T15:55:37.951Z", "You've hit your session limit · resets 2am (Asia/Tokyo)", "rate_limit"),
+      // timestamp 不明行は履歴/ライブを区別できないため通知しない。
+      apiError(null, "API Error: 529 Overloaded", "server_error"),
+      // 通常の assistant 行（同じ文言でも isApiErrorMessage 無し）は終端ではない。
+      JSON.stringify({ type: "assistant", timestamp: "2026-09-06T15:56:00.000Z", uuid: "a1",
+        message: { role: "assistant", content: [{ type: "text", text: "You've hit your session limit" }] } }),
+      apiError("2026-09-06T15:57:00.000Z", "API Error: 529 Overloaded", "server_error"),
+    ]);
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
+    const events: unknown[] = [];
+    tailer.setTurnLifecycleObserver((event) => events.push(event));
+    const messages = await collect(tailer.streamTranscript(p));
+    expect(events).toEqual([
+      { kind: "turn_start", atMs: Date.parse("2026-09-06T15:35:35.000Z") },
+      { kind: "turn_start", atMs: Date.parse("2026-09-06T15:46:00.000Z") },
+      { kind: "turn_start", atMs: Date.parse("2026-09-06T15:47:00.000Z") },
+      { kind: "api_error", atMs: Date.parse("2026-09-06T15:55:37.951Z") },
+      { kind: "api_error", atMs: Date.parse("2026-09-06T15:57:00.000Z") },
+    ]);
+    // 表示用の chat_output は従来どおり流れる（エラー文言はチャットに出す）。
+    expect(messages).toContainEqual({
+      type: "chat_output", v: 1, streamId: "e-rate_limit-2026-09-06T15:55:37.951Z", role: "assistant",
+      text: "You've hit your session limit · resets 2am (Asia/Tokyo)", eof: true,
+    });
+  });
+
+  test("findTrailingTurnEndMarkerMs は末尾が API エラー終端でも timestamp を返し、後続の発話があれば null", () => {
+    const prompt = (ts: string) => JSON.stringify({ type: "user", timestamp: ts, uuid: `p-${ts}`,
+      message: { role: "user", content: "続けて" } });
+    const apiError = (ts: string) => JSON.stringify({ type: "assistant", timestamp: ts, uuid: `e-${ts}`,
+      message: { model: "<synthetic>", role: "assistant",
+        content: [{ type: "text", text: "You've hit your session limit · resets 2am (Asia/Tokyo)" }] },
+      error: "rate_limit", isApiErrorMessage: true, apiErrorStatus: 429 });
+    // 実機 2026-09-06 の並び: 終端行の前後に attachment / turn_duration(system) / file-history-snapshot。
+    const reminder = JSON.stringify({ type: "attachment", timestamp: "2026-09-06T16:02:01.755Z", uuid: "r",
+      attachment: { type: "total_tokens_reminder", text: "<total_tokens>1</total_tokens>" } });
+    const turnDuration = JSON.stringify({ type: "system", subtype: "turn_duration", durationMs: 503792,
+      timestamp: "2026-09-06T16:02:02.762Z", uuid: "td" });
+    const snapshot = JSON.stringify({ type: "file-history-snapshot", messageId: "x", snapshot: {}, isSnapshotUpdate: false });
+    const at = Date.parse("2026-09-06T16:02:02.760Z");
+    expect(findTrailingTurnEndMarkerMs(writeTranscript([
+      prompt("2026-09-06T15:53:39.000Z"), reminder, apiError("2026-09-06T16:02:02.760Z"), turnDuration, snapshot,
+    ]))).toBe(at);
+    // 制限解除後の再送信（新しい発話）があれば進行中の可能性 → null。
+    expect(findTrailingTurnEndMarkerMs(writeTranscript([
+      apiError("2026-09-06T16:02:02.760Z"), prompt("2026-09-06T17:07:29.004Z"),
+    ]))).toBeNull();
+    // 中断マーカーと同じく timestamp 無しは null。
+    expect(findTrailingTurnEndMarkerMs(writeTranscript([
+      JSON.stringify({ type: "assistant", uuid: "n", isApiErrorMessage: true, error: "rate_limit",
+        message: { role: "assistant", content: [{ type: "text", text: "x" }] } }),
+    ]))).toBeNull();
+    // 終端の後に「発話でない user 形の記録」（ローカルコマンド記録・isMeta 注記・設問回答）が続いても
+    // 終端は隠れない（claude 停止中に /model を叩いた会話を hub 再起動で処理中に戻さない）。
+    expect(findTrailingTurnEndMarkerMs(writeTranscript([
+      apiError("2026-09-06T16:02:02.760Z"),
+      JSON.stringify({ type: "user", timestamp: "2026-09-06T16:03:00.000Z", uuid: "cmd",
+        message: { role: "user", content: "<command-name>/model</command-name>" } }),
+      JSON.stringify({ type: "user", timestamp: "2026-09-06T16:03:00.100Z", uuid: "out",
+        message: { role: "user", content: "<local-command-stdout>Set model</local-command-stdout>" } }),
+      JSON.stringify({ type: "user", isMeta: true, timestamp: "2026-09-06T16:03:01.000Z", uuid: "img",
+        message: { role: "user", content: "[Image: original 10x10]" } }),
+      JSON.stringify({ type: "user", timestamp: "2026-09-06T16:03:02.000Z", uuid: "ans",
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "q", content: "ok" }] },
+        toolUseResult: { questions: [{ question: "q" }], answers: { q: "はい" } } }),
+    ]))).toBe(at);
+    // isMeta でも cross-session の起こしは発話（ターン進行中の可能性）→ 終端を隠す。
+    expect(findTrailingTurnEndMarkerMs(writeTranscript([
+      apiError("2026-09-06T16:02:02.760Z"),
+      JSON.stringify({ type: "user", isMeta: true, timestamp: "2026-09-06T16:05:00.000Z", uuid: "wake",
+        message: { role: "user", content: "Another Claude session sent a message:\n<cross-session-message from=\"peer\">進めて</cross-session-message>" } }),
+    ]))).toBeNull();
+    // timestamp 無しの api-error 行は判定材料にせず、直前の有効な中断マーカーを潰さない。
+    const marker = JSON.stringify({ type: "user", timestamp: "2026-09-06T16:00:00.000Z", uuid: "m",
+      message: { role: "user", content: "[Request interrupted by user]" } });
+    expect(findTrailingTurnEndMarkerMs(writeTranscript([
+      marker,
+      JSON.stringify({ type: "assistant", uuid: "n2", isApiErrorMessage: true, error: "rate_limit",
+        message: { role: "assistant", content: [{ type: "text", text: "x" }] } }),
+    ]))).toBe(Date.parse("2026-09-06T16:00:00.000Z"));
+    // 書式（空白）に依存しない前置フィルタ: `"isApiErrorMessage": true` でも終端として拾う。
+    expect(findTrailingTurnEndMarkerMs(writeTranscript([
+      '{"type":"assistant","timestamp":"2026-09-06T16:02:02.760Z","uuid":"sp","isApiErrorMessage": true,"error":"rate_limit","message":{"role":"assistant","content":[{"type":"text","text":"x"}]}}',
+    ]))).toBe(at);
+    // 旧名エイリアスも同じ判定（中断 + API エラー）。
+    expect(findTrailingInterruptMarkerMs(writeTranscript([apiError("2026-09-06T16:02:02.760Z")]))).toBe(at);
   });
 
   test("newerThanMs より古い中断マーカーは lifecycle にも流れない（再接続 backfill の限界）", async () => {

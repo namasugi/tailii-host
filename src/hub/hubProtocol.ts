@@ -66,6 +66,13 @@ export type HubServerMessage =
    * 誕生イベントは出さない割り切りのため `alive` は常に false。
    */
   | { type: "conversation_liveness"; session: string; alive: false }
+  /**
+   * 購読消滅の通知（hub→engine）。retireSession（kill / demote / reclaim）で actor と購読が消えた
+   * ことを、その会話の購読者だけへ送る。engine は背景購読の台帳（backgroundChatSessions）から外し、
+   * 次の処理中通知で再購読できるようにする（背景購読は冪等化されており再送しないため）。
+   * 一覧向けの `conversation_liveness`（watcher 限定）とは別経路。
+   */
+  | { type: "conversation_retired"; session: string }
   | { type: "question_answer_result"; id: string; status: "accepted" | "already_resolved" | "unknown" }
   | { type: "input_claim_result"; id: string; status: "granted" | "duplicate" }
   | { type: "codex_turn_result"; id: string; status: "started" | "duplicate" | "failed"; error?: string }
@@ -312,6 +319,12 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
       ? { type: "conversation_liveness", session, alive: false }
       : null;
   }
+  if (record["type"] === "conversation_retired") {
+    const session = record["session"];
+    return typeof session === "string" && session.length > 0
+      ? { type: "conversation_retired", session }
+      : null;
+  }
   if (record["type"] === "conversation_event" || record["type"] === "conversation_pane_preview" ||
     record["type"] === "conversation_mode") {
     const session = record["session"];
@@ -389,9 +402,14 @@ function decodeProcessing(record: Record<string, unknown>): SessionProcessingMes
   const session = record["session"];
   const state = record["state"];
   const event = record["event"];
+  const atMs = record["atMs"];
   return record["type"] === "session_processing" && typeof session === "string" && session.length > 0 &&
     (state === "active" || state === "done")
-    ? { type: "session_processing", session, state, ...(typeof event === "string" ? { event } : {}) }
+    ? {
+      type: "session_processing", session, state,
+      ...(typeof event === "string" ? { event } : {}),
+      ...(typeof atMs === "number" && Number.isFinite(atMs) ? { atMs } : {}),
+    }
     : null;
 }
 
