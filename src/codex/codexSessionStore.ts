@@ -383,9 +383,10 @@ function normalizeSnippet(raw: string, maxLength: number): string {
 /**
  * rollout 末尾から最後の user/agent メッセージ本文を後方スキャンで読む（list-preview）。
  *
- * 対象は `event_msg` の payload.type `user_message` / `agent_message`（どちらも素のテキストを
- * `message` に持つ）。token_count 等のイベント行は自然に skip される。チャンク境界で行が
- * 切れた場合はその行を捨てて次のチャンクで読み直す。上限まで遡って無ければ null。
+ * 旧 `event_msg/user_message・agent_message` と、現行 `item_completed` のユーザー/応答本文、
+ * `response_item/message/assistant` を読む。注入を含む response_item の user 行は対象外。
+ * token_count 等は skip し、チャンク境界で切れた行は次のチャンクで読み直す。
+ * 上限まで遡って無ければ null。
  */
 function readLastRolloutMessage(rolloutPath: string): string | null {
   let fd: number;
@@ -408,21 +409,15 @@ function readLastRolloutMessage(rolloutPath: string): string | null {
       for (let i = lines.length - 1; i >= first; i--) {
         const line = lines[i] ?? "";
         // 早期スキップ（大半の行は対象 payload を含まない）。
-        if (!line.includes("user_message") && !line.includes("agent_message")) continue;
+        if (!line.includes("message") && !line.includes("item_completed")) continue;
         let obj: unknown;
         try {
           obj = JSON.parse(line);
         } catch {
           continue;
         }
-        if (typeof obj !== "object" || obj === null) continue;
-        if ((obj as { type?: unknown }).type !== "event_msg") continue;
-        const payload = (obj as { payload?: unknown }).payload;
-        if (typeof payload !== "object" || payload === null) continue;
-        const pl = payload as Record<string, unknown>;
-        if (pl["type"] !== "user_message" && pl["type"] !== "agent_message") continue;
-        const message = pl["message"];
-        if (typeof message === "string" && message.trim().length > 0) {
+        const message = rolloutMessageText(obj);
+        if (message !== null && message.trim().length > 0) {
           return normalizeSnippet(message, LAST_MESSAGE_MAX_LENGTH);
         }
       }
@@ -438,4 +433,50 @@ function readLastRolloutMessage(rolloutPath: string): string | null {
       // close 失敗は無視。
     }
   }
+}
+
+/** 新旧 rollout の表示用本文だけを取り出す。思考・ツール・注入された指示は採用しない。 */
+function rolloutMessageText(value: unknown): string | null {
+  const record = asRecord(value);
+  const payload = asRecord(record?.["payload"]);
+  if (payload === null) return null;
+
+  if (record?.["type"] === "response_item") {
+    if (payload["type"] !== "message" || payload["role"] !== "assistant" || !isVisiblePhase(payload)) {
+      return null;
+    }
+    // 一覧は本文だけが必要なので、旧 rollout で欠落し得る item ID は要求しない。
+    return contentText(payload["content"], "output_text");
+  }
+  if (record?.["type"] !== "event_msg") return null;
+  if (payload["type"] === "user_message" || payload["type"] === "agent_message") {
+    if (payload["type"] === "agent_message" && !isVisiblePhase(payload)) return null;
+    return typeof payload["message"] === "string" ? payload["message"] : null;
+  }
+  if (payload["type"] !== "item_completed") return null;
+  const item = asRecord(payload["item"]);
+  if (item?.["type"] === "UserMessage") return contentText(item["content"], "text");
+  if (item?.["type"] === "AgentMessage" && isVisiblePhase(item)) {
+    return contentText(item["content"], "Text");
+  }
+  return null;
+}
+
+function isVisiblePhase(message: Record<string, unknown>): boolean {
+  const phase = message["phase"];
+  return phase === undefined || phase === null || phase === "commentary" || phase === "final_answer";
+}
+
+function contentText(content: unknown, textType: string): string | null {
+  if (!Array.isArray(content)) return null;
+  return content.flatMap((part) => {
+    const item = asRecord(part);
+    return item?.["type"] === textType && typeof item["text"] === "string" ? [item["text"]] : [];
+  }).join("\n");
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
 }

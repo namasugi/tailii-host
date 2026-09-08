@@ -229,6 +229,114 @@ describe("CodexSessionStore.list", () => {
     expect(list[0]?.lastMessage).toBeUndefined();
   });
 
+  test.each([
+    {
+      label: "response_item の assistant 本文（ID なし）",
+      type: "response_item",
+      payload: {
+        type: "message", role: "assistant", phase: "final_answer",
+        content: [{ type: "output_text", text: "新形式の本文。\n続きです。" }],
+      },
+    },
+    {
+      label: "item_completed の AgentMessage",
+      type: "event_msg",
+      payload: {
+        type: "item_completed",
+        item: {
+          type: "AgentMessage", phase: "commentary",
+          content: [{ type: "Text", text: "新形式の本文。" }, { type: "Text", text: "続きです。" }],
+        },
+      },
+    },
+    {
+      label: "item_completed の UserMessage",
+      type: "event_msg",
+      payload: {
+        type: "item_completed",
+        item: {
+          type: "UserMessage",
+          content: [
+            { type: "text", text: "新形式の本文。\n続きです。", text_elements: [] },
+            { type: "image", image_url: "data:image/png;base64,ignored" },
+          ],
+        },
+      },
+    },
+  ])("$label をローカル一覧と App Server 一覧のプレビューへ反映する", async ({ type, payload }) => {
+    const home = makeTempDir("codex-store-modern-preview");
+    const p = writeRollout(
+      home, "2026/09/08", "rollout-modern.jsonl", "modern-id", "/work/modern",
+      undefined, "古い発話",
+    );
+    fs.appendFileSync(p, JSON.stringify({ type, payload }) + "\n");
+    const store = new CodexSessionStore(home);
+    expect(store.list()[0]?.lastMessage).toBe("新形式の本文。 続きです。");
+    const sessions = await store.listWithAppServer({
+      listThreads: async () => [{
+        id: "modern-id", name: "会話名", preview: "最初の発話", updatedAt: 300,
+        cwd: "/work/modern", source: "vscode", parentThreadId: null,
+      }],
+    });
+    expect(sessions[0]?.lastMessage).toBe("新形式の本文。 続きです。");
+  });
+
+  test("新旧形式の混在時も末尾の実発話を選び、注入・思考・ツール・不正行を表示しない", () => {
+    const home = makeTempDir("codex-store-preview-filter");
+    const p = writeRollout(
+      home, "2026/09/08", "rollout-filter.jsonl", "filter-id", "/work/filter",
+      undefined, "最初の発話",
+    );
+    const records = [
+      { type: "response_item", payload: {
+        type: "message", role: "assistant", content: [{ type: "output_text", text: "新形式の応答" }],
+      } },
+      { type: "event_msg", payload: { type: "agent_message", message: "最後の実発話" } },
+      ...["user", "developer", "system"].map((role) => ({ type: "response_item", payload: {
+        type: "message", role, content: [{ type: "input_text", text: "注入された指示" }],
+      } })),
+      { type: "response_item", payload: {
+        type: "message", role: "assistant", phase: "analysis",
+        content: [{ type: "output_text", text: "内部の思考" }],
+      } },
+      { type: "event_msg", payload: { type: "item_completed", item: {
+        type: "AgentMessage", phase: "analysis", content: [{ type: "Text", text: "内部の思考" }],
+      } } },
+      { type: "event_msg", payload: { type: "item_completed", item: {
+        type: "Reasoning", content: [{ type: "Text", text: "内部の思考" }],
+      } } },
+      { type: "event_msg", payload: { type: "item_completed", item: {
+        type: "McpToolCall", content: [{ type: "text", text: "ツールの出力" }],
+      } } },
+      { type: "response_item", payload: {
+        type: "message", role: "assistant", content: [{ type: "output_text", text: " \n " }],
+      } },
+      { type: "event_msg", payload: { type: "item_completed", item: {
+        type: "UserMessage", content: [null, { type: "text", text: 123 }],
+      } } },
+      { type: "event_msg", payload: { type: "token_count", info: { total: 123 } } },
+      { type: "event_msg", payload: { type: "item_completed", item: null } },
+      { type: "response_item", payload: { type: "message", role: "assistant", content: {} } },
+      { type: "response_item", payload: null },
+      null,
+    ];
+    fs.appendFileSync(p, records.map((record) => JSON.stringify(record)).join("\n") + '\n{"type":"response_item"');
+    expect(new CodexSessionStore(home).list()[0]?.lastMessage).toBe("最後の実発話");
+  });
+
+  test("新形式の本文が読み取りチャンクをまたいでも 80 字のプレビューを返す", () => {
+    const home = makeTempDir("codex-store-preview-chunk");
+    const p = writeRollout(home, "2026/09/08", "rollout-chunk.jsonl", "chunk-id", "/work/chunk");
+    fs.appendFileSync(p, JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "message", role: "assistant", phase: "final_answer",
+        content: [{ type: "output_text", text: "修正しました。".repeat(3000) }],
+      },
+    }) + "\n");
+    expect(new CodexSessionStore(home).list()[0]?.lastMessage).toBe("修正しました。".repeat(3000).slice(0, 80));
+  });
+
   test("新しい非対話 rollout が上限を占有しても古い対話セッションを返す", () => {
     const home = makeTempDir("codex-store-visible-limit");
     writeRollout(
