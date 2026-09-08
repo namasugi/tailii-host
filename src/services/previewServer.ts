@@ -4,9 +4,10 @@
 // iOS の Web プレビューは既存 SSH 接続内の direct-tcpip トンネルで Mac の
 // 127.0.0.1 へ到達する。dev サーバーはそのままトンネルで開けるが、
 // ディスク上の HTML ファイルには配信元が必要なため、このサーバーが
-// 「対象ファイルのディレクトリ」を root として loopback のみで配信する。
+// トークン付き入口から、認可 cookie を付けて実ファイルと同じパスへリダイレクトする。
+// ブラウザが ../ を含む相対参照を Mac 上のディレクトリ構造どおりに解決できる。
 // ネットワークへは一切公開しない（bind は 127.0.0.1 固定）。
-// URL には 128bit ランダムトークンのパス接頭辞を必須にする。
+// 入口 URL は 128bit ランダムトークン、後続要求はその cookie で認可する。
 
 import { randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
@@ -187,11 +188,19 @@ export class PreviewServer {
           res.writeHead(403).end();
           return;
         }
-        // トークンを cookie にも載せる。HTML 内の**絶対パス参照**（<img src="/Users/..."> 等）は
-        // トークン接頭辞を持たない URL になるため、後続要求はこの cookie で認可する。
-        await PreviewServer.serveFile(resolved, res, {
+        // `/t/<token>/preview.html` のままだと ../../assets が /assets になり、
+        // 元の HTML の親ディレクトリを辿れない。cookie 認可後は実ファイルと同じ
+        // パスへ移し、画像・CSS・子ページすべてをブラウザ標準の相対解決に任せる。
+        // Location はパスのみ（iPhone のトンネル用ローカルポートを維持）。
+        const encodedPath = resolved.split(path.sep).map(encodeURIComponent).join("/");
+        const trailingSlash = rawPath.endsWith("/") && !encodedPath.endsWith("/") ? "/" : "";
+        const queryStart = (req.url ?? "").indexOf("?");
+        const query = queryStart >= 0 ? req.url!.slice(queryStart) : "";
+        res.writeHead(302, {
+          location: `${encodedPath}${trailingSlash}${query}`,
           "set-cookie": `${COOKIE_PREFIX}${token}=1; Path=/; SameSite=Lax`,
-        });
+          "cache-control": "no-store",
+        }).end();
         return;
       }
 

@@ -2660,8 +2660,14 @@ describe("EngineControl — 横断制御チャネル", () => {
     expect(ready).toContain('"id":"PV1"');
     const url = JSON.parse(ready).url as string;
     expect(url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/t\/[0-9a-f]{32}\/index\.html$/);
-    const response = await fetch(url);
+    const entry = await fetch(url, { redirect: "manual" });
+    expect(entry.status).toBe(302);
+    const cookie = entry.headers.get("set-cookie")!.split(";")[0]!;
+    const destination = new URL(entry.headers.get("location")!, url);
+    await entry.arrayBuffer();
+    const response = await fetch(destination, { headers: { cookie } });
     expect(response.status).toBe(200);
+    expect(await response.text()).toBe("<p>preview</p>");
 
     engine.writeLine('{"id":"PV1","type":"preview_close","v":2}');
     // close 後は接続拒否になる（ポーリングで確定を待つ）。
