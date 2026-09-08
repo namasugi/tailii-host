@@ -806,18 +806,24 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
       return {
         type, v,
         id: requireString(raw, "id"), path: requireString(raw, "path"),
-        entries: requireArray(raw, "entries").map((element): FileEntry => {
-          const entry = requireObject(element, "entries");
-          const kind = requireString(entry, "kind");
-          if (kind !== "dir" && kind !== "file" && kind !== "symlink") {
-            throw new ProtocolDecodeError("missing-field", "entries.kind");
-          }
-          return compact<FileEntry>({
-            name: requireString(entry, "name"), kind,
-            size: requireNumber(entry, "size"), mtimeMs: requireNumber(entry, "mtimeMs"),
-            gitStatus: optionalString(entry, "gitStatus"),
-          });
-        }),
+        entries: decodeFileEntries(raw),
+        truncated: requireBoolean(raw, "truncated"),
+      };
+
+    case "file_search_request":
+      return compact({
+        type, v,
+        id: requireString(raw, "id"), path: requireString(raw, "path"),
+        query: requireString(raw, "query"),
+        limit: optionalNumber(raw, "limit"),
+      });
+
+    case "file_search_response":
+      return {
+        type, v,
+        id: requireString(raw, "id"), path: requireString(raw, "path"),
+        query: requireString(raw, "query"),
+        entries: decodeFileEntries(raw),
         truncated: requireBoolean(raw, "truncated"),
       };
 
@@ -1292,4 +1298,20 @@ function decodeOfficialAppProvider(raw: Raw, key: string): OfficialAppProvider {
     throw new ProtocolDecodeError("missing-field", key);
   }
   return provider;
+}
+
+/** `entries: FileEntry[]`（file_list / file_search 共通）。 */
+function decodeFileEntries(raw: Raw): FileEntry[] {
+  return requireArray(raw, "entries").map((element): FileEntry => {
+    const entry = requireObject(element, "entries");
+    const kind = requireString(entry, "kind");
+    if (kind !== "dir" && kind !== "file" && kind !== "symlink") {
+      throw new ProtocolDecodeError("missing-field", "entries.kind");
+    }
+    return compact<FileEntry>({
+      name: requireString(entry, "name"), kind,
+      size: requireNumber(entry, "size"), mtimeMs: requireNumber(entry, "mtimeMs"),
+      gitStatus: optionalString(entry, "gitStatus"),
+    });
+  });
 }

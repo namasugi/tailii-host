@@ -516,6 +516,10 @@ export type ControlMessage =
   | { type: "file_list_response"; v: number; id: string; path: string; entries: FileEntry[]; truncated: boolean }
   | { type: "file_read_request"; v: number; id: string; path: string }
   | ({ type: "file_read_response"; v: number; id: string } & FileReadResult)
+  /** 名前検索（iOS→Mac, file-search）。`path` は検索起点の絶対ディレクトリ。`limit` は省略可（既定 200）。 */
+  | { type: "file_search_request"; v: number; id: string; path: string; query: string; limit?: number }
+  /** 名前検索応答（Mac→iOS）。`entries[].name` は `path` からの相対パス。 */
+  | { type: "file_search_response"; v: number; id: string; path: string; query: string; entries: FileEntry[]; truncated: boolean }
   /** ファイル原本のダウンロード要求（iOS→Mac, file-download）。`path` は絶対パス。 */
   | { type: "file_fetch_request"; v: number; id: string; path: string }
   /** ダウンロードの中止（iOS→Mac）。以降のチャンク配信を打ち切る。 */

@@ -28,6 +28,134 @@ function isAbsolutePath(candidate: string): boolean {
   return path.isAbsolute(candidate) && !candidate.startsWith("~");
 }
 
+/** file_search の既定件数上限（要求 `limit` はこの値まで）。 */
+export const FILE_SEARCH_LIMIT = 200;
+/** 1 回の検索で辿るエントリ数の上限（巨大ツリーの暴走防止）。超えたら truncated。 */
+const FILE_SEARCH_VISIT_BUDGET = 200_000;
+/** 1 回の検索に使う壁時計の上限。超えたら途中結果を truncated で返す。 */
+const FILE_SEARCH_TIME_BUDGET_MS = 4_000;
+const FILE_SEARCH_QUERY_MAX_BYTES = 256;
+/** 名前検索で降りないディレクトリ（生成物・依存物。内容はまず探さない）。 */
+const FILE_SEARCH_SKIP_DIRS = new Set([
+  ".git",
+  "node_modules",
+  ".build",
+  "DerivedData",
+  ".cache",
+  "__pycache__",
+  ".venv",
+  "venv",
+  "Pods",
+  ".gradle",
+  "target",
+  "dist",
+]);
+
+export interface FileSearchResult {
+  path: string;
+  query: string;
+  /** `name` は検索起点からの相対パス（`src/a.ts`）。 */
+  entries: FileEntry[];
+  truncated: boolean;
+}
+
+/**
+ * 検索起点以下を再帰的に辿り、ファイル/ディレクトリ名（`/` を含む問い合わせは相対パス）の
+ * 大文字小文字を無視した部分一致で探す。symlink は辿らない（リンク自体は候補に含める）。
+ * 一致は「名前の前方一致 → 名前の部分一致 → 相対パスの部分一致」の順、同順位は相対パス昇順。
+ */
+export function fileSearch(
+  root: string,
+  rawQuery: string,
+  requestedLimit: number = FILE_SEARCH_LIMIT,
+  now: () => number = Date.now,
+): FileSearchResult {
+  const query = rawQuery.trim();
+  const limit = Math.max(1, Math.min(FILE_SEARCH_LIMIT, Math.floor(requestedLimit)));
+  if (
+    !isAbsolutePath(root) ||
+    query === "" ||
+    Buffer.byteLength(query, "utf8") > FILE_SEARCH_QUERY_MAX_BYTES
+  ) {
+    return { path: root, query, entries: [], truncated: false };
+  }
+  const needle = query.toLowerCase();
+  const matchesPath = needle.includes("/");
+  interface Candidate {
+    relative: string;
+    name: string;
+    kind: FileEntry["kind"];
+    absolute: string;
+    rank: number;
+  }
+  const candidates: Candidate[] = [];
+  const stack: string[] = [""];
+  let visited = 0;
+  let truncated = false;
+  const startedAt = now();
+  while (stack.length > 0) {
+    const relativeDir = stack.pop() ?? "";
+    const absoluteDir = relativeDir === "" ? root : path.join(root, relativeDir);
+    let dirents: fs.Dirent[];
+    try {
+      dirents = fs.readdirSync(absoluteDir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const dirent of dirents) {
+      visited += 1;
+      if (visited > FILE_SEARCH_VISIT_BUDGET || now() - startedAt > FILE_SEARCH_TIME_BUDGET_MS) {
+        truncated = true;
+        stack.length = 0;
+        break;
+      }
+      const name = dirent.name;
+      const relative = relativeDir === "" ? name : `${relativeDir}/${name}`;
+      const kind: FileEntry["kind"] = dirent.isSymbolicLink()
+        ? "symlink"
+        : dirent.isDirectory()
+          ? "dir"
+          : "file";
+      const lowerName = name.toLowerCase();
+      let rank = -1;
+      if (matchesPath) {
+        if (relative.toLowerCase().includes(needle)) rank = 2;
+      } else if (lowerName.startsWith(needle)) {
+        rank = 0;
+      } else if (lowerName.includes(needle)) {
+        rank = 1;
+      }
+      if (rank >= 0) {
+        candidates.push({ relative, name, kind, absolute: path.join(root, relative), rank });
+      }
+      if (kind === "dir" && !FILE_SEARCH_SKIP_DIRS.has(name)) stack.push(relative);
+    }
+  }
+  candidates.sort((lhs, rhs) => {
+    if (lhs.rank !== rhs.rank) return lhs.rank - rhs.rank;
+    return lhs.relative < rhs.relative ? -1 : lhs.relative > rhs.relative ? 1 : 0;
+  });
+  const entries: FileEntry[] = [];
+  for (const candidate of candidates.slice(0, limit)) {
+    let size = 0;
+    let mtimeMs = 0;
+    try {
+      const stat = fs.lstatSync(candidate.absolute);
+      size = candidate.kind === "dir" ? 0 : stat.size;
+      mtimeMs = Math.round(stat.mtimeMs);
+    } catch {
+      // 列挙後に消えたエントリは stat 無しで返す。
+    }
+    entries.push({ name: candidate.relative, kind: candidate.kind, size, mtimeMs });
+  }
+  return {
+    path: root,
+    query,
+    entries,
+    truncated: truncated || candidates.length > limit,
+  };
+}
+
 /** ディレクトリを列挙する。不正パス・読取不能は空一覧で返す。 */
 export function fileList(directoryPath: string): {
   path: string;

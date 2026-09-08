@@ -3,7 +3,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, test, vi } from "vitest";
-import { fileFetch, fileList, fileRead } from "../src/services/fileService.js";
+import { fileFetch, fileList, fileRead, fileSearch } from "../src/services/fileService.js";
 import { makeTempDir } from "./helpers.js";
 
 describe("fileService", () => {
@@ -22,6 +22,53 @@ describe("fileService", () => {
     ]);
     expect(result.truncated).toBe(false);
     expect(fileList("relative")).toEqual({ path: "relative", entries: [], truncated: false });
+  });
+
+  test("名前検索: 前方一致→部分一致→パス一致の順、生成物ディレクトリは降りない", () => {
+    const root = makeTempDir("file-search");
+    fs.mkdirSync(path.join(root, "src", "chat"), { recursive: true });
+    fs.mkdirSync(path.join(root, "node_modules", "pkg"), { recursive: true });
+    fs.mkdirSync(path.join(root, "docs"));
+    fs.writeFileSync(path.join(root, "src", "chat", "ChatView.swift"), "a");
+    fs.writeFileSync(path.join(root, "src", "chat", "MyChatModel.swift"), "bb");
+    fs.writeFileSync(path.join(root, "docs", "chat-notes.md"), "ccc");
+    fs.writeFileSync(path.join(root, "node_modules", "pkg", "chat.js"), "d");
+    fs.symlinkSync(path.join(root, "docs"), path.join(root, "chat-link"));
+
+    const result = fileSearch(root, "Chat");
+    expect(result).toMatchObject({ path: root, query: "Chat", truncated: false });
+    expect(result.entries.map((entry) => [entry.name, entry.kind])).toEqual([
+      ["chat-link", "symlink"],
+      ["docs/chat-notes.md", "file"],
+      ["src/chat", "dir"],
+      ["src/chat/ChatView.swift", "file"],
+      ["src/chat/MyChatModel.swift", "file"],
+    ]);
+    expect(result.entries.find((entry) => entry.name === "src/chat/MyChatModel.swift")?.size).toBe(2);
+
+    // `/` を含む問い合わせは相対パスで照合する。
+    expect(fileSearch(root, "chat/my").entries.map((entry) => entry.name)).toEqual([
+      "src/chat/MyChatModel.swift",
+    ]);
+    // 空・相対起点は空応答。
+    expect(fileSearch(root, "   ")).toMatchObject({ entries: [], truncated: false, query: "" });
+    expect(fileSearch("relative", "a")).toMatchObject({ entries: [], truncated: false });
+  });
+
+  test("名前検索: limit 超過と時間切れは truncated", () => {
+    const root = makeTempDir("file-search-limit");
+    for (let index = 0; index < 5; index += 1) {
+      fs.writeFileSync(path.join(root, `hit-${index}.txt`), "");
+    }
+    const limited = fileSearch(root, "hit", 2);
+    expect(limited.entries.map((entry) => entry.name)).toEqual(["hit-0.txt", "hit-1.txt"]);
+    expect(limited.truncated).toBe(true);
+
+    let tick = 0;
+    const slowClock = () => (tick++ === 0 ? 0 : 10_000);
+    const timedOut = fileSearch(root, "hit", 200, slowClock);
+    expect(timedOut.truncated).toBe(true);
+    expect(timedOut.entries.length).toBeLessThan(5);
   });
 
   test("一覧を1000件で切り詰める", () => {

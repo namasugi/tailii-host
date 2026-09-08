@@ -43,6 +43,12 @@ describe("EngineControl — file/git browser", () => {
       type: "file_read_response", id: "fr", kind: "text", content: "one\ntwo\n",
     });
 
+    engine.writeLine(JSON.stringify({ type: "file_search_request", v: 1, id: "fs", path: root, query: "a.t" }));
+    expect(decodeControlMessage(await engine.lines.nextOfType("file_search_response"))).toMatchObject({
+      type: "file_search_response", id: "fs", path: root, query: "a.t", truncated: false,
+      entries: [expect.objectContaining({ name: "a.txt", kind: "file", size: 8 })],
+    });
+
     engine.writeLine(JSON.stringify({ type: "git_status_request", v: 1, id: "gs", path: root }));
     expect(decodeControlMessage(await engine.lines.nextOfType("git_status_response"))).toMatchObject({
       type: "git_status_response", id: "gs", isRepo: true, branch: "main",

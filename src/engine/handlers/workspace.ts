@@ -3,7 +3,7 @@
 // ファイル一覧（git バッジ付き）/読み取り。
 
 import { dirCanCreate, dirChildren, dirCreate, dirList } from "../../services/dirLister.js";
-import { fileFetch, fileList, fileRead } from "../../services/fileService.js";
+import { fileFetch, fileList, fileRead, fileSearch } from "../../services/fileService.js";
 import { gitEntryStatuses } from "../../services/gitService.js";
 import { engineDiag, type HandlerRegistry } from "../context.js";
 import { collectSlashCommands } from "../slashCommands.js";
@@ -103,6 +103,28 @@ export const workspaceHandlers: HandlerRegistry = {
         type: "file_list_response", v, id: message.id, path: message.path,
         entries: [], truncated: false,
       });
+    }
+  },
+
+  file_search_request: (message, ctx) => {
+    const { writer, state } = ctx;
+    const v = state.negotiatedVersion;
+    engineDiag(`file_search_request id=${message.id} path=${message.path} query=${message.query}`);
+    // 名前検索。不正な起点・空問い合わせは空 entries（エラーにしない）。
+    let result: ReturnType<typeof fileSearch>;
+    try {
+      result = fileSearch(message.path, message.query, message.limit);
+    } catch (error) {
+      engineDiag(`file_search 失敗 id=${message.id}: ${String(error)}`);
+      result = { path: message.path, query: message.query, entries: [], truncated: false };
+    }
+    try {
+      writer.write({ type: "file_search_response", v, id: message.id, ...result });
+      engineDiag(`file_search_response id=${message.id} entries=${result.entries.length}`);
+    } catch (error) {
+      process.stderr.write(
+        `[tailii-host engine] file_search_response 書込失敗: ${String(error)}\n`,
+      );
     }
   },
 

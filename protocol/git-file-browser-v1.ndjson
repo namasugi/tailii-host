@@ -20,3 +20,5 @@
 {"branch":"tailii/20260713-120000","error":null,"id":"gw1","ok":true,"type":"git_worktree_create_response","v":1,"worktreePath":"/Users/alice/project/.claude/worktrees/20260713-120000"}
 {"force":false,"id":"gw2","path":"/Users/alice/project/.claude/worktrees/20260713-120000","type":"git_worktree_remove_request","v":1}
 {"error":null,"id":"gw2","ok":true,"type":"git_worktree_remove_response","v":1}
+{"id":"fs1","limit":200,"path":"/Users/alice/project","query":"a.t","type":"file_search_request","v":1}
+{"entries":[{"kind":"file","mtimeMs":1720000000000,"name":"a.txt","size":120},{"kind":"dir","mtimeMs":0,"name":"src/a.tools","size":0}],"id":"fs1","path":"/Users/alice/project","query":"a.t","truncated":false,"type":"file_search_response","v":1}
