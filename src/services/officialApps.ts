@@ -46,7 +46,10 @@ export interface OfficialAppRuntimeContext {
   sessionManager: SessionBackend;
   /** Hub の処理中/設問状態をまとめた入力安全性。active URL の open 自体は busy 中も許可する。 */
   canInjectClaudeCommand: boolean;
-  /** daemon 再起動で他会話の turn を切らないため、全 Codex turn が idle のときだけ true。 */
+  /**
+   * daemon 再起動で他会話の turn を切らないため、全 Codex turn が idle のときだけ true。
+   * 接続済み（status=connected）の pairing 発行は daemon を変更しないので、false でも open/repair は通す。
+   */
   canMutateCodexDaemon: boolean;
   /**
    * この会話の Claude transcript（`~/.claude/projects/<slug>/<uuid>.jsonl`）。
@@ -206,23 +209,27 @@ export class OfficialAppsService {
     const version = await this.providerVersion(context.provider);
     if (version === null) return unavailableStatus(context.provider, "official_cli_unavailable");
     if (context.provider === "codex") {
-      if (!context.canMutateCodexDaemon) {
-        return unavailableStatus("codex", "codex_agent_busy", version);
-      }
       if (this.codexRemoteControl !== null) {
         const status = await this.codexRemoteControl.remoteControlStatus();
         if (status === null) {
           return unavailableStatus("codex", "codex_app_server_remote_unavailable", version);
         }
+        // 接続済みなら open は pairing 発行だけ（daemon を触らない）なので、turn 実行中でも開ける。
+        // errored も enrollment 済み（environment あり）なら pairing は発行できる（実測 0.153.4:
+        // status=errored のまま pairing/start が成功する）ので、turn 実行中は同じ扱いにする。
+        if (status.status === "connected" || (status.status === "errored" && !context.canMutateCodexDaemon)) {
+          return {
+            provider: "codex",
+            version,
+            state: "active",
+            canOpen: true,
+            canStart: false,
+          };
+        }
+        if (!context.canMutateCodexDaemon) {
+          return unavailableStatus("codex", "codex_agent_busy", version);
+        }
         switch (status.status) {
-          case "connected":
-            return {
-              provider: "codex",
-              version,
-              state: "active",
-              canOpen: true,
-              canStart: false,
-            };
           case "disabled":
             return {
               provider: "codex",
@@ -236,6 +243,9 @@ export class OfficialAppsService {
           case "errored":
             return unavailableStatus("codex", "codex_remote_errored", version);
         }
+      }
+      if (!context.canMutateCodexDaemon) {
+        return unavailableStatus("codex", "codex_agent_busy", version);
       }
       return {
         provider: "codex",
@@ -277,7 +287,16 @@ export class OfficialAppsService {
         }
         return this.performClaude(context);
       }
+      if (this.codexRemoteControl !== null) {
+        return this.performCodexViaAppServer(
+          action,
+          automaticEnable,
+          paired,
+          context.canMutateCodexDaemon,
+        );
+      }
       if (!context.canMutateCodexDaemon) {
+        this.diag(`perform codex busy (daemon CLI) session=${context.session}`);
         return unavailableResult("codex", "codex_agent_busy");
       }
       return this.performCodex(action, automaticEnable, paired);
@@ -335,11 +354,17 @@ export class OfficialAppsService {
   ): Promise<OfficialAppStatus> {
     const paneText = await captureOfficialPane(context.sessionManager, context.session);
     const dialogUrl = paneText === null ? null : extractClaudeRemoteDialogUrl(paneText);
+    const transcriptEntry = lastTranscriptRemoteControlEntry(context.claudeTranscriptPath);
+    // 設問/承認ダイアログ中はステータスバー（/rc 点灯）がフッターに置き換わり pane から
+    // 活性を読めない。その間は transcript の接続記録（bridge-session）を権威にする。
+    const barHidden = paneText !== null && !statusBarVisible(paneText);
     const active =
-      dialogUrl !== null || (paneText !== null && statusBarShowsRemoteControl(paneText));
+      dialogUrl !== null ||
+      (paneText !== null && statusBarShowsRemoteControl(paneText)) ||
+      (barHidden && transcriptEntry !== null);
     if (active) {
       const launchUrl =
-        lastTranscriptRemoteControlEntry(context.claudeTranscriptPath)?.url ??
+        transcriptEntry?.url ??
         dialogUrl ??
         (paneText === null ? null : extractBannerClaudeUrl(paneText));
       return {
@@ -389,6 +414,15 @@ export class OfficialAppsService {
       // active なのに URL 不明（transcript 欠落・バナー窓外）: 注入すると CLI は
       // dialog を開くので、poll 側の dialog 経路で URL を回収できる。
       this.diag(`perform /rc lit but url unknown session=${context.session}`);
+    }
+    if (before !== null && !statusBarVisible(before)) {
+      // 設問/承認ダイアログでステータスバーが隠れている間は /rc を読めない。接続済みなら
+      // transcript の記録で開く（処理中でも「既に繋がっている会話」は開けるべき）。
+      const url = lastTranscriptRemoteControlEntry(context.claudeTranscriptPath)?.url ?? null;
+      if (url !== null) {
+        this.diag(`perform open via transcript (status bar hidden) session=${context.session}`);
+        return openResult("claude", url);
+      }
     }
     if (!context.canInjectClaudeCommand) {
       this.diag(`perform busy session=${context.session}`);
@@ -607,9 +641,6 @@ export class OfficialAppsService {
     automaticEnable: boolean,
     paired: boolean,
   ): Promise<OfficialAppActionResult> {
-    if (this.codexRemoteControl !== null) {
-      return this.performCodexViaAppServer(action, automaticEnable, paired);
-    }
     if (action === "stop") {
       const stopped = await this.runCommand(
         this.codexPath,
@@ -664,25 +695,44 @@ export class OfficialAppsService {
     action: OfficialAppAction,
     automaticEnable: boolean,
     paired: boolean,
+    canMutateDaemon: boolean,
   ): Promise<OfficialAppActionResult> {
     const remote = this.codexRemoteControl;
     if (remote === null) return unavailableResult("codex", "codex_app_server_remote_unavailable");
     if (action === "stop") {
+      if (!canMutateDaemon) {
+        this.diag("perform codex stop refused: turn active");
+        return unavailableResult("codex", "codex_agent_busy");
+      }
       const stopped = await remote.disableRemoteControl();
       return stopped?.status === "disabled"
         ? { provider: "codex", outcome: "stopped" }
         : unavailableResult("codex", "codex_stop_failed");
     }
-    if (!automaticEnable) {
-      return unavailableResult("codex", "codex_automatic_enable_disabled");
+    // 接続済みなら enable を挟まず pairing 発行だけ行う（daemon を変更しないので turn 実行中でも可）。
+    // 「再ペアリングが必要」な状況（アプリ側で環境が外れた等）は status=connected のまま起きるため、
+    // ここで turn 中を理由に弾くと利用者には「処理中」としか見えず修復できない。
+    const current = await remote.remoteControlStatus();
+    // errored は同じ enrollment の別 App Server が online の場合等にも返るが、pairing artifact は
+    // 同じ environment へ発行できる（実測）。turn 実行中は enable を挟めないので、connected と
+    // 同様に pairing だけで進める（実障害 2026-09-09: status=errored で一律 busy になっていた）。
+    const pairableWithoutEnable =
+      current?.status === "connected" || current?.status === "errored";
+    if (!pairableWithoutEnable || (current?.status === "errored" && canMutateDaemon)) {
+      if (!canMutateDaemon) {
+        this.diag(`perform codex busy status=${current?.status ?? "null"}`);
+        return unavailableResult("codex", "codex_agent_busy");
+      }
+      if (!automaticEnable) {
+        return unavailableResult("codex", "codex_automatic_enable_disabled");
+      }
+      const enabled = await remote.enableRemoteControl();
+      if (enabled === null || enabled.status === "disabled") {
+        return unavailableResult("codex", "codex_start_failed");
+      }
+      // errored は同じ enrollment の別 App Server が既に online の場合にも返る。この場合も
+      // pairing artifact は同じ environment へ発行できるため、pair/open を阻害しない。
     }
-
-    const enabled = await remote.enableRemoteControl();
-    if (enabled === null || enabled.status === "disabled") {
-      return unavailableResult("codex", "codex_start_failed");
-    }
-    // errored は同じ enrollment の別 App Server が既に online の場合にも返る。この場合も
-    // pairing artifact は同じ environment へ発行できるため、pair/open を阻害しない。
     const pairing = await remote.startRemoteControlPairing();
     if (pairing === null) return unavailableResult("codex", "codex_pair_failed");
     if (pairing.expiresAt <= this.now()) {
@@ -797,6 +847,33 @@ export function statusBarShowsProcessing(text: string): boolean {
     .some((line) => !line.trim().startsWith("❯") && line.includes("esc to interrupt"));
 }
 
+/** ステータスバー（アイドル/モード/処理中）の定型句。設問・承認ダイアログ中は消える。 */
+const STATUS_BAR_MARKERS = [
+  "shift+tab to cycle",
+  "? for shortcuts",
+  "esc to interrupt",
+  "for agents",
+] as const;
+
+/**
+ * pane 最下部にステータスバー自体が見えているか。AskUserQuestion・承認・選択ダイアログの
+ * 表示中はバーがフッター（`Enter to select · … · Esc to cancel`）に置き換わり、`/rc` 点灯の
+ * 有無を pane からは判定できない（実測 2.1.263）。false のときは transcript を権威にする。
+ */
+export function statusBarVisible(text: string): boolean {
+  const lines = text
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim() !== "");
+  return lines
+    .slice(-3)
+    .some(
+      (line) =>
+        !line.trim().startsWith("❯") &&
+        (STATUS_BAR_MARKERS.some((marker) => line.includes(marker)) || /(^|\s)\/rc$/u.test(line)),
+    );
+}
+
 export interface TranscriptRemoteControlEntry {
   url: string;
   atMs: number | null;
@@ -862,16 +939,54 @@ export function lastTranscriptRemoteControlEntry(
   const tail = readTranscriptTail(transcriptPath);
   if (tail === null) return null;
   const lines = tail.split("\n");
+  // 2.1.263 以降の記録形式:
+  //   {"type":"bridge-session","bridgeSessionId":"cse_<id>"}  … ターン終端ごとに追記。"" は切断済み。
+  //   {"type":"attachment","attachment":{"type":"remote_session_change","url":"https://claude.ai/code/session_<id>"}}
+  //   … 活性化時に 1 回（timestamp 付き）。
+  // 旧形式（bridge_status 行）も引き続き受理する。末尾から最初に見つかった記録が現在値。
+  // bridge-session には timestamp が無いので、同じ URL の attachment まで遡って atMs を補う。
+  let pendingUrl: string | null = null;
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     const line = lines[index] ?? "";
-    if (!line.includes('"bridge_status"')) continue;
+    const isLegacy = line.includes('"bridge_status"');
+    const isBridgeSession = line.includes('"bridge-session"');
+    const isAttachment = line.includes('"remote_session_change"');
+    if (!isLegacy && !isBridgeSession && !isAttachment) continue;
     let entry: unknown;
     try {
       entry = JSON.parse(line);
     } catch {
       continue;
     }
-    if (!isRecord(entry) || entry["subtype"] !== "bridge_status") continue;
+    if (!isRecord(entry)) continue;
+    const timestamp = typeof entry["timestamp"] === "string" ? Date.parse(entry["timestamp"]) : NaN;
+    const atMs = Number.isNaN(timestamp) ? null : timestamp;
+    if (entry["type"] === "bridge-session") {
+      const bridgeId = entry["bridgeSessionId"];
+      if (typeof bridgeId !== "string") continue;
+      const url = bridgeId === "" ? null : bridgeSessionUrl(bridgeId);
+      if (pendingUrl !== null) {
+        // 直近の記録より前は別接続。atMs 補完を諦めて直近値を返す。
+        if (url !== pendingUrl) return { url: pendingUrl, atMs: null };
+        continue;
+      }
+      if (bridgeId === "") return null;
+      if (url === null) continue;
+      pendingUrl = url;
+      continue;
+    }
+    if (entry["type"] === "attachment") {
+      const attachment = entry["attachment"];
+      if (!isRecord(attachment) || attachment["type"] !== "remote_session_change") continue;
+      const url = attachment["url"];
+      if (typeof url !== "string" || !validClaudeUrl(url)) continue;
+      if (pendingUrl !== null) {
+        return url === pendingUrl ? { url, atMs } : { url: pendingUrl, atMs: null };
+      }
+      return { url, atMs };
+    }
+    if (entry["subtype"] !== "bridge_status") continue;
+    if (pendingUrl !== null) return { url: pendingUrl, atMs: null };
     const content = typeof entry["content"] === "string" ? entry["content"] : "";
     if (!content.includes("/remote-control is active")) continue;
     const at = content.indexOf(CLAUDE_SESSION_PREFIX);
@@ -879,10 +994,16 @@ export function lastTranscriptRemoteControlEntry(
     const raw = content.slice(at).split(/\s/u, 1)[0] ?? "";
     const candidate = raw.endsWith(".") ? raw.slice(0, -1) : raw;
     if (!validClaudeUrl(candidate)) continue;
-    const timestamp = typeof entry["timestamp"] === "string" ? Date.parse(entry["timestamp"]) : NaN;
-    return { url: candidate, atMs: Number.isNaN(timestamp) ? null : timestamp };
+    return { url: candidate, atMs };
   }
-  return null;
+  return pendingUrl !== null ? { url: pendingUrl, atMs: null } : null;
+}
+
+/** `bridge-session` 行の `bridgeSessionId`（`cse_<id>`）を公式 URL（`session_<id>`）へ写す。 */
+export function bridgeSessionUrl(bridgeSessionId: string): string | null {
+  if (!bridgeSessionId.startsWith("cse_")) return null;
+  const candidate = `${CLAUDE_SESSION_PREFIX}session_${bridgeSessionId.slice("cse_".length)}`;
+  return validClaudeUrl(candidate) ? candidate : null;
 }
 
 /**

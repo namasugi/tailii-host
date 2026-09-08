@@ -13,6 +13,8 @@ import {
   parseCodexPairing,
   parseCodexStart,
   statusBarShowsRemoteControl,
+  statusBarVisible,
+  bridgeSessionUrl,
   unknownClaudeAuthKeys,
   validClaudeUrl,
   type OfficialCommandRunner,
@@ -1022,6 +1024,292 @@ describe("OfficialAppsService", () => {
     });
     expect(calls).toEqual(["enable", "pair", "enable", "pair"]);
     expect(runner).toHaveBeenCalledTimes(2);
+  });
+});
+
+// AskUserQuestion 表示中の pane 末尾（実採取 2.1.263）。ステータスバー（/rc）は隠れる。
+const QUESTION_DIALOG_FOOTER = [
+  "build 3 の回答をどうしますか？",
+  "",
+  "❯ 1. build 2 と同じ回答",
+  "  2. 自分で答える",
+  "───────────────────────────────",
+  "  3. Chat about this",
+  "",
+  "Enter to select · Tab/Arrow keys to navigate · Esc to cancel",
+].join("\n");
+
+function writeBridgeSessionTranscript(base: string, lines: unknown[]): string {
+  const transcriptPath = join(base, "bridge.jsonl");
+  writeFileSync(transcriptPath, lines.map((line) => JSON.stringify(line)).join("\n") + "\n");
+  return transcriptPath;
+}
+
+describe("2.1.263 の transcript 記録形式（bridge-session / remote_session_change）", () => {
+  test("bridge-session の bridgeSessionId を公式 URL に写し、attachment から timestamp を補う", () => {
+    const base = temporaryDirectory();
+    const transcriptPath = writeBridgeSessionTranscript(base, [
+      {
+        type: "attachment",
+        timestamp: "2026-09-08T15:03:55.805Z",
+        attachment: {
+          type: "remote_session_change",
+          url: "https://claude.ai/code/session_01MkJFKUNtuotD68Lf6CZtk8",
+          commit: "…",
+          pr: "…",
+          sendUserFileHint: true,
+        },
+      },
+      { type: "atis-latch" },
+      { type: "bridge-session", sessionId: "x", bridgeSessionId: "cse_01MkJFKUNtuotD68Lf6CZtk8", lastSequenceNum: 0 },
+      { type: "bridge-session", sessionId: "x", bridgeSessionId: "cse_01MkJFKUNtuotD68Lf6CZtk8", lastSequenceNum: 0 },
+    ]);
+    expect(lastTranscriptRemoteControlEntry(transcriptPath)).toEqual({
+      url: "https://claude.ai/code/session_01MkJFKUNtuotD68Lf6CZtk8",
+      atMs: Date.parse("2026-09-08T15:03:55.805Z"),
+    });
+    expect(bridgeSessionUrl("cse_abc")).toBe("https://claude.ai/code/session_abc");
+    expect(bridgeSessionUrl("abc")).toBeNull();
+    expect(bridgeSessionUrl("cse_bad/../x")).toBeNull();
+  });
+
+  test("bridgeSessionId が空文字なら切断済みとして null", () => {
+    const base = temporaryDirectory();
+    const transcriptPath = writeBridgeSessionTranscript(base, [
+      {
+        type: "attachment",
+        timestamp: "2026-09-08T13:20:54.662Z",
+        attachment: { type: "remote_session_change", url: "https://claude.ai/code/session_011wdhJH" },
+      },
+      { type: "bridge-session", sessionId: "x", bridgeSessionId: "cse_011wdhJH", lastSequenceNum: 0 },
+      { type: "bridge-session", sessionId: "x", bridgeSessionId: "", lastSequenceNum: 0 },
+    ]);
+    expect(lastTranscriptRemoteControlEntry(transcriptPath)).toBeNull();
+    // 切断後に再活性化した attachment があればそれが現在値。
+    writeFileSync(
+      transcriptPath,
+      readFileSync(transcriptPath, "utf8") +
+        JSON.stringify({
+          type: "attachment",
+          timestamp: "2026-09-08T14:58:47.000Z",
+          attachment: { type: "remote_session_change", url: "https://claude.ai/code/session_new" },
+        }) +
+        "\n",
+    );
+    expect(lastTranscriptRemoteControlEntry(transcriptPath)).toEqual({
+      url: "https://claude.ai/code/session_new",
+      atMs: Date.parse("2026-09-08T14:58:47.000Z"),
+    });
+  });
+
+  test("直近の bridge-session より前の別接続 attachment は timestamp 補完に使わない", () => {
+    const base = temporaryDirectory();
+    const transcriptPath = writeBridgeSessionTranscript(base, [
+      {
+        type: "attachment",
+        timestamp: "2026-09-08T13:20:54.662Z",
+        attachment: { type: "remote_session_change", url: "https://claude.ai/code/session_old" },
+      },
+      { type: "bridge-session", sessionId: "x", bridgeSessionId: "cse_new", lastSequenceNum: 0 },
+    ]);
+    expect(lastTranscriptRemoteControlEntry(transcriptPath)).toEqual({
+      url: "https://claude.ai/code/session_new",
+      atMs: null,
+    });
+  });
+});
+
+describe("設問ダイアログ中（ステータスバー非表示）の Claude open", () => {
+  test("statusBarVisible はバー定型句か /rc で判定し、設問フッターでは false", () => {
+    expect(statusBarVisible(["❯", RC_ON_BAR].join("\n"))).toBe(true);
+    expect(statusBarVisible(["❯", RC_OFF_BAR].join("\n"))).toBe(true);
+    expect(statusBarVisible("本文\n  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt   /rc")).toBe(true);
+    expect(statusBarVisible(QUESTION_DIALOG_FOOTER)).toBe(false);
+    expect(statusBarVisible("")).toBe(false);
+  });
+
+  test("接続済み会話は処理中（設問待ち）でも transcript の記録で開ける", async () => {
+    const base = temporaryDirectory();
+    const backend = new FakeBackend(base);
+    backend.pane = QUESTION_DIALOG_FOOTER;
+    const transcriptPath = writeBridgeSessionTranscript(base, [
+      { type: "bridge-session", sessionId: "x", bridgeSessionId: "cse_blocked", lastSequenceNum: 0 },
+    ]);
+    const service = new OfficialAppsService({
+      commandRunner: commandRunner({
+        "claude --version": { success: true, stdout: "2.1.263 (Claude Code)\n" },
+        "claude auth status --json": { success: true, stdout: claudeAuth2_1_260() },
+      }),
+      actionLockPath: join(base, "action.lock"),
+    });
+    const context = {
+      session: "s",
+      provider: "claude" as const,
+      sessionManager: backend,
+      canInjectClaudeCommand: false,
+      canMutateCodexDaemon: true,
+      claudeTranscriptPath: transcriptPath,
+    };
+    expect(await service.status(context)).toMatchObject({
+      state: "active",
+      canOpen: true,
+      launchUrl: "https://claude.ai/code/session_blocked",
+    });
+    const result = await service.perform(context, "open", true, false);
+    expect(result).toMatchObject({ outcome: "open", launchUrl: "https://claude.ai/code/session_blocked" });
+    // ダイアログ中の pane へは何も打ち込まない。
+    expect(backend.submitted).toEqual([]);
+    expect(backend.sentKeys).toEqual([]);
+  });
+
+  test("未接続の設問待ち会話は従来どおり busy（ダイアログへ注入しない）", async () => {
+    const base = temporaryDirectory();
+    const backend = new FakeBackend(base);
+    backend.pane = QUESTION_DIALOG_FOOTER;
+    const transcriptPath = writeBridgeSessionTranscript(base, [
+      { type: "bridge-session", sessionId: "x", bridgeSessionId: "", lastSequenceNum: 0 },
+    ]);
+    const service = new OfficialAppsService({
+      commandRunner: commandRunner({
+        "claude --version": { success: true, stdout: "2.1.263 (Claude Code)\n" },
+        "claude auth status --json": { success: true, stdout: claudeAuth2_1_260() },
+      }),
+      actionLockPath: join(base, "action.lock"),
+    });
+    const context = {
+      session: "s",
+      provider: "claude" as const,
+      sessionManager: backend,
+      canInjectClaudeCommand: false,
+      canMutateCodexDaemon: true,
+      claudeTranscriptPath: transcriptPath,
+    };
+    expect(await service.status(context)).toMatchObject({ unavailableReason: "claude_agent_busy" });
+    const result = await service.perform(context, "open", true, false);
+    expect(result.unavailableReason).toBe("claude_agent_busy");
+    expect(backend.submitted).toEqual([]);
+  });
+
+  test("バーが見えていて /rc 消灯なら transcript に記録が残っていても inactive（stale 防止）", async () => {
+    const base = temporaryDirectory();
+    const backend = new FakeBackend(base);
+    backend.pane = ["❯", RC_OFF_BAR].join("\n");
+    const transcriptPath = writeBridgeSessionTranscript(base, [
+      { type: "bridge-session", sessionId: "x", bridgeSessionId: "cse_stale", lastSequenceNum: 0 },
+    ]);
+    const service = new OfficialAppsService({
+      commandRunner: commandRunner({
+        "claude --version": { success: true, stdout: "2.1.263 (Claude Code)\n" },
+        "claude auth status --json": { success: true, stdout: claudeAuth2_1_260() },
+      }),
+      actionLockPath: join(base, "action.lock"),
+    });
+    expect(
+      await service.status({
+        session: "s",
+        provider: "claude",
+        sessionManager: backend,
+        canInjectClaudeCommand: true,
+        canMutateCodexDaemon: true,
+        claudeTranscriptPath: transcriptPath,
+      }),
+    ).toMatchObject({ state: "inactive", canStart: true });
+  });
+});
+
+describe("Codex turn 実行中の open", () => {
+  function codexService(
+    base: string,
+    status: "connected" | "disabled" | "errored",
+    calls: string[],
+  ): OfficialAppsService {
+    return new OfficialAppsService({
+      commandRunner: commandRunner({
+        "codex --version": { success: true, stdout: "codex-cli 0.153.4\n" },
+      }),
+      now: () => 1_900_000_000,
+      actionLockPath: join(base, "action.lock"),
+      codexRemoteControl: {
+        remoteControlStatus: async () => {
+          calls.push("status");
+          return { status, hasEnvironment: true };
+        },
+        enableRemoteControl: async () => {
+          calls.push("enable");
+          return { status: "connected", hasEnvironment: true };
+        },
+        disableRemoteControl: async () => {
+          calls.push("disable");
+          return { status: "disabled", hasEnvironment: true };
+        },
+        startRemoteControlPairing: async () => {
+          calls.push("pair");
+          return { pairingCode: "code", manualPairingCode: "ABCD-EFGH", expiresAt: 1_900_000_600 };
+        },
+      },
+    });
+  }
+  const busyContext = (backend: FakeBackend) => ({
+    session: "s",
+    provider: "codex" as const,
+    sessionManager: backend,
+    canInjectClaudeCommand: false,
+    canMutateCodexDaemon: false,
+    claudeTranscriptPath: null,
+  });
+
+  test("接続済みなら turn 実行中でも open/repair は pairing 発行だけで通す（enable しない）", async () => {
+    const base = temporaryDirectory();
+    const backend = new FakeBackend(base);
+    const calls: string[] = [];
+    const service = codexService(base, "connected", calls);
+    expect(await service.status(busyContext(backend))).toMatchObject({ state: "active", canOpen: true });
+    expect(await service.perform(busyContext(backend), "open", true, true)).toEqual({
+      provider: "codex",
+      outcome: "open",
+      launchUrl: "https://chatgpt.com/codex/pair?pairing_code=code",
+    });
+    expect(await service.perform(busyContext(backend), "repair", true, true)).toMatchObject({
+      outcome: "pair",
+      manualPairingCode: "ABCD-EFGH",
+    });
+    // 自動起動 OFF でも接続済みなら pairing は発行できる。
+    expect(await service.perform(busyContext(backend), "open", false, true)).toMatchObject({ outcome: "open" });
+    expect(calls).not.toContain("enable");
+    // stop は daemon を変更するので turn 実行中は拒否。
+    expect(await service.perform(busyContext(backend), "stop", true, true)).toMatchObject({
+      unavailableReason: "codex_agent_busy",
+    });
+    expect(calls).not.toContain("disable");
+  });
+
+  test("errored でも enrollment 済みなら turn 実行中に pairing だけで開ける（実障害 status=errored）", async () => {
+    const base = temporaryDirectory();
+    const backend = new FakeBackend(base);
+    const calls: string[] = [];
+    const service = codexService(base, "errored", calls);
+    expect(await service.status(busyContext(backend))).toMatchObject({ state: "active", canOpen: true });
+    expect(await service.perform(busyContext(backend), "open", true, true)).toMatchObject({
+      outcome: "open",
+      launchUrl: "https://chatgpt.com/codex/pair?pairing_code=code",
+    });
+    expect(calls).not.toContain("enable");
+    // idle なら従来どおり enable を試してから pairing（errored の自己修復を優先）。
+    const idle = { ...busyContext(backend), canMutateCodexDaemon: true };
+    expect(await service.perform(idle, "open", true, true)).toMatchObject({ outcome: "open" });
+    expect(calls).toContain("enable");
+  });
+
+  test("未接続で turn 実行中なら enable が必要なので busy", async () => {
+    const base = temporaryDirectory();
+    const backend = new FakeBackend(base);
+    const calls: string[] = [];
+    const service = codexService(base, "disabled", calls);
+    expect(await service.status(busyContext(backend))).toMatchObject({ unavailableReason: "codex_agent_busy" });
+    expect(await service.perform(busyContext(backend), "open", true, true)).toMatchObject({
+      unavailableReason: "codex_agent_busy",
+    });
+    expect(calls).not.toContain("enable");
   });
 });
 
