@@ -26,6 +26,8 @@ import { codexRolloutSystemNotice } from "./codexSystemNotice.js";
 
 /** 履歴再生完了マーカーの streamId（claude 側と共通。iOS `ChatLogModel` と対で解釈）。 */
 export const HISTORY_DONE_STREAM_ID = "pc:history-done";
+/** 全履歴再生の開始。キャッシュから欠けた古い発言を新着として末尾へ追加しないための境界。 */
+export const HISTORY_BEGIN_STREAM_ID = "pc:history-begin";
 /** 利用中モデル通知マーカーの streamId（claude 側と共通）。 */
 export const MODEL_STREAM_ID = "pc:model";
 /** 現在コンテキストトークン数通知マーカーの streamId（claude 側と共通）。 */
@@ -193,7 +195,18 @@ export class CodexRolloutTailer {
     }
     try {
       let position = 0;
-      let lineBuf = Buffer.alloc(0);
+      let lineParts: Buffer[] = [];
+      let lineBytes = 0;
+      const takeLine = (suffix?: Buffer): Buffer => {
+        if (suffix !== undefined) {
+          lineParts.push(suffix);
+          lineBytes += suffix.length;
+        }
+        const line = Buffer.concat(lineParts, lineBytes);
+        lineParts = [];
+        lineBytes = 0;
+        return line;
+      };
       const state: TailState = {
         seq: 0,
         lastModel: null,
@@ -206,7 +219,11 @@ export class CodexRolloutTailer {
       let announcedReplayDone = false;
       let lifecycleCaughtUp = false;
       let latestLifecycle: CodexTurnLifecycleEvent | null = null;
-      const chunk = Buffer.alloc(4096);
+      const chunk = Buffer.alloc(64 * 1024);
+      let bytesSinceYield = 0;
+      if (this.emitReplayDoneMarker && newerThanMs === null) {
+        yield marker(HISTORY_BEGIN_STREAM_ID, "");
+      }
 
       while (!signal?.aborted) {
         let bytesRead = 0;
@@ -236,11 +253,11 @@ export class CodexRolloutTailer {
           // 初回 EOF は rollout の現在状態へ追いついた境界。履歴中の terminal event を
           // 1件ずつ再通知せず、最後の lifecycle だけを照合候補として渡す。
           if (!lifecycleCaughtUp) {
-            if (lineBuf.length > 0) {
-              const lifecycle = parseTurnLifecycle(lineBuf);
+            if (lineBytes > 0) {
+              const line = takeLine();
+              const lifecycle = parseTurnLifecycle(line);
               if (lifecycle !== null) latestLifecycle = lifecycle;
-              yield* emitLineAfter(lineBuf, state, newerThanMs);
-              lineBuf = Buffer.alloc(0);
+              yield* emitLineAfter(line, state, newerThanMs);
             }
             lifecycleCaughtUp = true;
             if (latestLifecycle !== null) this.notifyTurnLifecycle(latestLifecycle);
@@ -259,7 +276,7 @@ export class CodexRolloutTailer {
           }
           if (!this.tailIndefinitely) {
             if (this.tailDeadlineMs === null || Date.now() - start >= this.tailDeadlineMs) {
-              if (lineBuf.length > 0) yield* emitLineAfter(lineBuf, state, newerThanMs);
+              if (lineBytes > 0) yield* emitLineAfter(takeLine(), state, newerThanMs);
               return;
             }
           }
@@ -268,18 +285,33 @@ export class CodexRolloutTailer {
         }
 
         position += bytesRead;
-        lineBuf = Buffer.concat([lineBuf, chunk.subarray(0, bytesRead)]);
-        let nl = lineBuf.indexOf(0x0a);
+        const data = chunk.subarray(0, bytesRead);
+        let offset = 0;
+        let nl = data.indexOf(0x0a);
         while (nl >= 0) {
-          const line = lineBuf.subarray(0, nl);
-          lineBuf = lineBuf.subarray(nl + 1);
+          const suffix = data.subarray(offset, nl);
+          const line = lineBytes > 0 ? takeLine(suffix) : suffix;
           const lifecycle = parseTurnLifecycle(line);
           if (lifecycle !== null) {
             latestLifecycle = lifecycle;
             if (lifecycleCaughtUp) this.notifyTurnLifecycle(lifecycle);
           }
           yield* emitLineAfter(line, state, newerThanMs);
-          nl = lineBuf.indexOf(0x0a);
+          offset = nl + 1;
+          nl = data.indexOf(0x0a, offset);
+        }
+        if (offset < bytesRead) {
+          // 再利用する読み取り buffer からコピーし、改行まで断片を保持する。
+          // 数MBの画像行を4KBごとに全コピーしていた二乗コストを避ける。
+          const rest = Buffer.from(data.subarray(offset));
+          lineParts.push(rest);
+          lineBytes += rest.length;
+        }
+        bytesSinceYield += bytesRead;
+        if (bytesSinceYield >= 1024 * 1024) {
+          bytesSinceYield = 0;
+          // 本文を出さない画像行の走査中も、切断・送信・購読解除を処理できるようにする。
+          await new Promise<void>((resolve) => setImmediate(resolve));
         }
       }
     } finally {
@@ -508,6 +540,37 @@ export function* emitLine(line: Buffer, state: TailState): Generator<ControlMess
   const payload = record.payload;
   if (typeof payload !== "object" || payload === null) return;
   const kind = (payload as { type?: unknown }).type;
+
+  // 現行 rollout は user_message の代わりに item_completed/UserMessage を記録する。
+  // response_item の user 行には開発指示も混ざるため、発話と確定したこのイベントだけを採用。
+  if (kind === "item_completed") {
+    const item = asRecord((payload as Record<string, unknown>)["item"]);
+    if (item?.["type"] !== "UserMessage") return;
+    const id = item["id"];
+    const content = item["content"];
+    if (typeof id !== "string" || id.length === 0 || !Array.isArray(content)) return;
+    const text = content.flatMap((part) => {
+      const record = asRecord(part);
+      return record?.["type"] === "text" && typeof record["text"] === "string" ? [record["text"]] : [];
+    }).join("\n");
+    if (text.length === 0) return;
+    state.seq += 1;
+    const clientId = item["client_id"];
+    const streamId = typeof clientId === "string" && clientId.length > 0
+      ? `codex-user-${clientId}` : `codex-item-${id}`;
+    if (streamId !== `codex-item-${id}`) {
+      yield {
+        type: "chat_stream_alias", v: PROTOCOL_V1,
+        streamId, aliasStreamIds: [`codex-item-${id}`],
+      };
+    }
+    yield {
+      type: "chat_output", v: PROTOCOL_V1,
+      streamId,
+      role: "user", text, eof: true,
+    };
+    return;
+  }
 
   const systemNotice = codexRolloutSystemNotice(payload as Record<string, unknown>);
   if (systemNotice !== null) {

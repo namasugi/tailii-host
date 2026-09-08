@@ -7,6 +7,8 @@ import {
   CodexRolloutTailer,
   CONTEXT_STREAM_ID,
   CONTEXT_WINDOW_STREAM_ID,
+  HISTORY_BEGIN_STREAM_ID,
+  HISTORY_DONE_STREAM_ID,
   MODEL_STREAM_ID,
   type CodexTurnLifecycleEvent,
 } from "../src/codex/codexRolloutTailer.js";
@@ -132,6 +134,47 @@ describe("CodexRolloutTailer.streamForCwd（有限 tail）", () => {
     for await (const m of tailer.streamForCwd(cwd, null)) out.push(m);
     return out;
   }
+
+  test("大きい画像行を跨いで全履歴を最後まで読み、前後の発言と境界・user alias を維持する", async () => {
+    const root = makeTempDir("codex-large-history");
+    const cwd = makeTempDir("codex-large-history-cwd");
+    writeRollout(root, "2026/09/08", "r.jsonl", cwd, [
+      JSON.stringify({ type: "event_msg", payload: { type: "item_completed", item: {
+        type: "UserMessage", id: "old-user", client_id: "client-old",
+        content: [{ type: "text", text: "過去の質問" }],
+      } } }),
+      JSON.stringify({ type: "response_item", payload: { type: "function_call_output",
+        call_id: "image", output: "A".repeat(8 * 1024 * 1024) } }),
+      agentItem("final", "履歴の最後"),
+    ]);
+    const tailer = new CodexRolloutTailer({ sessionsRoot: root, tailDeadlineMs: 0, emitReplayDoneMarker: true });
+    const messages = await collect(tailer, cwd);
+    expect(messages.filter((m) => m.type === "chat_output").map((m) => m.streamId)).toEqual([
+      HISTORY_BEGIN_STREAM_ID, "codex-user-client-old", "codex-item-final", HISTORY_DONE_STREAM_ID,
+    ]);
+    expect(messages[1]).toMatchObject({ type: "chat_stream_alias", streamId: "codex-user-client-old",
+      aliasStreamIds: ["codex-item-old-user"] });
+  });
+
+  test("本文を出さない大きい行の走査中も購読解除を受け、残りの履歴を配信しない", async () => {
+    const root = makeTempDir("codex-large-history-abort");
+    const cwd = makeTempDir("codex-large-history-abort-cwd");
+    writeRollout(root, "2026/09/08", "r.jsonl", cwd, [
+      JSON.stringify({ type: "response_item", payload: { type: "function_call_output",
+        call_id: "image", output: "A".repeat(8 * 1024 * 1024) } }),
+      agentItem("after-abort", "離脱後には送らない"),
+    ]);
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), 0);
+    const tailer = new CodexRolloutTailer({ sessionsRoot: root, tailDeadlineMs: 0, emitReplayDoneMarker: true });
+    const messages: ControlMessage[] = [];
+    try {
+      for await (const message of tailer.streamForCwd(cwd, null, abort.signal)) messages.push(message);
+    } finally { clearTimeout(timer); }
+    expect(abort.signal.aborted).toBe(true);
+    expect(messages).toEqual([{ type: "chat_output", v: 1, streamId: HISTORY_BEGIN_STREAM_ID,
+      role: "system", text: "", eof: true }]);
+  });
 
   test("newerThanMs は rollout 内の切断前本文を除外する", async () => {
     const root = makeTempDir("codex-stream-newer-lines");

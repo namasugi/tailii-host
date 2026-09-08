@@ -87,6 +87,7 @@ describe("ChatTailController — codex モード", () => {
       (m): m is Extract<ControlMessage, { type: "chat_output" }> => m.type === "chat_output",
     );
     expect(chats.map((c) => [c.role, c.text])).toEqual([
+      ["system", ""], // pc:history-begin
       ["user", "コンパイルして"],
       ["assistant", "完了しました"],
       ["system", ""], // pc:history-done

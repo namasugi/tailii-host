@@ -1384,6 +1384,13 @@ export class SessionHub {
       ownState.backfilling = false;
       if (reason !== "history-done") {
         this.options.log?.(`audit backfill-force-finish session=${session} reason=${reason}`);
+        if (meta.agent === "codex") {
+          this.sendTo(client, {
+            type: "conversation_event", session, serverSeq: 0,
+            payload: { type: "chat_output", v: PROTOCOL_V1,
+              streamId: "pc:history-cancelled", role: "system", text: "", eof: true },
+          });
+        }
       }
       if (actor.codexLive !== null) {
         // codex は rollout(履歴) と app-server(live) が同じ発話を二重に表すため、履歴側が
