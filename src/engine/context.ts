@@ -119,6 +119,8 @@ export interface HandlerContext {
    */
   accountIdentity: AccountIdentityProvider;
   homeDir: string;
+  /** iOS クライアントの最新ビルド番号の記録先（host-auto-update, 既定 ~/.tailii/host/client-build.json）。 */
+  clientBuildRecordPath: string;
   modeTiming: ModeTiming;
   /** 会話の claude transcript パス（prompt-cancelled の照合用。既定は ~/.claude/projects 規則。テスト注入用）。 */
   transcriptPathFor: (meta: SessionMeta) => string | null;

@@ -80,6 +80,7 @@ import {
 import { herdrInstalled } from "../backend/herdr.js";
 import { createStaleDistGuard, isStaleDist, readPackageVersion, type StaleDistGuard } from "../shared/version.js";
 import { readRecentUpdateError, resolveInstallState } from "../commands/selfUpdate.js";
+import { clientBuildRecordPath as defaultClientBuildRecordPath, readLatestClientBuild } from "../shared/clientBuild.js";
 import { resolveHostDisplayName } from "../shared/hostDisplayName.js";
 import {
   DEFAULT_MODE_TIMING,
@@ -331,6 +332,8 @@ export interface RunEngineOptions {
   accountIdentity?: AccountIdentityProvider;
   /** slash_list のユーザーレベル探索ルート（既定は os.homedir()）。 */
   homeDir?: string;
+  /** iOS クライアントの最新ビルド番号の記録先（テスト注入用。既定 ~/.tailii/host/client-build.json）。 */
+  clientBuildRecordPath?: string;
   /** mode_get/mode_set の待機間隔（テストは短縮値を注入する）。 */
   modeTiming?: Partial<ModeTiming>;
   /** 会話の claude transcript パス解決（prompt-cancelled の照合用。テスト注入用）。 */
@@ -384,6 +387,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     hostVersions = fetchHostVersions,
     accountIdentity = fetchAccountIdentities,
     homeDir = os.homedir(),
+    clientBuildRecordPath = defaultClientBuildRecordPath(),
     modeTiming = {},
     transcriptPathFor = claudeTranscriptPathFor,
     staleDistGuard = createStaleDistGuard(),
@@ -504,6 +508,9 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     // updateError は managed のときだけ載せる（unmanaged では self-update が動かず提示先も無い。
     // dev 機に残った last-update.json が hello を環境依存にするのも防ぐ）。
     const updateError = installState.managed ? readRecentUpdateError(helloVersion ?? null) : undefined;
+    // このホストへ接続した最も新しいアプリビルド（過去の hello で記録）。アプリは自分の
+    // CFBundleVersion と比較して「より新しいビルドがある」を判定する（host-auto-update）。
+    const latestClientBuild = readLatestClientBuild(clientBuildRecordPath);
     writer.write({
       type: "channel_hello",
       v: PROTOCOL_V1,
@@ -513,6 +520,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
       ...(hostDisplayName !== null ? { hostName: hostDisplayName } : {}),
       managed: installState.managed,
       ...(updateError !== undefined ? { updateError } : {}),
+      ...(latestClientBuild !== null ? { latestClientBuild } : {}),
     });
 
     // ---- 1.5 画像 pending を drain し image_available を送出 ----
@@ -990,6 +998,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           hostVersions,
           accountIdentity,
           homeDir,
+          clientBuildRecordPath,
           modeTiming: resolvedModeTiming,
           transcriptPathFor,
           defaultAgent: agent,

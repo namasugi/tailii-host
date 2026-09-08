@@ -74,7 +74,17 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
 
   switch (type) {
     case "channel_hello":
-      return compact({ type, v, maxVersion: requireNumber(raw, "maxVersion"), serverVersion: optionalString(raw, "serverVersion"), hostName: optionalString(raw, "hostName"), managed: optionalBoolean(raw, "managed"), updateError: optionalString(raw, "updateError") });
+      return compact({
+        type, v,
+        maxVersion: requireNumber(raw, "maxVersion"),
+        serverVersion: optionalString(raw, "serverVersion"),
+        hostName: optionalString(raw, "hostName"),
+        managed: optionalBoolean(raw, "managed"),
+        updateError: optionalString(raw, "updateError"),
+        clientVersion: optionalString(raw, "clientVersion"),
+        clientBuild: optionalString(raw, "clientBuild"),
+        latestClientBuild: optionalString(raw, "latestClientBuild"),
+      });
 
     case "host_update_request":
       return compact({

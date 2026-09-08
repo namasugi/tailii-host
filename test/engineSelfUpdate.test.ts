@@ -9,6 +9,10 @@ import { decodeControlMessage } from "../src/protocol.js";
 import { readPackageVersion } from "../src/shared/version.js";
 import { TmuxSessionManager } from "../src/backend/tmux.js";
 import { MockTmuxRunner, startEngine } from "./helpers.js";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { readLatestClientBuild } from "../src/shared/clientBuild.js";
 
 function makeManager(): TmuxSessionManager {
   return new TmuxSessionManager({
@@ -29,6 +33,37 @@ describe("EngineControl — host_update_request", () => {
       await engine.teardown();
     }
   }, 15_000);
+
+  test("アプリの channel_hello が名乗った clientBuild を記録し、次回 hello で latestClientBuild として広告する", async () => {
+    const recordPath = join(mkdtempSync(join(tmpdir(), "tailii-hello-build-")), "client-build.json");
+    // 1 本目: 記録が無いので latestClientBuild は載らない。アプリが build 4 を名乗る。
+    const first = startEngine({ sessionManager: makeManager(), clientBuildRecordPath: recordPath });
+    try {
+      const hello = decodeControlMessage(await first.lines.nextOfType("channel_hello"));
+      expect(hello.type === "channel_hello" && hello.latestClientBuild).toBeUndefined();
+      first.writeLine(JSON.stringify({
+        type: "channel_hello", v: 1, maxVersion: 2, clientVersion: "1.0.0", clientBuild: "4",
+      }));
+      // 記録は hello 処理内で同期的に書かれる。後続 RPC の応答で処理完了を待つ。
+      first.writeLine(JSON.stringify({ type: "host_update_request", v: 1, id: "b1", version: "not-semver" }));
+      await first.lines.nextOfType("host_update_response");
+      expect(readLatestClientBuild(recordPath)).toBe("4");
+    } finally {
+      await first.teardown();
+    }
+    // 2 本目: 記録済みの build 4 を広告する。古い build 3 の接続では記録が後退しない。
+    const second = startEngine({ sessionManager: makeManager(), clientBuildRecordPath: recordPath });
+    try {
+      const hello = decodeControlMessage(await second.lines.nextOfType("channel_hello"));
+      expect(hello).toMatchObject({ type: "channel_hello", latestClientBuild: "4" });
+      second.writeLine(JSON.stringify({ type: "channel_hello", v: 1, maxVersion: 2, clientBuild: "3" }));
+      second.writeLine(JSON.stringify({ type: "host_update_request", v: 1, id: "b2", version: "not-semver" }));
+      await second.lines.nextOfType("host_update_response");
+      expect(readLatestClientBuild(recordPath)).toBe("4");
+    } finally {
+      await second.teardown();
+    }
+  }, 20_000);
 
   test("不正 version / 同版 / ダウングレード / dev-install を判定して応答する", async () => {
     const current = readPackageVersion();

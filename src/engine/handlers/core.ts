@@ -3,15 +3,31 @@
 // 端末バックエンド設定の読み書き（backend_get/backend_set, session-backend）。
 
 import { engineDiag, type HandlerRegistry } from "../context.js";
+import { recordClientBuild } from "../../shared/clientBuild.js";
 
 export const coreHandlers: HandlerRegistry = {
   channel_hello: (message, ctx) => {
     const { state } = ctx;
     // 採用版 = min(自分の maxVersion, 相手の maxVersion)（4.3）。
     state.negotiatedVersion = Math.min(state.ownMaxVersion, message.maxVersion);
+    // アプリが名乗ったバージョン/ビルド番号を記録する（host-auto-update）。旧アプリは省略する。
+    const client =
+      message.clientBuild !== undefined
+        ? ` client=${message.clientVersion ?? "?"} (${message.clientBuild})`
+        : "";
     process.stderr.write(
-      `[tailii-host engine] channel_hello negotiated v=${state.negotiatedVersion}\n`,
+      `[tailii-host engine] channel_hello negotiated v=${state.negotiatedVersion}${client}\n`,
     );
+    if (message.clientBuild !== undefined) {
+      const advanced = recordClientBuild(
+        {
+          clientBuild: message.clientBuild,
+          ...(message.clientVersion !== undefined ? { clientVersion: message.clientVersion } : {}),
+        },
+        ctx.clientBuildRecordPath,
+      );
+      if (advanced) engineDiag(`latestClientBuild advanced to ${message.clientBuild}`);
+    }
   },
 
   backend_get_request: (message, ctx) => {

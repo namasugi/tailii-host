@@ -377,7 +377,13 @@ export interface HostVersions {
 }
 
 export type ControlMessage =
-  | { type: "channel_hello"; v: number; maxVersion: number; serverVersion?: string; hostName?: string; managed?: boolean; updateError?: string }
+  /**
+   * チャネル確立直後のバージョン交換。iOS→host は `clientVersion`(CFBundleShortVersionString) /
+   * `clientBuild`(CFBundleVersion) を名乗り、host→iOS は `serverVersion` / `hostName` / `managed` /
+   * `updateError` に加え、このホストへ接続した最も新しいアプリビルド `latestClientBuild` を広告する
+   * （アプリ側の「より新しいビルドがある」判定に使う, host-auto-update）。
+   */
+  | { type: "channel_hello"; v: number; maxVersion: number; serverVersion?: string; hostName?: string; managed?: boolean; updateError?: string; clientVersion?: string; clientBuild?: string; latestClientBuild?: string }
   | { type: "host_update_request"; v: number; id: string; version: string; integrity?: string }
   | { type: "host_update_response"; v: number; id: string; status: HostUpdateStatus; error?: string | null }
   | { type: "approval_request"; v: number; id: string; tool: string; summary: string; cwd: string; diff?: ToolDiff }
