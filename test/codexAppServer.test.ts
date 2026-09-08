@@ -2,7 +2,8 @@
 
 import * as path from "node:path";
 import * as fs from "node:fs";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
+import { CodexNativeTurnController } from "../src/codex/codexNativeTurnController.js";
 import {
   CodexAppServerManager,
   type CodexAppServerConnection,
@@ -1784,7 +1785,7 @@ describe("CodexAppServerManager", () => {
     expect(thread.initialItems).toEqual([]);
   });
 
-  test("履歴ページングは空ページ・循環 cursor・上限ページ数で止まり、timeout は読み直さない", async () => {
+  test("履歴ページングは空ページ・循環 cursor・上限ページ数で止まる", async () => {
     const makeManager = (
       name: string,
       onItems: (cursor: string | undefined, calls: number) => unknown,
@@ -1841,15 +1842,155 @@ describe("CodexAppServerManager", () => {
     expect(runawayThread.liveSubscriptionError).toContain("exceeded 2000 pages");
     expect(runaway.itemsCalls()).toBe(2000);
 
-    // timeout: 接続が刺さっている可能性があるため読み直さず、文言非依存の確認もせずに伝播する。
-    const timeout = makeManager("thread-items-timeout", () => {
-      throw new Error("Codex App Server request timed out: thread/items/list");
-    });
-    await expect(timeout.manager.openThread({ threadId: "thread-items-timeout" }))
-      .rejects.toThrow("timed out: thread/items/list");
-    expect(timeout.itemsCalls()).toBe(1);
-    expect(timeout.connection.requests.some((request) => request.method === "thread/read")).toBe(false);
-    expect(timeout.connection.closed).toBe(1);
+  });
+
+  test.each(["completed", "inProgress"])(
+    "画像を含む履歴の途中で timeout しても、別接続で送信を復旧する（直近 turn: %s）",
+    async (status) => {
+      const probe = new FakeConnection();
+      const slow = new FakeConnection("thread-large");
+      const recovered = new FakeConnection("thread-large");
+      const remaining = [probe, slow, recovered];
+      const logs: string[] = [];
+      for (const connection of [slow, recovered]) {
+        connection.request = async (method, params) => {
+          connection.requests.push({ method, params });
+          if (method === "thread/resume") {
+            return { thread: { id: "thread-large", historyMode: "paginated", model: "gpt-6-astra" } };
+          }
+          if (method === "thread/turns/list") {
+            return { data: [{ id: "turn-current", status, items: [] }], nextCursor: null };
+          }
+          if (method === "thread/items/list") {
+            expect(connection).toBe(slow);
+            if (!(params as { cursor?: string }).cursor) {
+              return { data: [{ item: { id: "partial", type: "agentMessage", text: "部分履歴" } }], nextCursor: "large-page" };
+            }
+            throw new Error("Codex App Server request timed out: thread/items/list");
+          }
+          if (method === "turn/start") return { turn: { id: "turn-new" } };
+          if (method === "turn/steer") return { turnId: "turn-current" };
+          throw new Error(`unexpected request: ${method}`);
+        };
+      }
+      const manager = new CodexAppServerManager({
+        codexHome: makeTempDir("codex-app-server-large-history"),
+        connect: async () => {
+          const connection = remaining.shift();
+          if (!connection) throw new Error("unexpected reconnect");
+          return connection;
+        },
+        launch: () => {},
+        log: (message) => logs.push(message),
+      });
+      const controller = new CodexNativeTurnController({
+        appServer: { openThread: (options) => manager.openThread(options) },
+      });
+      const session = { session: "work", threadId: "thread-large", cwd: "/tmp/work" };
+
+      const snapshot = await controller.subscribeSession(session);
+      expect(snapshot.liveSubscribed).toBe(false);
+      expect(snapshot.liveSubscriptionError).toContain("timed out: thread/items/list");
+      expect(snapshot.itemIds.size).toBe(0); // 途中までの履歴を権威にしない。
+      expect(snapshot.model).toBe("gpt-6-astra");
+      expect(slow.closed).toBe(1);
+      expect(slow.notificationHandler).toBeNull();
+      expect(slow.serverRequestHandler).toBeNull();
+      expect(recovered.initialized).toBe(1);
+      expect(recovered.notificationHandler).not.toBeNull();
+      expect(recovered.serverRequestHandler).not.toBeNull();
+      expect(recovered.closed).toBe(0);
+      expect(logs.some((line) => line.includes("新しい接続で turn 操作を復旧"))).toBe(true);
+
+      await expect(controller.startTurn({ ...session, text: "続けて", clientUserMessageId: "client-once" }))
+        .resolves.toBe(status === "inProgress" ? "turn-current" : "turn-new");
+      expect(recovered.requests.filter((r) => r.method === "thread/items/list")).toEqual([]);
+      const sends = recovered.requests.filter((r) => r.method.startsWith("turn/"));
+      expect(sends).toHaveLength(1);
+      expect(sends[0]?.method).toBe(status === "inProgress" ? "turn/steer" : "turn/start");
+      expect(sends[0]?.params).toMatchObject({ clientUserMessageId: "client-once" });
+      controller.closeSession("work");
+    },
+  );
+
+  test.each(["thread/resume", "thread/turns/list"])(
+    "履歴 timeout 後の制御接続も %s で失敗したら再接続を繰り返さず送信しない",
+    async (failedMethod) => {
+      const probe = new FakeConnection();
+      const slow = new FakeConnection("thread-unresponsive");
+      const recovery = new FakeConnection("thread-unresponsive");
+      const remaining = [probe, slow, recovery];
+      for (const connection of [slow, recovery]) {
+        connection.request = async (method, params) => {
+          connection.requests.push({ method, params });
+          if ((connection === recovery && method === failedMethod) || method === "thread/items/list") {
+            throw new Error(`Codex App Server request timed out: ${method}`);
+          }
+          if (method === "thread/resume") return { thread: { id: "thread-unresponsive", historyMode: "paginated" } };
+          if (method === "thread/turns/list") return { data: [], nextCursor: null };
+          throw new Error(`unexpected request: ${method}`);
+        };
+      }
+      const manager = new CodexAppServerManager({
+        codexHome: makeTempDir("codex-app-server-recovery-failed"),
+        connect: async () => {
+          const connection = remaining.shift();
+          if (!connection) throw new Error("unexpected reconnect");
+          return connection;
+        },
+        launch: () => {},
+      });
+      await expect(manager.openThread({ threadId: "thread-unresponsive" }))
+        .rejects.toThrow(`timed out: ${failedMethod}`);
+      expect(remaining).toEqual([]);
+      expect(slow.closed).toBe(1);
+      expect(recovery.closed).toBe(1);
+      expect(recovery.requests.some((r) => r.method.startsWith("turn/"))).toBe(false);
+    },
+  );
+
+  test("履歴全ページで3秒の期限を共有し、期限を超える次ページを送らず制御を復旧する", async () => {
+    let now = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      const probe = new FakeConnection();
+      const slow = new FakeConnection("thread-budget");
+      const recovered = new FakeConnection("thread-budget");
+      const remaining = [probe, slow, recovered];
+      const timeouts: Array<number | undefined> = [];
+      slow.request = async (method, params, timeoutMs) => {
+        slow.requests.push({ method, params });
+        if (method === "thread/resume") return { thread: { id: "thread-budget", historyMode: "paginated" } };
+        timeouts.push(timeoutMs);
+        if (method === "thread/turns/list") {
+          now = 1_000;
+          return { data: [], nextCursor: null };
+        }
+        if (method === "thread/items/list") {
+          now = now === 1_000 ? 2_500 : 3_001;
+          return { data: [{ type: "agentMessage", id: `item-${now}`, text: "item" }], nextCursor: `page-${now}` };
+        }
+        throw new Error(`unexpected request: ${method}`);
+      };
+      const manager = new CodexAppServerManager({
+        codexHome: makeTempDir("codex-app-server-history-budget"),
+        connect: async () => {
+          const connection = remaining.shift();
+          if (!connection) throw new Error("unexpected reconnect");
+          return connection;
+        },
+        launch: () => {},
+      });
+      const thread = await manager.openThread({ threadId: "thread-budget" });
+      expect(timeouts).toEqual([3_000, 2_000, 500]);
+      expect(thread.liveSubscriptionReady).toBe(false);
+      expect(thread.initialItems).toEqual([]);
+      expect(thread.liveSubscriptionError).toContain("timed out: thread/items/list");
+      expect(slow.closed).toBe(1);
+      thread.close();
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   test("実行中 turn の復元は末尾から最初の inProgress を採用する", async () => {

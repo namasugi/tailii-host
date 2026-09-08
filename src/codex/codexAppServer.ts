@@ -20,6 +20,8 @@ const DEFAULT_TITLE_GENERATION_TIMEOUT_MS = 30_000;
 const THREAD_HISTORY_PAGE_LIMIT = 100;
 /** 履歴ページングの上限ページ数（100 件 × 2000 ページ）。cursor が進まない版でも無限ループしない。 */
 const THREAD_HISTORY_MAX_PAGES = 2_000;
+/** 全履歴の取得で送信経路を塞がないための総時間上限。超過時は別接続で制御を復旧する。 */
+const THREAD_HISTORY_SNAPSHOT_TIMEOUT_MS = 3_000;
 /** タイトル生成で最初の user prompt を探す上限ページ数（paginated の thread/items/list）。 */
 const THREAD_TITLE_PROMPT_MAX_PAGES = 4;
 const THREAD_TITLE_OUTPUT_SCHEMA = {
@@ -303,7 +305,8 @@ export class CodexAppServerThread {
     /**
      * この接続で thread/resume と履歴スナップショットの読み取り（または作成元 bootstrap）が
      * 成功し、live 通知を受け取れるか。turn 履歴が未生成の新規 thread は false。呼び出し側は
-     * 初回 turn の表示を rollout tail へフォールバックし、この接続を live 権威にしない。
+     * 履歴取得がタイムアウトした場合も false。表示は rollout tail へフォールバックし、
+     * この接続を live 本文の権威にしない（turn 操作と承認は接続を維持する）。
      */
     readonly liveSubscriptionReady: boolean,
     private readonly connection: CodexAppServerConnection,
@@ -989,6 +992,13 @@ export class CodexAppServerManager {
   /** 既存 thread を購読する長寿命接続を開く。turn と native approval はこの接続を流れる。 */
   async openThread(options: CodexAppServerThreadOptions): Promise<CodexAppServerThread> {
     await this.ensureRunning();
+    return this.openThreadAttempt(options, null);
+  }
+
+  private async openThreadAttempt(
+    options: CodexAppServerThreadOptions,
+    historyTimeout: string | null,
+  ): Promise<CodexAppServerThread> {
     const bootstrap = this.bootstrapConnections.get(options.threadId) ?? null;
     if (bootstrap !== null) this.bootstrapConnections.delete(options.threadId);
     // 作成元接続を引き継ぐ場合は thread/start 応答の model を購読時のモデルとして使う。
@@ -1011,11 +1021,12 @@ export class CodexAppServerManager {
       );
     });
     const removeDisconnect = connection.onDisconnect?.((error) => options.onDisconnect?.(error)) ?? (() => {});
+    let resumedSuccessfully = false;
     try {
       let initialItems: Record<string, unknown>[] = [];
       let initialActiveTurnId: string | null = null;
       let liveSubscriptionReady = bootstrap !== null;
-      let liveSubscriptionError: string | null = null;
+      let liveSubscriptionError: string | null = historyTimeout;
       if (bootstrap === null) {
         await connection.initialize();
         try {
@@ -1029,17 +1040,31 @@ export class CodexAppServerManager {
             threadId: options.threadId,
             excludeTurns: true,
           });
+          resumedSuccessfully = true;
           // thread の現在モデルは resume 応答が権威。履歴読み取りが失敗する未materialize
           // thread（turn 前）でも resume 自体は成立するため、snapshot より先に確定する。
           model = threadModel(resumed) ?? model;
-          const snapshot = await readThreadHistorySnapshotWithRetry(
-            connection,
-            options.threadId,
-            threadHistoryMode(resumed),
-          );
-          initialItems = snapshot.items;
-          initialActiveTurnId = snapshot.activeTurnId;
-          liveSubscriptionReady = true;
+          if (historyTimeout === null) {
+            const snapshot = await readThreadHistorySnapshotWithRetry(
+              connection,
+              options.threadId,
+              threadHistoryMode(resumed),
+            );
+            initialItems = snapshot.items;
+            initialActiveTurnId = snapshot.activeTurnId;
+            liveSubscriptionReady = true;
+          } else {
+            // 大きい画像・tool 出力を含む履歴は、同じ socket の後続 RPC も塞ぐ。
+            // 新しい接続で購読し直し、turn 状態だけ確認する。部分履歴を live の権威に
+            // せず rollout fallback を使う。実行中なら controller が start ではなく steer する。
+            initialActiveTurnId = activeTurnIdOfTurns(await listThreadTurns(connection, options.threadId, {
+              limit: 1,
+              sortDirection: "desc",
+              itemsView: "notLoaded",
+              all: false,
+              timeoutMs: THREAD_METADATA_PROBE_TIMEOUT_MS,
+            }));
+          }
         } catch (error) {
           // thread/start から最初の user turn まで turn 履歴は未作成で、別接続からの
           // 履歴読み取りは "no rollout found" / "list_turns is not supported yet" になる。
@@ -1076,6 +1101,18 @@ export class CodexAppServerManager {
       removeServerRequest();
       removeDisconnect();
       connection.close();
+      if (historyTimeout === null && resumedSuccessfully && (
+        isRequestTimeout(error, "thread/items/list") ||
+        isRequestTimeout(error, "thread/turns/list") ||
+        isRequestTimeout(error, "thread/read")
+      )) {
+        this.log?.(
+          `Codex thread ${options.threadId} の履歴取得がタイムアウト: ` +
+          `新しい接続で turn 操作を復旧し、表示は rollout fallback へ移行: ${String(error)}`,
+        );
+        // 履歴の再取得・turn の再送はしない。新しい制御接続での復旧は 1 回だけ。
+        return this.openThreadAttempt(options, String(error));
+      }
       throw error;
     }
   }
@@ -1534,6 +1571,8 @@ interface ThreadHistoryPageOptions {
   /** true なら nextCursor が尽きるまで続きのページも読む。 */
   all: boolean;
   timeoutMs?: number;
+  /** 全ページで共有する期限。個別 RPC の期限だけでは長い履歴が送信を塞ぎ続ける。 */
+  deadlineMs?: number;
 }
 
 interface ThreadTurnsListOptions extends ThreadHistoryPageOptions {
@@ -1565,6 +1604,7 @@ async function pageThreadHistory(
   let cursor: string | null = null;
   const visited = new Set<string>();
   for (let page = 1; page <= THREAD_HISTORY_MAX_PAGES; page += 1) {
+    const timeoutMs = historyRequestTimeout(method, options.deadlineMs, options.timeoutMs);
     const response = objectRecord(await connection.request(
       method,
       {
@@ -1574,7 +1614,7 @@ async function pageThreadHistory(
         ...params,
         ...(cursor === null ? {} : { cursor }),
       },
-      options.timeoutMs,
+      timeoutMs,
     ));
     const data = response?.["data"];
     if (!Array.isArray(data)) {
@@ -1592,6 +1632,13 @@ async function pageThreadHistory(
   throw new CodexHistoryShapeError(
     `Codex App Server ${method} exceeded ${THREAD_HISTORY_MAX_PAGES} pages for thread ${threadId}`,
   );
+}
+
+function historyRequestTimeout(method: string, deadlineMs?: number, timeoutMs?: number): number | undefined {
+  if (deadlineMs === undefined) return timeoutMs;
+  const remaining = deadlineMs - Date.now();
+  if (remaining <= 0) throw new Error(`Codex App Server request timed out: ${method}`);
+  return Math.min(remaining, timeoutMs ?? remaining);
 }
 
 /** id 付き要素の重複（同じページを返し続ける壊れた cursor 等）を排除する。id 無しは常に採用。 */
@@ -1709,6 +1756,7 @@ async function readThreadHistorySnapshot(
   connection: CodexAppServerConnection,
   threadId: string,
   historyMode: CodexThreadHistoryMode,
+  deadlineMs: number,
 ): Promise<{ items: Record<string, unknown>[]; activeTurnId: string | null }> {
   if (historyMode === "paginated") {
     const latest = await listThreadTurns(connection, threadId, {
@@ -1716,16 +1764,20 @@ async function readThreadHistorySnapshot(
       sortDirection: "desc",
       itemsView: "notLoaded",
       all: false,
+      deadlineMs,
     });
     const items = await listThreadItems(connection, threadId, {
       limit: THREAD_HISTORY_PAGE_LIMIT,
       sortDirection: "asc",
       all: true,
+      deadlineMs,
     });
     return { items, activeTurnId: activeTurnIdOfTurns(latest) };
   }
   const turns = turnsOfThreadResponse(
-    await connection.request("thread/read", { threadId, includeTurns: true }),
+    await connection.request(
+      "thread/read", { threadId, includeTurns: true }, historyRequestTimeout("thread/read", deadlineMs),
+    ),
   );
   return { items: itemsOfTurns(turns), activeTurnId: activeTurnIdOfTurns(turns) };
 }
@@ -1741,8 +1793,9 @@ async function readThreadHistorySnapshotWithRetry(
   threadId: string,
   historyMode: CodexThreadHistoryMode,
 ): Promise<{ items: Record<string, unknown>[]; activeTurnId: string | null }> {
+  const deadlineMs = Date.now() + THREAD_HISTORY_SNAPSHOT_TIMEOUT_MS;
   try {
-    return await readThreadHistorySnapshot(connection, threadId, historyMode);
+    return await readThreadHistorySnapshot(connection, threadId, historyMode, deadlineMs);
   } catch (error) {
     if (!(error instanceof Error) ||
       error instanceof CodexHistoryShapeError ||
@@ -1750,7 +1803,7 @@ async function readThreadHistorySnapshotWithRetry(
       isUnmaterializedThreadError(error, threadId)) {
       throw error;
     }
-    return readThreadHistorySnapshot(connection, threadId, historyMode);
+    return readThreadHistorySnapshot(connection, threadId, historyMode, deadlineMs);
   }
 }
 
