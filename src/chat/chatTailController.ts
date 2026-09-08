@@ -9,7 +9,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { LineWriter } from "../shared/lineWriter.js";
-import type { ImageService } from "./imageService.js";
+import { attachmentImagePaths, type ImageService } from "./imageService.js";
 import { TranscriptTailer, type ClaudeTurnLifecycleEvent } from "./transcriptTailer.js";
 import { SubagentTailer } from "./subagentTailer.js";
 import {
@@ -189,16 +189,10 @@ export class ChatTailController {
             // サムネ（image_available）を後続で発行し、
             // iOS にインライン表示させる（chat-attachments）。id は決定的（att-<streamId>-<n>）。
             if (imageService !== null && message.type === "chat_output" && message.role === "user") {
-              const paths = ChatTailController.attachmentImagePaths(message.text);
-              for (let n = 0; n < paths.length; n += 1) {
-                const available = await imageService.makeAvailable(
-                  paths[n]!,
-                  `att-${message.streamId}-${n}`,
-                );
-                if (available !== null) {
-                  attachedImagePaths.add(paths[n]!);
-                  writer.write(available);
-                }
+              for (const available of await imageService.makeAttachmentsAvailable(message.text, message.streamId)) {
+                if (ac.signal.aborted) break;
+                attachedImagePaths.add(available.path);
+                writer.write(available);
               }
             }
             // Read ツールで画像ファイルを読んだら、そのサムネ（image_available）を後続で発行し
@@ -280,7 +274,7 @@ export class ChatTailController {
     this.currentResolvedPath = resolvedNow;
     this.currentSubagentPump = null;
 
-    const { writer, codexTailer } = this;
+    const { writer, codexTailer, imageService } = this;
     ChatTailController.diag(
       `openCodex cwd=${cwd} preferred=${preferredSessionId ?? "nil"} newerThan=${newerThanMs === null ? "nil" : String(newerThanMs)} resolved=${resolvedNow ?? "nil"}`,
     );
@@ -298,6 +292,13 @@ export class ChatTailController {
           if (count <= 3 || count % 25 === 0) ChatTailController.diag(`emit codex chat_output #${count}`);
           try {
             writer.write(message);
+            // Codex の履歴/rollout fallback も元の user 発話に紐づく添付サムネを送る。
+            if (imageService !== null && message.type === "chat_output" && message.role === "user") {
+              for (const available of await imageService.makeAttachmentsAvailable(message.text, message.streamId)) {
+                if (ac.signal.aborted) break;
+                writer.write(available);
+              }
+            }
           } catch (error) {
             ChatTailController.diag(`codex write failed at #${count}: ${String(error)}`);
             break;
@@ -321,28 +322,7 @@ export class ChatTailController {
    * 裸パスは Tailii 管理配下に限定し、通常本文の任意の画像パスを添付と誤認しない。
    */
   static attachmentImagePaths(text: string): string[] {
-    const paths: string[] = [];
-    for (const match of text.matchAll(/@"(\/[^"]+)"/g)) {
-      if (match[1] !== undefined) paths.push(match[1]);
-    }
-    for (const match of text.matchAll(/@(\/[^\s"]+)/g)) {
-      if (match[1] !== undefined) paths.push(match[1]);
-    }
-    // MessageInputBar.composeOutgoing は upload 済みパスを @ なしで本文先頭へ置く。
-    // ファイル名は iOS 側で安全な文字へ正規化済みなので、空白/引用符を境界に抽出できる。
-    for (const match of text.matchAll(
-      /(?:^|[\s"])(\/(?:[^\s"]*\/)?\.tailii\/uploads\/[^\s"]+)/g,
-    )) {
-      if (match[1] !== undefined) paths.push(match[1]);
-    }
-    const seen = new Set<string>();
-    return paths.filter((p) => {
-      const ext = path.extname(p).slice(1).toLowerCase();
-      if (!ChatTailController.IMAGE_EXTENSIONS.has(ext)) return false;
-      if (seen.has(p)) return false;
-      seen.add(p);
-      return true;
-    });
+    return attachmentImagePaths(text);
   }
 
   /**

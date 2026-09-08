@@ -26,6 +26,7 @@ import {
   type ClaudeTurnLifecycleEvent,
 } from "../chat/transcriptTailer.js";
 import type { ChatAgent } from "../chat/chatTailController.js";
+import type { ImageService } from "../chat/imageService.js";
 import type { PanePreviewMode } from "./panePreviewPump.js";
 import type { QuestionAnswer } from "../protocol.js";
 import { PROTOCOL_V1, PROTOCOL_V2 } from "../protocol.js";
@@ -88,6 +89,8 @@ export type SessionHubOptions = Omit<ReaperTickOptions, "now"> & {
    */
   transcriptPathFor?: (meta: SessionMeta) => string | null;
   tailFactory?: HubTailFactory;
+  /** Codex live/fallback 本文の添付サムネ。履歴 tail と同じ原本 index を共有する。 */
+  imageService?: ImageService;
   previewPumpFactory?: HubPreviewPumpFactory;
   replayLimit?: number;
   questionInjector?: (answers: QuestionAnswer[], session: string) => Promise<void>;
@@ -1332,6 +1335,17 @@ export class SessionHub {
     const key = chatContentKey(payload);
     if (key !== null) incrementCount(state.publishedContentCounts, key);
     this.publishConversationEvent(session, actor, payload);
+    if (payload.type === "chat_output" && payload.role === "user" && this.options.imageService !== undefined) {
+      // 本文配信は止めず、完成したサムネを同じ streamId へ後着させる。
+      void this.options.imageService.makeAttachmentsAvailable(payload.text, payload.streamId).then(
+        (images) => {
+          // サムネ生成中の離脱/再購読/actor 破棄で、古い会話へ届かせない。
+          if (this.actors.get(session) !== actor || actor.codexLive !== state || actor.subscribers.size === 0) return;
+          for (const image of images) this.publishConversationEvent(session, actor, image);
+        },
+        (error) => this.options.log?.(`Codex 添付サムネ生成失敗 session=${session}: ${String(error)}`),
+      );
+    }
   }
 
   private publishConversationEvent(session: string, actor: SessionActor, payload: ControlMessage): void {

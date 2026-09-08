@@ -423,6 +423,7 @@ export async function runHubCommand(args: string[]): Promise<number> {
   const imageService = new ImageService();
   const hub = new SessionHub({
     runner,
+    imageService,
     heartbeatDir: defaultHeartbeatDir(),
     metadataStore,
     timeoutSeconds,

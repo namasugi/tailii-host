@@ -868,7 +868,11 @@ export function codexItemToChatOutput(item: Record<string, unknown>): ControlMes
         : [];
     }).join("\n");
     if (text.length === 0) return null;
-    return { type: "chat_output", v: PROTOCOL_V1, streamId: `codex-item-${id}`,
+    // iOS の楽観バブルと rollout の client_id に合わせ、添付サムネのアンカーも一致させる。
+    const clientId = item["clientId"];
+    const streamId = typeof clientId === "string" && clientId.length > 0
+      ? `codex-user-${clientId}` : `codex-item-${id}`;
+    return { type: "chat_output", v: PROTOCOL_V1, streamId,
       role: "user", text, eof: true };
   }
   if (type === "agentMessage") {

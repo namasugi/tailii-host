@@ -73,6 +73,10 @@ describe("CodexNativeTurnController", () => {
       item: { id: "a1", type: "agentMessage", text: "回答" },
     } });
     openOptions?.onNotification?.({ method: "item/completed", params: {
+      item: { id: "u2", clientId: "client-attachment", type: "userMessage",
+        content: [{ type: "text", text: "/Users/me/.tailii/uploads/img.jpg この画像を見て" }] },
+    } });
+    openOptions?.onNotification?.({ method: "item/completed", params: {
       item: { id: "r1", type: "reasoning", summary: ["非表示"] },
     } });
 
@@ -81,6 +85,9 @@ describe("CodexNativeTurnController", () => {
         streamId: "codex-item-u1", role: "user", text: "質問", eof: true } },
       { session: "work", itemId: "a1", payload: { type: "chat_output", v: 1,
         streamId: "codex-item-a1", role: "assistant", text: "回答", eof: true } },
+      { session: "work", itemId: "u2", payload: { type: "chat_output", v: 1,
+        streamId: "codex-user-client-attachment", role: "user",
+        text: "/Users/me/.tailii/uploads/img.jpg この画像を見て", eof: true } },
     ]);
   });
 

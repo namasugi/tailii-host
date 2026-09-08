@@ -32,6 +32,8 @@ export interface ThumbnailResult {
 /** サムネ生成の注入可能な抽象。読めない/画像でない場合は null。 */
 export type Thumbnailer = (imagePath: string, maxPixelSize: number) => Promise<ThumbnailResult | null>;
 
+type ImageAvailable = Extract<ControlMessage, { type: "image_available" }>;
+
 /** 原本 fetch の分割チャンクサイズ（生バイト, ≈32KiB）。base64 化前の生バイトで数える。 */
 const FETCH_CHUNK_SIZE = 32 * 1024;
 
@@ -216,9 +218,20 @@ export class ImageService {
    * 指定パスから直接 `image_available` を生成する（pending 非経由・chat 添付用）。
    * 生成成功時は id→path を index に記録する。不存在・非画像は null（ベストエフォート）。
    */
-  async makeAvailable(imagePath: string, imageId: string): Promise<ControlMessage | null> {
+  async makeAvailable(imagePath: string, imageId: string): Promise<ImageAvailable | null> {
     const message = await this.generate(imageId, imagePath, null);
     return message.type === "image_available" ? message : null;
+  }
+
+  /** Claude/Codex・履歴/live 共通。欠損画像があっても添付連番を詰めず、元発話へ紐づける。 */
+  async makeAttachmentsAvailable(text: string, streamId: string): Promise<ImageAvailable[]> {
+    const available: ImageAvailable[] = [];
+    const paths = attachmentImagePaths(text);
+    for (const [index, imagePath] of paths.entries()) {
+      const image = await this.makeAvailable(imagePath, `att-${streamId}-${index}`);
+      if (image !== null) available.push(image);
+    }
+    return available;
   }
 
   /** サムネ生成の中核（pending 経路と直接経路で共有）。 */
@@ -348,4 +361,30 @@ export class ImageService {
 
 function notFound(id: string): ControlMessage {
   return { type: "error", v: PROTOCOL_V1, id, code: "image_not_found", message: "画像が見つかりません" };
+}
+
+/** 添付パス抽出は Claude/Codex・履歴/live の各配信経路で共有する。 */
+export function attachmentImagePaths(text: string): string[] {
+  const paths: string[] = [];
+  for (const match of text.matchAll(/@"(\/[^"]+)"/g)) {
+    if (match[1] !== undefined) paths.push(match[1]);
+  }
+  for (const match of text.matchAll(/@(\/[^\s"]+)/g)) {
+    if (match[1] !== undefined) paths.push(match[1]);
+  }
+  // MessageInputBar.composeOutgoing は upload 済みパスを @ なしで本文先頭へ置く。
+  // ファイル名は iOS 側で安全な文字へ正規化済みなので、空白/引用符を境界に抽出できる。
+  for (const match of text.matchAll(
+    /(?:^|[\s"])(\/(?:[^\s"]*\/)?\.tailii\/uploads\/[^\s"]+)/g,
+  )) {
+    if (match[1] !== undefined) paths.push(match[1]);
+  }
+  const seen = new Set<string>();
+  return paths.filter((p) => {
+    const ext = path.extname(p).slice(1).toLowerCase();
+    if (!IMAGE_EXTENSIONS.has(ext)) return false;
+    if (seen.has(p)) return false;
+    seen.add(p);
+    return true;
+  });
 }

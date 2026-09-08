@@ -7,6 +7,7 @@ import * as path from "node:path";
 import { bumpHeartbeat, readHeartbeat, writeHeartbeat } from "../src/sessions/heartbeat.js";
 import { SessionHub, type HubTail } from "../src/hub/sessionHub.js";
 import { HISTORY_DONE_STREAM_ID } from "../src/chat/transcriptTailer.js";
+import { ImageService } from "../src/chat/imageService.js";
 import { codexCommandActivity, toolActivityMessage } from "../src/codex/codexToolActivity.js";
 import type { ControlMessage } from "../src/protocol.js";
 import type {
@@ -2231,6 +2232,7 @@ describe("SessionHub conversation stream", () => {
 function makeCodexStreamingHub(options: {
   subscribeFails?: boolean;
   liveSubscribed?: boolean;
+  imageService?: ImageService;
   /** 購読時に App Server が返す thread の現在モデル（thread/resume 応答）。 */
   model?: string | null;
 } = {}) {
@@ -2262,6 +2264,7 @@ function makeCodexStreamingHub(options: {
   };
   const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-codex-live"),
     metadataStore, timeoutSeconds: 1800,
+    ...(options.imageService ? { imageService: options.imageService } : {}),
     tailFactory: (write, onCodexTurnLifecycle) => {
       writes.push(write);
       lifecycleWrites.push(onCodexTurnLifecycle);
@@ -2285,6 +2288,76 @@ function makeCodexStreamingHub(options: {
 describe("SessionHub Codex App Server live stream", () => {
   const chat = (role: "user" | "assistant" | "system", text: string, streamId: string): ControlMessage =>
     ({ type: "chat_output", v: 1, streamId, role, text, eof: true });
+
+  test.each(["live", "buffered", "fallback"])("%s の添付は元発話の ID でサムネを1回配信する", async (mode) => {
+    const root = makeTempDir("hub-codex-thumbnail");
+    const imagePath = path.join(root, ".tailii", "uploads", "img-A7BCDDF4.jpg");
+    fs.mkdirSync(path.dirname(imagePath), { recursive: true });
+    fs.writeFileSync(imagePath, Buffer.from([0xff, 0xd8, 0xff]));
+    const imageService = new ImageService({ indexBase: path.join(root, "index"),
+      thumbnailer: async () => ({ thumbnailBase64: "QUFB", width: 8, height: 6 }) });
+    const { hub, writes, getCallbacks } = makeCodexStreamingHub({ imageService });
+    const client = {}, received: any[] = [];
+    subscribe(hub, client, received);
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+    const streamId = mode === "fallback" ? "codex-turn-2" : "codex-item-image";
+    const payload = chat("user", `${imagePath} codexが繋がらない`, streamId);
+    const emitNative = () => getCallbacks().onChatItem?.({ session: "work", itemId: "image", payload });
+    if (mode === "buffered") {
+      emitNative();
+      expect(received.filter((m) => m?.payload?.type === "image_available")).toHaveLength(0);
+    }
+    writes[0]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+    if (mode === "fallback") {
+      getCallbacks().onDisconnect?.("work", new Error("closed"));
+      writes[1]!(payload);
+      writes[1]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+    } else {
+      emitNative(); // buffered の場合も同じ item を再通知し、二重配信されないことを確認。
+    }
+    await vi.waitFor(() => expect(received.filter((m) => m?.payload?.type === "image_available"))
+      .toHaveLength(1));
+    const imageEvent = received.find((m) => m?.payload?.type === "image_available");
+    expect(imageEvent).toMatchObject({ session: "work", payload: {
+      id: `att-${streamId}-0`, path: imagePath, thumbnail: "QUFB",
+    } });
+    const userEvent = received.find((m) => m?.payload?.streamId === streamId);
+    expect(imageEvent.serverSeq).toBeGreaterThan(userEvent.serverSeq);
+    expect(hub.actors.get("work")?.replayBuffer.map((event) => event.payload)).toContainEqual(imageEvent.payload);
+    hub.close();
+  });
+
+  test("サムネ生成中に離脱・再購読したら古い購読の画像を配信しない", async () => {
+    const root = makeTempDir("hub-codex-late-thumbnail");
+    const imagePath = path.join(root, ".tailii", "uploads", "image.jpg");
+    fs.mkdirSync(path.dirname(imagePath), { recursive: true });
+    fs.writeFileSync(imagePath, Buffer.from([0xff, 0xd8, 0xff]));
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const thumbnailer = vi.fn(async () => {
+      await pending;
+      return { thumbnailBase64: "QUFB", width: 8, height: 6 };
+    });
+    const imageService = new ImageService({ indexBase: path.join(root, "index"), thumbnailer });
+    const { hub, writes, getCallbacks } = makeCodexStreamingHub({ imageService });
+    const client = {}, received: any[] = [];
+    subscribe(hub, client, received);
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+    writes[0]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+    getCallbacks().onChatItem?.({ session: "work", itemId: "image",
+      payload: chat("user", imagePath, "codex-user-client-image") });
+    expect(thumbnailer).toHaveBeenCalledOnce();
+    hub.handleClientMessage(client, JSON.stringify({ type: "conversation_unsubscribe", session: "work" }));
+    hub.handleClientMessage(client, JSON.stringify({ type: "conversation_subscribe", session: "work" }));
+    await vi.waitFor(() => expect(writes).toHaveLength(2));
+    writes[1]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+    release();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(received.filter((m) => m?.payload?.type === "image_available")).toHaveLength(0);
+    expect(hub.actors.get("work")?.replayBuffer.filter((event) => event.payload.type === "image_available"))
+      .toHaveLength(0);
+    hub.close();
+  });
 
   test("購読を先に開き、backfill 境界の item を欠落・重複なく live へ切り替える", async () => {
     const { hub, writes, tails, getCallbacks } = makeCodexStreamingHub();
