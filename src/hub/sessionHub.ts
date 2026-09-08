@@ -139,7 +139,15 @@ const DELIVERED_RECEIPT_TTL_MS = 30 * 24 * 60 * 60 * 1_000;
 const MAX_DELIVERED_RECEIPTS_PER_SESSION = 10_000;
 interface CodexBufferedItem { itemId: string; payload: ControlMessage }
 interface CodexLiveState {
-  phase: "starting" | "backfill" | "live" | "fallback-scan" | "fallback-live";
+  phase: "backfill" | "live" | "fallback-scan" | "fallback-live";
+  /**
+   * App Server 購読（thread/resume + 履歴スナップショット）が確定したか。rollout の backfill は
+   * 購読の完了を待たずに始めるため、`pc:history-done` と snapshot の到着順は不定。両方が揃った
+   * 時点で live へ切り替える（片方だけでは backfill のまま rollout を一次ソースにし続ける）。
+   */
+  snapshotReady: boolean;
+  /** rollout backfill が `pc:history-done` まで到達したか（snapshot 待ちの間だけ意味を持つ）。 */
+  historyDone: boolean;
   initialItemIds: ReadonlySet<string>;
   initialContentCounts: ReadonlyMap<string, number>;
   buffered: CodexBufferedItem[];
@@ -1108,7 +1116,9 @@ export class SessionHub {
     newerThanMs: number | null,
   ): void {
     const state: CodexLiveState = {
-      phase: "starting",
+      phase: "backfill",
+      snapshotReady: false,
+      historyDone: false,
       initialItemIds: new Set(),
       initialContentCounts: new Map(),
       buffered: [],
@@ -1122,10 +1132,16 @@ export class SessionHub {
       scanLastModel: null,
     };
     actor.codexLive = state;
+    // 履歴表示は rollout だけで完結する。App Server の購読（daemon 起動・接続・thread/resume・
+    // 履歴スナップショット。巨大 thread では items/list が 3 秒で timeout してから復旧接続へ進む）
+    // の完了を待ってから rollout を開くと、その間 iOS は「会話を読み込み中…」のまま止まって
+    // 見える。rollout の backfill を先に始め、購読は並行して確立する。境界照合（flushCodexBuffer）
+    // は history-done と snapshot の両方が揃った時点で行う（順序不定）。
+    this.openCodexRollout(session, actor, cwd, threadId, newerThanMs);
     const controller = this.ensureCodexTurnController();
     const subscribe = controller.subscribeSession;
     if (subscribe === undefined) {
-      this.startCodexFallback(session, actor, cwd, threadId, newerThanMs, false);
+      this.degradeCodexToFallback(session, actor, state, null);
       return;
     }
     void subscribe.call(controller, { session, threadId, cwd }).then(
@@ -1141,18 +1157,60 @@ export class SessionHub {
             `Codex App Server の履歴スナップショットが読めない（turn 前の未materialize か履歴読み取り失敗）ため、rollout fallbackへ移行 session=${session} thread=${threadId}` +
             (snapshot.liveSubscriptionError ? `（理由: ${snapshot.liveSubscriptionError}）` : ""),
           );
-          this.startCodexFallback(session, actor, cwd, threadId, newerThanMs, false);
+          this.degradeCodexToFallback(session, actor, state, null);
           return;
         }
-        state.phase = "backfill";
-        this.openCodexRollout(session, actor, cwd, threadId, newerThanMs);
+        state.snapshotReady = true;
+        if (state.historyDone) this.finishCodexBackfill(session, actor, state);
       },
       (error) => {
         if (actor.codexLive !== state || actor.subscribers.size === 0) return;
-        this.options.log?.(`Codex App Server 購読失敗、rollout fallback へ移行: ${String(error)}`);
-        this.startCodexFallback(session, actor, cwd, threadId, newerThanMs, false);
+        this.degradeCodexToFallback(
+          session, actor, state, `Codex App Server 購読失敗、rollout fallback へ移行: ${String(error)}`,
+        );
       },
     );
+  }
+
+  /**
+   * 購読が成立しない（未materialize・履歴読み取り失敗・購読エラー）と分かった時点で、既に開いて
+   * いる rollout tail をそのまま一次ソースに降格する。tail を開き直すと履歴を頭から二重再生する
+   * ため再利用する（接続断と同じ扱い: history-done で fallback-live へ、到達済みなら即座に）。
+   */
+  private degradeCodexToFallback(
+    session: string,
+    actor: SessionActor,
+    state: CodexLiveState,
+    logMessage: string | null,
+  ): void {
+    if (logMessage !== null) this.options.log?.(logMessage);
+    state.disconnected = true;
+    state.buffered.length = 0;
+    if (state.phase === "backfill" && state.historyDone) this.finishCodexBackfill(session, actor, state);
+  }
+
+  /** backfill 完了（history-done）と購読の確定（snapshot または fallback）が揃った時点の切り替え。 */
+  private finishCodexBackfill(session: string, actor: SessionActor, state: CodexLiveState): void {
+    // 履歴末尾の turn_context より新しい設定変更（turn 未実行）は rollout に無い。
+    // 購読時の thread モデルで上書きする（同値なら畳む）。fallback でも resume が
+    // 成立していれば同じ。
+    const subscribedModel = state.subscribedModel;
+    state.subscribedModel = null;
+    if (state.disconnected) {
+      // fallback 確定前に届いた App Server item は、この継続 rollout と同じ内容を
+      // 別 streamId で持ち得る。rollout を唯一の一次ソースにした時点で破棄し、
+      // history 完了時に flush して会話全体を二重表示しない。
+      state.buffered.length = 0;
+      state.phase = "fallback-live"; // この tail は既に同じ EOF 境界にいるので継続利用する。
+    } else {
+      this.flushCodexBuffer(session, actor, state);
+      state.phase = "live";
+      // 本文は以後 App Server のみを採用するが、rollout tail 自体は lifecycle の
+      // 副監視として残す。ここで止めると、後続 turn の App Server `turn/completed`
+      // 欠落時に terminal event（task_complete / turn_aborted）を観測できず、
+      // 処理中状態を自己修復できない。
+    }
+    this.publishCodexModelMarker(session, actor, state, subscribedModel);
   }
 
   private openCodexRollout(
@@ -1209,34 +1267,18 @@ export class SessionHub {
           return;
         }
 
-        // App Server 購読を先に確立して通知を buffer し、その後 rollout を EOF まで読む。
+        // rollout を EOF まで読みつつ、App Server 購読は並行して確立し通知を buffer する。
         // resume 応答の item ID / content occurrence を境界スナップショットとして使い、
-        // EOF 後は rollout にまだ無い buffered item だけを flush する。event_msg 自体には
-        // item ID が無いため、同文は Set ではなく occurrence count で照合する。
+        // 両方が揃った時点で rollout にまだ無い buffered item だけを flush する。event_msg
+        // 自体には item ID が無いため、同文は Set ではなく occurrence count で照合する。
+        // snapshot がまだなら backfill のまま留まり、EOF 以降に rollout へ追記された行も
+        // この経路で配信する（snapshot 側の occurrence と後で照合されるので重複しない）。
         this.publishConversationEvent(session, actor, payload);
         if (contentKey !== null) incrementCount(state.publishedContentCounts, contentKey);
         if (isModelMarker) state.lastModel = payload.text;
         if (!isHistoryDone) return;
-        // 履歴末尾の turn_context より新しい設定変更（turn 未実行）は rollout に無い。
-        // 購読時の thread モデルで上書きする（同値なら畳む）。fallback でも resume が
-        // 成立していれば同じ。
-        const subscribedModel = state.subscribedModel;
-        state.subscribedModel = null;
-        if (state.disconnected) {
-          // fallback 確定前に届いた App Server item は、この継続 rollout と同じ内容を
-          // 別 streamId で持ち得る。rollout を唯一の一次ソースにした時点で破棄し、
-          // history 完了時に flush して会話全体を二重表示しない。
-          state.buffered.length = 0;
-          state.phase = "fallback-live"; // この tail は既に同じ EOF 境界にいるので継続利用する。
-        } else {
-          this.flushCodexBuffer(session, actor, state);
-          state.phase = "live";
-          // 本文は以後 App Server のみを採用するが、rollout tail 自体は lifecycle の
-          // 副監視として残す。ここで止めると、後続 turn の App Server `turn/completed`
-          // 欠落時に terminal event（task_complete / turn_aborted）を観測できず、
-          // 処理中状態を自己修復できない。
-        }
-        this.publishCodexModelMarker(session, actor, state, subscribedModel);
+        state.historyDone = true;
+        if (state.snapshotReady || state.disconnected) this.finishCodexBackfill(session, actor, state);
       },
       (event) => {
         if (actor.codexLive !== state || event.state !== "done") return;
@@ -1261,7 +1303,7 @@ export class SessionHub {
     // 成立しておらず live 通知の完全性を保証できない。fallback 選択後は rollout だけを
     // 一次ソースにし、運良く届いた App Server item を backfill buffer へ混ぜて重複させない。
     if (state.disconnected) return;
-    if (state.phase === "starting" || state.phase === "backfill") {
+    if (state.phase === "backfill") {
       // tool_activity は buffer せず捨てる。履歴は rollout（backfill）側が同じカードを
       // 供給するのが正で、live 由来と rollout 由来のカードは id が一致しないため
       // snapshot occurrence 照合に混ぜると開くたびに重複しうる。backfill 中に完了した
@@ -1316,29 +1358,34 @@ export class SessionHub {
     const actor = this.actors.get(session);
     const state = actor?.codexLive;
     if (actor === undefined || state == null || actor.subscribers.size === 0) return;
-    this.options.log?.(`Codex App Server 接続断、rollout fallback へ移行: ${String(error)}`);
+    const logMessage = `Codex App Server 接続断、rollout fallback へ移行: ${String(error)}`;
+    if (state.phase === "backfill") {
+      // backfill 中（snapshot 待ちを含む）の切断は、開いている rollout tail をそのまま一次ソースにする。
+      this.degradeCodexToFallback(session, actor, state, logMessage);
+      return;
+    }
+    this.options.log?.(logMessage);
     state.disconnected = true;
-    if (state.phase === "starting" || state.phase === "backfill") return;
     if (state.phase !== "live") return;
     const meta = this.options.metadataStore.get(session);
     if (meta === null) return;
-    this.startCodexFallback(
-      session, actor, meta.cwd, meta.providerSessionId ?? meta.claudeSessionId ?? null, null, true,
+    this.startCodexFallbackRescan(
+      session, actor, meta.cwd, meta.providerSessionId ?? meta.claudeSessionId ?? null, null,
     );
   }
 
-  private startCodexFallback(
+  /** live 移行後の接続断: rollout を頭から再走査し、配信済み本文を occurrence 照合で除外して継続する。 */
+  private startCodexFallbackRescan(
     session: string,
     actor: SessionActor,
     cwd: string,
     threadId: string | null,
     newerThanMs: number | null,
-    rescan: boolean,
   ): void {
     const state = actor.codexLive;
     if (state === null) return;
     actor.tail?.stop();
-    state.phase = rescan ? "fallback-scan" : "backfill";
+    state.phase = "fallback-scan";
     state.disconnected = true;
     state.buffered.length = 0;
     state.scanContentCounts.clear();

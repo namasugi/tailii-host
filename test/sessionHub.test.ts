@@ -2269,6 +2269,8 @@ function makeCodexStreamingHub(options: {
   imageService?: ImageService;
   /** 購読時に App Server が返す thread の現在モデル（thread/resume 応答）。 */
   model?: string | null;
+  /** true なら subscribeSession を `releaseSubscribe()` まで解決させない（購読より先に rollout が EOF に達する順序）。 */
+  holdSubscribe?: boolean;
 } = {}) {
   const metadataStore = makeTempStore();
   metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0,
@@ -2284,13 +2286,17 @@ function makeCodexStreamingHub(options: {
     callbacks.onProcessing?.(session, "done");
     return true;
   });
+  let releaseSubscribe: () => void = () => {};
+  const gate = new Promise<void>((resolve) => { releaseSubscribe = resolve; });
   const controller: CodexTurnControllerRuntime = {
-    subscribeSession: options.subscribeFails
-      ? async () => { throw new Error("app server unavailable"); }
-      : async () => ({ itemIds: new Set(["history-item"]),
-          contentCounts: new Map([["assistant\u0000履歴", 1]]),
-          liveSubscribed: options.liveSubscribed ?? true,
-          model: options.model ?? null }),
+    subscribeSession: async () => {
+      if (options.holdSubscribe) await gate;
+      if (options.subscribeFails) throw new Error("app server unavailable");
+      return { itemIds: new Set(["history-item"]),
+        contentCounts: new Map([["assistant\u0000履歴", 1]]),
+        liveSubscribed: options.liveSubscribed ?? true,
+        model: options.model ?? null };
+    },
     startTurn: async () => "turn-1",
     reconcileCompletedTurn,
     closeSession: vi.fn(),
@@ -2316,6 +2322,7 @@ function makeCodexStreamingHub(options: {
     tails,
     reconcileCompletedTurn,
     getCallbacks: () => callbacks,
+    releaseSubscribe: () => releaseSubscribe(),
   };
 }
 
@@ -2390,6 +2397,77 @@ describe("SessionHub Codex App Server live stream", () => {
     expect(received.filter((m) => m?.payload?.type === "image_available")).toHaveLength(0);
     expect(hub.actors.get("work")?.replayBuffer.filter((event) => event.payload.type === "image_available"))
       .toHaveLength(0);
+    hub.close();
+  });
+
+  // 履歴表示は rollout だけで完結する。App Server 購読（daemon 起動・resume・履歴スナップショット。
+  // 巨大 thread では items/list の 3 秒 timeout 後に復旧接続へ進む）を待ってから rollout を開くと、
+  // その間 iOS は「会話を読み込み中…」のまま止まって見える（2026-09-08 実障害）。
+  test("rollout backfill は App Server 購読の完了を待たず、history-done を先に配信する", async () => {
+    const { hub, writes, tails, getCallbacks, releaseSubscribe } =
+      makeCodexStreamingHub({ holdSubscribe: true, model: "gpt-current" });
+    const client = {}, received: any[] = [];
+    subscribe(hub, client, received);
+    // 購読は未解決のまま rollout tail が同期的に開く。
+    expect(writes).toHaveLength(1);
+    writes[0]!(chat("assistant", "履歴", "codex-turn-1"));
+    writes[0]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+    const streamIds = () => received.flatMap((message) => message?.payload?.streamId ? [message.payload.streamId] : []);
+    expect(streamIds()).toEqual(["codex-turn-1", HISTORY_DONE_STREAM_ID]);
+
+    // snapshot 待ちの間: live 通知は buffer、EOF 以降の rollout 追記は backfill 経路で配信する。
+    getCallbacks().onChatItem?.({ session: "work", itemId: "history-item",
+      payload: chat("assistant", "履歴", "codex-item-history-item") });
+    getCallbacks().onChatItem?.({ session: "work", itemId: "live-item",
+      payload: chat("assistant", "境界の新着", "codex-item-live-item") });
+    writes[0]!(chat("assistant", "EOF 後の追記", "codex-turn-2"));
+    const texts = () => received.flatMap((message) => message?.payload?.role === "assistant"
+      ? [message.payload.text] : []);
+    expect(texts()).toEqual(["履歴", "EOF 後の追記"]);
+
+    // snapshot 到着で境界照合: snapshot item は rollout 済みなので捨て、新着だけ flush して live へ。
+    releaseSubscribe();
+    await vi.waitFor(() => expect(texts()).toEqual(["履歴", "EOF 後の追記", "境界の新着"]));
+    expect(received.flatMap((message) =>
+      message?.payload?.streamId === "pc:model" ? [message.payload.text] : [])).toEqual(["gpt-current"]);
+    expect(tails[0]!.stopped).toBe(false);
+    getCallbacks().onChatItem?.({ session: "work", itemId: "live-2",
+      payload: chat("assistant", "live 本文", "codex-item-live-2") });
+    writes[0]!(chat("assistant", "live 本文", "codex-turn-3")); // live 移行後の rollout 本文は無視。
+    expect(texts()).toEqual(["履歴", "EOF 後の追記", "境界の新着", "live 本文"]);
+    hub.close();
+  });
+
+  test("history-done 後に購読が不成立なら、同じ rollout tail のまま fallback-live へ降格する", async () => {
+    const { hub, writes, tails, getCallbacks, releaseSubscribe } =
+      makeCodexStreamingHub({ holdSubscribe: true, liveSubscribed: false });
+    const client = {}, received: any[] = [];
+    subscribe(hub, client, received);
+    expect(writes).toHaveLength(1);
+    writes[0]!(chat("assistant", "初期履歴", "codex-turn-1"));
+    writes[0]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+    // 降格前に届いた live item は rollout と同文を別 streamId で持ち得るので捨てる。
+    getCallbacks().onChatItem?.({ session: "work", itemId: "partial-live",
+      payload: chat("assistant", "初回ターンの新着", "codex-item-partial-live") });
+    releaseSubscribe();
+    await vi.waitFor(() => expect(hub.actors.get("work")?.codexLive?.phase).toBe("fallback-live"));
+    writes[0]!(chat("assistant", "初回ターンの新着", "codex-turn-2"));
+    expect(writes).toHaveLength(1); // 履歴を頭から二重再生する開き直しはしない。
+    expect(tails[0]!.stopped).toBe(false);
+    expect(received.filter((message) => message?.payload?.text === "初回ターンの新着")).toHaveLength(1);
+    hub.close();
+  });
+
+  test("snapshot 待ちの間の接続断は同じ tail で即 fallback-live へ移行する", async () => {
+    const { hub, writes, getCallbacks } = makeCodexStreamingHub({ holdSubscribe: true });
+    const client = {}, received: any[] = [];
+    subscribe(hub, client, received);
+    writes[0]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+    getCallbacks().onDisconnect?.("work", new Error("closed"));
+    expect(hub.actors.get("work")?.codexLive?.phase).toBe("fallback-live");
+    writes[0]!(chat("assistant", "切断後の新着", "codex-turn-2"));
+    expect(writes).toHaveLength(1);
+    expect(received.filter((message) => message?.payload?.text === "切断後の新着")).toHaveLength(1);
     hub.close();
   });
 
