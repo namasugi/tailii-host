@@ -462,13 +462,13 @@ export async function runHubCommand(args: string[]): Promise<number> {
     questionInjector: (answers, session) => injectQuestionAnswers(answers, session, sessionBackend),
     // 本文+送信確定は backend 側の 1 操作に委ねる（herdr は本文+CR 単一コール必須。
     // 分割すると Ink のペースト取り込み窓に CR が飲まれ送信されない）。
-    chatInjector: async (text, session) => {
+    chatInjector: async (text, session, context) => {
       // 注入の所要時間を残す（実機 2026-09-07: 処理中の会話への送信が 14.5s かかり、アプリ側では
       // その間 pending 表示のまま → 利用者が開き直す事案）。所要時間は毎回 1 行で記録し、iOS の
       // ACK 予算 18s に迫る 4 秒以上は `chat-inject-slow` として目立たせる（事後解析用）。
       const startedAt = Date.now();
       try {
-        await sessionBackend.sendTextSubmit(session, text);
+        await sessionBackend.sendTextSubmit(session, text, { recordedPromptText: context.recordedPromptText });
       } finally {
         const elapsedMs = Date.now() - startedAt;
         log(`audit ${elapsedMs >= 4_000 ? "chat-inject-slow" : "chat-inject"} session=${session} elapsedMs=${elapsedMs}`);

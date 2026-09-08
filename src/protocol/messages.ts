@@ -447,6 +447,12 @@ export type ControlMessage =
   | { type: "pane_key_send"; v: number; id: string; session: string; key: string }
   | { type: "pane_key_send_result"; v: number; id: string; ok: boolean; error: string | null }
   /**
+   * 中断（pane_key_send C-c / Escape）で claude が入力欄へ書き戻した「配送済みだが未処理の発話」を
+   * host が検出・破棄したことの通知（host→iOS, prompt-cancelled）。`text` は transcript に記録済みの
+   * 発話本文（iOS は同文の直近 user バブルを「中断で未処理」+ 再送に切り替える）。
+   */
+  | { type: "chat_prompt_cancelled"; v: number; session: string; text: string }
+  /**
    * `/login` の OAuth コード送出要求（iOS→host, login-code）。転写カードのコード欄から、
    * 通常の chat 注入（入力欄検証・C-u クリアつき）を通さず、コード入力待ちの画面へ
    * literal + Enter で渡す。host はコード入力待ちでなければ ok=false で拒否する。

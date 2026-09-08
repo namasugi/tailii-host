@@ -23,6 +23,7 @@ import type {
 import {
   HISTORY_DONE_STREAM_ID,
   findTrailingTurnEndMarkerMs,
+  findTrailingUserPromptText,
   type ClaudeTurnLifecycleEvent,
 } from "../chat/transcriptTailer.js";
 import type { ChatAgent } from "../chat/chatTailController.js";
@@ -46,6 +47,7 @@ import {
   type CodexTurnLifecycleEvent,
 } from "../codex/codexRolloutTailer.js";
 import type { SessionMeta } from "../sessions/sessionMetadataStore.js";
+import { claudeTranscriptPathFor } from "../sessions/transcriptPath.js";
 
 export interface HubTail {
   open(cwd: string, preferredSessionId: string | null, newerThanMs?: number | null, agent?: ChatAgent): void;
@@ -61,6 +63,15 @@ export interface HubPreviewPump {
   stop(): void;
   /** 前面購読者の参加時に、直近の入力待ちフレームを再送する（任意実装）。 */
   resendLastIfInteractive?(): void;
+}
+
+/**
+ * chat 注入（chatInjector）へ渡す会話文脈。backend の sendTextSubmit が入力欄の残存テキストの
+ * 身元判定（restored-prompt-discard）に使う。遅延評価なので残存が無ければ transcript は読まない。
+ */
+export interface ChatInjectContext {
+  /** transcript に記録済みの直近の発話本文（claude 会話のみ。不明は null）。 */
+  recordedPromptText: () => string | null;
 }
 
 export type HubTailFactory = (
@@ -94,7 +105,7 @@ export type SessionHubOptions = Omit<ReaperTickOptions, "now"> & {
   previewPumpFactory?: HubPreviewPumpFactory;
   replayLimit?: number;
   questionInjector?: (answers: QuestionAnswer[], session: string) => Promise<void>;
-  chatInjector?: (text: string, session: string) => Promise<void>;
+  chatInjector?: (text: string, session: string, context: ChatInjectContext) => Promise<void>;
   codexAppServerFactory?: () => CodexAppServerThreadRuntime;
   codexTurnControllerFactory?: (options: CodexNativeTurnControllerOptions) => CodexTurnControllerRuntime;
   /** 未回答設問の永続化先。省略時は永続化しない（daemon は既定パスを明示する）。 */
@@ -231,12 +242,9 @@ function isContinuationHookEvent(event: string | undefined): boolean {
   return event === "PreToolUse" || event === "PostToolUse";
 }
 
-/** 既定の claude transcript 解決（`~/.claude/projects/<slug>/<sessionId>.jsonl`）。ID 未記録は null。 */
+/** 既定の claude transcript 解決（sessions/transcriptPath.ts と同一規則）。 */
 function defaultTranscriptPathFor(meta: SessionMeta): string | null {
-  // 他の tail open と同じ優先順（providerSessionId → claudeSessionId）。別会話を照合しない。
-  const sessionId = meta.providerSessionId ?? meta.claudeSessionId;
-  if (sessionId === undefined || sessionId.length === 0) return null;
-  return path.join(os.homedir(), ".claude", "projects", claudeProjectSlug(meta.cwd), `${sessionId}.jsonl`);
+  return claudeTranscriptPathFor(meta);
 }
 
 export class SessionHub {
@@ -330,6 +338,19 @@ export class SessionHub {
     const transcriptPath = (this.options.transcriptPathFor ?? defaultTranscriptPathFor)(meta);
     if (transcriptPath === null) return null;
     return findTrailingTurnEndMarkerMs(transcriptPath);
+  }
+
+  /**
+   * chat 注入前の残存テキスト照合用: transcript 末尾に記録済みの直近の発話本文（claude 会話のみ。
+   * 不明は null）。中断で入力欄へ書き戻された配送済み発話を Enter で送り直さないための材料
+   * （restored-prompt-discard。詳細は `findTrailingUserPromptText`）。
+   */
+  private trailingUserPromptText(session: string): string | null {
+    const meta = this.options.metadataStore.get(session);
+    if (meta === null || meta.agent === "codex") return null;
+    const transcriptPath = (this.options.transcriptPathFor ?? defaultTranscriptPathFor)(meta);
+    if (transcriptPath === null) return null;
+    return findTrailingUserPromptText(transcriptPath);
   }
 
   /** 永続化済み設問を復元する。App Server の request handle は再起動を越せないため TUI のみ対象。 */
@@ -1764,7 +1785,9 @@ export class SessionHub {
             }
             continue;
           }
-          await (this.options.chatInjector?.(message.text, session) ?? Promise.resolve());
+          await (this.options.chatInjector?.(message.text, session, {
+            recordedPromptText: () => this.trailingUserPromptText(session),
+          }) ?? Promise.resolve());
           // 明示 kill / reaper kill が注入 await 中に actor を廃棄した場合、同名の新 actorへ
           // 古い receipt を復活させない。waiter は retireSession が既に失敗で解放している。
           if (this.actors.get(session) !== actor) continue;

@@ -188,6 +188,36 @@ export function inputBoxRealText(ansiScreen: string): string | null {
 }
 
 /**
+ * chat 注入（sendTextSubmit）の呼び出し側が渡す補助情報。
+ */
+export interface SendTextSubmitOptions {
+  /**
+   * transcript に記録済みの直近の発話本文（遅延評価。入力欄に残存テキストが無ければ呼ばれない）。
+   * 残存テキストがこれと同文なら「出力前に中断されて書き戻された発話」= 既に配送・表示済みなので、
+   * Enter で送り直さず破棄する（restored-prompt-discard）。null = 不明（従来どおり Enter で flush）。
+   */
+  recordedPromptText?: () => string | null;
+}
+
+/**
+ * 入力欄の残存テキストが、transcript に記録済みの発話本文と同文か（restored-prompt-discard）。
+ *
+ * 入力欄の描画は折り返し（trim + 改行連結）・composer スクロールで先頭行が窓外に出る・シェルモード
+ * 記号 `!` の吸い上げがあるため、生の等値比較は使えない。空白類を両辺から除去し、先頭の `!` を
+ * 落としたうえで「同一」または「残存が記録本文の末尾（可視領域は常に末尾側）」なら同文とみなす。
+ * 末尾一致は短い断片の偶然一致（Mac 側で打ちかけた下書きが記録本文の語尾と重なる等）を避けるため
+ * 24 字以上に限る（typedTextProbe と同じ長さ）。
+ */
+export function inputBoxTextMatchesRecordedPrompt(boxText: string, recordedPrompt: string): boolean {
+  const normalize = (value: string): string => value.replace(/\s+/g, "").replace(/^!/, "");
+  const pending = normalize(boxText);
+  const recorded = normalize(recordedPrompt);
+  if (pending.length === 0 || recorded.length === 0) return false;
+  if (pending === recorded) return true;
+  return pending.length >= 24 && recorded.endsWith(pending);
+}
+
+/**
  * claude TUI のプロンプト提案文を取り出す（提案チップ表示用）。
  * 入力欄本文が薄字(faint)のみ かつ 既知プレースホルダーでない非空テキストのときだけ、その
  * 本文を返す（＝提案）。空・実テキスト（利用者入力/中断書き戻し）・プレースホルダーは null。
@@ -640,6 +670,8 @@ export class TmuxSessionManager {
   /** login-code 送出の待ち時間（テスト注入用）。 */
   private readonly loginTiming: { delayMs: number; pollMs: number; settleMs: number };
   private readonly protocolVersion: number;
+  /** clearInputBox の C-u 1回ごとの反映待ち ms（herdr 側と同じ既定 150ms。テスト注入用）。 */
+  private readonly clearKeyDelayMs: number;
 
   constructor(options: {
     runner?: TmuxCommandRunner;
@@ -647,11 +679,13 @@ export class TmuxSessionManager {
     captureLines?: number;
     protocolVersion?: number;
     loginTiming?: { delayMs?: number; pollMs?: number; settleMs?: number };
+    clearKeyDelayMs?: number;
   } = {}) {
     this.runner = options.runner ?? processTmuxCommandRunner();
     this.store = options.store ?? new SessionMetadataStore();
     this.captureLines = options.captureLines ?? 50;
     this.protocolVersion = options.protocolVersion ?? PROTOCOL_V1;
+    this.clearKeyDelayMs = options.clearKeyDelayMs ?? 150;
     this.loginTiming = {
       delayMs: options.loginTiming?.delayMs ?? 150,
       pollMs: options.loginTiming?.pollMs ?? 250,
@@ -781,7 +815,7 @@ export class TmuxSessionManager {
    * 本文入力と送信確定を 1 操作で行う（chat 注入・kick 用, SessionBackend 共通面）。
    * literal 送出 → 150ms（Ink 再描画待ち）→ Enter。
    */
-  async sendTextSubmit(name: string, text: string): Promise<void> {
+  async sendTextSubmit(name: string, text: string, options: SendTextSubmitOptions = {}): Promise<void> {
     // 1 回の capture で「/login フロー中か」と「残存テキスト」を判定する（chat 毎の capture を増やさない）。
     const screen = await this.captureVisibleScreenOrNull(name);
     // `/login` フロー中（方式選択 / コード入力待ち / retry）は通常の入力欄が無く、注入した本文が
@@ -790,16 +824,31 @@ export class TmuxSessionManager {
     if (screen !== null && screenInLoginFlow(screen)) {
       throw new LoginCodeError(CHAT_BLOCKED_BY_LOGIN_PROMPT);
     }
-    // 中断（停止）直後は claude が queued メッセージを入力欄へ書き戻す。残存したまま
-    // 注入すると今回の本文がその後ろへ連結され 1 メッセージになる（実機FB 2026-07-29）。
-    // 残存は先に Enter で独立メッセージとして送信し切ってから注入する。空入力への
-    // Enter は no-op なので誤検出は無害（herdr 側 sendTextSubmit と同じ防御）。
+    // 中断（停止）直後の入力欄に残存テキストがあるまま注入すると、今回の本文がその後ろへ連結され
+    // 1 メッセージになる（実機FB 2026-07-29）。残存の身元で扱いを分ける（herdr 側と同じ規則）:
+    // - transcript の直近の発話と同文 = 出力前の中断で claude が書き戻した「配送済みの発話」
+    //   → 破棄（C-u）。Enter で送り直すと同じ発話が二重に届く（実機 2026-09-08）。
+    // - それ以外（旧版の queued 書き戻し / Mac 側の下書き）→ 従来どおり Enter で独立送信し切る。
     // 判定は ANSI で行い、薄字（faint）のプロンプト提案/プレースホルダーを実テキストと
     // 数えない（実障害 2026-09-03: 提案を残留と誤認し Enter で勝手に送信していた）。
     const ansiScreen = await this.captureVisibleScreenAnsiOrNull(name);
-    if (ansiScreen !== null && inputBoxHasRealPendingText(ansiScreen)) {
-      await this.sendKeys(name, ["Enter"]);
-      await new Promise((resolve) => setTimeout(resolve, 300));
+    const pending = ansiScreen !== null && inputBoxHasRealPendingText(ansiScreen)
+      ? (inputBoxRealText(ansiScreen) ?? "")
+      : "";
+    if (pending.length > 0) {
+      const recorded = options.recordedPromptText?.() ?? null;
+      if (recorded !== null && inputBoxTextMatchesRecordedPrompt(pending, recorded)) {
+        if (!(await this.clearInputBox(name))) {
+          throw new TmuxFailedError(
+            ["send-keys", "-t", this.paneTarget(name), "C-u"],
+            1,
+            "restored prompt could not be cleared from the input box (中断で書き戻された発話が残存)",
+          );
+        }
+      } else {
+        await this.sendKeys(name, ["Enter"]);
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
     }
     // 入力欄がシェルモード（プロンプト `!`）のまま残っていると、注入した通常メッセージが
     // そのままシェルコマンドとして実行される。空入力の Backspace（tmux キー名は BSpace）で
@@ -852,6 +901,31 @@ export class TmuxSessionManager {
       }
     } catch {
       // no-op（fail-open）
+    }
+  }
+
+  /**
+   * 入力欄を空にする（中断で書き戻された配送済み発話の破棄用, restored-prompt-discard）。
+   * C-u(kill-line) を繰り返す（herdr 側 clearInputBox と同じ規則: 多行本文は末尾行→改行の順に
+   * 消え 2N-1 回で必ず空になる。Backspace は本文の実文字を削るため使わない）。空にできたら true。
+   * 入力欄が見えない / 上限回数で空にならない / capture 失敗は false（呼び出し側は注入を諦めて
+   * 明示再送へ倒す。残存の上へ重ね打ちして連結送信するよりよい）。
+   */
+  async clearInputBox(name: string): Promise<boolean> {
+    try {
+      for (let attempt = 0; attempt < 15; attempt += 1) {
+        const ansiScreen = await this.captureVisibleScreenAnsiOrNull(name);
+        const realText = ansiScreen === null ? null : inputBoxRealText(ansiScreen);
+        if (realText === null) return false;
+        if (realText.replace(/\s+/g, "").length === 0) return true;
+        await this.sendKeys(name, ["C-u"]);
+        await new Promise((resolve) => setTimeout(resolve, this.clearKeyDelayMs));
+      }
+      const ansiScreen = await this.captureVisibleScreenAnsiOrNull(name);
+      const realText = ansiScreen === null ? null : inputBoxRealText(ansiScreen);
+      return realText !== null && realText.replace(/\s+/g, "").length === 0;
+    } catch {
+      return false;
     }
   }
 

@@ -145,6 +145,54 @@ export function findTrailingTurnEndMarkerMs(transcriptPath: string, tailBytes = 
 export const findTrailingInterruptMarkerMs = findTrailingTurnEndMarkerMs;
 
 /**
+ * transcript 末尾を読み、最後に記録された「本物の発話」（`userLineKind` = utterance）の本文を返す
+ * （claude 会話のみ。中断確定マーカー・ローカルコマンド記録・tool_result・isMeta 注記・attachment は
+ * 発話に数えない。不明 / 読めない / 末尾が中断マーカーは null）。
+ *
+ * 用途は chat 注入前の「入力欄の残存テキスト」の身元判定（restored-prompt-discard）。Claude Code
+ * 2.1.263 は、出力が始まる前に中断（C-c / Esc）されると **その発話の本文を入力欄へ書き戻す**
+ * （transcript には user 行が残ったまま、次の発話の parentUuid はその前へ戻る）。queued 発話が
+ * ある中断は書き戻さず自動送信する（実測 2026-09-08 sandbox）。したがって注入時に入力欄へ残って
+ * いる本文が「transcript の直近の発話と同文」なら、それは既に配送・表示済みで利用者が取り消した
+ * ものなので、Enter で送り直すと同じ発話が二重に届く（実機 2026-09-08: 中断→別文を送信で
+ * 中断前の発話が重複投稿）。呼び出し側はこの本文と照合して flush（Enter）ではなく破棄（C-u）を選ぶ。
+ */
+export function findTrailingUserPromptText(transcriptPath: string, tailBytes = 256 * 1024): string | null {
+  let fd: number;
+  try {
+    fd = fs.openSync(transcriptPath, "r");
+  } catch {
+    return null;
+  }
+  try {
+    const size = fs.fstatSync(fd).size;
+    const start = Math.max(0, size - tailBytes);
+    const readStart = start > 0 ? start - 1 : 0;
+    const buffer = Buffer.alloc(size - readStart);
+    const read = fs.readSync(fd, buffer, 0, buffer.length, readStart);
+    const lines = buffer.subarray(0, read).toString("utf8").split("\n");
+    if (start > 0) lines.shift();
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      const line = (lines[index] ?? "").replaceAll("\r", "");
+      if (!line) continue;
+      if (userLineKind(line) !== "utterance") continue;
+      const body = userLineBodyText(line);
+      if (body === null || body.trim().length === 0) return null;
+      return isClaudeInterruptMarker(body) ? null : body;
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      // 二重 close 等は無視。
+    }
+  }
+}
+
+/**
  * transcript 由来の claude ターン権威ライフサイクル。Claude Code の Stop hook は利用者の中断と
  * API エラー終端（使用量上限 429 等）では発火しないため、hook だけを見ている hub の処理中状態が
  * ターン終了後も残る。終端マーカーを timestamp 付きで観測し、hub が「処理開始より後のマーカー」
@@ -450,6 +498,33 @@ const META_ANNOTATION_BODY_PREFIXES = [
   "[Image:", "<local-command-caveat>", "Base directory for this skill:", "Your tool call was malformed",
 ];
 
+/**
+ * user 行の本文（content が文字列ならそのまま、ブロック配列なら text ブロックの連結。tool_result
+ * のみ等は ""）。user 行でない / 解釈不能は null。`userLineKind` の種別判定と、注入前の残存テキスト
+ * 照合（`findTrailingUserPromptText`）が同じ本文を見る。
+ */
+function userLineBodyText(line: string): string | null {
+  try {
+    const parsed = JSON.parse(line) as unknown;
+    if (typeof parsed !== "object" || parsed === null) return null;
+    const record = parsed as Record<string, unknown>;
+    if (record["type"] !== "user") return null;
+    const message = record["message"];
+    if (typeof message !== "object" || message === null) return null;
+    const content = (message as Record<string, unknown>)["content"];
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return "";
+    return content
+      .map((block) => (typeof block === "object" && block !== null &&
+        (block as Record<string, unknown>)["type"] === "text" &&
+        typeof (block as Record<string, unknown>)["text"] === "string"
+        ? ((block as Record<string, unknown>)["text"] as string) : ""))
+      .join("");
+  } catch {
+    return null;
+  }
+}
+
 function userLineKind(line: string): UserLineKind {
   try {
     const parsed = JSON.parse(line) as unknown;
@@ -457,20 +532,8 @@ function userLineKind(line: string): UserLineKind {
     const record = parsed as Record<string, unknown>;
     if (record["type"] === "attachment") return "attachment";
     if (record["type"] !== "user") return "other";
-    const message = record["message"];
-    if (typeof message !== "object" || message === null) return "other";
-    const content = (message as Record<string, unknown>)["content"];
-    let body = "";
-    if (typeof content === "string") {
-      body = content;
-    } else if (Array.isArray(content)) {
-      body = content
-        .map((block) => (typeof block === "object" && block !== null &&
-          (block as Record<string, unknown>)["type"] === "text" &&
-          typeof (block as Record<string, unknown>)["text"] === "string"
-          ? ((block as Record<string, unknown>)["text"] as string) : ""))
-        .join("");
-    }
+    const body = userLineBodyText(line);
+    if (body === null) return "other";
     const trimmed = body.trim();
     if (trimmed.length === 0) return "tool-result";
     if (record["isMeta"] === true) {

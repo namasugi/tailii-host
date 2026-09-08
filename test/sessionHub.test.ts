@@ -83,6 +83,40 @@ describe("SessionHub actor", () => {
     expect(chatInjector).toHaveBeenCalledOnce();
   });
 
+  test("chat_send の注入には transcript 末尾の直近の発話本文を遅延評価で渡す（restored-prompt-discard）", async () => {
+    const transcriptDir = makeTempDir("hub-chat-inject-context");
+    const metadataStore = makeTempStore();
+    metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0, claudeSessionId: "id-work" });
+    metadataStore.put({ name: "codex", cwd: "/tmp/codex", createdAt: 0, agent: "codex", providerSessionId: "id-codex" });
+    const prompt = (text: string) => JSON.stringify({ type: "user", timestamp: "2026-09-08T12:11:11.968Z", uuid: "p",
+      message: { role: "user", content: text } });
+    fs.writeFileSync(path.join(transcriptDir, "id-work.jsonl"), prompt("中周(r≈175)を1枚足す") + "\n");
+    const seen: Array<{ text: string; session: string; recorded: string | null }> = [];
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir: makeTempDir("hub-chat-inject-context-hb"),
+      metadataStore, timeoutSeconds: 1800,
+      transcriptPathFor: (meta) => {
+        const id = meta.providerSessionId ?? meta.claudeSessionId;
+        return id ? path.join(transcriptDir, `${id}.jsonl`) : null;
+      },
+      chatInjector: async (text, session, context) => {
+        seen.push({ text, session, recorded: context.recordedPromptText() });
+      },
+    });
+    const client = {};
+    hub.registerClient(client, () => {});
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "one", session: "work",
+      clientMessageId: "c-1", text: "軌道は抽選でいい" }));
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "two", session: "codex",
+      clientMessageId: "c-2", text: "hello" }));
+    await vi.waitFor(() => expect(seen).toHaveLength(2));
+    expect(seen).toEqual([
+      { text: "軌道は抽選でいい", session: "work", recorded: "中周(r≈175)を1枚足す" },
+      // codex 会話は transcript 照合の対象外（App Server 経路。書き戻しの概念が無い）。
+      { text: "hello", session: "codex", recorded: null },
+    ]);
+  });
+
   test("chat_send 注入は actor ごとに FIFO 直列化する", async () => {
     const releases: Array<() => void> = [];
     const order: string[] = [];
@@ -284,7 +318,7 @@ describe("SessionHub actor", () => {
       id: "question-blocks-delete-failure",
     });
     await vi.waitFor(() => expect(chatInjector).toHaveBeenCalledWith(
-      "must remain queued", "work",
+      "must remain queued", "work", expect.objectContaining({ recordedPromptText: expect.any(Function) }),
     ));
   });
 
@@ -530,7 +564,7 @@ describe("SessionHub actor", () => {
     hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "new", session: "work",
       clientMessageId: "new-client", text: "new command" }));
     await vi.waitFor(() => expect(chatInjector).toHaveBeenCalledOnce());
-    expect(chatInjector).toHaveBeenCalledWith("new command", "work");
+    expect(chatInjector).toHaveBeenCalledWith("new command", "work", expect.objectContaining({ recordedPromptText: expect.any(Function) }));
   });
 
   test("restore は同名でもsession世代が異なる旧queueを新paneへ注入しない", async () => {
@@ -628,7 +662,7 @@ describe("SessionHub actor", () => {
     expect(received).not.toContainEqual(expect.objectContaining({ type: "chat_send_result" }));
     expect(chatInjector).not.toHaveBeenCalled();
     hub.handleRelayMessage({ type: "question_event", session: "work", event: "dismiss", id: "q1" });
-    await vi.waitFor(() => expect(chatInjector).toHaveBeenCalledWith("after answer", "work"));
+    await vi.waitFor(() => expect(chatInjector).toHaveBeenCalledWith("after answer", "work", expect.objectContaining({ recordedPromptText: expect.any(Function) })));
   });
 
   test("chat_send 注入の部分失敗はmarker+failedにしてuncertain receiptで再注入を抑止する", async () => {

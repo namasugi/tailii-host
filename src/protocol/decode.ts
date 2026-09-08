@@ -588,6 +588,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
     }
 
     case "input_suggestion":
+    case "chat_prompt_cancelled":
       return {
         type, v,
         session: requireString(raw, "session"),

@@ -66,7 +66,8 @@ import {
 } from "../protocol.js";
 import { ownTranscriptActivityProvider } from "../sessions/sessionActivityProvider.js";
 import { SessionListService } from "../sessions/sessionListService.js";
-import { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
+import { SessionMetadataStore, type SessionMeta } from "../sessions/sessionMetadataStore.js";
+import { claudeTranscriptPathFor } from "../sessions/transcriptPath.js";
 import { OfficialAppsService } from "../services/officialApps.js";
 import { HISTORY_DONE_STREAM_ID, TranscriptTailer } from "../chat/transcriptTailer.js";
 import {
@@ -332,6 +333,8 @@ export interface RunEngineOptions {
   homeDir?: string;
   /** mode_get/mode_set の待機間隔（テストは短縮値を注入する）。 */
   modeTiming?: Partial<ModeTiming>;
+  /** 会話の claude transcript パス解決（prompt-cancelled の照合用。テスト注入用）。 */
+  transcriptPathFor?: (meta: SessionMeta) => string | null;
   /** 起動時 package version と現在の package version を比較する stale 判定（テスト注入用）。 */
   staleDistGuard?: StaleDistGuard | null;
   /**
@@ -382,6 +385,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     accountIdentity = fetchAccountIdentities,
     homeDir = os.homedir(),
     modeTiming = {},
+    transcriptPathFor = claudeTranscriptPathFor,
     staleDistGuard = createStaleDistGuard(),
     hostDisplayName = resolveHostDisplayName() ?? null,
     onStaleDist = undefined,
@@ -987,6 +991,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           accountIdentity,
           homeDir,
           modeTiming: resolvedModeTiming,
+          transcriptPathFor,
           defaultAgent: agent,
           activeChatSession,
           listPreviewWatch,

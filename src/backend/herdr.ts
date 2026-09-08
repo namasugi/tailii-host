@@ -34,6 +34,7 @@ import {
   inputBoxHasRealPendingText,
   inputBoxRealText,
   inputBoxIsShellMode,
+  inputBoxTextMatchesRecordedPrompt,
   LoginCodeError,
   paneCommandLooksLikeAgent,
   screenInLoginFlow,
@@ -41,6 +42,7 @@ import {
   type CapturePaneOptions,
   type ClaudeInputBox,
   type ReattachResult,
+  type SendTextSubmitOptions,
 } from "./tmux.js";
 
 /** herdr コマンド 1 回分の実行結果。 */
@@ -615,7 +617,7 @@ export class HerdrSessionManager {
    * よって「本文 → CR → 入力欄を読んで残留確認 → 残っていれば CR 再送」の確認つき
    * リトライで確定させる。submit 済みの空入力への Enter は no-op なので二重送信は起きない。
    */
-  async sendTextSubmit(name: string, text: string): Promise<void> {
+  async sendTextSubmit(name: string, text: string, options: SendTextSubmitOptions = {}): Promise<void> {
     // ブート直後の注入は本文ごと TUI 初期化に破棄され得る（実測: 入力欄にも jsonl にも
     // 残らない）。herdr の claude 検出（agent_status が unknown を抜けるまで）を注入の
     // 準備完了ゲートにする。working（処理中の queue 入力）も注入可。判定不能は fail-open。
@@ -649,14 +651,31 @@ export class HerdrSessionManager {
       await this.sendKeys(name, ["Escape"]);
       await new Promise((resolve) => setTimeout(resolve, 300));
     }
-    // 中断（停止）直後は claude が queued メッセージを入力欄へ書き戻す。残存したまま
-    // 注入すると今回の本文がその後ろへ連結され 1 メッセージとして送信される（実機FB
-    // 2026-07-29: 停止→送信で「前回本文+今回本文」の連結バブルが二重表示）。残存は先に
-    // Enter で独立メッセージとして送信し切ってから注入する（アプリの楽観バブルとも一致
-    // する）。空入力への Enter は no-op なので、誤検出しても無害。
-    if (await this.inputBoxHasPendingText(name)) {
-      await this.sendKeys(name, ["Enter"]);
-      await new Promise((resolve) => setTimeout(resolve, this.submitDelayMs));
+    // 中断（停止）直後の入力欄に残存テキストがあるまま注入すると、今回の本文がその後ろへ
+    // 連結され 1 メッセージとして送信される（実機FB 2026-07-29: 停止→送信で「前回本文+今回
+    // 本文」の連結バブルが二重表示）。残存の身元で扱いを分ける（restored-prompt-discard）:
+    // - transcript の直近の発話と同文 = 出力が始まる前の中断で claude 2.1.263 が書き戻した
+    //   「配送済み・表示済みの発話」（実測 2026-09-08 sandbox: queued 発話がある中断は書き戻さず
+    //   自動送信するので、書き戻しは常にこの 1 種）→ 破棄（C-u）。Enter で送り直すと同じ発話が
+    //   二重に届く（実機 2026-09-08: 中断→別文を送信で中断前の発話が重複投稿）。
+    // - それ以外（旧版の queued 書き戻し / Mac 側の下書き）→ 従来どおり Enter で独立メッセージ
+    //   として送信し切る（アプリの楽観バブルとも一致する）。空入力への Enter は no-op。
+    const pending = await this.inputBoxPendingText(name);
+    if (pending.length > 0) {
+      const recorded = options.recordedPromptText?.() ?? null;
+      if (recorded !== null && inputBoxTextMatchesRecordedPrompt(pending, recorded)) {
+        // 空にできないまま注入すると連結送信になるので、何も打たずに throw（明示再送へ倒す）。
+        if (!(await this.clearInputBox(name))) {
+          throw new HerdrFailedError(
+            ["pane", "send-text", name],
+            1,
+            "restored prompt could not be cleared from the input box (中断で書き戻された発話が残存)",
+          );
+        }
+      } else {
+        await this.sendKeys(name, ["Enter"]);
+        await new Promise((resolve) => setTimeout(resolve, this.submitDelayMs));
+      }
     }
     // 前回の注入が途中で終わった等でシェルモード（プロンプト `!`）に入ったままの入力欄へ
     // 注入すると、本文がそのままシェルコマンドとして実行される。空入力の Backspace で
@@ -766,12 +785,13 @@ export class HerdrSessionManager {
    * - 上限回数で空にならない（1回150ms×15回=2.25s。iOS の chat_send ACK 予算 18s の
    *   内側で速やかに諦めて明示再送へ倒す）
    *
-   * トレードオフ（意図的な設計判断）: 中断直後に claude が queued 本文を composer へ
-   * 書き戻すタイミングと重なると、そのテキストも C-u で消える（receipt なしの破棄）。
+   * トレードオフ（意図的な設計判断）: 中断直後に claude が本文を composer へ書き戻す
+   * タイミングと重なると、そのテキストも C-u で消える（receipt なしの破棄）。
    * 再投入前クリアを省くと「本文二重化」という別のデータ破損になるため、注入経路では
-   * 「重複より欠落」を選ぶ（残存の主経路は sendTextSubmit 冒頭の Enter flush が先に守る）。
+   * 「重複より欠落」を選ぶ（残存の主経路は sendTextSubmit 冒頭の身元判定 — 記録済みの
+   * 発話は破棄 / それ以外は Enter flush — が先に守る。restored-prompt-discard）。
    */
-  private async clearInputBox(name: string): Promise<boolean> {
+  async clearInputBox(name: string): Promise<boolean> {
     try {
       for (let attempt = 0; attempt < 15; attempt += 1) {
         // ダイアログ判定は selectionDialogVisible（末尾30行窓）に揃える。全画面を
@@ -896,6 +916,20 @@ export class HerdrSessionManager {
       return inputBoxHasRealPendingText(await this.captureVisibleScreenAnsi(name));
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * 入力欄の未送信「実テキスト」（faint の提案/プレースホルダーを除く）。判定不能は ""
+   * （= 残存なし扱い。inputBoxHasPendingText と同じ fail-open）。
+   */
+  private async inputBoxPendingText(name: string): Promise<string> {
+    try {
+      const ansiScreen = await this.captureVisibleScreenAnsi(name);
+      if (!inputBoxHasRealPendingText(ansiScreen)) return "";
+      return inputBoxRealText(ansiScreen) ?? "";
+    } catch {
+      return "";
     }
   }
 

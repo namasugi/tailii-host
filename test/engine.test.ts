@@ -848,7 +848,7 @@ describe("EngineControl — 横断制御チャネル", () => {
 
     engine.writeLine('{"answers":[],"id":"Q1","session":"work","type":"question_answer","v":2}');
     await engine.lines.nextOfType("remote_pending_cleared");
-    await vi.waitFor(() => expect(chatInjector).toHaveBeenCalledWith("after answer", "work"));
+    await vi.waitFor(() => expect(chatInjector).toHaveBeenCalledWith("after answer", "work", expect.objectContaining({ recordedPromptText: expect.any(Function) })));
     expect(decodeControlMessage(await engine.lines.nextOfType("chat_send_result"))).toMatchObject({
       id: "send-1", status: "accepted",
     });

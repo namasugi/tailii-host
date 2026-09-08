@@ -2,6 +2,7 @@
 // Swift 版 EngineLifecycleTests.swift の移植（session-list-lifecycle 2.3/3.3）。
 
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { describe, expect, test } from "vitest";
 import { sendSessionProcessingToEngine } from "../src/hub/engineRelaySocket.js";
 import { readHeartbeat, writeHeartbeat, type Heartbeat } from "../src/sessions/heartbeat.js";
@@ -724,6 +725,74 @@ describe("Engine — アイドルライフサイクル/ページング", () => {
     const recorded = runner.recorded.map((cmd) => JSON.stringify(cmd));
     expect(recorded).toContain(JSON.stringify(["send-keys", "-t", "work", "C-c"]));
 
+    await engine.teardown();
+  });
+
+  test("pane_key_send C-c の後、書き戻された配送済み発話を検出して C-u で消し chat_prompt_cancelled を送る（prompt-cancelled）", async () => {
+    // 実機 2026-09-08: 出力前の中断で claude 2.1.263 が発話本文を入力欄へ書き戻す。
+    const store = makeTempStore();
+    store.put({ name: "work", cwd: "/tmp/work", createdAt: 0, claudeSessionId: "id-work" });
+    const transcriptDir = makeTempDir("engine-prompt-cancelled");
+    const transcriptPath = path.join(transcriptDir, "id-work.jsonl");
+    fs.writeFileSync(transcriptPath, JSON.stringify({ type: "user", timestamp: "2026-09-08T12:11:11.968Z", uuid: "p",
+      message: { role: "user", content: "中周(r≈175)を1枚足す" } }) + "\n");
+    const state = { input: "" , interrupted: false };
+    const screen = () => {
+      const rule = "─".repeat(40);
+      const body = state.input.length > 0 ? `❯ ${state.input}` : "❯ \u001b[2mTry \"fix\"\u001b[22m";
+      return ["⏺ 前の応答", rule, body, rule, "  ⏸ manual mode on"].join("\n");
+    };
+    const runner = new MockTmuxRunner((args) => {
+      if (args[0] === "send-keys" && args[3] === "C-c") {
+        // 書き戻しは C-c の少し後に描画される（1 回目の read はまだ空）。
+        state.interrupted = true;
+        setTimeout(() => { state.input = "中周(r≈175)を1枚足す"; }, 5);
+        return ok("");
+      }
+      if (args[0] === "send-keys" && args[3] === "C-u") { state.input = ""; return ok(""); }
+      if (args[0] === "capture-pane") return ok(screen());
+      return ok("");
+    });
+    const mgr = new TmuxSessionManager({ runner: runner.runner, store, clearKeyDelayMs: 0 });
+    const engine = startEngine({
+      sessionManager: mgr, metadataStore: store,
+      transcriptPathFor: (meta) => meta.claudeSessionId ? path.join(transcriptDir, `${meta.claudeSessionId}.jsonl`) : null,
+      modeTiming: { cancelDetectPollMs: 5, cancelDetectTimeoutMs: 500 },
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"id":"PK5","key":"C-c","session":"work","type":"pane_key_send","v":1}');
+    const resp = await engine.lines.nextOfType("pane_key_send_result");
+    expect(resp).toContain('"ok":true');
+    const cancelled = decodeControlMessage(await engine.lines.nextOfType("chat_prompt_cancelled"));
+    expect(cancelled).toMatchObject({ type: "chat_prompt_cancelled", session: "work", text: "中周(r≈175)を1枚足す" });
+    await waitForCommand(runner, ["send-keys", "-t", "work", "C-u"]);
+    expect(state.input).toBe("");
+
+    await engine.teardown();
+  });
+
+  test("pane_key_send C-c の後、残存が記録本文と別文なら何も消さず通知もしない", async () => {
+    const store = makeTempStore();
+    store.put({ name: "work", cwd: "/tmp/work", createdAt: 0, claudeSessionId: "id-work" });
+    const transcriptDir = makeTempDir("engine-prompt-cancelled-other");
+    fs.writeFileSync(path.join(transcriptDir, "id-work.jsonl"), JSON.stringify({ type: "user",
+      timestamp: "2026-09-08T12:11:11.968Z", uuid: "p", message: { role: "user", content: "記録済みの発話" } }) + "\n");
+    const rule = "─".repeat(40);
+    const screen = ["⏺ 前の応答", rule, "❯ Mac で打ちかけの下書き", rule, "  ⏸ manual mode on"].join("\n");
+    const runner = new MockTmuxRunner((args) => (args[0] === "capture-pane" ? ok(screen) : ok("")));
+    const mgr = new TmuxSessionManager({ runner: runner.runner, store, clearKeyDelayMs: 0 });
+    const engine = startEngine({
+      sessionManager: mgr, metadataStore: store,
+      transcriptPathFor: (meta) => meta.claudeSessionId ? path.join(transcriptDir, `${meta.claudeSessionId}.jsonl`) : null,
+      modeTiming: { cancelDetectPollMs: 5, cancelDetectTimeoutMs: 100 },
+    });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine('{"id":"PK6","key":"C-c","session":"work","type":"pane_key_send","v":1}');
+    expect(await engine.lines.nextOfType("pane_key_send_result")).toContain('"ok":true');
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(runner.recorded.some((cmd) => cmd[0] === "send-keys" && cmd[3] === "C-u")).toBe(false);
+    await expect(engine.lines.nextOfType("chat_prompt_cancelled", 100)).rejects.toThrow(/timeout/);
     await engine.teardown();
   });
 

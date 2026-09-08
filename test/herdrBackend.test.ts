@@ -31,6 +31,7 @@ import {
   extractInputBoxSuggestion,
   inputBoxHasRealPendingText,
   inputBoxRealText,
+  inputBoxTextMatchesRecordedPrompt,
   screenHasLoginCodePrompt,
   TmuxSessionManager,
 } from "../src/backend/tmux.js";
@@ -525,6 +526,105 @@ describe("HerdrSessionManager", () => {
       ["pane", "send-text", "w4:p2", "今回の本文"],
       ["pane", "send-text", "w4:p2", "\r"],
     ]);
+  });
+
+  test("sendTextSubmit: 残存が transcript の直近の発話と同文なら Enter で送り直さず C-u で破棄して注入する", async () => {
+    // 実機 2026-09-08: 出力前に中断（C-c）すると claude 2.1.263 は中断した発話本文を入力欄へ
+    // 書き戻す。旧実装は残存を一律 Enter で flush していたため、次の送信で中断前の発話が
+    // 重複投稿された（transcript にも同文の user 行が 2 本）。
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const { runner } = makeSubmitHarness({ initialInput: "中周(r≈175)を1枚足す" });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    let asked = 0;
+    await manager.sendTextSubmit("s-a", "軌道は抽選でいい", {
+      recordedPromptText: () => { asked += 1; return "中周(r≈175)を1枚足す"; },
+    });
+    expect(asked).toBe(1);
+    expect(submitSends(runner)).toEqual([
+      ["pane", "send-text", "w4:p2", "\u0015"],
+      ["pane", "send-text", "w4:p2", "軌道は抽選でいい"],
+      ["pane", "send-text", "w4:p2", "\r"],
+    ]);
+  });
+
+  test("sendTextSubmit: 残存が記録本文と別文なら従来どおり Enter で独立送信してから注入する（照合は遅延評価）", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const { runner } = makeSubmitHarness({ initialInput: "queued だった本文" });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    await manager.sendTextSubmit("s-a", "今回の本文", { recordedPromptText: () => "直近の発話" });
+    expect(submitSends(runner)).toEqual([
+      ["pane", "send-text", "w4:p2", "\r"],
+      ["pane", "send-text", "w4:p2", "今回の本文"],
+      ["pane", "send-text", "w4:p2", "\r"],
+    ]);
+    // 残存が無ければ transcript は読まない（chat_send ごとの I/O を増やさない）。
+    const empty = makeSubmitHarness();
+    const manager2 = new HerdrSessionManager({
+      runner: empty.runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    let asked = 0;
+    await manager2.sendTextSubmit("s-a", "本文", { recordedPromptText: () => { asked += 1; return "x"; } });
+    expect(asked).toBe(0);
+  });
+
+  test("sendTextSubmit: 折り返し描画された書き戻し本文も同文と判定して破棄する", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const prompt = "軌道は抽選でいいが全ての軌道に対して型で重み付けして抽選で良いと思う\n全ての軌道が出る可能性を捨てない";
+    const { runner } = makeSubmitHarness({ initialInput: prompt, wrapWidth: 20 });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    await manager.sendTextSubmit("s-a", "次の本文", { recordedPromptText: () => prompt });
+    const sends = submitSends(runner);
+    expect(sends.filter((args) => args[3] === "\u0015").length).toBeGreaterThan(0);
+    expect(sends.filter((args) => args[3] === "\r")).toHaveLength(1);
+    expect(sends.at(-2)).toEqual(["pane", "send-text", "w4:p2", "次の本文"]);
+  });
+
+  test("sendTextSubmit: 書き戻し本文を空にできなければ何も打たずに throw する（連結送信より明示再送）", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    // ghostInput: C-u で消えない残骸の再現。
+    const { runner } = makeSubmitHarness({ ghostInput: "中周(r≈175)を1枚足す" });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    await expect(manager.sendTextSubmit("s-a", "次の本文", {
+      recordedPromptText: () => "中周(r≈175)を1枚足す",
+    })).rejects.toThrow(/restored prompt could not be cleared/);
+    const sends = submitSends(runner);
+    expect(sends.every((args) => args[3] === "\u0015")).toBe(true);
+  });
+
+  test("inputBoxTextMatchesRecordedPrompt: 空白・折り返し・先頭 `!` を無視し、末尾一致は 24 字以上に限る", () => {
+    expect(inputBoxTextMatchesRecordedPrompt("中周(r≈175)を1枚足す", "中周(r≈175)を1枚足す")).toBe(true);
+    expect(inputBoxTextMatchesRecordedPrompt("中周(r≈175)を\n1枚足す", "中周(r≈175)を 1枚足す")).toBe(true);
+    expect(inputBoxTextMatchesRecordedPrompt("ls -la", "!ls -la")).toBe(true);
+    expect(inputBoxTextMatchesRecordedPrompt("中周(r≈175)を1枚足す", "中周(r≈175)を2枚足す")).toBe(false);
+    expect(inputBoxTextMatchesRecordedPrompt("", "中周")).toBe(false);
+    expect(inputBoxTextMatchesRecordedPrompt("中周", "")).toBe(false);
+    // composer スクロールで先頭行が窓外: 末尾 24 字以上が一致すれば同文。
+    const long = "あ".repeat(40) + "い".repeat(40);
+    expect(inputBoxTextMatchesRecordedPrompt("い".repeat(30), long)).toBe(true);
+    // 短い断片の末尾一致は偶然（Mac 側の下書き）とみなして不一致。
+    expect(inputBoxTextMatchesRecordedPrompt("い".repeat(10), long)).toBe(false);
   });
 
   /** 実測 claude 2.1.241 の `/login` コード入力待ち画面（URL は Ink がハード改行する）。 */

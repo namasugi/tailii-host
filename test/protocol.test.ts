@@ -85,6 +85,14 @@ describe("golden roundtrip", () => {
     }
   });
 
+  it("prompt-cancelled v1 golden 全行が byte-exact でラウンドトリップする", () => {
+    for (const line of goldenLines("prompt-cancelled-v1.ndjson")) {
+      const decoded = decodeControlMessage(line);
+      expect(decoded.type).toBe("chat_prompt_cancelled");
+      expect(encodeControlMessage(decoded)).toBe(line);
+    }
+  });
+
   it("login-code v1 golden 全行が byte-exact でラウンドトリップする", () => {
     for (const line of goldenLines("login-code-v1.ndjson")) {
       const decoded = decodeControlMessage(line);

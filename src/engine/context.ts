@@ -29,7 +29,7 @@ import {
   type SessionInfo,
 } from "../protocol.js";
 import type { SessionListService } from "../sessions/sessionListService.js";
-import type { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
+import type { SessionMeta, SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
 import type {
   OfficialAppProvider,
   OfficialAppRuntimeContext,
@@ -56,6 +56,9 @@ export interface ModeTiming {
   setInitialTimeoutMs: number;
   setChangePollMs: number;
   setChangeTimeoutMs: number;
+  /** 中断キー注入後、書き戻された発話を入力欄に探す間隔 / 上限（prompt-cancelled）。 */
+  cancelDetectPollMs: number;
+  cancelDetectTimeoutMs: number;
 }
 
 export const DEFAULT_MODE_TIMING: ModeTiming = {
@@ -65,6 +68,9 @@ export const DEFAULT_MODE_TIMING: ModeTiming = {
   setInitialTimeoutMs: 10_000,
   setChangePollMs: 150,
   setChangeTimeoutMs: 1_500,
+  // 実測 2.1.263: C-c から書き戻しまで 1.5s 未満。TUI 再描画の遅れを見て 2.5s まで待つ。
+  cancelDetectPollMs: 300,
+  cancelDetectTimeoutMs: 2_500,
 };
 
 export interface HandlerContext {
@@ -114,6 +120,8 @@ export interface HandlerContext {
   accountIdentity: AccountIdentityProvider;
   homeDir: string;
   modeTiming: ModeTiming;
+  /** 会話の claude transcript パス（prompt-cancelled の照合用。既定は ~/.claude/projects 規則。テスト注入用）。 */
+  transcriptPathFor: (meta: SessionMeta) => string | null;
   /** host 側の既定エージェント（session_start が agentType を指定しないときのフォールバック）。 */
   defaultAgent: ChatAgent;
   activeChatSession: { name: string | null };

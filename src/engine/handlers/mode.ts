@@ -5,7 +5,8 @@
 import { parsePermissionMode } from "../../shared/permissionMode.js";
 import { sleep } from "../../shared/sleep.js";
 import type { SessionBackend } from "../../backend/sessionBackend.js";
-import { loginCodeErrorMessage } from "../../backend/tmux.js";
+import { inputBoxRealText, inputBoxTextMatchesRecordedPrompt, loginCodeErrorMessage } from "../../backend/tmux.js";
+import { findTrailingUserPromptText } from "../../chat/transcriptTailer.js";
 import type { ControlMessage } from "../../protocol.js";
 import {
   engineDiag,
@@ -124,6 +125,14 @@ export const modeHandlers: HandlerRegistry = {
       writer.write({
         type: "pane_key_send_result", v, id: message.id, ok: false, error: String(error),
       });
+      return;
+    }
+    // 中断キーの後は、claude が入力欄へ書き戻した「配送済みだが未処理の発話」を検出する
+    // （prompt-cancelled）。結果を待たずに応答を返す（中断の ACK を遅らせない）。
+    if (INTERRUPT_KEYS.has(message.key)) {
+      void detectCancelledPrompt(ctx, message.session).catch((error: unknown) => {
+        engineDiag(`prompt-cancelled 検出失敗 session=${message.session}: ${String(error)}`);
+      });
     }
   },
 
@@ -174,6 +183,58 @@ async function runLoginCodeSend(
  * 空白・改行・制御文字（ESC 等）だけを落とす（印字可能 ASCII のみ、512 文字以内）。
  */
 const LOGIN_CODE_PATTERN = /^[\x21-\x7e]{1,512}$/;
+
+/** 中断として扱うキー（書き戻し検出の対象）。Up/Down/Enter はダイアログ操作なので対象外。 */
+const INTERRUPT_KEYS = new Set(["C-c", "Escape"]);
+
+/**
+ * 中断キー注入後の書き戻し検出（prompt-cancelled）。
+ *
+ * Claude Code 2.1.263 は出力が始まる前に中断（C-c / Esc）されると、中断した発話本文を入力欄へ
+ * 書き戻す（transcript には user 行が残り、マーカーは書かれない。queued 発話がある中断や出力後の
+ * 中断は書き戻さない — sandbox 実測 2026-09-08）。利用者から見ると「送ったはずの文が処理されて
+ * いない」状態なので、host が検出して iOS へ `chat_prompt_cancelled` を送り（バブルを「中断で
+ * 未処理」+ 再送へ）、入力欄は C-u で空にする（次の注入で連結・重複しないように。Mac 側での
+ * 再編集は iOS の再送で代替する）。hub には処理完了を伝える（この中断は Stop hook もマーカーも
+ * 無く、hub の処理中状態が残る）。
+ *
+ * 判定は transcript 末尾の直近の発話本文との同文照合（sendTextSubmit の restored-prompt-discard と
+ * 同じ規則）。別文（Mac 側の下書き等）は触らない。codex 会話は App Server 経路なので対象外。
+ * 入力欄が見えるまで cancelDetectTimeoutMs までポーリングし、空のままなら何もしない。
+ */
+async function detectCancelledPrompt(ctx: HandlerContext, session: string): Promise<void> {
+  const { writer, state, sessionManager, metadataStore, modeTiming } = ctx;
+  const meta = metadataStore?.get(session) ?? null;
+  if (meta === null || meta.agent === "codex") return;
+  const transcriptPath = ctx.transcriptPathFor(meta);
+  if (transcriptPath === null) return;
+  const deadline = Date.now() + modeTiming.cancelDetectTimeoutMs;
+  let pending = "";
+  for (;;) {
+    await sleep(modeTiming.cancelDetectPollMs);
+    let realText: string | null = null;
+    try {
+      realText = inputBoxRealText(await sessionManager.captureVisibleAnsi(session));
+    } catch {
+      realText = null;
+    }
+    if (realText !== null && realText.replace(/\s+/g, "").length > 0) {
+      pending = realText;
+      break;
+    }
+    if (Date.now() >= deadline) return;
+  }
+  const recorded = findTrailingUserPromptText(transcriptPath);
+  if (recorded === null || !inputBoxTextMatchesRecordedPrompt(pending, recorded)) {
+    engineDiag(`prompt-cancelled 対象外の残存 session=${session}（記録本文と別文 or 記録なし）`);
+    return;
+  }
+  const cleared = await sessionManager.clearInputBox(session);
+  engineDiag(`prompt-cancelled session=${session} cleared=${cleared} chars=${recorded.length}`);
+  // 入力欄を空にできなくても通知はする（次の注入時に restored-prompt-discard が破棄する）。
+  writer.write({ type: "chat_prompt_cancelled", v: state.negotiatedVersion, session, text: recorded });
+  ctx.hubLink.send({ type: "session_processing", session, state: "done", event: "prompt-cancelled", atMs: Date.now() });
+}
 
 /**
  * pane_key_send が受理する制御キー（tmux 互換キー名）。テキスト注入経路には使わせない。

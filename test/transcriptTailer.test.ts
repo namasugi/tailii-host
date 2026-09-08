@@ -14,6 +14,7 @@ import {
   TranscriptTailer,
   findTrailingInterruptMarkerMs,
   findTrailingTurnEndMarkerMs,
+  findTrailingUserPromptText,
   questionsFromToolInput,
 } from "../src/chat/transcriptTailer.js";
 import { makeTempDir } from "./helpers.js";
@@ -146,6 +147,40 @@ describe("TranscriptTailer", () => {
       type: "chat_output", v: 1, streamId: "e-rate_limit-2026-09-06T15:55:37.951Z", role: "assistant",
       text: "You've hit your session limit · resets 2am (Asia/Tokyo)", eof: true,
     });
+  });
+
+  test("findTrailingUserPromptText は末尾の本物の発話本文を返す（tool_result / 注記 / ローカルコマンド / 中断マーカーは飛ばす）", () => {
+    const prompt = (text: string, ts = "2026-09-08T12:11:11.968Z") => JSON.stringify({ type: "user", timestamp: ts,
+      uuid: `p-${ts}`, message: { role: "user", content: text }, promptSource: "typed" });
+    const blocks = JSON.stringify({ type: "user", timestamp: "2026-09-08T12:11:11.968Z", uuid: "b",
+      message: { role: "user", content: [{ type: "image", source: {} }, { type: "text", text: "画像を見て" }] } });
+    const toolResult = JSON.stringify({ type: "user", timestamp: "2026-09-08T12:15:08.900Z", uuid: "tr",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] } });
+    const reminder = JSON.stringify({ type: "attachment", timestamp: "2026-09-08T12:11:11.967Z", uuid: "r",
+      attachment: { type: "total_tokens_reminder", text: "<total_tokens>1</total_tokens>" } });
+    const snapshot = JSON.stringify({ type: "file-history-snapshot", messageId: "x", snapshot: {}, isSnapshotUpdate: false });
+    const queueOp = JSON.stringify({ type: "queue-operation", operation: "enqueue", timestamp: "2026-09-08T12:14:38.502Z",
+      content: "軌道は抽選でいい" });
+    const localCommand = JSON.stringify({ type: "user", timestamp: "2026-09-08T12:16:00.000Z", uuid: "lc",
+      message: { role: "user", content: "<command-name>/model</command-name>" } });
+    const meta = JSON.stringify({ type: "user", timestamp: "2026-09-08T12:16:01.000Z", uuid: "m", isMeta: true,
+      message: { role: "user", content: "[Image: source: x]" } });
+    const marker = JSON.stringify({ type: "user", timestamp: "2026-09-08T12:17:00.000Z", uuid: "i",
+      message: { role: "user", content: "[Request interrupted by user]" } });
+    // 実機 2026-09-08 の並び: 発話 → attachment → snapshot（出力前に中断され、次の送信まで何も続かない）。
+    expect(findTrailingUserPromptText(writeTranscript([prompt("中周(r≈175)を1枚足す"), reminder, snapshot])))
+      .toBe("中周(r≈175)を1枚足す");
+    // 発話の後に tool_result / queue-operation / ローカルコマンド記録 / 注記が続いても直近の発話は変わらない。
+    expect(findTrailingUserPromptText(writeTranscript([
+      prompt("中周(r≈175)を1枚足す"), queueOp, toolResult, localCommand, meta,
+    ]))).toBe("中周(r≈175)を1枚足す");
+    // ブロック配列の本文は text ブロックの連結。
+    expect(findTrailingUserPromptText(writeTranscript([prompt("古い"), blocks]))).toBe("画像を見て");
+    // 末尾が中断確定マーカー（出力後の中断）なら書き戻しは無い → null。
+    expect(findTrailingUserPromptText(writeTranscript([prompt("古い"), marker]))).toBeNull();
+    // 発話が無い / ファイルが無い → null。
+    expect(findTrailingUserPromptText(writeTranscript([toolResult, snapshot]))).toBeNull();
+    expect(findTrailingUserPromptText(path.join(makeTempDir("tailer-missing"), "none.jsonl"))).toBeNull();
   });
 
   test("findTrailingTurnEndMarkerMs は末尾が API エラー終端でも timestamp を返し、後続の発話があれば null", () => {

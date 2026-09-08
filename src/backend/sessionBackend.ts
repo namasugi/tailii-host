@@ -16,6 +16,7 @@ import {
   TmuxSessionManager,
   type CapturePaneOptions,
   type ReattachResult,
+  type SendTextSubmitOptions,
 } from "./tmux.js";
 
 /** セッションを収容する端末バックエンド種別（ワイヤーの TerminalBackendKind と同一）。 */
@@ -36,7 +37,13 @@ export interface SessionBackend {
    * tmux は従来どおり literal 送出 → 150ms → Enter。herdr は本文+CR を単一コールで送る
    * （分割すると Ink のペースト取り込み窓に CR が飲まれ送信されない。実測 2026-07-22）。
    */
-  sendTextSubmit(name: string, text: string): Promise<void>;
+  sendTextSubmit(name: string, text: string, options?: SendTextSubmitOptions): Promise<void>;
+  /**
+   * claude TUI の入力欄を C-u で空にする（中断で書き戻された配送済み発話の破棄用,
+   * restored-prompt-discard）。空にできたら true。入力欄不可視 / ダイアログ表示中 / 上限回数で
+   * 空にならない / capture 失敗は false（何も壊さず諦める）。
+   */
+  clearInputBox(name: string): Promise<boolean>;
   /**
    * `/login` の OAuth コードをコード入力欄へ渡して確定する（login_code_send）。
    * コード入力待ちの画面でなければ何も送らず throw する。
@@ -137,8 +144,12 @@ export class CompositeSessionBackend implements SessionBackend {
     return this.backendFor(name).sendKeys(name, keys, literal);
   }
 
-  sendTextSubmit(name: string, text: string): Promise<void> {
-    return this.backendFor(name).sendTextSubmit(name, text);
+  sendTextSubmit(name: string, text: string, options?: SendTextSubmitOptions): Promise<void> {
+    return this.backendFor(name).sendTextSubmit(name, text, options);
+  }
+
+  clearInputBox(name: string): Promise<boolean> {
+    return this.backendFor(name).clearInputBox(name);
   }
 
   sendLoginCode(name: string, code: string): Promise<void> {

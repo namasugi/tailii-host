@@ -919,6 +919,43 @@ describe("TmuxSessionManager", () => {
     await expect(mgr.kill("a/b")).rejects.toThrow();
     expect(runner.recorded).toEqual([]);
   });
+
+  /** sendTextSubmit 用の最小 pane 状態機械（入力欄の残存テキストと C-u / Enter の効果だけを再現）。 */
+  function makeTmuxSubmitHarness(initialInput: string) {
+    const state = { input: initialInput };
+    const screen = () => {
+      const rule = "─".repeat(40);
+      const body = state.input.length > 0 ? `❯ ${state.input}` : "❯ \u001b[2mTry \"fix\"\u001b[22m";
+      return ["⏺ 前の応答", rule, body, rule, "  ⏸ manual mode on"].join("\n");
+    };
+    const runner = new MockTmuxRunner((args) => {
+      if (args[0] === "capture-pane") return ok(screen());
+      if (args[0] === "send-keys" && args[3] === "C-u") { state.input = ""; return ok(""); }
+      if (args[0] === "send-keys" && args[3] === "Enter") { state.input = ""; return ok(""); }
+      if (args[0] === "send-keys" && args[3] === "-l") { state.input += args[5] ?? ""; return ok(""); }
+      return ok("");
+    });
+    const sends = () => runner.recorded.filter((args) => args[0] === "send-keys").map((args) => args.slice(3));
+    return { runner, state, sends };
+  }
+
+  test("sendTextSubmit: 残存が transcript の直近の発話と同文なら C-u で破棄してから注入する（tmux）", async () => {
+    const { runner, sends } = makeTmuxSubmitHarness("中周(r≈175)を1枚足す");
+    const mgr = new TmuxSessionManager({ runner: runner.runner, store: makeTempStore(), clearKeyDelayMs: 0 });
+    await mgr.sendTextSubmit("s", "軌道は抽選でいい", { recordedPromptText: () => "中周(r≈175)を1枚足す" });
+    expect(sends()).toEqual([["C-u"], ["-l", "--", "軌道は抽選でいい"], ["Enter"]]);
+  });
+
+  test("sendTextSubmit: 残存が記録本文と別文 / 照合材料なしなら従来どおり Enter で独立送信してから注入する（tmux）", async () => {
+    const a = makeTmuxSubmitHarness("queued だった本文");
+    const mgrA = new TmuxSessionManager({ runner: a.runner.runner, store: makeTempStore() });
+    await mgrA.sendTextSubmit("s", "今回の本文", { recordedPromptText: () => "直近の発話" });
+    expect(a.sends()).toEqual([["Enter"], ["-l", "--", "今回の本文"], ["Enter"]]);
+    const b = makeTmuxSubmitHarness("残存");
+    const mgrB = new TmuxSessionManager({ runner: b.runner.runner, store: makeTempStore() });
+    await mgrB.sendTextSubmit("s", "今回の本文");
+    expect(b.sends()).toEqual([["Enter"], ["-l", "--", "今回の本文"], ["Enter"]]);
+  });
 });
 
 // MARK: - ClaudeSessionStore
