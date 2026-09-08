@@ -16,6 +16,11 @@ export const FILE_FETCH_CHUNK_SIZE = 64 * 1024;
 /** file_fetch で配信する原本サイズの上限。iPhone 側の保存先・回線を考え 512 MiB。 */
 export const FILE_FETCH_SIZE_LIMIT = 512 * 1024 * 1024;
 const TEXT_PREVIEW_LIMIT = 256 * 1024;
+/** バイナリ判定（NUL バイト探索）に使う先頭バイト数。 */
+const BINARY_SNIFF_BYTES = 8 * 1024;
+/** 不正バイトがこの割合以下ならテキストとして見せる。 */
+const INVALID_BYTE_RATIO_LIMIT = 0.05;
+/** プレビューできないファイルを「上限超過」として返す原本サイズ。 */
 const NON_IMAGE_SIZE_LIMIT = 5 * 1024 * 1024;
 const IMAGE_PREVIEW_MAX_PIXEL_SIZE = 1_024;
 
@@ -105,16 +110,14 @@ export async function fileRead(
     }
   }
 
-  if (stat.size > NON_IMAGE_SIZE_LIMIT) return { ...common, kind: "tooLarge" };
-
-  let content: Buffer;
+  let head: Buffer;
   try {
     const descriptor = fs.openSync(filePath, "r");
     try {
       const length = Math.min(stat.size, TEXT_PREVIEW_LIMIT);
-      content = Buffer.alloc(length);
-      const bytesRead = fs.readSync(descriptor, content, 0, length, 0);
-      content = content.subarray(0, bytesRead);
+      head = Buffer.alloc(length);
+      const bytesRead = fs.readSync(descriptor, head, 0, length, 0);
+      head = head.subarray(0, bytesRead);
     } finally {
       fs.closeSync(descriptor);
     }
@@ -122,17 +125,60 @@ export async function fileRead(
     return { ...common, kind: "error", error: String(error) };
   }
 
-  try {
-    const text = new TextDecoder("utf-8", { fatal: true }).decode(content);
-    return {
-      ...common,
-      kind: "text",
-      content: text,
-      truncated: stat.size > content.length,
-    };
-  } catch {
-    return { ...common, kind: "binary" };
+  // 先頭 256 KiB を読んだだけなので、末尾で多バイト文字が割れていることがある。
+  // 割れたぶんを落としてから判定しないと、巨大なテキストが binary へ落ちる。
+  const truncated = stat.size > head.length;
+  const content = truncated ? trimIncompleteUtf8Tail(head) : head;
+  const text = decodeTextPreview(content);
+  if (text !== null) {
+    return { ...common, kind: "text", content: text, truncated: stat.size > content.length };
   }
+  if (stat.size > NON_IMAGE_SIZE_LIMIT) return { ...common, kind: "tooLarge" };
+  return { ...common, kind: "binary" };
+}
+
+/**
+ * テキストとして表示できるなら文字列を、バイナリと判断したら null を返す。
+ *
+ * - NUL バイトを含むものはバイナリ扱い（実行ファイル・画像・アーカイブ）。
+ * - UTF-8 として妥当ならそのまま。妥当でなくても不正バイトが僅かなら、
+ *   置換文字を混ぜたテキストとして見せる（ログの文字化け 1 行でプレビュー全滅にしない）。
+ */
+function decodeTextPreview(content: Buffer): string | null {
+  if (content.length === 0) return "";
+  if (content.subarray(0, BINARY_SNIFF_BYTES).includes(0)) return null;
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(content);
+  } catch {
+    // 継続
+  }
+  const lossy = new TextDecoder("utf-8").decode(content);
+  let replacements = 0;
+  for (const character of lossy) {
+    if (character === "\uFFFD") replacements += 1;
+  }
+  if (lossy.length === 0) return null;
+  return replacements / lossy.length <= INVALID_BYTE_RATIO_LIMIT ? lossy : null;
+}
+
+/** 末尾で割れた UTF-8 シーケンスを落とす。 */
+function trimIncompleteUtf8Tail(buffer: Buffer): Buffer {
+  for (let back = 1; back <= 4 && back <= buffer.length; back += 1) {
+    const byte = buffer[buffer.length - back]!;
+    if ((byte & 0b1100_0000) === 0b1000_0000) continue; // 継続バイト
+    const expected = byte < 0x80
+      ? 1
+      : (byte & 0b1110_0000) === 0b1100_0000
+        ? 2
+        : (byte & 0b1111_0000) === 0b1110_0000
+          ? 3
+          : (byte & 0b1111_1000) === 0b1111_0000
+            ? 4
+            : 0;
+    if (expected === 0 || expected <= back) return buffer; // 不正な先頭バイト or 完結済み
+    return buffer.subarray(0, buffer.length - back);
+  }
+  return buffer;
 }
 
 function fileError(filePath: string, error: string): FileReadResult {

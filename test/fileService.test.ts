@@ -69,6 +69,45 @@ describe("fileService", () => {
     await expect(fileRead("relative.txt")).resolves.toMatchObject({ kind: "error" });
   });
 
+  test("256 KiB 境界で多バイト文字が割れてもテキストとして返す", async () => {
+    const root = makeTempDir("file-read-boundary");
+    const filePath = path.join(root, "japanese.txt");
+    // 「あ」(3 バイト) を並べ、256 KiB の境界が文字の途中に落ちるようにする。
+    const body = "あ".repeat(Math.ceil((256 * 1024) / 3) + 100);
+    fs.writeFileSync(filePath, body);
+    expect(Buffer.byteLength(body) % 3).toBe(0);
+
+    const result = await fileRead(filePath);
+    expect(result.kind).toBe("text");
+    expect(result.truncated).toBe(true);
+    expect(result.content?.includes("\uFFFD")).toBe(false);
+    expect(result.content?.startsWith("あああ")).toBe(true);
+  });
+
+  test("5 MiB 超のテキストも先頭だけプレビューする", async () => {
+    const root = makeTempDir("file-read-big-text");
+    const filePath = path.join(root, "big.log");
+    fs.writeFileSync(filePath, "log line\n".repeat(700_000));
+    expect(fs.statSync(filePath).size).toBeGreaterThan(5 * 1024 * 1024);
+
+    await expect(fileRead(filePath)).resolves.toMatchObject({ kind: "text", truncated: true });
+  });
+
+  test("不正バイトが僅かなテキストは置換文字を混ぜて表示し、多ければバイナリにする", async () => {
+    const root = makeTempDir("file-read-invalid");
+    const mostlyTextPath = path.join(root, "mostly-text.log");
+    const garbagePath = path.join(root, "garbage.bin");
+    fs.writeFileSync(mostlyTextPath, Buffer.concat([
+      Buffer.from("a".repeat(1_000)),
+      Buffer.from([0xff, 0xfe]),
+      Buffer.from("b".repeat(1_000)),
+    ]));
+    fs.writeFileSync(garbagePath, Buffer.from(Array.from({ length: 512 }, () => 0xff)));
+
+    await expect(fileRead(mostlyTextPath)).resolves.toMatchObject({ kind: "text" });
+    await expect(fileRead(garbagePath)).resolves.toMatchObject({ kind: "binary" });
+  });
+
   test("画像は注入 thumbnailer を最大辺1024pxで再利用する", async () => {
     const root = makeTempDir("file-image");
     const imagePath = path.join(root, "photo.png");
