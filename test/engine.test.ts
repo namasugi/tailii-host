@@ -9,6 +9,7 @@ import {
   type CodexAppServerThreadOptions,
 } from "../src/codex/codexAppServer.js";
 import { ImageService } from "../src/chat/imageService.js";
+import { CLIENT_BUILD_PIN } from "../src/shared/clientBuild.js";
 import {
   sendQuestionEventToEngine,
   sendRemotePendingToEngine,
@@ -1179,8 +1180,11 @@ describe("EngineControl — 横断制御チャネル", () => {
     });
 
     // managed は host-auto-update の能力広告（開発ツリー実行のため false）。
+    // latestClientBuild は記録が無くても host 版のピンを広告する（host 先行更新でも
+    // 古いアプリへ更新導線を出すため）。
     expect(await engine.lines.nextOfType("channel_hello")).toBe(
-      '{"managed":false,"maxVersion":2,"serverVersion":"0.1.0","type":"channel_hello","v":1}',
+      `{"latestClientBuild":"${CLIENT_BUILD_PIN}","managed":false,"maxVersion":2,`
+        + '"serverVersion":"0.1.0","type":"channel_hello","v":1}',
     );
     currentVersion = "0.2.0";
     engine.writeLine('{"id":"L-stale","type":"session_list_request","v":1}');

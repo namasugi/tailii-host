@@ -3,8 +3,9 @@
 // アプリは channel_hello に自分の `clientVersion`(CFBundleShortVersionString, 例 "1.0.0") と
 // `clientBuild`(CFBundleVersion, 例 "4") を載せる。host はこのホストへ接続してきた
 // 「最も新しいビルド番号」を ~/.tailii/host/client-build.json に記録し、次回以降の
-// channel_hello で `latestClientBuild` として広告する。アプリは自分のビルド番号と比較し、
-// より新しいビルドがこのホストを使った実績があれば「アプリを更新」を促す
+// channel_hello で `latestClientBuild` として広告する（記録が無い / 古い間は host 版が持つ
+// ピン CLIENT_BUILD_PIN を使う）。アプリは自分のビルド番号と比較し、より新しいビルドが
+// あれば「アプリを更新」を促す
 // （TestFlight 配布ではマーケティング版 1.0.0 が据え置かれたままビルド番号だけ進むため、
 // 版文字列ではなくビルド番号で判定する）。
 //
@@ -23,6 +24,20 @@ export interface ClientBuildRecord {
   /** 記録した時刻（epoch ms）。 */
   tsMs: number;
 }
+
+/**
+ * この host 版がリリース時点で把握しているアプリの最新ビルド（CFBundleVersion）。
+ *
+ * 観測値（このホストへ接続してきた中で最も新しいビルド）だけを広告すると、
+ * **host が先に更新された場合に古いアプリへ何も促せない**（新しいビルドが一度も
+ * 接続していないため記録が育たない）。広告値はこのピンと観測値の新しい方を採り、
+ * どちらが先に更新されても古い側にだけ更新導線が出るようにする。
+ *
+ * **アプリの新ビルドを配布したときに上げる**。配布前に上げると、まだ入手できない
+ * ビルドへの更新を促すことになる（host のピンをアプリ側が持つ関係の裏返し。
+ * 順序は docs/host-auto-update.md を参照）。
+ */
+export const CLIENT_BUILD_PIN = "5";
 
 /** 記録ファイルの既定パス（self-update の管理ルートと同じ ~/.tailii/host/ 配下）。 */
 export function clientBuildRecordPath(): string {
@@ -94,4 +109,19 @@ export function recordClientBuild(
   } catch {
     return false;
   }
+}
+
+/**
+ * hello で広告するビルド番号を決める（ピンと観測値の新しい方）。
+ * どちらも無い / 規約外なら null（広告しない = 誤警報より沈黙）。
+ */
+export function advertisedClientBuild(
+  observed: string | null,
+  pin: string | null = CLIENT_BUILD_PIN,
+): string | null {
+  const validObserved = observed !== null && parseBuildTuple(observed) !== null ? observed : null;
+  const validPin = pin !== null && parseBuildTuple(pin) !== null ? pin : null;
+  if (validPin === null) return validObserved;
+  if (validObserved === null) return validPin;
+  return (compareBuild(validObserved, validPin) ?? 0) >= 0 ? validObserved : validPin;
 }

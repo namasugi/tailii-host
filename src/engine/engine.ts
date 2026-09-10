@@ -80,7 +80,7 @@ import {
 import { herdrInstalled } from "../backend/herdr.js";
 import { createStaleDistGuard, isStaleDist, readPackageVersion, type StaleDistGuard } from "../shared/version.js";
 import { readRecentUpdateError, resolveInstallState } from "../commands/selfUpdate.js";
-import { clientBuildRecordPath as defaultClientBuildRecordPath, readLatestClientBuild } from "../shared/clientBuild.js";
+import { advertisedClientBuild, clientBuildRecordPath as defaultClientBuildRecordPath, readLatestClientBuild } from "../shared/clientBuild.js";
 import { resolveHostDisplayName } from "../shared/hostDisplayName.js";
 import {
   DEFAULT_MODE_TIMING,
@@ -508,9 +508,11 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     // updateError は managed のときだけ載せる（unmanaged では self-update が動かず提示先も無い。
     // dev 機に残った last-update.json が hello を環境依存にするのも防ぐ）。
     const updateError = installState.managed ? readRecentUpdateError(helloVersion ?? null) : undefined;
-    // このホストへ接続した最も新しいアプリビルド（過去の hello で記録）。アプリは自分の
-    // CFBundleVersion と比較して「より新しいビルドがある」を判定する（host-auto-update）。
-    const latestClientBuild = readLatestClientBuild(clientBuildRecordPath);
+    // アプリの最新ビルド。過去の hello で記録した観測値と、この host 版が知っている
+    // ピン（CLIENT_BUILD_PIN）の新しい方を広告する。アプリは自分の CFBundleVersion と
+    // 比較して「より新しいビルドがある」を判定する（host-auto-update）。
+    // 観測値だけだと host が先に更新されたときに古いアプリへ何も促せない。
+    const latestClientBuild = advertisedClientBuild(readLatestClientBuild(clientBuildRecordPath));
     writer.write({
       type: "channel_hello",
       v: PROTOCOL_V1,

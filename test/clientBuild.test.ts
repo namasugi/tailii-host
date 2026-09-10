@@ -7,6 +7,7 @@ import { join } from "node:path";
 import {
   compareBuild,
   parseBuildTuple,
+  advertisedClientBuild,
   readLatestClientBuild,
   recordClientBuild,
 } from "../src/shared/clientBuild.js";
@@ -68,5 +69,27 @@ describe("clientBuild — 記録", () => {
     // 壊れた記録の上には普通に書ける。
     expect(recordClientBuild({ clientBuild: "6" }, filePath)).toBe(true);
     expect(readLatestClientBuild(filePath)).toBe("6");
+  });
+});
+
+describe("advertisedClientBuild", () => {
+  it("記録が無ければピンを広告する（host 先行更新でも古いアプリへ促せる）", () => {
+    expect(advertisedClientBuild(null, "5")).toBe("5");
+  });
+
+  it("観測値の方が新しければ観測値を採る（ピンより先を行くアプリを引き戻さない）", () => {
+    expect(advertisedClientBuild("7", "5")).toBe("7");
+  });
+
+  it("観測値が古ければピンを採る", () => {
+    expect(advertisedClientBuild("4", "5")).toBe("5");
+  });
+
+  it("規約外のピンは無視して観測値を返す", () => {
+    expect(advertisedClientBuild("4", "beta")).toBe("4");
+  });
+
+  it("どちらも無ければ広告しない", () => {
+    expect(advertisedClientBuild(null, null)).toBeNull();
   });
 });

@@ -12,7 +12,7 @@ import { MockTmuxRunner, startEngine } from "./helpers.js";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readLatestClientBuild } from "../src/shared/clientBuild.js";
+import { CLIENT_BUILD_PIN, readLatestClientBuild } from "../src/shared/clientBuild.js";
 
 function makeManager(): TmuxSessionManager {
   return new TmuxSessionManager({
@@ -36,30 +36,30 @@ describe("EngineControl — host_update_request", () => {
 
   test("アプリの channel_hello が名乗った clientBuild を記録し、次回 hello で latestClientBuild として広告する", async () => {
     const recordPath = join(mkdtempSync(join(tmpdir(), "tailii-hello-build-")), "client-build.json");
-    // 1 本目: 記録が無いので latestClientBuild は載らない。アプリが build 4 を名乗る。
+    // 1 本目: 記録が無いので host 版のピンを広告する。アプリはピンより新しい build を名乗る。
     const first = startEngine({ sessionManager: makeManager(), clientBuildRecordPath: recordPath });
     try {
       const hello = decodeControlMessage(await first.lines.nextOfType("channel_hello"));
-      expect(hello.type === "channel_hello" && hello.latestClientBuild).toBeUndefined();
+      expect(hello).toMatchObject({ type: "channel_hello", latestClientBuild: CLIENT_BUILD_PIN });
       first.writeLine(JSON.stringify({
-        type: "channel_hello", v: 1, maxVersion: 2, clientVersion: "1.0.0", clientBuild: "4",
+        type: "channel_hello", v: 1, maxVersion: 2, clientVersion: "1.0.0", clientBuild: "9000",
       }));
       // 記録は hello 処理内で同期的に書かれる。後続 RPC の応答で処理完了を待つ。
       first.writeLine(JSON.stringify({ type: "host_update_request", v: 1, id: "b1", version: "not-semver" }));
       await first.lines.nextOfType("host_update_response");
-      expect(readLatestClientBuild(recordPath)).toBe("4");
+      expect(readLatestClientBuild(recordPath)).toBe("9000");
     } finally {
       await first.teardown();
     }
-    // 2 本目: 記録済みの build 4 を広告する。古い build 3 の接続では記録が後退しない。
+    // 2 本目: 記録済みの build 9000（ピンより新しい）を広告する。古い build 3 では記録が後退しない。
     const second = startEngine({ sessionManager: makeManager(), clientBuildRecordPath: recordPath });
     try {
       const hello = decodeControlMessage(await second.lines.nextOfType("channel_hello"));
-      expect(hello).toMatchObject({ type: "channel_hello", latestClientBuild: "4" });
+      expect(hello).toMatchObject({ type: "channel_hello", latestClientBuild: "9000" });
       second.writeLine(JSON.stringify({ type: "channel_hello", v: 1, maxVersion: 2, clientBuild: "3" }));
       second.writeLine(JSON.stringify({ type: "host_update_request", v: 1, id: "b2", version: "not-semver" }));
       await second.lines.nextOfType("host_update_response");
-      expect(readLatestClientBuild(recordPath)).toBe("4");
+      expect(readLatestClientBuild(recordPath)).toBe("9000");
     } finally {
       await second.teardown();
     }
