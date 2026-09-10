@@ -834,6 +834,16 @@ function extractText(content: unknown): string {
   return parts.join("");
 }
 
+/** 選択肢を選ばず Notes 欄だけで確定したときに Claude Code が入れる回答値。 */
+const NOTES_ONLY_ANSWER = "(notes only)";
+
+/** annotations[question] からメモ本文を取り出す（無ければ空文字）。 */
+function extractQuestionNotes(value: unknown): string {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return "";
+  const notes = (value as Record<string, unknown>)["notes"];
+  return typeof notes === "string" ? notes.trim() : "";
+}
+
 /** AskUserQuestion の toolUseResult を、会話ログへ表示するユーザー回答文へ整形する。 */
 function extractQuestionAnswerText(value: unknown): string {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return "";
@@ -843,6 +853,11 @@ function extractQuestionAnswerText(value: unknown): string {
   if (!Array.isArray(rawQuestions)) return "";
   if (typeof rawAnswers !== "object" || rawAnswers === null || Array.isArray(rawAnswers)) return "";
   const answers = rawAnswers as Record<string, unknown>;
+  const rawAnnotations = result["annotations"];
+  const annotations =
+    typeof rawAnnotations === "object" && rawAnnotations !== null && !Array.isArray(rawAnnotations)
+      ? (rawAnnotations as Record<string, unknown>)
+      : {};
   const rows: string[] = [];
   for (const rawQuestion of rawQuestions) {
     if (typeof rawQuestion !== "object" || rawQuestion === null || Array.isArray(rawQuestion)) continue;
@@ -855,8 +870,18 @@ function extractQuestionAnswerText(value: unknown): string {
         : Array.isArray(rawAnswer)
           ? rawAnswer.filter((item): item is string => typeof item === "string").join("、").trim()
           : "";
-    if (answer.length === 0) continue;
-    rows.push(`・${question.trim()} → ${answer}`);
+    // preview 付き設問には Other 行が無く、自由記述は Notes 欄が受ける。選択肢を選ばずに
+    // 確定すると回答値が `(notes only)` になるので、会話ログにはメモ本文の方を出す。
+    // メモが空なら回答値をそのまま出す（"(notes only)" のまま出す方が、行ごと消えるよりまし）。
+    const notes = extractQuestionNotes(annotations[question]);
+    let shown = answer;
+    if (notes.length > 0) {
+      shown = answer === NOTES_ONLY_ANSWER || answer.length === 0
+        ? notes
+        : `${answer}（メモ: ${notes}）`;
+    }
+    if (shown.length === 0) continue;
+    rows.push(`・${question.trim()} → ${shown}`);
   }
   return rows.length > 0 ? `回答:\n${rows.join("\n")}` : "";
 }
@@ -1173,9 +1198,11 @@ function decodeQuestionPromptQuestion(raw: Record<string, unknown>): QuestionPro
       const rec = rawOption as Record<string, unknown>;
       const label = rec["label"];
       if (typeof label !== "string") continue;
+      const preview = rec["preview"];
       options.push({
         label,
         description: typeof rec["description"] === "string" ? rec["description"] : "",
+        ...(typeof preview === "string" && preview.length > 0 ? { preview } : {}),
       });
     }
   }

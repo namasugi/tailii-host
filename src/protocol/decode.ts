@@ -19,6 +19,7 @@ import {
   type HostVersions,
   type OfficialAppProvider,
   type QuestionAnswer,
+  type QuestionOption,
   type RemotePendingKind,
   type ServeProcessInfo,
   type SessionInfo,
@@ -672,10 +673,12 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
             multiSelect: requireBoolean(obj, "multiSelect"),
             options: requireArray(obj, "options").map((option) => {
               const optionObj = requireObject(option, "options");
-              return {
+              // preview は additive フィールド（旧形式は欠落）。
+              return compact<QuestionOption>({
                 label: requireString(optionObj, "label"),
                 description: requireString(optionObj, "description"),
-              };
+                preview: optionalString(optionObj, "preview"),
+              });
             }),
           };
         }),

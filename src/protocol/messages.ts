@@ -237,6 +237,12 @@ export interface ClaudeModelInfo {
 export interface QuestionOption {
   label: string;
   description: string;
+  /**
+   * 選択肢のプレビュー本文（AskUserQuestion の `option.preview`）。
+   * これを持つ単一選択の設問は TUI が preview レイアウトで描く（Other 行が無く、
+   * 自由記述は Notes 欄が受ける）ので、iOS 側の「その他」も同じ意味へ寄せる。
+   */
+  preview?: string;
 }
 
 /** AskUserQuestion の質問 1 件。 */

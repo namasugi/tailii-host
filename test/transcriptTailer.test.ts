@@ -885,6 +885,92 @@ describe("TranscriptTailer", () => {
     ]);
   });
 
+  test("preview 付き設問の自由記述は (notes only) ではなくメモ本文を会話ログへ出す", async () => {
+    // preview 付き単一選択には Other 行が無く、Notes 欄だけで確定すると回答値が
+    // "(notes only)" になる（claude 2.1.267）。ログにはユーザーが書いた本文を出す。
+    const ask = JSON.stringify({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        content: [{
+          type: "tool_use", id: "toolu_q2", name: "AskUserQuestion",
+          input: {
+            questions: [{
+              question: "どれにしますか?", header: "選択", multiSelect: false,
+              options: [{ label: "A", description: "前者", preview: "表\n1 → 2" }],
+            }],
+          },
+        }],
+      },
+      uuid: "a2",
+    });
+    const result = JSON.stringify({
+      type: "user",
+      message: {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "toolu_q2", content: "(notes only)" }],
+      },
+      toolUseResult: {
+        questions: [{
+          question: "どれにしますか?", header: "選択", multiSelect: false,
+          options: [{ label: "A", description: "前者", preview: "表\n1 → 2" }],
+        }],
+        answers: { "どれにしますか?": "(notes only)" },
+        annotations: { "どれにしますか?": { notes: "自分で書いた回答" } },
+      },
+      uuid: "u2",
+    });
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
+    const messages = await collect(tailer.streamTranscript(writeTranscript([ask, result])));
+
+    // preview は question_prompt にもそのまま載せる（iOS の設問シートが比較表を出す）。
+    const prompts = messages.filter((m) => m.type === "question_prompt");
+    expect(prompts[0]).toMatchObject({
+      questions: [{ options: [{ label: "A", preview: "表\n1 → 2" }] }],
+    });
+    const answerOutputs = messages.filter((m) => m.type === "chat_output" && m.role === "user");
+    expect(answerOutputs).toEqual([{
+      type: "chat_output", v: 1, streamId: "u2", role: "user",
+      text: "回答:\n・どれにしますか? → 自分で書いた回答", eof: true,
+    }]);
+  });
+
+  test("選択肢 + メモの両方があれば回答値にメモを添える", async () => {
+    const ask = JSON.stringify({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        content: [{
+          type: "tool_use", id: "toolu_q3", name: "AskUserQuestion",
+          input: {
+            questions: [{
+              question: "どれ?", header: "選択", multiSelect: false,
+              options: [{ label: "A", description: "" }],
+            }],
+          },
+        }],
+      },
+      uuid: "a3",
+    });
+    const result = JSON.stringify({
+      type: "user",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_q3", content: "A" }] },
+      toolUseResult: {
+        questions: [{
+          question: "どれ?", header: "選択", multiSelect: false,
+          options: [{ label: "A", description: "" }],
+        }],
+        answers: { "どれ?": "A" },
+        annotations: { "どれ?": { notes: "急ぎで" } },
+      },
+      uuid: "u3",
+    });
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
+    const messages = await collect(tailer.streamTranscript(writeTranscript([ask, result])));
+    const answerOutputs = messages.filter((m) => m.type === "chat_output" && m.role === "user");
+    expect(answerOutputs[0]).toMatchObject({ text: "回答:\n・どれ? → A（メモ: 急ぎで）" });
+  });
+
   test("追記 tail: 上限 tail 中に追記された行も拾う", async () => {
     const p = writeTranscript(['{"type":"user","message":{"role":"user","content":"1"},"uuid":"u1"}']);
     const tailer = new TranscriptTailer({ pollIntervalMs: 10, tailDeadlineMs: 1500 });

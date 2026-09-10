@@ -2,7 +2,9 @@
 // AskUserQuestion 回答注入の検証（ダイアログ残存の検知と自己修復トリガ）。
 
 import { expect, test } from "vitest";
-import { injectQuestionAnswers, isQuestionDialogFrame } from "../src/hub/questionInjection.js";
+import {
+  injectQuestionAnswers, isPreviewQuestionFrame, isQuestionDialogFrame,
+} from "../src/hub/questionInjection.js";
 import type { SessionBackend } from "../src/backend/sessionBackend.js";
 import type { QuestionAnswer } from "../src/protocol.js";
 
@@ -22,6 +24,7 @@ const SINGLE_ANSWER: QuestionAnswer[] = [
   { questionIndex: 0, selectedOptionIndexes: [0], multiSelect: false },
 ];
 
+/** 従来レイアウト（preview 無し）。Other 行を必ず描き、Notes 行は無い。 */
 const QUESTION_DIALOG = [
   "←  ☐ 表示位置  ☐ 更新  ✔ Submit  →",
   "",
@@ -29,8 +32,29 @@ const QUESTION_DIALOG = [
   "",
   "❯ 1. ヘッダーに常設ピル",
   "  2. 一覧最上部のカード",
+  "  3. Type something.",
   "",
-  "Enter to select · ↑/↓ to navigate · n to add notes · Tab to switch questions · Esc to cancel",
+  "Enter to select · Tab/Arrow keys to navigate · Esc to cancel",
+].join("\n");
+
+/**
+ * preview レイアウト（単一選択 + option.preview あり。claude 2.1.267 実測フレーム）。
+ * 選択肢だけを左に描き、Other 行が無く、Notes 行を持つ。
+ */
+const PREVIEW_DIALOG = [
+  " ☐ 報酬の形",
+  "",
+  "│ メダル報酬の増やし方はどの形にしますか?",
+  "",
+  "❯ 1. 深いほど厚くする(推奨)       ┌──────────────┐",
+  "  2. 一律に増やす                 │ 到達  現行 → 新 │",
+  "  3. 制覇ボーナス重視             └──────────────┘",
+  "",
+  "                                  Notes: press n to add notes",
+  "",
+  "  Chat about this",
+  "",
+  "Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel",
 ].join("\n");
 
 test("isQuestionDialogFrame: 設問 TUI だけを検知し、承認ダイアログ/❯メニューは対象外", () => {
@@ -48,6 +72,86 @@ test("isQuestionDialogFrame: 設問 TUI だけを検知し、承認ダイアロ�
     "Remote Control\n❯ Continue\nEnter to select · Esc to continue",
   )).toBe(false);
   expect(isQuestionDialogFrame("")).toBe(false);
+});
+
+/** preview レイアウトで Notes 欄を開いた状態（`press n to add notes` が入力欄に置き換わる）。 */
+const PREVIEW_DIALOG_NOTES_OPEN = PREVIEW_DIALOG
+  .replace("Notes: press n to add notes", "Notes: Add notes on this design…");
+
+test("isPreviewQuestionFrame: preview レイアウトだけを検知する", () => {
+  expect(isPreviewQuestionFrame(PREVIEW_DIALOG)).toBe(true);
+  // 従来レイアウトは Other 行（Type something.）を持つので対象外。
+  expect(isPreviewQuestionFrame(QUESTION_DIALOG)).toBe(false);
+  // 設問ダイアログですらないフレーム。
+  expect(isPreviewQuestionFrame("")).toBe(false);
+});
+
+test("preview レイアウトは数字キーで確定しないので、行番号 → Enter を注入する", async () => {
+  // 実測（2.1.267）: preview 付き単一選択の数字キーはカーソル移動のみ。
+  const { keys, backend } = stubBackend([PREVIEW_DIALOG, ""]);
+  await expect(
+    injectQuestionAnswers(SINGLE_ANSWER, "work", backend),
+  ).resolves.toBeUndefined();
+  expect(keys).toEqual([["1"], ["Enter"]]);
+});
+
+test("preview レイアウトの 10 番目以降は ↓ でカーソルを寄せてから Enter で確定する", async () => {
+  const { keys, backend } = stubBackend([PREVIEW_DIALOG, ""]);
+  await expect(
+    injectQuestionAnswers(
+      [{ questionIndex: 0, selectedOptionIndexes: [9], multiSelect: false }], "work", backend,
+    ),
+  ).resolves.toBeUndefined();
+  expect(keys).toEqual([...Array(9).fill(["Down"]), ["Enter"]]);
+});
+
+test("preview レイアウトの otherText は Notes 欄（n）へ書いて確定する", async () => {
+  // Other 行が無い代わりに、TUI は Notes 欄で自由記述を受ける（回答は "(notes only)"）。
+  const { keys, backend } = stubBackend([PREVIEW_DIALOG, PREVIEW_DIALOG_NOTES_OPEN, ""]);
+  await expect(
+    injectQuestionAnswers(
+      [{ questionIndex: 0, selectedOptionIndexes: [3], otherText: "自分で書く", multiSelect: false }],
+      "work", backend,
+    ),
+  ).resolves.toBeUndefined();
+  expect(keys).toEqual([["n"], ["自分で書く"], ["Enter"]]);
+});
+
+test("pane を読めないときも本文を打たない（fail closed）", async () => {
+  // 読取失敗を「開いたかも」と扱うと、本文中の数字がカーソル移動として食われて誤確定する。
+  const keys: string[][] = [];
+  const backend = {
+    sendKeys: async (_session: string, sent: string[]) => { keys.push(sent); },
+    sendTextSubmit: async () => {},
+    capturePane: (() => {
+      let call = 0;
+      return async () => {
+        call += 1;
+        // 1 回目（レイアウト判定）は preview フレーム、2 回目（Notes 確認）は読取失敗。
+        if (call === 1) return PREVIEW_DIALOG;
+        throw new Error("pane not found");
+      };
+    })(),
+  } as unknown as SessionBackend;
+  await expect(
+    injectQuestionAnswers(
+      [{ questionIndex: 0, selectedOptionIndexes: [3], otherText: "2 倍にする", multiSelect: false }],
+      "work", backend,
+    ),
+  ).rejects.toThrow("notes field did not open");
+  expect(keys).toEqual([["n"]]);
+});
+
+test("Notes 欄が開かなければ本文を打たずに失敗させる（誤確定を防ぐ）", async () => {
+  // 本文中の数字がカーソル移動として食われ、Enter で別の選択肢を確定してしまうため。
+  const { keys, backend } = stubBackend([PREVIEW_DIALOG]);
+  await expect(
+    injectQuestionAnswers(
+      [{ questionIndex: 0, selectedOptionIndexes: [3], otherText: "2 倍にする", multiSelect: false }],
+      "work", backend,
+    ),
+  ).rejects.toThrow("notes field did not open");
+  expect(keys).toEqual([["n"]]);
 });
 
 test("注入後にダイアログが消えていれば正常完了する", async () => {

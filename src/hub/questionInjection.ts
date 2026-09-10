@@ -12,6 +12,8 @@ const OTHER_TEXT_CR_GAP_MS = 400;
 const VERIFY_DELAY_MS = 600;
 /** 1回目の検証でダイアログ残存だったときの再検証までの猶予。 */
 const VERIFY_RETRY_DELAY_MS = 1_500;
+/** preview レイアウトの Notes 欄が閉じている（未フォーカス）ことを示すヒント行。 */
+const NOTES_HINT = "press n to add notes";
 
 /**
  * AskUserQuestion ダイアログのフレームか。`Enter to select` は /remote-control 等の
@@ -31,9 +33,25 @@ export function isQuestionDialogFrame(text: string): boolean {
 }
 
 /**
+ * preview 付き単一選択で Claude TUI が使う「左に選択肢・右にプレビュー」レイアウトか。
+ * このレイアウトでは数字キーはカーソル移動だけで確定せず、Enter が必要（2.1.267 実測 /
+ * バンドル実装: 数字キーのハンドラは setHighlight のみを呼ぶ）。Other（Type something）行も
+ * 描かれないため、従来レイアウト用の注入手順をそのまま使うと必ず取りこぼす。
+ *
+ * 判定は AND で保守的に取る: 従来レイアウトは必ず Other 行（`Type something` / `Type something.`）を
+ * 描き、Notes 行（`n to add notes`）を持たない。preview レイアウトはその逆。
+ */
+export function isPreviewQuestionFrame(text: string): boolean {
+  if (!isQuestionDialogFrame(text)) return false;
+  return text.includes("to add notes") && !text.includes("Type something");
+}
+
+/**
  * question_answer → Claude AskUserQuestion TUI のキー操作。
  * 各キー間の待機は、Ink の再描画中に連続入力が欠落するのを避けるために設ける。
  * - 単一選択 = 数字キーで即確定。Other は行番号 → literal 入力 → Enter。
+ * - 単一選択（preview レイアウト）= 数字キーはカーソル移動のみなので、行番号 → Enter で確定する。
+ *   Other 行は無く、自由記述は Notes 欄（n）が受ける（確定すると回答は "(notes only)"）。
  * - multiSelect = 数字キーは無反応。カーソル（先頭 index 0 から開始）を ↓ で対象行へ移動し
  *   Space でトグル → Right でレビュー → 最終問後に「1」Submit answers。
  *   Other 行は Space でチェック＆入力欄化 → literal 入力 → ↑ でテキスト欄を抜けてから Right。
@@ -49,6 +67,10 @@ export async function injectQuestionAnswers(
   // Submit answers までは行わない。1 問だけの単一選択のみ即時完了する。
   const needsReviewSubmit = sorted.length > 1 || sorted.some((answer) => answer.multiSelect);
   for (const answer of sorted) {
+    // レイアウトは設問ごとに変わる（preview を持つ単一選択の設問だけが preview レイアウト）。
+    // 直前のフレームで毎回判定する。
+    const previewLayout = !answer.multiSelect
+      && await capturedFrameMatches(session, sessionManager, isPreviewQuestionFrame);
     const other = (answer.otherText ?? "").trim();
     let indexes = answer.selectedOptionIndexes.filter((i) => i >= 0).sort((a, b) => a - b);
     // otherText があるとき、最大 index は Other（Type something.）行。
@@ -57,7 +79,39 @@ export async function injectQuestionAnswers(
       otherIndex = indexes[indexes.length - 1]!;
       indexes = indexes.slice(0, -1);
     }
-    if (answer.multiSelect) {
+    if (previewLayout && other.length > 0) {
+      // preview レイアウトに Other 行は無い。TUI は代わりに Notes 欄で自由記述を受け、
+      // 選択肢を選ばずに確定すると回答が "(notes only)" + notes になる（2.1.267 実測）。
+      // 自由記述の意図はここに写す。
+      await sessionManager.sendKeys(session, ["n"]);
+      await sleep(KEY_STEP_MS);
+      // n が Notes 欄を開けていなければ、本文の数字がカーソル移動として食われ Enter で
+      // 別の選択肢を誤確定してしまう。開いたと確認できるまで本文は打たない（pane を読めない
+      // ときも打たない = fail closed。届かない方が誤った回答を送るよりましなので、
+      // 末尾の検証と違ってここは読取失敗を「不明」ではなく失敗として扱う）。
+      const notesFrame = await capturedFrame(session, sessionManager);
+      if (notesFrame === null || notesFrame.includes(NOTES_HINT)) {
+        throw new Error("AskUserQuestion notes field did not open");
+      }
+      await sessionManager.sendKeys(session, [other], true);
+      await sleep(OTHER_TEXT_CR_GAP_MS);
+      await sessionManager.sendKeys(session, ["Enter"]);
+    } else if (previewLayout) {
+      const target = indexes[0];
+      if (target === undefined) throw new Error("AskUserQuestion answer has no selected option");
+      if (target < 9) {
+        // 数字キーはカーソル移動のみ（1-9 のみ受理）。
+        await sessionManager.sendKeys(session, [String(target + 1)]);
+      } else {
+        // 10 番目以降は ↓ で寄せる（カーソルは先頭 index 0 から開始）。
+        for (let n = 0; n < target; n += 1) {
+          await sessionManager.sendKeys(session, ["Down"]);
+          await sleep(KEY_STEP_MS);
+        }
+      }
+      await sleep(KEY_STEP_MS);
+      await sessionManager.sendKeys(session, ["Enter"]);
+    } else if (answer.multiSelect) {
       // multiSelect は数字キーではトグルできない（実 TUI）。カーソルを ↓ で移動し Space でトグルする。
       // カーソルは先頭（index 0）から開始。indexes / otherIndex は昇順なので下方向のみで足りる。
       let cursor = 0;
@@ -126,9 +180,24 @@ export async function injectQuestionAnswers(
 async function questionDialogStillVisible(
   session: string, sessionManager: SessionBackend,
 ): Promise<boolean> {
+  return capturedFrameMatches(session, sessionManager, isQuestionDialogFrame);
+}
+
+/** pane を読んで判定に掛ける。読取失敗は false（＝従来どおりの手順へ倒す）。 */
+async function capturedFrameMatches(
+  session: string, sessionManager: SessionBackend, matches: (text: string) => boolean,
+): Promise<boolean> {
+  const text = await capturedFrame(session, sessionManager);
+  return text === null ? false : matches(text);
+}
+
+/** pane の現在フレーム。読取失敗は null（呼び手が「不明」の倒し方を決める）。 */
+async function capturedFrame(
+  session: string, sessionManager: SessionBackend,
+): Promise<string | null> {
   try {
-    return isQuestionDialogFrame(await sessionManager.capturePane(session, { lines: 40 }));
+    return await sessionManager.capturePane(session, { lines: 40 });
   } catch {
-    return false;
+    return null;
   }
 }
