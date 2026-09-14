@@ -139,8 +139,8 @@ describe("TranscriptTailer", () => {
       { kind: "turn_start", atMs: Date.parse("2026-09-06T15:35:35.000Z") },
       { kind: "turn_start", atMs: Date.parse("2026-09-06T15:46:00.000Z") },
       { kind: "turn_start", atMs: Date.parse("2026-09-06T15:47:00.000Z") },
-      { kind: "api_error", atMs: Date.parse("2026-09-06T15:55:37.951Z") },
-      { kind: "api_error", atMs: Date.parse("2026-09-06T15:57:00.000Z") },
+      { kind: "api_error", atMs: Date.parse("2026-09-06T15:55:37.951Z"), errorKind: "rate_limit" },
+      { kind: "api_error", atMs: Date.parse("2026-09-06T15:57:00.000Z"), errorKind: "server_error" },
     ]);
     // 表示用の chat_output は従来どおり流れる（エラー文言はチャットに出す）。
     expect(messages).toContainEqual({

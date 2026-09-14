@@ -1,0 +1,7 @@
+{"cwd":"/Users/alice/work","id":"ss1","name":"cs-1a2b3c4d","outputStyle":"Concise","todoTools":true,"type":"session_start","v":1,"worktree":"#1234"}
+{"cwd":"/Users/alice/work","id":"ss2","name":"cs-2b3c4d5e","type":"session_start","v":1,"worktree":"https://gitlab.com/group/project/-/merge_requests/42"}
+{"id":"pl1","type":"peer_session_list_request","v":1}
+{"id":"pl1","peers":[{"bridged":true,"cwd":"/Users/alice/work","name":"work-a1","sessionId":"11111111-2222-3333-4444-555555555555","status":"idle"},{"cwd":"/Users/alice/other","name":"other-b2","sessionId":"66666666-7777-8888-9999-000000000000"}],"type":"peer_session_list_response","v":1}
+{"claudeSessions":[{"cwd":"/Users/alice/work","peerBridged":true,"peerSessionName":"work-a1","sessionId":"11111111-2222-3333-4444-555555555555","title":"認証バグの調査","updatedAt":1789000000},{"cwd":"/Users/alice/other","peerSessionName":"other-b2","sessionId":"66666666-7777-8888-9999-000000000000","title":"リファクタ"}],"id":"cl1","liveSessionsResolved":true,"type":"claude_session_list_response","v":1}
+{"description":"時短の手引き","descriptionTruncated":false,"file":"/tmp/scratch/guide.html","id":"toolu_01","label":"Artifact を公開 guide.html","name":"Artifact","type":"tool_activity","url":"https://claude.ai/code/artifact/f8f47ed1-ecbf-4cb1-ac5c-ba5a2d60b173","v":1}
+{"id":"ml1","models":[{"displayName":"Claude Opus 5","id":"claude-opus-5","isDefault":true},{"displayName":"Claude Sonnet 5","id":"claude-sonnet-5"}],"type":"claude_model_list_response","v":1}

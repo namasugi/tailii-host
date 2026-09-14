@@ -31,6 +31,8 @@ import { ChatTailController } from "../chat/chatTailController.js";
 import { TranscriptTailer } from "../chat/transcriptTailer.js";
 import { LineWriter } from "../shared/lineWriter.js";
 import { PanePreviewPump } from "./panePreviewPump.js";
+import { makeUsageLimitPushNotifier } from "../push/approvalPushNotifier.js";
+import { parseUsageLimitWait } from "../shared/usageLimitWait.js";
 import { makeSessionBackend } from "../backend/sessionBackend.js";
 import { Writable } from "node:stream";
 import {
@@ -448,18 +450,23 @@ export async function runHubCommand(args: string[]): Promise<number> {
       onCodexTurnLifecycle,
       onClaudeTurnLifecycle,
     }),
-    previewPumpFactory: (write, onPermissionMode, pollIntervalMs) => new PanePreviewPump({
+    previewPumpFactory: (write, onPermissionMode, pollIntervalMs, onUsageLimitWait) => new PanePreviewPump({
       writer: controlMessageCallbackWriter(write),
       capture: (session) => sessionBackend.capturePane(session, { lines: 60, joinWrappedLines: true }),
       // プロンプト提案（薄字ゴースト）抽出用の viewport ANSI キャプチャ（prompt-suggestion-chip）。
       captureSuggestion: (session) => sessionBackend.captureVisibleAnsi(session),
       onPermissionMode,
+      ...(onUsageLimitWait !== undefined ? { onUsageLimitWait } : {}),
       ...(pollIntervalMs !== undefined ? { pollIntervalMs } : {}),
       log,
       // 静止した入力待ちダイアログ（選択 / /login）は初回フレームから送る（開き直しで転写カードを出す）。
-      emitInitialIf: (text) => screenHasSelectionFooter(text) || screenInLoginFlow(text),
+      // 使用量制限の待機フッター（usage-limit-wait）も静止画面なので初回フレームから送る。
+      emitInitialIf: (text) =>
+        screenHasSelectionFooter(text) || screenInLoginFlow(text) || parseUsageLimitWait(text) !== null,
     }),
     questionInjector: (answers, session) => injectQuestionAnswers(answers, session, sessionBackend),
+    // 使用量制限の自動再開待ちを push で知らせる（usage-limit-wait。APNs 未設定なら内部で skip）。
+    usageLimitNotify: makeUsageLimitPushNotifier(log),
     // 本文+送信確定は backend 側の 1 操作に委ねる（herdr は本文+CR 単一コール必須。
     // 分割すると Ink のペースト取り込み窓に CR が飲まれ送信されない）。
     chatInjector: async (text, session, context) => {

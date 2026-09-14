@@ -9,6 +9,7 @@ import {
   type CodexAccountUsage,
   type ClaudeSessionInfo,
   type ClaudeModelInfo,
+  type PeerSessionInfo,
   type CodexModelInfo,
   type ControlMessage,
   type FileEntry,
@@ -225,6 +226,13 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         codexModel: optionalString(raw, "codexModel"),
         codexSandbox,
         deferSubscribe: optionalBoolean(raw, "deferSubscribe"),
+        // 出力スタイル（claude 新規起動の `--settings '{"outputStyle":…}'`）。組み込み 5 値 + カスタム名
+        // （英数字・空白・`_-.`）のみ採用。不正は undefined（設定しない）。
+        outputStyle: decodeOutputStyle(optionalString(raw, "outputStyle")),
+        // PR / MR からの worktree 起動（`claude --worktree`）。`#123` / `123` / PR・MR の URL のみ採用。
+        worktree: decodeWorktreeRef(optionalString(raw, "worktree")),
+        // Task/Todo ツールの有効化（`CLAUDE_CODE_ENABLE_TODO_TOOLS=1`）。
+        todoTools: optionalBoolean(raw, "todoTools"),
       });
     }
 
@@ -292,10 +300,11 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         id: requireString(raw, "id"),
         models: requireArray(raw, "models").map((element): ClaudeModelInfo => {
           const obj = requireObject(element, "models");
-          return {
+          return compact<ClaudeModelInfo>({
             id: requireString(obj, "id"),
             displayName: requireString(obj, "displayName"),
-          };
+            isDefault: optionalBoolean(obj, "isDefault"),
+          });
         }),
       };
 
@@ -749,6 +758,25 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
     case "slash_list_request":
       return compact({ type, v, id: requireString(raw, "id"), cwd: optionalString(raw, "cwd") });
 
+    case "peer_session_list_request":
+      return { type, v, id: requireString(raw, "id") };
+
+    case "peer_session_list_response":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        peers: requireArray(raw, "peers").map((element) => {
+          const obj = requireObject(element, "peers");
+          return compact<PeerSessionInfo>({
+            name: requireString(obj, "name"),
+            cwd: requireString(obj, "cwd"),
+            sessionId: requireString(obj, "sessionId"),
+            status: optionalString(obj, "status"),
+            bridged: optionalBoolean(obj, "bridged"),
+          });
+        }),
+      };
+
     case "slash_list_response":
       return {
         type, v,
@@ -983,6 +1011,8 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
             lastMessage: optionalString(obj, "lastMessage"),
             liveSessionName,
             liveSessionBackend,
+            peerSessionName: optionalString(obj, "peerSessionName"),
+            peerBridged: optionalBoolean(obj, "peerBridged"),
           });
         }),
         liveSessionsResolved: optionalBoolean(raw, "liveSessionsResolved"),
@@ -1268,7 +1298,27 @@ function decodeToolActivity(raw: Raw): ToolActivity {
     descriptionTruncated: optionalBoolean(raw, "descriptionTruncated") ?? false,
     todos,
     files,
+    url: optionalString(raw, "url"),
   });
+}
+
+/** 出力スタイル名の採用規則（組み込み 5 値 + カスタム名。シェル/JSON へ安全に渡せる文字だけ）。 */
+export function decodeOutputStyle(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const trimmed = value.trim();
+  return /^[A-Za-z0-9][A-Za-z0-9 _.-]{0,39}$/.test(trimmed) ? trimmed : undefined;
+}
+
+/** `--worktree` の PR / MR 参照の採用規則（`#123` / `123` / GitHub PR・GitLab MR の URL）。 */
+export function decodeWorktreeRef(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const trimmed = value.trim();
+  if (/^#?\d{1,8}$/.test(trimmed)) return trimmed;
+  if (/^https?:\/\/[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]{1,300}$/.test(trimmed) &&
+      /\/(pull|merge_requests)\/\d{1,8}\/?$/.test(trimmed)) {
+    return trimmed;
+  }
+  return undefined;
 }
 
 function decodeSubagentNode(raw: Raw): SubagentNode {

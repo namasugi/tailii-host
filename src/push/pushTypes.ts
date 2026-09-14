@@ -68,15 +68,22 @@ export function ensureApnsDirectory(base: string): void {
  * 承認内容の詳細本文・diff・cwd 全文・秘密は載せない（Requirement 2.3 / 6.5）。
  * キー順の非決定性を避けるため辞書順で符号化する（Swift 版 .sortedKeys と同一）。
  */
-export function pushPayloadBody(approvalId: string, tool: string, session: string): Buffer {
-  const alert = { body: `${tool} · ${session}`, title: "承認待ち" };
+export function pushPayloadBody(
+  approvalId: string,
+  tool: string,
+  session: string,
+  alertOverride?: { title: string; body: string },
+  kind?: string,
+): Buffer {
+  const alert = alertOverride ?? { body: `${tool} · ${session}`, title: "承認待ち" };
   const aps = {
     alert,
     "interruption-level": "time-sensitive",
     sound: "default",
     "thread-id": session,
   };
-  const root = { approvalId, aps, session, tool };
+  const root: Record<string, unknown> = { approvalId, aps, session, tool };
+  if (kind !== undefined) root["kind"] = kind;
   return Buffer.from(JSON.stringify(sortDeep(root)), "utf8");
 }
 

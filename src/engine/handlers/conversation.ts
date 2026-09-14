@@ -12,6 +12,7 @@ import {
   annotateLiveSessions,
   buildLiveSessionIndex,
 } from "../../sessions/liveSessionJoin.js";
+import { annotatePeerSessions, listPeerSessions } from "../../services/peerSessions.js";
 import { searchClaudeSessions } from "../../sessions/sessionSearch.js";
 import { engineDiag, subscribeConversation, writeError, type HandlerRegistry } from "../context.js";
 
@@ -201,6 +202,16 @@ export const conversationHandlers: HandlerRegistry = {
       annotated = annotateLiveSessions(sessions, index);
       liveResolved = true;
       engineDiag(`claude_session_list live join count=${index.size}`);
+      // peer-live: Tailii 管理外の生存 CLI（Mac の端末 / `claude remote-control`）が掴んでいる会話を
+      // 注記する（`~/.claude/sessions` の登録簿）。開くと第 2 インスタンスが並走するため iOS が確認を挟む。
+      // 生存 join が失敗した応答には付けない（Tailii 自身の pane を外部と誤認しない）。
+      try {
+        const peers = listPeerSessions();
+        annotated = annotatePeerSessions(annotated, peers);
+        engineDiag(`claude_session_list peer join count=${peers.length}`);
+      } catch (error) {
+        engineDiag(`claude_session_list peer join 失敗: ${String(error)}`);
+      }
     } catch (error) {
       engineDiag(`claude_session_list live join 失敗: ${String(error)}`);
     }
@@ -216,6 +227,31 @@ export const conversationHandlers: HandlerRegistry = {
       process.stderr.write(
         `[tailii-host engine] claude_session_list_response 書込失敗: ${String(error)}\n`,
       );
+    }
+  },
+
+  peer_session_list_request: (message, ctx) => {
+    const { writer, state } = ctx;
+    const v = state.negotiatedVersion;
+    // 同じマシンで生きている Claude Code セッション（`@名前` 指名 / SendMessage の宛先, peer-sessions）。
+    // 登録簿が読めなければ空一覧（エラーにしない）。
+    let peers: { name: string; cwd: string; sessionId: string; status?: string; bridged?: boolean }[] = [];
+    try {
+      peers = listPeerSessions().map((peer) => ({
+        name: peer.name,
+        cwd: peer.cwd,
+        sessionId: peer.sessionId,
+        ...(peer.status !== null ? { status: peer.status } : {}),
+        ...(peer.bridged ? { bridged: true } : {}),
+      }));
+    } catch (error) {
+      engineDiag(`peer_session_list 登録簿の読取失敗（空一覧で応答）: ${String(error)}`);
+    }
+    engineDiag(`peer_session_list_response id=${message.id} count=${peers.length}`);
+    try {
+      writer.write({ type: "peer_session_list_response", v, id: message.id, peers });
+    } catch (error) {
+      process.stderr.write(`[tailii-host engine] peer_session_list_response 書込失敗: ${String(error)}\n`);
     }
   },
 

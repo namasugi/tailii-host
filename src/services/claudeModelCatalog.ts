@@ -199,3 +199,54 @@ function parseModels(raw: unknown): RawModel[] | null {
   }
   return models;
 }
+
+// MARK: - 既定モデル（ANTHROPIC_DEFAULT_MODEL, default-model）
+
+/** `ANTHROPIC_DEFAULT_MODEL` の安全な値（alias / モデル id。`[1m]` 接尾辞可）。 */
+const DEFAULT_MODEL_SAFE = /^[A-Za-z0-9._-]+(\[[A-Za-z0-9]+\])?$/;
+
+/**
+ * 新規セッションの既定モデル設定を読む（Claude Code 2.1.236 の `ANTHROPIC_DEFAULT_MODEL`）。
+ * 環境変数 → `~/.claude/settings.json` の `env` の順（CLI と同じ源泉）。無ければ null。
+ * Tailii は tmux / herdr 内の非ログインシェルで claude を起動するため、シェル rc の export は
+ * 届かない（engine の環境変数と settings.json の env だけが効く）。
+ */
+export function readClaudeDefaultModelSetting(
+  env: NodeJS.ProcessEnv = process.env,
+  settingsPath: string = path.join(os.homedir(), ".claude", "settings.json"),
+): string | null {
+  const fromEnv = env["ANTHROPIC_DEFAULT_MODEL"]?.trim() ?? "";
+  if (fromEnv.length > 0) return DEFAULT_MODEL_SAFE.test(fromEnv) ? fromEnv : null;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as Record<string, unknown>;
+    const envBlock = parsed["env"];
+    if (typeof envBlock !== "object" || envBlock === null) return null;
+    const value = (envBlock as Record<string, unknown>)["ANTHROPIC_DEFAULT_MODEL"];
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 && DEFAULT_MODEL_SAFE.test(trimmed) ? trimmed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 既定モデル設定を一覧へ写す（純ロジック, TESTABLE）。完全一致の id、または alias（`FAMILY_ORDER` の
+ * `fable` / `opus` / `sonnet` / `haiku`。`[1m]` 接尾辞は無視）に該当するファミリーの先頭 1 件へ
+ * `isDefault: true` を立てる。設定なし・該当なしは一覧をそのまま返す（iOS は従来の「既定」表示）。
+ * `default` / `opusplan` 等の意味付き alias は解決できないので素通し。
+ */
+export function markClaudeDefaultModel(
+  models: ClaudeModelInfo[],
+  setting: string | null,
+): ClaudeModelInfo[] {
+  if (setting === null) return models;
+  const bare = setting.replace(/\[[^\]]*\]$/, "").toLowerCase();
+  const exact = models.findIndex((model) => model.id.toLowerCase() === bare);
+  let index = exact;
+  if (index < 0 && (FAMILY_ORDER as readonly string[]).includes(bare)) {
+    index = models.findIndex((model) => model.displayName.toLowerCase().includes(bare));
+  }
+  if (index < 0) return models;
+  return models.map((model, i) => (i === index ? { ...model, isDefault: true } : model));
+}

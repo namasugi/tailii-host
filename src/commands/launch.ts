@@ -58,6 +58,109 @@ const CLAUDE_PERMISSION_MODES = new Set(["default", "acceptEdits", "plan", "auto
 const CLAUDE_EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
 
 /**
+ * `--worktree` に渡す PR / MR 参照（claude 2.1.233〜: `#123` / GitHub PR URL / GitLab MR URL。
+ * origin のホストで fetch 先を選び `.claude/worktrees/pr-<n>` を作る）。decode 側で採用済みの形だけ
+ * 通し、裸の数字は `#` を補う。不正は null（フラグを付けない）。
+ */
+export function claudeWorktreeArgument(ref: string | null | undefined): string | null {
+  if (!ref) return null;
+  const trimmed = ref.trim();
+  if (/^\d{1,8}$/.test(trimmed)) return `#${trimmed}`;
+  if (/^#\d{1,8}$/.test(trimmed)) return trimmed;
+  if (/^https?:\/\/[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]{1,300}$/.test(trimmed) &&
+      /\/(pull|merge_requests)\/\d{1,8}\/?$/.test(trimmed)) {
+    return trimmed;
+  }
+  return null;
+}
+
+/** 出力スタイル名（`--settings '{"outputStyle":…}'`）。decode 側と同じ採用規則。 */
+const CLAUDE_OUTPUT_STYLE = /^[A-Za-z0-9][A-Za-z0-9 _.-]{0,39}$/;
+
+/**
+ * 起動限定の `--settings` JSON に出力スタイルを合成する（純ロジック, TESTABLE, output-style）。
+ * フック設定（`claudeHookLaunchSettings`）が無効化されていても outputStyle だけの JSON を返す。
+ * 両方無ければ null。Claude Code の `/output-style` コマンドは v2.1.91 で削除済みで、起動後の
+ * 切替は `/config outputStyle=<name>`（iOS が注入）で行う。
+ */
+export function mergeClaudeLaunchSettings(
+  hookSettingsJson: string | null,
+  outputStyle: string | null | undefined,
+): string | null {
+  const style = outputStyle && CLAUDE_OUTPUT_STYLE.test(outputStyle.trim()) ? outputStyle.trim() : null;
+  if (style === null) return hookSettingsJson;
+  let base: Record<string, unknown> = {};
+  if (hookSettingsJson !== null) {
+    try {
+      const parsed = JSON.parse(hookSettingsJson) as unknown;
+      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+        base = parsed as Record<string, unknown>;
+      }
+    } catch {
+      base = {};
+    }
+  }
+  base["outputStyle"] = style;
+  return JSON.stringify(base);
+}
+
+/**
+ * `claude --worktree <PR/MR>` が会話を始める worktree のパス（`<git 最上位>/.claude/worktrees/pr-<n>`,
+ * worktree-from-pr）。メタデータの cwd（transcript slug / ファイル・Git 画面の起点）に記録する。
+ * 参照が無い・不正・番号が取れない場合は null（従来どおり起動 dir を記録）。git の最上位が取れなければ
+ * 起動 dir を最上位とみなす（テストのモック runner はここに落ちる）。
+ */
+export async function claudeWorktreeRecordCwd(
+  cwd: string,
+  baseDir: string | null,
+  worktree: string | null,
+  runner: ProcessRunner,
+): Promise<string | null> {
+  const argument = claudeWorktreeArgument(worktree);
+  if (argument === null) return null;
+  const number = /(\d{1,8})\/?$/.exec(argument)?.[1] ?? null;
+  if (number === null) return null;
+  const resolved = resolveWorkdir(cwd, baseDir, () => {});
+  if (resolved === null) return null;
+  // git の最上位が取れなければ推測しない（サブディレクトリ起動で別 slug を刻むと tail が空になる）。
+  // null = 従来どおり起動 dir を記録する。
+  try {
+    const result = await runner("git", ["-C", resolved, "rev-parse", "--show-toplevel"], {});
+    const line = result.stdout.split(/\r?\n/)[0]?.trim() ?? "";
+    if (result.exitCode !== 0 || !line.startsWith("/")) return null;
+    return path.join(line, ".claude", "worktrees", `pr-${number}`);
+  } catch {
+    return null;
+  }
+}
+
+/** Task/Todo ツールを新しいモデルでも有効にする環境変数（claude 2.1.232〜で既定無効化）。 */
+export const CLAUDE_TODO_TOOLS_ENV = "CLAUDE_CODE_ENABLE_TODO_TOOLS=1";
+
+/** `ANTHROPIC_DEFAULT_MODEL` の安全な値（tmux / herdr 内の claude へ前置で引き継ぐ）。 */
+const DEFAULT_MODEL_ENV_SAFE = /^[A-Za-z0-9._-]+(\[[A-Za-z0-9]+\])?$/;
+
+/**
+ * inner コマンドへ前置する環境変数群（純ロジック, TESTABLE）。
+ * - `todoTools` で `CLAUDE_CODE_ENABLE_TODO_TOOLS=1`
+ * - engine プロセスの `ANTHROPIC_DEFAULT_MODEL` は、model 指定の無い claude 起動へそのまま引き継ぐ
+ *   （pane の非ログインシェルには届かないため。settings.json の env は claude 自身が読む）。
+ */
+export function claudeLaunchEnvPrefix(options: {
+  todoTools?: boolean;
+  defaultModel?: string | null;
+  hasModelFlag?: boolean;
+}): string {
+  const parts: string[] = [];
+  if (options.todoTools === true) parts.push(CLAUDE_TODO_TOOLS_ENV);
+  const model = options.defaultModel?.trim() ?? "";
+  if (!options.hasModelFlag && model.length > 0 && DEFAULT_MODEL_ENV_SAFE.test(model)) {
+    parts.push(`ANTHROPIC_DEFAULT_MODEL=${model}`);
+  }
+  return parts.join(" ");
+}
+
+/**
  * claude の resume/continue は古く大きいセッションで TUI 専用設問
  * `Resume from summary?` を出してブロックする。この設問は transcript にもフックにも乗らず
  * リモートから見えないため、閾値を実質無効化して常に従来どおりフル resume にする。
@@ -76,9 +179,13 @@ export function claudeInnerCommand(opts: {
   model?: string | null;
   permissionMode?: string | null;
   effort?: string | null;
+  /** PR / MR からの worktree 起動（`--worktree`, worktree-from-pr）。不正値は付けない。 */
+  worktree?: string | null;
 }): string {
   let cmd = DEFAULT_INNER_COMMAND;
   if (opts.model && CODEX_MODEL_SAFE.test(opts.model)) cmd += ` --model ${opts.model}`;
+  const worktree = claudeWorktreeArgument(opts.worktree);
+  if (worktree !== null) cmd += ` --worktree ${shellSingleQuote(worktree)}`;
   if (
     opts.permissionMode &&
     opts.permissionMode !== "default" &&
@@ -134,10 +241,20 @@ export type EngineLauncher = (
   newSessionId?: string | null,
   /** Claude の表示名（`claude --name`。会話名を付けた新規起動のみ, lazy-session）。null なら付与しない。 */
   title?: string | null,
-  /** Codex 新規threadのApp Server設定。Claude/resumeでは無視。 */
+  /** Codex 新規threadのApp Server設定（Claude/resumeでは無視）と、Claude 起動の追加設定。 */
   launchOptions?: {
     codexModel?: string | null;
     codexSandbox?: CodexSandbox | null;
+    /** Claude: 起動限定 `--settings` に載せる出力スタイル（output-style）。 */
+    outputStyle?: string | null;
+    /** Claude: Task/Todo ツールを有効化する env を前置する（todo-tools）。 */
+    todoTools?: boolean;
+    /**
+     * Claude: `--worktree` の PR / MR 参照（worktree-from-pr）。claude は `<repo>/.claude/worktrees/pr-<n>`
+     * で会話を始めるため、メタデータの cwd（tail 対象 transcript の slug / ファイル・Git 画面の起点）も
+     * その worktree パスで記録する。inner コマンド自体は起動時に `claudeInnerCommand` で組む。
+     */
+    worktree?: string | null;
   },
 ) => Promise<{ exitCode: number; errorText: string; providerSessionId?: string }>;
 
@@ -272,6 +389,7 @@ export function makeSessionLauncher(options: {
       agent === "claude" ? (resumeSessionId ?? newSessionId ?? null) : resumeSessionId;
     let effectiveCwd = cwd;
     let effectiveBaseDir = baseDir;
+    let recordCwd: string | null = null;
     if (agent === "claude") {
       if (resumeSessionId) {
         effectiveInner = `${inner} --resume ${resumeSessionId}`;
@@ -282,6 +400,20 @@ export function makeSessionLauncher(options: {
         effectiveInner = inner;
       }
       effectiveInner = `${CLAUDE_RESUME_THRESHOLD_ENV} ${effectiveInner}`;
+      // Task/Todo ツール有効化 env（todo-tools）と、engine 環境の ANTHROPIC_DEFAULT_MODEL の引き継ぎ
+      // （default-model。model フラグ付き起動では付けない）。
+      const envPrefix = claudeLaunchEnvPrefix({
+        todoTools: launchOptions?.todoTools === true,
+        defaultModel: process.env["ANTHROPIC_DEFAULT_MODEL"] ?? null,
+        hasModelFlag: inner.includes(" --model "),
+      });
+      if (envPrefix.length > 0) effectiveInner = `${envPrefix} ${effectiveInner}`;
+      // `--worktree` 起動（worktree-from-pr）: claude は `<repo>/.claude/worktrees/pr-<n>` で会話を始め、
+      // transcript もその slug 配下に書く。メタデータの cwd をそこへ揃えないと tail が永久に空になる。
+      if (resumeSessionId === null || resumeSessionId === undefined) {
+        const worktreeCwd = await claudeWorktreeRecordCwd(cwd, baseDir, launchOptions?.worktree ?? null, runner);
+        if (worktreeCwd !== null) recordCwd = worktreeCwd;
+      }
     } else {
       if (codexAppServer === null) {
         return { exitCode: 1, errorText: "Codex App Server が構成されていません。" };
@@ -332,6 +464,8 @@ export function makeSessionLauncher(options: {
       backend: typeof backendOption === "function" ? backendOption() : backendOption,
       herdrPath: herdr,
       innerCommand: effectiveInner,
+      outputStyle: launchOptions?.outputStyle ?? null,
+      recordCwd,
       path: defaultInjectedPath(),
       store,
       now: () => Math.floor(Date.now() / 1000),
@@ -346,6 +480,15 @@ export function makeSessionLauncher(options: {
       providerSessionId: effectiveProviderSessionId,
       displayTitle: title ?? null,
     });
+    // `--worktree` 起動の事後検証（worktree-from-pr）: claude が worktree を作れなかった（PR 不在 / origin 無し /
+    // fetch 失敗）ときは起動 dir に留まるため、記録した worktree パスが現れなければ起動 dir へ書き戻す
+    // （実在しない cwd を刻んだまま tail が永久に空になるのを防ぐ）。
+    if (exitCode === 0 && recordCwd !== null) {
+      const launchDir = resolveWorkdir(effectiveCwd, effectiveBaseDir, () => {}) ?? effectiveCwd;
+      void reconcileWorktreeRecordCwd(store, name, recordCwd, launchDir, (message) => {
+        process.stderr.write(`[tailii-host launch] ${message}\n`);
+      });
+    }
     return {
       exitCode,
       errorText,
@@ -354,6 +497,42 @@ export function makeSessionLauncher(options: {
         : {}),
     };
   };
+}
+
+/** worktree ディレクトリの出現を待つ上限と間隔（fetch + checkout に十分な窓）。 */
+const WORKTREE_APPEAR_TIMEOUT_MS = 45_000;
+const WORKTREE_APPEAR_POLL_MS = 2_000;
+
+/**
+ * 記録した worktree パスが現れなければメタデータの cwd を起動 dir へ戻す（worktree-from-pr）。
+ * 現れたら何もしない。`sleeper` はテスト注入用。
+ */
+export async function reconcileWorktreeRecordCwd(
+  store: SessionMetadataStore,
+  session: string,
+  worktreeCwd: string,
+  launchDir: string,
+  log: (message: string) => void,
+  sleeper: (ms: number) => Promise<void> = sleep,
+  exists: (dir: string) => boolean = (dir) => fs.existsSync(dir),
+  timeoutMs: number = WORKTREE_APPEAR_TIMEOUT_MS,
+  pollMs: number = WORKTREE_APPEAR_POLL_MS,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (exists(worktreeCwd)) return true;
+    if (Date.now() >= deadline) break;
+    await sleeper(pollMs);
+  }
+  const meta = store.get(session);
+  if (meta === null || meta.cwd !== worktreeCwd) return false;
+  try {
+    store.put({ ...meta, cwd: launchDir });
+    log(`worktree ${worktreeCwd} が現れないため cwd を起動 dir へ戻しました session=${session}`);
+  } catch (error) {
+    log(`worktree cwd の書き戻し失敗 session=${session}: ${String(error)}`);
+  }
+  return false;
 }
 
 /** Codex TUIを共有App Serverの同一threadへ接続する安全なresumeコマンド。 */
@@ -436,6 +615,13 @@ export async function launchCore(options: {
   claudeJsonPath?: string;
   /** フックのグローバル無効化マーカーの場所。テスト注入用（実マシンのマーカーに左右されない密閉性）。 */
   hookGlobalMarkerPath?: string;
+  /** claude 起動限定の出力スタイル（`--settings '{"outputStyle":…}'`, output-style）。null は付けない。 */
+  outputStyle?: string | null;
+  /**
+   * メタデータへ記録する cwd（省略時は起動 dir）。`claude --worktree` は起動 dir とは別の worktree で
+   * 会話を始めるため、transcript slug / 画面の起点をそちらに揃える（worktree-from-pr）。
+   */
+  recordCwd?: string | null;
 }): Promise<number> {
   const { session, binaryPath, tmuxPath, store, now, errorSink } = options;
   const agent: LaunchAgent = options.agent ?? "claude";
@@ -476,8 +662,10 @@ export async function launchCore(options: {
         globalMarkerPath: options.hookGlobalMarkerPath,
       }),
     });
-    if (hookSettings !== null) {
-      innerCommand = `${innerCommand} --settings ${shellSingleQuote(hookSettings)}`;
+    // 出力スタイル（Concise 等）も同じ起動限定 `--settings` に合成する（settings.json は書かない）。
+    const launchSettings = mergeClaudeLaunchSettings(hookSettings, options.outputStyle ?? null);
+    if (launchSettings !== null) {
+      innerCommand = `${innerCommand} --settings ${shellSingleQuote(launchSettings)}`;
     }
   }
 
@@ -498,6 +686,7 @@ export async function launchCore(options: {
       now,
       errorSink,
       ...(options.claudeSessionId !== undefined ? { claudeSessionId: options.claudeSessionId } : {}),
+      ...(options.recordCwd !== undefined && options.recordCwd !== null ? { recordCwd: options.recordCwd } : {}),
       ...(options.providerSessionId !== undefined
         ? { providerSessionId: options.providerSessionId }
         : {}),
@@ -571,7 +760,7 @@ export async function launchCore(options: {
     // 任意メタは必要なときだけ記録する（古いメタ形式との後方互換を保つ）。
     store.put({
       name: session,
-      cwd: dir,
+      cwd: options.recordCwd ?? dir,
       createdAt: now(),
       ...(agent === "codex" ? { agent } : {}),
       ...(agent === "claude" && options.claudeSessionId
@@ -612,6 +801,8 @@ async function launchHerdrPane(options: {
   errorSink: (message: string) => void;
   claudeSessionId?: string | null;
   providerSessionId?: string | null;
+  /** メタデータへ記録する cwd（`claude --worktree` の worktree パス）。省略時は起動 dir。 */
+  recordCwd?: string | null;
   /** 会話の表示タイトル（session-title）。新規タブのラベルに使う（未命名は session 名）。 */
   displayTitle?: string | null;
   /** detached プロセス起動の注入点（tailii セッションサーバーのヘッドレス起動用）。 */
@@ -736,7 +927,7 @@ async function launchHerdrPane(options: {
   try {
     store.put({
       name: session,
-      cwd: dir,
+      cwd: options.recordCwd ?? dir,
       createdAt: existing !== null && recordedMeta !== null ? recordedMeta.createdAt : now(),
       backend: "herdr",
       ...(agent === "codex" ? { agent } : {}),

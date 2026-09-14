@@ -29,6 +29,7 @@ import {
 import type { ChatAgent } from "../chat/chatTailController.js";
 import type { ImageService } from "../chat/imageService.js";
 import type { PanePreviewMode } from "./panePreviewPump.js";
+import { sameUsageLimitWait, type UsageLimitWaitState } from "../shared/usageLimitWait.js";
 import type { QuestionAnswer } from "../protocol.js";
 import { PROTOCOL_V1, PROTOCOL_V2 } from "../protocol.js";
 import { LoginCodeError } from "../backend/tmux.js";
@@ -84,6 +85,8 @@ export type HubPreviewPumpFactory = (
   onPermissionMode?: (mode: string) => void,
   /** 毎周期評価するポーリング間隔（ms）。前面購読あり=高頻度 / 一覧 watch のみ=低頻度。 */
   pollIntervalMs?: () => number,
+  /** 使用量制限の自動再開待ち（pane フッター）の遷移通知（usage-limit-wait）。 */
+  onUsageLimitWait?: (state: UsageLimitWaitState | null) => void,
 ) => HubPreviewPump;
 
 export type SessionHubOptions = Omit<ReaperTickOptions, "now"> & {
@@ -105,6 +108,12 @@ export type SessionHubOptions = Omit<ReaperTickOptions, "now"> & {
   previewPumpFactory?: HubPreviewPumpFactory;
   replayLimit?: number;
   questionInjector?: (answers: QuestionAnswer[], session: string) => Promise<void>;
+  /**
+   * 使用量制限の自動再開待ちの遷移を利用者へ知らせる（APNs push, usage-limit-wait）。制限到達
+   * （`api_error` の `rate_limit`）後は購読者が居なくても pane を低頻度で見張り、待機表示の出現・
+   * Enter 待ち・停止・再開を 1 回ずつ通知する。省略時は通知しない（テスト / push 未設定）。
+   */
+  usageLimitNotify?: (session: string, state: UsageLimitWaitState | { kind: "resumed" }) => void;
   chatInjector?: (text: string, session: string, context: ChatInjectContext) => Promise<void>;
   codexAppServerFactory?: () => CodexAppServerThreadRuntime;
   codexTurnControllerFactory?: (options: CodexNativeTurnControllerOptions) => CodexTurnControllerRuntime;
@@ -211,6 +220,16 @@ interface SessionActor {
   tail: HubTail | null;
   tailRetryTimer: ReturnType<typeof setTimeout> | null;
   previewPump: HubPreviewPump | null;
+  /**
+   * 使用量制限の自動再開待ちの見張り（usage-limit-wait）。制限到達で武装し、待機表示が消える
+   * （再開 / キャンセル）か期限で解除する。武装中は購読者が居なくても pump を低頻度で回す。
+   */
+  usageLimitWatch: {
+    state: UsageLimitWaitState | null;
+    timer: ReturnType<typeof setTimeout> | null;
+    /** 待機表示が消えたフレームからの猶予（再描画の過渡で 1 フレーム写らないだけの消失で畳まない）。 */
+    missingTimer: ReturnType<typeof setTimeout> | null;
+  } | null;
   backfillTails: Map<object, HubTail>;
   seenClientMessageIds: Set<string>;
   deliveredChatMessageIds: Map<string, number>;
@@ -537,6 +556,11 @@ export class SessionHub {
           `audit preview-watch ${message.enabled ? "start" : "stop"} watchers=${this.previewWatchers.size}`,
         );
         this.syncAllPreviews();
+        // 静止した画面（制限待ちフッター / 入力待ちダイアログ）は変化フレームが出ないため、watch 開始時に
+        // 稼働中 pump の直近フレームを再送する（usage-limit-wait の一覧ピル）。
+        if (message.enabled) {
+          for (const actor of this.actors.values()) actor.previewPump?.resendLastIfInteractive?.();
+        }
       }
       return;
     }
@@ -861,6 +885,10 @@ export class SessionHub {
       if (actor.focusedBy.size > 0) this.bumpSafe(session, "hub-tick");
       if (actor.processingSince !== null) this.bumpSafe(session, "hub-processing", "active");
       if (actor.pendingQuestion !== null) this.bumpSafe(session, "hub-question", "active");
+      // 使用量制限の自動再開待ち（usage-limit-wait）: Claude Code は入力待ちで静止したまま数時間待つ。
+      // 放置すると reaper が 30 分で pane ごと kill して自動再開が永久に起きないため、見張り中は
+      // 利用中とみなして heartbeat を進める。
+      if (actor.usageLimitWatch !== null) this.bumpSafe(session, "hub-usage-limit-wait");
     }
     const result = await reaperTick({ ...this.options, now: this.now() });
     // reaper の判定と actor の処理中フラグを同期する。demote(プロセス死亡)や kill 後も
@@ -915,6 +943,11 @@ export class SessionHub {
     actor.tail = null;
     actor.previewPump?.stop();
     actor.previewPump = null;
+    if (actor.usageLimitWatch !== null) {
+      if (actor.usageLimitWatch.timer !== null) clearTimeout(actor.usageLimitWatch.timer);
+      if (actor.usageLimitWatch.missingTimer !== null) clearTimeout(actor.usageLimitWatch.missingTimer);
+      actor.usageLimitWatch = null;
+    }
     for (const tail of actor.backfillTails.values()) tail.stop();
     actor.backfillTails.clear();
     this.activeCodexTurns.delete(session);
@@ -1565,7 +1598,9 @@ export class SessionHub {
     const wantsForeground = [...actor.subscribers.values()].some((state) => state.preview);
     // 一覧 Mission Control: watcher がいる間、処理中会話は前面購読が無くても pump する。
     const wantsWatch = this.previewWatchers.size > 0 && actor.processingSince !== null;
-    if (!wantsForeground && !wantsWatch) {
+    // 使用量制限の自動再開待ちの見張り（usage-limit-wait）: 購読者が居なくても低頻度で回す。
+    const wantsLimitWatch = actor.usageLimitWatch !== null;
+    if (!wantsForeground && !wantsWatch && !wantsLimitWatch) {
       if (actor.previewPump !== null) this.options.log?.(`audit preview-pump stop session=${session}`);
       actor.previewPump?.stop();
       actor.previewPump = null;
@@ -1594,7 +1629,8 @@ export class SessionHub {
         // watcher へは処理中の会話だけ流す（前面都合で動く pump のアイドル画面は一覧に不要）。
         // 消灯フレーム（active=false）だけは処理完了直後でも届け、一覧側の表示を確実に落とす。
         const inactiveFrame = outgoingPayload.type === "pane_preview" && !outgoingPayload.active;
-        if (actor.processingSince !== null || inactiveFrame) {
+        // 制限待ちの見張り中（usage-limit-wait）も一覧へ流す（一覧の「制限待ち」ピル用）。
+        if (actor.processingSince !== null || inactiveFrame || actor.usageLimitWatch !== null) {
           for (const watcher of this.previewWatchers) {
             if (!delivered.has(watcher)) {
               this.sendTo(watcher, {
@@ -1618,7 +1654,16 @@ export class SessionHub {
         }
       },
       // 前面購読が無い（一覧 watch だけの）間は低頻度で capture し、多重 pump のコストを抑える。
-      () => ([...actor.subscribers.values()].some((state) => state.preview) ? 250 : 1000),
+      // 制限待ちの見張りだけの間はさらに低頻度（5s）。
+      () => {
+        if ([...actor.subscribers.values()].some((state) => state.preview)) return 250;
+        if (this.previewWatchers.size > 0 && actor.processingSince !== null) return 1000;
+        // 制限待ちの見張り: 数時間の静止画面を 5s で見る（再開は処理中遷移 = hook が権威なので、
+        // 再開中の過渡表示を取りこぼしても構わない）。
+        if (actor.usageLimitWatch !== null) return 5000;
+        return 1000;
+      },
+      (state) => this.handleUsageLimitWait(session, actor, state),
     );
     actor.previewPump = pump;
     pump.start(
@@ -1637,7 +1682,7 @@ export class SessionHub {
         lastTurnEndMs: null, turnStartFiredAtMs: null, lastTurnStartMs: null,
         focusedBy: new Set(), subscribers: new Map(),
         nextServerSeq: 1, replayBuffer: [], tail: null, tailRetryTimer: null,
-        previewPump: null, backfillTails: new Map(),
+        previewPump: null, usageLimitWatch: null, backfillTails: new Map(),
         seenClientMessageIds: new Set(), deliveredChatMessageIds: new Map(),
         deliveredCodexMessageIds: new Map(),
         deletedChatMessageIds: new Map(), deletedCodexMessageIds: new Map(),
@@ -2097,6 +2142,15 @@ export class SessionHub {
       return;
     }
     if (event.kind !== "interrupted" && event.kind !== "api_error") return;
+    // 使用量制限（rate_limit）: Claude Code 2.1.234〜は待機して自動再開する。pane の待機フッターを
+    // 見張り、遷移を push で知らせる（usage-limit-wait）。処理中判定とは独立に武装する。
+    // 履歴再生の古いマーカーでは武装しない（直近 10 分以内の live な制限到達だけ）。
+    if (
+      event.kind === "api_error" && event.errorKind === "rate_limit" &&
+      this.nowMs() - event.atMs <= SessionHub.USAGE_LIMIT_ARM_RECENT_MS
+    ) {
+      this.armUsageLimitWatch(session, actor);
+    }
     if (actor.processingSince === null) {
       // 処理中でなくても終端の時刻は覚える: 終端より前に発火した hook（別プロセス起動 + relay で遅着する
       // UserPromptSubmit / Pre・PostToolUse）は既に終わったターンの残響として無視する
@@ -2117,6 +2171,93 @@ export class SessionHub {
     if (event.kind === "interrupted") actor.lastInterruptDoneMs = this.nowMs();
     this.applyProcessing(session, "done");
     this.broadcast({ type: "session_processing", session, state: "done" });
+  }
+
+  /** 見張りを武装する制限到達マーカーの新しさ（履歴再生の古い rate_limit では武装しない）。 */
+  private static readonly USAGE_LIMIT_ARM_RECENT_MS = 10 * 60 * 1000;
+  /** 待機表示が現れないまま見張りを畳む猶予（制限到達直後に TUI がフッターを描くまでの窓 + 余裕）。 */
+  private static readonly USAGE_LIMIT_ARM_GRACE_MS = 120_000;
+  /** 待機表示の消失から見張りを畳むまでの猶予（過渡フレームの取りこぼしを吸収。5s poll の数周）。 */
+  private static readonly USAGE_LIMIT_MISSING_GRACE_MS = 30_000;
+  /** 待機表示を観測した後の見張り上限（週次制限のリセットでも一晩は見張る）。 */
+  private static readonly USAGE_LIMIT_WATCH_MAX_MS = 12 * 60 * 60 * 1000;
+
+  /** 使用量制限の自動再開待ちの見張りを武装する（usage-limit-wait）。既に武装中なら猶予を延ばすだけ。 */
+  private armUsageLimitWatch(session: string, actor: SessionActor): void {
+    const existing = actor.usageLimitWatch;
+    // 待機表示を観測済みの見張りは上限タイマーのまま触らない（繰り返し到達で猶予タイマーに差し替えると、
+    // 猶予発火時に state があるため何もせずタイマーだけ消え、見張りが永久化する）。
+    if (existing !== null && existing.state !== null) return;
+    if (existing !== null && existing.timer !== null) clearTimeout(existing.timer);
+    const watch = existing ?? { state: null, timer: null, missingTimer: null };
+    watch.timer = setTimeout(() => {
+      if (this.actors.get(session) !== actor || actor.usageLimitWatch !== watch) return;
+      if (watch.state === null) {
+        this.options.log?.(`usage-limit-watch 待機表示なしで解除 session=${session}`);
+        this.disarmUsageLimitWatch(session, actor);
+      }
+    }, SessionHub.USAGE_LIMIT_ARM_GRACE_MS);
+    watch.timer.unref?.();
+    actor.usageLimitWatch = watch;
+    this.options.log?.(`usage-limit-watch 武装 session=${session}`);
+    this.syncPreview(session, actor);
+  }
+
+  private disarmUsageLimitWatch(session: string, actor: SessionActor): void {
+    const watch = actor.usageLimitWatch;
+    if (watch === null) return;
+    if (watch.timer !== null) clearTimeout(watch.timer);
+    if (watch.missingTimer !== null) clearTimeout(watch.missingTimer);
+    actor.usageLimitWatch = null;
+    this.syncPreview(session, actor);
+  }
+
+  /** pump からの待機フッターの遷移（null = 表示なし）。通知は遷移ごとに 1 回。 */
+  private handleUsageLimitWait(session: string, actor: SessionActor, state: UsageLimitWaitState | null): void {
+    if (this.actors.get(session) !== actor) return;
+    const watch = actor.usageLimitWatch;
+    // 武装外（直近の rate_limit 到達が無い）の観測は無視する。前ターンの待機行が pane に残っている
+    // だけの処理中フレームで push しない（10 分 recency gate の迂回を塞ぐ）。
+    if (watch === null) return;
+    const previous = watch.state;
+    this.options.log?.(
+      `usage-limit-wait session=${session} ${previous?.kind ?? "none"} -> ${state?.kind ?? "none"}` +
+        (state?.kind === "waiting" && state.resumeAt !== null ? ` at=${state.resumeAt}` : ""),
+    );
+    // 前面で見ている購読者が居る間は push しない（承認 push の presence ゲートと同じ考え方）。
+    const unattended = actor.subscribers.size === 0;
+    if (state !== null) {
+      // 再観測: 消失猶予中なら取り消す（過渡フレームで 1 回写らなかっただけ）。
+      if (watch.missingTimer !== null) {
+        clearTimeout(watch.missingTimer);
+        watch.missingTimer = null;
+      }
+      // 同じ状態への戻り（猶予中の再観測）は再通知しない。
+      if (unattended && !sameUsageLimitWait(previous, state)) this.options.usageLimitNotify?.(session, state);
+      watch.state = state;
+      if (watch.timer !== null) clearTimeout(watch.timer);
+      watch.timer = setTimeout(() => {
+        if (this.actors.get(session) === actor && actor.usageLimitWatch === watch) {
+          this.options.log?.(`usage-limit-watch 上限で解除 session=${session}`);
+          this.disarmUsageLimitWatch(session, actor);
+        }
+      }, SessionHub.USAGE_LIMIT_WATCH_MAX_MS);
+      watch.timer.unref?.();
+      return;
+    }
+    // 待機表示が消えた。再描画途中の capture で 1 フレーム写らないだけの消失で畳むと、以後 reaper 保護が
+    // 外れて 30 分後に kill される。猶予を置き、その間に再観測が無ければ解除する（再開中からの消失は
+    // 「作業を再開した」= 処理中遷移が先に来ていれば applyProcessing 側で既に畳まれている）。
+    if (previous === null || watch.missingTimer !== null) return;
+    watch.missingTimer = setTimeout(() => {
+      if (this.actors.get(session) !== actor || actor.usageLimitWatch !== watch) return;
+      this.options.log?.(`usage-limit-wait 消失で解除 session=${session} last=${previous.kind}`);
+      if (previous.kind === "resuming" && actor.subscribers.size === 0) {
+        this.options.usageLimitNotify?.(session, { kind: "resumed" });
+      }
+      this.disarmUsageLimitWatch(session, actor);
+    }, SessionHub.USAGE_LIMIT_MISSING_GRACE_MS);
+    watch.missingTimer.unref?.();
   }
 
   /** 遅着 hook が直書きした active の heartbeat を idle へ戻す（その hook の書込のままのときだけ）。 */
@@ -2171,6 +2312,13 @@ export class SessionHub {
         return false;
       }
       actor.processingSince = this.now();
+      // 使用量制限の待機中に処理へ戻った = 自動再開（usage-limit-wait）。pane の過渡表示を取りこぼしても
+      // 処理中遷移を権威に「再開した」を知らせ、見張りを畳む。
+      if (actor.usageLimitWatch !== null && actor.usageLimitWatch.state !== null) {
+        this.options.log?.(`usage-limit-wait 処理再開で解除 session=${session}`);
+        if (actor.subscribers.size === 0) this.options.usageLimitNotify?.(session, { kind: "resumed" });
+        this.disarmUsageLimitWatch(session, actor);
+      }
       // ターン開始は UserPromptSubmit で確定し、継続 hook では進めない（未確定なら今）。
       if (event === "UserPromptSubmit") actor.turnStartFiredAtMs = atMs ?? null;
       actor.processingSinceMs =

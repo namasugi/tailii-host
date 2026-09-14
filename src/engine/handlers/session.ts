@@ -244,7 +244,7 @@ export const sessionHandlers: HandlerRegistry = {
       sessionAgent === "claude" &&
       message.resumeSessionId === undefined &&
       (message.model !== undefined || message.permissionMode !== undefined ||
-        message.effort !== undefined)
+        message.effort !== undefined || message.worktree !== undefined)
         ? makeSessionLauncher({
             ...(ctx.metadataStore !== null && { store: ctx.metadataStore }),
             agent: "claude",
@@ -253,6 +253,7 @@ export const sessionHandlers: HandlerRegistry = {
               model: message.model ?? null,
               permissionMode: message.permissionMode ?? null,
               effort: message.effort ?? null,
+              worktree: message.worktree ?? null,
             }),
           })
         : null;
@@ -341,7 +342,15 @@ export const sessionHandlers: HandlerRegistry = {
               codexModel: message.codexModel ?? null,
               codexSandbox: message.codexSandbox ?? null,
             }
-          : undefined,
+          : message.outputStyle !== undefined || message.todoTools === true || message.worktree !== undefined
+            ? {
+                // 出力スタイル（新規起動の `--settings`）・Task/Todo ツール env（新規 / resume 共通）・
+                // PR/MR worktree（メタデータ cwd の記録先, worktree-from-pr）。
+                outputStyle: message.outputStyle ?? null,
+                todoTools: message.todoTools === true,
+                worktree: message.worktree ?? null,
+              }
+            : undefined,
       );
     } finally {
       ctx.hubLink.send({ type: "runtime_claim_release", session: message.name });

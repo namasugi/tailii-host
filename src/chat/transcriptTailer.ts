@@ -67,16 +67,49 @@ function isClaudeInterruptMarker(text: string): boolean {
  * 空白の書式には依存させない — 書式変更で判定が無言で失効しないように）。
  */
 function isApiErrorAssistantLine(text: string): boolean {
+  return apiErrorAssistantKind(text) !== null;
+}
+
+/**
+ * API エラー終端行ならそのエラー種別（トップレベル `error` 文字列。無ければ ""）を、そうでなければ
+ * null を返す。実測: 使用量制限は `error: "rate_limit"`（usage-limit-wait の武装に使う）。
+ */
+export function apiErrorAssistantKind(text: string): string | null {
   // 引用符込みでキー名を探す（本文中に同名文字列を含む巨大 tool_result 行で parse を走らせない）。
-  if (!text.includes('"isApiErrorMessage"')) return false;
+  if (!text.includes('"isApiErrorMessage"')) return null;
   try {
     const parsed = JSON.parse(text) as unknown;
-    if (typeof parsed !== "object" || parsed === null) return false;
+    if (typeof parsed !== "object" || parsed === null) return null;
     const record = parsed as Record<string, unknown>;
-    return record["type"] === "assistant" && record["isApiErrorMessage"] === true;
+    if (record["type"] !== "assistant" || record["isApiErrorMessage"] !== true) return null;
+    return typeof record["error"] === "string" ? record["error"] : "";
   } catch {
-    return false;
+    return null;
   }
+}
+
+/**
+ * 制限リセット後の自動再開プロンプト（isMeta の user 行）を利用者向けの注記へ。cross-session の
+ * 起こし（`Another Claude session sent a message:` / 封筒）は自動再開ではないので対象外。
+ */
+const AUTO_CONTINUE_NOTICE = "⏱️ 使用量制限がリセットされ、Claude Code が作業を自動再開しました";
+
+/** 制限到達から自動再開プロンプトを待つ時間窓（週次制限のリセットでも一晩は待つ）。 */
+const AUTO_CONTINUE_WINDOW_MS = 12 * 60 * 60 * 1000;
+
+/**
+ * isMeta の user 行のうち、自動再開プロンプトではないと分かる harness 由来の形（cross-session の起こし /
+ * idle 通知 / 停止境界の注入 / バックグラウンド通知封筒）。これらは畳まず従来どおり present() に委ねる。
+ */
+function looksLikeOtherHarnessPrompt(text: string): boolean {
+  const trimmed = text.trimStart();
+  return (
+    trimmed.includes("<cross-session-message") ||
+    trimmed.startsWith("Another Claude session sent a message") ||
+    trimmed.startsWith("[Cross-session") ||
+    trimmed.startsWith("<system-reminder>") ||
+    trimmed.includes("<task-notification>")
+  );
 }
 
 /**
@@ -207,6 +240,12 @@ export interface ClaudeTurnLifecycleEvent {
    * 処理中状態を直接は動かさない（権威は hook）。
    */
   kind: "interrupted" | "api_error" | "turn_start";
+  /**
+   * `api_error` のエラー種別（合成 assistant 行の `error`。実測: `rate_limit` = 使用量制限 429 /
+   * `server_error` 529 / `authentication_failed` 403）。hub は `rate_limit` のとき、Claude Code の
+   * 自動再開待ち（usage-limit-wait）を pane から見張り push で知らせる。不明は省略。
+   */
+  errorKind?: string | null;
   /** transcript 行の timestamp（Unix ms）。履歴再生で流れる過去ターンのマーカーを除外する根拠。 */
   atMs: number;
 }
@@ -246,6 +285,10 @@ interface Turn {
   effort: string | null;
   /** Skill ツール起動で注入されたスキル本文（該当ツールカードへ後付けする）。 */
   skillInjection?: { toolUseId: string; text: string };
+  /** user 行の `isMeta`（harness 注入のプロンプト。制限リセット後の自動再開プロンプト判定に使う）。 */
+  isMeta?: boolean;
+  /** Artifact ツールの tool_result から拾った公開 URL（該当ツールカードへ後付けする, artifact-card）。 */
+  artifactResults?: { toolUseId: string; url: string }[];
 }
 
 /** tail 中の可変状態（1 ストリームぶん）。 */
@@ -259,6 +302,18 @@ interface TailState {
   activeQuestionIds: Set<string>;
   /** 本文待ちの Skill ツールカード（tool_use id → 発行済み activity）。 */
   pendingSkillActivities: Map<string, ToolActivity>;
+  /** 公開 URL 待ちの Artifact ツールカード（tool_use id → 発行済み activity, artifact-card）。 */
+  pendingArtifactActivities: Map<string, ToolActivity>;
+  /**
+   * 直近の API エラー終端が使用量制限（`error: "rate_limit"`）で、その後まだ本物の発話が無い
+   * （usage-limit-wait）。この間に届く isMeta の user 発話は Claude Code の自動再開プロンプト
+   * （2.1.234〜。文言は固定だが transcript では isMeta の user 行）とみなし、system 注記へ畳む。
+   */
+  rateLimitArmed: boolean;
+  /** `rateLimitArmed` を立てた api_error 行の timestamp（時間窓の起点。不明は null）。 */
+  rateLimitArmedAtMs: number | null;
+  /** 既存内容の再生が終わり live 追尾に入ったか（診断ログは live 行だけに出す）。 */
+  live: boolean;
   /** ターン権威ライフサイクルの観測者（hub が処理中状態の補完に使う）。 */
   onLifecycle: ((event: ClaudeTurnLifecycleEvent) => void) | null;
 }
@@ -380,6 +435,10 @@ export class TranscriptTailer {
         noticeCtx: createSystemNoticeContext(),
         activeQuestionIds: new Set(),
         pendingSkillActivities: new Map(),
+        pendingArtifactActivities: new Map(),
+        rateLimitArmed: false,
+        rateLimitArmedAtMs: null,
+        live: false,
         onLifecycle: this.lifecycleObserver,
       };
       const start = Date.now();
@@ -395,6 +454,7 @@ export class TranscriptTailer {
         }
 
         if (bytesRead === 0) {
+          state.live = true;
           // 初回 EOF = 既存内容の再生完了。マーカー有効時は完了シグナルを 1 通流す。
           if (this.emitReplayDoneMarker && !announcedReplayDone) {
             announcedReplayDone = true;
@@ -568,12 +628,44 @@ function* emitLine(line: Buffer, state: TailState): Generator<ControlMessage, vo
   // 実機 2026-09-07: 「You've hit your session limit」で止まった会話が hub では処理中のまま残り、
   // 停止ボタン点灯・背景購読の継続（開き直しても履歴再生が走らず host 経路が配線されない）・
   // reaper の計時停止を招いていた。
-  if (state.onLifecycle !== null && isApiErrorAssistantLine(text)) {
-    const atMs = lineTimestampMs(line);
-    if (Number.isFinite(atMs)) state.onLifecycle({ kind: "api_error", atMs });
+  const apiErrorKind = apiErrorAssistantKind(text);
+  if (apiErrorKind !== null) {
+    // 使用量制限（rate_limit）の後は、Claude Code が自動再開で流す isMeta の発話を注記へ畳む。
+    state.rateLimitArmed = apiErrorKind === "rate_limit";
+    const errorAtMs = lineTimestampMs(line);
+    state.rateLimitArmedAtMs = state.rateLimitArmed && Number.isFinite(errorAtMs) ? errorAtMs : null;
+    if (state.onLifecycle !== null && Number.isFinite(errorAtMs)) {
+      state.onLifecycle({ kind: "api_error", atMs: errorAtMs, errorKind: apiErrorKind });
+    }
   }
   const turn = extractTurn(text, state.noticeCtx);
   if (turn === null) return;
+  if (state.rateLimitArmed && turn.role === "assistant" && apiErrorKind === null) {
+    // 自動再開プロンプトを挟まず assistant が動いた（queued 発話の自動 dequeue 等）→ 武装解除。
+    state.rateLimitArmed = false;
+  }
+  let foldAutoContinue = false;
+  if (turn.role === "user" && turn.text.length > 0 && userLineKind(text) === "utterance") {
+    const lineAtMs = lineTimestampMs(line);
+    const inWindow =
+      state.rateLimitArmedAtMs === null || !Number.isFinite(lineAtMs) ||
+      lineAtMs - state.rateLimitArmedAtMs <= AUTO_CONTINUE_WINDOW_MS;
+    if (turn.isMeta === true && state.rateLimitArmed && inWindow && !looksLikeOtherHarnessPrompt(turn.text)) {
+      // 自動再開の固定プロンプト（usage-limit-wait）: 利用者の発話ではないので system 注記にする。
+      // 文言そのものは公開されていないため、live 行に限り本文の先頭を診断ログへ残し次回の精緻化に使う。
+      if (state.live) {
+        process.stderr.write(
+          `[tailii-host tailer] auto-continue-prompt 検出（isMeta, rate_limit 後）: ${turn.text.slice(0, 120).replaceAll("\n", " ")}\n`,
+        );
+      }
+      state.rateLimitArmed = false;
+      // 注記への書き換えはライフサイクル観測（turn_start）の後に行う（下）。
+      foldAutoContinue = true;
+    } else if (turn.isMeta !== true || !inWindow) {
+      // 本物の発話が来た（利用者が制限後に別の指示を出した）/ 時間窓を過ぎた → 武装解除。
+      state.rateLimitArmed = false;
+    }
+  }
 
   // 中断確定マーカー: ターン終了の権威（Stop hook は中断で発火しない）。表示用の chat_output
   // とは別に、行の timestamp 付きで観測者へ通知する。timestamp 不明行は履歴/ライブを区別
@@ -592,6 +684,12 @@ function* emitLine(line: Buffer, state: TailState): Generator<ControlMessage, vo
     }
   }
 
+  // 自動再開プロンプト（usage-limit-wait）: 発話としての観測（turn_start）は上で済ませ、表示だけ注記へ畳む。
+  if (foldAutoContinue) {
+    turn.role = "system";
+    turn.text = AUTO_CONTINUE_NOTICE;
+  }
+
   for (const prompt of turn.questionPrompts) {
     if (state.activeQuestionIds.has(prompt.id)) continue;
     state.activeQuestionIds.add(prompt.id);
@@ -599,6 +697,15 @@ function* emitLine(line: Buffer, state: TailState): Generator<ControlMessage, vo
   }
 
   for (const activity of turn.toolActivities) {
+    // Artifact カードは tool_result に載る公開 URL（`Published … at https://claude.ai/…`）を後付けする
+    // ため保持する（artifact-card）。上限は Skill と共用の値で最古から破棄。
+    if (activity.name === "Artifact") {
+      state.pendingArtifactActivities.set(activity.id, activity);
+      if (state.pendingArtifactActivities.size > MAX_PENDING_SKILL_ACTIVITIES) {
+        const oldest = state.pendingArtifactActivities.keys().next().value;
+        if (oldest !== undefined) state.pendingArtifactActivities.delete(oldest);
+      }
+    }
     // Skill ツールカードは注入されるスキル本文（後続の isMeta 行）を詳細へ後付けする
     // ため保持する。本文が届かないまま溜まらないよう上限で最古から破棄。
     if (activity.name === "Skill") {
@@ -622,6 +729,14 @@ function* emitLine(line: Buffer, state: TailState): Generator<ControlMessage, vo
       if (bodyCap.value !== null) enriched.command = bodyCap.value;
       yield { type: "tool_activity", v: PROTOCOL_V1, activity: enriched };
     }
+  }
+
+  // Artifact の公開 URL が届いたら、該当カードを url 付きで再送する（iOS は同一 id を更新として扱う）。
+  for (const result of turn.artifactResults ?? []) {
+    const pending = state.pendingArtifactActivities.get(result.toolUseId);
+    if (pending === undefined) continue;
+    state.pendingArtifactActivities.delete(result.toolUseId);
+    yield { type: "tool_activity", v: PROTOCOL_V1, activity: { ...pending, url: result.url } };
   }
 
   for (const id of turn.toolResultIds) {
@@ -801,6 +916,11 @@ export function extractTurn(line: string, ctx?: SystemNoticeContext): Turn | nul
   const turn: Turn = { id, role, text, toolActivities, questionPrompts, toolResultIds, model, contextTokens, effort };
   if (injectedSkill && typeof rec["sourceToolUseID"] === "string" && plainText.length > 0) {
     turn.skillInjection = { toolUseId: rec["sourceToolUseID"], text: plainText };
+  }
+  if (role === "user") {
+    if (rec["isMeta"] === true) turn.isMeta = true;
+    const artifactResults = extractArtifactResults(rawContent);
+    if (artifactResults.length > 0) turn.artifactResults = artifactResults;
   }
   return turn;
 }
@@ -1037,6 +1157,35 @@ function makeToolActivity(id: string, name: string, input: Record<string, unknow
       if (captionCap.value !== null) activity.description = captionCap.value;
       return activity;
     }
+    case "Artifact": {
+      // Claude Code の Artifact ツール（`/design` のキャンバスや共有ページの公開, Week 34）。
+      // input = { file_path?, title?, description?, favicon?, url?（更新時）, action?（list/read 等） }。
+      // 公開 URL は tool_result（`Published <path> at https://claude.ai/code/artifact/<id>`）から後付けする。
+      const action = nonEmpty(str(input["action"]));
+      const title = nonEmpty(str(input["title"]));
+      const filePath = nonEmpty(str(input["file_path"]));
+      const descriptionCap = cap(str(input["description"]), MAX_DESCRIPTION_CHARACTERS);
+      const subject = title ?? (filePath !== null ? displayPath(filePath, name) : null);
+      const label = action !== null && action !== "publish"
+        ? `Artifact ${action}`
+        : subject === null ? "Artifact を公開" : `Artifact を公開 ${subject}`;
+      const activity: ToolActivity = {
+        id,
+        name,
+        label,
+        commandTruncated: false,
+        descriptionTruncated: descriptionCap.truncated,
+      };
+      if (filePath !== null) activity.file = filePath;
+      if (descriptionCap.value !== null) activity.description = descriptionCap.value;
+      // 公開（action 無し / publish）だけ URL を載せる。read / comments / upload_asset 等は入力に url を
+      // 取るが「開く」導線にしない（カードは公開操作だけ）。
+      const url = nonEmpty(str(input["url"]));
+      if ((action === null || action === "publish") && url !== null && /^https:\/\/claude\.ai\//.test(url)) {
+        activity.url = url;
+      }
+      return activity;
+    }
     case "TodoWrite": {
       const todos = extractTodos(input["todos"]);
       const activity: ToolActivity = {
@@ -1207,6 +1356,37 @@ function decodeQuestionPromptQuestion(raw: Record<string, unknown>): QuestionPro
     }
   }
   return { header, question, multiSelect, options };
+}
+
+/** Artifact ツールの tool_result から公開 URL を拾う（`https://claude.ai/code/artifact/<id>` 等）。 */
+const ARTIFACT_URL_PATTERN = /https:\/\/claude\.ai\/(?:code\/)?artifact\/[A-Za-z0-9-]+/;
+
+function extractArtifactResults(content: unknown): { toolUseId: string; url: string }[] {
+  if (!Array.isArray(content)) return [];
+  const out: { toolUseId: string; url: string }[] = [];
+  for (const block of content) {
+    if (typeof block !== "object" || block === null) continue;
+    const rec = block as Record<string, unknown>;
+    if (rec["type"] !== "tool_result" || typeof rec["tool_use_id"] !== "string") continue;
+    const text = toolResultPlainText(rec["content"]);
+    if (!text.includes("claude.ai/")) continue;
+    const match = ARTIFACT_URL_PATTERN.exec(text);
+    if (match !== null) out.push({ toolUseId: rec["tool_use_id"], url: match[0] });
+  }
+  return out;
+}
+
+/** tool_result の content（文字列 / text ブロック配列）を平文へ。 */
+function toolResultPlainText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((block) => {
+      if (typeof block !== "object" || block === null) return "";
+      const rec = block as Record<string, unknown>;
+      return rec["type"] === "text" && typeof rec["text"] === "string" ? rec["text"] : "";
+    })
+    .join("\n");
 }
 
 function extractToolResultIds(content: unknown): string[] {

@@ -2772,3 +2772,184 @@ describe("SessionHub Codex App Server live stream", () => {
     expect(received.filter((message) => message?.payload?.text === "切断中の新着")).toHaveLength(1);
   });
 });
+
+describe("usage-limit-wait: 制限待ちの見張り（武装 / push / reaper 保護 / 解除）", () => {
+  type Lifecycle = (event: { kind: "interrupted" | "api_error" | "turn_start"; atMs: number; errorKind?: string | null }) => void;
+  type WaitState = { kind: "waiting"; resumeAt: string | null } | { kind: "resuming" } | { kind: "needs_enter" } | { kind: "stopped" };
+
+  function makeWaitHub(initialNow = 100) {
+    let now = initialNow;
+    const log = vi.fn();
+    const notify = vi.fn();
+    const metadataStore = makeTempStore();
+    metadataStore.put({ name: "cs-work", cwd: "/tmp/work", createdAt: 0, providerSessionId: "provider-1" });
+    const heartbeatDir = makeTempDir("session-hub-usage-limit");
+    const lifecycles: Lifecycle[] = [];
+    let onWait: ((state: WaitState | null) => void) | undefined;
+    let pollMs: (() => number) | undefined;
+    let pumpStarts = 0;
+    let pumpStops = 0;
+    // reaper の tick で tmux が「work」を生存（claude 稼働中）として返す runner。
+    const runner = async (args: string[]) => {
+      if (args[0] === "ls") return ok("cs-work\n");
+      if (args[0] === "list-clients") return ok("");
+      if (args[0] === "display-message") return ok("claude\n");
+      return ok("");
+    };
+    const hub = new SessionHub({
+      runner, heartbeatDir, metadataStore, timeoutSeconds: 1800,
+      now: () => now, nowMs: () => now * 1000 + 250, log,
+      tailFactory: (_write, _codex, onClaudeTurnLifecycle) => {
+        if (onClaudeTurnLifecycle !== undefined) lifecycles.push(onClaudeTurnLifecycle as Lifecycle);
+        return { open() {}, stop() {} };
+      },
+      previewPumpFactory: (_write, _onMode, pollIntervalMs, onUsageLimitWait) => {
+        pollMs = pollIntervalMs;
+        onWait = onUsageLimitWait as ((state: WaitState | null) => void) | undefined;
+        return { start() { pumpStarts += 1; }, stop() { pumpStops += 1; } };
+      },
+      usageLimitNotify: notify,
+    });
+    return {
+      hub, heartbeatDir, log, notify, lifecycles,
+      setNow: (value: number) => { now = value; },
+      onWait: () => onWait!, pollMs: () => pollMs!,
+      pumps: () => ({ starts: pumpStarts, stops: pumpStops }),
+    };
+  }
+
+  function subscribeWork(hub: SessionHub, client: object): unknown[] {
+    const received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "conversation_subscribe", session: "cs-work", preview: true }));
+    return received;
+  }
+
+  test("待機表示を観測した見張りは 12 時間で上限解除される", () => {
+    vi.useFakeTimers();
+    try {
+      const h = makeWaitHub();
+      const client = {};
+      subscribeWork(h.hub, client);
+      h.hub.handleRelayMessage({ type: "session_processing", session: "cs-work", state: "active" });
+      h.setNow(125);
+      h.lifecycles[0]!({ kind: "api_error", atMs: 125_000, errorKind: "rate_limit" });
+      const actor = h.hub.actors.get("cs-work")!;
+      h.onWait()({ kind: "waiting", resumeAt: "3pm" });
+      vi.advanceTimersByTime(12 * 60 * 60 * 1000 - 1);
+      expect(actor.usageLimitWatch).not.toBeNull();
+      vi.advanceTimersByTime(2);
+      expect(actor.usageLimitWatch).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("直近の rate_limit で武装し、購読者が居なくても pump を保ち、遷移ごとに push・reaper から保護する", async () => {
+    vi.useFakeTimers();
+    const h = makeWaitHub();
+    const client = {};
+    subscribeWork(h.hub, client);
+    const lifecycle = h.lifecycles[0]!;
+    h.hub.handleRelayMessage({ type: "session_processing", session: "cs-work", state: "active" });
+    h.setNow(125);
+    // 現ターンの終端 = 使用量制限（rate_limit）。done へ写像しつつ見張りを武装する。
+    lifecycle({ kind: "api_error", atMs: 125_000, errorKind: "rate_limit" });
+    const actor = h.hub.actors.get("cs-work")!;
+    expect(actor.processingSince).toBeNull();
+    expect(actor.usageLimitWatch).not.toBeNull();
+    expect(actor.usageLimitWatch?.state).toBeNull();
+    // 前面購読がある間は 250ms（従来）。
+    expect(h.pollMs()()).toBe(250);
+
+    // 前面購読が外れても見張り中は pump を止めない（待機表示の未観測中は 5s）。
+    h.hub.handleClientMessage(client, JSON.stringify({ type: "conversation_unsubscribe", session: "cs-work" }));
+    expect(actor.subscribers.size).toBe(0);
+    expect(h.pumps().stops).toBe(0);
+    expect(h.pollMs()()).toBe(5000);
+
+    // 待機フッターの観測 → push（購読者なし）。観測後も 5s ポーリング（数時間の静止画面を回すため）。
+    h.onWait()({ kind: "waiting", resumeAt: "3:45pm" });
+    expect(h.notify).toHaveBeenCalledTimes(1);
+    expect(h.notify).toHaveBeenLastCalledWith("cs-work", { kind: "waiting", resumeAt: "3:45pm" });
+    expect(actor.usageLimitWatch?.state).toEqual({ kind: "waiting", resumeAt: "3:45pm" });
+    expect(h.pollMs()()).toBe(5000);
+
+    // 同じ状態の再通知は pump が抑えるが、hub 側は繰り返し到達（2 本目の rate_limit）で見張りを壊さない:
+    // 観測済みの見張りは上限タイマーのまま（猶予タイマーへ差し替わると猶予発火で永久化する）。
+    lifecycle({ kind: "api_error", atMs: 125_500, errorKind: "rate_limit" });
+    expect(actor.usageLimitWatch?.state).toEqual({ kind: "waiting", resumeAt: "3:45pm" });
+    vi.advanceTimersByTime(120_001);
+    expect(actor.usageLimitWatch?.state).toEqual({ kind: "waiting", resumeAt: "3:45pm" });
+
+    // reaper 保護: idle のまま 1800s 超えても tick が heartbeat を進める（kill 対象にならない）。
+    h.setNow(125 + 1900);
+    const tick = await h.hub.tick();
+    expect(tick.killed).toEqual([]);
+    expect(tick.reclaimed).toEqual([]);
+    expect(readHeartbeat(h.heartbeatDir, "cs-work")?.ts).toBe(125 + 1900);
+    expect(h.hub.actors.get("cs-work")).toBe(actor);
+
+    // 処理へ戻った（自動再開）= 「再開した」を push し、見張りを畳む。
+    h.hub.handleRelayMessage({ type: "session_processing", session: "cs-work", state: "active" });
+    expect(h.notify).toHaveBeenLastCalledWith("cs-work", { kind: "resumed" });
+    expect(actor.usageLimitWatch).toBeNull();
+    // 見張りが無く購読者も居ないので pump は止まる。
+    expect(h.pumps().stops).toBe(1);
+    vi.useRealTimers();
+  });
+
+  test("履歴再生の古い rate_limit では武装せず、武装外の観測は push しない", () => {
+    const h = makeWaitHub();
+    const client = {};
+    subscribeWork(h.hub, client);
+    const lifecycle = h.lifecycles[0]!;
+    // 1 時間前の終端マーカー（開き直しの履歴再生）。
+    lifecycle({ kind: "api_error", atMs: 100_250 - 60 * 60 * 1000, errorKind: "rate_limit" });
+    expect(h.hub.actors.get("cs-work")?.usageLimitWatch ?? null).toBeNull();
+    // 前面購読の pump が待機行を拾っても、武装外なら push しない（前ターンの残存行の誤報を塞ぐ）。
+    h.hub.handleClientMessage(client, JSON.stringify({ type: "conversation_unsubscribe", session: "cs-work" }));
+    h.onWait()({ kind: "waiting", resumeAt: "3pm" });
+    expect(h.notify).not.toHaveBeenCalled();
+    // server_error（529）は武装しない。
+    lifecycle({ kind: "api_error", atMs: 100_250 - 1000, errorKind: "server_error" });
+    expect(h.hub.actors.get("cs-work")?.usageLimitWatch ?? null).toBeNull();
+  });
+
+  test("購読者が居る間は push せず、待機表示の消失は猶予後に畳む（過渡の 1 フレームでは畳まない / resuming からの消失は再開 push）", () => {
+    vi.useFakeTimers();
+    try {
+      const h = makeWaitHub();
+      const client = {};
+      subscribeWork(h.hub, client);
+      const lifecycle = h.lifecycles[0]!;
+      h.hub.handleRelayMessage({ type: "session_processing", session: "cs-work", state: "active" });
+      h.setNow(125);
+      lifecycle({ kind: "api_error", atMs: 125_000, errorKind: "rate_limit" });
+      const actor = h.hub.actors.get("cs-work")!;
+      // 前面で見ている（購読者あり）→ push なし。状態は記録する。
+      h.onWait()({ kind: "needs_enter" });
+      expect(h.notify).not.toHaveBeenCalled();
+      expect(actor.usageLimitWatch?.state).toEqual({ kind: "needs_enter" });
+      // 過渡フレームでフッターが 1 回写らなくても、猶予内に再観測すれば畳まない・再通知もしない。
+      h.hub.handleClientMessage(client, JSON.stringify({ type: "conversation_unsubscribe", session: "cs-work" }));
+      h.onWait()(null);
+      expect(actor.usageLimitWatch).not.toBeNull();
+      vi.advanceTimersByTime(10_000);
+      h.onWait()({ kind: "needs_enter" });
+      expect(h.notify).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(60_000);
+      expect(actor.usageLimitWatch).not.toBeNull();
+      // 再開中 → 消失が猶予を超えて続く: 「再開した」を 1 回 push し、見張りは解除。
+      h.onWait()({ kind: "resuming" });
+      expect(h.notify).toHaveBeenCalledTimes(1);
+      h.onWait()(null);
+      expect(actor.usageLimitWatch).not.toBeNull();
+      vi.advanceTimersByTime(30_000);
+      expect(h.notify).toHaveBeenLastCalledWith("cs-work", { kind: "resumed" });
+      expect(actor.usageLimitWatch).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

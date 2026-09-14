@@ -4,6 +4,7 @@
 // （キャッシュ表示）は iOS 側の責務とする。
 
 import { writeError, type HandlerRegistry } from "../context.js";
+import { markClaudeDefaultModel, readClaudeDefaultModelSetting } from "../../services/claudeModelCatalog.js";
 
 export const claudeModelHandlers: HandlerRegistry = {
   claude_model_list_request: async (message, ctx) => {
@@ -21,7 +22,10 @@ export const claudeModelHandlers: HandlerRegistry = {
         );
         return;
       }
-      writer.write({ type: "claude_model_list_response", v, id: message.id, models });
+      // `ANTHROPIC_DEFAULT_MODEL`（Claude Code 2.1.236）で既定を変えている環境では「既定」の表示と
+      // 実体がズレるため、設定が指すモデルへ isDefault を立てて返す（default-model）。
+      const marked = markClaudeDefaultModel(models, readClaudeDefaultModelSetting());
+      writer.write({ type: "claude_model_list_response", v, id: message.id, models: marked });
     } catch (error) {
       writeError(writer, v, message.id, "claude_model_list_failed", String(error));
     }

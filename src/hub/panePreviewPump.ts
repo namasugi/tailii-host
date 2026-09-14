@@ -3,6 +3,7 @@
 
 import type { LineWriter } from "../shared/lineWriter.js";
 import { parsePermissionMode } from "../shared/permissionMode.js";
+import { parseUsageLimitWait, sameUsageLimitWait, type UsageLimitWaitState } from "../shared/usageLimitWait.js";
 import { extractInputBoxSuggestion } from "../backend/tmux.js";
 import { PROTOCOL_V2 } from "../protocol.js";
 import { abortableSleep } from "../shared/sleep.js";
@@ -28,6 +29,11 @@ export interface PanePreviewPumpOptions {
    * claude_status モードのときだけ判定する（codex に permission mode は無い）。
    */
   onPermissionMode?: (mode: string) => void;
+  /**
+   * 使用量制限の自動再開待ち（Claude Code 2.1.234〜のフッター行）の遷移通知（usage-limit-wait）。
+   * claude_status モードのときだけ判定し、状態が変わったフレームでだけ呼ぶ（null = 待機表示なし）。
+   */
+  onUsageLimitWait?: (state: UsageLimitWaitState | null) => void;
   /** 診断ログ（選択ダイアログフレームの emit 遷移など。既定は無効）。 */
   log?: (message: string) => void;
   /**
@@ -66,6 +72,8 @@ export class PanePreviewPump {
   private session: string | null = null;
   private mode: PanePreviewMode = "claude_status";
   private readonly onPermissionMode: ((mode: string) => void) | null;
+  private readonly onUsageLimitWait: ((state: UsageLimitWaitState | null) => void) | null;
+  private lastUsageLimitWait: UsageLimitWaitState | null = null;
   private readonly log: ((message: string) => void) | null;
   private readonly emitInitialIf: ((text: string) => boolean) | null;
   private readonly captureSuggestion: ((session: string) => Promise<string>) | null;
@@ -86,6 +94,7 @@ export class PanePreviewPump {
     this.quietThresholdMs = options.quietThresholdMs ?? 2500;
     this.protocolVersion = options.protocolVersion ?? (() => PROTOCOL_V2);
     this.onPermissionMode = options.onPermissionMode ?? null;
+    this.onUsageLimitWait = options.onUsageLimitWait ?? null;
     this.log = options.log ?? null;
     this.emitInitialIf = options.emitInitialIf ?? null;
     this.captureSuggestion = options.captureSuggestion ?? null;
@@ -193,6 +202,14 @@ export class PanePreviewPump {
           this.onPermissionMode(permissionMode);
         }
       }
+      if (text !== null && mode === "claude_status" && this.onUsageLimitWait !== null) {
+        // 使用量制限の待機フッター（usage-limit-wait）。遷移したフレームでだけ通知する。
+        const wait = parseUsageLimitWait(text);
+        if (!sameUsageLimitWait(wait, this.lastUsageLimitWait)) {
+          this.lastUsageLimitWait = wait;
+          this.onUsageLimitWait(wait);
+        }
+      }
 
       const now = Date.now();
       if (text !== null && text !== this.lastText) {
@@ -238,6 +255,9 @@ export class PanePreviewPump {
       if (
         mode === "claude_status" &&
         this.captureSuggestion !== null &&
+        // 低頻度の見張り（制限待ち, usage-limit-wait）中は提案抽出を行わない（数時間の静止画面で毎周回
+        // 2 回 capture しない）。
+        this.pollIntervalMs() < 5000 &&
         now - this.lastSuggestionAt >= this.suggestionIntervalMs
       ) {
         this.lastSuggestionAt = now;

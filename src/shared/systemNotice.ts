@@ -165,6 +165,15 @@ export function systemNoticeText(rec: Record<string, unknown>, ctx?: SystemNotic
     );
   }
 
+  // --- 別セッションの待機通知（SendMessage の notify_when_idle, Claude Code 2.1.236〜） ---
+  // 通知は level=notice の informational 行 `<name> is idle`（実測 2026-09-14。封筒なし）で届く。
+  // notice 級は従来一律に落としていたため、この形だけを ⇄ 注記へ転写する（cross-session）。
+  if (subtype === "informational" && level === "notice") {
+    // 形は `<name> is idle` だけを採る（`… exited` は未観測で、背景コマンドの終了文言と衝突し得る）。
+    const idle = /^(.+?) is idle$/u.exec(content);
+    if (idle !== null) return `⇄ ${idle[1]} は待機状態になりました（別セッションからの通知）`;
+  }
+
   // --- API エラー ---
   // 出す条件: 初回試行 / エラー種別が直前の告知と変わった / 認証・権限・レート系 / 再試行上限。
   // 同じエラーの再試行ごとの連投は出さない（実データ: 502 ×1 → 401 ×n。旧実装は初回だけで

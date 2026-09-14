@@ -24,6 +24,7 @@ import { APNsSender, type ApnsSending, Http2HttpClient } from "./apnsSender.js";
 import { DeviceTokenStore, type DeviceTokenStoring } from "./deviceTokenStore.js";
 import { ObservationLog } from "../shared/observationLog.js";
 import { defaultApnsBase, type PushError, pushPayloadBody } from "./pushTypes.js";
+import { describeUsageLimitWait, type UsageLimitWaitState } from "../shared/usageLimitWait.js";
 import { SendLog } from "./sendLog.js";
 
 // MARK: - リクエスト / 結果型
@@ -33,6 +34,13 @@ export interface ApprovalPushRequest {
   approvalId: string;
   tool: string;
   session: string;
+  /**
+   * 承認以外の通知（使用量制限の自動再開待ち等, usage-limit-wait）で表示文言を差し替える。
+   * 省略時は従来の「承認待ち / <tool> · <session>」。
+   */
+  alert?: { title: string; body: string };
+  /** 通知種別（iOS のタップ経路の分岐用。省略時は承認）。 */
+  kind?: string;
 }
 
 /** push 送信を見送った理由。 */
@@ -193,8 +201,9 @@ export class ApprovalPushNotifier {
     }
 
     // 6. 送信（+ ExpiredProviderToken 時の再署名・1回再試行 / Unregistered 時の token 削除）。
+    // alert / kind（使用量制限 push の文言差し替え, usage-limit-wait）も落とさず渡す。
     const result = await this.sendWithRetry(
-      { approvalId: req.approvalId, tool: req.tool, session: req.session },
+      req,
       tokenRecord,
       config.topic,
       jwt,
@@ -262,7 +271,7 @@ export class ApprovalPushNotifier {
       topic,
       collapseId: req.approvalId,
       expiration: this.expiration,
-      body: pushPayloadBody(req.approvalId, req.tool, req.session),
+      body: pushPayloadBody(req.approvalId, req.tool, req.session, req.alert, req.kind),
     };
   }
 }
@@ -310,5 +319,33 @@ export function makeProductionPushNotifier(): (
   });
   return async (request, timeLimitMs) => {
     await notifier.notify(request, timeLimitMs);
+  };
+}
+
+/**
+ * 使用量制限の自動再開待ち（usage-limit-wait）の push 送信子。hub daemon が待機フッターの遷移ごとに
+ * 呼ぶ。承認 push と同じ配管（config / device token / JWT / バースト抑制）を使い、文言だけ差し替える。
+ * 送信失敗・未設定はログに残すだけ（見張り自体は阻害しない）。
+ */
+export function makeUsageLimitPushNotifier(
+  log?: (message: string) => void,
+): (session: string, state: UsageLimitWaitState | { kind: "resumed" }) => void {
+  const send = makeProductionPushNotifier();
+  return (session, state) => {
+    const body = state.kind === "resumed"
+      ? "使用量制限の待機が終わり、作業を再開しました"
+      : describeUsageLimitWait(state);
+    const request: ApprovalPushRequest = {
+      // apns-collapse-id は 64 バイト上限（長いセッション名でも BadCollapseId で落とさない）。
+      approvalId: `usage-limit-${state.kind}-${Date.now()}-${session}`.slice(0, 64),
+      tool: "usage-limit",
+      session,
+      kind: "usage_limit",
+      alert: { title: "使用量制限", body },
+    };
+    send(request, 8_000).then(
+      () => log?.(`usage-limit-push sent session=${session} kind=${state.kind}`),
+      (error) => log?.(`usage-limit-push failed session=${session}: ${String(error)}`),
+    );
   };
 }

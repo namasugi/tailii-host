@@ -48,6 +48,8 @@ export interface ToolActivity {
   todos?: ToolActivityTodo[];
   /** SendUserFile が利用者へ渡したファイルの絶対パス一覧（他ツールは省略, additive, file-download）。 */
   files?: string[];
+  /** Artifact ツールが公開したページの URL（tool_result から後付け, additive, artifact-card）。 */
+  url?: string;
 }
 
 export type SubagentNodeStatus = "running" | "completed" | "error";
@@ -116,6 +118,14 @@ export interface ClaudeSessionInfo {
   liveSessionName?: string;
   /** `liveSessionName` を収容する端末バックエンド（live-pill）。liveSessionName と同時にのみ載る。 */
   liveSessionBackend?: TerminalBackendKind;
+  /**
+   * Tailii 管理外の生存 CLI インスタンス（Mac の端末 / `claude remote-control` が同じ会話を掴んでいる）
+   * のセッション名（`~/.claude/sessions` の登録簿, peer-live）。Tailii の pane が無い行にだけ載る。
+   * 開くと第 2 インスタンスが並走するため、iOS は確認を挟む。
+   */
+  peerSessionName?: string;
+  /** `peerSessionName` の CLI が Remote Control（公式アプリ / claude.ai）にも繋がっているか。 */
+  peerBridged?: boolean;
 }
 
 /** session_search_response の 1 検索結果。 */
@@ -139,6 +149,19 @@ export interface ServeProcessInfo {
   cwd?: string;
   /** 配信中ページの HTML `<title>`（host が HTTP GET で取得。HTML でない/応答なしは省略）。 */
   title?: string;
+}
+
+/** peer_session_list_response の 1 件（同じマシンで生きている Claude Code セッション, peer-sessions）。 */
+export interface PeerSessionInfo {
+  /** cross-session messaging の宛先名（`@名前` / SendMessage の `to`）。 */
+  name: string;
+  cwd: string;
+  /** Claude の会話 id（iOS は開いている会話自身を候補から除く）。 */
+  sessionId: string;
+  /** `busy` | `idle`（不明は省略）。 */
+  status?: string;
+  /** Remote Control（公式アプリ / claude.ai）にも繋がっているか。 */
+  bridged?: boolean;
 }
 
 /** slash_list_response の 1 コマンド候補。 */
@@ -231,6 +254,11 @@ export interface ClaudeModelInfo {
   id: string;
   /** API の display_name（例: "Claude Sonnet 5"。表示整形は iOS 側）。 */
   displayName: string;
+  /**
+   * `ANTHROPIC_DEFAULT_MODEL`（環境変数 / ~/.claude/settings.json の env）が指す「model を渡さずに
+   * 起動したとき実際に使われるモデル」なら true（additive, default-model）。設定が無ければ省略。
+   */
+  isDefault?: boolean;
 }
 
 /** AskUserQuestion の選択肢。 */
@@ -398,7 +426,7 @@ export type ControlMessage =
   | { type: "remote_pending_cleared"; v: number; id: string; session: string; kind: RemotePendingKind }
   | { type: "session_list_request"; v: number; id: string; limit?: number; cursor?: string }
   | { type: "session_list_response"; v: number; id: string; sessions: SessionInfo[]; nextCursor?: string; adoptedName?: string; worktreePath?: string; worktreeRemoved?: boolean; worktreeDirty?: boolean }
-  | { type: "session_start"; v: number; id: string; cwd: string; name: string; baseDir?: string; resumeSessionId?: string; title?: string; agentType?: "claude" | "codex"; model?: string; permissionMode?: "default" | "acceptEdits" | "plan" | "auto"; effort?: "low" | "medium" | "high" | "xhigh" | "max"; codexModel?: string; codexSandbox?: "read-only" | "workspace-write" | "danger-full-access"; deferSubscribe?: boolean }
+  | { type: "session_start"; v: number; id: string; cwd: string; name: string; baseDir?: string; resumeSessionId?: string; title?: string; agentType?: "claude" | "codex"; model?: string; permissionMode?: "default" | "acceptEdits" | "plan" | "auto"; effort?: "low" | "medium" | "high" | "xhigh" | "max"; codexModel?: string; codexSandbox?: "read-only" | "workspace-write" | "danger-full-access"; deferSubscribe?: boolean; outputStyle?: string; worktree?: string; todoTools?: boolean }
   | { type: "session_reattach"; v: number; id: string; name: string }
   | { type: "session_kill"; v: number; id: string; name: string }
   | { type: "session_idle_hint"; v: number; id: string; name: string }
@@ -514,6 +542,8 @@ export type ControlMessage =
   | { type: "mode_set_response"; v: number; id: string; mode: string }
   | { type: "slash_list_request"; v: number; id: string; cwd?: string }
   | { type: "slash_list_response"; v: number; id: string; commands: SlashCommandInfo[] }
+  | { type: "peer_session_list_request"; v: number; id: string }
+  | { type: "peer_session_list_response"; v: number; id: string; peers: PeerSessionInfo[] }
   | { type: "dir_list_request"; v: number; id: string; baseDir: string; partial: string }
   | { type: "dir_list_response"; v: number; id: string; entries: string[] }
   | { type: "browse_request"; v: number; id: string; path: string }

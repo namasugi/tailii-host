@@ -70,19 +70,47 @@ export function readBackgroundOutput(file: string | null): SubagentTranscriptRes
   };
 }
 
+/**
+ * fork サブエージェント（Claude Code 2.1.232〜, fork mode 既定 ON）の user 行から、harness の定型
+ * 指示 `<fork-boilerplate>…</fork-boilerplate>` を外して指示本文だけを返す（TESTABLE, fork-subagent）。
+ * 実測 2026-09-14 の形: boilerplate ブロック + 空行 + `Your directive: <本文>`。
+ * boilerplate を含まない本文は null（通常の user 行）。
+ */
+export function presentForkDirective(raw: string): string | null {
+  const open = raw.indexOf("<fork-boilerplate>");
+  if (open < 0) return null;
+  const closeTag = "</fork-boilerplate>";
+  const close = raw.indexOf(closeTag, open);
+  const rest = (close < 0 ? "" : raw.slice(close + closeTag.length)).trim();
+  const directive = rest.replace(/^Your directive:\s*/u, "").trim();
+  return directive.length > 0 ? `⑂ 分岐（fork）への指示\n\n${directive}` : "⑂ 分岐（fork）への指示";
+}
+
 export function parseSubagentTranscript(jsonl: string): SubagentTranscriptResult {
   const all: SubagentTranscriptEntry[] = [];
+  // fork の transcript は親履歴を複製せず、先頭に参照レコード `fork-context-ref` を置き、その直後に
+  // 親が fork を起こした Agent tool_use の写しが 1 行入る（実測 2026-09-14）。写しは fork 自身の
+  // 行動ではないのでタイムラインから外す。
+  let forkSpawnCopyPending = false;
   for (const line of jsonl.split(/\r?\n/)) {
     if (!line) continue;
     let value: unknown;
     try { value = JSON.parse(line); } catch { continue; }
     if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
     const record = value as Record<string, unknown>;
+    if (record["type"] === "fork-context-ref") {
+      forkSpawnCopyPending = true;
+      continue;
+    }
     const ts = parseTimestamp(record["timestamp"]);
     const message = object(record["message"]);
     const role = message?.["role"] ?? record["type"];
     if (role !== "user" && role !== "assistant") continue;
     const content = message?.["content"] ?? record["content"];
+    if (forkSpawnCopyPending) {
+      forkSpawnCopyPending = false;
+      if (role === "assistant" && isAgentSpawnOnlyContent(content)) continue;
+    }
     // harness 注入の <system-reminder>（user 行のリマインダ / assistant text 末尾の背景通知）は
     // 表示せず、user 行で届く通知封筒はコンパクトな 1 行に畳む。除去で空になった text は行にしない。
     const present = (raw: string): string => {
@@ -93,6 +121,11 @@ export function parseSubagentTranscript(jsonl: string): SubagentTranscriptResult
       if (role === "user" && isNotificationEnvelope(raw)) {
         const status = /<status>([^<]*)<\/status>/u.exec(raw)?.[1]?.trim() ?? "";
         return status === "" ? "⚙️ バックグラウンドタスク通知" : `⚙️ バックグラウンドタスク通知（${status}）`;
+      }
+      // fork の定型指示（<fork-boilerplate>）は harness の注入。指示本文だけを見せる。
+      if (role === "user") {
+        const directive = presentForkDirective(raw);
+        if (directive !== null) return directive;
       }
       // 別セッションからのメッセージ封筒（<cross-session-message>）は、封筒と harness の
       // 前置き/後置きを外して「⇄ 送信元名 より」+ 本文へ転写する（規則は shared/crossSession.ts）。
@@ -323,4 +356,13 @@ function snippet(value: unknown, cap: number): string {
 
 function truncate(value: string, cap: number): string {
   return value.length <= cap ? value : `${value.slice(0, cap)}…`;
+}
+
+/** content が「Agent ツール呼び出しのみ」か（fork 先頭の spawn 写し判定）。 */
+function isAgentSpawnOnlyContent(content: unknown): boolean {
+  if (!Array.isArray(content) || content.length === 0) return false;
+  return content.every((block) => {
+    const rec = object(block);
+    return rec !== null && rec["type"] === "tool_use" && rec["name"] === "Agent";
+  });
 }

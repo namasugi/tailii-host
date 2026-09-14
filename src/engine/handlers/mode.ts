@@ -3,6 +3,7 @@
 // Codex TUI 番号付きダイアログへの選択返送（pane_choice_send）。
 
 import { parsePermissionMode } from "../../shared/permissionMode.js";
+import { parseUsageLimitWait } from "../../shared/usageLimitWait.js";
 import { sleep } from "../../shared/sleep.js";
 import type { SessionBackend } from "../../backend/sessionBackend.js";
 import { inputBoxRealText, inputBoxTextMatchesRecordedPrompt, loginCodeErrorMessage } from "../../backend/tmux.js";
@@ -214,7 +215,14 @@ async function detectCancelledPrompt(ctx: HandlerContext, session: string): Prom
     await sleep(modeTiming.cancelDetectPollMs);
     let realText: string | null = null;
     try {
-      realText = inputBoxRealText(await sessionManager.captureVisibleAnsi(session));
+      const capture = await sessionManager.captureVisibleAnsi(session);
+      // 使用量制限の待機中（usage-limit-wait）の Esc は「自動再開の取り消し」であって中断ではない。
+      // 入力欄に書き戻された発話を消したり prompt-cancelled を流したりしない。
+      if (parseUsageLimitWait(capture) !== null) {
+        engineDiag(`prompt-cancelled 判定スキップ（制限待ちの取り消し） session=${session}`);
+        return;
+      }
+      realText = inputBoxRealText(capture);
     } catch {
       realText = null;
     }
