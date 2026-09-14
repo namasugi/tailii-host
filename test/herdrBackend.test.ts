@@ -385,7 +385,7 @@ describe("HerdrSessionManager", () => {
     // 起動中の画面: 初期シェルのプロンプト + launcher がタイプした exec 行 + 起動バナー
     // （角付き枠。入力欄の罫線 `─…` は無い）。
     const bootScreen = [
-      "namasugi@macbook-air ~ % exec zsh -lc 'claude --session-id 0000 --settings {}'",
+      "alice@macbook-air ~ % exec zsh -lc 'claude --session-id 0000 --settings {}'",
       "╭──────────────────────────────╮",
       "│ ✻ Welcome to Claude Code!    │",
       "╰──────────────────────────────╯",
