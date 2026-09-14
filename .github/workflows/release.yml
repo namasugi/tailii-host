@@ -6,7 +6,11 @@ name: Release
 # 公開順は platform package（@tailii/quic-gw-darwin-*）→ tailii-host（optionalDependencies が
 # 参照するため、先に platform package が registry に存在している必要がある）。
 #
-# 前提: リポジトリ secrets に NPM_TOKEN（@tailii スコープと tailii-host の publish 権限）。
+# 認証は npm Trusted Publishing（OIDC）。トークンは使わない。
+# 前提: npmjs.com の各パッケージ（tailii-host / @tailii/quic-gw-darwin-arm64 /
+# @tailii/quic-gw-darwin-x64）の Settings → Trusted Publisher に、この
+# リポジトリと **このファイル名（release.yml）** を登録しておくこと。
+# 要件: `id-token: write`・Node 22.14 以上・npm 11.5.1 以上（npm docs: trusted-publishers）。
 
 on:
   push:
@@ -16,6 +20,8 @@ on:
 
 permissions:
   contents: read
+  # OIDC トークンの発行に必須（これが無いと trusted publishing は成立しない）。
+  id-token: write
 
 jobs:
   release:
@@ -26,9 +32,15 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           registry-url: "https://registry.npmjs.org"
           cache: npm
+
+      # trusted publishing は npm 11.5.1 以上が要る（Node 同梱版が古い場合の保険）。
+      - name: Ensure npm supports trusted publishing
+        run: |
+          npm install -g npm@latest
+          npm --version
 
       - name: Install Rust targets
         run: |
@@ -52,16 +64,10 @@ jobs:
       - name: Publish @tailii/quic-gw-darwin-arm64
         working-directory: quic-gw/npm/darwin-arm64
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish @tailii/quic-gw-darwin-x64
         working-directory: quic-gw/npm/darwin-x64
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish tailii-host
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
