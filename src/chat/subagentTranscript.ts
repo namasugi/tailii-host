@@ -8,12 +8,7 @@ import {
   rolloutResponseItemToolActivities,
 } from "../codex/codexToolActivity.js";
 import { stripInjectedReminderBlocks, stripReminderTagBlocks } from "../shared/harnessReminder.js";
-import {
-  SUBAGENT_HANDBACK_LABEL,
-  crossSessionOriginHint,
-  crossSessionSenderLabel,
-  presentCrossSessionMessage,
-} from "../shared/crossSession.js";
+import { crossSessionOriginHint, crossSessionSenderLabel, presentCrossSessionMessage } from "../shared/crossSession.js";
 
 const MAX_ENTRIES = 200;
 const MAX_TOOL_TEXT = 1_000;
@@ -142,9 +137,8 @@ export function parseSubagentTranscript(jsonl: string): SubagentTranscriptResult
       if (role === "user") {
         const peer = presentCrossSessionMessage(raw, crossSessionOriginHint(record));
         if (peer !== null) {
-          const label = peer.kind === "handback"
-            ? `⇄ ${SUBAGENT_HANDBACK_LABEL}`
-            : `⇄ ${crossSessionSenderLabel(peer)} より`;
+          // ラベル本体は shared 側（hand-back は固定見出し）。ピアだけ「〜 より」を付ける。
+          const label = `⇄ ${crossSessionSenderLabel(peer)}${peer.kind === "handback" ? "" : " より"}`;
           return peer.body === "" ? label : `${label}\n\n${peer.body}`;
         }
       }
@@ -168,7 +162,9 @@ export function parseSubagentTranscript(jsonl: string): SubagentTranscriptResult
         // サブエージェント自身の最終レポート送信（SubagentHandback）は input.message がレポート全文。
         // 親会話面と同じ本文をここでも読めるよう、ツール入力の 300 文字スニペット（空白畳み）には
         // 潰さず、見出し付きの assistant 行として全文を載せる。
-        const handback = block["name"] === "SubagentHandback" ? object(block["input"])?.["message"] : undefined;
+        const handback = role === "assistant" && block["name"] === "SubagentHandback"
+          ? object(block["input"])?.["message"]
+          : undefined;
         if (typeof handback === "string" && handback.trim()) {
           all.push(entry("assistant", `${SUBAGENT_HANDBACK_REPORT_HEADING}\n\n${handback.trim()}`, ts));
           continue;

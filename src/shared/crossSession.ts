@@ -183,11 +183,20 @@ function firstContentLine(bodyLines: string[]): number {
   return bodyLines.findIndex((line) => line.trim() !== "");
 }
 
-/** first 行以降で定型前置き行（"… The report follows:" で終わる行）の添字（無ければ -1）。 */
+/**
+ * first 行から始まる定型前置きブロックの中で "… The report follows:" で終わる行の添字（無ければ -1）。
+ * 前置きは実測 1 行だが折り返しに備え、連続する非インデント行は前置きの続きとみなす。空行や
+ * 2 空白インデントの行（= レポート）を越えては探さない: マーカーで本文を始めたピアがレポート風の
+ * 本文の途中に同フレーズを含んでも、その前の行を落とさない（ピアとして全文を見せる）。
+ */
 function reportFollowsLine(bodyLines: string[], first: number): number {
   if (first < 0) return -1;
-  const offset = bodyLines.slice(first).findIndex((line) => line.trimEnd().endsWith(HANDBACK_REPORT_FOLLOWS));
-  return offset < 0 ? -1 : first + offset;
+  for (let i = first; i < bodyLines.length; i += 1) {
+    const line = bodyLines[i] ?? "";
+    if (i > first && (line.trim() === "" || line.startsWith(HANDBACK_INDENT))) return -1;
+    if (line.trimEnd().endsWith(HANDBACK_REPORT_FOLLOWS)) return i;
+  }
+  return -1;
 }
 
 /**
