@@ -8,11 +8,18 @@ import {
   rolloutResponseItemToolActivities,
 } from "../codex/codexToolActivity.js";
 import { stripInjectedReminderBlocks, stripReminderTagBlocks } from "../shared/harnessReminder.js";
-import { crossSessionSenderLabel, presentCrossSessionMessage } from "../shared/crossSession.js";
+import {
+  SUBAGENT_HANDBACK_LABEL,
+  crossSessionOriginHint,
+  crossSessionSenderLabel,
+  presentCrossSessionMessage,
+} from "../shared/crossSession.js";
 
 const MAX_ENTRIES = 200;
 const MAX_TOOL_TEXT = 1_000;
 const MAX_TOOL_INPUT = 300;
+/** サブエージェント自身の最終レポート送信（SubagentHandback ツール）を全文で載せるときの見出し。 */
+const SUBAGENT_HANDBACK_REPORT_HEADING = "📨 最終レポート（親セッションへの hand-back）";
 
 export interface SubagentTranscriptResult {
   entries: SubagentTranscriptEntry[];
@@ -127,12 +134,17 @@ export function parseSubagentTranscript(jsonl: string): SubagentTranscriptResult
         const directive = presentForkDirective(raw);
         if (directive !== null) return directive;
       }
-      // 別セッションからのメッセージ封筒（<cross-session-message>）は、封筒と harness の
-      // 前置き/後置きを外して「⇄ 送信元名 より」+ 本文へ転写する（規則は shared/crossSession.ts）。
+      // 別セッション / 別エージェントからのメッセージ封筒（<cross-session-message> / <agent-message>）
+      // は、封筒と harness の前置き/後置きを外して「⇄ 送信元名 より」+ 本文へ転写する（規則は
+      // shared/crossSession.ts）。委任したサブエージェント（この会話から見た孫）の完了報告
+      // （hand-back）は「⇄ サブエージェントの報告」+ レポート全文（hand-back 判定の権威は行の
+      // origin.handback、無ければ本文の形）。
       if (role === "user") {
-        const peer = presentCrossSessionMessage(raw);
+        const peer = presentCrossSessionMessage(raw, crossSessionOriginHint(record));
         if (peer !== null) {
-          const label = `⇄ ${crossSessionSenderLabel(peer)} より`;
+          const label = peer.kind === "handback"
+            ? `⇄ ${SUBAGENT_HANDBACK_LABEL}`
+            : `⇄ ${crossSessionSenderLabel(peer)} より`;
           return peer.body === "" ? label : `${label}\n\n${peer.body}`;
         }
       }
@@ -153,6 +165,14 @@ export function parseSubagentTranscript(jsonl: string): SubagentTranscriptResult
         if (text.trim()) all.push(entry(role, text, ts));
       }
       if (block["type"] === "tool_use" && typeof block["name"] === "string") {
+        // サブエージェント自身の最終レポート送信（SubagentHandback）は input.message がレポート全文。
+        // 親会話面と同じ本文をここでも読めるよう、ツール入力の 300 文字スニペット（空白畳み）には
+        // 潰さず、見出し付きの assistant 行として全文を載せる。
+        const handback = block["name"] === "SubagentHandback" ? object(block["input"])?.["message"] : undefined;
+        if (typeof handback === "string" && handback.trim()) {
+          all.push(entry("assistant", `${SUBAGENT_HANDBACK_REPORT_HEADING}\n\n${handback.trim()}`, ts));
+          continue;
+        }
         const input = snippet(block["input"], MAX_TOOL_INPUT);
         all.push(entry(
           "tool", input ? `${block["name"]}: ${input}` : block["name"], ts, "tool_use",

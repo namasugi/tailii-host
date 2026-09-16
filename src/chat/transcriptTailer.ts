@@ -105,6 +105,7 @@ function looksLikeOtherHarnessPrompt(text: string): boolean {
   const trimmed = text.trimStart();
   return (
     trimmed.includes("<cross-session-message") ||
+    trimmed.includes("<agent-message") ||
     trimmed.startsWith("Another Claude session sent a message") ||
     trimmed.startsWith("[Cross-session") ||
     trimmed.startsWith("<system-reminder>") ||

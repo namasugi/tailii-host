@@ -447,6 +447,20 @@ describe("TranscriptTailer", () => {
     ]);
   });
 
+  test("<agent-message> の hand-back が queued_command で届いた形も封筒のまま user ターンとして流す（転写は表示側）", async () => {
+    const prompt = "<agent-message from=\"a185ce2fc9e2cd728\">\n[Subagent hand-back] The report follows:\n  done\n</agent-message>";
+    const p = writeTranscript([
+      JSON.stringify({ type: "queue-operation", operation: "enqueue", content: prompt }),
+      JSON.stringify({ type: "attachment", uuid: "hb1", userType: "external", attachment: { type: "queued_command", prompt,
+        commandMode: "prompt", origin: { kind: "peer", from: "a185ce2fc9e2cd728", senderTaskId: "a185ce2fc9e2cd728", body: "…", handback: true } } }),
+    ]);
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
+    const chats = (await collect(tailer.streamTranscript(p))).filter((m) => m.type === "chat_output");
+    expect(chats).toEqual([
+      { type: "chat_output", v: 1, streamId: "hb1", role: "user", text: prompt, eof: true },
+    ]);
+  });
+
   test("system/local_command の実行・出力記録を user 行として流す（iOS 側でタグ整形）", async () => {
     const p = writeTranscript([
       '{"type":"system","subtype":"local_command","content":"<command-name>/remote-control</command-name>","uuid":"lc1"}',

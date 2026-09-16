@@ -10,7 +10,7 @@ import * as path from "node:path";
 import type { ClaudeSessionInfo } from "../protocol.js";
 import { isInsideBase } from "../shared/paths.js";
 import { stripInjectedReminderBlocks, stripReminderTagBlocks } from "../shared/harnessReminder.js";
-import { crossSessionPreviewLine, presentCrossSessionMessage } from "../shared/crossSession.js";
+import { crossSessionOriginHint, crossSessionPreviewLine, presentCrossSessionMessage } from "../shared/crossSession.js";
 import { isInjectedSkillContent } from "../shared/skillInjection.js";
 
 /** タイトル抽出の最大長（先頭 ~60 字）。 */
@@ -451,8 +451,10 @@ function extractMessageText(obj: Record<string, unknown>, maxLength: number): st
   if (raw === null) return null;
   // 別セッションからのメッセージ封筒（<cross-session-message>）は、生 XML を出さず
   // 「⇄ 送信元名: 本文」へ転写する（タイトル/プレビュー共通。規則は shared/crossSession.ts）。
+  // 委任したサブエージェントの完了報告（<agent-message> の hand-back）は「⇄ サブエージェントの報告:
+  // レポート先頭」（hand-back 判定の権威は行の origin.handback、無ければ本文の形）。
   if (obj["type"] === "user") {
-    const peer = presentCrossSessionMessage(raw);
+    const peer = presentCrossSessionMessage(raw, crossSessionOriginHint(obj));
     if (peer !== null) raw = crossSessionPreviewLine(peer);
   }
   // harness が user ロールへ注入する <system-reminder> ブロック（リマインダ・記憶リコール等）は

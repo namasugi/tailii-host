@@ -252,6 +252,12 @@ describe("usage-limit-wait: rate_limit 後の isMeta 発話は自動再開注記
     expect(out.map((m) => m.role)).toEqual(["assistant", "user", "user"]);
     const out2 = await collect([apiError, wake]);
     expect(out2[1]!.role).toBe("user");
+    // 2.1.273: 同一セッション内のエージェントからの封筒（<agent-message>）も畳まない。前置き行の判定に
+    // 頼らずタグで除外できることを、前置き無しの裸の封筒が isMeta で届いた形で固定する。
+    const handback = JSON.stringify({ type: "user", uuid: "h1", isMeta: true, timestamp: "2026-09-14T03:04:00.000Z",
+      message: { role: "user", content: "<agent-message from=\"ae10c462719f9f472\">\n[Subagent hand-back] The report follows:\n  done\n</agent-message>" } });
+    const out3 = await collect([apiError, handback]);
+    expect(out3[1]!.role).toBe("user");
   });
 
   it("harness 由来の isMeta 行（idle 通知の起こし / system-reminder / task-notification）は畳まず、assistant が先に動いたら武装解除", async () => {

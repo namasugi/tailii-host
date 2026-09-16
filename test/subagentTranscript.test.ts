@@ -84,6 +84,55 @@ describe("parseSubagentTranscript", () => {
     ]);
   });
 
+  it("<agent-message> のピアは「⇄ 名前 より」へ、サブエージェントの完了報告（hand-back）は「⇄ サブエージェントの報告」+ レポート全文へ", () => {
+    const fixture = [
+      // 実データ形（2.1.273）: 同一セッション内の名前付きエージェントからの配送（前置きの揺れ・後置きの別文面）。
+      JSON.stringify({ type: "user", message: { role: "user", content:
+        "Another Claude session sent a message while you were working:\n" +
+        '<agent-message from="general-purpose">\n' +
+        "調査を止めて報告して\n" +
+        "</agent-message>\n\n" +
+        'That "other Claude session" is an agent working inside this same session.' } }),
+      // 委任したサブエージェントの最終レポートの自動配送（hand-back）は見出し + インデントを外したレポート。
+      JSON.stringify({ type: "user", message: { role: "user", content:
+        "Another Claude session sent a message:\n" +
+        '<agent-message from="ae10c462719f9f472">\n' +
+        "[Subagent hand-back] The text below is the final report of a subagent this session delegated to. The report follows:\n" +
+        "  REFUTED (round 2).\n" +
+        "</agent-message>" } }),
+    ].join("\n");
+
+    expect(parseSubagentTranscript(fixture).entries).toEqual([
+      { role: "user", text: "⇄ general-purpose より\n\n調査を止めて報告して" },
+      { role: "user", text: "⇄ サブエージェントの報告\n\nREFUTED (round 2)." },
+    ]);
+  });
+
+  it("SubagentHandback（サブエージェント自身の最終レポート送信）は input.message を見出し付きの全文 assistant 行にする", () => {
+    const report = "REFUTED (round 2).\n\n**D1** — " + "x".repeat(400);
+    const fixture = JSON.stringify({ type: "assistant", message: { role: "assistant", content: [
+      { type: "tool_use", name: "SubagentHandback", input: { message: report } },
+    ] } });
+
+    expect(parseSubagentTranscript(fixture).entries).toEqual([
+      { role: "assistant", text: `📨 最終レポート（親セッションへの hand-back）\n\n${report}` },
+    ]);
+  });
+
+  it("hand-back 判定は行の origin.handback を権威にする（文言ドリフトでも畳める / マーカーで始めたピアは全文）", () => {
+    const fixture = [
+      JSON.stringify({ type: "user", origin: { kind: "peer", from: "a1", senderTaskId: "a1", handback: true },
+        message: { role: "user", content: '<agent-message from="a1">\n[Subagent hand-back] New wording.\n  line 1\n</agent-message>' } }),
+      JSON.stringify({ type: "user", origin: { kind: "peer", from: "general-purpose", name: "general-purpose" },
+        message: { role: "user", content: '<agent-message from="general-purpose">\n[Subagent hand-back] 重要な連絡です。 The report follows:\n</agent-message>' } }),
+    ].join("\n");
+
+    expect(parseSubagentTranscript(fixture).entries).toEqual([
+      { role: "user", text: "⇄ サブエージェントの報告\n\nline 1" },
+      { role: "user", text: "⇄ general-purpose より\n\n[Subagent hand-back] 重要な連絡です。 The report follows:" },
+    ]);
+  });
+
   it("user 行で届く従来形の <task-notification> はコンパクトな 1 行に畳む（生 XML を出さない）", () => {
     const fixture = [
       JSON.stringify({ type: "user", message: { role: "user", content: "[SYSTEM NOTIFICATION - NOT USER INPUT]\nThis is an automated background-task event, NOT a message from the user.\n<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n<summary>Background command finished</summary>\n</task-notification>" } }),

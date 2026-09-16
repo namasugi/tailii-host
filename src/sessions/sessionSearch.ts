@@ -4,7 +4,7 @@
 import * as fs from "node:fs";
 import type { ClaudeSessionInfo, SessionSearchResult } from "../protocol.js";
 import { stripInjectedReminderBlocks, stripReminderTagBlocks } from "../shared/harnessReminder.js";
-import { crossSessionPreviewLine, presentCrossSessionMessage } from "../shared/crossSession.js";
+import { crossSessionOriginHint, crossSessionPreviewLine, presentCrossSessionMessage } from "../shared/crossSession.js";
 
 export interface SessionSearchSource {
   list(): ClaudeSessionInfo[];
@@ -144,11 +144,13 @@ function extractMessageText(obj: Record<string, unknown>): string | null {
   const content = (message as Record<string, unknown>)["content"];
   // harness 注入の <system-reminder>（user 行のリマインダ / assistant text 末尾の背景通知）は
   // 検索対象にもスニペットにも出さない（生 XML の混入と、通知本文でのヒットを防ぐ）。
-  // 別セッションからのメッセージ封筒（<cross-session-message>）は「⇄ 送信元名: 本文」へ
-  // 転写して照合する（生タグでなく本文と送信元名でヒットし、スニペットも整形済みになる）。
+  // 別セッション / 別エージェントからのメッセージ封筒（<cross-session-message> / <agent-message>）
+  // は「⇄ 送信元名: 本文」へ転写して照合する（生タグでなく本文と送信元名でヒットし、スニペットも
+  // 整形済みになる）。委任したサブエージェントの完了報告（hand-back）は「⇄ サブエージェントの報告:
+  // レポート全文」で照合する（harness の定型前置きは対象外。判定の権威は行の origin.handback）。
   const strip = (raw: string): string => {
     if (obj["type"] === "assistant") return stripInjectedReminderBlocks(raw);
-    const peer = presentCrossSessionMessage(raw);
+    const peer = presentCrossSessionMessage(raw, crossSessionOriginHint(obj));
     if (peer !== null) return crossSessionPreviewLine(peer);
     return stripReminderTagBlocks(raw);
   };
