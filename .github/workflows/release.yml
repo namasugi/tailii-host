@@ -56,13 +56,21 @@ jobs:
         run: node scripts/stage-prebuilt.mjs
 
       # 版上げコミットの時点では optionalDependencies（@tailii/quic-gw-darwin-*）が
-      # 未 publish で lock に載せられず、`npm ci` は lock 不一致（EUSAGE）で必ず落ちる
-      # （--omit=optional を付けても lock 検証は走る）。ゲートウェイはジョブ内で
-      # ソースからビルドするので、optional を外した npm install で入れる。
-      - run: npm install --omit=optional --no-audit --no-fund
+      # 未 publish のため、lock にも registry にも無い。`npm ci` は lock 不一致で落ち、
+      # `--omit=optional` は TypeScript 自身のプラットフォームパッケージまで外してしまう。
+      # そこで検証中だけ @tailii のピンを外して入れ、publish 直前に元へ戻す。
+      - name: Install dependencies for verification
+        run: |
+          npm pkg delete optionalDependencies
+          npm install --no-audit --no-fund
+
       - run: npm run lint
       - run: npm run build
       - run: npm test
+
+      # publish するのは配布物そのもの（optionalDependencies のピンを含む正規の package.json）。
+      - name: Restore package manifests
+        run: git checkout -- package.json package-lock.json
 
       # platform package を先に公開（tailii-host の optionalDependencies が参照するため）。
       - name: Publish @tailii/quic-gw-darwin-arm64
