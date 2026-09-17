@@ -14,7 +14,9 @@ jobs:
         with:
           node-version: 20
           cache: npm
-      - run: npm ci
+      # リリース直後の版上げコミットでは optionalDependencies が未 publish のため
+      # lock に載らない。CI は prebuilt を必要としないので optional は外す。
+      - run: npm ci --omit=optional
       - run: npm run lint
       - run: npm run build
       - run: npm test

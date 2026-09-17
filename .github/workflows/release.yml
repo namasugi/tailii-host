@@ -55,7 +55,10 @@ jobs:
       - name: Stage prebuilt binaries into platform packages
         run: node scripts/stage-prebuilt.mjs
 
-      - run: npm ci
+      # optionalDependencies（@tailii/quic-gw-darwin-*）は、このワークフローが今から
+      # publish する版を指すため、この時点では registry に存在せず lock にも載らない。
+      # ゲートウェイはこのジョブ内でソースからビルド済みなので、optional は外して入れる。
+      - run: npm ci --omit=optional
       - run: npm run lint
       - run: npm run build
       - run: npm test
