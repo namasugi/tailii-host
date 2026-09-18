@@ -12,6 +12,7 @@ import {
   herdrRemediation,
   parseNumericVersion,
   probeVersion,
+  quicServiceDoctorCheck,
   shimContent,
   sshServerRemediation,
   tmuxInstallRemediation,
@@ -151,5 +152,43 @@ describe("checkTcpPort", () => {
     const port = (server.address() as net.AddressInfo).port;
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await expect(checkTcpPort("127.0.0.1", port)).resolves.toBe(false);
+  });
+});
+
+describe("quicServiceDoctorCheck", () => {
+  it("未登録 → 未常駐・tailii setup", () => {
+    const check = quicServiceDoctorCheck({ loaded: false });
+    expect(check.ok).toBe(false);
+    expect(check.required).toBe(false);
+    expect(check.detail).toBe("未常駐");
+    expect(check.remediation).toBe("tailii setup");
+  });
+
+  it("登録済みだが一度も起動していない（runs = 0 = launchd が保留）→ 稼働中と区別し kickstart を案内する", () => {
+    const check = quicServiceDoctorCheck({ loaded: true, running: false, pid: null, runs: 0, lastExitCode: null });
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain("一度も起動していない");
+    expect(check.remediation).toBe("launchctl kickstart gui/$(id -u)/com.tailii.quic-gw");
+  });
+
+  it("起動したが終了した（runs > 0）→ 保留と区別し、終了コードとログ確認を案内する", () => {
+    const check = quicServiceDoctorCheck({ loaded: true, running: false, pid: null, runs: 3, lastExitCode: 1 });
+    expect(check.ok).toBe(false);
+    expect(check.detail).toBe("com.tailii.quic-gw は登録済みだが停止中（起動 3 回、直近の終了コード 1）");
+    expect(check.remediation).toBe("tail -n 50 ~/.tailii/quic-gw.log");
+  });
+
+  it("runs が読めない停止中は保留と断定せずログ確認へ", () => {
+    const check = quicServiceDoctorCheck({ loaded: true, running: false, pid: null, runs: null, lastExitCode: null });
+    expect(check.ok).toBe(false);
+    expect(check.detail).toBe("com.tailii.quic-gw は登録済みだが停止中（起動 ? 回）");
+    expect(check.remediation).toBe("tail -n 50 ~/.tailii/quic-gw.log");
+  });
+
+  it("稼働中 → ok・pid を添える", () => {
+    const check = quicServiceDoctorCheck({ loaded: true, running: true, pid: 12796, runs: 1, lastExitCode: null });
+    expect(check.ok).toBe(true);
+    expect(check.detail).toBe("com.tailii.quic-gw 稼働中 (pid 12796)");
+    expect(check.remediation).toBeUndefined();
   });
 });

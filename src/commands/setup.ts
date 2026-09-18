@@ -492,9 +492,22 @@ async function setupQuicGateway(): Promise<QuicPayloadFields | null> {
   }
   try {
     const creds = await ensureQuicCredentials(gatewayPath);
-    await installQuicLaunchAgent({ gatewayPath });
+    const installed = await installQuicLaunchAgent({ gatewayPath });
+    if (!installed.running) {
+      // 登録はできたが動いていない（launchd ドメインの on-demand-only モードで起動が保留、
+      // または起動直後に終了）。動いていないゲートウェイの接続情報を QR に載せても新端末が
+      // 接続毎に 1.5s の試行税を払うだけなので配らない（quic-info と同じ安全側）。
+      // 復旧後は SSH ブートストラップ（quic-info）で配る。
+      process.stderr.write(
+        "QUIC ゲートウェイ: 常駐を登録しましたが起動を確認できませんでした（SSH のみで続行します）。\n"
+        + "  確認: tailii doctor / 起動: launchctl kickstart gui/$(id -u)/com.tailii.quic-gw"
+        + " / ログ: ~/.tailii/quic-gw.log\n",
+      );
+      return null;
+    }
     process.stdout.write(
-      `QUIC ゲートウェイ: 常駐を設置しました（udp/${creds.port}, pin=${creds.spkiPin}）。\n`,
+      `QUIC ゲートウェイ: 常駐を設置しました（udp/${creds.port}, pin=${creds.spkiPin}`
+      + `${installed.pid === null ? "" : `, pid=${installed.pid}`}）。\n`,
     );
     return { port: creds.port, pin: creds.spkiPin, token: creds.token };
   } catch (error) {

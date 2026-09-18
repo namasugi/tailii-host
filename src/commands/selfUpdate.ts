@@ -470,7 +470,7 @@ async function refreshQuicGateway(packageDir: string, io: SelfUpdateIO): Promise
   fs.chmodSync(prebuilt, 0o755);
   // installQuicGatewayBinary の「サイズ一致なら据え置き」最適化は npm tarball の
   // 正規化 mtime(過去日付)と噛み合い偽陰性になり得るため、更新時は必ずコピーする。
-  await installQuicLaunchAgent({
+  const installed = await installQuicLaunchAgent({
     gatewayPath: prebuilt,
     installBinary: (source) => {
       const dest = path.join(os.homedir(), ".tailii", "bin", "tailii-quic-gw");
@@ -480,7 +480,12 @@ async function refreshQuicGateway(packageDir: string, io: SelfUpdateIO): Promise
       return dest;
     },
   });
-  io.log("QUIC gateway を新版へ載せ替え");
+  io.log(
+    installed.running
+      ? `QUIC gateway を新版へ載せ替え${installed.pid === null ? "" : ` (pid ${installed.pid})`}`
+      : "QUIC gateway を新版へ載せ替えたが起動を確認できない"
+        + "（tailii doctor で確認 / launchctl kickstart gui/$(id -u)/com.tailii.quic-gw で起動）",
+  );
 }
 
 /** 目標と .prev が指す版以外の管理ディレクトリを消す（管理外の設置には触れない）。 */

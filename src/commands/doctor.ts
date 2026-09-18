@@ -18,6 +18,8 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { defaultInjectedPath } from "./launch.js";
 import { resolveSessionBackendKind } from "../backend/sessionBackend.js";
+// 型だけ。実体は quicGateway が doctor の findCommand を import する循環を避けるため動的 import。
+import type { QuicGatewayServiceState } from "../services/quicGateway.js";
 import {
   MINIMUM_CLAUDE_CLI_VERSION,
   MINIMUM_CODEX_CLI_VERSION,
@@ -283,7 +285,7 @@ function resolveWithin<T>(promise: Promise<T>, timeoutMs: number, fallback: T): 
 
 /** macOS 専用の任意 QUIC 診断。Linux では launchd 項目自体を表示しない。 */
 async function collectDarwinQuicChecks(): Promise<DoctorCheck[]> {
-  const { isQuicGatewayLoaded, quicCredentialsDir, resolveQuicGatewayBinary } = await import(
+  const { quicGatewayServiceState, quicCredentialsDir, resolveQuicGatewayBinary } = await import(
     "../services/quicGateway.js"
   );
   const gatewayPath = resolveQuicGatewayBinary(process.env);
@@ -291,9 +293,10 @@ async function collectDarwinQuicChecks(): Promise<DoctorCheck[]> {
   const credsOk = ["cert.pem", "key.pem", "token"].every((name) =>
     fs.existsSync(path.join(credsDir, name)),
   );
-  const loaded = gatewayPath !== null
-    ? await resolveWithin(isQuicGatewayLoaded(), DOCTOR_QUIC_STATUS_TIMEOUT_MS, false)
-    : false;
+  const notLoaded: QuicGatewayServiceState = { loaded: false };
+  const service = gatewayPath !== null
+    ? await resolveWithin(quicGatewayServiceState(), DOCTOR_QUIC_STATUS_TIMEOUT_MS, notLoaded)
+    : notLoaded;
   return [
     {
       id: "quic-binary",
@@ -311,15 +314,43 @@ async function collectDarwinQuicChecks(): Promise<DoctorCheck[]> {
       detail: credsOk ? credsDir : "未生成",
       ...(!credsOk ? { remediation: "tailii setup" } : {}),
     },
-    {
-      id: "quic-service",
-      label: "QUIC GW 常駐(launchd)",
-      ok: loaded,
-      required: false,
-      detail: loaded ? "com.tailii.quic-gw 稼働中" : "未常駐",
-      ...(!loaded ? { remediation: "tailii setup" } : {}),
-    },
+    quicServiceDoctorCheck(service),
   ];
+}
+
+/**
+ * launchd 常駐の診断行。「登録済みだが動いていない」を稼働中と区別し、さらに
+ * 「一度も起動していない（runs = 0。ドメインが on-demand-only モードで自動起動が保留され、
+ * `launchctl print` は成功するのに `state = not running` のまま。2026-09-18 実機障害）」と
+ * 「起動したが終了した（クラッシュ / 即終了。原因はゲートウェイのログにある）」を分ける。
+ */
+export function quicServiceDoctorCheck(state: QuicGatewayServiceState): DoctorCheck {
+  const base = { id: "quic-service", label: "QUIC GW 常駐(launchd)", required: false } as const;
+  if (!state.loaded) {
+    return { ...base, ok: false, detail: "未常駐", remediation: "tailii setup" };
+  }
+  if (!state.running) {
+    if (state.runs === 0) {
+      return {
+        ...base,
+        ok: false,
+        detail: "com.tailii.quic-gw は登録済みだが一度も起動していない（launchd が起動を保留中）",
+        remediation: "launchctl kickstart gui/$(id -u)/com.tailii.quic-gw",
+      };
+    }
+    const exit = state.lastExitCode === null ? "" : `、直近の終了コード ${state.lastExitCode}`;
+    return {
+      ...base,
+      ok: false,
+      detail: `com.tailii.quic-gw は登録済みだが停止中（起動 ${state.runs ?? "?"} 回${exit}）`,
+      remediation: "tail -n 50 ~/.tailii/quic-gw.log",
+    };
+  }
+  return {
+    ...base,
+    ok: true,
+    detail: `com.tailii.quic-gw 稼働中${state.pid === null ? "" : ` (pid ${state.pid})`}`,
+  };
 }
 
 /** 全検査を実行する（副作用なし・シムは検査のみ）。 */

@@ -234,16 +234,54 @@ ${programArguments}
 `;
 }
 
-/** launchctl 実行子（テスト注入用）。exit 0 で resolve、非 0 は reject。 */
-export type LaunchctlRunner = (args: string[]) => Promise<void>;
+/**
+ * launchctl 実行子（テスト注入用）。exit 0 で resolve（stdout を返す）、非 0 は reject。
+ * `print` の stdout は稼働状態の判定（`quicGatewayServiceState`）に使う。
+ */
+export type LaunchctlRunner = (args: string[]) => Promise<string | void>;
 
 const defaultLaunchctl: LaunchctlRunner = (args) =>
   new Promise((resolve, reject) => {
-    execFile("launchctl", args, { timeout: 15_000 }, (error) => {
+    execFile("launchctl", args, { timeout: 15_000 }, (error, stdout) => {
       if (error) reject(error);
-      else resolve();
+      else resolve(stdout);
     });
   });
+
+/** `launchctl print` から読み取れる稼働状態（登録済みジョブのみ）。 */
+export interface QuicGatewayRunState {
+  /** `state = running` か。 */
+  running: boolean;
+  pid: number | null;
+  /** 登録以来の起動回数（`runs = N`）。0 なら一度も spawn していない = launchd が保留中。 */
+  runs: number | null;
+  /** 直近の終了コード（`last exit code = N`）。未終了 `(never exited)` や不明は null。 */
+  lastExitCode: number | null;
+}
+
+/** `launchctl print gui/<uid>/<label>` から読んだ常駐ジョブの状態。 */
+export type QuicGatewayServiceState =
+  | { loaded: false }
+  | ({ loaded: true } & QuicGatewayRunState);
+
+/**
+ * `launchctl print` の出力から稼働状態を読む。
+ * 見るのはトップレベルの `state = running` / `pid = N` / `runs = N` / `last exit code = N` 行だけ
+ * （`state = not running` や endpoint 配下の `state = active` は一致しない。
+ * 他の書式は macOS 版で揺れるため依存せず、読めない項目は null にする）。
+ */
+export function parseLaunchctlPrintState(output: string): QuicGatewayRunState {
+  const num = (pattern: RegExp): number | null => {
+    const m = pattern.exec(output);
+    return m === null ? null : Number(m[1]);
+  };
+  return {
+    running: /^\s*state = running\s*$/m.test(output),
+    pid: num(/^\s*pid = (\d+)\s*$/m),
+    runs: num(/^\s*runs = (\d+)\s*$/m),
+    lastExitCode: num(/^\s*last exit code = (\d+)\s*$/m),
+  };
+}
 
 export interface InstallLaunchAgentOptions {
   /** 解決済み gateway バイナリ（ビルド/配布物の場所。TCC 保護下でも可）。 */
@@ -265,14 +303,24 @@ export interface InstallLaunchAgentOptions {
   launchctl?: LaunchctlRunner;
 }
 
+/** `installQuicLaunchAgent` の結果。登録は済んでいる前提で、起動を実確認できたかを返す。 */
+export interface QuicLaunchAgentInstallResult {
+  /** `launchctl print` が `state = running` を報告したか。 */
+  running: boolean;
+  pid: number | null;
+}
+
 /**
  * LaunchAgent を設置して（再）起動する（冪等）。
  * 既存ジョブは bootout してから bootstrap し、plist 更新を確実に反映する。
+ * bootstrap 後に kickstart で起動を確定させ、`launchctl print` で稼働を実確認して返す。
  *
  * gateway バイナリは非 TCC 保護の `~/.tailii/bin` へコピーしてから launchd に渡す
  * （`installQuicGatewayBinary` 参照。TCC 保護フォルダ由来の dyld ストール回避）。
  */
-export async function installQuicLaunchAgent(options: InstallLaunchAgentOptions): Promise<void> {
+export async function installQuicLaunchAgent(
+  options: InstallLaunchAgentOptions,
+): Promise<QuicLaunchAgentInstallResult> {
   const plistPath = options.plistPath ?? quicLaunchAgentPlistPath();
   const logPath = options.logPath ?? quicGatewayLogPath();
   const uid = options.uid ?? process.getuid?.() ?? 501;
@@ -308,19 +356,60 @@ export async function installQuicLaunchAgent(options: InstallLaunchAgentOptions)
     // 旧 macOS / 非 GUI セッション向けフォールバック。
     await launchctl(["load", "-w", plistPath]);
   }
+
+  // 実機で判明した罠（2026-09-18）: ログインセッションの launchd ドメインが
+  // 「on-demand-only モード」（`launchctl print gui/<uid>` の `on-demand count` > 0。入る
+  // きっかけは launchd がログに残さないため未特定。再ログイン / 再起動で解ける）に居ると、
+  // RunAtLoad / KeepAlive による自動起動は "pending spawn, domain in on-demand-only mode"
+  // で保留される。bootstrap 自体は成功扱いなので、setup 再実行で稼働中の gw を bootout
+  // した直後に「登録済みなのに誰も居ない」状態になり、アプリは SSH に落ちたまま復帰しない。
+  // kickstart は demand 起動なので保留を突き抜ける。稼働中なら no-op（`-k` は付けない:
+  // 直前に spawn した正常系プロセスを殺して入れ替える無駄と競合を避ける）。
+  try {
+    await launchctl(["kickstart", `gui/${uid}/${QUIC_GW_LAUNCHD_LABEL}`]);
+  } catch {
+    // 失敗は直後の状態確認で「未起動」として呼び出し側に伝わる。
+  }
+  const state = await quicGatewayServiceState(uid, launchctl);
+  return state.loaded ? { running: state.running, pid: state.pid } : { running: false, pid: null };
 }
 
-/** launchd ジョブが常駐しているか（doctor / quic-info 用・副作用なし）。 */
+/** launchd ジョブの状態を読む（doctor / quic-info / setup 用・副作用なし）。 */
+export async function quicGatewayServiceState(
+  uid: number = process.getuid?.() ?? 501,
+  launchctl: LaunchctlRunner = defaultLaunchctl,
+): Promise<QuicGatewayServiceState> {
+  let output: string | void;
+  try {
+    output = await launchctl(["print", `gui/${uid}/${QUIC_GW_LAUNCHD_LABEL}`]);
+  } catch {
+    return { loaded: false };
+  }
+  // stdout を返さない実行子（テスト注入）は「登録済み・稼働不明」として未起動側に倒す。
+  if (typeof output !== "string") {
+    return { loaded: true, running: false, pid: null, runs: null, lastExitCode: null };
+  }
+  return { loaded: true, ...parseLaunchctlPrintState(output) };
+}
+
+/** launchd ジョブが登録されているか（起動保留中でも true。稼働判定は `isQuicGatewayRunning`）。 */
 export async function isQuicGatewayLoaded(
   uid: number = process.getuid?.() ?? 501,
   launchctl: LaunchctlRunner = defaultLaunchctl,
 ): Promise<boolean> {
-  try {
-    await launchctl(["print", `gui/${uid}/${QUIC_GW_LAUNCHD_LABEL}`]);
-    return true;
-  } catch {
-    return false;
-  }
+  return (await quicGatewayServiceState(uid, launchctl)).loaded;
+}
+
+/**
+ * launchd ジョブが実際に稼働しているか。登録済みでも launchd が起動を保留している間は false
+ * （print は成功するため「登録済み」だけでは死んだゲートウェイを配ってしまう）。
+ */
+export async function isQuicGatewayRunning(
+  uid: number = process.getuid?.() ?? 501,
+  launchctl: LaunchctlRunner = defaultLaunchctl,
+): Promise<boolean> {
+  const state = await quicGatewayServiceState(uid, launchctl);
+  return state.loaded && state.running;
 }
 
 // MARK: - quic-info（SSH ブートストラップ: iOS が exec 経由で資格情報を取得する）
@@ -369,16 +458,18 @@ export function readQuicCredentialsFromDisk(dir: string = quicCredentialsDir()):
 /** quic-info の本体（テスト注入可能な純ロジック）。 */
 export async function collectQuicInfo(options?: {
   dir?: string;
-  isLoaded?: () => Promise<boolean>;
+  /** 常駐が実際に稼働しているか（既定 `isQuicGatewayRunning`。登録済みだけでは不足）。 */
+  isRunning?: () => Promise<boolean>;
 }): Promise<QuicInfoResult> {
   const creds = readQuicCredentialsFromDisk(options?.dir ?? quicCredentialsDir());
   if (creds === null) {
     return { available: false, reason: "credentials-missing" };
   }
-  const loaded = await (options?.isLoaded ?? (() => isQuicGatewayLoaded()))();
-  if (!loaded) {
-    // 常駐していないのに資格情報だけ配ると、クライアントが再接続のたびに
+  const running = await (options?.isRunning ?? (() => isQuicGatewayRunning()))();
+  if (!running) {
+    // 稼働していないのに資格情報だけ配ると、クライアントが再接続のたびに
     // 死んだゲートウェイへ 1.5s の接続試行税を払う。配らない方が安全側。
+    // 「登録済み（print 成功）」は launchd が起動を保留していても真になるため稼働状態で判定する。
     return { available: false, reason: "gateway-not-running" };
   }
   return { available: true, port: QUIC_GW_DEFAULT_PORT, pin: creds.pin, token: creds.token };

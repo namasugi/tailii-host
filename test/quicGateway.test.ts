@@ -13,6 +13,9 @@ import {
   ensureQuicCredentials,
   installQuicLaunchAgent,
   isQuicGatewayLoaded,
+  isQuicGatewayRunning,
+  parseLaunchctlPrintState,
+  quicGatewayServiceState,
   quicLaunchAgentPlist,
   readQuicCredentialsFromDisk,
   resolveQuicGatewayBinary,
@@ -112,14 +115,44 @@ describe("quicLaunchAgentPlist", () => {
   });
 });
 
+/** 実機 `launchctl print gui/502/com.tailii.quic-gw` の抜粋（稼働中）。endpoint 配下に別の state 行が混ざる。 */
+const PRINT_RUNNING = `gui/502/com.tailii.quic-gw = {
+	active count = 3
+	path = /Users/alice/Library/LaunchAgents/com.tailii.quic-gw.plist
+	state = running
+
+	program = /Users/alice/.tailii/bin/tailii-quic-gw
+	runs = 1
+	pid = 12796
+	endpoints = {
+		"com.tailii.quic-gw" = {
+			state = active
+		}
+	}
+}
+`;
+
+/** 同じく、on-demand-only モードで spawn が保留された状態（2026-09-18 実機障害の実出力）。 */
+const PRINT_PENDED = `gui/502/com.tailii.quic-gw = {
+	active count = 0
+	path = /Users/alice/Library/LaunchAgents/com.tailii.quic-gw.plist
+	state = not running
+
+	program = /Users/alice/.tailii/bin/tailii-quic-gw
+	runs = 0
+	pended nondemand spawn = speculative
+	last exit code = (never exited)
+}
+`;
+
 describe("installQuicLaunchAgent", () => {
-  it("バイナリを設置先へコピーし、plist はそのコピーを指す + bootout → bootstrap", async () => {
+  it("バイナリを設置先へコピーし、plist はそのコピーを指す + bootout → bootstrap → kickstart → print", async () => {
     const dir = tempDir("launchd");
     const plistPath = path.join(dir, "com.tailii.quic-gw.plist");
     const installedBinary = path.join(dir, "installed", "tailii-quic-gw");
     const calls: string[][] = [];
     const installedFrom: string[] = [];
-    await installQuicLaunchAgent({
+    const result = await installQuicLaunchAgent({
       gatewayPath: "/opt/gw/tailii-quic-gw",
       plistPath,
       logPath: "/tmp/quic-gw.log",
@@ -131,6 +164,7 @@ describe("installQuicLaunchAgent", () => {
       },
       launchctl: async (args) => {
         calls.push(args);
+        if (args[0] === "print") return PRINT_RUNNING;
       },
     });
     expect(fs.existsSync(plistPath)).toBe(true);
@@ -146,14 +180,17 @@ describe("installQuicLaunchAgent", () => {
     expect(calls).toEqual([
       ["bootout", "gui/501/com.tailii.quic-gw"],
       ["bootstrap", "gui/501", plistPath],
+      ["kickstart", "gui/501/com.tailii.quic-gw"],
+      ["print", "gui/501/com.tailii.quic-gw"],
     ]);
+    expect(result).toEqual({ running: true, pid: 12796 });
   });
 
-  it("bootout 失敗（未登録）は無視し、bootstrap 失敗時は load -w へフォールバックする", async () => {
+  it("bootout 失敗（未登録）は無視し、bootstrap 失敗時は load -w へフォールバックする（kickstart は同様に打つ）", async () => {
     const dir = tempDir("launchd2");
     const plistPath = path.join(dir, "com.tailii.quic-gw.plist");
     const calls: string[][] = [];
-    await installQuicLaunchAgent({
+    const result = await installQuicLaunchAgent({
       gatewayPath: "/opt/gw/tailii-quic-gw",
       plistPath,
       logPath: "/tmp/quic-gw.log",
@@ -166,8 +203,128 @@ describe("installQuicLaunchAgent", () => {
         }
       },
     });
-    expect(calls.map((c) => c[0])).toEqual(["bootout", "bootstrap", "load"]);
+    expect(calls.map((c) => c[0])).toEqual(["bootout", "bootstrap", "load", "kickstart", "print"]);
     expect(calls[2]).toEqual(["load", "-w", plistPath]);
+    // stdout を返さない実行子は稼働不明 = 未起動側に倒す（呼び出し側が警告を出せる）。
+    expect(result).toEqual({ running: false, pid: null });
+  });
+
+  it("on-demand-only モードで保留された自動起動を kickstart で起こす（2026-09-18 実機障害の再現）", async () => {
+    // setup 再実行 = 稼働中 gw を bootout → bootstrap。ドメインが on-demand-only だと
+    // RunAtLoad/KeepAlive の spawn は保留され print は `state = not running / runs = 0`。
+    // kickstart（demand 起動）だけが保留を突き抜ける。
+    const dir = tempDir("launchd3");
+    const plistPath = path.join(dir, "com.tailii.quic-gw.plist");
+    const calls: string[][] = [];
+    let spawned = false;
+    const result = await installQuicLaunchAgent({
+      gatewayPath: "/opt/gw/tailii-quic-gw",
+      plistPath,
+      logPath: "/tmp/quic-gw.log",
+      uid: 502,
+      installBinary: (src) => src,
+      launchctl: async (args) => {
+        calls.push(args);
+        if (args[0] === "kickstart") spawned = true;
+        if (args[0] === "print") return spawned ? PRINT_RUNNING : PRINT_PENDED;
+      },
+    });
+    expect(calls.map((c) => c[0])).toEqual(["bootout", "bootstrap", "kickstart", "print"]);
+    expect(calls[2]).toEqual(["kickstart", "gui/502/com.tailii.quic-gw"]);
+    expect(result).toEqual({ running: true, pid: 12796 });
+  });
+
+  it("kickstart 失敗は握りつぶし、print が報告する未起動をそのまま返す（throw しない）", async () => {
+    const dir = tempDir("launchd4");
+    const plistPath = path.join(dir, "com.tailii.quic-gw.plist");
+    const result = await installQuicLaunchAgent({
+      gatewayPath: "/opt/gw/tailii-quic-gw",
+      plistPath,
+      logPath: "/tmp/quic-gw.log",
+      uid: 501,
+      installBinary: (src) => src,
+      launchctl: async (args) => {
+        if (args[0] === "kickstart") throw new Error("Could not find service");
+        if (args[0] === "print") return PRINT_PENDED;
+      },
+    });
+    expect(result).toEqual({ running: false, pid: null });
+  });
+});
+
+/** 起動はしたが終了した状態（KeepAlive の再起動待ち・クラッシュ）。保留とは runs / last exit code で区別する。 */
+const PRINT_EXITED = `gui/502/com.tailii.quic-gw = {
+	active count = 0
+	path = /Users/alice/Library/LaunchAgents/com.tailii.quic-gw.plist
+	state = not running
+
+	program = /Users/alice/.tailii/bin/tailii-quic-gw
+	runs = 3
+	last exit code = 1
+}
+`;
+
+describe("parseLaunchctlPrintState / quicGatewayServiceState", () => {
+  it("稼働中の print から running / pid / runs を読む（endpoint 配下の state = active に惑わされない）", () => {
+    expect(parseLaunchctlPrintState(PRINT_RUNNING)).toEqual({
+      running: true,
+      pid: 12796,
+      runs: 1,
+      lastExitCode: null,
+    });
+  });
+
+  it("保留中の print（state = not running / runs = 0 / never exited）は未起動・終了コード無し", () => {
+    expect(parseLaunchctlPrintState(PRINT_PENDED)).toEqual({
+      running: false,
+      pid: null,
+      runs: 0,
+      lastExitCode: null,
+    });
+  });
+
+  it("起動後に終了した print は runs と last exit code を読む", () => {
+    expect(parseLaunchctlPrintState(PRINT_EXITED)).toEqual({
+      running: false,
+      pid: null,
+      runs: 3,
+      lastExitCode: 1,
+    });
+  });
+
+  it("print 成功 + 未起動 → loaded だが running ではない（isQuicGatewayRunning は false）", async () => {
+    const runner = async (): Promise<string> => PRINT_PENDED;
+    expect(await quicGatewayServiceState(502, runner)).toEqual({
+      loaded: true,
+      running: false,
+      pid: null,
+      runs: 0,
+      lastExitCode: null,
+    });
+    expect(await isQuicGatewayLoaded(502, runner)).toBe(true);
+    expect(await isQuicGatewayRunning(502, runner)).toBe(false);
+  });
+
+  it("stdout を返さない実行子は「登録済み・稼働不明」= 未起動側（旧テストの互換）", async () => {
+    expect(await quicGatewayServiceState(502, async () => {})).toEqual({
+      loaded: true,
+      running: false,
+      pid: null,
+      runs: null,
+      lastExitCode: null,
+    });
+  });
+
+  it("print 失敗 → 未登録", async () => {
+    const runner = async (): Promise<string> => {
+      throw new Error("Could not find service");
+    };
+    expect(await quicGatewayServiceState(502, runner)).toEqual({ loaded: false });
+    expect(await isQuicGatewayRunning(502, runner)).toBe(false);
+  });
+
+  it("稼働中 → isQuicGatewayRunning は true", async () => {
+    expect(await isQuicGatewayRunning(502, async () => PRINT_RUNNING)).toBe(true);
   });
 });
 
@@ -239,21 +396,21 @@ describe("readQuicCredentialsFromDisk / collectQuicInfo", () => {
   it("資格情報が無ければ null（quic-info は available:false）", async () => {
     const dir = tempDir("nocreds");
     expect(readQuicCredentialsFromDisk(dir)).toBeNull();
-    const info = await collectQuicInfo({ dir, isLoaded: async () => true });
+    const info = await collectQuicInfo({ dir, isRunning: async () => true });
     expect(info).toEqual({ available: false, reason: "credentials-missing" });
   });
 
-  it("常駐していなければ配らない（クライアントの 1.5s 接続試行税を防ぐ）", async () => {
+  it("稼働していなければ配らない（クライアントの 1.5s 接続試行税を防ぐ。登録済みでも保留中は含む）", async () => {
     const dir = tempDir("notloaded");
     writeFixtureCreds(dir);
-    const info = await collectQuicInfo({ dir, isLoaded: async () => false });
+    const info = await collectQuicInfo({ dir, isRunning: async () => false });
     expect(info).toEqual({ available: false, reason: "gateway-not-running" });
   });
 
-  it("資格情報あり + 常駐中なら port/pin/token を返す", async () => {
+  it("資格情報あり + 稼働中なら port/pin/token を返す", async () => {
     const dir = tempDir("ok");
     writeFixtureCreds(dir);
-    const info = await collectQuicInfo({ dir, isLoaded: async () => true });
+    const info = await collectQuicInfo({ dir, isRunning: async () => true });
     expect(info).toEqual({
       available: true,
       port: QUIC_GW_DEFAULT_PORT,
