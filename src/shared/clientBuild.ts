@@ -37,7 +37,7 @@ export interface ClientBuildRecord {
  * ビルドへの更新を促すことになる（host のピンをアプリ側が持つ関係の裏返し。
  * 順序は docs/host-auto-update.md を参照）。
  */
-export const CLIENT_BUILD_PIN = "7";
+export const CLIENT_BUILD_PIN = "8";
 
 /** 記録ファイルの既定パス（self-update の管理ルートと同じ ~/.tailii/host/ 配下）。 */
 export function clientBuildRecordPath(): string {
