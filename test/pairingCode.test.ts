@@ -532,3 +532,90 @@ describe("parseClientPublicKeyLine", () => {
     expect(parseClientPublicKeyLine(Buffer.from(`${valid} a b`, "utf8"))).toBeNull();
   });
 });
+
+// MARK: - v1.2 SAS 有効期限（server_key.ttl + sas expired）
+
+describe("v1.2 SAS 有効期限", () => {
+  const PSK = Buffer.alloc(32, 0x33);
+
+  it("直接入力（SAS）モードの server_key は ttl 秒を運び、PSK モードは運ばない", async () => {
+    const sas = await runResponderHarness({
+      deps: { sasTtlMs: 45_000 },
+      initiator: (peer) => runInitiator(peer),
+    });
+    expect(sas.responderResult).toEqual({ status: "paired" });
+    expect(sas.wire).toContain('"ttl":45');
+
+    const psk = await runResponderHarness({
+      deps: { psk: PSK, sasTtlMs: 45_000 },
+      initiator: (peer) => runInitiator(peer, { psk: PSK }),
+    });
+    expect(psk.responderResult).toEqual({ status: "paired" });
+    expect(psk.wire).not.toContain('"ttl"');
+  });
+
+  it("ttl は秒に切り上げ（1 秒未満でも 1）、既定は 60 秒", async () => {
+    const short = await runResponderHarness({ deps: { sasTtlMs: 10 }, initiator: (peer) => runInitiator(peer) });
+    expect(short.wire).toContain('"ttl":1');
+    const dflt = await runResponderHarness({ initiator: (peer) => runInitiator(peer) });
+    expect(dflt.wire).toContain('"ttl":60');
+  });
+
+  it("SAS モードの confirm 待ちは ttl で切れ、理由は sas expired（ステップ timeout と区別）", async () => {
+    const result = await runResponderHarness({
+      timeoutMs: 1000,
+      deps: { sasTtlMs: 20 },
+      initiator: (peer) => runInitiator(peer, { skipConfirm: true }),
+    });
+    expect(result.responderResult).toEqual({ status: "aborted", reason: "sas expired" });
+    expect(result.displayedSAS).toHaveLength(1);
+    expectNoPayloadOnWire(result.wire);
+  });
+
+  it("PSK モードの confirm 待ちは従来どおりステップ timeout", async () => {
+    const result = await runResponderHarness({
+      timeoutMs: 20,
+      deps: { psk: PSK, sasTtlMs: 60_000 },
+      initiator: (peer) => runInitiator(peer, { psk: PSK, skipConfirm: true }),
+    });
+    expect(result.responderResult).toEqual({ status: "aborted", reason: "timeout" });
+    expect(result.displayedSAS).toEqual([]);
+  });
+
+  it("parsePairingMessage は ttl を正の整数だけ受理し、それ以外は未通知として落とす", () => {
+    const epk = Buffer.alloc(32, 1).toString("base64");
+    expect(parsePairingMessage(`{"t":"server_key","v":1,"epk":"${epk}","ttl":60}`)).toEqual({
+      t: "server_key",
+      v: 1,
+      epk,
+      ttl: 60,
+    });
+    for (const bad of ['"60"', "0", "-5", "1.5", "null"]) {
+      expect(parsePairingMessage(`{"t":"server_key","v":1,"epk":"${epk}","ttl":${bad}}`)).toEqual({
+        t: "server_key",
+        v: 1,
+        epk,
+      });
+    }
+    // encode は型どおり ttl を載せる（iOS パーサは未知フィールド無視なので旧アプリにも無害）。
+    expect(encodePairingMessage({ t: "server_key", v: 1, epk, ttl: 60 })).toBe(
+      `{"t":"server_key","v":1,"epk":"${epk}","ttl":60}`,
+    );
+  });
+});
+
+describe("v1.2 abort 理由の切り分け（closed vs timeout / sas expired）", () => {
+  it("initiator が途中で切断したら timeout ではなく closed", async () => {
+    const result = await runResponderHarness({
+      timeoutMs: 1000,
+      initiator: async (peer) => {
+        const reader = new TestLineReader(peer.stream.readable);
+        writeMessage(peer.stream.writable, { t: "hello", v: 1, commit: Buffer.alloc(32, 1).toString("base64") });
+        await reader.readLine(1000);
+        peer.stream.writable.end();
+        return {};
+      },
+    });
+    expect(result.responderResult).toEqual({ status: "aborted", reason: "closed" });
+  });
+});

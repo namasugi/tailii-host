@@ -11,6 +11,14 @@ const INFO_DATA = "pocketclaude-pair-v1 data";
 const INFO_CLIENT_KEY = "pocketclaude-pair-v1 client-key";
 const INITIATOR_CONFIRM_MESSAGE = "pocketclaude-pair-v1 initiator-confirm";
 const DEFAULT_STEP_TIMEOUT_MS = 30_000;
+/**
+ * SAS（6 桁コード）の有効期限（spec v1.2）。直接入力モードで人間がコードを読んで打つ猶予。
+ * 各ステップの機械的な応答待ち（DEFAULT_STEP_TIMEOUT_MS）とは別枠で、`server_key.ttl` で
+ * initiator にも通知する。切れたら接続だけ閉じ、待受は継続する（再発行 = 再接続）。
+ */
+export const DEFAULT_SAS_TTL_MS = 60_000;
+/** SAS 期限切れの abort 理由（setup がステップ timeout と区別して案内を出す）。 */
+export const SAS_EXPIRED_REASON = "sas expired";
 /** client_key 平文（authorized_keys 1 行）の上限（spec v1.1）。 */
 const CLIENT_KEY_LINE_MAX_BYTES = 1024;
 
@@ -35,6 +43,8 @@ export interface PairingResponderDeps {
   registerClientKey?: (publicKeyLine: string) => void;
   randomBytes?: (size: number) => Buffer;
   timeoutMs?: number;
+  /** v1.2: SAS の有効期限（confirm 待ちの上限）。PSK モードでは使わない。既定 DEFAULT_SAS_TTL_MS。 */
+  sasTtlMs?: number;
 }
 
 export type PairingResult =
@@ -51,7 +61,7 @@ export interface DerivedPairingKeys {
 
 export type PairingMessage =
   | { t: "hello"; v: 1; commit: string; cpk?: 1; psk?: 1 }
-  | { t: "server_key"; v: 1; epk: string; ck?: 1 }
+  | { t: "server_key"; v: 1; epk: string; ck?: 1; ttl?: number }
   | { t: "reveal"; epk: string }
   | { t: "confirm"; mac: string }
   | { t: "client_key"; iv: string; ct: string; tag: string }
@@ -144,6 +154,8 @@ export function parsePairingMessage(line: string): PairingMessage | null {
         v: PROTOCOL_VERSION,
         epk: value.epk,
         ...(value.ck === 1 ? { ck: 1 as const } : {}),
+        // v1.2: SAS 有効期限（秒）。正の整数以外は「未通知」として落とす。
+        ...(Number.isInteger(value.ttl) && (value.ttl as number) > 0 ? { ttl: value.ttl as number } : {}),
       };
     case "reveal":
       if (typeof value.epk !== "string") return null;
@@ -230,7 +242,7 @@ export async function runPairingResponder(stream: PairingStream, deps: PairingRe
   const reader = new PairingLineReader(stream.readable);
   try {
     const helloLine = await reader.readLine(timeoutMs);
-    if (helloLine === null) return abort(stream, reader, "timeout");
+    if (helloLine === null) return abort(stream, reader, reader.isEnded ? "closed" : "timeout");
     const hello = parsePairingMessage(helloLine);
     if (hello?.t !== "hello") return abort(stream, reader, "invalid hello");
     const commit = decodeBase64Field(hello.commit, 32);
@@ -244,15 +256,18 @@ export async function runPairingResponder(stream: PairingStream, deps: PairingRe
 
     const responderKeypair = crypto.generateKeyPairSync("x25519");
     const responderPubRaw = x25519PublicKeyObjectToRaw(responderKeypair.publicKey);
+    // v1.2: 直接入力（SAS）モードだけ、コードの有効期限（秒）を initiator に通知する。
+    const sasTtlMs = deps.sasTtlMs ?? DEFAULT_SAS_TTL_MS;
     writeMessage(stream.writable, {
       t: "server_key",
       v: PROTOCOL_VERSION,
       epk: responderPubRaw.toString("base64"),
       ...(enroll ? { ck: 1 as const } : {}),
+      ...(pskMode ? {} : { ttl: Math.max(1, Math.ceil(sasTtlMs / 1000)) }),
     });
 
     const revealLine = await reader.readLine(timeoutMs);
-    if (revealLine === null) return abort(stream, reader, "timeout");
+    if (revealLine === null) return abort(stream, reader, reader.isEnded ? "closed" : "timeout");
     const reveal = parsePairingMessage(revealLine);
     if (reveal?.t !== "reveal") return abort(stream, reader, "invalid reveal");
     const initiatorPubRaw = decodeBase64Field(reveal.epk, 32);
@@ -272,8 +287,9 @@ export async function runPairingResponder(stream: PairingStream, deps: PairingRe
     // PSK モードでは SAS の人間照合を省略する（QR の psk 所持が相互認証を担う）。
     if (!pskMode) deps.displaySAS(keys.sasCode);
 
-    const confirmLine = await reader.readLine(timeoutMs);
-    if (confirmLine === null) return abort(stream, reader, "timeout");
+    // SAS モードの confirm 待ちは「人間がコードを打つ猶予」なので有効期限（ttl）で待つ。
+    const confirmLine = await reader.readLine(pskMode ? timeoutMs : sasTtlMs);
+    if (confirmLine === null) return abort(stream, reader, reader.isEnded ? "closed" : pskMode ? "timeout" : SAS_EXPIRED_REASON);
     const confirm = parsePairingMessage(confirmLine);
     if (confirm?.t !== "confirm") return abort(stream, reader, "invalid confirm");
     const receivedMac = decodeBase64Field(confirm.mac, 32);
@@ -285,7 +301,7 @@ export async function runPairingResponder(stream: PairingStream, deps: PairingRe
     let clientKeyLine: string | undefined;
     if (enroll) {
       const clientKeyMsgLine = await reader.readLine(timeoutMs);
-      if (clientKeyMsgLine === null) return abort(stream, reader, "timeout");
+      if (clientKeyMsgLine === null) return abort(stream, reader, reader.isEnded ? "closed" : "timeout");
       const clientKeyMsg = parsePairingMessage(clientKeyMsgLine);
       if (clientKeyMsg?.t !== "client_key") return abort(stream, reader, "invalid client_key");
       const iv = decodeBase64Field(clientKeyMsg.iv, 12);
@@ -361,6 +377,11 @@ class PairingLineReader {
   private buffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
   private lines: string[] = [];
   private ended = false;
+  /** 相手が閉じた（end/close/error）か。readLine の null が「無応答」か「切断」かを呼び出し側が区別するため。 */
+  get isEnded(): boolean {
+    return this.ended;
+  }
+
   private waiter: ((line: string | null) => void) | null = null;
 
   constructor(private readonly readable: NodeJS.ReadableStream) {

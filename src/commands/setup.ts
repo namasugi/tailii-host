@@ -39,7 +39,8 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import qrcode from "qrcode-terminal";
-import { runPairingResponder } from "./pairingCode.js";
+import { DEFAULT_SAS_TTL_MS, SAS_EXPIRED_REASON, runPairingResponder } from "./pairingCode.js";
+import { StatusLine, formatRemaining } from "./statusLine.js";
 import {
   collectDoctorChecks,
   defaultShimBinDir,
@@ -536,67 +537,185 @@ interface CodePairingServerOptions {
   registerClientKey: (publicKeyLine: string) => void;
   lanIP: string;
   port: number;
+  /** テスト用の時間注入。省略時は本番値（待受 600s / SAS 60s / 各ステップ 30s）。 */
+  timing?: CodePairingServerTiming;
+  /** 出力先（テスト用）。省略時は process.stdout / stderr。 */
+  out?: CodePairingServerOutput;
 }
 
-/** bind 済みサーバで QR（psk）/ 直接入力（SAS）両モードのペアリングを 1 接続だけ受理する。 */
-async function runCodePairingServer(server: net.Server, options: CodePairingServerOptions): Promise<number> {
+export interface CodePairingServerTiming {
+  /** 接続を待ち続ける総時間。失敗・期限切れ後も、この枠内なら次の接続を受ける。 */
+  waitTotalMs: number;
+  /** 6 桁コードの有効期限（server_key.ttl として iPhone にも通知）。 */
+  sasTtlMs: number;
+  /** 機械的な各ステップの応答待ち。 */
+  stepTimeoutMs?: number;
+  /** 1 回の setup で受理する接続数の上限（spec v1.2「試行回数の上限」）。 */
+  maxAttempts?: number;
+}
+
+/**
+ * 1 回の setup で受理する接続数の上限。
+ * 待受を継続すると、能動 MITM がホスト側で鍵交換だけを高速に回し（reveal 前に自分側の SAS を
+ * 計算できるので 1 接続 = RTT 1 回）、iPhone 側に出ている 6 桁と衝突する鍵（2^-20/回）を探せる。
+ * 回数を小さく抑えて「実質単発試行」（≤ 5×2^-20）を保ちつつ、人間の再発行 2〜3 回は許す。
+ */
+const DEFAULT_PAIRING_MAX_ATTEMPTS = 5;
+
+export interface CodePairingServerOutput {
+  stdout: { isTTY?: boolean; write(text: string): unknown };
+  stderr: { write(text: string): unknown };
+}
+
+const DEFAULT_PAIRING_WAIT_TOTAL_MS = 600_000;
+
+/**
+ * bind 済みサーバで QR（psk）/ 直接入力（SAS）両モードのペアリングを受理する。
+ * 成立するまで（総待受時間と接続回数上限の範囲で）接続を受け続ける: コード期限切れや失敗で
+ * 接続が閉じても待受は残るので、iPhone 側の「コードを再発行」（= 再接続）だけでやり直せる。
+ * 待受中とコード表示中は残り時間をカウントダウンで見せる（「勝手に終わった」に見せない）。
+ */
+export async function runCodePairingServer(server: net.Server, options: CodePairingServerOptions): Promise<number> {
   const host = options.lanIP === "" ? "0.0.0.0" : options.lanIP;
-  process.stdout.write(
+  const out: CodePairingServerOutput = options.out ?? { stdout: process.stdout, stderr: process.stderr };
+  const waitTotalMs = options.timing?.waitTotalMs ?? DEFAULT_PAIRING_WAIT_TOTAL_MS;
+  const sasTtlMs = options.timing?.sasTtlMs ?? DEFAULT_SAS_TTL_MS;
+  const maxAttempts = options.timing?.maxAttempts ?? DEFAULT_PAIRING_MAX_ATTEMPTS;
+  out.stdout.write(
     "\n============ ② 直接入力でペアリング ============\n" +
       `  接続先 : ${host}:${options.port}\n` +
       "  iPhone の Tailii →「ペアリング」→「直接入力」に上の host:port を入力\n" +
       "  → 接続すると両側に 6桁コードが出るので、一致を確認して承認\n" +
+      `  → 6桁コードは表示から ${Math.round(sasTtlMs / 1000)} 秒有効。切れたら iPhone で「コードを再発行」\n` +
       "  （QR をスキャンした場合は何もしなくてよい — 自動で完了します）\n" +
       "================================================\n",
   );
 
+  // 'connection' は常時受けてキューに積む（responder 実行中〜次の待受登録の隙間に届いた接続を
+  // 取りこぼさないため）。maxConnections=1 なので同時 2 本目は Node が drop する。
+  const inbox = new ConnectionInbox(server);
+  const deadline = Date.now() + waitTotalMs;
   try {
-    const socket = await acceptOneConnection(server, 600_000);
-    if (socket === null) {
-      process.stdout.write("ペアリングの待受を終了しました（時間切れ）。再実行してください。\n");
-      return 0;
-    }
+    for (let attempt = 1; ; attempt += 1) {
+      if (attempt > maxAttempts) {
+        out.stdout.write(
+          `ペアリングの待受を終了しました（接続 ${maxAttempts} 回の上限）。再実行してください。\n`,
+        );
+        return 1;
+      }
+      const remaining = deadline - Date.now();
+      const waitLine = new StatusLine(out.stdout);
+      waitLine.start(() => `待受中…（残り ${formatRemaining(deadline - Date.now())}、Ctrl-C で終了）`);
+      const socket = remaining > 0 ? await inbox.next(remaining) : null;
+      if (socket === null) {
+        waitLine.stop(
+          `ペアリングの待受を終了しました（${formatRemaining(waitTotalMs)} 経過）。再実行してください。`,
+        );
+        return 0;
+      }
+      waitLine.stop(`iPhone から接続がありました（${attempt}/${maxAttempts} 回目）。`);
 
-    server.close();
-    const result = await runPairingResponder(
-      { readable: socket, writable: socket },
-      {
-        payloadJSON: options.payloadJSON,
-        payloadJSONNoKey: options.payloadJSONNoKey,
-        psk: options.psk,
-        registerClientKey: options.registerClientKey,
-        displaySAS: (code) => process.stdout.write(`ペアリングコード: ${code}\n`),
-      },
-    );
-
-    if (result.status === "paired") {
-      process.stdout.write(
-        result.clientKeyLine !== undefined
-          ? "ペアリングが完了しました（iPhone 生成の鍵を登録・秘密鍵転送なし）。\n"
-          : "ペアリングが完了しました。\n",
+      // SAS 行はコードと残り時間を毎秒書き換える。confirm が通ったら（= registerClientKey /
+      // legacy payload 生成の直前）行を確定させ、以降の通常出力が同じ行に混ざらないようにする。
+      const sasLine = new StatusLine(out.stdout);
+      let sasCode = "";
+      let sasDeadline = 0;
+      const settleSAS = (): void => {
+        if (sasCode !== "") sasLine.stop(`ペアリングコード: ${sasCode}  （確認済み）`);
+      };
+      const result = await runPairingResponder(
+        { readable: socket, writable: socket },
+        {
+          payloadJSON: () => {
+            settleSAS();
+            return options.payloadJSON();
+          },
+          payloadJSONNoKey: options.payloadJSONNoKey,
+          psk: options.psk,
+          registerClientKey: (line) => {
+            settleSAS();
+            options.registerClientKey(line);
+          },
+          sasTtlMs,
+          ...(options.timing?.stepTimeoutMs !== undefined ? { timeoutMs: options.timing.stepTimeoutMs } : {}),
+          displaySAS: (code) => {
+            sasCode = code;
+            sasDeadline = Date.now() + sasTtlMs;
+            sasLine.start(() => `ペアリングコード: ${code}  （残り ${formatRemaining(sasDeadline - Date.now())}）`);
+          },
+        },
       );
-      return 0;
+
+      if (result.status === "paired") {
+        settleSAS();
+        out.stdout.write(
+          result.clientKeyLine !== undefined
+            ? "ペアリングが完了しました（iPhone 生成の鍵を登録・秘密鍵転送なし）。\n"
+            : "ペアリングが完了しました。\n",
+        );
+        return 0;
+      }
+      const continues = attempt < maxAttempts;
+      const tail = continues ? "" : "（接続回数の上限に達したため終了します）";
+      if (result.reason === SAS_EXPIRED_REASON) {
+        sasLine.stop(
+          `ペアリングコード: ${sasCode}  は期限切れになりました。` +
+            (continues ? "iPhone で「コードを再発行」を押すと新しいコードが出ます。" : tail),
+        );
+      } else {
+        sasLine.stop();
+        out.stderr.write(`ペアリングを中止しました: ${result.reason}${continues ? "（引き続き待ち受けます）" : tail}\n`);
+      }
     }
-    process.stderr.write(`ペアリングを中止しました: ${result.reason}\n`);
-    return 1;
   } finally {
+    inbox.dispose();
     await closeServer(server);
   }
 }
 
-function acceptOneConnection(server: net.Server, timeoutMs: number): Promise<net.Socket | null> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      server.off("connection", onConnection);
-      resolve(null);
-    }, timeoutMs);
-    const onConnection = (socket: net.Socket): void => {
-      clearTimeout(timer);
-      server.off("connection", onConnection);
-      resolve(socket);
-    };
-    server.on("connection", onConnection);
-  });
+/** 'connection' を常時受けてキューに積み、`next()` で 1 本ずつ取り出す（待受の隙間の取りこぼし防止）。 */
+class ConnectionInbox {
+  private readonly queue: net.Socket[] = [];
+  private waiter: ((socket: net.Socket | null) => void) | null = null;
+  private readonly onConnection = (socket: net.Socket): void => {
+    if (this.waiter !== null) {
+      const waiter = this.waiter;
+      this.waiter = null;
+      waiter(socket);
+    } else {
+      this.queue.push(socket);
+    }
+  };
+
+  constructor(private readonly server: net.Server) {
+    server.on("connection", this.onConnection);
+  }
+
+  /** 次の接続を返す。timeoutMs 以内に来なければ null。既に相手が去ったキュー内ソケットは読み飛ばす。 */
+  next(timeoutMs: number): Promise<net.Socket | null> {
+    while (this.queue.length > 0) {
+      const socket = this.queue.shift()!;
+      if (!socket.destroyed) return Promise.resolve(socket);
+    }
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        if (this.waiter === onSocket) this.waiter = null;
+        resolve(null);
+      }, timeoutMs);
+      const onSocket = (socket: net.Socket | null): void => {
+        clearTimeout(timer);
+        resolve(socket);
+      };
+      this.waiter = onSocket;
+    });
+  }
+
+  dispose(): void {
+    this.server.off("connection", this.onConnection);
+    for (const socket of this.queue) socket.destroy();
+    this.queue.length = 0;
+    this.waiter = null;
+  }
 }
 
 function closeServer(server: net.Server): Promise<void> {
