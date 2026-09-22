@@ -1,0 +1,45 @@
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.278[39m
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mHaiku 4.5 · Claude Max[39m
+[38;5;174m  ▝▝ ▝▝  [39m  [38;5;246m/private/tmp/claude-502/-Users-namasugi-Documents-ClaudeCode-code0630/b001f38b-439c-4b13-bb40-d4479e357ace/scratchpad/dlg278[39m
+
+[38;5;220m⚠[39m [38;5;220mYour login expires in 2 days[38;5;246m · run /login to renew[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mRun this bash command now: echo dialog-probe[39m
+
+[49m  [38;5;246mRan [1m1[0m[38;5;246m shell command [39m
+
+[38;5;231m⏺[39m Done. The command echoed [38;5;153mdialog-probe[39m successfully.
+
+[38;5;246m✻[39m [38;5;246mBrewed for 3s · done 7:18 AM[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mCreate a file named probe.txt containing the word hello, using the Write tool.[39m
+
+[38;5;211m[49m⏺[39m [1mWrite[0m(]8;id=43ukfk;file:///private/tmp/claude-502/-Users-namasugi-Documents-ClaudeCode-code0630/b001f38b-439c-4b13-bb40-d4479e357ace/scratchpad/dlg278/probe.txt\probe.txt]8;;\)
+[38;5;246m  ⎿  [38;5;239mUser rejected write to [1mprobe.txt[0m
+     [2m[38;5;231m 1 hello[0m
+
+[38;5;246m✻[39m [38;5;246mSautéed for 3s · done 7:20 AM[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mCall the AskUserQuestion tool right now with one single-select question "Pick one" (header "Pick") and two options Alpha and Beta, each with a description. No preview.[39m
+  [38;5;231mNothing else before the tool call.[39m
+[38;5;246m[49m──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[38;5;16m[48;5;153m ☐ Pick [39m[49m
+
+[1m[38;5;231mPick one[0m
+
+[38;5;153m❯[39m [38;5;246m1.[39m [38;5;153mAlpha[39m
+     [38;5;246mFirst option[39m
+  [38;5;246m2.[39m Beta
+     [38;5;246mSecond option[39m
+  [38;5;246m3. Type something.[39m
+[38;5;246m──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  4. Chat about this
+
+[38;5;246mEnter to select · ↑/↓ to navigate · Esc to cancel[39m
+
+
+
+
+
+

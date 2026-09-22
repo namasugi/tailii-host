@@ -53,6 +53,7 @@ import {
   TmuxFailedError,
   TmuxSessionManager,
 } from "../src/backend/tmux.js";
+import { stripInvisibleForComparison } from "../src/shared/invisibleText.js";
 import { aggregateUsage } from "../src/services/usageAggregator.js";
 import { MockTmuxRunner, makeTempDir, makeTempStore, ok } from "./helpers.js";
 import { sessionInfoFromMeta } from "../src/engine/context.js";
@@ -926,17 +927,55 @@ describe("TmuxSessionManager", () => {
   });
 
   /** sendTextSubmit 用の最小 pane 状態機械（入力欄の残存テキストと C-u / Enter の効果だけを再現）。 */
-  function makeTmuxSubmitHarness(initialInput: string) {
-    const state = { input: initialInput };
+  function makeTmuxSubmitHarness(initialInput: string, options: {
+    /** 1 回目の Enter は送信せず、不可視文字だけ落として入力欄に残す（2.1.277+ の確認待ち）。 */
+    holdFirstSubmit?: boolean;
+    /** 1 回目の Enter で選択ダイアログが開く（/remote-control 等）。 */
+    dialogOnFirstSubmit?: boolean;
+    /** 1 回目の Enter でツール承認ダイアログが開く（フッターは `Esc to cancel · Tab to amend`）。 */
+    approvalOnFirstSubmit?: boolean;
+    /** Enter がいくら効かず、入力欄が空にならない（送信不成立）。 */
+    neverSubmits?: boolean;
+    /** 最初からダイアログが開いている（送信前に Mac 側で開いた等）。 */
+    dialogFromStart?: "selection" | "approval";
+  } = {}) {
+    const state = {
+      input: initialInput,
+      dialog: options.dialogFromStart === "selection",
+      approval: options.dialogFromStart === "approval",
+    };
+    let submits = 0;
     const screen = () => {
       const rule = "─".repeat(40);
+      if (state.approval) {
+        // 実機 2.1.278 の承認ダイアログ: フッターに `Enter to select` は出ず、
+        // ボトムバーも消える。カーソル行 `❯ 1. Yes` は入力欄の残存と区別が付かない。
+        return ["⏺ 前の応答", rule, "❯ 1. Yes", "  3. No", rule, "Esc to cancel · Tab to amend"].join("\n");
+      }
+      if (state.dialog) {
+        // 実ダイアログはカーソル行が罫線に挟まれるため、ガードが無いと `❯ Continue` を
+        // 未送信テキストと誤認して Enter を撃ち直す（実障害 2026-07-28 と同型）。
+        return ["⏺ 前の応答", rule, "❯ Continue", rule, "Enter to select · Esc to cancel"].join("\n");
+      }
       const body = state.input.length > 0 ? `❯ ${state.input}` : "❯ \u001b[2mTry \"fix\"\u001b[22m";
       return ["⏺ 前の応答", rule, body, rule, "  ⏸ manual mode on"].join("\n");
     };
     const runner = new MockTmuxRunner((args) => {
       if (args[0] === "capture-pane") return ok(screen());
       if (args[0] === "send-keys" && args[3] === "C-u") { state.input = ""; return ok(""); }
-      if (args[0] === "send-keys" && args[3] === "Enter") { state.input = ""; return ok(""); }
+      if (args[0] === "send-keys" && args[3] === "Enter") {
+        submits += 1;
+        if ((options.dialogOnFirstSubmit ?? false) && submits === 1) { state.dialog = true; return ok(""); }
+        if ((options.approvalOnFirstSubmit ?? false) && submits === 1) { state.approval = true; return ok(""); }
+        if (options.neverSubmits ?? false) return ok("");
+        // 2.1.277+ は不可視文字を含む本文の 1 回目の Enter で送信せず、除去後の本文を残す。
+        if ((options.holdFirstSubmit ?? false) && submits === 1) {
+          state.input = stripInvisibleForComparison(state.input);
+          return ok("");
+        }
+        state.input = "";
+        return ok("");
+      }
       if (args[0] === "send-keys" && args[3] === "-l") { state.input += args[5] ?? ""; return ok(""); }
       return ok("");
     });
@@ -946,20 +985,115 @@ describe("TmuxSessionManager", () => {
 
   test("sendTextSubmit: 残存が transcript の直近の発話と同文なら C-u で破棄してから注入する（tmux）", async () => {
     const { runner, sends } = makeTmuxSubmitHarness("中周(r≈175)を1枚足す");
-    const mgr = new TmuxSessionManager({ runner: runner.runner, store: makeTempStore(), clearKeyDelayMs: 0 });
+    const mgr = new TmuxSessionManager({ runner: runner.runner, store: makeTempStore(), clearKeyDelayMs: 0, submitDelayMs: 0, submitVerifyDelayMs: 0 });
     await mgr.sendTextSubmit("s", "軌道は抽選でいい", { recordedPromptText: () => "中周(r≈175)を1枚足す" });
     expect(sends()).toEqual([["C-u"], ["-l", "--", "軌道は抽選でいい"], ["Enter"]]);
   });
 
   test("sendTextSubmit: 残存が記録本文と別文 / 照合材料なしなら従来どおり Enter で独立送信してから注入する（tmux）", async () => {
     const a = makeTmuxSubmitHarness("queued だった本文");
-    const mgrA = new TmuxSessionManager({ runner: a.runner.runner, store: makeTempStore() });
+    const mgrA = new TmuxSessionManager({ runner: a.runner.runner, store: makeTempStore(), submitDelayMs: 0, submitVerifyDelayMs: 0 });
     await mgrA.sendTextSubmit("s", "今回の本文", { recordedPromptText: () => "直近の発話" });
     expect(a.sends()).toEqual([["Enter"], ["-l", "--", "今回の本文"], ["Enter"]]);
     const b = makeTmuxSubmitHarness("残存");
-    const mgrB = new TmuxSessionManager({ runner: b.runner.runner, store: makeTempStore() });
+    const mgrB = new TmuxSessionManager({ runner: b.runner.runner, store: makeTempStore(), submitDelayMs: 0, submitVerifyDelayMs: 0 });
     await mgrB.sendTextSubmit("s", "今回の本文");
     expect(b.sends()).toEqual([["Enter"], ["-l", "--", "今回の本文"], ["Enter"]]);
+  });
+
+  test("sendTextSubmit: 送信が成立したら Enter は 1 回だけで終える（tmux）", async () => {
+    const h = makeTmuxSubmitHarness("");
+    const mgr = new TmuxSessionManager({
+      runner: h.runner.runner, store: makeTempStore(), submitDelayMs: 0, submitVerifyDelayMs: 0,
+    });
+    await mgr.sendTextSubmit("s", "ふつうの本文");
+    expect(h.sends()).toEqual([["-l", "--", "ふつうの本文"], ["Enter"]]);
+    expect(h.state.input).toBe("");
+  });
+
+  test("sendTextSubmit: 不可視文字の確認待ちで 1 回目の Enter が送信にならないとき、撃ち直して成立させる（tmux/2.1.277+）", async () => {
+    const zwsp = String.fromCodePoint(0x200b);
+    const text = `ゼロ幅${zwsp}入りの本文`;
+    const h = makeTmuxSubmitHarness("", { holdFirstSubmit: true });
+    const mgr = new TmuxSessionManager({
+      runner: h.runner.runner, store: makeTempStore(), submitDelayMs: 0, submitVerifyDelayMs: 0,
+    });
+    await mgr.sendTextSubmit("s", text);
+    // 1 回目の Enter は除去だけ（入力欄に残る）→ 2 回目で送信が成立する。
+    expect(h.sends()).toEqual([["-l", "--", text], ["Enter"], ["Enter"]]);
+    expect(h.state.input).toBe("");
+  });
+
+  test("sendTextSubmit: 送出した本文が選択ダイアログを開いたら Enter を撃ち直さない（tmux）", async () => {
+    const h = makeTmuxSubmitHarness("", { dialogOnFirstSubmit: true });
+    const mgr = new TmuxSessionManager({
+      runner: h.runner.runner, store: makeTempStore(), submitDelayMs: 0, submitVerifyDelayMs: 0,
+    });
+    await mgr.sendTextSubmit("s", "/remote-control");
+    // ダイアログのカーソル行（❯ Continue）は未送信テキストに見えるが、Enter は撃たない。
+    expect(h.sends()).toEqual([["-l", "--", "/remote-control"], ["Enter"]]);
+  });
+
+  test("sendTextSubmit: 送出した本文が承認ダイアログを開いたら Enter を撃ち直さない（tmux）", async () => {
+    // 承認ダイアログのフッターは `Enter to select` ではないので、文言列挙では取りこぼす。
+    // カーソル行 `❯ 1. Yes` を残存テキストと誤認して Enter を撃つと、ファイル書き込みを
+    // 勝手に承認してしまう（実測 2.1.278: inputBoxRealText が "1. Yes" を返す）。
+    const h = makeTmuxSubmitHarness("", { approvalOnFirstSubmit: true });
+    const mgr = new TmuxSessionManager({
+      runner: h.runner.runner, store: makeTempStore(), submitDelayMs: 0, submitVerifyDelayMs: 0,
+    });
+    await mgr.sendTextSubmit("s", "ファイルを作って");
+    expect(h.sends()).toEqual([["-l", "--", "ファイルを作って"], ["Enter"]]);
+  });
+
+  test("sendTextSubmit: 送信前からダイアログが開いていたら 1 キーも打たずに失敗する（tmux）", async () => {
+    // 実機の入口はこちら（送信の**結果**ではなく、送る前から開いている）。承認ダイアログの
+    // カーソル行 `❯ 1. Yes` は残存テキストに見えるので、盲目に Enter を撃つと
+    // ファイル書き込みを勝手に承認する。
+    const h = makeTmuxSubmitHarness("", { dialogFromStart: "approval" });
+    const mgr = new TmuxSessionManager({
+      runner: h.runner.runner, store: makeTempStore(), submitDelayMs: 0, submitVerifyDelayMs: 0,
+    });
+    await expect(mgr.sendTextSubmit("s", "ふつうの質問", { recordedPromptText: () => "直近の発話" }))
+      .rejects.toThrow(/ダイアログの表示中/);
+    expect(h.sends()).toEqual([]);
+  });
+
+  test("sendTextSubmit: 送信前から設問ダイアログでも同じく 1 キーも打たない（tmux）", async () => {
+    const h = makeTmuxSubmitHarness("", { dialogFromStart: "selection" });
+    const mgr = new TmuxSessionManager({
+      runner: h.runner.runner, store: makeTempStore(), submitDelayMs: 0, submitVerifyDelayMs: 0,
+    });
+    await expect(mgr.sendTextSubmit("s", "ふつうの質問")).rejects.toThrow(/ダイアログの表示中/);
+    expect(h.sends()).toEqual([]);
+  });
+
+  test("sendTextSubmit: 送信が成立しなくても Enter は上限で打ち切り、未確定を通知する（tmux）", async () => {
+    const h = makeTmuxSubmitHarness("", { neverSubmits: true });
+    const unconfirmed: string[] = [];
+    const mgr = new TmuxSessionManager({
+      runner: h.runner.runner, store: makeTempStore(), submitDelayMs: 0, submitVerifyDelayMs: 0,
+    });
+    await mgr.sendTextSubmit("s", "消えない本文", {
+      onUnconfirmedSubmit: () => unconfirmed.push("unconfirmed"),
+    });
+    const enters = h.sends().filter((keys) => keys[0] === "Enter");
+    // 無限に撃ち続けない。確認できなかったことは呼び出し側へ 1 回だけ伝える。
+    expect(enters.length).toBe(4);
+    expect(unconfirmed).toEqual(["unconfirmed"]);
+  });
+
+  test("sendTextSubmit: 残存を送信し切れないときは本文を打たずに失敗する（連結送信の防止）", async () => {
+    // 2.1.277+ は残存に不可視文字があると 1 回目の Enter で送信せず確認待ちにする。
+    // 裸の Enter 1 発で流せたつもりになると、今回の本文が残存の後ろへ連結される。
+    const h = makeTmuxSubmitHarness("消えない残存", { neverSubmits: true });
+    const mgr = new TmuxSessionManager({
+      runner: h.runner.runner, store: makeTempStore(), submitDelayMs: 0, submitVerifyDelayMs: 0,
+    });
+    await expect(mgr.sendTextSubmit("s", "今回の本文", { recordedPromptText: () => null }))
+      .rejects.toThrow(/送り切れなかった/);
+    // 本文は 1 文字も打っていない（明示再送へ倒す）。
+    expect(h.sends().some((keys) => keys[0] === "-l")).toBe(false);
   });
 });
 

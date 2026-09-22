@@ -32,7 +32,7 @@ import type { PanePreviewMode } from "./panePreviewPump.js";
 import { sameUsageLimitWait, type UsageLimitWaitState } from "../shared/usageLimitWait.js";
 import type { QuestionAnswer } from "../protocol.js";
 import { PROTOCOL_V1, PROTOCOL_V2 } from "../protocol.js";
-import { LoginCodeError } from "../backend/tmux.js";
+import { ChatInjectionRejectedError, LoginCodeError } from "../backend/tmux.js";
 import { CodexAppServerManager } from "../codex/codexAppServer.js";
 import {
   CodexNativeTurnController,
@@ -1907,7 +1907,11 @@ export class SessionHub {
           // `/login` 中の門番（LoginCodeError）は 1 キーも送る前の確定拒否 = 非配達が確定している。
           // uncertain（配送不明）に積むと削除不能・後続ブロックのゾンビになるので、失敗として
           // そのまま片付ける。それ以外の注入失敗は従来どおり配送不明として明示再送に倒す。
-          const rejectedBeforeSend = error instanceof LoginCodeError;
+          // 1 キーも打つ前に諦めた注入（`/login` 門番・ダイアログ表示中・残存を流し切れない）は
+          // **非配達が確定**している。uncertain は「二重送信が怖くて消せない」分類なので、
+          // ここへ積むと削除不能・後続ブロックのゾンビになる（下のコメント参照）。
+          const rejectedBeforeSend =
+            error instanceof LoginCodeError || error instanceof ChatInjectionRejectedError;
           if (rejectedBeforeSend) {
             removeOrderedID(actor.chatOrder, message.clientMessageId);
           } else {

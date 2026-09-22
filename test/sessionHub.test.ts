@@ -5,6 +5,7 @@ import { decodeHubServerLine } from "../src/hub/hubProtocol.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { bumpHeartbeat, readHeartbeat, writeHeartbeat } from "../src/sessions/heartbeat.js";
+import { ChatInjectionRejectedError } from "../src/backend/tmux.js";
 import { SessionHub, type HubTail } from "../src/hub/sessionHub.js";
 import { HISTORY_DONE_STREAM_ID } from "../src/chat/transcriptTailer.js";
 import { ImageService } from "../src/chat/imageService.js";
@@ -694,6 +695,40 @@ describe("SessionHub actor", () => {
     expect(JSON.parse(fs.readFileSync(receiptsPath, "utf8"))).toMatchObject({
       sessions: { work: { injecting: [{ clientMessageId: "client-1" }] } },
     });
+  });
+
+  test("1 キーも打たずに拒否された chat_send は uncertain に積まず、後続の送信を止めない", async () => {
+    // ダイアログ表示中・残存を流し切れない等の拒否は**非配達が確定**している。
+    // uncertain（配送不明）へ積むと削除不能・後続ブロックのゾンビになり、
+    // 原因が持続する状況では明示再送しても同じ拒否に落ちて iPhone から 1 通も送れなくなる。
+    const receiptsPath = path.join(makeTempDir("hub-chat-rejected"), "receipts.json");
+    const chatInjector = vi.fn()
+      .mockRejectedValueOnce(new ChatInjectionRejectedError("ダイアログの表示中はメッセージを送信できません"))
+      .mockResolvedValueOnce(undefined);
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-chat-rej"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, chatInjector, chatReceiptsPath: receiptsPath });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "conversation_subscribe", session: "work" }));
+    const send = (id: string, clientMessageId: string, text: string) =>
+      hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id, session: "work", clientMessageId, text }));
+
+    send("one", "client-1", "ダイアログ中の送信");
+    await vi.waitFor(() => expect(received).toContainEqual(expect.objectContaining({
+      type: "chat_send_result", id: "one", status: "failed",
+      error: expect.stringContaining("ダイアログの表示中"),
+    })));
+
+    // 別メッセージは通る（先頭に居座る uncertain でブロックされない）。
+    send("two", "client-2", "次のメッセージ");
+    await vi.waitFor(() => expect(received).toContainEqual(expect.objectContaining({
+      type: "chat_send_result", id: "two", status: "accepted",
+    })));
+    expect(chatInjector).toHaveBeenCalledTimes(2);
+    // uncertain は 1 件も残らない（明示再送を強要されない）。
+    expect(received).not.toContainEqual(expect.objectContaining({
+      type: "chat_send_result", error: expect.stringContaining("uncertain"),
+    }));
   });
 
   test("codex turn は遅延生成した Hub controller へ渡し clientUserMessageId で重複排除する", async () => {

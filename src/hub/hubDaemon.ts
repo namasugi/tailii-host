@@ -475,7 +475,12 @@ export async function runHubCommand(args: string[]): Promise<number> {
       // ACK 予算 18s に迫る 4 秒以上は `chat-inject-slow` として目立たせる（事後解析用）。
       const startedAt = Date.now();
       try {
-        await sessionBackend.sendTextSubmit(session, text, { recordedPromptText: context.recordedPromptText });
+        await sessionBackend.sendTextSubmit(session, text, {
+          recordedPromptText: context.recordedPromptText,
+          // 送信確定を確認できないまま配送済みレシートを返す唯一の経路。無言だと
+          // 「送ったのに届かない」の再発に誰も気づけないので 1 行残す（事後解析用）。
+          onUnconfirmedSubmit: () => log(`audit chat-submit-unconfirmed session=${session}`),
+        });
       } finally {
         const elapsedMs = Date.now() - startedAt;
         log(`audit ${elapsedMs >= 4_000 ? "chat-inject-slow" : "chat-inject"} session=${session} elapsedMs=${elapsedMs}`);

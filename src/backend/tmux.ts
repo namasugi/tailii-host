@@ -6,6 +6,7 @@
 import { execFile } from "node:child_process";
 import { PROTOCOL_V1, type ControlMessage, type SessionInfo } from "../protocol.js";
 import { SessionMetadataStore, validateSessionName } from "../sessions/sessionMetadataStore.js";
+import { normalizeForTextMatch } from "../shared/invisibleText.js";
 
 /** tmux コマンド 1 回分の実行結果。 */
 export interface TmuxCommandResult {
@@ -88,9 +89,11 @@ function isInputBoxRuleLine(line: string): boolean {
  * （旧 `inputBoxHasPendingText` と同じ判定なので退行しない）。
  * 判定不能は null（呼び出し側は fail-open 材料として扱う）。
  *
- * **前提**: 選択ダイアログ表示中は本文側の罫線ペア（`──── Planning: … ────` 等）を
- * 入力欄と誤認しうる。注入前にダイアログを閉じるのは呼び出し側の責務
- * （`sendTextSubmit` が `selectionDialogVisible` → Esc で担保）。
+ * **前提**: ダイアログ表示中は本文側の罫線ペア（`──── Planning: … ────` 等）を入力欄と
+ * 誤認しうる（実測 2.1.278: 承認ダイアログで `"1. Yes"`、設問ダイアログで選択肢全文を返す）。
+ * ダイアログかどうかの判定はこの関数の責務ではない。書き込む側が
+ * `claudeComposerBarVisible`（バーが見えている時だけ入力欄として信じる）で門番すること。
+ * herdr は加えて注入前に `selectionDialogVisible` → Esc でダイアログを閉じる。
  */
 export function extractClaudeInputBox(screen: string): ClaudeInputBox | null {
   const lines = screen.split("\n").map((line) => line.trim());
@@ -197,6 +200,12 @@ export interface SendTextSubmitOptions {
    * Enter で送り直さず破棄する（restored-prompt-discard）。null = 不明（従来どおり Enter で flush）。
    */
   recordedPromptText?: () => string | null;
+  /**
+   * 送信確定ループが上限まで撃っても成立を確認できなかったときに 1 回だけ呼ばれる。
+   * 呼び出し側（hub）は監査ログへ残す。throw にしないのは、実際には送信済みかもしれない
+   * 本文を明示再送へ倒すと二重送信になり得るため（「配送済み扱い + 可観測化」を選ぶ）。
+   */
+  onUnconfirmedSubmit?: () => void;
 }
 
 /**
@@ -207,9 +216,13 @@ export interface SendTextSubmitOptions {
  * 落としたうえで「同一」または「残存が記録本文の末尾（可視領域は常に末尾側）」なら同文とみなす。
  * 末尾一致は短い断片の偶然一致（Mac 側で打ちかけた下書きが記録本文の語尾と重なる等）を避けるため
  * 24 字以上に限る（typedTextProbe と同じ長さ）。
+ *
+ * 不可視文字は両辺から落とす（`normalizeForTextMatch`）。2.1.277+ の claude は送信時に
+ * 不可視文字を除去するため、記録本文（除去後）と入力欄（除去前後どちらもありうる）を
+ * 生で比べると、貼り付け由来のゼロ幅文字 1 つで照合が外れる。
  */
 export function inputBoxTextMatchesRecordedPrompt(boxText: string, recordedPrompt: string): boolean {
-  const normalize = (value: string): string => value.replace(/\s+/g, "").replace(/^!/, "");
+  const normalize = (value: string): string => normalizeForTextMatch(value).replace(/^!/, "");
   const pending = normalize(boxText);
   const recorded = normalize(recordedPrompt);
   if (pending.length === 0 || recorded.length === 0) return false;
@@ -473,6 +486,19 @@ export function loginCodeErrorLine(screen: string): string | null {
  * chat 注入の門番（1 キーも送る前の確定拒否）にも使う — hub はこの型を「未送出の失敗」として
  * uncertain（配送不明）に積まない。
  */
+/**
+ * 本文を 1 キーも打つ前に注入を諦めたときのエラー（**非配達が確定**）。
+ * hub はこれを `uncertain`（配送不明）に積まず失敗として片付ける: uncertain は
+ * 「二重送信が怖くて消せない」分類なので、非配達が確定しているものを積むと
+ * 削除不能・後続ブロックのゾンビになる（`sessionHub` の同名コメント参照）。
+ */
+export class ChatInjectionRejectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ChatInjectionRejectedError";
+  }
+}
+
 export class LoginCodeError extends Error {
   constructor(message: string) {
     super(message);
@@ -657,6 +683,113 @@ export class TmuxFailedError extends Error {
   }
 }
 
+/**
+ * ボトムバーの**下**に常駐しうる TUI 行か（artifact タブ `\u29c9 <名前>` / agents パネルの
+ * `\u23fa main` `\u25ef <agent名>`）。これらを読み飛ばさずに「最下行 = バー」と決め打つと、
+ * subagent を走らせている会話でバーを見失う（iOS 側 `shouldSkipTailLine` と同じ規則。
+ * 2026-07-29 にライブビュー全滅を起こした実障害と同型）。
+ */
+function isTrailingTuiLine(line: string): boolean {
+  const first = line.trim().codePointAt(0);
+  return first === 0x29c9 || first === 0x23fa || first === 0x25ef || first === 0x25cf;
+}
+
+/**
+ * claude TUI のモード行（ボトムバー）か。`\u23f5\u23f5`=auto/acceptEdits, `\u23f8`=manual/plan の
+ * 行頭グリフを必須にする（`shared/permissionMode.ts` と同じ規則）。定型句の部分一致で
+ * 拾うと、会話本文やダイアログの選択肢が同じ語（`for agents` 等）を含むだけで誤検出する。
+ * 旧版互換で単独の `? for shortcuts` 行も認める。
+ */
+function isComposerBarLine(line: string): boolean {
+  const trimmed = line.trim();
+  // シェルモード（入力欄の先頭 `!`）ではバーがモード記号を持たない（実測 2.1.278:
+  // `! for shell mode`）。これを外すとシェルモード送信だけ再送判定が効かなくなる。
+  if (trimmed.startsWith("!") && trimmed.includes("for shell mode")) return true;
+  if (trimmed === "? for shortcuts") return true;
+  const first = trimmed.codePointAt(0);
+  return first === 0x23f5 || first === 0x23f8;
+}
+
+/**
+ * ダイアログのフッター行が**画面下部に**出ているか（＝積極的なダイアログ判定）。
+ * 実測 2.1.278 の 2 形: 設問/選択は `Enter to select · ↑/↓ to navigate · Esc to cancel`、
+ * ツール承認は `Esc to cancel · Tab to amend`。どちらも行頭から始まる。
+ *
+ * バー非検出（`claudeComposerBarVisible === false`）を「ダイアログ」と見なして送信を拒む
+ * 設計は、未知のフレーム（起動直後・制限待ち等）で送信が丸ごと不能になるため採らない。
+ * **本文を打つかどうかの門番はこちら（積極判定・見逃しは従来動作）**、
+ * **Enter を撃ち直すかどうかはバー検出（fail-closed・見逃しは再送しないだけ）** と役割を分ける。
+ * 会話本文の引用で誤検出しないよう、末尾の数行に限り trim 後の行頭一致で見る
+ * （`screenHasSelectionFooter` と同じ硬化）。
+ */
+export function screenShowsDialogFooter(screen: string): boolean {
+  return screen
+    .split("\n")
+    .map((line) => stripSgr(line).trimEnd())
+    .filter((line) => line.trim() !== "")
+    .slice(-DIALOG_FOOTER_WINDOW_LINES)
+    .some((line) => {
+      const trimmed = line.trim();
+      return trimmed.startsWith("Enter to select") || trimmed.startsWith("Esc to cancel");
+    });
+}
+
+/** ダイアログのフッターを探す viewport 末尾の行数（フッターは最下段に出る）。 */
+const DIALOG_FOOTER_WINDOW_LINES = 4;
+
+/**
+ * 画面最下部に composer のボトムバーが出ているか＝「いま見ているのは入力欄であって
+ * ダイアログではない」か（TESTABLE。text / ANSI どちらのキャプチャでも使える）。
+ *
+ * `extractClaudeInputBox` はダイアログ本体の罫線ペアを入力欄と誤認する（実測 2.1.278:
+ * 承認ダイアログで `inputBoxRealText` が `"1. Yes"`、設問ダイアログで選択肢全文を返す）。
+ * 残存テキスト判定だけで Enter を撃つと選択肢を誤選択する＝ファイル書き込みを勝手に
+ * 承認する実害になる。ダイアログのフッター文言を列挙する方式は取りこぼす
+ * （承認ダイアログは `Esc to cancel \u00b7 Tab to amend` で `Enter to select` ではない）ため、
+ * **バーが見えている時だけ入力欄として信じる** fail-closed 側で判定する。
+ * 実測ではダイアログ表示中の viewport にモード行は 1 行も無い（設問・承認とも確認済み）。
+ *
+ * 判定は「末尾から常駐 TUI 行を読み飛ばした最初の行がバーか」。バーの直下しか見ないので、
+ * 会話本文が偶然モード記号で始まっても拾わない。
+ */
+export function claudeComposerBarVisible(screen: string): boolean {
+  const lines = screen
+    .split("\n")
+    .map((line) => stripSgr(line).trimEnd())
+    .filter((line) => line.trim() !== "");
+  let index = lines.length - 1;
+  while (index >= 0 && isTrailingTuiLine(lines[index] ?? "")) index -= 1;
+  const candidate = lines[index];
+  return candidate !== undefined && isComposerBarLine(candidate);
+}
+
+/**
+ * 送信確定ループ 1 フレーム分の判定（純ロジック, TESTABLE）。
+ * - `submitted`: バーが見えていて入力欄に実テキストが無い＝送信が成立した唯一の証拠。
+ * - `pending`: バーが見えていて実テキストが残っている＝もう一度 Enter を撃つ。
+ * - `dialog`: フッターでダイアログと確認できた。Enter を撃つと選択肢を誤操作する。
+ * - `unknown`: capture 不能、またはバーもダイアログも判別できない未知のフレーム。
+ *
+ * 「撃つな」と「送信できた」を同一視しないため 4 値に分ける（同一視すると capture が
+ * 一度失敗しただけで無言の配送済みレシートになる）。薄字のプロンプト提案・プレースホルダーは
+ * 実テキストに数えない（提案を残存と誤認して勝手に送信した実障害 2026-09-03 と同じ判定）。
+ */
+export type SubmitFrameVerdict = "submitted" | "pending" | "dialog" | "unknown";
+
+export function classifySubmitFrame(ansiScreen: string | null): SubmitFrameVerdict {
+  if (ansiScreen === null) return "unknown";
+  // ダイアログは積極判定を優先する（バーが見えていても選択肢へ Enter を撃たない）。
+  if (screenShowsDialogFooter(ansiScreen)) return "dialog";
+  if (!claudeComposerBarVisible(ansiScreen)) return "unknown";
+  return inputBoxHasRealPendingText(ansiScreen) ? "pending" : "submitted";
+}
+
+/** 送信確定ループの結果。`blocked` は本文を 1 キーも打てずに諦めた（非配達が確定）。 */
+export type SubmitOutcome = "submitted" | "blocked" | "unconfirmed";
+
+/** 送信確定ループの Enter 再送上限（tmux / herdr 共通）。 */
+export const SUBMIT_ATTEMPT_LIMIT = 4;
+
 /** reattach の型付き結果。 */
 export type ReattachResult =
   | { kind: "attached"; info: SessionInfo; recentOutput: string }
@@ -672,6 +805,10 @@ export class TmuxSessionManager {
   private readonly protocolVersion: number;
   /** clearInputBox の C-u 1回ごとの反映待ち ms（herdr 側と同じ既定 150ms。テスト注入用）。 */
   private readonly clearKeyDelayMs: number;
+  /** 本文送出 → Enter の間隔 ms（Ink の再描画待ち。テスト注入用）。 */
+  private readonly submitDelayMs: number;
+  /** Enter → 送信成立確認 の間隔 ms（テスト注入用）。 */
+  private readonly submitVerifyDelayMs: number;
 
   constructor(options: {
     runner?: TmuxCommandRunner;
@@ -680,12 +817,16 @@ export class TmuxSessionManager {
     protocolVersion?: number;
     loginTiming?: { delayMs?: number; pollMs?: number; settleMs?: number };
     clearKeyDelayMs?: number;
+    submitDelayMs?: number;
+    submitVerifyDelayMs?: number;
   } = {}) {
     this.runner = options.runner ?? processTmuxCommandRunner();
     this.store = options.store ?? new SessionMetadataStore();
     this.captureLines = options.captureLines ?? 50;
     this.protocolVersion = options.protocolVersion ?? PROTOCOL_V1;
     this.clearKeyDelayMs = options.clearKeyDelayMs ?? 150;
+    this.submitDelayMs = options.submitDelayMs ?? 150;
+    this.submitVerifyDelayMs = options.submitVerifyDelayMs ?? 700;
     this.loginTiming = {
       delayMs: options.loginTiming?.delayMs ?? 150,
       pollMs: options.loginTiming?.pollMs ?? 250,
@@ -831,10 +972,20 @@ export class TmuxSessionManager {
     // - それ以外（旧版の queued 書き戻し / Mac 側の下書き）→ 従来どおり Enter で独立送信し切る。
     // 判定は ANSI で行い、薄字（faint）のプロンプト提案/プレースホルダーを実テキストと
     // 数えない（実障害 2026-09-03: 提案を残留と誤認し Enter で勝手に送信していた）。
+    // 残存の有無は **composer フレームでだけ** 意味を持つ。ダイアログ表示中の
+    // `inputBoxRealText` はカーソル行（`1. Yes` 等）を返すので、これを残存と信じて
+    // Enter を撃つと選択肢を誤確定する（実測 2.1.278）。
     const ansiScreen = await this.captureVisibleScreenAnsiOrNull(name);
-    const pending = ansiScreen !== null && inputBoxHasRealPendingText(ansiScreen)
-      ? (inputBoxRealText(ansiScreen) ?? "")
-      : "";
+    const frame = classifySubmitFrame(ansiScreen);
+    if (frame === "dialog") {
+      // 本文を 1 キーも打たずに諦める（ダイアログへ打ち込むより確実に安全）。
+      // 非配達が確定しているので、hub は uncertain に積まず失敗として片付ける。
+      // 見逃し側（未知フレーム）は従来どおり注入へ進む＝送信が丸ごと不能にはならない。
+      throw new ChatInjectionRejectedError(
+        "ダイアログの表示中はメッセージを送信できません（アプリで選択肢に答えてから送り直してください）",
+      );
+    }
+    const pending = frame === "pending" ? (inputBoxRealText(ansiScreen ?? "") ?? "") : "";
     if (pending.length > 0) {
       const recorded = options.recordedPromptText?.() ?? null;
       if (recorded !== null && inputBoxTextMatchesRecordedPrompt(pending, recorded)) {
@@ -845,9 +996,14 @@ export class TmuxSessionManager {
             "restored prompt could not be cleared from the input box (中断で書き戻された発話が残存)",
           );
         }
-      } else {
-        await this.sendKeys(name, ["Enter"]);
-        await new Promise((resolve) => setTimeout(resolve, 300));
+      } else if ((await this.submitTypedText(name)) !== "submitted") {
+        // 残存を送信し切れないまま本文を打つと、今回の本文が残存の後ろへ連結されて
+        // 1 メッセージになる（実機FB 2026-07-29）。2.1.277+ は残存に不可視文字があると
+        // 1 回目の Enter で送信せず確認待ちにするため、裸の Enter 1 発では流し切れない。
+        // 流せなかったら何も打たずに失敗させ、明示再送へ倒す（「重複より欠落」）。
+        throw new ChatInjectionRejectedError(
+          "入力欄に残っていた文字を送り切れなかったため、メッセージを送信しませんでした（連結送信の防止）",
+        );
       }
     }
     // 入力欄がシェルモード（プロンプト `!`）のまま残っていると、注入した通常メッセージが
@@ -856,8 +1012,58 @@ export class TmuxSessionManager {
     // 常に通常モードから始めるのが決定的で安全（herdr 側 exitShellMode と同じ防御）。
     await this.exitShellMode(name);
     await this.sendKeys(name, [text], true);
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    await this.sendKeys(name, ["Enter"]);
+    if ((await this.submitTypedText(name)) !== "submitted") options.onUnconfirmedSubmit?.();
+  }
+
+  /**
+   * 入力済みの本文を Enter で送信し、成立を確認するまで上限つきで Enter を撃ち直す
+   * （herdr 側 `sendTextSubmit` の送信確定ループと同型）。
+   *
+   * 1 回の Enter では送信が成立しない既知の経路:
+   * - **不可視文字の確認待ち（2.1.277+）**: 本文にゼロ幅文字などが含まれていると、最初の
+   *   Enter は送信せず除去だけ行い、「Removed N invisible characters · review and press
+   *   Enter to send」を出して入力欄に本文を残す（2.1.278 実測）。旧実装はここで戻っていたため、
+   *   本文が入力欄に滞留したまま iOS へ配送済みレシートを返し、次の送信の冒頭 flush で
+   *   ようやく 1 通遅れて届いていた。
+   * - Ink の再描画中に CR が飲まれる場合（herdr で実測済みの同型事象）。
+   *
+   * 送信済みの空入力への Enter は no-op なので、余分な Enter で二重送信にはならない。
+   * 打ち切り判定は `submitSettledFromScreen`（同一フレームから「ダイアログでない」＋
+   * 「実テキストが無い」を導く fail-closed 判定）に委ね、herdr 側と同じ規則を共有する。
+   *
+   * 待ち時間は固定 700ms（`submitVerifyDelayMs`）で、短周期ポーリングにはしない:
+   * 描画途中のフレームを捕まえるとボトムバーが欠けて「ダイアログ」と誤判定し、
+   * 撃ち直すべき場面で黙って打ち切ってしまう（＝この修正が潰した不具合の再発）。
+   * 1 通あたり約 +850ms のコストは iOS の ACK 予算 18s の内側に収まる。
+   *
+   * 割り切り: ループ中（約 0.85〜3.4s）に Mac 側で打ち始めた下書きは「未送信テキスト」に
+   * 見えるため Enter で送られ得る（herdr では既存の挙動）。冒頭の残存判定が先に効くので窓は狭い。
+   *
+   * @returns 送信成立を確認できたら true。上限まで撃っても確認できなければ false
+   *   （呼び出し側が `onUnconfirmedSubmit` で監査ログへ残す。throw はしない — 実際には
+   *   送信済みかもしれない本文を明示再送へ倒すと二重送信になるため）。
+   */
+  private async submitTypedText(name: string): Promise<SubmitOutcome> {
+    for (let attempt = 0; attempt < SUBMIT_ATTEMPT_LIMIT; attempt += 1) {
+      // **撃つ前に必ずフレームを見る**。ダイアログ表示中・判定不能のまま Enter を撃つと
+      // 選択肢を誤操作する（承認ダイアログならファイル書き込みを勝手に承認する）。
+      const before = classifySubmitFrame(await this.captureVisibleScreenAnsiOrNull(name));
+      if (before === "dialog") return "blocked";
+      // 「撃つ前に入力欄が空」は送信成立の証拠にならない（本文を打った直後にこれなら、
+      // 打鍵が入力欄へ届いていない＝ RC limbo 等）。打ち切らずに Enter は必ず 1 回撃つ
+      // （空 composer への Enter は no-op。薄字の提案は実テキストに数えないので送らない）。
+      await new Promise((resolve) => setTimeout(resolve, this.submitDelayMs));
+      await this.sendKeys(name, ["Enter"]);
+      await new Promise((resolve) => setTimeout(resolve, this.submitVerifyDelayMs));
+      const after = classifySubmitFrame(await this.captureVisibleScreenAnsiOrNull(name));
+      if (after === "submitted") return "submitted";
+      // 撃った**後**にダイアログが出たのは、本文が送られてそれが開いた場合
+      // （`/remote-control` など）。送信は成立しているので打ち切る。
+      if (after === "dialog") return "submitted";
+      // 未知のフレームでは撃ち続けない（従来どおり Enter 1 発で止め、未確定として報告する）。
+      if (before === "unknown" || after === "unknown") return "unconfirmed";
+    }
+    return "unconfirmed";
   }
 
   /**

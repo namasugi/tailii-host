@@ -1,0 +1,45 @@
+
+
+[38;5;246m✻[39m [38;5;246mBrewed for 3s · done 7:18 AM[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mCreate a file named probe.txt containing the word hello, using the Write tool.[39m
+
+[38;5;211m[49m⏺[39m [1mWrite[0m(]8;id=43ukfk;file:///private/tmp/claude-502/-Users-namasugi-Documents-ClaudeCode-code0630/b001f38b-439c-4b13-bb40-d4479e357ace/scratchpad/dlg278/probe.txt\probe.txt]8;;\)
+[38;5;246m  ⎿  [38;5;239mUser rejected write to [1mprobe.txt[0m
+     [2m[38;5;231m 1 hello[0m
+
+[38;5;246m✻[39m [38;5;246mSautéed for 3s · done 7:20 AM[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mCall the AskUserQuestion tool right now with one single-select question "Pick one" (header "Pick") and two options Alpha and Beta, each with a description. No preview.[39m
+  [38;5;231mNothing else before the tool call.[39m
+
+[38;5;246m[49m⏺ [39mUser declined to answer questions
+[38;5;246m  ⎿  · Pick one (Alpha / Beta)[39m
+
+[38;5;246m✻[39m [38;5;246mBrewed for 2s · done 7:29 AM[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mguard e2e zerowidth: reply with just OK[39m
+
+[38;5;231m[49m⏺[39m OK
+
+[38;5;246m✻[39m [38;5;246mChurned for 1s · done 7:29 AM[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mCall the AskUserQuestion tool right now with one single-select question "Pick two" (header "Pick2") and two options Alpha and Beta, each with a description. No [39m
+  [38;5;231mpreview. Nothing else before the tool call.[39m
+
+[38;5;246m[49m⏺ [39mUser answered Claude's questions:
+[38;5;246m  ⎿  · Pick two → freeanswer[39m
+
+[38;5;231m⏺[39m The user answered "freeanswer" for the Pick two question.
+
+[38;5;246m✻[39m [38;5;246mCogitated for 3s · done 7:31 AM[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mCount slowly from 1 to 40, one number per line, with a short sentence about each number.[39m
+
+[38;5;174m[49m✶[39m [38;5;174mFluttering… [38;5;246m(0s · thinking)[39m
+[38;5;246m  ⎿  Tip: Use /focus to see just your prompt, a one-line summary of the work, and the response[39m
+
+[38;5;244m──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[38;5;246m❯ [39m
+[38;5;244m──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246m⏸ manual mode on · esc to interrupt · ← for agents[39m

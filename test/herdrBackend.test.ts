@@ -156,6 +156,29 @@ describe("inputBoxTextIncludesProbe", () => {
     // 先に走るため実発生は稀。REFUTE レビュー P2）。
     expect(inputBoxTextIncludesProbe("git status を\n見て", "を見て")).toBe(true);
   });
+
+  test("不可視文字は両辺から落として照合する（2.1.277+ で入力欄からだけ消える）", () => {
+    const zwsp = String.fromCodePoint(0x200b);
+    // 送信本文にはゼロ幅文字があるが、端末セル（capture）には載らない。
+    expect(inputBoxTextIncludesProbe("確認したいので、ZQ", `確認し${zwsp}たいので、ZQ`)).toBe(true);
+    // 逆向き（入力欄側にだけ残る）でも一致する。
+    expect(inputBoxTextIncludesProbe(`確認し${zwsp}たいので、ZQ`, "確認したいので、ZQ")).toBe(true);
+    // 不可視文字だけの probe は照合材料にならない（従来の空 probe と同じ扱い）。
+    expect(inputBoxTextIncludesProbe("何か入っている", zwsp)).toBe(false);
+  });
+});
+
+describe("typedTextProbe（不可視文字）", () => {
+  test("probe は不可視文字を除いた可視本文から取る", () => {
+    const zwsp = String.fromCodePoint(0x200b);
+    expect(typedTextProbe(`abc${zwsp}def`)).toBe("abcdef");
+    // 末尾 24 字は「可視 24 字」になる（不可視混じりで短くならない）。
+    const body = "あ".repeat(30);
+    const dirty = body.split("").join(zwsp);
+    expect(typedTextProbe(dirty)).toBe("あ".repeat(24));
+    // 不可視文字だけの本文は検証不能（null）。
+    expect(typedTextProbe(`${zwsp}${String.fromCodePoint(0xfeff)}`)).toBeNull();
+  });
 });
 
 describe("HerdrSessionManager", () => {
@@ -623,6 +646,10 @@ describe("HerdrSessionManager", () => {
     // composer スクロールで先頭行が窓外: 末尾 24 字以上が一致すれば同文。
     const long = "あ".repeat(40) + "い".repeat(40);
     expect(inputBoxTextMatchesRecordedPrompt("い".repeat(30), long)).toBe(true);
+    // 2.1.277+ は送信時に不可視文字を落とすため、記録本文と入力欄で食い違う。
+    const zwsp = String.fromCodePoint(0x200b);
+    expect(inputBoxTextMatchesRecordedPrompt("中周を1枚足す", `中周を${zwsp}1枚足す`)).toBe(true);
+    expect(inputBoxTextMatchesRecordedPrompt(`中周を${zwsp}1枚足す`, "中周を1枚足す")).toBe(true);
     // 短い断片の末尾一致は偶然（Mac 側の下書き）とみなして不一致。
     expect(inputBoxTextMatchesRecordedPrompt("い".repeat(10), long)).toBe(false);
   });
@@ -910,14 +937,17 @@ describe("HerdrSessionManager", () => {
       submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
+    // 残存が居座る画面では、本文を打つ前の残留 flush が成立しない時点で失敗する
+    // （2.1.277+ は不可視文字入りの残存を 1 回の Enter で流せないため、裸の Enter で
+    //  流せたつもりになると今回の本文が残存の後ろへ連結される）。
     await expect(manager.sendTextSubmit("s-a", "重要なメッセージ")).rejects.toThrow(
-      /did not reach the input box/,
+      /送り切れなかった/,
     );
-    // 本文の投入は 1 回だけ（クリアを確信できないまま重ね打ちしない）。
+    // 本文は 1 文字も打っていない（クリアを確信できないまま重ね打ちしない）。
     const bodySends = runner.recorded.filter(
       (args) => args[1] === "send-text" && args[3] === "重要なメッセージ",
     );
-    expect(bodySends).toHaveLength(1);
+    expect(bodySends).toHaveLength(0);
   });
 
   test("sendTextSubmit: composer がスクロールして先頭行が窓外でも末尾側 probe で反映済みと判定する", async () => {

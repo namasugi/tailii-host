@@ -22,6 +22,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { PROTOCOL_V1, type ControlMessage, type SessionInfo } from "../protocol.js";
+import { normalizeForTextMatch, stripInvisibleForComparison } from "../shared/invisibleText.js";
 import {
   HERDR_PANE_ID_PATTERN,
   SessionMetadataStore,
@@ -38,7 +39,11 @@ import {
   LoginCodeError,
   paneCommandLooksLikeAgent,
   screenInLoginFlow,
+  ChatInjectionRejectedError,
+  classifySubmitFrame,
+  SUBMIT_ATTEMPT_LIMIT,
   submitLoginCode,
+  type SubmitOutcome,
   type CapturePaneOptions,
   type ClaudeInputBox,
   type ReattachResult,
@@ -193,7 +198,10 @@ export function screenHasSelectionFooter(screen: string): boolean {
  * 落とさないと末尾24字に `!` が含まれるとき反映検証が失敗する。
  */
 export function typedTextProbe(text: string): string | null {
-  const lines = text
+  // 不可視文字は端末のセルに載らない（capture に出ない）ため、probe に混ざると反映検証が
+  // 構造的に偽陰性になる。probe は不可視文字を除いた可視本文から取る
+  // （照合側 `inputBoxTextIncludesProbe` も両辺から落とすので規則は一致する）。
+  const lines = stripInvisibleForComparison(text)
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
@@ -210,13 +218,12 @@ export function typedTextProbe(text: string): string | null {
  * extractClaudeInputBox は表示行を trim + "\n" 連結で返すため、probe が入力欄の
  * 行折り返しをまたぐと生の includes は絶対に一致しない（全角24字=48桁 > 内幅で必発）。
  * この偽陰性が「反映済み本文の再投入 = 初回送信の本文二重化」の根因だった（実機5件）。
- * 空白類（折り返しの改行・trim 痕・全角空白含む）を両辺から除去して照合する。
+ * 空白類（折り返しの改行・trim 痕・全角空白含む）と不可視文字を両辺から除去して照合する。
  */
 export function inputBoxTextIncludesProbe(boxText: string, probe: string): boolean {
-  const strip = (value: string): string => value.replace(/\s+/g, "");
-  const needle = strip(probe);
+  const needle = normalizeForTextMatch(probe);
   if (needle.length === 0) return false;
-  return strip(boxText).includes(needle);
+  return normalizeForTextMatch(boxText).includes(needle);
 }
 
 /** herdr CLI の JSON stdout から `result` を取り出す。JSON でない/エラー封筒は null。 */
@@ -660,7 +667,20 @@ export class HerdrSessionManager {
     //   二重に届く（実機 2026-09-08: 中断→別文を送信で中断前の発話が重複投稿）。
     // - それ以外（旧版の queued 書き戻し / Mac 側の下書き）→ 従来どおり Enter で独立メッセージ
     //   として送信し切る（アプリの楽観バブルとも一致する）。空入力への Enter は no-op。
-    const pending = await this.inputBoxPendingText(name);
+    //
+    // 残存の有無は **composer フレームでだけ** 意味を持つ。ダイアログ表示中の
+    // `inputBoxRealText` はカーソル行（`1. Yes` 等）を返すので、これを残存と信じて Enter を
+    // 撃つと選択肢を誤確定する（実測 2.1.278: 承認ダイアログのフッターは `Enter to select`
+    // ではないので上の Esc では閉じられない）。ここまで来てバーが見えないなら、本文を
+    // 1 キーも打たずに諦める。
+    // 見逃し側（未知フレーム）は従来どおり注入へ進む＝送信が丸ごと不能にはならない。
+    const injectFrame = classifySubmitFrame(await this.captureVisibleScreenAnsiOrNull(name));
+    if (injectFrame === "dialog") {
+      throw new ChatInjectionRejectedError(
+        "ダイアログの表示中はメッセージを送信できません（アプリで選択肢に答えてから送り直してください）",
+      );
+    }
+    const pending = injectFrame === "pending" ? await this.inputBoxPendingText(name) : "";
     if (pending.length > 0) {
       const recorded = options.recordedPromptText?.() ?? null;
       if (recorded !== null && inputBoxTextMatchesRecordedPrompt(pending, recorded)) {
@@ -672,9 +692,14 @@ export class HerdrSessionManager {
             "restored prompt could not be cleared from the input box (中断で書き戻された発話が残存)",
           );
         }
-      } else {
-        await this.sendKeys(name, ["Enter"]);
-        await new Promise((resolve) => setTimeout(resolve, this.submitDelayMs));
+      } else if ((await this.submitTypedText(name)) !== "submitted") {
+        // 残存を送信し切れないまま本文を打つと、今回の本文が残存の後ろへ連結されて
+        // 1 メッセージになる（実機FB 2026-07-29）。2.1.277+ は残存に不可視文字があると
+        // 1 回目の Enter で送信せず確認待ちにするため、裸の Enter 1 発では流し切れない。
+        // 流せなかったら何も打たずに失敗させ、明示再送へ倒す（「重複より欠落」）。
+        throw new ChatInjectionRejectedError(
+          "入力欄に残っていた文字を送り切れなかったため、メッセージを送信しませんでした（連結送信の防止）",
+        );
       }
     }
     // 前回の注入が途中で終わった等でシェルモード（プロンプト `!`）に入ったままの入力欄へ
@@ -724,17 +749,42 @@ export class HerdrSessionManager {
         "typed text did not reach the input box (RC limbo / ダイアログ表示中 / 入力欄不可視のいずれか)",
       );
     }
-    for (let attempt = 0; attempt < 4; attempt += 1) {
+    if ((await this.submitTypedText(name)) !== "submitted") options.onUnconfirmedSubmit?.();
+  }
+
+  /**
+   * 入力済みの本文を Enter で送信し、成立を確認するまで上限つきで撃ち直す（tmux 側と同型）。
+   *
+   * 1 回の Enter では送信が成立しない既知の経路:
+   * - Ink の再描画中に CR が飲まれる（実測 2026-07-22）。
+   * - **不可視文字の確認待ち（2.1.277+）**: 本文にゼロ幅文字などが含まれていると、最初の
+   *   Enter は送信せず除去だけ行い「Removed N invisible characters · review and press Enter
+   *   to send」を出して入力欄に本文を残す（2.1.278 実測）。
+   *
+   * @returns 送信成立を確認できたら true。上限まで撃っても確認できなければ false。
+   */
+  private async submitTypedText(name: string): Promise<SubmitOutcome> {
+    for (let attempt = 0; attempt < SUBMIT_ATTEMPT_LIMIT; attempt += 1) {
+      // **撃つ前に必ずフレームを見る**。ダイアログ表示中・判定不能のまま Enter を撃つと
+      // 選択肢を誤操作する（承認ダイアログならファイル書き込みを勝手に承認する）。
+      const before = classifySubmitFrame(await this.captureVisibleScreenAnsiOrNull(name));
+      if (before === "dialog") return "blocked";
+      // 「撃つ前に入力欄が空」は送信成立の証拠にならない（本文を打った直後にこれなら、
+      // 打鍵が入力欄へ届いていない＝ RC limbo 等）。打ち切らずに Enter は必ず 1 回撃つ
+      // （空 composer への Enter は no-op。薄字の提案は実テキストに数えないので送らない）。
       await new Promise((resolve) => setTimeout(resolve, this.submitDelayMs));
       await this.sendKeys(name, ["Enter"]);
       await new Promise((resolve) => setTimeout(resolve, this.submitVerifyDelayMs));
-      // 送出した本文が選択ダイアログを開いた場合（RC active 中の /remote-control 等）、
-      // ダイアログのカーソル行（❯ Continue）を未送信テキストと誤認して Enter を再送すると
-      // 選択肢を誤操作してダイアログを閉じてしまう（実障害: 転写カードが一瞬で消える）。
-      // ダイアログ表示中は送信成立として扱い、以降の操作は転写カード側に任せる。
-      if (await this.selectionDialogVisible(name)) return;
-      if (!(await this.inputBoxHasPendingText(name))) return;
+      const after = classifySubmitFrame(await this.captureVisibleScreenAnsiOrNull(name));
+      if (after === "submitted") return "submitted";
+      // 撃った**後**にバーが消えたのは、本文が送られてダイアログが開いた場合
+      // （RC active 中の `/remote-control` など。実障害 2026-07-28 の誤 Continue はここ）。
+      // 送信は成立しているので打ち切る。capture 不能は配送を主張しない。
+      if (after === "dialog") return "submitted";
+      // 未知のフレームでは撃ち続けない（従来どおり Enter 1 発で止め、未確定として報告する）。
+      if (before === "unknown" || after === "unknown") return "unconfirmed";
     }
+    return "unconfirmed";
   }
 
   /**
@@ -903,21 +953,6 @@ export class HerdrSessionManager {
     }
   }
 
-  /**
-   * claude TUI の入力欄に未送信テキストが残っているか。
-   * 送信済みメッセージのエコーも `❯` で始まるため、入力欄（末尾の罫線に挟まれた領域）
-   * だけを見る。判定不能（読取失敗・入力欄を特定できない）は false = 送信成立扱い
-   * （fail-open。誤リトライしても空入力 Enter の no-op で無害だが、無限再送はしない側に倒す）。
-   */
-  private async inputBoxHasPendingText(name: string): Promise<boolean> {
-    try {
-      // ANSI で取り、薄字（faint）のプロンプト提案/プレースホルダーを実テキストと数えない
-      // （実障害 2026-09-03: 提案を残留テキストと誤認し Enter で勝手に送信していた）。
-      return inputBoxHasRealPendingText(await this.captureVisibleScreenAnsi(name));
-    } catch {
-      return false;
-    }
-  }
 
   /**
    * 入力欄の未送信「実テキスト」（faint の提案/プレースホルダーを除く）。判定不能は ""
@@ -941,6 +976,15 @@ export class HerdrSessionManager {
       throw new HerdrFailedError(["pane", "read", name], 1, "pane not found");
     }
     return this.readPane(target, ["--source", "visible", "--format", "ansi"]);
+  }
+
+  /** 判定不能（capture 失敗）を null で返す ANSI キャプチャ（送信確定ループ用）。 */
+  private async captureVisibleScreenAnsiOrNull(name: string): Promise<string | null> {
+    try {
+      return await this.captureVisibleScreenAnsi(name);
+    } catch {
+      return null;
+    }
   }
 
   /** SessionBackend: プロンプト提案抽出用の viewport ANSI キャプチャ。 */
