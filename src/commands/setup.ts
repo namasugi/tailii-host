@@ -18,6 +18,8 @@
 //   --session <name>      tmux セッション名。指定で payload v2（無指定は従来 v1）。
 //   --session-cwd <cwd>   tmux セッションの作業ディレクトリ（任意、v2 のみ有効）。
 //   --host <ip>           接続先ホストを明示上書き（自動選定を使わない場合のみ）。通常は不要。
+//   --no-quic             QUIC ゲートウェイの設置（launchd の載せ直し）を飛ばし、SSH のみでペアリングする。
+//                         稼働中のゲートウェイ（= 接続中の端末）を落とさずに別端末を追加したいとき用。
 //   --code                後方互換の無効フラグ（通常モードが常に直接入力サーバも起動するため）。
 //   --emit-payload        副作用なし検証モード。keygen/QR/ファイル操作を行わず payload JSON を stdout に出すだけ。
 //                         既存の鍵があれば読むが無くても擬似値で継続。
@@ -285,6 +287,8 @@ interface SetupArgs {
   sessionCwd?: string;
   /** payload / 待受表示に使うホストを明示指定（Tailscale IP など）。未指定なら detectLanIP()。 */
   host?: string;
+  /** QUIC ゲートウェイの設置を飛ばす（稼働中のゲートウェイを載せ直さない）。 */
+  skipQuic?: boolean;
 }
 
 function parseSetupArgs(argv: string[]): SetupArgs {
@@ -299,6 +303,9 @@ function parseSetupArgs(argv: string[]): SetupArgs {
         break;
       case "--host":
         if (i + 1 < argv.length) args.host = argv[++i];
+        break;
+      case "--no-quic":
+        args.skipQuic = true;
         break;
       case "--session":
         if (i + 1 < argv.length) args.sessionName = argv[++i];
@@ -372,7 +379,11 @@ export async function runSetupCommand(argv: string[]): Promise<number> {
 
   // --- 2.7) QUIC ゲートウェイ（任意機能）: 資格情報生成 + launchd 常駐 ---
   // 失敗しても SSH-only でペアリングを続行する（QUIC は優先経路であって必須ではない）。
-  const quic = await setupQuicGateway();
+  // --no-quic: 稼働中のゲートウェイを bootout/bootstrap で載せ直さない（接続中の端末を落とさない）。
+  // payload に quic を載せないので、新端末は SSH のみで繋ぐ（後から quic-info で取得できる）。
+  const quic = args.skipQuic
+    ? (process.stdout.write("QUIC ゲートウェイ: --no-quic のため設置を飛ばします（SSH のみでペアリングします）。\n"), null)
+    : await setupQuicGateway();
 
   // --- 3) ペアリング payload を構築 ---
   // 接続先は自動選定（Tailscale があれば優先・無ければ LAN）。--host で明示上書きも可。
