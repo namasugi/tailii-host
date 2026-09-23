@@ -506,8 +506,9 @@ describe("claudeInnerCommand", () => {
     expect(claudeInnerCommand({ permissionMode: "plan" })).toBe("claude --permission-mode plan");
   });
 
-  test("default モードはフラグ無しと等価なので付けない", () => {
-    expect(claudeInnerCommand({ permissionMode: "default" })).toBe("claude");
+  test("default モードも明示して渡す（既定がオートの環境で確認モードを固定する）", () => {
+    // "default" も明示する（フラグ無しの既定は 2.1.27x でオートになり得る。確認モードの選択を固定）。
+    expect(claudeInnerCommand({ permissionMode: "default" })).toBe("claude --permission-mode default");
   });
 
   test("不正なモデル slug / 未知モードは無視する（コマンド注入防止）", () => {

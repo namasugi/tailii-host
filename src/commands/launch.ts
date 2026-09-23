@@ -172,7 +172,9 @@ const CLAUDE_RESUME_THRESHOLD_ENV =
 /**
  * claude 新規起動の inner コマンドを組み立てる（起動前モデル/モード選択の反映）。
  * @param model 省略/不正文字は無視（アカウント既定モデル）。alias（'opus' 等）と完全 id の両方可。
- * @param permissionMode 既知 4 値のみ採用。"default" はフラグ無しと等価なので付けない。
+ * @param permissionMode 既知 4 値のみ採用。"default" も明示して渡す — Claude Code 2.1.27x から
+ *   フラグ無しの既定はアカウント設定しだいでオートモードになり得るため、利用者が「確認モード」を
+ *   選んだ意図（承認カードを出す）はフラグで固定する。nil（未選択）だけがフラグ無し。
  * @param effort 既知 5 値のみ採用（起動前の工数選択。TUI 未起動のため `/effort` は届かない）。
  */
 export function claudeInnerCommand(opts: {
@@ -186,11 +188,7 @@ export function claudeInnerCommand(opts: {
   if (opts.model && CODEX_MODEL_SAFE.test(opts.model)) cmd += ` --model ${opts.model}`;
   const worktree = claudeWorktreeArgument(opts.worktree);
   if (worktree !== null) cmd += ` --worktree ${shellSingleQuote(worktree)}`;
-  if (
-    opts.permissionMode &&
-    opts.permissionMode !== "default" &&
-    CLAUDE_PERMISSION_MODES.has(opts.permissionMode)
-  ) {
+  if (opts.permissionMode && CLAUDE_PERMISSION_MODES.has(opts.permissionMode)) {
     cmd += ` --permission-mode ${opts.permissionMode}`;
   }
   if (opts.effort && CLAUDE_EFFORT_LEVELS.has(opts.effort)) cmd += ` --effort ${opts.effort}`;
