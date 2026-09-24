@@ -9,6 +9,20 @@ import {
 import { makeTempDir } from "./helpers.js";
 
 describe("parseSubagentTranscript", () => {
+  it("文脈圧縮の要約（isCompactSummary の user 行）はタイムラインに出さない", () => {
+    const fixture = [
+      JSON.stringify({ timestamp: "2026-07-12T01:02:03.456Z", type: "user", message: { role: "user", content: "調べて" } }),
+      JSON.stringify({ type: "system", subtype: "compact_boundary", content: "Conversation compacted" }),
+      JSON.stringify({
+        timestamp: "2026-07-12T01:02:04.000Z", type: "user", isVisibleInTranscriptOnly: true, isCompactSummary: true,
+        message: { role: "user", content: "This session is being continued from a previous conversation that ran out of context." },
+      }),
+    ].join("\n");
+    expect(parseSubagentTranscript(fixture).entries).toEqual([
+      { role: "user", text: "調べて", ts: 1_783_818_123_456 },
+    ]);
+  });
+
   it("user/assistant/tool_use/tool_result を表示行へ変換する", () => {
     const fixture = [
       JSON.stringify({

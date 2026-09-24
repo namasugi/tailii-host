@@ -7,6 +7,7 @@ import {
   rolloutPatchApplyActivities,
   rolloutResponseItemToolActivities,
 } from "../codex/codexToolActivity.js";
+import { isCompactSummaryRecord } from "../shared/compactSummary.js";
 import { stripInjectedReminderBlocks, stripReminderTagBlocks } from "../shared/harnessReminder.js";
 import { crossSessionOriginHint, crossSessionSenderLabel, presentCrossSessionMessage } from "../shared/crossSession.js";
 
@@ -108,6 +109,8 @@ export function parseSubagentTranscript(jsonl: string): SubagentTranscriptResult
     const message = object(record["message"]);
     const role = message?.["role"] ?? record["type"];
     if (role !== "user" && role !== "assistant") continue;
+    // サブエージェント自身の文脈圧縮の要約（isCompactSummary の user 行）は行動ではない。
+    if (isCompactSummaryRecord(record)) continue;
     const content = message?.["content"] ?? record["content"];
     if (forkSpawnCopyPending) {
       forkSpawnCopyPending = false;

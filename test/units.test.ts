@@ -1296,6 +1296,25 @@ describe("ClaudeSessionStore", () => {
     expect(list[0]?.updatedAt).toBe(Math.floor(Date.parse("2026-01-01T00:04:00Z") / 1000));
   });
 
+  test("圧縮の要約（isCompactSummary の user 行）は lastMessage / タイトルに採用しない", () => {
+    const root = makeTempDir("claude-sessions-compact-summary");
+    const slugDir = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slugDir, { recursive: true });
+    // 実測形（2.1.281）: compact_boundary → attachment 数行 → isCompactSummary の user 行。
+    const summary = '{"type":"user","isVisibleInTranscriptOnly":true,"isCompactSummary":true,"timestamp":"2026-01-01T00:03:00Z","message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\\n\\nSummary:"}}\n';
+    fs.writeFileSync(
+      path.join(slugDir, "kkkkkkkk-1111.jsonl"),
+      summary +
+        '{"type":"user","cwd":"/tmp/proj","timestamp":"2026-01-01T00:00:00Z","message":{"content":"最初の質問"}}\n' +
+        '{"type":"assistant","timestamp":"2026-01-01T00:01:00Z","message":{"content":[{"type":"text","text":"圧縮前の応答"}]}}\n' +
+        '{"type":"system","subtype":"compact_boundary","level":"info","content":"Conversation compacted","timestamp":"2026-01-01T00:02:00Z"}\n' +
+        summary,
+    );
+    const list = new ClaudeSessionStore(root).list();
+    expect(list[0]?.lastMessage).toBe("圧縮前の応答");
+    expect(list[0]?.title).toBe("最初の質問");
+  });
+
   test("assistant text 末尾へ追記された harness 注入（停止境界の背景通知）は lastMessage から除去する", () => {
     const root = makeTempDir("claude-sessions-assistant-reminder");
     const slugDir = path.join(root, "-tmp-proj");
@@ -1815,6 +1834,26 @@ describe("presentCrossSessionMessage", () => {
 });
 
 describe("searchClaudeSessions", () => {
+  test("圧縮の要約（isCompactSummary の user 行）は検索対象にしない（原文の行で当たる）", () => {
+    const root = makeTempDir("session-search-compact");
+    const slug = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slug, { recursive: true });
+    fs.writeFileSync(
+      path.join(slug, "ssssssss-search.jsonl"),
+      [
+        JSON.stringify({ type: "user", cwd: "/tmp/proj", timestamp: "2026-01-01T00:00:00Z", message: { content: "ログインが止まる" } }),
+        JSON.stringify({ type: "system", subtype: "compact_boundary", content: "Conversation compacted", timestamp: "2026-01-01T00:02:00Z" }),
+        JSON.stringify({ type: "user", isVisibleInTranscriptOnly: true, isCompactSummary: true, timestamp: "2026-01-01T00:02:00Z", message: { content: "This session is being continued from a previous conversation that ran out of context. needle-summary 「ログインが止まる」" } }),
+      ].join("\n") + "\n",
+    );
+    const store = new ClaudeSessionStore(root);
+
+    expect(searchClaudeSessions(store, "needle-summary").results).toEqual([]);
+    const hit = searchClaudeSessions(store, "ログインが止まる").results;
+    expect(hit).toHaveLength(1);
+    expect(hit[0]?.snippet).toBe("ログインが止まる");
+  });
+
   test("harness 注入（assistant 末尾の背景通知 / user のリマインダ）は検索対象にもスニペットにも出さない", () => {
     const root = makeTempDir("session-search-reminder");
     const slug = path.join(root, "-tmp-proj");

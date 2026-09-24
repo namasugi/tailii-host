@@ -3,6 +3,7 @@
 
 import * as fs from "node:fs";
 import type { ClaudeSessionInfo, SessionSearchResult } from "../protocol.js";
+import { isCompactSummaryRecord } from "../shared/compactSummary.js";
 import { stripInjectedReminderBlocks, stripReminderTagBlocks } from "../shared/harnessReminder.js";
 import { crossSessionOriginHint, crossSessionPreviewLine, presentCrossSessionMessage } from "../shared/crossSession.js";
 
@@ -128,6 +129,9 @@ function searchTranscriptFile(
     if (typeof parsed !== "object" || parsed === null) continue;
     const obj = parsed as Record<string, unknown>;
     if (obj["type"] !== "user" && obj["type"] !== "assistant") continue;
+    // 圧縮の要約は過去の発話の言い換えで、ヒットしても英文の要約がスニペットに出るだけ（原文は
+    // 圧縮前の行として同じ transcript に残るのでそちらで当たる）。
+    if (isCompactSummaryRecord(obj)) continue;
     const text = extractMessageText(obj);
     if (text === null) continue;
     const normalizedText = text.toLocaleLowerCase();

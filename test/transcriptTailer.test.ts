@@ -531,6 +531,37 @@ describe("TranscriptTailer", () => {
     ]);
   });
 
+  test("圧縮の要約（isCompactSummary の user 行）は発話バブルにせず、圧縮の注記だけを流す", async () => {
+    // 実測形（2.1.281, 2026-09-24）: compact_boundary → attachment 数行 → 要約の user 行。
+    const p = writeTranscript([
+      '{"type":"user","message":{"role":"user","content":"圧縮前の発話"},"uuid":"u1","timestamp":"2026-09-24T12:50:00.000Z"}',
+      '{"type":"system","subtype":"compact_boundary","level":"info","content":"Conversation compacted","compactMetadata":{"trigger":"auto","preTokens":968528,"postTokens":12899},"uuid":"cb1","timestamp":"2026-09-24T12:56:59.994Z"}',
+      '{"type":"attachment","attachment":{"type":"plan_mode"},"uuid":"at1","timestamp":"2026-09-24T12:56:59.995Z"}',
+      '{"type":"user","isVisibleInTranscriptOnly":true,"isCompactSummary":true,"message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\\n\\nSummary:\\n1. Primary Request and Intent:"},"uuid":"cs1","timestamp":"2026-09-24T12:56:59.576Z"}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"続きをやります"}]},"uuid":"a1","timestamp":"2026-09-24T12:57:10.000Z"}',
+    ]);
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
+    const chats = (await collect(tailer.streamTranscript(p))).filter((m) => m.type === "chat_output");
+    const rows = chats.map((m) => (m.type === "chat_output" ? [m.streamId, m.role] : null));
+    expect(rows).toEqual([
+      ["u1", "user"],
+      ["cb1", "system"],
+      ["a1", "assistant"],
+    ]);
+    // 要約はターンを始める発話ではない: 末尾の本物の発話は圧縮前のもののまま。
+    expect(findTrailingUserPromptText(p)).toBe("圧縮前の発話");
+  });
+
+  test("圧縮の要約は直前の中断マーカーを隠さない（末尾の終端判定）", () => {
+    const p = writeTranscript([
+      '{"type":"user","message":{"role":"user","content":"発話"},"uuid":"u1","timestamp":"2026-09-24T12:50:00.000Z"}',
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"uuid":"u2","timestamp":"2026-09-24T12:51:00.000Z"}',
+      '{"type":"system","subtype":"compact_boundary","level":"info","content":"Conversation compacted","uuid":"cb1","timestamp":"2026-09-24T12:52:00.000Z"}',
+      '{"type":"user","isVisibleInTranscriptOnly":true,"isCompactSummary":true,"message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context."},"uuid":"cs1","timestamp":"2026-09-24T12:52:00.000Z"}',
+    ]);
+    expect(findTrailingTurnEndMarkerMs(p)).toBe(Date.parse("2026-09-24T12:51:00.000Z"));
+  });
+
   test("assistant 行の fallback ブロックで切替を実時刻に告知し、pc:model も同じ行で切り替え、遅れて来る system 行は重複させない（system-notice）", async () => {
     const p = writeTranscript([
       '{"type":"assistant","message":{"role":"assistant","model":"claude-fable-5-1","content":[{"type":"text","text":"最初の応答"}]},"uuid":"a1"}',

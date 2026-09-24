@@ -11,6 +11,7 @@ import type { ClaudeSessionInfo } from "../protocol.js";
 import { isInsideBase } from "../shared/paths.js";
 import { stripInjectedReminderBlocks, stripReminderTagBlocks } from "../shared/harnessReminder.js";
 import { crossSessionOriginHint, crossSessionPreviewLine, presentCrossSessionMessage } from "../shared/crossSession.js";
+import { isCompactSummaryRecord } from "../shared/compactSummary.js";
 import { isInjectedSkillContent } from "../shared/skillInjection.js";
 
 /** タイトル抽出の最大長（先頭 ~60 字）。 */
@@ -439,6 +440,8 @@ function extractUserText(obj: Record<string, unknown>): string | null {
 
 /** user/assistant 行のメッセージ本文テキストを取り出し、先頭 maxLength 字へ整形する。 */
 function extractMessageText(obj: Record<string, unknown>, maxLength: number): string | null {
+  // 圧縮の要約（isCompactSummary の user 行）は発話ではないので提示しない（前の実発話へ遡る）。
+  if (isCompactSummaryRecord(obj)) return null;
   const message = obj["message"];
   if (typeof message !== "object" || message === null) return null;
   const content = (message as Record<string, unknown>)["content"];
