@@ -310,3 +310,40 @@ describe("hubProtocol pane_preview 封筒", () => {
     expect(decodeHubServerLine(line)).toBeNull();
   });
 });
+
+describe("hubProtocol codex plan mode / goal", () => {
+  test("codex_turn_submit は collaborationMode を往復し、未知値は拒否する", () => {
+    const base = {
+      type: "codex_turn_submit", id: "codex", session: "work", clientUserMessageId: "client-codex",
+      text: "計画", effort: null, approvalPolicy: null, sandbox: null, threadId: "thread", cwd: "/tmp/work",
+    } as const;
+    const plan: HubClientMessage = { ...base, collaborationMode: "plan" };
+    expect(decodeHubClientLine(encodeHubMessage(plan))).toEqual(plan);
+    // 旧 engine（フィールド無し）と null は「指定なし」として同じ形に落ちる。
+    expect(decodeHubClientLine(JSON.stringify(base))).toEqual(base);
+    expect(decodeHubClientLine(JSON.stringify({ ...base, collaborationMode: null }))).toEqual(base);
+    expect(decodeHubClientLine(JSON.stringify({ ...base, collaborationMode: "review" }))).toBeNull();
+  });
+
+  test("codex_goal_submit / codex_goal_result を往復し、不正 action / goal 形を拒否する", () => {
+    const get: HubClientMessage = {
+      type: "codex_goal_submit", id: "goal-1", session: "work", threadId: "thread", cwd: "/tmp/work", action: "get",
+    };
+    const set: HubClientMessage = {
+      type: "codex_goal_submit", id: "goal-2", session: "work", threadId: "thread", cwd: "/tmp/work",
+      action: "set", objective: "テストを緑にする", status: "active", tokenBudget: 200000,
+    };
+    const goal = {
+      threadId: "thread", objective: "テストを緑にする", status: "active", tokenBudget: 200000,
+      tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1,
+    };
+    const ok: HubServerMessage = { type: "codex_goal_result", id: "goal-2", status: "ok", goal };
+    const cleared: HubServerMessage = { type: "codex_goal_result", id: "goal-3", status: "ok", cleared: true };
+    const failed: HubServerMessage = { type: "codex_goal_result", id: "goal-4", status: "failed", error: "unsupported" };
+    for (const message of [get, set]) expect(decodeHubClientLine(encodeHubMessage(message))).toEqual(message);
+    for (const message of [ok, cleared, failed]) expect(decodeHubServerLine(encodeHubMessage(message))).toEqual(message);
+    expect(decodeHubClientLine(JSON.stringify({ ...get, action: "pause" }))).toBeNull();
+    expect(decodeHubClientLine(JSON.stringify({ ...set, tokenBudget: "many" }))).toBeNull();
+    expect(decodeHubServerLine(JSON.stringify({ ...ok, goal: { objective: "x" } }))).toBeNull();
+  });
+});

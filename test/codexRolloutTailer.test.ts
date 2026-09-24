@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import {
   CodexRolloutTailer,
+  COLLABORATION_MODE_STREAM_ID,
   CONTEXT_STREAM_ID,
   CONTEXT_WINDOW_STREAM_ID,
   HISTORY_BEGIN_STREAM_ID,
@@ -543,5 +544,129 @@ describe("CodexRolloutTailer.streamForCwd（有限 tail）", () => {
       (m) => m.type === "chat_output" && m.streamId === "pc:history-done",
     );
     expect(done.length).toBe(1);
+  });
+});
+
+describe("CodexRolloutTailer plan mode / goal（codex-plan-mode / codex-goal）", () => {
+  async function collect(tailer: CodexRolloutTailer, cwd: string): Promise<ControlMessage[]> {
+    const out: ControlMessage[] = [];
+    for await (const m of tailer.streamForCwd(cwd, null)) out.push(m);
+    return out;
+  }
+
+  test("item_completed/Plan を codex-plan- の assistant chat_output にし、<proposed_plan> の mirror は本文にしない", async () => {
+    const root = makeTempDir("codex-plan");
+    const cwd = makeTempDir("codex-plan-cwd");
+    const planText = "- README を作る\n- 1 文だけにする\n";
+    writeRollout(root, "2026/09/24", "r.jsonl", cwd, [
+      JSON.stringify({ type: "event_msg", payload: {
+        type: "task_started", turn_id: "turn-1", collaboration_mode_kind: "plan",
+      } }),
+      JSON.stringify({ type: "event_msg", payload: {
+        type: "item_completed", turn_id: "turn-1", item: { type: "Plan", id: "turn-1-plan", text: planText },
+      } }),
+      agentItem("msg-final", `<proposed_plan>\n${planText}</proposed_plan>`, "final_answer"),
+      JSON.stringify({ type: "event_msg", payload: {
+        type: "task_started", turn_id: "turn-2", collaboration_mode_kind: "plan",
+      } }),
+      JSON.stringify({ type: "event_msg", payload: {
+        type: "task_started", turn_id: "turn-3", collaboration_mode_kind: "default",
+      } }),
+    ]);
+    const tailer = new CodexRolloutTailer({ sessionsRoot: root, tailDeadlineMs: 0 });
+    const msgs = await collect(tailer, cwd);
+    const chats = msgs.filter((m): m is Extract<ControlMessage, { type: "chat_output" }> => m.type === "chat_output");
+    expect(chats.filter((c) => c.role === "assistant")).toEqual([
+      {
+        type: "chat_output", v: 1, streamId: "codex-plan-turn-1-plan", role: "assistant",
+        text: "- README を作る\n- 1 文だけにする", eof: true,
+      },
+    ]);
+    // 過去の turn の mode（task_started）は配らない（iOS のトグルを実績で上書きしない）。
+    expect(chats.filter((c) => c.streamId === COLLABORATION_MODE_STREAM_ID)).toEqual([]);
+  });
+
+  test("thread_goal_updated は状態 / 内容が変わったときだけ 🎯 注記にし、解除も 1 回だけ出す", async () => {
+    const root = makeTempDir("codex-goal");
+    const cwd = makeTempDir("codex-goal-cwd");
+    const goal = {
+      threadId: "abc", objective: "ベンチ整備", status: "active", tokenBudget: 1000,
+      tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1,
+    };
+    const goalEvent = (value: Record<string, unknown>): string =>
+      JSON.stringify({ type: "event_msg", payload: { type: "thread_goal_updated", threadId: "abc", goal: value } });
+    writeRollout(root, "2026/09/24", "r.jsonl", cwd, [
+      goalEvent(goal),
+      goalEvent({ ...goal, tokensUsed: 900, timeUsedSeconds: 120, updatedAt: 2 }),
+      goalEvent({ ...goal, status: "budgetLimited", updatedAt: 3 }),
+      JSON.stringify({ type: "event_msg", payload: { type: "thread_goal_cleared", threadId: "abc" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "thread_goal_cleared", threadId: "abc" } }),
+    ]);
+    const tailer = new CodexRolloutTailer({ sessionsRoot: root, tailDeadlineMs: 0 });
+    const msgs = await collect(tailer, cwd);
+    const notices = msgs.filter((m): m is Extract<ControlMessage, { type: "chat_output" }> =>
+      m.type === "chat_output" && m.role === "system" && m.streamId.startsWith("codex-notice-"));
+    expect(notices.map((n) => n.text)).toEqual([
+      "🎯 目標（追求中）: ベンチ整備",
+      "🎯 目標（トークン予算に到達）: ベンチ整備",
+      "🎯 目標を解除しました",
+    ]);
+  });
+});
+
+describe("CodexRolloutTailer plan mode / goal（2 周目の欠陥固定）", () => {
+  async function collect(tailer: CodexRolloutTailer, cwd: string): Promise<ControlMessage[]> {
+    const out: ControlMessage[] = [];
+    for await (const m of tailer.streamForCwd(cwd, null)) out.push(m);
+    return out;
+  }
+
+  test("一時停止 → 再開、解除 → 再設定 → 解除の 2 回目も別 streamId で注記する（iOS の既出照合で消えない）", async () => {
+    const root = makeTempDir("codex-goal-repeat");
+    const cwd = makeTempDir("codex-goal-repeat-cwd");
+    const goal = {
+      threadId: "abc", objective: "ベンチ整備", status: "active",
+      tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1,
+    };
+    const goalEvent = (value: Record<string, unknown>): string =>
+      JSON.stringify({ type: "event_msg", payload: { type: "thread_goal_updated", threadId: "abc", goal: value } });
+    const cleared = JSON.stringify({ type: "event_msg", payload: { type: "thread_goal_cleared", threadId: "abc" } });
+    writeRollout(root, "2026/09/24", "r.jsonl", cwd, [
+      goalEvent(goal),
+      goalEvent({ ...goal, status: "paused", updatedAt: 2 }),
+      goalEvent({ ...goal, status: "active", updatedAt: 3 }),
+      cleared,
+      goalEvent({ ...goal, createdAt: 10, updatedAt: 10 }),
+      cleared,
+    ]);
+    const tailer = new CodexRolloutTailer({ sessionsRoot: root, tailDeadlineMs: 0 });
+    const notices = (await collect(tailer, cwd)).filter((m): m is Extract<ControlMessage, { type: "chat_output" }> =>
+      m.type === "chat_output" && m.role === "system" && m.streamId.startsWith("codex-notice-"));
+    expect(notices.map((n) => n.text)).toEqual([
+      "🎯 目標（追求中）: ベンチ整備",
+      "🎯 目標（一時停止）: ベンチ整備",
+      "🎯 目標（追求中）: ベンチ整備",
+      "🎯 目標を解除しました",
+      "🎯 目標（追求中）: ベンチ整備",
+      "🎯 目標を解除しました",
+    ]);
+    expect(new Set(notices.map((n) => n.streamId)).size).toBe(6);
+  });
+
+  test("前置き文付きの最終応答は <proposed_plan> ブロックだけ外して残りを本文にする", async () => {
+    const root = makeTempDir("codex-plan-preamble");
+    const cwd = makeTempDir("codex-plan-preamble-cwd");
+    writeRollout(root, "2026/09/24", "r.jsonl", cwd, [
+      JSON.stringify({ type: "event_msg", payload: { type: "item_completed", turn_id: "turn-1",
+        item: { type: "Plan", id: "turn-1-plan", text: "- README を作る\n" } } }),
+      agentItem("msg-final", "調査の結果、次の計画にします。\n\n<proposed_plan>\n- README を作る\n</proposed_plan>", "final_answer"),
+    ]);
+    const tailer = new CodexRolloutTailer({ sessionsRoot: root, tailDeadlineMs: 0 });
+    const chats = (await collect(tailer, cwd)).filter((m): m is Extract<ControlMessage, { type: "chat_output" }> =>
+      m.type === "chat_output" && m.role === "assistant");
+    expect(chats.map((c) => [c.streamId, c.text])).toEqual([
+      ["codex-plan-turn-1-plan", "- README を作る"],
+      ["codex-item-msg-final", "調査の結果、次の計画にします。"],
+    ]);
   });
 });

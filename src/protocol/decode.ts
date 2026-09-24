@@ -10,6 +10,7 @@ import {
   type ClaudeSessionInfo,
   type ClaudeModelInfo,
   type PeerSessionInfo,
+  type CodexGoalInfo,
   type CodexModelInfo,
   type ControlMessage,
   type FileEntry,
@@ -381,6 +382,9 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         rawApprovalPolicy === "untrusted" || rawApprovalPolicy === "on-request" || rawApprovalPolicy === "never"
           ? rawApprovalPolicy
           : undefined;
+      const rawCollaborationMode = optionalString(raw, "collaborationMode");
+      const collaborationMode =
+        rawCollaborationMode === "plan" || rawCollaborationMode === "default" ? rawCollaborationMode : undefined;
       return compact({
         type, v,
         id: requireString(raw, "id"),
@@ -391,6 +395,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         approvalPolicy,
         sandbox,
         explicitRetry: optionalBoolean(raw, "explicitRetry"),
+        collaborationMode,
       });
 
     case "codex_turn_start_result": {
@@ -407,6 +412,44 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         id: requireString(raw, "id"),
         session: requireString(raw, "session"),
       };
+
+    case "codex_goal_request": {
+      const action = requireString(raw, "action");
+      if (action !== "get" && action !== "set" && action !== "clear") {
+        throw new ProtocolDecodeError("missing-field", "action");
+      }
+      return compact({
+        type, v,
+        id: requireString(raw, "id"),
+        session: requireString(raw, "session"),
+        action,
+        objective: optionalString(raw, "objective"),
+        status: optionalString(raw, "status"),
+        tokenBudget: optionalNumber(raw, "tokenBudget"),
+      });
+    }
+
+    case "codex_goal_response": {
+      const status = requireString(raw, "status");
+      if (status !== "ok" && status !== "failed") {
+        throw new ProtocolDecodeError("missing-field", "status");
+      }
+      return compact({
+        type, v,
+        id: requireString(raw, "id"),
+        status,
+        goal: raw["goal"] === undefined ? undefined : decodeCodexGoal(raw["goal"]),
+        cleared: optionalBoolean(raw, "cleared"),
+        error: optionalString(raw, "error"),
+      });
+    }
+
+    case "codex_goal_state":
+      return compact({
+        type, v,
+        session: requireString(raw, "session"),
+        goal: raw["goal"] === undefined ? undefined : decodeCodexGoal(raw["goal"]),
+      });
 
     case "session_processing_state":
       return {
@@ -1342,6 +1385,21 @@ function decodeSubagentNode(raw: Raw): SubagentNode {
     ts: requireNumber(raw, "ts"),
     kind,
     model: optionalNullableString(raw, "model"),
+  });
+}
+
+/** `codex_goal_response` / `codex_goal_state` の `goal`（App Server ThreadGoal の wire 形, codex-goal）。 */
+function decodeCodexGoal(value: unknown): CodexGoalInfo {
+  const raw = requireObject(value, "goal");
+  return compact<CodexGoalInfo>({
+    threadId: requireString(raw, "threadId"),
+    objective: requireString(raw, "objective"),
+    status: requireString(raw, "status"),
+    tokenBudget: optionalNumber(raw, "tokenBudget"),
+    tokensUsed: requireNumber(raw, "tokensUsed"),
+    timeUsedSeconds: requireNumber(raw, "timeUsedSeconds"),
+    createdAt: requireNumber(raw, "createdAt"),
+    updatedAt: requireNumber(raw, "updatedAt"),
   });
 }
 

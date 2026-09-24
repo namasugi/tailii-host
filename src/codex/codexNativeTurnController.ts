@@ -9,16 +9,21 @@ import type {
   CodexThreadTitleGenerationResult,
   CodexThreadTitleSource,
 } from "./codexAppServer.js";
+import { codexGoalFromWire } from "./codexAppServer.js";
 import {
   decodeControlMessage,
   encodeControlMessage,
   PROTOCOL_V1,
   PROTOCOL_V2,
+  type CodexCollaborationMode,
+  type CodexGoalAction,
+  type CodexGoalInfo,
   type Decision,
   type QuestionAnswer,
   type QuestionPromptQuestion,
 } from "../protocol.js";
 import type { ControlMessage } from "../protocol.js";
+import { codexPlanChatOutput } from "./codexPlanItem.js";
 import { resolveSocketPath } from "../shared/socketPath.js";
 import { sleep } from "../shared/sleep.js";
 import {
@@ -30,7 +35,11 @@ import {
 import { CodexSubagentTracker } from "./codexSubagentTracker.js";
 import {
   codexAppServerSystemNotice,
+  codexCollaborationModeSteerNotice,
   codexDeprecationNoticeLogLine,
+  codexGoalClearedNotice,
+  codexGoalNotice,
+  codexGoalNoticeKey,
   codexMcpItemErrorNotice,
   codexSystemNoticeContentKey,
 } from "./codexSystemNotice.js";
@@ -67,6 +76,14 @@ export interface CodexNativeTurnControllerOptions {
   }) => void;
   onQuestionDismiss?: (session: string, id: string) => void;
   onChatItem?: (event: { session: string; itemId: string; payload: ControlMessage }) => void;
+  /**
+   * 目標の現在値（codex-goal）。`thread/goal/updated` / `cleared`、goal RPC の結果、会話オープン時の
+   * 読み取りから配る。null は「目標なし」。Hub は会話 stream（codex_goal_state）へ流し、目標が
+   * active な間は購読者ゼロでも thread 購読を保持する（継続 turn は server 起点のため）。
+   */
+  onGoal?: (session: string, goal: CodexGoalInfo | null) => void;
+  /** thread の collaboration mode（`thread/settings/updated`）。Hub は `pc:collab` マーカーで iOS へ配る。 */
+  onCollaborationMode?: (session: string, mode: CodexCollaborationMode) => void;
   onDisconnect?: (session: string, error: Error) => void;
   onThreadTitle?: (event: {
     session: string;
@@ -95,8 +112,14 @@ export interface CodexTurnControllerRuntime {
     effort?: string | null;
     sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null;
     approvalPolicy?: CodexAppServerApprovalPolicy | null;
+    /** collaboration mode（プランモード, codex-plan-mode）。未指定は thread の現状のまま。 */
+    collaborationMode?: CodexCollaborationMode | null;
   }): Promise<string>;
   interruptTurn?(session: string): Promise<void>;
+  /** 目標の読み取り / 設定 / 解除（codex-goal）。thread を開いていなければ開いてから実行する。 */
+  goal?(options: CodexGoalOperation): Promise<CodexGoalOperationResult>;
+  /** 目標が active な会話か（Hub が購読者ゼロでも thread 購読を保持する判定）。 */
+  hasActiveGoal?(session: string): boolean;
   /**
    * rollout の terminal event（task_complete / turn_aborted）を、現在追跡中の
    * 同一 turn に限って完了へ反映する。App Server の turn/completed 通知欠落を補う副経路。
@@ -134,6 +157,7 @@ export interface CodexThreadClient {
     effort?: string | null,
     sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null,
     approvalPolicy?: CodexAppServerApprovalPolicy | null,
+    collaborationMode?: CodexCollaborationMode | null,
   ): Promise<string>;
   steerTurn(
     turnId: string,
@@ -141,7 +165,45 @@ export interface CodexThreadClient {
     clientUserMessageId?: string | null,
   ): Promise<void>;
   interruptTurn(turnId: string): Promise<void>;
+  /** `thread/settings/updated` の取り込み（モデル / effort / collaboration mode の追従, codex-plan-mode）。 */
+  noteThreadSettings?(settings: Record<string, unknown>): void;
+  /** この接続で最後に観測 / 送信した collaboration mode（server の thread 設定に残る値）。不明は null。 */
+  readonly collaborationMode?: CodexCollaborationMode | null;
+  /** plan 直前の model / effort（default 復帰で戻す値）。plan 中でなければ null。未対応は undefined。 */
+  readonly planRestoreSnapshot?: CodexPlanRestoreSnapshot | null;
+  /** 接続を作り直したときに controller が預かっていた plan 直前の値を引き継ぐ（既にあれば上書きしない）。 */
+  seedPlanRestoreSnapshot?(snapshot: CodexPlanRestoreSnapshot): void;
+  /** `model/rerouted` 等のモデルだけの変更の取り込み。 */
+  noteModel?(model: string): void;
+  /** 目標 API（codex-goal）。旧 App Server / テスト fake では未提供。 */
+  goalGet?(): Promise<CodexGoalInfo | null>;
+  goalSet?(params: { objective?: string; status?: string; tokenBudget?: number }): Promise<CodexGoalInfo>;
+  goalClear?(): Promise<boolean>;
   close(): void;
+}
+
+/** plan に入る直前の thread 設定（default 復帰で戻す, codex-plan-mode）。 */
+export interface CodexPlanRestoreSnapshot {
+  model: string | null;
+  effort: string | null;
+}
+
+/** 目標操作の入力（Hub の `codex_goal_submit` と同形）。 */
+export interface CodexGoalOperation {
+  session: string;
+  threadId: string;
+  cwd: string;
+  action: CodexGoalAction;
+  objective?: string;
+  status?: string;
+  tokenBudget?: number;
+}
+
+export interface CodexGoalOperationResult {
+  /** 操作後の現在値（clear 後や未設定は null）。 */
+  goal: CodexGoalInfo | null;
+  /** clear の結果（server が何かを消したか）。 */
+  cleared?: boolean;
 }
 
 export interface CodexSubscriptionSnapshot {
@@ -157,6 +219,11 @@ export interface CodexSubscriptionSnapshot {
    * 反映する。null は不明（未materialize で resume が成立しない・旧 App Server）。
    */
   model?: string | null;
+  /**
+   * 購読時点で thread に残っている collaboration mode（controller が観測 / 送信した値。codex-plan-mode）。
+   * Hub は backfill 完了後に `pc:collab` として配り、iOS のトグルを実体へ揃える。null は不明。
+   */
+  collaborationMode?: CodexCollaborationMode | null;
 }
 
 export interface CodexAppServerThreadRuntime {
@@ -213,6 +280,10 @@ interface OpenThread {
   subagents: CodexSubagentTracker;
   /** subagent_node は同じ collab item から状態更新を複数回流すため専用連番で dedup する。 */
   subagentSeq: number;
+  /** 目標の現在値（codex-goal）。open 時に `thread/goal/get` で読み、通知と RPC 結果で追従する。 */
+  goal: CodexGoalInfo | null;
+  /** 直近に注記した目標の照合キー（状態 / 内容が変わったときだけ 🎯 注記を出す）。null は未確定。 */
+  goalNoticeKey: string | null;
 }
 
 interface PendingUserInput {
@@ -239,13 +310,33 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     CodexNativeTurnControllerOptions["onQuestionDismiss"]
   >;
   private readonly onChatItem: NonNullable<CodexNativeTurnControllerOptions["onChatItem"]>;
+  private readonly onGoal: NonNullable<CodexNativeTurnControllerOptions["onGoal"]>;
+  private readonly onCollaborationMode: NonNullable<
+    CodexNativeTurnControllerOptions["onCollaborationMode"]
+  >;
   private readonly onDisconnect: NonNullable<CodexNativeTurnControllerOptions["onDisconnect"]>;
   private readonly onThreadTitle: NonNullable<CodexNativeTurnControllerOptions["onThreadTitle"]>;
   private readonly log: (message: string) => void;
   /** 同文の deprecationNotice は process 内で 1 回だけ記録する（thread を開くたびに届く）。 */
   private readonly loggedDeprecationNotices = new Set<string>();
   private readonly open = new Map<string, OpenThread>();
+  /** session ごとの開始中 Promise（threadFor の同時呼び出しを 1 回の open に畳む）。 */
+  private readonly opening = new Map<string, { threadId: string; task: Promise<OpenThread> }>();
+  /**
+   * plan に入る直前の model / effort（codex-plan-mode）。thread 接続は購読者ゼロで畳まれるため、接続を
+   * 作り直しても default 復帰で元の値へ戻せるよう controller が session 単位で預かる（hub 再起動では失う）。
+   */
+  private readonly planRestoreBySession = new Map<string, { threadId: string; snapshot: CodexPlanRestoreSnapshot }>();
+  /** 開始中（opening）に close を要求された session。開き終わった時点で畳む。 */
+  private readonly closeRequestedWhileOpening = new Set<string>();
   private readonly pendingUserInput = new Map<string, PendingUserInput>();
+
+  private rememberPlanRestoreSnapshot(session: string, threadId: string, thread: CodexThreadClient): void {
+    const snapshot = thread.planRestoreSnapshot;
+    if (snapshot === undefined) return;
+    if (snapshot === null) this.planRestoreBySession.delete(session);
+    else this.planRestoreBySession.set(session, { threadId, snapshot });
+  }
 
   constructor(options: CodexNativeTurnControllerOptions) {
     this.appServer = options.appServer;
@@ -256,6 +347,8 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     this.onQuestion = options.onQuestion ?? (() => {});
     this.onQuestionDismiss = options.onQuestionDismiss ?? (() => {});
     this.onChatItem = options.onChatItem ?? (() => {});
+    this.onGoal = options.onGoal ?? (() => {});
+    this.onCollaborationMode = options.onCollaborationMode ?? (() => {});
     this.onDisconnect = options.onDisconnect ?? (() => {});
     this.onThreadTitle = options.onThreadTitle ?? (() => {});
     this.log = options.log ?? (() => {});
@@ -266,7 +359,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     threadId: string;
     cwd: string;
   }): Promise<CodexSubscriptionSnapshot> {
-    const opened = await this.threadFor(options.session, options.threadId, options.cwd);
+    const opened = await this.threadFor(options.session, options.threadId, options.cwd, "subscribe");
     const itemIds = new Set<string>();
     const contentCounts = new Map<string, number>();
     for (const item of opened.thread.initialItems ?? []) {
@@ -278,12 +371,16 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
         if (key !== null) contentCounts.set(key, (contentCounts.get(key) ?? 0) + 1);
       }
     }
+    // 目標の現在値は購読のたびに配る（既存 thread の再利用 = 開き直し / 再接続 / 別端末でも届く。
+    // null も配って、開いていない間に解除された目標の古い表示を消す）。
+    this.onGoal(options.session, opened.goal);
     return {
       itemIds,
       contentCounts,
       liveSubscribed: opened.thread.liveSubscriptionReady !== false,
       liveSubscriptionError: opened.thread.liveSubscriptionError ?? null,
       model: opened.thread.model ?? null,
+      collaborationMode: opened.thread.collaborationMode ?? null,
     };
   }
 
@@ -296,6 +393,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     effort?: string | null;
     sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null;
     approvalPolicy?: CodexAppServerApprovalPolicy | null;
+    collaborationMode?: CodexCollaborationMode | null;
   }): Promise<string> {
     const opened = await this.threadFor(options.session, options.threadId, options.cwd);
     this.onProcessing(options.session, "active");
@@ -315,6 +413,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
             options.text,
             options.clientUserMessageId,
           );
+          this.noteCollaborationModeNotAppliedBySteer(options.session, opened, activeTurnId, options.collaborationMode);
           this.generateThreadTitle(opened, options.session, options.text);
           return activeTurnId;
         } catch (error) {
@@ -328,6 +427,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
               options.text,
               options.clientUserMessageId,
             );
+            this.noteCollaborationModeNotAppliedBySteer(options.session, opened, currentTurnId, options.collaborationMode);
             this.generateThreadTitle(opened, options.session, options.text);
             return currentTurnId;
           }
@@ -337,12 +437,15 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
           if (!isDefinitiveSteerRejection(error)) throw error;
         }
       }
+      // 実行中 turn への steer は入力を足すだけで collaboration mode は変えられない（上の steer 経路）。
+      // 新規 turn だけが iOS のトグルどおりの mode で始まる。
       const turnId = await opened.thread.startTurn(
         options.text,
         options.clientUserMessageId,
         options.effort,
         options.sandbox,
         options.approvalPolicy,
+        options.collaborationMode ?? null,
       );
       opened.activeTurnId = turnId;
       this.generateThreadTitle(opened, options.session, options.text);
@@ -350,6 +453,98 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     } catch (error) {
       this.onProcessing(options.session, "done");
       throw error;
+    }
+  }
+
+  /**
+   * 実行中 turn への steer は collaboration mode を変えられない（turn/steer に mode 引数が無い）。iOS の
+   * トグルと違う mode の turn が走っている間の送信は、そのまま steer しつつ注記で知らせる（次の新規 turn
+   * から反映される）。thread の現 mode が不明な接続（テスト fake / 旧 server）では判定できないので黙る。
+   */
+  private noteCollaborationModeNotAppliedBySteer(
+    session: string,
+    opened: OpenThread,
+    turnId: string,
+    requested: CodexCollaborationMode | null | undefined,
+  ): void {
+    if (!requested) return;
+    const current = opened.thread.collaborationMode;
+    if (current === undefined || current === null || current === requested) return;
+    const notice = codexCollaborationModeSteerNotice(requested, turnId);
+    this.onChatItem({ session, itemId: notice.itemId, payload: notice.payload });
+  }
+
+  /** 目標の読み取り / 設定 / 解除（codex-goal）。結果は通知と同じ経路（onGoal / 注記）にも反映する。 */
+  async goal(options: CodexGoalOperation): Promise<CodexGoalOperationResult> {
+    const opened = await this.threadFor(options.session, options.threadId, options.cwd);
+    const thread = opened.thread;
+    if (options.action === "get") {
+      if (thread.goalGet === undefined) throw new Error("この Codex App Server は目標（goal）に対応していません");
+      const goal = await thread.goalGet();
+      this.applyGoal(options.session, opened, goal, { publishState: true });
+      return { goal };
+    }
+    if (options.action === "clear") {
+      if (thread.goalClear === undefined) throw new Error("この Codex App Server は目標（goal）に対応していません");
+      const cleared = await thread.goalClear();
+      this.applyGoal(options.session, opened, null, { publishState: true });
+      return { goal: null, cleared };
+    }
+    if (thread.goalSet === undefined) throw new Error("この Codex App Server は目標（goal）に対応していません");
+    const goal = await thread.goalSet({
+      ...(options.objective !== undefined ? { objective: options.objective } : {}),
+      ...(options.status !== undefined ? { status: options.status } : {}),
+      ...(options.tokenBudget !== undefined ? { tokenBudget: options.tokenBudget } : {}),
+    });
+    this.applyGoal(options.session, opened, goal, { publishState: true });
+    return { goal };
+  }
+
+  hasActiveGoal(session: string): boolean {
+    return this.open.get(session)?.goal?.status === "active";
+  }
+
+  /**
+   * 目標の現在値を取り込む。状態 / 内容が変わったときだけ 🎯 注記を chat へ出し（進捗だけの更新では
+   * 出さない）、必要なら onGoal で Hub へ配る。open 直後の初回読み取りは注記を出さない（履歴側の
+   * rollout 注記と二重になるため）。
+   */
+  private applyGoal(
+    session: string,
+    opened: OpenThread,
+    goal: CodexGoalInfo | null,
+    options: { publishState: boolean; initial?: boolean },
+  ): void {
+    const key = codexGoalNoticeKey(goal);
+    const changed = opened.goalNoticeKey !== key;
+    const previousCreatedAt = opened.goal?.createdAt ?? null;
+    opened.goal = goal;
+    // 注記は「変化」だけ。初回読み取り（履歴の rollout 注記と二重になる）と、目標を一度も見ていない
+    // 状態での「解除」（意味が無い）は出さない。
+    const knownBefore = opened.goalNoticeKey !== null;
+    if (changed && options.initial !== true && (goal !== null || knownBefore)) {
+      const notice = goal === null ? codexGoalClearedNotice(previousCreatedAt) : codexGoalNotice(goal);
+      this.onChatItem({ session, itemId: notice.itemId, payload: notice.payload });
+    }
+    opened.goalNoticeKey = key;
+    if (options.publishState) this.onGoal(session, goal);
+  }
+
+  /**
+   * open 直後に現在の目標を読む（失敗は無視: 旧 server / ephemeral thread は未対応）。threadFor が
+   * await するので、購読直後に購読者がいなくなっても hasActiveGoal が「未読」で false を返さない。
+   */
+  private async loadGoal(session: string, opened: OpenThread): Promise<void> {
+    if (opened.thread.goalGet === undefined) return;
+    try {
+      const goal = await opened.thread.goalGet();
+      if (this.open.get(session) !== opened) return;
+      // 通知（thread/goal/updated）が先に届いて確定済みなら上書きしない。
+      if (opened.goalNoticeKey !== null) return;
+      // 配信は購読確立（subscribeSession）側で行う: 開き直しで既存 thread を再利用する場合も必ず 1 回届く。
+      this.applyGoal(session, opened, goal, { publishState: false, initial: true });
+    } catch (error) {
+      this.log(`Codex 目標の読み取りに失敗（無視） session=${session}: ${String(error)}`);
     }
   }
 
@@ -437,7 +632,12 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
 
   closeSession(session: string): void {
     const opened = this.open.get(session);
-    if (opened === undefined) return;
+    if (opened === undefined) {
+      // 開いている途中なら、開き終わった時点で畳む（openThread の完了を待たずに孤児接続を作らない）。
+      if (this.opening.has(session)) this.closeRequestedWhileOpening.add(session);
+      return;
+    }
+    this.rememberPlanRestoreSnapshot(session, opened.threadId, opened.thread);
     this.open.delete(session);
     opened.thread.close();
     this.resolvePendingQuestionsForSession(session);
@@ -475,11 +675,53 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     return true;
   }
 
-  private async threadFor(session: string, threadId: string, cwd: string): Promise<OpenThread> {
+  /**
+   * `intent`: "operate"（turn 開始 / 目標操作）は、開いている途中で close 要求が入って畳まれた場合に開き直す
+   * （閉じた接続へ turn/start を投げない）。"subscribe" は畳まれた OpenThread をそのまま返す（購読者が
+   * 去った後の再 open は無駄で、hub 側が購読者ゼロなら結果を捨てる）。
+   */
+  private async threadFor(
+    session: string,
+    threadId: string,
+    cwd: string,
+    intent: "subscribe" | "operate" = "operate",
+  ): Promise<OpenThread> {
+    // 開始中（openThread → 目標読み取り → サブエージェント復元）の同じ session は完了を共有する。
+    // 会話オープンでは hub の購読と iOS の目標 get がほぼ同時に届くため、共有しないと openThread が
+    // 2 回走って片方の接続が閉じられずに残り、その切断が正しい方の OpenThread まで消す。
+    // 待った後は必ず opening を見直す: 別 threadId の待ち手が先に起きて新しい open を始めていることが
+    // あり、1 回だけの確認だと同じ threadId の open が 2 本走る。
+    for (;;) {
+      const pending = this.opening.get(session);
+      if (pending === undefined) break;
+      let opened: OpenThread | null = null;
+      try {
+        opened = await pending.task;
+      } catch (error) {
+        // 同じ thread の open が失敗したなら、待ち手全員が順番に開き直して待ち時間を積み上げない
+        // （daemon 不調時に hub の RPC 予算を超える）。別 thread の失敗なら自分で開く。
+        if (pending.threadId === threadId) throw error;
+      }
+      // 開き終わった直後に閉じられた / 別 thread へ切り替わった OpenThread は返さない。
+      if (opened !== null && opened.threadId === threadId && this.open.get(session) === opened) return opened;
+    }
     const existing = this.open.get(session);
     if (existing?.threadId === threadId) return existing;
     if (existing !== undefined) this.closeSession(session);
+    this.closeRequestedWhileOpening.delete(session);
+    const task = this.openThreadFor(session, threadId, cwd).finally(() => {
+      if (this.opening.get(session)?.task === task) this.opening.delete(session);
+    });
+    this.opening.set(session, { threadId, task });
+    const opened = await task;
+    if (intent === "operate" && this.open.get(session) !== opened) {
+      // 開いている途中に close 要求（購読者が去った等）で畳まれた。操作の相手が要るので開き直す。
+      return this.threadFor(session, threadId, cwd, intent);
+    }
+    return opened;
+  }
 
+  private async openThreadFor(session: string, threadId: string, cwd: string): Promise<OpenThread> {
     const items = new Map<string, Record<string, unknown>>();
     const bufferedNotifications: CodexAppServerNotification[] = [];
     let notificationTargetReady = false;
@@ -497,12 +739,18 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       onDisconnect: (error) => {
         const current = this.open.get(session);
         if (current?.threadId !== threadId) return;
+        this.rememberPlanRestoreSnapshot(session, threadId, current.thread);
         this.open.delete(session);
         this.resolvePendingQuestionsForSession(session);
         this.onProcessing(session, "done");
         this.onDisconnect(session, error);
       },
     });
+    // plan 直前の model / effort は接続をまたいで復元する（接続は購読者ゼロで畳まれるため）。
+    const planRestore = this.planRestoreBySession.get(session);
+    if (planRestore !== undefined && planRestore.threadId === threadId) {
+      thread.seedPlanRestoreSnapshot?.(planRestore.snapshot);
+    }
     const opened = {
       threadId,
       cwd,
@@ -515,9 +763,20 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       planSeq: 0,
       subagents: new CodexSubagentTracker(threadId),
       subagentSeq: 0,
+      goal: null,
+      goalNoticeKey: null,
     };
     this.open.set(session, opened);
+    // 開いている間に close が要求されていた（購読者が去った等）なら、開き終わった接続を残さず畳む。
+    if (this.closeRequestedWhileOpening.delete(session)) {
+      this.closeSession(session);
+      return opened;
+    }
     if (opened.activeTurnId !== null) this.onProcessing(session, "active");
+    // 目標は rollout に現在値が無い（SQLite 保存）ため、開くたびに App Server から読む（失敗無視）。
+    // Hub の close 判定（hasActiveGoal）が open 直後から正しい値を返すよう、ここで待つ。
+    await this.loadGoal(session, opened);
+    if (this.open.get(session) !== opened) return opened;
     const restoredSubagents = [];
     for (const item of thread.initialItems ?? []) {
       restoredSubagents.push(...opened.subagents.ingestItem(item, Date.now()));
@@ -711,21 +970,41 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       const settingsThreadId = params?.["threadId"];
       const settings = asRecord(params?.["threadSettings"]);
       const model = settings?.["model"];
+      const ownThread = typeof settingsThreadId !== "string" || settingsThreadId === threadId;
       if (typeof model === "string" && model.length > 0) {
-        if (typeof settingsThreadId !== "string" || settingsThreadId === threadId) {
+        if (ownThread) {
           this.onModel(session, model);
         } else {
           this.applySubagentModel(session, threadId, settingsThreadId, model);
         }
+      }
+      if (ownThread && settings !== null && current?.threadId === threadId) {
+        // collaboration mode / effort / モデルの実体を turn 開始側へ追従させる（codex-plan-mode）。
+        current.thread.noteThreadSettings?.(settings);
+        const mode = asRecord(settings["collaborationMode"])?.["mode"];
+        if (mode === "plan" || mode === "default") this.onCollaborationMode(session, mode);
       }
     }
     if (notification.method === "model/rerouted") {
       const reroutedThreadId = params?.["threadId"];
       const model = params?.["toModel"];
       if (typeof reroutedThreadId === "string" && typeof model === "string" && model.length > 0) {
-        if (reroutedThreadId === threadId) this.onModel(session, model);
-        else this.applySubagentModel(session, threadId, reroutedThreadId, model);
+        if (reroutedThreadId === threadId) {
+          // 表示だけ更新する。振り替え先を settings.model に採らない（default 毎回明示で恒久化しないため）。
+          this.onModel(session, model);
+        } else {
+          this.applySubagentModel(session, threadId, reroutedThreadId, model);
+        }
       }
+    }
+    if (notification.method === "thread/goal/updated" && lifecycleMatchesThread) {
+      const goal = codexGoalFromWire(params?.["goal"]);
+      if (goal !== null && current?.threadId === threadId) {
+        this.applyGoal(session, current, goal, { publishState: true });
+      }
+    }
+    if (notification.method === "thread/goal/cleared" && lifecycleMatchesThread) {
+      if (current?.threadId === threadId) this.applyGoal(session, current, null, { publishState: true });
     }
     if (notification.method === "thread/tokenUsage/updated") {
       const tokenUsage = asRecord(params?.["tokenUsage"]);
@@ -882,6 +1161,11 @@ export function codexItemToChatOutput(item: Record<string, unknown>): ControlMes
     if (typeof text !== "string" || text.length === 0) return null;
     return { type: "chat_output", v: PROTOCOL_V1, streamId: `codex-item-${id}`,
       role: "assistant", text, eof: true };
+  }
+  if (type === "plan") {
+    // プランモードの提案プラン（codex-plan-mode）。rollout の item_completed/Plan と同じ streamId / 本文。
+    const text = item["text"];
+    return typeof text === "string" ? codexPlanChatOutput(id, text) : null;
   }
   return null;
 }

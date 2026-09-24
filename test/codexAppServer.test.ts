@@ -2243,3 +2243,301 @@ describe("CodexAppServerManager", () => {
     expect(connection.closed).toBe(2);
   });
 });
+
+describe("CodexAppServerThread collaboration mode / goal（codex-plan-mode / codex-goal）", () => {
+  function connectionWith(threadOverrides: Record<string, unknown>, presets: unknown[] | null): FakeConnection {
+    const connection = new FakeConnection("thread-plan");
+    connection.request = async (method, params) => {
+      connection.requests.push({ method, params });
+      if (method === "thread/resume") return { thread: { id: "thread-plan", ...threadOverrides } };
+      if (method === "thread/turns/list") return { data: [], nextCursor: null };
+      if (method === "thread/read") return { thread: { id: "thread-plan", turns: [] } };
+      if (method === "collaborationMode/list") {
+        if (presets === null) throw new Error("-32601 unknown method: collaborationMode/list");
+        return { data: presets };
+      }
+      if (method === "turn/start") return { turn: { id: "turn-plan" } };
+      return {};
+    };
+    return connection;
+  }
+  const presets = [
+    { name: "Plan", mode: "plan", model: null, reasoning_effort: "medium" },
+    { name: "Default", mode: "default", model: null, reasoning_effort: null },
+  ];
+  const lastTurnStart = (connection: FakeConnection): unknown =>
+    connection.requests.filter((request) => request.method === "turn/start").at(-1)?.params;
+
+  test("plan は thread の現在モデルと effort（明示 → thread → preset）で collaborationMode を組み立てる", async () => {
+    const connection = connectionWith({ model: "gpt-6-astra", reasoningEffort: "high" }, presets);
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-collab-plan"), connect: async () => connection, launch: () => {},
+    });
+    const thread = await manager.openThread({ threadId: "thread-plan", cwd: "/tmp/project" });
+    await expect(thread.startTurn("計画", "client-1", null, "read-only", "never", "plan")).resolves.toBe("turn-plan");
+    expect(lastTurnStart(connection)).toMatchObject({
+      collaborationMode: {
+        mode: "plan",
+        settings: { model: "gpt-6-astra", reasoning_effort: "high", developer_instructions: null },
+      },
+    });
+    // 明示 effort は turn の effort と settings の両方に入る。
+    await thread.startTurn("計画2", "client-2", "low", "read-only", "never", "plan");
+    expect(lastTurnStart(connection)).toMatchObject({
+      effort: "low", collaborationMode: { settings: { reasoning_effort: "low" } },
+    });
+    // 未指定（従来の呼び出し）は collaborationMode を付けない。
+    await thread.startTurn("従来", "client-3", null, "read-only", "never");
+    expect(lastTurnStart(connection)).not.toHaveProperty("collaborationMode");
+  });
+
+  test("モデル不明の default は指定なし、plan はモデル不明なら開始しない", async () => {
+    const connection = connectionWith({}, presets);
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-collab-unknown"), connect: async () => connection, launch: () => {},
+    });
+    const thread = await manager.openThread({ threadId: "thread-plan", cwd: "/tmp/project" });
+    await expect(thread.startTurn("通常", "client-1", null, "read-only", "never", "default")).resolves.toBe("turn-plan");
+    expect(lastTurnStart(connection)).not.toHaveProperty("collaborationMode");
+    await expect(thread.startTurn("計画", "client-2", null, "read-only", "never", "plan"))
+      .rejects.toThrow("現在モデルが未確定");
+    expect(connection.requests.filter((request) => request.method === "turn/start")).toHaveLength(1);
+  });
+
+  test("preset のモデル上書きを優先し、thread/settings/updated の取り込み後は plan → default の復帰を明示する", async () => {
+    const connection = connectionWith({ model: "gpt-6-astra" }, [
+      { name: "Plan", mode: "plan", model: "gpt-6-luna", reasoning_effort: "medium" },
+      { name: "Default", mode: "default", model: null, reasoning_effort: null },
+    ]);
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-collab-preset"), connect: async () => connection, launch: () => {},
+    });
+    const thread = await manager.openThread({ threadId: "thread-plan", cwd: "/tmp/project" });
+    await thread.startTurn("計画", "client-1", null, "read-only", "never", "plan");
+    expect(lastTurnStart(connection)).toMatchObject({
+      collaborationMode: { mode: "plan", settings: { model: "gpt-6-luna", reasoning_effort: "medium" } },
+    });
+    thread.noteThreadSettings({ model: "gpt-6-luna", effort: "medium", collaborationMode: { mode: "plan" } });
+    // default へ戻る turn は plan の preset が thread 設定へ書いた model / effort を引きずらず、plan 直前の
+    // 値（astra / effort 未設定 = null）へ戻す。
+    await thread.startTurn("実装", "client-2", null, "read-only", "never", "default");
+    expect(lastTurnStart(connection)).toMatchObject({
+      collaborationMode: {
+        mode: "default",
+        settings: { model: "gpt-6-astra", reasoning_effort: null, developer_instructions: null },
+      },
+    });
+    // 復帰後の default は thread の現在値をそのまま使う（退避値は 1 回で消費）。
+    thread.noteThreadSettings({ model: "gpt-6-astra", effort: "high", collaborationMode: { mode: "default" } });
+    await thread.startTurn("続き", "client-3", null, "read-only", "never", "default");
+    expect(lastTurnStart(connection)).toMatchObject({
+      collaborationMode: { mode: "default", settings: { model: "gpt-6-astra", reasoning_effort: "high" } },
+    });
+  });
+
+  test("接続を作り直した後（直前の mode を知らない）でも、モデルが分かれば default を明示して plan 固着を解く", async () => {
+    // resume 応答に reasoningEffort が無い = thread は既定 effort で動いている。default は毎回明示する。
+    const connection = connectionWith({ model: "gpt-6-astra" }, presets);
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-collab-fresh-default"), connect: async () => connection, launch: () => {},
+    });
+    const thread = await manager.openThread({ threadId: "thread-plan", cwd: "/tmp/project" });
+    await expect(thread.startTurn("実装して", "client-1", null, "read-only", "never", "default")).resolves.toBe("turn-plan");
+    expect(lastTurnStart(connection)).toMatchObject({
+      collaborationMode: {
+        mode: "default",
+        settings: { model: "gpt-6-astra", reasoning_effort: null, developer_instructions: null },
+      },
+    });
+  });
+
+  test("collaborationMode/list 非対応の server でも plan は thread のモデル / effort で開始できる", async () => {
+    const connection = connectionWith({ model: "gpt-6-astra", reasoningEffort: "medium" }, null);
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-collab-nolist"), connect: async () => connection, launch: () => {},
+    });
+    const thread = await manager.openThread({ threadId: "thread-plan", cwd: "/tmp/project" });
+    await expect(thread.startTurn("計画", "client-1", null, "read-only", "never", "plan")).resolves.toBe("turn-plan");
+    expect(lastTurnStart(connection)).toMatchObject({
+      collaborationMode: { mode: "plan", settings: { model: "gpt-6-astra", reasoning_effort: "medium" } },
+    });
+  });
+
+  test("goalGet / goalSet / goalClear は thread/goal/* を呼び、応答を CodexGoalInfo へ写像する", async () => {
+    const connection = connectionWith({ model: "gpt-6-astra" }, presets);
+    const goal = {
+      threadId: "thread-plan", objective: "ベンチ整備", status: "paused", tokenBudget: 1000,
+      tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1790207615, updatedAt: 1790207615,
+    };
+    const original = connection.request.bind(connection);
+    connection.request = async (method, params) => {
+      if (method === "thread/goal/get") { connection.requests.push({ method, params }); return { goal: null }; }
+      if (method === "thread/goal/set") { connection.requests.push({ method, params }); return { goal }; }
+      if (method === "thread/goal/clear") { connection.requests.push({ method, params }); return { cleared: true }; }
+      return original(method, params);
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-goal-rpc"), connect: async () => connection, launch: () => {},
+    });
+    const thread = await manager.openThread({ threadId: "thread-plan", cwd: "/tmp/project" });
+    await expect(thread.goalGet()).resolves.toBeNull();
+    await expect(thread.goalSet({ objective: "ベンチ整備", status: "paused", tokenBudget: 1000 })).resolves.toEqual(goal);
+    await expect(thread.goalClear()).resolves.toBe(true);
+    expect(connection.requests.filter((request) => request.method.startsWith("thread/goal/")).map((request) => request.params))
+      .toEqual([
+        { threadId: "thread-plan" },
+        { threadId: "thread-plan", objective: "ベンチ整備", status: "paused", tokenBudget: 1000 },
+        { threadId: "thread-plan" },
+      ]);
+  });
+});
+
+
+describe("CodexAppServerThread plan 前設定の退避（TUI 経由 / 引き継ぎ）", () => {
+  function connectionWith(threadOverrides: Record<string, unknown>): FakeConnection {
+    const connection = new FakeConnection("thread-plan");
+    connection.request = async (method, params) => {
+      connection.requests.push({ method, params });
+      if (method === "thread/resume") return { thread: { id: "thread-plan", ...threadOverrides } };
+      if (method === "thread/turns/list") return { data: [], nextCursor: null };
+      if (method === "thread/read") return { thread: { id: "thread-plan", turns: [] } };
+      if (method === "collaborationMode/list") {
+        return { data: [
+          { name: "Plan", mode: "plan", model: null, reasoning_effort: "medium" },
+          { name: "Default", mode: "default", model: null, reasoning_effort: null },
+        ] };
+      }
+      if (method === "turn/start") return { turn: { id: "turn-plan" } };
+      return {};
+    };
+    return connection;
+  }
+  const lastTurnStart = (connection: FakeConnection): unknown =>
+    connection.requests.filter((request) => request.method === "turn/start").at(-1)?.params;
+
+  test("TUI の /plan（thread/settings/updated で plan へ）でも preset 上書き前の effort を退避し default で戻す", async () => {
+    const connection = connectionWith({ model: "gpt-6-astra", reasoningEffort: "xhigh" });
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-collab-tui-plan"), connect: async () => connection, launch: () => {},
+    });
+    const thread = await manager.openThread({ threadId: "thread-plan", cwd: "/tmp/project" });
+    // 別クライアントが plan に入り、preset の effort が thread 設定へ書かれた。
+    thread.noteThreadSettings({ model: "gpt-6-astra", effort: "medium", collaborationMode: { mode: "plan" } });
+    expect(thread.planRestoreSnapshot).toEqual({ model: "gpt-6-astra", effort: "xhigh" });
+    await thread.startTurn("実装", "client-1", null, "read-only", "never", "default");
+    expect(lastTurnStart(connection)).toMatchObject({
+      collaborationMode: { mode: "default", settings: { model: "gpt-6-astra", reasoning_effort: "xhigh" } },
+    });
+    expect(thread.planRestoreSnapshot).toBeNull();
+  });
+
+  test("接続を作り直した後は controller が預けた退避値で default へ戻す（既にあれば上書きしない）", async () => {
+    const connection = connectionWith({ model: "gpt-6-astra", reasoningEffort: "medium" });
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-collab-seed"), connect: async () => connection, launch: () => {},
+    });
+    const thread = await manager.openThread({ threadId: "thread-plan", cwd: "/tmp/project" });
+    thread.seedPlanRestoreSnapshot({ model: "gpt-6-astra", effort: "xhigh" });
+    thread.seedPlanRestoreSnapshot({ model: "gpt-6-astra", effort: "low" });
+    await thread.startTurn("実装", "client-1", null, "read-only", "never", "default");
+    expect(lastTurnStart(connection)).toMatchObject({
+      collaborationMode: { mode: "default", settings: { reasoning_effort: "xhigh" } },
+    });
+    // 明示 effort は退避値より優先する。
+    thread.seedPlanRestoreSnapshot({ model: "gpt-6-astra", effort: "xhigh" });
+    await thread.startTurn("実装2", "client-2", "low", "read-only", "never", "default");
+    expect(lastTurnStart(connection)).toMatchObject({
+      effort: "low", collaborationMode: { settings: { reasoning_effort: "low" } },
+    });
+  });
+});
+
+describe("CodexAppServerThread 退避値（3 周目: 再接続後の plan → default）", () => {
+  test("seed → plan turn → default turn で、plan 中の preset 値ではなく seed の effort へ戻る", async () => {
+    const connection = new FakeConnection("thread-plan");
+    connection.request = async (method, params) => {
+      connection.requests.push({ method, params });
+      if (method === "thread/resume") return { thread: { id: "thread-plan", model: "gpt-6-astra", reasoningEffort: "medium" } };
+      if (method === "thread/turns/list") return { data: [], nextCursor: null };
+      if (method === "thread/read") return { thread: { id: "thread-plan", turns: [] } };
+      if (method === "collaborationMode/list") {
+        return { data: [{ name: "Plan", mode: "plan", model: null, reasoning_effort: "medium" }] };
+      }
+      if (method === "turn/start") return { turn: { id: "turn-plan" } };
+      return {};
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-collab-seed-plan-default"), connect: async () => connection, launch: () => {},
+    });
+    const thread = await manager.openThread({ threadId: "thread-plan", cwd: "/tmp/project" });
+    // 前の接続が plan 中に畳まれ、controller が「plan 前は xhigh」を預けていた。thread は今も plan（effort medium）。
+    thread.seedPlanRestoreSnapshot({ model: "gpt-6-astra", effort: "xhigh" });
+    await thread.startTurn("計画を続けて", "client-1", null, "read-only", "never", "plan");
+    expect(thread.planRestoreSnapshot).toEqual({ model: "gpt-6-astra", effort: "xhigh" });
+    await thread.startTurn("実装", "client-2", null, "read-only", "never", "default");
+    const last = connection.requests.filter((request) => request.method === "turn/start").at(-1)?.params;
+    expect(last).toMatchObject({ collaborationMode: { mode: "default", settings: { reasoning_effort: "xhigh" } } });
+    expect(thread.planRestoreSnapshot).toBeNull();
+  });
+
+  test("resume 応答が default と言っていれば古い seed は捨てる（0.156+ の thread.collaborationMode）", async () => {
+    const connection = new FakeConnection("thread-plan");
+    connection.request = async (method, params) => {
+      connection.requests.push({ method, params });
+      if (method === "thread/resume") {
+        return { thread: { id: "thread-plan", model: "gpt-6-astra", reasoningEffort: "low", collaborationMode: { mode: "default" } } };
+      }
+      if (method === "thread/turns/list") return { data: [], nextCursor: null };
+      if (method === "thread/read") return { thread: { id: "thread-plan", turns: [] } };
+      if (method === "turn/start") return { turn: { id: "turn-plan" } };
+      return {};
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-collab-seed-stale"), connect: async () => connection, launch: () => {},
+    });
+    const thread = await manager.openThread({ threadId: "thread-plan", cwd: "/tmp/project" });
+    expect(thread.collaborationMode).toBe("default");
+    thread.seedPlanRestoreSnapshot({ model: "gpt-6-astra", effort: "xhigh" });
+    expect(thread.planRestoreSnapshot).toBeNull();
+    await thread.startTurn("続き", "client-1", null, "read-only", "never", "default");
+    const last = connection.requests.filter((request) => request.method === "turn/start").at(-1)?.params;
+    expect(last).toMatchObject({ collaborationMode: { mode: "default", settings: { reasoning_effort: "low" } } });
+  });
+});
+
+describe("CodexAppServerThread 退避値（4 周目: plan の turn/start 失敗）", () => {
+  function connection(fail: () => boolean): FakeConnection {
+    const fake = new FakeConnection("thread-plan");
+    fake.request = async (method, params) => {
+      fake.requests.push({ method, params });
+      if (method === "thread/resume") return { thread: { id: "thread-plan", model: "gpt-6-astra", reasoningEffort: "xhigh" } };
+      if (method === "thread/turns/list") return { data: [], nextCursor: null };
+      if (method === "thread/read") return { thread: { id: "thread-plan", turns: [] } };
+      if (method === "collaborationMode/list") return { data: [{ name: "Plan", mode: "plan", model: null, reasoning_effort: "medium" }] };
+      if (method === "turn/start") {
+        if (fail()) throw new Error("turn/start failed");
+        return { turn: { id: "turn-plan" } };
+      }
+      return {};
+    };
+    return fake;
+  }
+
+  test("plan の turn/start が失敗したら、その呼び出しで作った退避値は捨てる（既存の退避値は保つ）", async () => {
+    let shouldFail = true;
+    const fake = connection(() => shouldFail);
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-collab-plan-fail"), connect: async () => fake, launch: () => {},
+    });
+    const thread = await manager.openThread({ threadId: "thread-plan", cwd: "/tmp/project" });
+    await expect(thread.startTurn("計画", "client-1", null, "read-only", "never", "plan")).rejects.toThrow("turn/start failed");
+    expect(thread.planRestoreSnapshot).toBeNull();
+    // 既に退避値がある状態での失敗はそれを保つ。
+    thread.seedPlanRestoreSnapshot({ model: "gpt-6-astra", effort: "low" });
+    await expect(thread.startTurn("計画2", "client-2", null, "read-only", "never", "plan")).rejects.toThrow("turn/start failed");
+    expect(thread.planRestoreSnapshot).toEqual({ model: "gpt-6-astra", effort: "low" });
+    shouldFail = false;
+    await expect(thread.startTurn("計画3", "client-3", null, "read-only", "never", "plan")).resolves.toBe("turn-plan");
+    expect(thread.planRestoreSnapshot).toEqual({ model: "gpt-6-astra", effort: "low" });
+  });
+});

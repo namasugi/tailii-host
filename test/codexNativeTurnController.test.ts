@@ -1,12 +1,16 @@
 // Codex App Server native turn / approval bridge の単体テスト。
 
 import { describe, expect, test, vi } from "vitest";
-import type { CodexAppServerThreadOptions } from "../src/codex/codexAppServer.js";
+import type {
+  CodexAppServerApprovalPolicy,
+  CodexAppServerThreadOptions,
+} from "../src/codex/codexAppServer.js";
 import {
   CodexNativeTurnController,
   type CodexNativeApproval,
   type CodexThreadClient,
 } from "../src/codex/codexNativeTurnController.js";
+import type { CodexCollaborationMode, CodexGoalInfo, ControlMessage } from "../src/protocol.js";
 
 class FakeThread implements CodexThreadClient {
   readonly starts: { text: string; clientId?: string | null; effort?: string | null }[] = [];
@@ -1462,5 +1466,348 @@ describe("CodexNativeTurnController", () => {
       answers: { language: { answers: ["TypeScript", "補足"] } },
     });
     expect(dismissed).toEqual(["codex-question:thread-1:rpc-q1"]);
+  });
+});
+
+/** collaboration mode を受け取る fake thread（FakeThread は 3 引数までしか記録しない）。 */
+class PlanFakeThread extends FakeThread {
+  readonly planStarts: { text: string; collaborationMode: CodexCollaborationMode | null | undefined }[] = [];
+  override async startTurn(
+    text: string,
+    clientId?: string | null,
+    effort?: string | null,
+    _sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null,
+    _approvalPolicy?: CodexAppServerApprovalPolicy | null,
+    collaborationMode?: CodexCollaborationMode | null,
+  ): Promise<string> {
+    this.planStarts.push({ text, collaborationMode });
+    return super.startTurn(text, clientId, effort);
+  }
+}
+
+describe("CodexNativeTurnController plan mode / goal（codex-plan-mode / codex-goal）", () => {
+  test("collaborationMode を turn/start へ渡し、plan item を codex-plan- streamId の assistant chat_output へ写像する", async () => {
+    const thread = new PlanFakeThread();
+    thread.nextTurnId = "turn-plan";
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const chats: { itemId: string; payload: unknown }[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return thread; } },
+      onChatItem: (event) => chats.push(event),
+    });
+    await expect(controller.startTurn({
+      session: "work", threadId: "thread-1", cwd: "/tmp/work",
+      text: "計画して", clientUserMessageId: "client-plan", collaborationMode: "plan",
+    })).resolves.toBe("turn-plan");
+    expect(thread.planStarts).toEqual([{ text: "計画して", collaborationMode: "plan" }]);
+    openOptions?.onNotification?.({ method: "item/completed", params: { threadId: "thread-1", item: {
+      id: "turn-plan-plan", type: "plan", text: "- README を作る\n- 1 文だけにする\n",
+    } } });
+    expect(chats.map((event) => event.payload)).toContainEqual({
+      type: "chat_output", v: 1, streamId: "codex-plan-turn-plan-plan", role: "assistant",
+      text: "- README を作る\n- 1 文だけにする", eof: true,
+    });
+    // turn 完了後の未指定は従来どおり null（thread の現状のまま）で新規 turn を開始する。
+    openOptions?.onNotification?.({ method: "turn/completed", params: {
+      threadId: "thread-1", turn: { id: "turn-plan", status: "completed" },
+    } });
+    await controller.startTurn({ session: "work", threadId: "thread-1", cwd: "/tmp/work", text: "続けて" });
+    expect(thread.planStarts.at(-1)).toEqual({ text: "続けて", collaborationMode: null });
+  });
+
+  test("thread/goal/updated を onGoal と 🎯 注記へ写像し、進捗だけの更新では注記を繰り返さない", async () => {
+    const thread = new FakeThread();
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const chats: { payload: unknown }[] = [];
+    const goals: (CodexGoalInfo | null)[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return thread; } },
+      onChatItem: (event) => chats.push(event),
+      onGoal: (_session, goal) => goals.push(goal),
+    });
+    await controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" });
+    const goal = {
+      threadId: "thread-1", objective: "テストを緑にする", status: "active",
+      tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1,
+    };
+    openOptions?.onNotification?.({ method: "thread/goal/updated", params: { threadId: "thread-1", turnId: null, goal } });
+    expect(controller.hasActiveGoal("work")).toBe(true);
+    openOptions?.onNotification?.({ method: "thread/goal/updated", params: {
+      threadId: "thread-1", turnId: "t", goal: { ...goal, tokensUsed: 500, timeUsedSeconds: 30, updatedAt: 2 },
+    } });
+    openOptions?.onNotification?.({ method: "thread/goal/updated", params: {
+      threadId: "thread-1", turnId: "t", goal: { ...goal, status: "complete", updatedAt: 3 },
+    } });
+    openOptions?.onNotification?.({ method: "thread/goal/cleared", params: { threadId: "thread-1" } });
+    // 別 thread の目標は無視する。
+    openOptions?.onNotification?.({ method: "thread/goal/updated", params: { threadId: "thread-other", goal } });
+    // 先頭の null は購読確立時の現在値配信（目標なし）。以後は通知ごとに配る。
+    expect(goals.map((value) => value?.status ?? null)).toEqual([null, "active", "active", "complete", null]);
+    expect(controller.hasActiveGoal("work")).toBe(false);
+    const notices = chats
+      .map((event) => event.payload as ControlMessage)
+      .filter((payload): payload is Extract<ControlMessage, { type: "chat_output" }> =>
+        payload.type === "chat_output" && payload.role === "system");
+    expect(notices.map((notice) => notice.text)).toEqual([
+      "🎯 目標（追求中）: テストを緑にする",
+      "🎯 目標（達成）: テストを緑にする",
+      "🎯 目標を解除しました",
+    ]);
+  });
+
+  test("goal() は thread の goalGet / goalSet / goalClear を呼び、結果を onGoal と hasActiveGoal へ反映する", async () => {
+    const calls: unknown[] = [];
+    const goal = {
+      threadId: "thread-1", objective: "ベンチ整備", status: "active", tokenBudget: 1000,
+      tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1,
+    };
+    const thread = Object.assign(new FakeThread(), {
+      goalGet: async (): Promise<CodexGoalInfo | null> => { calls.push("get"); return null; },
+      goalSet: async (params: unknown): Promise<CodexGoalInfo> => { calls.push(["set", params]); return goal; },
+      goalClear: async (): Promise<boolean> => { calls.push("clear"); return true; },
+    });
+    const goals: (CodexGoalInfo | null)[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => thread },
+      onGoal: (_session, value) => goals.push(value),
+    });
+    const base = { session: "work", threadId: "thread-1", cwd: "/tmp/work" } as const;
+    await expect(controller.goal({ ...base, action: "get" })).resolves.toEqual({ goal: null });
+    await expect(controller.goal({
+      ...base, action: "set", objective: "ベンチ整備", status: "active", tokenBudget: 1000,
+    })).resolves.toEqual({ goal });
+    expect(controller.hasActiveGoal("work")).toBe(true);
+    await expect(controller.goal({ ...base, action: "clear" })).resolves.toEqual({ goal: null, cleared: true });
+    expect(controller.hasActiveGoal("work")).toBe(false);
+    // open 直後の自動読み取り（get）+ 明示 get + set + clear。
+    expect(calls).toEqual([
+      "get", "get", ["set", { objective: "ベンチ整備", status: "active", tokenBudget: 1000 }], "clear",
+    ]);
+    expect(goals).toEqual([null, goal, null]);
+  });
+
+  test("thread/settings/updated の collaborationMode を onCollaborationMode と thread.noteThreadSettings へ渡す", async () => {
+    const noted: Record<string, unknown>[] = [];
+    const thread = Object.assign(new FakeThread(), {
+      noteThreadSettings: (settings: Record<string, unknown>): void => { noted.push(settings); },
+    });
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const modes: string[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return thread; } },
+      onCollaborationMode: (session, mode) => modes.push(`${session}:${mode}`),
+    });
+    await controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" });
+    openOptions?.onNotification?.({ method: "thread/settings/updated", params: { threadId: "thread-1",
+      threadSettings: {
+        model: "gpt-6-astra", effort: "low", collaborationMode: { mode: "plan", settings: { model: "gpt-6-astra" } },
+      } } });
+    // 子 thread の設定は親に混ぜない。
+    openOptions?.onNotification?.({ method: "thread/settings/updated", params: { threadId: "thread-child",
+      threadSettings: { model: "gpt-5.6-luna", collaborationMode: { mode: "default" } } } });
+    expect(modes).toEqual(["work:plan"]);
+    expect(noted).toHaveLength(1);
+    expect(noted[0]).toMatchObject({ effort: "low" });
+  });
+});
+
+describe("CodexNativeTurnController plan mode（実行中 turn への送信）", () => {
+  test("plan turn が実行中に default を送ると steer になり、mode 未反映の注記を出す（新規 turn は開始しない）", async () => {
+    const thread = Object.assign(new PlanFakeThread(), { collaborationMode: "plan" as const });
+    thread.nextTurnId = "turn-plan";
+    const chats: { payload: unknown }[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => thread },
+      onChatItem: (event) => chats.push(event),
+    });
+    await controller.startTurn({ session: "work", threadId: "thread-1", cwd: "/tmp/work",
+      text: "計画して", clientUserMessageId: "c1", collaborationMode: "plan" });
+    // turn/completed が来る前に「実装して」（default）を送る = plan item 直後の操作。
+    await controller.startTurn({ session: "work", threadId: "thread-1", cwd: "/tmp/work",
+      text: "実装して", clientUserMessageId: "c2", collaborationMode: "default" });
+    expect(thread.planStarts).toHaveLength(1);
+    expect(thread.steers.map((s) => s.text)).toEqual(["実装して"]);
+    const notices = chats
+      .map((event) => event.payload as ControlMessage)
+      .filter((payload): payload is Extract<ControlMessage, { type: "chat_output" }> =>
+        payload.type === "chat_output" && payload.role === "system");
+    expect(notices.map((n) => n.text)).toEqual([
+      "⚠️ 実行中の turn には通常モードを反映できません。今の応答が終わってからの送信で切り替わります。",
+    ]);
+    // 同じ mode の steer（plan のまま追加指示）は注記しない。
+    await controller.startTurn({ session: "work", threadId: "thread-1", cwd: "/tmp/work",
+      text: "もう少し詳しく", clientUserMessageId: "c3", collaborationMode: "plan" });
+    const noticesAfter = chats
+      .map((event) => event.payload as ControlMessage)
+      .filter((payload) => payload.type === "chat_output" && payload.role === "system");
+    expect(noticesAfter).toHaveLength(1);
+  });
+
+  test("subscribeSession は既存 thread の再購読でも目標の現在値と collaboration mode を返す", async () => {
+    const goal = {
+      threadId: "thread-1", objective: "ベンチ整備", status: "active",
+      tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1,
+    };
+    const thread = Object.assign(new FakeThread(), {
+      goalGet: async (): Promise<CodexGoalInfo | null> => goal,
+      collaborationMode: "plan" as const,
+    });
+    const goals: (CodexGoalInfo | null)[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => thread },
+      onGoal: (_session, value) => goals.push(value),
+    });
+    const first = await controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" });
+    const second = await controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" });
+    expect(first.collaborationMode).toBe("plan");
+    expect(second.collaborationMode).toBe("plan");
+    // 初回読み取り（notice 無し）+ 購読ごとに現在値を配る = 2 回。
+    expect(goals).toEqual([goal, goal]);
+    expect(controller.hasActiveGoal("work")).toBe(true);
+  });
+});
+
+
+describe("CodexNativeTurnController threadFor の同時呼び出し / plan 前設定の引き継ぎ", () => {
+  test("購読と目標 get が同時に来ても openThread は 1 回で、同じ OpenThread を共有する", async () => {
+    let openCount = 0;
+    const goal = {
+      threadId: "thread-1", objective: "ベンチ整備", status: "active",
+      tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1,
+    };
+    const thread = Object.assign(new FakeThread(), {
+      goalGet: async (): Promise<CodexGoalInfo | null> => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return goal;
+      },
+    });
+    const goals: (CodexGoalInfo | null)[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => { openCount += 1; return thread; } },
+      onGoal: (_session, value) => goals.push(value),
+    });
+    const [snapshot, result] = await Promise.all([
+      controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" }),
+      controller.goal({ session: "work", threadId: "thread-1", cwd: "/tmp/work", action: "get" }),
+    ]);
+    expect(openCount).toBe(1);
+    expect(snapshot.liveSubscribed).toBe(true);
+    expect(result.goal).toEqual(goal);
+    // 購読は読み込み済みの現在値（null ではなく goal）を配る。
+    expect(goals.every((value) => value !== null)).toBe(true);
+    expect(thread.closed).toBe(0);
+  });
+
+  test("plan 直前の設定は接続を畳んで作り直しても引き継がれる", async () => {
+    const seeds: unknown[] = [];
+    const makeThread = (): FakeThread => Object.assign(new FakeThread(), {
+      planRestoreSnapshot: { model: "gpt-6-astra", effort: "high" },
+      seedPlanRestoreSnapshot: (snapshot: unknown): void => { seeds.push(snapshot); },
+    });
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => makeThread() },
+    });
+    await controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" });
+    controller.closeSession("work");
+    await controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" });
+    expect(seeds).toEqual([{ model: "gpt-6-astra", effort: "high" }]);
+  });
+});
+
+describe("CodexNativeTurnController threadFor（3 周目: 別 threadId の競合 / 開始中の close）", () => {
+  test("同じ session に別 threadId の open が重なっても、同じ threadId の open は 1 回で孤児接続を残さない", async () => {
+    const opened: FakeThread[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        const thread = new FakeThread();
+        opened.push(thread);
+        return thread;
+      } },
+    });
+    await Promise.all([
+      controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" }),
+      controller.subscribeSession({ session: "work", threadId: "thread-2", cwd: "/tmp/work" }),
+      controller.subscribeSession({ session: "work", threadId: "thread-2", cwd: "/tmp/work" }),
+    ]);
+    // thread-1 と thread-2 の 2 回だけ開き、閉じられなかった接続は最後の 1 本だけ。
+    expect(opened).toHaveLength(2);
+    expect(opened.filter((thread) => thread.closed === 0)).toHaveLength(1);
+  });
+
+  test("開始中に closeSession されたら、開き終わった時点で畳む", async () => {
+    const thread = new FakeThread();
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return thread;
+      } },
+    });
+    const subscribing = controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" });
+    controller.closeSession("work");
+    await subscribing;
+    expect(thread.closed).toBe(1);
+    expect(controller.hasActiveGoal("work")).toBe(false);
+    // 次の open は普通に開ける（close 要求が残らない）。
+    const again = new FakeThread();
+    const controller2 = controller as unknown as { appServer: { openThread: () => Promise<FakeThread> } };
+    controller2.appServer.openThread = async () => again;
+    await controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" });
+    expect(again.closed).toBe(0);
+  });
+
+  test("open 失敗の後は次の呼び出しで開き直せる", async () => {
+    let attempts = 0;
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error("boom");
+        return new FakeThread();
+      } },
+    });
+    await expect(controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" }))
+      .rejects.toThrow("boom");
+    await expect(controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" }))
+      .resolves.toMatchObject({ liveSubscribed: true });
+    expect(attempts).toBe(2);
+  });
+});
+
+describe("CodexNativeTurnController threadFor（4 周目 should-fix）", () => {
+  test("同じ thread の open 失敗は待ち手にも同じエラーで伝え、順番に開き直さない", async () => {
+    let attempts = 0;
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => {
+        attempts += 1;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        throw new Error("boom");
+      } },
+    });
+    const results = await Promise.allSettled([
+      controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" }),
+      controller.goal({ session: "work", threadId: "thread-1", cwd: "/tmp/work", action: "get" }),
+      controller.startTurn({ session: "work", threadId: "thread-1", cwd: "/tmp/work", text: "run" }),
+    ]);
+    expect(results.map((result) => result.status)).toEqual(["rejected", "rejected", "rejected"]);
+    expect(attempts).toBe(1);
+  });
+
+  test("開始中に close 要求で畳まれても、turn 開始は生きた接続で行う（購読は畳まれたまま返す）", async () => {
+    const threads: FakeThread[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        const thread = new FakeThread();
+        threads.push(thread);
+        return thread;
+      } },
+    });
+    const starting = controller.startTurn({ session: "work", threadId: "thread-1", cwd: "/tmp/work", text: "run" });
+    controller.closeSession("work");
+    await expect(starting).resolves.toBe("turn-1");
+    expect(threads).toHaveLength(2);
+    expect(threads[0]!.closed).toBe(1);
+    expect(threads[1]!.starts.map((start) => start.text)).toEqual(["run"]);
+    expect(threads[1]!.closed).toBe(0);
   });
 });

@@ -2988,3 +2988,112 @@ describe("usage-limit-wait: 制限待ちの見張り（武装 / push / reaper �
     }
   });
 });
+
+describe("SessionHub codex goal（codex-goal）", () => {
+  test("codex_goal_submit を controller.goal へ渡し、結果を codex_goal_result で返す", async () => {
+    const goalInfo = {
+      threadId: "thread-1", objective: "ベンチ整備", status: "active",
+      tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1,
+    };
+    const goal = vi.fn(async (options: { action: string }) =>
+      options.action === "clear" ? { goal: null, cleared: true } : { goal: goalInfo });
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir: makeTempDir("hub-codex-goal"), metadataStore: makeTempStore(),
+      timeoutSeconds: 1800,
+      codexAppServerFactory: () => ({ openThread: async () => { throw new Error("unused"); } }),
+      codexTurnControllerFactory: () => ({
+        startTurn: vi.fn(async () => "turn-1"), goal, closeSession: vi.fn(), close: vi.fn(),
+      }),
+    });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({
+      type: "codex_goal_submit", id: "g1", session: "work", threadId: "thread-1", cwd: "/tmp/work",
+      action: "set", objective: "ベンチ整備", status: "active",
+    }));
+    await vi.waitFor(() => expect(received).toContainEqual({
+      type: "codex_goal_result", id: "g1", status: "ok", goal: goalInfo,
+    }));
+    expect(goal).toHaveBeenCalledWith({
+      session: "work", threadId: "thread-1", cwd: "/tmp/work", action: "set", objective: "ベンチ整備", status: "active",
+    });
+    hub.handleClientMessage(client, JSON.stringify({
+      type: "codex_goal_submit", id: "g2", session: "work", threadId: "thread-1", cwd: "/tmp/work", action: "clear",
+    }));
+    await vi.waitFor(() => expect(received).toContainEqual({
+      type: "codex_goal_result", id: "g2", status: "ok", cleared: true,
+    }));
+  });
+
+  test("目標が active な会話は購読者ゼロで turn が終わっても thread 接続を畳まず、目標解除で畳む", async () => {
+    let controllerOptions: CodexNativeTurnControllerOptions | null = null;
+    const closeSession = vi.fn();
+    let active = true;
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir: makeTempDir("hub-codex-goal-hold"), metadataStore: makeTempStore(),
+      timeoutSeconds: 1800,
+      codexAppServerFactory: () => ({ openThread: async () => { throw new Error("unused"); } }),
+      codexTurnControllerFactory: (options) => {
+        controllerOptions = options;
+        return { startTurn: vi.fn(async () => "turn-1"), hasActiveGoal: () => active, closeSession, close: vi.fn() };
+      },
+    });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({
+      type: "codex_turn_submit", id: "one", session: "work", text: "run", clientUserMessageId: "client-1",
+      effort: null, approvalPolicy: null, sandbox: null, threadId: "thread-1", cwd: "/tmp/work",
+    }));
+    await vi.waitFor(() => expect(received).toContainEqual({ type: "codex_turn_result", id: "one", status: "started" }));
+    controllerOptions!.onProcessing?.("work", "done");
+    expect(closeSession).not.toHaveBeenCalled();
+    active = false;
+    controllerOptions!.onGoal?.("work", null);
+    expect(closeSession).toHaveBeenCalledWith("work");
+  });
+});
+
+describe("SessionHub codex collaboration mode（pc:collab の配信）", () => {
+  test("controller の onCollaborationMode を pc:collab として配り、後から加わった購読者にも backfill 完了時に添える", async () => {
+    let controllerOptions: CodexNativeTurnControllerOptions | null = null;
+    const store = makeTempStore();
+    store.put({ name: "work", cwd: "/tmp/work", createdAt: 1, agent: "codex", providerSessionId: "thread-1" });
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir: makeTempDir("hub-codex-collab"), metadataStore: store,
+      timeoutSeconds: 1800,
+      codexAppServerFactory: () => ({ openThread: async () => { throw new Error("unused"); } }),
+      codexTurnControllerFactory: (options) => {
+        controllerOptions = options;
+        return { startTurn: vi.fn(async () => "turn-1"), closeSession: vi.fn(), close: vi.fn() };
+      },
+      // 履歴は空: open 即 history-done（共有 tail も後から加わった client の backfill も同じ）。
+      tailFactory: (write) => ({
+        open() {
+          write({ type: "chat_output", v: 1, streamId: HISTORY_DONE_STREAM_ID, role: "system", text: "", eof: true });
+        },
+        stop() {},
+      }),
+    });
+    const first = {}, firstReceived: unknown[] = [];
+    hub.registerClient(first, (line) => firstReceived.push(decodeHubServerLine(line)));
+    // turn を 1 回流して controller を作らせる。
+    hub.handleClientMessage(first, JSON.stringify({
+      type: "codex_turn_submit", id: "one", session: "work", text: "run", clientUserMessageId: "client-1",
+      effort: null, approvalPolicy: null, sandbox: null, threadId: "thread-1", cwd: "/tmp/work",
+    }));
+    await vi.waitFor(() => expect(controllerOptions).not.toBeNull());
+    hub.handleClientMessage(first, JSON.stringify({ type: "conversation_subscribe", session: "work" }));
+    controllerOptions!.onCollaborationMode?.("work", "plan");
+    const collab = (events: unknown[]): string[] => events.flatMap((event) => {
+      const record = event as { type?: string; payload?: { streamId?: string; text?: string } };
+      return record.type === "conversation_event" && record.payload?.streamId === "pc:collab"
+        ? [record.payload.text ?? ""] : [];
+    });
+    expect(collab(firstReceived)).toEqual(["plan"]);
+    // 後から加わった client は境界前の live 配信を受け取れないので、backfill 完了時に現在値が添えられる。
+    const second = {}, secondReceived: unknown[] = [];
+    hub.registerClient(second, (line) => secondReceived.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(second, JSON.stringify({ type: "conversation_subscribe", session: "work" }));
+    await vi.waitFor(() => expect(collab(secondReceived)).toContain("plan"));
+  });
+});

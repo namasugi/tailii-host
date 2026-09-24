@@ -248,6 +248,31 @@ export interface CodexModelInfo {
   isDefault: boolean;
 }
 
+/**
+ * Codex の collaboration mode（App Server `turn/start.collaborationMode` の `mode`）。
+ * `plan` はプランモード（変更せず `<proposed_plan>` を出す）、`default` は通常実行（codex-plan-mode）。
+ */
+export type CodexCollaborationMode = "plan" | "default";
+
+/**
+ * Codex thread の目標（App Server `thread/goal/*` の `ThreadGoal`, codex-goal）。
+ * 状態は `active` | `paused` | `blocked` | `usageLimited` | `budgetLimited` | `complete`。
+ * 時刻は Unix 秒。`tokenBudget` は未設定なら省略。
+ */
+export interface CodexGoalInfo {
+  threadId: string;
+  objective: string;
+  status: string;
+  tokenBudget?: number;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** `codex_goal_request` の操作種別。`set` は objective / status / tokenBudget の指定分だけを更新する。 */
+export type CodexGoalAction = "get" | "set" | "clear";
+
 /** Anthropic Models API `/v1/models` を iOS のモデル選択へ渡すための 1 要素。 */
 export interface ClaudeModelInfo {
   /** `/model <id>` / `--model` に渡す値（例: claude-sonnet-5）。 */
@@ -443,9 +468,22 @@ export type ControlMessage =
       provider: OfficialAppProvider; action: OfficialAppAction; automaticEnable: boolean; paired: boolean;
     }
   | ({ type: "official_app_action_response"; v: number; id: string } & OfficialAppActionResult)
-  | { type: "codex_turn_start"; v: number; id: string; session: string; text: string; clientUserMessageId?: string; effort?: string; approvalPolicy?: "untrusted" | "on-request" | "never"; sandbox?: "read-only" | "workspace-write" | "danger-full-access"; explicitRetry?: boolean }
+  | { type: "codex_turn_start"; v: number; id: string; session: string; text: string; clientUserMessageId?: string; effort?: string; approvalPolicy?: "untrusted" | "on-request" | "never"; sandbox?: "read-only" | "workspace-write" | "danger-full-access"; explicitRetry?: boolean; collaborationMode?: CodexCollaborationMode }
   | { type: "codex_turn_start_result"; v: number; id: string; status: "started" | "duplicate" | "failed"; error?: string }
   | { type: "codex_turn_interrupt"; v: number; id: string; session: string }
+  /**
+   * Codex thread の目標を読む / 設定する / 解除する（iOS→Mac, codex-goal）。App Server の
+   * `thread/goal/get|set|clear` へ写像する。`set` は指定したフィールドだけを更新する
+   * （objective 省略で status だけの一時停止 / 再開、tokenBudget はトークン予算）。
+   */
+  | { type: "codex_goal_request"; v: number; id: string; session: string; action: CodexGoalAction; objective?: string; status?: string; tokenBudget?: number }
+  /** `codex_goal_request` の結果（Mac→iOS）。`goal` は get / set 後の現在値（無ければ省略）。 */
+  | { type: "codex_goal_response"; v: number; id: string; status: "ok" | "failed"; goal?: CodexGoalInfo; cleared?: boolean; error?: string }
+  /**
+   * 目標の現在値（Mac→iOS, 会話 stream に載る）。App Server の `thread/goal/updated` / `cleared`
+   * と会話オープン時の読み取りから配る。`goal` 省略 = 目標なし。
+   */
+  | { type: "codex_goal_state"; v: number; session: string; goal?: CodexGoalInfo }
   | { type: "session_processing_state"; v: number; session: string; active: boolean }
   | { type: "chat_send"; v: number; id: string; session: string; clientMessageId: string; text: string; explicitRetry?: boolean }
   | { type: "chat_send_result"; v: number; id: string; status: "accepted" | "duplicate" | "failed"; error?: string }

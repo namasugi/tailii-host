@@ -4,7 +4,7 @@
 // 作り、Session Hub と iOS の双方で冪等に扱えるようにする。
 
 import { createHash } from "node:crypto";
-import { PROTOCOL_V1, type ControlMessage } from "../protocol.js";
+import { PROTOCOL_V1, type CodexGoalInfo, type ControlMessage } from "../protocol.js";
 
 const NOTICE_STREAM_PREFIX = "codex-notice-";
 const NOTICE_DETAIL_LIMIT = 240;
@@ -168,6 +168,69 @@ export function codexAppServerSystemNotice(
   }
 
   return null;
+}
+
+// MARK: - 目標（codex-goal）
+
+/** 目標状態の利用者向けラベル（iOS のバナーと同じ語）。未知の状態はそのまま返す。 */
+export function codexGoalStatusLabel(status: string): string {
+  switch (status) {
+    case "active": return "追求中";
+    case "paused": return "一時停止";
+    case "blocked": return "行き詰まり";
+    case "usageLimited": return "使用量上限で停止";
+    case "budgetLimited": return "トークン予算に到達";
+    case "complete": return "達成";
+    default: return status;
+  }
+}
+
+/**
+ * 目標の状態 / 内容が変わったときだけ注記を出すための照合キー（tokensUsed 等の進捗更新では変えない）。
+ * live（thread/goal/updated）と rollout（event_msg thread_goal_updated）の両系統で同じ規則を使う。
+ */
+export function codexGoalNoticeKey(goal: CodexGoalInfo | null): string {
+  // createdAt を含めるのは、解除 → 同文で再設定した目標を「新しい目標」として再び注記するため
+  // （streamId が同じだと iOS が既出行として捨てる）。同じ goal は live / rollout とも同じ createdAt。
+  return goal === null ? "cleared" : `${goal.createdAt}\u0000${goal.status}\u0000${goal.objective}`;
+}
+
+/**
+ * 目標の設定 / 状態変化の注記（🎯 目標（追求中）: …）。
+ * streamId の identity には `updatedAt` も入れる: 一時停止 → 再開のように同じ状態へ戻る注記が最初の注記と
+ * 同じ streamId になると、iOS が既出行として捨てて「状態が変わったときだけ注記する」が崩れるため。
+ * live と rollout は同じ変化イベント（同じ updatedAt）から注記を作るので identity は一致する。
+ */
+export function codexGoalNotice(goal: CodexGoalInfo): CodexSystemNotice {
+  const identity = `goal:${goal.createdAt}:${goal.updatedAt}:${goal.status}:${goal.objective}`;
+  return notice(
+    identity,
+    identity,
+    `🎯 目標（${codexGoalStatusLabel(goal.status)}）: ${clip(goal.objective, NOTICE_DETAIL_LIMIT)}`,
+  );
+}
+
+/** 目標解除の注記。identity に直前の目標の createdAt を入れ、解除 → 再設定 → 解除の 2 回目も表示させる。 */
+export function codexGoalClearedNotice(previousCreatedAt: number | null): CodexSystemNotice {
+  const identity = `goal:cleared:${previousCreatedAt ?? "unknown"}`;
+  return notice(identity, identity, "🎯 目標を解除しました");
+}
+
+/**
+ * 実行中 turn への送信（turn/steer）は collaboration mode を変えられない。iOS のトグルと違う mode の turn が
+ * 走っている間に送った場合の注記（次の turn から反映される）。
+ */
+export function codexCollaborationModeSteerNotice(
+  requested: "plan" | "default",
+  turnId: string,
+): CodexSystemNotice {
+  const identity = `collab-steer:${turnId}:${requested}`;
+  const label = requested === "plan" ? "プランモード" : "通常モード";
+  return notice(
+    identity,
+    identity,
+    `⚠️ 実行中の turn には${label}を反映できません。今の応答が終わってからの送信で切り替わります。`,
+  );
 }
 
 /** App Server `deprecationNotice` を診断ログ 1 行へ正規化する。表示用ではない。 */

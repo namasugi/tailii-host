@@ -906,6 +906,32 @@ describe("encode 詳細", () => {
     });
   });
 
+  it("codex-plan-goal v1 golden 全行が byte-exact でラウンドトリップする", () => {
+    for (const line of goldenLines("codex-plan-goal-v1.ndjson")) {
+      expect(encodeControlMessage(decodeControlMessage(line))).toBe(line);
+    }
+  });
+
+  it("codex_turn_start の collaborationMode は plan / default だけを受理し、未知値は落とす", () => {
+    expect(decodeControlMessage(
+      '{"collaborationMode":"plan","id":"t1","session":"codex-work","text":"計画","type":"codex_turn_start","v":2}',
+    )).toEqual({
+      type: "codex_turn_start", v: 2, id: "t1", session: "codex-work", text: "計画", collaborationMode: "plan",
+    });
+    expect(decodeControlMessage(
+      '{"collaborationMode":"review","id":"t2","session":"codex-work","text":"x","type":"codex_turn_start","v":2}',
+    )).not.toHaveProperty("collaborationMode");
+  });
+
+  it("codex_goal_request の action 不正と goal の形不正を拒否する", () => {
+    expect(() => decodeControlMessage(
+      '{"action":"pause","id":"g","session":"s","type":"codex_goal_request","v":2}',
+    )).toThrow();
+    expect(() => decodeControlMessage(
+      '{"goal":{"objective":"x"},"session":"s","type":"codex_goal_state","v":2}',
+    )).toThrow();
+  });
+
   it("codex_model_set は thread の後続 turn 用モデル変更を往復する", () => {
     const request = encodeControlMessage({
       type: "codex_model_set_request",

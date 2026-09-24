@@ -1,0 +1,9 @@
+{"clientUserMessageId":"client-1","collaborationMode":"plan","id":"turn-1","session":"codex-work","text":"README を追加する計画を立てて","type":"codex_turn_start","v":2}
+{"action":"get","id":"goal-1","session":"codex-work","type":"codex_goal_request","v":2}
+{"action":"set","id":"goal-2","objective":"テストを全て緑にする","session":"codex-work","status":"active","tokenBudget":200000,"type":"codex_goal_request","v":2}
+{"goal":{"createdAt":1790207615,"objective":"テストを全て緑にする","status":"active","threadId":"01a0d0b0-2ef3-7c40-916d-afa13d4bf52c","timeUsedSeconds":0,"tokenBudget":200000,"tokensUsed":0,"updatedAt":1790207615},"id":"goal-2","status":"ok","type":"codex_goal_response","v":2}
+{"action":"clear","id":"goal-3","session":"codex-work","type":"codex_goal_request","v":2}
+{"cleared":true,"id":"goal-3","status":"ok","type":"codex_goal_response","v":2}
+{"error":"この Codex App Server は目標（goal）に対応していません","id":"goal-4","status":"failed","type":"codex_goal_response","v":2}
+{"goal":{"createdAt":1790207615,"objective":"テストを全て緑にする","status":"paused","threadId":"01a0d0b0-2ef3-7c40-916d-afa13d4bf52c","timeUsedSeconds":42,"tokensUsed":1234,"updatedAt":1790207700},"session":"codex-work","type":"codex_goal_state","v":2}
+{"session":"codex-work","type":"codex_goal_state","v":2}

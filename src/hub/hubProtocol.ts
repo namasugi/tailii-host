@@ -5,6 +5,9 @@ import type { EngineRelayMessage, SessionProcessingMessage } from "./engineRelay
 import {
   decodeControlMessage,
   encodeControlMessage,
+  type CodexCollaborationMode,
+  type CodexGoalAction,
+  type CodexGoalInfo,
   type ControlMessage,
   type QuestionAnswer,
   type QuestionPromptQuestion,
@@ -32,8 +35,22 @@ export type HubClientMessage =
       threadId: string;
       cwd: string;
       explicitRetry?: boolean;
+      /** collaboration mode（codex-plan-mode）。省略 / null は旧 engine からの turn（従来どおり指定なし）。 */
+      collaborationMode?: CodexCollaborationMode | null;
     }
   | { type: "codex_turn_interrupt"; id: string; session: string }
+  /** Codex thread の目標操作（engine→hub, codex-goal）。hub 所有の App Server 接続で `thread/goal/*` を実行する。 */
+  | {
+      type: "codex_goal_submit";
+      id: string;
+      session: string;
+      threadId: string;
+      cwd: string;
+      action: CodexGoalAction;
+      objective?: string;
+      status?: string;
+      tokenBudget?: number;
+    }
   | { type: "chat_send"; id: string; session: string; clientMessageId: string; text: string; explicitRetry?: boolean }
   | { type: "pending_message_delete"; id: string; session: string; clientMessageId: string; kind: "chat" | "codex" }
   | { type: "runtime_claim"; id: string; session: string }
@@ -76,6 +93,7 @@ export type HubServerMessage =
   | { type: "question_answer_result"; id: string; status: "accepted" | "already_resolved" | "unknown" }
   | { type: "input_claim_result"; id: string; status: "granted" | "duplicate" }
   | { type: "codex_turn_result"; id: string; status: "started" | "duplicate" | "failed"; error?: string }
+  | { type: "codex_goal_result"; id: string; status: "ok" | "failed"; goal?: CodexGoalInfo; cleared?: boolean; error?: string }
   | { type: "chat_send_result"; id: string; status: "accepted" | "duplicate" | "failed"; error?: string }
   | { type: "pending_message_delete_result"; id: string; status: "deleted" | "not_found" | "processing" | "failed"; error?: string }
   | { type: "runtime_claim_result"; id: string; status: "granted" | "held" }
@@ -161,20 +179,42 @@ export function decodeHubClientLine(line: string): HubClientMessage | null {
     const approvalPolicy = record["approvalPolicy"] ?? null;
     const sandbox = record["sandbox"], threadId = record["threadId"], cwd = record["cwd"];
     const explicitRetry = record["explicitRetry"];
+    const collaborationMode = record["collaborationMode"] ?? null;
     const validSandbox = sandbox === null || sandbox === "read-only" ||
       sandbox === "workspace-write" || sandbox === "danger-full-access";
     const validApprovalPolicy = approvalPolicy === null || approvalPolicy === "untrusted" ||
       approvalPolicy === "on-request" || approvalPolicy === "never";
+    const validCollaborationMode = collaborationMode === null || collaborationMode === "plan" ||
+      collaborationMode === "default";
     return typeof id === "string" && id.length > 0 && typeof session === "string" && session.length > 0 &&
       typeof text === "string" && typeof clientUserMessageId === "string" && clientUserMessageId.length > 0 &&
       (effort === null || typeof effort === "string") && validApprovalPolicy && validSandbox &&
+      validCollaborationMode &&
       typeof threadId === "string" && threadId.length > 0 && typeof cwd === "string" && cwd.length > 0 &&
       (explicitRetry === undefined || typeof explicitRetry === "boolean")
       ? { type: "codex_turn_submit", id, session, text, clientUserMessageId,
           effort: effort as string | null,
           approvalPolicy: approvalPolicy as "untrusted" | "on-request" | "never" | null,
           sandbox: sandbox as "read-only" | "workspace-write" | "danger-full-access" | null,
-          threadId, cwd, ...(explicitRetry === true ? { explicitRetry: true } : {}) }
+          threadId, cwd, ...(explicitRetry === true ? { explicitRetry: true } : {}),
+          ...(collaborationMode !== null ? { collaborationMode: collaborationMode as CodexCollaborationMode } : {}) }
+      : null;
+  }
+  if (record["type"] === "codex_goal_submit") {
+    const id = record["id"], session = record["session"], threadId = record["threadId"], cwd = record["cwd"];
+    const action = record["action"], objective = record["objective"], status = record["status"];
+    const tokenBudget = record["tokenBudget"];
+    const validAction = action === "get" || action === "set" || action === "clear";
+    return typeof id === "string" && id.length > 0 && typeof session === "string" && session.length > 0 &&
+      typeof threadId === "string" && threadId.length > 0 && typeof cwd === "string" && cwd.length > 0 &&
+      validAction &&
+      (objective === undefined || typeof objective === "string") &&
+      (status === undefined || typeof status === "string") &&
+      (tokenBudget === undefined || (typeof tokenBudget === "number" && Number.isFinite(tokenBudget)))
+      ? { type: "codex_goal_submit", id, session, threadId, cwd, action: action as CodexGoalAction,
+          ...(typeof objective === "string" ? { objective } : {}),
+          ...(typeof status === "string" ? { status } : {}),
+          ...(typeof tokenBudget === "number" ? { tokenBudget } : {}) }
       : null;
   }
   if (record["type"] === "codex_turn_interrupt") {
@@ -217,6 +257,22 @@ export function decodeHubClientLine(line: string): HubClientMessage | null {
     return typeof enabled === "boolean" ? { type: "session_preview_watch", enabled } : null;
   }
   return decodeProcessing(record);
+}
+
+/** `codex_goal_result.goal` の検証。形が違えば null（行ごと捨てる）。 */
+function parseCodexGoal(value: unknown): CodexGoalInfo | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const isNumber = (candidate: unknown): candidate is number =>
+    typeof candidate === "number" && Number.isFinite(candidate);
+  const threadId = raw["threadId"], objective = raw["objective"], status = raw["status"];
+  const tokenBudget = raw["tokenBudget"], tokensUsed = raw["tokensUsed"];
+  const timeUsedSeconds = raw["timeUsedSeconds"], createdAt = raw["createdAt"], updatedAt = raw["updatedAt"];
+  if (typeof threadId !== "string" || typeof objective !== "string" || typeof status !== "string" ||
+    !isNumber(tokensUsed) || !isNumber(timeUsedSeconds) || !isNumber(createdAt) || !isNumber(updatedAt) ||
+    (tokenBudget !== undefined && !isNumber(tokenBudget))) return null;
+  return { threadId, objective, status, ...(isNumber(tokenBudget) ? { tokenBudget } : {}),
+    tokensUsed, timeUsedSeconds, createdAt, updatedAt };
 }
 
 export function decodeHubServerLine(line: string): HubServerMessage | null {
@@ -276,6 +332,18 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
     if (typeof id !== "string" || (status !== "started" && status !== "duplicate" && status !== "failed") ||
       (error !== undefined && typeof error !== "string")) return null;
     return { type: "codex_turn_result", id, status, ...(typeof error === "string" ? { error } : {}) };
+  }
+  if (record["type"] === "codex_goal_result") {
+    const id = record["id"], status = record["status"], error = record["error"], cleared = record["cleared"];
+    if (typeof id !== "string" || (status !== "ok" && status !== "failed") ||
+      (error !== undefined && typeof error !== "string") ||
+      (cleared !== undefined && typeof cleared !== "boolean")) return null;
+    const goal = record["goal"] === undefined ? undefined : parseCodexGoal(record["goal"]);
+    if (goal === null) return null;
+    return { type: "codex_goal_result", id, status,
+      ...(goal !== undefined ? { goal } : {}),
+      ...(typeof cleared === "boolean" ? { cleared } : {}),
+      ...(typeof error === "string" ? { error } : {}) };
   }
   if (record["type"] === "chat_send_result") {
     const id = record["id"], status = record["status"], error = record["error"];

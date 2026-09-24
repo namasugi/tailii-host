@@ -42,6 +42,7 @@ import {
   type CodexTurnControllerRuntime,
 } from "../codex/codexNativeTurnController.js";
 import {
+  COLLABORATION_MODE_STREAM_ID as CODEX_COLLABORATION_MODE_STREAM_ID,
   CONTEXT_STREAM_ID as CODEX_CONTEXT_STREAM_ID,
   CONTEXT_WINDOW_STREAM_ID as CODEX_CONTEXT_WINDOW_STREAM_ID,
   MODEL_STREAM_ID as CODEX_MODEL_STREAM_ID,
@@ -178,6 +179,13 @@ interface CodexLiveState {
    * 読み直すため、途中の旧モデルを配信せず走査完了時に最新値だけを配る。
    */
   scanLastModel: string | null;
+  /**
+   * 購読時点で controller が把握している collaboration mode（codex-plan-mode）。backfill 完了後に
+   * `pc:collab` として配り、履歴の最後の turn ではなく thread の現在値へ iOS のトグルを揃える。
+   */
+  subscribedCollaborationMode: "plan" | "default" | null;
+  /** この会話へ最後に配った live の collaboration mode（後から加わった client の backfill 完了時に添える）。 */
+  lastCollaborationMode: "plan" | "default" | null;
 }
 interface SessionActor {
   pendingQuestion: {
@@ -743,6 +751,43 @@ export class SessionHub {
       void this.drainCodexQueue(message.session, actor);
       return;
     }
+    if (message.type === "codex_goal_submit") {
+      // 目標操作（codex-goal）。turn と同じ hub 所有の thread 接続で実行し、結果と通知を会話 stream へ返す。
+      const controller = this.ensureCodexTurnController();
+      const goal = controller.goal;
+      if (goal === undefined) {
+        this.sendTo(client, {
+          type: "codex_goal_result", id: message.id, status: "failed",
+          error: "この host の Codex 連携は目標（goal）に対応していません。",
+        });
+        return;
+      }
+      void goal.call(controller, {
+        session: message.session, threadId: message.threadId, cwd: message.cwd, action: message.action,
+        ...(message.objective !== undefined ? { objective: message.objective } : {}),
+        ...(message.status !== undefined ? { status: message.status } : {}),
+        ...(message.tokenBudget !== undefined ? { tokenBudget: message.tokenBudget } : {}),
+      }).then(
+        (result) => {
+          this.sendTo(client, {
+            type: "codex_goal_result", id: message.id, status: "ok",
+            ...(result.goal !== null ? { goal: result.goal } : {}),
+            ...(result.cleared !== undefined ? { cleared: result.cleared } : {}),
+          });
+          // 解除 / 完了後に購読者も turn も無ければ、目標のために保持していた thread 接続を畳む。
+          this.maybeCloseIdleCodexSession(message.session);
+        },
+        (error) => {
+          this.options.log?.(`codex goal ${message.action} 失敗 session=${message.session}: ${String(error)}`);
+          this.sendTo(client, {
+            type: "codex_goal_result", id: message.id, status: "failed", error: String(error),
+          });
+          // 失敗でも、この操作のために開いただけの thread 接続は残さない。
+          this.maybeCloseIdleCodexSession(message.session);
+        },
+      );
+      return;
+    }
     if (message.type === "codex_turn_interrupt") {
       void this.codexTurnController?.interruptTurn?.(message.session).catch((error) => {
         this.publishCodexMarker(
@@ -1102,8 +1147,19 @@ export class SessionHub {
       actor.tail?.stop();
       actor.tail = null;
       actor.codexLive = null;
-      if (!this.activeCodexTurns.has(session)) this.codexTurnController?.closeSession(session);
+      this.maybeCloseIdleCodexSession(session);
     }
+  }
+
+  /**
+   * 購読者ゼロ・turn なし・active な目標なし、のときだけ Codex thread 接続を畳む。
+   * 目標が active な間は購読者がいなくても保持する（継続 turn を観測するため, codex-goal）。
+   */
+  private maybeCloseIdleCodexSession(session: string): void {
+    if ((this.actors.get(session)?.subscribers.size ?? 0) > 0) return;
+    if (this.activeCodexTurns.has(session)) return;
+    if (this.codexTurnController?.hasActiveGoal?.(session) === true) return;
+    this.codexTurnController?.closeSession(session);
   }
 
   private startSharedTail(session: string, actor: SessionActor, newerThanMs: number | null): void {
@@ -1163,6 +1219,8 @@ export class SessionHub {
       lastModel: null,
       subscribedModel: null,
       scanLastModel: null,
+      subscribedCollaborationMode: null,
+      lastCollaborationMode: null,
     };
     actor.codexLive = state;
     // 履歴表示は rollout だけで完結する。App Server の購読（daemon 起動・接続・thread/resume・
@@ -1185,6 +1243,7 @@ export class SessionHub {
         // 会話を開いていない間の /model や設定変更は thread/settings/updated が誰にも届かない。
         // resume 応答の現在モデルを backfill 完了後に配信し、開き直しで表示を実体へ揃える。
         state.subscribedModel = snapshot.model ?? null;
+        state.subscribedCollaborationMode = snapshot.collaborationMode ?? null;
         if (!snapshot.liveSubscribed) {
           this.options.log?.(
             `Codex App Server の履歴スナップショットが読めない（turn 前の未materialize か履歴読み取り失敗）ため、rollout fallbackへ移行 session=${session} thread=${threadId}` +
@@ -1244,6 +1303,14 @@ export class SessionHub {
       // 処理中状態を自己修復できない。
     }
     this.publishCodexModelMarker(session, actor, state, subscribedModel);
+    // thread の現在の collaboration mode（controller が把握している場合）。履歴（task_started）由来の値は
+    // iOS が採用しないので、実体はここで 1 回配る（codex-plan-mode）。
+    const subscribedCollaborationMode = state.subscribedCollaborationMode;
+    state.subscribedCollaborationMode = null;
+    if (subscribedCollaborationMode !== null) {
+      state.lastCollaborationMode = subscribedCollaborationMode;
+      this.publishCodexMarker(session, CODEX_COLLABORATION_MODE_STREAM_ID, subscribedCollaborationMode);
+    }
   }
 
   private openCodexRollout(
@@ -1541,6 +1608,15 @@ export class SessionHub {
       if (currentModel !== null) {
         this.sendTo(client, {
           type: "conversation_event", session, serverSeq: 0, payload: codexModelMarker(currentModel),
+        });
+      }
+      // collaboration mode も同様（turn を伴わない `/plan` 等は境界前の live 配信にしか無い, codex-plan-mode）。
+      const currentCollaborationMode = actor.codexLive?.lastCollaborationMode ?? null;
+      if (currentCollaborationMode !== null) {
+        this.sendTo(client, {
+          type: "conversation_event", session, serverSeq: 0,
+          payload: { type: "chat_output", v: PROTOCOL_V1, streamId: CODEX_COLLABORATION_MODE_STREAM_ID,
+            role: "system", text: currentCollaborationMode, eof: true },
         });
       }
     };
@@ -1954,9 +2030,26 @@ export class SessionHub {
         else this.activeCodexTurns.delete(session);
         this.applyProcessing(session, state);
         this.broadcast({ type: "session_processing", session, state });
-        if (state === "done" && (this.actors.get(session)?.subscribers.size ?? 0) === 0) {
-          this.codexTurnController?.closeSession(session);
+        // 購読者ゼロで turn が終われば接続を畳む。ただし目標（goal）が active な会話は畳まない:
+        // 継続 turn は server 起点で、購読を落とすと処理中 / heartbeat / 完了通知を観測できない
+        // （reaper が idle 扱いで pane を掃除する）ため（codex-goal）。
+        if (state === "done") this.maybeCloseIdleCodexSession(session);
+      },
+      onGoal: (session, goal) => {
+        // 目標の現在値を会話 stream に載せる（replay buffer 経由で後から加わった購読者にも届く）。
+        this.publishConversationEvent(session, this.actor(session), {
+          type: "codex_goal_state", v: PROTOCOL_V2, session, ...(goal !== null ? { goal } : {}),
+        });
+        if (goal === null || goal.status !== "active") this.maybeCloseIdleCodexSession(session);
+      },
+      onCollaborationMode: (session, mode) => {
+        // backfill 中は iOS が live 行を history-done まで捨てるため、finish で配る値も最新へ更新しておく。
+        const live = this.actors.get(session)?.codexLive ?? null;
+        if (live !== null) {
+          live.lastCollaborationMode = mode;
+          if (live.phase === "backfill") live.subscribedCollaborationMode = mode;
         }
+        this.publishCodexMarker(session, CODEX_COLLABORATION_MODE_STREAM_ID, mode);
       },
       onModel: (session, model) => this.publishCodexMarker(session, CODEX_MODEL_STREAM_ID, model),
       onTokenUsage: (session, totalTokens, contextWindow) => {
@@ -2053,6 +2146,10 @@ export class SessionHub {
         effort: message.effort,
         approvalPolicy: message.approvalPolicy,
         sandbox: message.sandbox,
+        // collaboration mode（プランモード, codex-plan-mode）。旧 engine は付けないので従来どおり省略。
+        ...(message.collaborationMode !== undefined && message.collaborationMode !== null
+          ? { collaborationMode: message.collaborationMode }
+          : {}),
       });
       const actor = this.actors.get(message.session);
       if (actor === undefined || actor !== expectedActor) return;
@@ -2677,6 +2774,7 @@ function sameCodexRetry(
     left.clientUserMessageId === right.clientUserMessageId && left.effort === right.effort &&
     (left.approvalPolicy ?? null) === (right.approvalPolicy ?? null) &&
     left.sandbox === right.sandbox &&
+    (left.collaborationMode ?? null) === (right.collaborationMode ?? null) &&
     left.threadId === right.threadId && left.cwd === right.cwd;
 }
 

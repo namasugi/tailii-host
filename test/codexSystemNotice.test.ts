@@ -4,6 +4,10 @@ import { describe, expect, test } from "vitest";
 import {
   codexAppServerSystemNotice,
   codexDeprecationNoticeLogLine,
+  codexGoalClearedNotice,
+  codexGoalNotice,
+  codexGoalNoticeKey,
+  codexGoalStatusLabel,
   codexMcpItemErrorNotice,
   codexRolloutSystemNotice,
   codexSystemNoticeContentKey,
@@ -137,5 +141,31 @@ describe("codexSystemNotice", () => {
     expect(notice?.payload.text).not.toContain("\n");
     expect(notice?.payload.text).toContain("…");
     expect([...(notice?.payload.text ?? "")].length).toBeLessThan(280);
+  });
+});
+
+describe("codexSystemNotice goal（codex-goal）", () => {
+  test("目標注記は状態ラベル付きで、進捗だけの更新は同じ streamId / 照合キーになる", () => {
+    const goal = {
+      threadId: "t", objective: "ベンチ整備", status: "blocked",
+      tokensUsed: 1, timeUsedSeconds: 2, createdAt: 3, updatedAt: 4,
+    };
+    const first = codexGoalNotice(goal);
+    // 同じ変化イベント（同じ updatedAt）から作る live / rollout の注記は同じ streamId になる。
+    expect(first.payload.streamId).toBe(codexGoalNotice({ ...goal }).payload.streamId);
+    expect(first.payload.text).toBe("🎯 目標（行き詰まり）: ベンチ整備");
+    // 照合キーは進捗（tokensUsed / updatedAt）では変わらず、状態が変わると変わる。
+    expect(codexGoalNoticeKey(goal)).toBe(codexGoalNoticeKey({ ...goal, tokensUsed: 99, updatedAt: 5 }));
+    expect(codexGoalNoticeKey(goal)).not.toBe(codexGoalNoticeKey({ ...goal, status: "active" }));
+    // 一時停止 → 再開のように同じ状態へ戻る注記は別の streamId（iOS の既出照合で捨てられない）。
+    const resumed = codexGoalNotice({ ...goal, status: "active", updatedAt: 9 });
+    expect(resumed.payload.streamId).not.toBe(codexGoalNotice({ ...goal, status: "active", updatedAt: 2 }).payload.streamId);
+    expect(codexGoalNoticeKey(null)).toBe("cleared");
+    expect(codexGoalClearedNotice(3).payload.text).toBe("🎯 目標を解除しました");
+    // 解除 → 再設定 → 解除の 2 回目は直前の目標の createdAt で区別する。
+    expect(codexGoalClearedNotice(3).payload.streamId).not.toBe(codexGoalClearedNotice(7).payload.streamId);
+    expect(codexGoalStatusLabel("usageLimited")).toBe("使用量上限で停止");
+    expect(codexGoalStatusLabel("mystery")).toBe("mystery");
+    expect(codexSystemNoticeContentKey(first.payload)).toBe(`system\u0000${first.payload.text}`);
   });
 });

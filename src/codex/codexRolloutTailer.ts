@@ -22,7 +22,18 @@ import {
   rolloutResponseItemToolActivities,
   toolActivityMessage,
 } from "./codexToolActivity.js";
-import { codexRolloutSystemNotice } from "./codexSystemNotice.js";
+import {
+  codexGoalClearedNotice,
+  codexGoalNotice,
+  codexGoalNoticeKey,
+  codexRolloutSystemNotice,
+} from "./codexSystemNotice.js";
+import { codexGoalFromWire } from "./codexAppServer.js";
+import {
+  codexPlanChatOutput,
+  containsProposedPlanBlock,
+  stripProposedPlanBlocks,
+} from "./codexPlanItem.js";
 
 /** 履歴再生完了マーカーの streamId（claude 側と共通。iOS `ChatLogModel` と対で解釈）。 */
 export const HISTORY_DONE_STREAM_ID = "pc:history-done";
@@ -34,6 +45,12 @@ export const MODEL_STREAM_ID = "pc:model";
 export const CONTEXT_STREAM_ID = "pc:context";
 /** モデルに割り当てられたコンテキスト窓通知マーカーの streamId。 */
 export const CONTEXT_WINDOW_STREAM_ID = "pc:context-window";
+/**
+ * Codex の collaboration mode（"plan" | "default"）通知マーカーの streamId（codex-plan-mode）。
+ * live（`thread/settings/updated` と購読時の controller 現在値）からだけ配る。rollout の
+ * `task_started.collaboration_mode_kind` は過去の turn の mode なので配らない（トグルを実績で上書きしない）。
+ */
+export const COLLABORATION_MODE_STREAM_ID = "pc:collab";
 
 /** rollout が持つ Codex turn の権威ライフサイクル。App Server 通知欠落時の照合に使う。 */
 export interface CodexTurnLifecycleEvent {
@@ -89,6 +106,10 @@ interface TailState {
     legacyStreamId: string;
   } | null;
   pendingAssistantEOFStartedAtMs: number | null;
+  /** 直近に注記した目標の照合キー（進捗だけの thread_goal_updated では注記しない）。 */
+  lastGoalNoticeKey: string | null;
+  /** 直近に見た目標の createdAt（解除注記の identity。live 側の applyGoal と同じ規則）。 */
+  lastGoalCreatedAt: number | null;
 }
 
 export class CodexRolloutTailer {
@@ -214,6 +235,8 @@ export class CodexRolloutTailer {
         lastContextWindow: null,
         pendingAssistantEvent: null,
         pendingAssistantEOFStartedAtMs: null,
+        lastGoalNoticeKey: null,
+        lastGoalCreatedAt: null,
       };
       const start = Date.now();
       let announcedReplayDone = false;
@@ -478,7 +501,18 @@ export function* emitLine(line: Buffer, state: TailState): Generator<ControlMess
   if (typeof parsed !== "object" || parsed === null) return;
   const record = parsed as { type?: unknown; payload?: unknown };
 
-  const mirroredAssistant = responseItemAssistant(record);
+  let mirroredAssistant = responseItemAssistant(record);
+  if (mirroredAssistant !== null && containsProposedPlanBlock(mirroredAssistant.text)) {
+    // プランモードの最終応答。`<proposed_plan>` ブロックは plan item（item_completed/Plan）として別に届くので
+    // 本文からは外し、残り（前置き文があれば）だけを assistant 行にする。ブロックだけなら行ごと出さない
+    // （live はこれを agentMessage として配らない, codex-plan-mode）。
+    const remainder = stripProposedPlanBlocks(mirroredAssistant.text);
+    if (remainder.length === 0) {
+      yield* flushPendingAssistantEvent(state);
+      return;
+    }
+    mirroredAssistant = { ...mirroredAssistant, text: remainder };
+  }
   if (mirroredAssistant !== null) {
     const pending = state.pendingAssistantEvent;
     if (pending !== null &&
@@ -543,8 +577,41 @@ export function* emitLine(line: Buffer, state: TailState): Generator<ControlMess
 
   // 現行 rollout は user_message の代わりに item_completed/UserMessage を記録する。
   // response_item の user 行には開発指示も混ざるため、発話と確定したこのイベントだけを採用。
+  // task_started の `collaboration_mode_kind` は「その turn の mode」= 過去の実績で、thread の現在値ではない。
+  // iOS のトグルは利用者の意図なので履歴で上書きせず、`pc:collab` は live（thread/settings/updated と
+  // 購読時に controller が把握している値）だけから配る。差分購読（newerThanMs 付き、history-begin 無し）では
+  // iOS 側の再生ゲートが効かないため、発生元で出さない。
+  if (kind === "task_started") return;
+
+  if (kind === "thread_goal_updated" || kind === "thread_goal_cleared") {
+    // 目標の設定 / 状態変化だけを注記にする（進捗更新は tokensUsed が変わるだけ）。live の
+    // thread/goal/updated と同じ本文 / streamId になり、occurrence 照合で 1 回だけ出る。
+    const goal = kind === "thread_goal_updated"
+      ? codexGoalFromWire((payload as Record<string, unknown>)["goal"])
+      : null;
+    if (kind === "thread_goal_updated" && goal === null) return;
+    const key = codexGoalNoticeKey(goal);
+    if (key === state.lastGoalNoticeKey) return;
+    // 「解除」は目標を一度でも見た後だけ意味がある（初手の cleared は無視）。
+    if (goal === null && state.lastGoalNoticeKey === null) return;
+    const previousCreatedAt = state.lastGoalCreatedAt;
+    state.lastGoalNoticeKey = key;
+    state.lastGoalCreatedAt = goal?.createdAt ?? null;
+    yield (goal === null ? codexGoalClearedNotice(previousCreatedAt) : codexGoalNotice(goal)).payload;
+    return;
+  }
+
   if (kind === "item_completed") {
     const item = asRecord((payload as Record<string, unknown>)["item"]);
+    if (item?.["type"] === "Plan") {
+      // プランモードの提案プラン（codex-plan-mode）。live の item/completed(plan) と同じ streamId / 本文。
+      const planId = item["id"];
+      const planText = item["text"];
+      if (typeof planId !== "string" || typeof planText !== "string") return;
+      const plan = codexPlanChatOutput(planId, planText);
+      if (plan !== null) yield plan;
+      return;
+    }
     if (item?.["type"] !== "UserMessage") return;
     const id = item["id"];
     const content = item["content"];

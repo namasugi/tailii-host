@@ -87,7 +87,9 @@ export const codexHandlers: HandlerRegistry = {
             approvalPolicy: message.approvalPolicy ?? null,
             sandbox: message.sandbox ?? null,
             threadId: providerSessionId, cwd: meta.cwd,
-            ...(message.explicitRetry === true ? { explicitRetry: true } : {}) },
+            ...(message.explicitRetry === true ? { explicitRetry: true } : {}),
+            // collaboration mode（プランモード, codex-plan-mode）。未指定は従来どおり hub に渡さない。
+            ...(message.collaborationMode !== undefined ? { collaborationMode: message.collaborationMode } : {}) },
           message.id, ctx.codexHubRpcTimeoutMs,
         );
         writer.write({
@@ -118,6 +120,42 @@ export const codexHandlers: HandlerRegistry = {
         id: message.id,
         status: "failed",
         error: String(error),
+      });
+    }
+  },
+
+  codex_goal_request: async (message, ctx) => {
+    const { writer, state, metadataStore } = ctx;
+    const v = state.negotiatedVersion;
+    const meta = metadataStore?.get(message.session) ?? null;
+    const providerSessionId = meta?.providerSessionId ?? null;
+    if (meta?.agent !== "codex" || providerSessionId === null) {
+      writer.write({
+        type: "codex_goal_response", v, id: message.id, status: "failed",
+        error: `Codex App Server thread がセッション '${message.session}' に束縛されていません。`,
+      });
+      return;
+    }
+    try {
+      // 目標は hub 所有の App Server 接続（turn と同じ購読）で操作する: thread/goal/updated 通知が
+      // その接続へ届き、hub が会話 stream（codex_goal_state）と目標中の購読保持へ反映できる。
+      const result = await ctx.hubRpc<Extract<HubServerMessage, { type: "codex_goal_result" }>>(
+        { type: "codex_goal_submit", id: message.id, session: message.session,
+          threadId: providerSessionId, cwd: meta.cwd, action: message.action,
+          ...(message.objective !== undefined ? { objective: message.objective } : {}),
+          ...(message.status !== undefined ? { status: message.status } : {}),
+          ...(message.tokenBudget !== undefined ? { tokenBudget: message.tokenBudget } : {}) },
+        message.id, ctx.codexHubRpcTimeoutMs,
+      );
+      writer.write({
+        type: "codex_goal_response", v, id: result.id, status: result.status,
+        ...(result.goal !== undefined ? { goal: result.goal } : {}),
+        ...(result.cleared !== undefined ? { cleared: result.cleared } : {}),
+        ...(result.error !== undefined ? { error: result.error } : {}),
+      });
+    } catch (error) {
+      writer.write({
+        type: "codex_goal_response", v, id: message.id, status: "failed", error: String(error),
       });
     }
   },

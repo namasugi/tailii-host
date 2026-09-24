@@ -2850,3 +2850,46 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 });
+
+describe("codex goal（codex-goal）", () => {
+  test("codex_goal_request は hub 経由で controller.goal を呼び、codex_goal_response を返す", async () => {
+    const store = makeTempStore();
+    store.put({
+      name: "codex-work", cwd: "/tmp/codex-work", createdAt: 1, agent: "codex", providerSessionId: "thread-123",
+    });
+    const goalInfo = {
+      threadId: "thread-123", objective: "ベンチ整備", status: "active",
+      tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1,
+    };
+    const goal = vi.fn(async () => ({ goal: goalInfo }));
+    const controller: CodexTurnControllerRuntime = {
+      startTurn: vi.fn(async () => "turn-1"), goal, closeSession: vi.fn(), close: vi.fn(),
+    };
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store), metadataStore: store, codexTurnController: controller,
+    });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine(
+      '{"action":"set","id":"goal-1","objective":"ベンチ整備","session":"codex-work","status":"active","type":"codex_goal_request","v":2}',
+    );
+    expect(await engine.lines.nextOfType("codex_goal_response")).toBe(
+      '{"goal":{"createdAt":1,"objective":"ベンチ整備","status":"active","threadId":"thread-123","timeUsedSeconds":0,"tokensUsed":0,"updatedAt":1},"id":"goal-1","status":"ok","type":"codex_goal_response","v":2}',
+    );
+    expect(goal).toHaveBeenCalledWith({
+      session: "codex-work", threadId: "thread-123", cwd: "/tmp/codex-work",
+      action: "set", objective: "ベンチ整備", status: "active",
+    });
+    await engine.teardown();
+  });
+
+  test("codex_goal_request は codex 以外の会話を失敗応答にする", async () => {
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner) });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine('{"action":"get","id":"goal-2","session":"missing","type":"codex_goal_request","v":2}');
+    const response = await engine.lines.nextOfType("codex_goal_response");
+    expect(response).toContain('"status":"failed"');
+    await engine.teardown();
+  });
+});

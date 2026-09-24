@@ -9,7 +9,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import WebSocket, { type RawData } from "ws";
 import { ensureDirectory0700 } from "../shared/paths.js";
-import type { CodexModelInfo } from "../protocol.js";
+import type { CodexCollaborationMode, CodexGoalInfo, CodexModelInfo } from "../protocol.js";
 
 const THREAD_TITLE_MODEL = "gpt-5.6-luna";
 const THREAD_TITLE_PROMPT_MAX_LENGTH = 2_000;
@@ -298,6 +298,41 @@ export class CodexAppServerThread {
   /** null=未判定、true=stable ID対応、false=旧App ServerなのでIDなしsteerへ固定。 */
   private supportsSteerClientUserMessageId: boolean | null = null;
 
+  /**
+   * thread の現在モデル / effort（購読応答と `thread/settings/updated` で追従）。collaboration mode の
+   * `settings.model` は必須文字列で、違う値を渡すとその turn からモデルが切り替わってしまうため、
+   * 実体（thread 設定）以外の推測値は使わない（codex-plan-mode）。
+   */
+  private currentModel: string | null;
+  private currentEffort: string | null;
+  /** この thread で最後に観測 / 送信した collaboration mode（server は turn をまたいで保持する）。 */
+  private lastCollaborationMode: CodexCollaborationMode | null = null;
+  /**
+   * プランモードに入る直前の model / effort。plan の preset（`plan_mode_reasoning_effort` 等）が
+   * `thread/settings/updated` 経由で currentModel / currentEffort を上書きするため、default へ戻る turn は
+   * これを使って元の値へ戻す（戻さないと会話がずっと preset の effort のままになる）。
+   */
+  private settingsBeforePlan: { model: string | null; effort: string | null } | null = null;
+
+  /** 現在の collaboration mode（controller が購読時の `pc:collab` 配信と steer 時の注記判定に使う）。 */
+  get collaborationMode(): CodexCollaborationMode | null {
+    return this.lastCollaborationMode;
+  }
+
+  /** plan 直前の model / effort（controller が接続をまたいで預かる）。 */
+  get planRestoreSnapshot(): { model: string | null; effort: string | null } | null {
+    return this.settingsBeforePlan;
+  }
+
+  seedPlanRestoreSnapshot(snapshot: { model: string | null; effort: string | null }): void {
+    // resume 応答が「thread は default」と言っている（0.156+ の thread.collaborationMode）なら、離れている
+    // 間に別クライアントが戻した後なので古い退避値で巻き戻さない。
+    if (this.lastCollaborationMode === "default") return;
+    this.settingsBeforePlan ??= snapshot;
+  }
+  /** `collaborationMode/list` の preset（mode ごとの model / effort 上書き）。接続ごとに 1 回だけ読む。 */
+  private collaborationPresetsPromise: Promise<CodexCollaborationPresets> | null = null;
+
   constructor(
     readonly threadId: string,
     readonly initialItems: readonly Record<string, unknown>[],
@@ -319,7 +354,15 @@ export class CodexAppServerThread {
      * として配信し、会話を開いていない間に変更されたモデルも開き直しで反映する。
      */
     readonly model: string | null = null,
-  ) {}
+    /** 購読時点の thread の reasoning effort（`thread.reasoningEffort`）。不明なら null。 */
+    reasoningEffort: string | null = null,
+    /** 購読時点の thread の collaboration mode（0.156+ の `thread.collaborationMode.mode`）。不明なら null。 */
+    initialCollaborationMode: CodexCollaborationMode | null = null,
+  ) {
+    this.currentModel = model;
+    this.currentEffort = reasoningEffort;
+    this.lastCollaborationMode = initialCollaborationMode;
+  }
 
   async startTurn(
     text: string,
@@ -327,6 +370,7 @@ export class CodexAppServerThread {
     effort?: string | null,
     sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null,
     approvalPolicy?: CodexAppServerApprovalPolicy | null,
+    collaborationMode?: CodexCollaborationMode | null,
   ): Promise<string> {
     if (text.length === 0) throw new Error("Codex turn text must not be empty");
     const inherited =
@@ -338,7 +382,13 @@ export class CodexAppServerThread {
       approvalPolicy === null ? inherited?.approvalPolicy ?? null : approvalPolicy;
     const effectiveApprovalsReviewer =
       approvalPolicy === null ? inherited?.approvalsReviewer ?? null : null;
-    const response = await this.connection.request("turn/start", {
+    const hadPlanSnapshot = this.settingsBeforePlan !== null;
+    const collaboration = collaborationMode
+      ? await this.resolveCollaborationMode(collaborationMode, effort ?? null)
+      : null;
+    let response: unknown;
+    try {
+      response = await this.connection.request("turn/start", {
       threadId: this.threadId,
       input: [{ type: "text", text }],
       ...(clientUserMessageId ? { clientUserMessageId } : {}),
@@ -346,10 +396,139 @@ export class CodexAppServerThread {
       ...(effectiveSandbox ? { sandboxPolicy: codexSandboxPolicy(effectiveSandbox) } : {}),
       ...(effectiveApprovalPolicy ? { approvalPolicy: effectiveApprovalPolicy } : {}),
       ...(effectiveApprovalsReviewer ? { approvalsReviewer: effectiveApprovalsReviewer } : {}),
-    });
+      ...(collaboration !== null ? { collaborationMode: collaboration } : {}),
+      });
+    } catch (error) {
+      // この呼び出しで作った退避値は、turn が始まらなかったなら捨てる（後日の default で古い effort へ
+      // 巻き戻さない）。既にあった退避値は保つ。
+      if (!hadPlanSnapshot) this.settingsBeforePlan = null;
+      throw error;
+    }
     const turnId = extractTurnId(response);
     if (turnId === null) throw new Error("Codex App Server turn/start response omitted turn.id");
+    if (collaboration !== null && collaborationMode) {
+      this.lastCollaborationMode = collaborationMode;
+      if (collaborationMode === "default") this.settingsBeforePlan = null;
+    }
     return turnId;
+  }
+
+  /**
+   * `turn/start.collaborationMode` の実体を組み立てる（codex-plan-mode）。
+   *
+   * App Server の collaboration mode は「この turn 以降」thread 設定に残る（0.153.4 実測: turn/start 直後に
+   * `thread/settings/updated` が `collaborationMode` 付きで届く）。iOS が指定した mode は毎 turn 明示して
+   * 送り、TUI の `/plan` 等で thread 側が変わっていても iOS のトグルどおりに揃える。
+   * - `settings.model` は必須。plan は preset の上書き → thread の現在モデルの順で、不明なら開始しない
+   *   （推測値でモデルが切り替わる事故を避ける）。default は thread の現在モデルが不明なら「指定なし」
+   *   （従来挙動）。分かっていれば毎回明示する: 接続を作り直した後（thread 接続は購読者ゼロで畳まれる）は
+   *   直前の mode を覚えていないので、「plan からの復帰のときだけ送る」では plan に固着する。
+   * - `settings.reasoning_effort` は iOS の明示 effort → thread の現在 effort → preset（plan は
+   *   `plan_mode_reasoning_effort`）→ null（= server 既定。resume 応答の `reasoningEffort` が null の thread は
+   *   実際に既定で動いているので忠実）。default へ戻るときは plan に入る直前の effort（settingsBeforePlan）を
+   *   優先し、plan の preset が thread 設定へ書いた値を引きずらない。
+   * - `developer_instructions: null` = その mode の組み込み指示（プランモードの規範文）を使う。
+   */
+  private async resolveCollaborationMode(
+    mode: CodexCollaborationMode,
+    explicitEffort: string | null,
+  ): Promise<Record<string, unknown> | null> {
+    const presets = await this.collaborationModePresets();
+    if (mode === "plan") {
+      const preset = presets.get("plan") ?? null;
+      const model = preset?.model ?? this.currentModel;
+      if (model === null) {
+        throw new Error("Codex プランモードを開始できません: この会話の現在モデルが未確定です（開き直してから再送してください）");
+      }
+      // `??=`: 接続を作り直した直後は lastCollaborationMode が不明（null）で、controller が預けた退避値
+      // （seed）を持っている。ここで代入すると plan 中の preset 値で seed を潰す。
+      if (this.lastCollaborationMode !== "plan") {
+        this.settingsBeforePlan ??= { model: this.currentModel, effort: this.currentEffort };
+      }
+      const reasoningEffort = explicitEffort ?? this.currentEffort ?? preset?.reasoningEffort ?? null;
+      return { mode, settings: { model, reasoning_effort: reasoningEffort, developer_instructions: null } };
+    }
+    const restored = this.settingsBeforePlan;
+    const planPresetModel = presets.get("plan")?.model ?? null;
+    // plan の preset がモデルを固定していて、その間に利用者がモデルを変えていない（現在値 = preset）なら
+    // plan 前のモデルへ戻す。それ以外は thread の現在モデルをそのまま使う。
+    const model = restored?.model !== null && restored?.model !== undefined &&
+      planPresetModel !== null && this.currentModel === planPresetModel
+      ? restored.model
+      : this.currentModel;
+    if (model === null) return null;
+    const reasoningEffort = explicitEffort ?? (restored !== null ? restored.effort : this.currentEffort);
+    return { mode, settings: { model, reasoning_effort: reasoningEffort, developer_instructions: null } };
+  }
+
+  private collaborationModePresets(): Promise<CodexCollaborationPresets> {
+    this.collaborationPresetsPromise ??= readCollaborationModePresets(this.connection)
+      .catch(() => new Map<CodexCollaborationMode, CodexCollaborationPreset>());
+    return this.collaborationPresetsPromise;
+  }
+
+  /**
+   * `thread/settings/updated` の threadSettings を取り込む（モデル / effort / collaboration mode）。
+   * 別クライアント（remote TUI）の変更もこの経路で追従する。
+   */
+  noteThreadSettings(settings: Record<string, unknown>): void {
+    const mode = objectRecord(settings["collaborationMode"])?.["mode"];
+    // TUI の `/plan` など別クライアントで plan に入った場合も、preset が上書きする前の値を退避する
+    // （自分の turn/start 経由なら resolveCollaborationMode が先に退避済みで `??=` は何もしない）。
+    if (mode === "plan" && this.lastCollaborationMode !== "plan") {
+      this.settingsBeforePlan ??= { model: this.currentModel, effort: this.currentEffort };
+    }
+    const model = stringValue(settings["model"]);
+    if (model !== null) this.currentModel = model;
+    if (settings["effort"] === null) {
+      this.currentEffort = null;
+    } else {
+      const effort = stringValue(settings["effort"]);
+      if (effort !== null) this.currentEffort = effort;
+    }
+    if (mode === "plan" || mode === "default") {
+      this.lastCollaborationMode = mode;
+      // 別クライアントが default へ戻した後は thread の現在値が権威（古い退避値で戻さない）。
+      if (mode === "default") this.settingsBeforePlan = null;
+    }
+  }
+
+  /** `model/rerouted` 等、モデルだけが変わる通知の取り込み。 */
+  noteModel(model: string): void {
+    if (model.length > 0) this.currentModel = model;
+  }
+
+  /** 現在の目標（`thread/goal/get`）。無ければ null（codex-goal）。 */
+  async goalGet(): Promise<CodexGoalInfo | null> {
+    const response = objectRecord(
+      await this.connection.request("thread/goal/get", { threadId: this.threadId }),
+    );
+    const goal = response?.["goal"];
+    if (goal === null || goal === undefined) return null;
+    const parsed = codexGoalFromWire(goal);
+    if (parsed === null) throw new Error("Codex App Server thread/goal/get response was malformed");
+    return parsed;
+  }
+
+  /** 目標の作成 / 更新（`thread/goal/set`）。指定したフィールドだけを送る。 */
+  async goalSet(params: { objective?: string; status?: string; tokenBudget?: number }): Promise<CodexGoalInfo> {
+    const response = objectRecord(await this.connection.request("thread/goal/set", {
+      threadId: this.threadId,
+      ...(params.objective !== undefined ? { objective: params.objective } : {}),
+      ...(params.status !== undefined ? { status: params.status } : {}),
+      ...(params.tokenBudget !== undefined ? { tokenBudget: params.tokenBudget } : {}),
+    }));
+    const parsed = codexGoalFromWire(response?.["goal"]);
+    if (parsed === null) throw new Error("Codex App Server thread/goal/set response omitted goal");
+    return parsed;
+  }
+
+  /** 目標の解除（`thread/goal/clear`）。 */
+  async goalClear(): Promise<boolean> {
+    const response = objectRecord(
+      await this.connection.request("thread/goal/clear", { threadId: this.threadId }),
+    );
+    return response?.["cleared"] === true;
   }
 
   async readActiveTurnId(): Promise<string | null | undefined> {
@@ -530,6 +709,60 @@ async function readCodexSecurityDefaults(
   return { approvalPolicy, approvalsReviewer, sandbox };
 }
 
+interface CodexCollaborationPreset {
+  model: string | null;
+  reasoningEffort: string | null;
+}
+type CodexCollaborationPresets = Map<CodexCollaborationMode, CodexCollaborationPreset>;
+
+/**
+ * `collaborationMode/list` の preset（0.153.4 実測: `{ name, mode, model: null, reasoning_effort }` の配列で
+ * Plan は `plan_mode_reasoning_effort`、Default は null）。未対応の server は空。
+ */
+async function readCollaborationModePresets(
+  connection: CodexAppServerConnection,
+): Promise<CodexCollaborationPresets> {
+  const response = objectRecord(await connection.request("collaborationMode/list", {}));
+  const data = response?.["data"];
+  const presets: CodexCollaborationPresets = new Map();
+  if (!Array.isArray(data)) return presets;
+  for (const entry of data) {
+    const record = objectRecord(entry);
+    const mode = record?.["mode"];
+    if (record === null || (mode !== "plan" && mode !== "default")) continue;
+    presets.set(mode, {
+      model: stringValue(record["model"]),
+      reasoningEffort: stringValue(record["reasoning_effort"]) ?? stringValue(record["reasoningEffort"]),
+    });
+  }
+  return presets;
+}
+
+/** App Server ThreadGoal（camelCase wire）を Tailii の `CodexGoalInfo` へ。形が違えば null。 */
+export function codexGoalFromWire(value: unknown): CodexGoalInfo | null {
+  const raw = objectRecord(value);
+  if (raw === null) return null;
+  const threadId = stringValue(raw["threadId"]);
+  const objective = typeof raw["objective"] === "string" ? raw["objective"] : null;
+  const status = stringValue(raw["status"]);
+  const tokensUsed = finiteNumber(raw["tokensUsed"]);
+  const timeUsedSeconds = finiteNumber(raw["timeUsedSeconds"]);
+  const createdAt = finiteNumber(raw["createdAt"]);
+  const updatedAt = finiteNumber(raw["updatedAt"]);
+  if (threadId === null || objective === null || status === null || tokensUsed === null ||
+    timeUsedSeconds === null || createdAt === null || updatedAt === null) return null;
+  const tokenBudget = finiteNumber(raw["tokenBudget"]);
+  return {
+    threadId, objective, status,
+    ...(tokenBudget !== null ? { tokenBudget } : {}),
+    tokensUsed, timeUsedSeconds, createdAt, updatedAt,
+  };
+}
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
 /**
  * 利用者設定（config.toml 階層）の既定モデル。config/read の `config.model` で、TUI の
  * `/model` で保存した値も含む現在値を読む。未設定・旧 App Server・失敗時は null。
@@ -617,6 +850,8 @@ export class CodexAppServerManager {
   private readonly bootstrapConnections = new Map<string, CodexAppServerConnection>();
   /** thread/start 応答の model。bootstrap 接続を引き継ぐ openThread が購読時のモデルとして返す。 */
   private readonly bootstrapThreadModels = new Map<string, string | null>();
+  /** 作成元接続の thread/start 応答の reasoning effort（collaboration mode の settings に使う）。 */
+  private readonly bootstrapThreadEfforts = new Map<string, string | null>();
   private readonly log: ((message: string) => void) | null;
   private readonly readCliVersion: () => Promise<string | null>;
   private cliVersionPromise: Promise<string | null> | null = null;
@@ -820,6 +1055,7 @@ export class CodexAppServerManager {
       this.bootstrapConnections.get(threadId)?.close();
       this.bootstrapConnections.set(threadId, connection);
       this.bootstrapThreadModels.set(threadId, threadModel(response));
+      this.bootstrapThreadEfforts.set(threadId, threadReasoningEffort(response));
       succeeded = true;
       return threadId;
     } finally {
@@ -1005,6 +1241,10 @@ export class CodexAppServerManager {
     let model: string | null =
       bootstrap !== null ? this.bootstrapThreadModels.get(options.threadId) ?? null : null;
     this.bootstrapThreadModels.delete(options.threadId);
+    let reasoningEffort: string | null =
+      bootstrap !== null ? this.bootstrapThreadEfforts.get(options.threadId) ?? null : null;
+    this.bootstrapThreadEfforts.delete(options.threadId);
+    let initialCollaborationMode: CodexCollaborationMode | null = null;
     const connection = bootstrap ?? (await this.connect(this.socketPath));
     const removeNotification = connection.onNotification((notification) => {
       options.onNotification?.(notification);
@@ -1044,6 +1284,8 @@ export class CodexAppServerManager {
           // thread の現在モデルは resume 応答が権威。履歴読み取りが失敗する未materialize
           // thread（turn 前）でも resume 自体は成立するため、snapshot より先に確定する。
           model = threadModel(resumed) ?? model;
+          reasoningEffort = threadReasoningEffort(resumed) ?? reasoningEffort;
+          initialCollaborationMode = threadCollaborationMode(resumed);
           if (historyTimeout === null) {
             const snapshot = await readThreadHistorySnapshotWithRetry(
               connection,
@@ -1095,6 +1337,8 @@ export class CodexAppServerManager {
         options.cwd ?? null,
         liveSubscriptionError,
         model,
+        reasoningEffort,
+        initialCollaborationMode,
       );
     } catch (error) {
       removeNotification();
@@ -1872,6 +2116,21 @@ function defaultLaunch(executable: string, args: string[], env: NodeJS.ProcessEn
 function threadModel(response: unknown): string | null {
   const thread = objectRecord(objectRecord(response)?.["thread"]);
   return stringValue(thread?.["model"]);
+}
+
+/** thread/resume 応答の `thread.collaborationMode.mode`（0.156+ で存在。無ければ null = 不明）。 */
+function threadCollaborationMode(response: unknown): CodexCollaborationMode | null {
+  const thread = objectRecord(objectRecord(response)?.["thread"]);
+  const mode = objectRecord(thread?.["collaborationMode"])?.["mode"];
+  return mode === "plan" || mode === "default" ? mode : null;
+}
+
+/** thread/start / thread/resume 応答の `thread.reasoningEffort`（0.153.x で存在。無ければ null）。 */
+function threadReasoningEffort(response: unknown): string | null {
+  const record = objectRecord(response);
+  const thread = objectRecord(record?.["thread"]);
+  // 応答 top-level の `reasoningEffort`（thread/start・resume の schema に併記）も代替として読む。
+  return stringValue(thread?.["reasoningEffort"]) ?? stringValue(record?.["reasoningEffort"]);
 }
 
 function extractThreadId(response: unknown): string | null {
