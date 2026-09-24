@@ -150,10 +150,16 @@ function isInputPlaceholder(text: string): boolean {
   return text.startsWith("Message @") && text.endsWith("…");
 }
 
-/** SGR カラー/属性エスケープ（`ESC[…m`）を除いた素のテキスト。 */
+/**
+ * CSI エスケープ（`ESC[…`）を除いた素のテキスト。
+ * **SGR（`ESC[…m`）だけを落とすと不十分**: カーソル可視制御（`ESC[?25l`）や消去、コロン区切りの
+ * 真カラー（`ESC[38:2:255:0:0m`）が 1 つ混ざるだけで行頭一致が全滅し、門番が黙って外れる
+ * （2026-09-24 のセルフレビュー 2 周目で実測）。iOS `stripANSI` と同じ範囲に揃える（同値実装）。
+ * 実測 2.8µs/call（60 行フレーム）で、250ms 周期の pane preview でも無視できる。
+ */
 function stripSgr(line: string): string {
   // eslint-disable-next-line no-control-regex
-  return line.replace(/\u001b\[[0-9;]*m/g, "");
+  return line.replace(/\u001b\[[0-9;:?]*[ -/]*[@-~]/g, "");
 }
 
 /**
@@ -371,12 +377,70 @@ export const LOGIN_CONTINUE_MARKER = "to continue";
 const LOGIN_TAIL_WINDOW = 12;
 
 /**
+ * ダイアログ行の直下、`Esc to cancel` フッターを探す行数。
+ * 実測は 2.1.241 / 2.1.281 とも **2 行**（間に空行 1 本）だが、**CLI が案内行を 1 本挿すだけで
+ * `/login` 検出が丸ごと落ちる**（= chat 注入の門番が外れてコード欄へ本文を打つ / login_code_send が
+ * 「入力待ちではありません」で拒否して詰む）ので余裕を持たせる。狭さで刺されたのが
+ * 2026-09-24 の実障害（iOS 側の URL 抽出。窓は 1 行しか余裕が無かった）。
+ * 広げた分の誤判定は `hasLoginDialogAnchor`（/login 固有の陽性根拠）で抑える。
+ */
+const LOGIN_FOOTER_REACH = 6;
+
+/** `/login` ダイアログのタイトル行（実測 2.1.241 / 2.1.281 とも単独行の `Login`）。 */
+const LOGIN_TITLE_LINE = "login";
+
+/**
+ * タイトル行を marker から上へ探す窓。狭い pane では URL 断片が増えてタイトルが遠のくため広めに取る。
+ */
+const LOGIN_TITLE_REACH = 24;
+
+/** `/login` のコード入力画面にある URL 案内行（陽性根拠の 1 つ）。 */
+const LOGIN_URL_HINT_MARKER = "Use the url below to sign in";
+
+/**
+ * `/login` の画面だという**独立した 3 つの陽性根拠**のどれか（iOS `hasLoginAnchor` と同値実装）。
+ * marker の上 LOGIN_TITLE_REACH 行以内に、
+ * ① 単独行の `Login` タイトル ② `Use the url below to sign in` を含む行
+ * ③ `https://` と `/oauth/` を両方含む行（サインイン URL）、のいずれかがあること。
+ *
+ * OR にするのは、CLI が 1 つを変えても検出が落ちないようにするため（AND だと片方の変更で全滅
+ * = 2026-09-24 に直した破損の再来）。逆にフッター（`Esc to cancel`）は根拠に使わない:
+ * **Ink の汎用キャンセルフッター**なので `/login` の証拠にならない。根拠が無いと、Ink の折り返しで
+ * 行頭に来た本文（`Paste code here if prompted` / `Select login method` / `Press Enter to retry`）と
+ * 別ダイアログのフッターが噛み合って `/login` フロー中と誤判定し、chat 注入が
+ * 「Claude が /login の途中です」と理由を偽って止まる（`· Tab to amend` 付きの承認ダイアログ、
+ * 素の `Esc to cancel` を持つ `Select model` 等、どちらも実測で再現した）。
+ *
+ * 誤判定の向きについて: ここが厳しすぎて偽陰性になっても、`sendTextSubmit` は続けて
+ * `classifySubmitFrame` を見る。**`dialog` は `screenShowsDialogFooter` だけから来る**ので、
+ * フッターを持つ 3 面（方式選択 / コード入力待ち / retry）は注入前に必ず止まる。
+ * フッターを持たない継続待ち画面だけは `unknown` になって注入が通ってしまうため、
+ * `screenShowsDialogFooter` 側に継続待ちの文言を足して穴を塞いでいる（2 周目の実測指摘）。
+ * 「バーが無ければ dialog」ではない点に注意 — バー非検出は `unknown` で、注入は通る。
+ */
+function hasLoginDialogAnchor(lines: string[], markerIndex: number): boolean {
+  const start = Math.max(0, markerIndex - LOGIN_TITLE_REACH);
+  for (let index = markerIndex - 1; index >= start; index -= 1) {
+    const text = (lines[index] ?? "").trim();
+    if (text.toLowerCase() === LOGIN_TITLE_LINE) return true;
+    if (text.includes(LOGIN_URL_HINT_MARKER)) return true;
+    if (text.includes("https://") && text.includes("/oauth/")) return true;
+  }
+  return false;
+}
+
+/**
  * `marker` で始まる行が、生きたダイアログとして画面にあるか（TESTABLE 内部）。
  * 会話本文が同じ文言を行頭に含むだけ（Ink の折り返し・/login の説明文）で発火しないよう、
- * (a) 末尾 LOGIN_TAIL_WINDOW 行以内 (b) 直下 `footerReach` 行以内に `Esc to cancel` フッター、
- * の 2 条件を課す（iOS 側 ClaudeLoginPromptParser.isLiveDialogLine と同じ規則）。
+ * (a) 末尾 LOGIN_TAIL_WINDOW 行以内 (b) 直下 `footerReach` 行以内に `Esc to cancel` フッター
+ * (c) `/login` の陽性根拠（`hasLoginDialogAnchor`）、の 3 条件を課す
+ * （iOS 側 ClaudeLoginPromptParser.isLiveDialogLine と同じ規則）。
  */
-function liveDialogLineIndex(lines: string[], marker: string, footerReach: number): number | null {
+function liveDialogLineIndex(rawLines: string[], marker: string, footerReach: number): number | null {
+  // **必ず SGR を落としてから**行頭一致を見る。ANSI 付きキャプチャ（`capture-pane -e` /
+  // herdr `--format ansi`）を渡されると行頭がエスケープ列になり、全条件が黙って false になる
+  // （= 門番が外れてコード欄へ本文を打つ。呼び出し側の capture 種別に依存しない）。
+  const lines = rawLines.map((line) => stripSgr(line));
   let lastContent = -1;
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     if ((lines[index] ?? "").trim().length > 0) {
@@ -390,7 +454,8 @@ function liveDialogLineIndex(lines: string[], marker: string, footerReach: numbe
     if (lastContent - index > LOGIN_TAIL_WINDOW) return null;
     const end = Math.min(lines.length, index + 1 + footerReach);
     for (let below = index + 1; below < end; below += 1) {
-      if ((lines[below] ?? "").trim().toLowerCase().startsWith("esc to cancel")) return index;
+      if (!(lines[below] ?? "").trim().toLowerCase().startsWith("esc to cancel")) continue;
+      return hasLoginDialogAnchor(lines, index) ? index : null;
     }
     return null;
   }
@@ -399,21 +464,22 @@ function liveDialogLineIndex(lines: string[], marker: string, footerReach: numbe
 
 /** 画面が `/login` のコード入力待ちか（TESTABLE）。chat 注入の門番と login_code_send の前提確認に使う。 */
 export function screenHasLoginCodePrompt(screen: string): boolean {
-  return liveDialogLineIndex(screen.split("\n"), LOGIN_CODE_PROMPT_MARKER, 3) !== null;
+  return liveDialogLineIndex(screen.split("\n"), LOGIN_CODE_PROMPT_MARKER, LOGIN_FOOTER_REACH) !== null;
 }
 
 function screenHasLoginRetry(screen: string): boolean {
-  return liveDialogLineIndex(screen.split("\n"), LOGIN_RETRY_MARKER, 3) !== null;
+  return liveDialogLineIndex(screen.split("\n"), LOGIN_RETRY_MARKER, LOGIN_FOOTER_REACH) !== null;
 }
 
 function screenHasLoginMethodSelect(screen: string): boolean {
-  // タイトル行と Esc フッターの間に選択肢（最大 3 行 + 空行）が入る。
+  // タイトル行と Esc フッターの間に選択肢（最大 3 行 + 空行）が入る。実測 2.1.281 は 6 行なので
+  // 8 のままで足りる（根拠なく広げると誤判定の当たり面だけが広がる）。
   return liveDialogLineIndex(screen.split("\n"), LOGIN_METHOD_MARKER, 8) !== null;
 }
 
 /** 成功後の継続待ち（`Login successful. Press Enter to continue…`）が pane 末尾付近にあるか。 */
 export function screenHasLoginContinue(screen: string): boolean {
-  const lines = screen.split("\n");
+  const lines = screen.split("\n").map((line) => stripSgr(line));
   let lastContent = -1;
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     if ((lines[index] ?? "").trim().length > 0) {
@@ -425,7 +491,9 @@ export function screenHasLoginContinue(screen: string): boolean {
   for (let index = lastContent; index >= Math.max(0, lastContent - LOGIN_TAIL_WINDOW); index -= 1) {
     const text = (lines[index] ?? "").trim().toLowerCase();
     if (text.includes("login successful") && text.includes(LOGIN_CONTINUE_MARKER)) return true;
-    if (text.startsWith("press enter to continue")) return true;
+    // `Press Enter to continue` 単独は他の CLI / 本文でも出るので、`Login` タイトルを陽性根拠に要求する
+    // （これが無いと本文の 1 行で chat 注入が「/login の途中」として恒久ブロックされる。実測で再現）。
+    if (text.startsWith("press enter to continue") && hasLoginDialogAnchor(lines, index)) return true;
   }
   return false;
 }
@@ -456,7 +524,7 @@ export function loginCodeScreenState(screen: string): LoginCodeScreenState {
   if (screenHasLoginRetry(screen)) return "retry";
   if (screenHasLoginMethodSelect(screen)) return "method";
   if (screenHasLoginContinue(screen)) return "continue";
-  const lines = screen.split("\n");
+  const lines = screen.split("\n").map((line) => stripSgr(line));
   const tail = lines.slice(-LOGIN_TAIL_WINDOW - 8);
   const rules = tail.filter((line) => isInputBoxRuleLine(line.trim())).length;
   if (rules >= 2) return "accepted";
@@ -469,7 +537,7 @@ export function loginCodeScreenState(screen: string): LoginCodeScreenState {
  * 漏れる）。念のためコード欄マーカーを含む行は採用しない。
  */
 export function loginCodeErrorLine(screen: string): string | null {
-  const lines = screen.split("\n").map((line) => line.trim());
+  const lines = screen.split("\n").map((line) => stripSgr(line).trim());
   const tail = lines.slice(-LOGIN_TAIL_WINDOW - 8);
   for (let index = tail.length - 1; index >= 0; index -= 1) {
     const text = tail[index] ?? "";
@@ -730,7 +798,15 @@ export function screenShowsDialogFooter(screen: string): boolean {
     .slice(-DIALOG_FOOTER_WINDOW_LINES)
     .some((line) => {
       const trimmed = line.trim();
-      return trimmed.startsWith("Enter to select") || trimmed.startsWith("Esc to cancel");
+      if (trimmed.startsWith("Enter to select") || trimmed.startsWith("Esc to cancel")) return true;
+      // `/login` 成功後の継続待ち（`Login successful. Press Enter to continue…`）は**フッターを持たない**。
+      // これを落とすと `classifySubmitFrame` が `unknown` になり、注入が通ってしまう:
+      // 本文を打って Enter → Enter が継続待ちを閉じて本文は消え、次のフレームでは空の入力欄が
+      // 見えるので送信確定ループが `submitted` を返す = **無言の配送済みレシート**
+      // （2026-09-24 セルフレビュー 2 周目で実測。ここが `/login` フロー唯一の非フッター面）。
+      const lower = trimmed.toLowerCase();
+      return lower.startsWith("press enter to continue")
+        || (lower.includes("login successful") && lower.includes("to continue"));
     });
 }
 

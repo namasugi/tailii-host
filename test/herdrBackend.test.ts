@@ -1070,9 +1070,16 @@ describe("HerdrSessionManager", () => {
     // チャット本文の引用（文中・箇条書き・かぎ括弧）は検出しない。
     expect(screenHasSelectionFooter("  - ダイアログ表示中（\"Enter to select\"）は再送しない")).toBe(false);
     expect(screenHasSelectionFooter("フッターに「Enter to select」が出ます")).toBe(false);
-    // /login のコード入力待ち（実測 2.1.241）も行頭一致だけを採用する。
-    expect(screenHasLoginCodePrompt("  Paste code here if prompted >\n  Esc to cancel")).toBe(true);
+    // /login のコード入力待ち（実測 2.1.241 / 2.1.281）も行頭一致だけを採用する。
+    // 実画面には必ず `Login` タイトルとサインイン URL があり、それを /login 固有の陽性根拠として
+    // 要求する（マーカー + `Esc to cancel` だけでは、本文の折り返し + 別ダイアログのフッターで
+    // 誤発火して送信が偽の理由で止まる。2026-09-24 のセルフレビューで実測再現）。
+    expect(screenHasLoginCodePrompt(
+      "  Login\n  Paste code here if prompted >\n  Esc to cancel",
+    )).toBe(true);
     expect(screenHasLoginCodePrompt("本文で「Paste code here if prompted」に触れただけ")).toBe(false);
+    // 陽性根拠が無い（タイトル / 案内行 / サインイン URL のどれも無い）フレームは採らない。
+    expect(screenHasLoginCodePrompt("  Paste code here if prompted >\n  Esc to cancel")).toBe(false);
   });
 
   test("sendTextSubmit: 注入前にダイアログが開いていたら Esc で閉じてから本文を流す", async () => {

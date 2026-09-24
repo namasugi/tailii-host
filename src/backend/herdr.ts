@@ -181,7 +181,15 @@ const KILL_LINE_SEQUENCE = "\u0015";
 export function screenHasSelectionFooter(screen: string): boolean {
   return screen
     .split("\n")
-    .some((line) => line.trim().startsWith("Enter to select"));
+    // ANSI 付きキャプチャを渡されても行頭一致が死なないよう CSI を落とす（`stripSgr` と同じ理由。
+    // false になると注入前の Esc が飛ばず、開いたままのダイアログに本文が食われる）。
+    .some((line) => stripAnsiForMatch(line).trim().startsWith("Enter to select"));
+}
+
+/** 行頭一致の前に CSI エスケープを落とす（backend/tmux.ts の stripSgr と同値）。 */
+function stripAnsiForMatch(line: string): string {
+  // eslint-disable-next-line no-control-regex
+  return line.replace(/\u001b\[[0-9;:?]*[ -/]*[@-~]/g, "");
 }
 
 /**

@@ -3,6 +3,7 @@
 // PlanUsageFetcherTests / SessionMetadataStoreTests / HeartbeatTests /
 // TmuxSessionManagerTests / ClaudeSessionStoreTests の要点を移植する。
 
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, test } from "vitest";
@@ -46,6 +47,7 @@ import {
 import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
 import { resolveDefaultAgent } from "../src/engine/engine.js";
 import {
+  classifySubmitFrame,
   loginCodeScreenState,
   screenHasLoginCodePrompt,
   screenInLoginFlow,
@@ -2117,6 +2119,202 @@ describe("login-code 画面判定 / submitLoginCode（仮想時計）", () => {
   const methodScreen = "  Login\n  Select login method:\n  ❯ 1. Claude account with subscription\n    2. Anthropic Console account\n  Esc to cancel";
   const acceptedScreen = "  ⎿  Login successful\n────────\n❯ \n────────\n  ⏸ manual mode on";
   const pendingScreen = "  Login\n  Signing in…\n  Esc to cancel";
+
+  // claude 2.1.281 の実機フレーム（herdr `pane read --source recent-unwrapped`、幅 239 桁・無加工）。
+  // 2.1.241 から URL とコード入力行の間に `Hold Shift …` の案内行が入り、方式選択のインデントが
+  // 1 桁深くなった（iOS の URL 抽出はこれで壊れた）。host の門番・受理判定は行頭一致 + 末尾窓
+  // なので影響を受けないことを実キャプチャで抑える。
+  const promptScreen281 = [
+    "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔",
+    "   Login",
+    "",
+    "   Browser didn't open? Use the url below to sign in (c to copy)",
+    "",
+    "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ain",
+    "ference+user%3Asessions%3Aclaude_code+user%3Amcp_servers+user%3Afile_upload+user%3Aplugins&code_challenge=ElCKfftYxtsJZg7wQyVIVi20p6LeP74veN2gRhRgziE&code_challenge_method=S256&state=8RGTMhUHg8T_TT9nZXLx_ZZYvi-s82-mClpBe7UBKjU",
+    "",
+    "   Hold Shift (Option in iTerm2, Fn in Terminal.app) while selecting to use your terminal's native copy",
+    "",
+    "",
+    "   Paste code here if prompted >",
+    "",
+    "   Esc to cancel",
+  ].join("\n");
+  const methodScreen281 = [
+    "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔",
+    "   Login",
+    "",
+    "   Claude Code can be used with your Claude subscription or billed based on API usage through your Console account.",
+    "",
+    "   Select login method:",
+    "",
+    "   ❯ 1. Claude account with subscription · Pro, Max, Team, or Enterprise",
+    "     2. Anthropic Console account · API usage billing",
+    "     3. 3rd-party platform · Amazon Bedrock, Microsoft Foundry, or Vertex AI",
+    "",
+    "   Esc to cancel",
+  ].join("\n");
+
+  // インストール済み claude の実測フレーム（`node scripts/probe-claude-tui.mjs` が更新する）。
+  // **CLI を上げたら probe を回す**運用の番犬: 新しい描画で門番が外れたらここが赤くなる
+  // （外れると chat 注入がコード欄へ本文を打ち、login_code_send は「入力待ちではありません」で詰む）。
+  const LOGIN_FIXTURE_DIR = path.join(import.meta.dirname, "fixtures", "login");
+  function probedLoginFrame(name: string): string {
+    const lines = fs.readFileSync(path.join(LOGIN_FIXTURE_DIR, `${name}.txt`), "utf8").split("\n");
+    while (lines.length > 0 && (lines[lines.length - 1] ?? "").trim() === "") lines.pop();
+    return lines.join("\n");
+  }
+
+  test("素の `Esc to cancel` を持つ別ダイアログ + 本文引用も /login と誤判定しない", () => {
+    // `Esc to cancel` 単独行は Ink の**汎用**キャンセルフッターで、`/login` の証拠にならない
+    // （`Select model` 等も同じ）。フッターを陽性根拠に使うと、本文の折り返しでマーカーが行頭に
+    // 来たフレームで誤発火し、送信が「Claude が /login の途中です」と偽の理由で全部落ちる。
+    const bareFooterDialog = [
+      "⏺ 手順の説明が折り返して",
+      "Paste code here if prompted > の欄へ貼ります",
+      "",
+      "  Select model",
+      "  ❯ 1. Sonnet",
+      "    2. Opus",
+      "  Esc to cancel",
+    ].join("\n");
+    expect(screenInLoginFlow(bareFooterDialog)).toBe(false);
+    expect(loginCodeScreenState(bareFooterDialog)).toBe("pending");
+  });
+
+  test("幅 80 桁の実機フレーム（URL が 6 断片）でも門番と受理判定が効く", () => {
+    // production の tmux は `-x/-y` 無しで作るので既定 80x24。狭い幅では URL の断片が増え、
+    // タイトル行がマーカーから遠のく（陽性根拠の探索窓が足りているかの実測）。
+    const narrow = probedLoginFrame("frozen-code-prompt-80col");
+    expect(screenInLoginFlow(narrow)).toBe(true);
+    expect(screenHasLoginCodePrompt(narrow)).toBe(true);
+    expect(loginCodeScreenState(narrow)).toBe("prompt");
+  });
+
+  test("probe フィクスチャがインストール済み claude と同じ版である（走らせ忘れを赤にする）", () => {
+    // ここが無いと、CLI を上げて probe を回さないまま**古いフレームで永久に緑**になり、
+    // 番犬が吠えない（2026-09-24 のセルフレビュー指摘）。claude が無い環境（CI）は skip。
+    let installed: string | null = null;
+    try {
+      installed = execFileSync("/bin/zsh", ["-lc", "claude --version"], { encoding: "utf8" })
+        .trim().split(" ")[0] ?? null;
+    } catch {
+      installed = null;
+    }
+    if (installed === null || !/^\d+\.\d+\.\d+$/.test(installed)) return;
+    const probed = fs.readFileSync(path.join(LOGIN_FIXTURE_DIR, "PROBE.txt"), "utf8").trim();
+    // substring 一致だと `2.1.28` が `claude 2.1.281 …` に当たる（ダウングレードを見逃す）。
+    const matches = probed.startsWith(`claude ${installed} `);
+    const hint = `フィクスチャの採取版 (${probed}) がインストール済み claude (${installed}) と違います。`
+      + " `node scripts/probe-claude-tui.mjs` を実行してフィクスチャを更新してください";
+    // 既定は warning だけ（公開リポなので、外部の人の初回 `npm test` を版差で赤にしない）。
+    // リリース手順では `TAILII_PROBE_STRICT=1 npm test` で赤にする（docs/deploy.md）。
+    if (process.env.TAILII_PROBE_STRICT === undefined) {
+      if (!matches) console.warn(`[probe-drift] ${hint}`);
+      return;
+    }
+    expect(matches, hint).toBe(true);
+  });
+
+  test("ANSI 付きキャプチャでも門番が効く（行頭一致が静かに全滅しない）", () => {
+    // 実測フレームを `capture-pane -e` 相当（各行を SGR で包む）にしても判定は変わらないこと。
+    // ここを外すと、呼び出し側が ANSI キャプチャを渡した瞬間に `/login` 検出が黙って false になり、
+    // chat 注入の門番が外れてコード欄へ本文を打つ（2026-09-24 の probe 作業中に踏んだ罠）。
+    const dressed = (text: string) => text
+      .split("\n")
+      .map((line) => `\u001b[2m${line}\u001b[0m`)
+      .join("\n");
+    // SGR 以外の CSI（カーソル可視制御）やコロン区切りの真カラーが混ざっても落ちないこと
+    // （SGR だけ落とす実装では 1 つ混ざるだけで行頭一致が全滅した。2 周目の実測指摘）。
+    const dressedCsi = (text: string) => text
+      .split("\n")
+      .map((line) => `\u001b[?25l\u001b[38:2:255:0:0m${line}\u001b[0m`)
+      .join("\n");
+    expect(screenInLoginFlow(dressedCsi(probedLoginFrame("code-prompt")))).toBe(true);
+    expect(loginCodeScreenState(dressedCsi(probedLoginFrame("code-prompt")))).toBe("prompt");
+    expect(screenInLoginFlow(dressed(probedLoginFrame("code-prompt")))).toBe(true);
+    expect(screenHasLoginCodePrompt(dressed(probedLoginFrame("code-prompt")))).toBe(true);
+    expect(loginCodeScreenState(dressed(probedLoginFrame("code-prompt")))).toBe("prompt");
+    expect(loginCodeScreenState(dressed(probedLoginFrame("method-select")))).toBe("method");
+  });
+
+  test("成功後の継続待ち（フッター無し）も dialog として扱い、本文を打たせない", () => {
+    // `classifySubmitFrame` の `dialog` は `screenShowsDialogFooter` だけから来る。継続待ちは
+    // フッターを持たないので、対策前は `unknown` → 注入が通り、Enter が画面を閉じて本文が消え、
+    // 次のフレームで空の入力欄が見えるため「送信できた」と誤って報告していた（無言の欠落）。
+    const continueScreen = [
+      "  Login",
+      "  Logged in as a***@example.com",
+      "  Login successful. Press Enter to continue…",
+    ].join("\n");
+    expect(screenInLoginFlow(continueScreen)).toBe(true);
+    expect(loginCodeScreenState(continueScreen)).toBe("continue");
+    expect(classifySubmitFrame(continueScreen)).toBe("dialog");
+    // 2 行に割れた変種（フッターも無い）でも dialog 側に倒す。
+    const split = ["  Login", "  Login successful.", "  Press Enter to continue…"].join("\n");
+    expect(classifySubmitFrame(split)).toBe("dialog");
+  });
+
+  test("承認ダイアログ + 本文の折り返し引用を /login と誤判定しない（陽性根拠を要求する）", () => {
+    // 承認ダイアログのフッターは `Esc to cancel · Tab to amend …` で "esc to cancel" 前方一致に**当たる**。
+    // 本文が Ink の折り返しでマーカーを行頭に持ってくると、両者が噛み合って /login フロー中と
+    // 誤判定し、chat 注入が「Claude が /login の途中です」と理由を偽って恒久ブロックされる
+    // （2026-09-24 のセルフレビューで実測再現。窓を広げたぶん当たりやすくなっていた）。
+    const approvalFooter = [
+      "  Bash command",
+      "  rm -rf build",
+      "",
+      "  Do you want to proceed?",
+      "  ❯ 1. Yes",
+      "    2. No",
+      "  Esc to cancel · Tab to amend · ctrl+e to explain",
+    ];
+    const quoted = (marker: string) => ["⏺ 説明の途中で折り返して", marker, "", ...approvalFooter].join("\n");
+    expect(screenInLoginFlow(quoted("Select login method: と出ます"))).toBe(false);
+    expect(screenInLoginFlow(quoted("Paste code here if prompted > に貼ります"))).toBe(false);
+    expect(screenInLoginFlow(quoted("Press Enter to retry. と出ます"))).toBe(false);
+    // フッターを持たない `Press Enter to continue` 単独（他 CLI / 本文）も /login とみなさない。
+    expect(screenInLoginFlow("⏺ セットアップ後は\nPress Enter to continue で次へ進みます")).toBe(false);
+    // 陽性根拠（`Login` タイトル）があれば、フッターに語が足されていても検出できる
+    // （タイトルとフッターの OR なので、CLI がどちらか片方を変えても落ちない）。
+    const titledWithSuffixFooter = [
+      "  Login",
+      "  Browser didn't open? Use the url below to sign in (c to copy)",
+      "  Paste code here if prompted >",
+      "  Esc to cancel · c to copy",
+    ].join("\n");
+    expect(screenHasLoginCodePrompt(titledWithSuffixFooter)).toBe(true);
+  });
+
+  test("probe が採取した実測フレームで門番・受理判定・送信確定が効く", () => {
+    const probedAt = fs.readFileSync(path.join(LOGIN_FIXTURE_DIR, "PROBE.txt"), "utf8").trim();
+    expect(probedAt).toMatch(/^claude \d+\.\d+\.\d+/);
+    const method = probedLoginFrame("method-select");
+    const prompt = probedLoginFrame("code-prompt");
+    expect(screenInLoginFlow(method)).toBe(true);
+    expect(loginCodeScreenState(method)).toBe("method");
+    expect(screenInLoginFlow(prompt)).toBe(true);
+    expect(screenHasLoginCodePrompt(prompt)).toBe(true);
+    expect(loginCodeScreenState(prompt)).toBe("prompt");
+    // ダイアログ中の Enter 再送で選択肢を誤操作しない（送信確定ループ側の門番）。
+    expect(classifySubmitFrame(method)).toBe("dialog");
+    expect(classifySubmitFrame(prompt)).toBe("dialog");
+  });
+
+  test("2.1.281 の実機フレーム（案内行挿入・インデント変化）でも門番と受理判定が効く", () => {
+    expect(screenInLoginFlow(promptScreen281)).toBe(true);
+    expect(screenHasLoginCodePrompt(promptScreen281)).toBe(true);
+    expect(loginCodeScreenState(promptScreen281)).toBe("prompt");
+    expect(screenInLoginFlow(methodScreen281)).toBe(true);
+    expect(loginCodeScreenState(methodScreen281)).toBe("method");
+    // 案内行が**もう 1 本**挿さっても落ちない余裕（LOGIN_FOOTER_REACH）を持つ。
+    const extraHint = promptScreen281.replace(
+      "   Paste code here if prompted >",
+      "   Paste code here if prompted >\n\n   Press c to copy the url",
+    );
+    expect(screenHasLoginCodePrompt(extraHint)).toBe(true);
+    expect(loginCodeScreenState(extraHint)).toBe("prompt");
+  });
 
   test("本文の引用（フッター無し / 末尾から遠い）では /login フロー中と判定しない", () => {
     const quoted = "⏺ /login の画面では\n  Select login method:\n  と出て、下に Paste code here if prompted と表示されます\n" +
