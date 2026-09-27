@@ -15,6 +15,17 @@
 //     bump が止まって timeout を超えた active は「死んだターン」→ そのまま kill してよい。
 //     Hub は bump 代行しない(すると bump 停止=ターン死亡のシグナルが壊れる)。
 //
+// claude の idle が timeout を超えても、背景作業が残っていれば殺さない（Stop hook は背景の
+// サブエージェント・シェル・予約が残っていても発火して idle になるため）:
+//   - Claude Code 自身の状態ファイル `~/.claude/sessions/<pid>.json` の status が仕事中
+//     （busy=背景サブエージェント等 / shell=背景シェル・Monitor / waiting=承認・ダイアログ待ち）なら bump。
+//     完了通知に依存しない生の申告。同じ status のまま 24h を超えたら保護しない。照合は tmux=`tmux` 欄の
+//     セッション名、herdr=pane の前面 pid（取れなければ、tmux 欄の無い生きた記録がちょうど 1 件の
+//     ときだけ session id）。
+//   - Stop hook が記録した予約（/loop・ScheduleWakeup・CronCreate）が未発火で、それを持つ Claude
+//     プロセス（pid）が生きていれば bump。1 回きり=発火時刻+10 分（記録から 7 日上限）、繰り返し=最初に
+//     見てから 7 日（Claude Code の自動失効）+最終発火の猶予、解釈不能=24h で保護を外す。
+//
 // 対象は tailii が作る `cs-*` / `s-*` セッションのみ。ユーザーの他の tmux セッションには触れない。
 // heartbeat 未採番の生存セッション(過去の残骸)は「今を idle」として採番し、次周期から計時する。
 // 対象セッションが 0 になったら自然終了する(次の engine 接続 / hook 発火で ensure され再起動)。
@@ -23,6 +34,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import {
   bumpHeartbeat,
+  type Heartbeat,
+  type HeartbeatScheduled,
   listHeartbeatSessions,
   readHeartbeat,
   removeHeartbeat,
@@ -34,12 +47,53 @@ import type { SessionInfo } from "../protocol.js";
 import { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
 import { ClaudeSessionStore, transcriptTitle } from "../sessions/claudeSessionStore.js";
 import { paneCommandLooksLikeAgent, type TmuxCommandRunner } from "../backend/tmux.js";
+import {
+  type ClaudeLiveRecord,
+  claudeProcessAlive,
+  defaultClaudeSessionsDir,
+  findClaudeLiveRecords,
+  isClaudeWorking,
+  readClaudeLiveRecordOf,
+} from "../sessions/claudeLiveStatus.js";
 
 /** 一律のアイドル timeout(秒)。idle/active(bump 停止)の両方に同じ値を使う。 */
 export const REAPER_IDLE_TIMEOUT_SECONDS = 1800;
 
 /** 巡回間隔(秒)。 */
 export const REAPER_CHECK_INTERVAL_SECONDS = 60;
+
+/**
+ * Claude 自身が「仕事中（背景のサブエージェント・シェル等）」と申告している間の保護上限(秒)。
+ * 申告が同じ status のまま固着しても、これを超えたら通常の計時へ戻す（永続保護にしない）。
+ */
+export const CLAUDE_WORKING_MAX_SECONDS = 24 * 3600;
+
+/** 1 回きりの予約の発火時刻から、発火後のターンが始まるまでを待つ猶予(秒)。 */
+export const SCHEDULED_ONE_SHOT_GRACE_SECONDS = 10 * 60;
+
+/**
+ * 予約による保護の上限(秒)。Claude Code は繰り返し予約を作成から 7 日で自動失効させる
+ * （最後に 1 回発火してから消える）ので、繰り返しは最初に見た時刻から数える。
+ * 1 回きりにも記録時刻から同じ上限を掛ける: ターン中に発火時刻を過ぎた予約は Stop の一覧に残り、
+ * 「次の一致」が翌日（ScheduleWakeup の日付 `*`）や翌年（日付固定）になる。通常は Stop 直後に
+ * 発火して次の Stop で消えるが、そのターンが中断・API エラーで Stop なく終わると記録が残り続けるため。
+ */
+export const SCHEDULED_MAX_SECONDS = 7 * 24 * 3600;
+
+/** 繰り返し予約の失効前の最終発火を待つ猶予(秒)。繰り返しは最大 30 分遅れて発火する。 */
+export const SCHEDULED_RECURRING_FINAL_GRACE_SECONDS = 40 * 60;
+
+/** 解釈できない予約の保護期限(秒)。 */
+export const SCHEDULED_UNPARSED_MAX_SECONDS = 24 * 3600;
+
+/** Stop 時点の予約がまだ先に残っているか。 */
+export function scheduledPending(scheduled: HeartbeatScheduled, now: number): boolean {
+  if (scheduled.recurring.some((entry) =>
+    now < entry.firstSeenTs + SCHEDULED_MAX_SECONDS + SCHEDULED_RECURRING_FINAL_GRACE_SECONDS)) return true;
+  if (scheduled.unparsed && now < scheduled.atTs + SCHEDULED_UNPARSED_MAX_SECONDS) return true;
+  if (now >= scheduled.atTs + SCHEDULED_MAX_SECONDS) return false;
+  return scheduled.oneShotTs.some((fireTs) => now < fireTs + SCHEDULED_ONE_SHOT_GRACE_SECONDS);
+}
 
 /** tailii が管理する tmux セッション名(これ以外は絶対に触らない)。 */
 export const TAILII_SESSION_PATTERN = /^(cs|s)-/;
@@ -53,6 +107,8 @@ export interface HerdrReaperOps {
    */
   listLive?(): Promise<SessionInfo[] | null>;
   agentProcessAlive(name: string): Promise<boolean>;
+  /** pane の前面プロセスの pid 群（Claude の状態ファイル照合用, 任意実装）。取得不能は null。 */
+  agentProcessIds?(name: string): Promise<number[] | null>;
   kill(name: string): Promise<void>;
   /** 生存 Tailii セッションが 0 のとき、pane ゼロの専用 server を停止する（任意実装）。 */
   stopServerIfEmpty?(): Promise<void>;
@@ -89,6 +145,13 @@ export interface ReaperTickOptions {
    * 省略時は稼働中の共有 App Server の thread/list を巡回ごとに一度だけ読む。
    */
   deriveCodexTitle?: (threadId: string) => string | null | Promise<string | null>;
+  /**
+   * Claude Code がプロセスごとに書く状態ファイルの置き場（`~/.claude/sessions`）。
+   * null で「Claude の仕事中申告」による保護を無効化。
+   */
+  claudeSessionsDir?: string | null;
+  /** 状態ファイルの pid が生きているか（テスト注入可。既定は kill 0 + 起動時刻照合）。 */
+  claudeProcessAlive?: (pid: number, procStart: string | null) => boolean | Promise<boolean>;
 }
 
 export interface ReaperTickResult {
@@ -220,16 +283,76 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
     return localServerCwdsPromise;
   };
 
+  const claudeSessionsDir =
+    options.claudeSessionsDir !== undefined ? options.claudeSessionsDir : defaultClaudeSessionsDir();
+
+  /**
+   * timeout 超過の claude セッションを生かす理由（無ければ null）。
+   *   - working-<status>: Claude の状態ファイルが仕事中（背景サブエージェント=busy / 背景シェル=shell /
+   *     承認待ち=waiting）。完了通知に依存しない生の申告。status が 24h 変わらなければ保護しない。
+   *   - scheduled: Stop 時点の予約（/loop・ScheduleWakeup・CronCreate）が未発火で、プロセスが生きている。
+   */
+  const claudeKeepAliveReason = async (
+    name: string,
+    heartbeat: Heartbeat,
+    agentAlive: () => Promise<boolean>,
+    claudeMatch: { paneProcessIds?: () => Promise<number[] | null>; useSessionId: boolean },
+  ): Promise<string | null> => {
+    const processAlive = options.claudeProcessAlive ?? claudeProcessAlive;
+    let records: ClaudeLiveRecord[] = [];
+    if (claudeSessionsDir !== null) {
+      const meta = metadataStore.get(name);
+      const claudeSessionId = claudeMatch.useSessionId ? meta?.providerSessionId ?? meta?.claudeSessionId : undefined;
+      try {
+        records = await findClaudeLiveRecords({
+          dir: claudeSessionsDir,
+          sessionName: name,
+          ...(claudeMatch.paneProcessIds !== undefined ? { paneProcessIds: claudeMatch.paneProcessIds } : {}),
+          ...(claudeSessionId !== undefined ? { claudeSessionId } : {}),
+          processAlive,
+        });
+      } catch (error) {
+        log(`claude 状態ファイル読取失敗(保護なしで継続): ${name}: ${String(error)}`);
+      }
+      for (const record of records) {
+        if (!isClaudeWorking(record.status) || record.statusSinceMs === null) continue;
+        // 時計の巻き戻り等で未来の時刻になっていたら上限を判定できないので信用しない。
+        const age = now - record.statusSinceMs / 1_000;
+        if (age > -300 && age < CLAUDE_WORKING_MAX_SECONDS) return `working-${record.status}`;
+      }
+    }
+    const scheduled = heartbeat.scheduled;
+    if (scheduled === undefined || !scheduledPending(scheduled, now)) return null;
+    // 予約はそれを作ったプロセス内にしか無い。
+    if (scheduled.pid !== undefined) {
+      // 持ち主の pid が分かっていれば、その pid が（起動時刻まで一致して）生きていて pane にも
+      // エージェントがいることを直接確かめる（状態ファイルの照合が外れても古い予約で新しい
+      // プロセスを守らない）。
+      if (records.some((record) => record.pid === scheduled.pid)) return "scheduled";
+      const ownRecord = claudeSessionsDir !== null ? readClaudeLiveRecordOf(claudeSessionsDir, scheduled.pid) : null;
+      const ownerAlive = await processAlive(scheduled.pid, ownRecord?.procStart ?? null);
+      return ownerAlive && records.length === 0 && await agentAlive() ? "scheduled" : null;
+    }
+    // pid 不明（解決できなかった Stop）: session id で照合し、記録が無ければ pane の生存で代える。
+    if (records.length > 0) {
+      return records.some((record) => scheduled.sessionId === undefined || record.sessionId === scheduled.sessionId)
+        ? "scheduled"
+        : null;
+    }
+    return await agentAlive() ? "scheduled" : null;
+  };
+
   /**
    * 1 セッション分の判定（tmux / herdr 共通）。heartbeat のルールは backend に依らない:
    * 未採番=adopt / attach 中=bump / claude active+alive=bump 代行 / active+dead=idle 降格 /
-   * idle・codex active の timeout 超過=kill。
+   * claude の背景作業・予約あり=bump / idle・codex active の timeout 超過=kill。
    */
   const judge = async (
     name: string,
     isAttached: boolean,
     agentAlive: () => Promise<boolean>,
     kill: () => Promise<void>,
+    claudeMatch: { paneProcessIds?: () => Promise<number[] | null>; useSessionId: boolean },
   ): Promise<void> => {
     const heartbeat = readHeartbeat(heartbeatDir, name);
     if (heartbeat === null) {
@@ -250,7 +373,8 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
         bumpHeartbeat(heartbeatDir, name, now, "daemon-agent-alive", "active");
       } else {
         // active のままプロセスだけ死んだ(クラッシュ等)。idle へ倒して通常計時に載せる。
-        writeHeartbeat(heartbeatDir, name, { ts: now, state: "idle", event: "agent-process-dead" });
+        // プロセスと一緒に予約（プロセス内にしか無い）も消えている。
+        writeHeartbeat(heartbeatDir, name, { ts: now, state: "idle", event: "agent-process-dead", scheduled: null });
         demoted.push(name);
         log(`demote ${name} (agent process dead)`);
       }
@@ -258,6 +382,16 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
     }
     // idle、および codex の active(bump 停止=ターン死亡)は一律 timeout で kill。
     if (now - heartbeat.ts < timeoutSeconds) return;
+    // Stop hook は背景のサブエージェント・シェル・予約が残っていても発火して idle になる。
+    // Claude 自身の申告（生の状態）と Stop 時点の予約を見て、背景作業ごと殺さない。
+    if (agent === "claude") {
+      const reason = await claudeKeepAliveReason(name, heartbeat, agentAlive, claudeMatch);
+      if (reason !== null) {
+        bumpHeartbeat(heartbeatDir, name, now, `daemon-claude-${reason}`);
+        log(`protect ${name} (claude ${reason})`);
+        return;
+      }
+    }
     // 同じプロジェクト配下でローカル開発サーバーが LISTEN 中なら、その pane を閉じると
     // server まで巻き添え終了する。server 自体を利用中の activity とみなし、停止後に改めて
     // timeout 分の猶予を取る（herdr は attach 状態を取得できないため特に重要）。
@@ -299,6 +433,9 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
           log(`kill 失敗(掃除して継続): ${name}: ${result.stderr.trim()}`);
         }
       },
+      // tmux 内の Claude は状態ファイルに `tmux` 欄（セッション名）を書くのでそれだけで照合する。
+      // session id は同じ会話の複製インスタンス（Mac のターミナル等）と一致してしまうため使わない。
+      { useSessionId: false },
     );
   }
 
@@ -339,6 +476,13 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
           } catch (error) {
             log(`kill 失敗(掃除して継続): ${name}: ${String(error)}`);
           }
+        },
+        // herdr は `tmux` 欄が無いので pane の前面 pid で照合し、取れないときだけ session id に頼る。
+        {
+          ...(herdrOps.agentProcessIds !== undefined
+            ? { paneProcessIds: () => herdrOps.agentProcessIds!(name) }
+            : {}),
+          useSessionId: true,
         },
       );
     }

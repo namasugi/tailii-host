@@ -367,6 +367,29 @@ export function parseHerdrForegroundCommand(stdout: string): string {
   return typeof name === "string" ? name : "";
 }
 
+/**
+ * `pane process-info` の前面プロセス群の pid（前面プロセスグループ id を含む）。
+ * Claude Code の `~/.claude/sessions/<pid>.json` と照合する（tmux 欄の無い herdr 用, 実測で一致）。
+ */
+export function parseHerdrForegroundPids(stdout: string): number[] {
+  const result = parseHerdrResult(stdout);
+  const info = result?.["process_info"];
+  if (typeof info !== "object" || info === null) return [];
+  const raw = info as Record<string, unknown>;
+  const pids = new Set<number>();
+  const group = raw["foreground_process_group_id"];
+  if (typeof group === "number" && Number.isInteger(group) && group > 0) pids.add(group);
+  const list = raw["foreground_processes"];
+  if (Array.isArray(list)) {
+    for (const item of list) {
+      if (typeof item !== "object" || item === null) continue;
+      const pid = (item as Record<string, unknown>)["pid"];
+      if (typeof pid === "number" && Number.isInteger(pid) && pid > 0) pids.add(pid);
+    }
+  }
+  return [...pids];
+}
+
 /** herdr backend のセッション list / reattach / kill / send / read とメタデータ統合。 */
 export class HerdrSessionManager {
   private readonly runner: HerdrCommandRunner;
@@ -570,6 +593,22 @@ export class HerdrSessionManager {
       return this.launchedWithinGrace(name);
     } catch {
       return true;
+    }
+  }
+
+  /** pane の前面プロセスの pid 群。取得できなければ null（reaper の Claude 状態照合用）。 */
+  async agentProcessIds(name: string): Promise<number[] | null> {
+    validateSessionName(name);
+    const target = await this.paneTarget(name);
+    if (target === null) return null;
+    try {
+      const result = await this.runner(["pane", "process-info", "--pane", target]);
+      if (result.exitCode !== 0) return null;
+      // 空は「前面プロセスが無い」ではなく形式変更・一時失敗の疑い → 取得不能として扱う。
+      const pids = parseHerdrForegroundPids(result.stdout);
+      return pids.length > 0 ? pids : null;
+    } catch {
+      return null;
     }
   }
 

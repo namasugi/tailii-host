@@ -44,7 +44,14 @@ import {
 } from "../hub/engineRelaySocket.js";
 import type { QuestionEventMessage } from "../hub/engineRelaySocket.js";
 import { questionsFromToolInput } from "../chat/transcriptTailer.js";
-import { defaultHeartbeatDir, writeHeartbeat } from "../sessions/heartbeat.js";
+import {
+  defaultHeartbeatDir,
+  readHeartbeat,
+  writeHeartbeat,
+  type HeartbeatScheduled,
+} from "../sessions/heartbeat.js";
+import { scheduledFromSessionCrons } from "../sessions/cronSchedule.js";
+import { claudePidOfHook } from "../sessions/claudeLiveStatus.js";
 import { ensureHubDaemon } from "../hub/hubDaemon.js";
 import { decodeHubServerLine, encodeHubMessage } from "../hub/hubProtocol.js";
 import { ObservationLog, defaultObservationBase } from "../shared/observationLog.js";
@@ -148,6 +155,8 @@ export interface RunHookOptions {
    * 省略時は書かない（テスト密閉）。runHookCommand が既定パスを渡す。
    */
   heartbeatDir?: string;
+  /** 予約を持つ Claude の pid の解決（注入）。省略時は hook の親 → 祖父で状態ファイルがある pid。 */
+  resolveClaudePid?: () => number | undefined;
   /** Session Hub daemon の常駐保証（注入）。省略時は何もしない。UserPromptSubmit でのみ呼ぶ。 */
   ensureHub?: () => void;
 }
@@ -176,7 +185,17 @@ export async function runHookCore(options: RunHookOptions): Promise<HookRunResul
         // ensure は best-effort。
       }
     }
-    await notifySessionProcessing(options, session, parsed.eventName === "Stop" ? "done" : "active", parsed.eventName);
+    // Stop 時点で残っているセッション予約（/loop・ScheduleWakeup・CronCreate）を記録する。
+    // 予約はプロセス内にしか無いので、reaper は次回発火まで延命する（欄の無い旧 CLI は消す）。
+    const scheduled = parsed.eventName === "Stop"
+      ? scheduledFromSessionCrons(parsed.sessionCrons, Date.now(), {
+        ...(parsed.sessionId !== undefined ? { sessionId: parsed.sessionId } : {}),
+        ...scheduledOwnerPid(parsed.sessionCrons, options),
+        ...previousScheduled(options, session),
+      })
+      : undefined;
+    await notifySessionProcessing(
+      options, session, parsed.eventName === "Stop" ? "done" : "active", parsed.eventName, scheduled);
     return { exitCode: 0, stdout: "" };
   }
 
@@ -282,11 +301,30 @@ function hookSpawnedAtMs(): number {
   return Date.now() - Math.round(process.uptime() * 1000);
 }
 
+/** 予約を持つ Claude の pid（予約がある Stop だけ解決する）。解決できなければ空。 */
+function scheduledOwnerPid(sessionCrons: unknown, options: RunHookOptions): { pid?: number } {
+  if (!Array.isArray(sessionCrons) || sessionCrons.length === 0) return {};
+  const pid = (options.resolveClaudePid ?? claudePidOfHook)();
+  return pid !== undefined ? { pid } : {};
+}
+
+/** 直前の予約記録（繰り返し予約の最初に見た時刻を引き継ぐ）。読めなければ空。 */
+function previousScheduled(options: RunHookOptions, session: string): { previous?: HeartbeatScheduled } {
+  if (options.heartbeatDir === undefined || session === "default") return {};
+  try {
+    const previous = readHeartbeat(options.heartbeatDir, session)?.scheduled;
+    return previous !== undefined ? { previous } : {};
+  } catch {
+    return {};
+  }
+}
+
 async function notifySessionProcessing(
   options: RunHookOptions,
   session: string,
   state: "active" | "done",
   event: string,
+  scheduled?: HeartbeatScheduled | null,
 ): Promise<void> {
   // heartbeat は engine の生死と無関係に書ける唯一の経路（reaper daemon が読む）。
   // session 未解決（"default"）は書かない — 実在しない tmux 名の残骸ファイルを作らない。
@@ -296,6 +334,7 @@ async function notifySessionProcessing(
         ts: Math.floor(Date.now() / 1000),
         state: state === "done" ? "idle" : "active",
         event,
+        ...(scheduled !== undefined ? { scheduled } : {}),
       });
     } catch {
       // heartbeat 書込失敗は無視（reaper 保護が弱まるだけで安全性は変わらない）。
@@ -887,6 +926,10 @@ interface ParsedPreToolUse {
   toolUseId: string;
   /** PostToolUse の tool_response 内 permissionDecision（あれば）。 */
   postDecision?: string;
+  /** Stop の `session_crons`（未検証の生値。解釈は scheduledFromSessionCrons）。 */
+  sessionCrons?: unknown;
+  /** Claude の session id（`session_id`）。 */
+  sessionId?: string;
 }
 
 /** フック JSON を寛容にパースする。欠落フィールドは安全な既定値で補う。 */
@@ -922,6 +965,8 @@ function parsePreToolUse(data: Buffer): ParsedPreToolUse {
   } else if (typeof raw["session_id"] === "string") {
     parsed.toolUseId = raw["session_id"];
   }
+  if ("session_crons" in raw) parsed.sessionCrons = raw["session_crons"];
+  if (typeof raw["session_id"] === "string" && raw["session_id"].length > 0) parsed.sessionId = raw["session_id"];
   const response = raw["tool_response"];
   if (typeof response === "object" && response !== null && !Array.isArray(response)) {
     const decision = (response as Record<string, unknown>)["permissionDecision"];

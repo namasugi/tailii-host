@@ -5,10 +5,22 @@
 import { describe, expect, test } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { readHeartbeat, writeHeartbeat, listHeartbeatSessions } from "../src/sessions/heartbeat.js";
 import {
+  type HeartbeatScheduled,
+  readHeartbeat,
+  writeHeartbeat,
+  listHeartbeatSessions,
+} from "../src/sessions/heartbeat.js";
+import {
+  CLAUDE_WORKING_MAX_SECONDS,
+  type HerdrReaperOps,
   REAPER_IDLE_TIMEOUT_SECONDS,
+  SCHEDULED_MAX_SECONDS,
+  SCHEDULED_ONE_SHOT_GRACE_SECONDS,
+  SCHEDULED_RECURRING_FINAL_GRACE_SECONDS,
+  SCHEDULED_UNPARSED_MAX_SECONDS,
   reaperTick,
+  scheduledPending,
   serverCwdBelongsToSession,
 } from "../src/hub/reaper.js";
 import { MockTmuxRunner, makeTempDir, makeTempStore, ok } from "./helpers.js";
@@ -640,5 +652,304 @@ describe("reaperTick herdr backend", () => {
 
     expect(result.liveCount).toBe(1);
     expect(result.killed).toEqual([]);
+  });
+});
+
+describe("reaperTick claude の背景作業の保護", () => {
+  const NOW_MS = NOW * 1000;
+
+  /** Claude Code の状態ファイル置き場（`<pid>.json` を並べる）。 */
+  function claudeSessionsDir(...records: Record<string, unknown>[]): string {
+    const dir = makeTempDir("claude-sessions");
+    for (const fields of records) {
+      const pid = typeof fields["pid"] === "number" ? fields["pid"] : 4242;
+      fs.writeFileSync(path.join(dir, `${pid}.json`), JSON.stringify({
+        pid,
+        sessionId: "sid-1",
+        procStart: "Sat Sep 26 23:29:25 2026",
+        status: "idle",
+        updatedAt: NOW_MS - 60_000,
+        statusUpdatedAt: NOW_MS - 60_000,
+        ...fields,
+      }));
+    }
+    return dir;
+  }
+
+  function oneShot(fireTs: number, fields: Partial<HeartbeatScheduled> = {}): HeartbeatScheduled {
+    return { atTs: NOW - TIMEOUT, sessionId: "sid-1", oneShotTs: [fireTs], recurring: [], unparsed: false, ...fields };
+  }
+
+  async function tick(options: {
+    dir: string;
+    runner: MockTmuxRunner;
+    sessionsDir: string | null;
+    alivePids?: number[];
+    now?: number;
+    store?: ReturnType<typeof makeTempStore>;
+    herdrOps?: HerdrReaperOps | null;
+  }) {
+    const alive = new Set(options.alivePids ?? [4242]);
+    return reaperTick({
+      runner: options.runner.runner,
+      heartbeatDir: options.dir,
+      metadataStore: options.store ?? makeTempStore(),
+      timeoutSeconds: TIMEOUT,
+      now: options.now ?? NOW,
+      claudeSessionsDir: options.sessionsDir,
+      claudeProcessAlive: (pid) => alive.has(pid),
+      herdrOps: options.herdrOps ?? null,
+    });
+  }
+
+  test("Stop 後の idle でも背景サブエージェント中（busy）なら bump して kill しない", async () => {
+    const dir = makeTempDir("reaper");
+    const runner = runnerWithSessions(["cs-bg"]);
+    writeHeartbeat(dir, "cs-bg", { ts: NOW - TIMEOUT, state: "idle", event: "Stop" });
+    const sessionsDir = claudeSessionsDir({ tmux: "cs-bg:@0.%1", status: "busy" });
+
+    const result = await tick({ dir, runner, sessionsDir });
+
+    expect(result.killed).toEqual([]);
+    expect(readHeartbeat(dir, "cs-bg")).toEqual({ ts: NOW, state: "idle", event: "daemon-claude-working-busy" });
+  });
+
+  test("背景シェル（shell）・承認待ち（waiting）も保護し、idle なら従来どおり kill", async () => {
+    for (const [status, expectKilled] of [["shell", false], ["waiting", false], ["idle", true]] as const) {
+      const dir = makeTempDir("reaper");
+      const runner = runnerWithSessions(["cs-bg"]);
+      writeHeartbeat(dir, "cs-bg", { ts: NOW - TIMEOUT, state: "idle" });
+      const sessionsDir = claudeSessionsDir({ tmux: "cs-bg:@0.%1", status });
+
+      const result = await tick({ dir, runner, sessionsDir });
+
+      expect(result.killed).toEqual(expectKilled ? ["cs-bg"] : []);
+    }
+  });
+
+  test("状態ファイルの pid が死んでいる（異常終了の残骸）なら保護しない", async () => {
+    const dir = makeTempDir("reaper");
+    const runner = runnerWithSessions(["cs-bg"]);
+    writeHeartbeat(dir, "cs-bg", { ts: NOW - TIMEOUT, state: "idle" });
+    const sessionsDir = claudeSessionsDir({ tmux: "cs-bg:@0.%1", status: "busy" });
+
+    const result = await tick({ dir, runner, sessionsDir, alivePids: [] });
+
+    expect(result.killed).toEqual(["cs-bg"]);
+  });
+
+  test("同じ status のまま 24 時間を超えた申告・未来時刻の申告は信用しない", async () => {
+    for (const statusUpdatedAt of [NOW_MS - CLAUDE_WORKING_MAX_SECONDS * 1000, NOW_MS + 3600_000]) {
+      const dir = makeTempDir("reaper");
+      const runner = runnerWithSessions(["cs-bg"]);
+      writeHeartbeat(dir, "cs-bg", { ts: NOW - TIMEOUT, state: "idle" });
+      const sessionsDir = claudeSessionsDir({ tmux: "cs-bg:@0.%1", status: "busy", statusUpdatedAt });
+
+      const result = await tick({ dir, runner, sessionsDir });
+
+      expect(result.killed).toEqual(["cs-bg"]);
+    }
+  });
+
+  test("codex セッションは Claude の申告を見ない", async () => {
+    const dir = makeTempDir("reaper");
+    const runner = runnerWithSessions(["cs-codex"]);
+    const store = makeTempStore();
+    store.put({ name: "cs-codex", cwd: "/work", createdAt: NOW - 10_000, agent: "codex" });
+    writeHeartbeat(dir, "cs-codex", { ts: NOW - TIMEOUT, state: "idle" });
+    const sessionsDir = claudeSessionsDir({ tmux: "cs-codex:@0.%1", status: "busy" });
+
+    const result = await tick({ dir, runner, sessionsDir, store });
+
+    expect(result.killed).toEqual(["cs-codex"]);
+  });
+
+  test("tmux は session id で照合しない: 同じ会話の複製インスタンス（Mac のターミナル）の仕事中で守らない", async () => {
+    const dir = makeTempDir("reaper");
+    const runner = runnerWithSessions(["cs-dup"]);
+    const store = makeTempStore();
+    store.put({ name: "cs-dup", cwd: "/work", createdAt: NOW - 10_000, claudeSessionId: "sid-1" });
+    writeHeartbeat(dir, "cs-dup", { ts: NOW - TIMEOUT, state: "idle" });
+    const sessionsDir = claudeSessionsDir(
+      { pid: 100, tmux: "cs-dup:@0.%1", status: "idle" },
+      { pid: 200, status: "shell" },
+      { pid: 300, tmux: "main:@1.%4", status: "busy" },
+    );
+
+    const result = await tick({ dir, runner, sessionsDir, store, alivePids: [100, 200, 300] });
+
+    expect(result.killed).toEqual(["cs-dup"]);
+  });
+
+  /** herdr の操作面（前面 pid 取得つき）。 */
+  function herdrOps(name: string, pids: number[] | null | undefined): { ops: HerdrReaperOps; killed: string[] } {
+    const killedNames: string[] = [];
+    return {
+      killed: killedNames,
+      ops: {
+        list: async () => [{ name, cwd: "/w", alive: true, backend: "herdr" as const }],
+        agentProcessAlive: async () => true,
+        ...(pids !== undefined ? { agentProcessIds: async () => pids } : {}),
+        kill: async (target) => {
+          killedNames.push(target);
+        },
+      },
+    };
+  }
+
+  test("herdr は pane の前面 pid で照合し、同じ session id の別インスタンスを見ない", async () => {
+    const store = makeTempStore();
+    store.put({ name: "s-h", cwd: "/w", createdAt: NOW - 10_000, backend: "herdr", claudeSessionId: "sid-1" });
+    const sessionsDir = claudeSessionsDir(
+      { pid: 100, status: "idle" },
+      { pid: 200, status: "busy" },
+    );
+    // [55] = 取れたが一致しない → 同じ session id の複製（200 busy）へ落ちず回収する。
+    for (const [pids, expectKilled] of [[[100, 55], true], [[200], false], [[55], true]] as const) {
+      const dir = makeTempDir("reaper");
+      writeHeartbeat(dir, "s-h", { ts: NOW - TIMEOUT, state: "idle" });
+      const { ops, killed: killedNames } = herdrOps("s-h", [...pids]);
+
+      await tick({ dir, runner: runnerWithSessions([]), sessionsDir, store, alivePids: [100, 200], herdrOps: ops });
+
+      expect(killedNames).toEqual(expectKilled ? ["s-h"] : []);
+    }
+  });
+
+  test("herdr で前面 pid が取れないときだけ session id（tmux 欄の無い記録）に頼る", async () => {
+    const store = makeTempStore();
+    store.put({ name: "s-h", cwd: "/w", createdAt: NOW - 10_000, backend: "herdr", claudeSessionId: "sid-1" });
+    const sessionsDir = claudeSessionsDir({ pid: 200, status: "shell" });
+    const dir = makeTempDir("reaper");
+    writeHeartbeat(dir, "s-h", { ts: NOW - TIMEOUT, state: "idle" });
+    const { ops, killed: killedNames } = herdrOps("s-h", null);
+
+    await tick({ dir, runner: runnerWithSessions([]), sessionsDir, store, alivePids: [200], herdrOps: ops });
+
+    expect(killedNames).toEqual([]);
+  });
+
+  test("1 回きりの予約は発火時刻 + 猶予まで保護し、過ぎたら通常どおり kill", async () => {
+    const scheduled = oneShot(NOW + 600);
+    const dir = makeTempDir("reaper");
+    const runner = runnerWithSessions(["cs-loop"]);
+    writeHeartbeat(dir, "cs-loop", { ts: NOW - TIMEOUT, state: "idle", scheduled });
+
+    const first = await tick({ dir, runner, sessionsDir: null });
+    expect(first.killed).toEqual([]);
+    // bump しても予約の記録は保持する。
+    expect(readHeartbeat(dir, "cs-loop")).toEqual({
+      ts: NOW, state: "idle", event: "daemon-claude-scheduled", scheduled,
+    });
+
+    // 発火せず（ターンも Stop も来ず）猶予を過ぎた → 最後の bump から timeout 後に kill。
+    const later = NOW + 600 + SCHEDULED_ONE_SHOT_GRACE_SECONDS;
+    writeHeartbeat(dir, "cs-loop", { ts: later - TIMEOUT, state: "idle" });
+    const second = await tick({ dir, runner, sessionsDir: null, now: later });
+    expect(second.killed).toEqual(["cs-loop"]);
+  });
+
+  test("予約があってもエージェントプロセスが死んでいれば保護しない（予約はプロセス内にしか無い）", async () => {
+    const dir = makeTempDir("reaper");
+    const runner = runnerWithSessions(["cs-loop"], "zsh");
+    writeHeartbeat(dir, "cs-loop", { ts: NOW - TIMEOUT, state: "idle", scheduled: oneShot(NOW + 600) });
+
+    const result = await tick({ dir, runner, sessionsDir: null });
+
+    expect(result.killed).toEqual(["cs-loop"]);
+  });
+
+  test("同じ pane で別の会話が起動し直されていたら、古い会話の予約では守らない", async () => {
+    for (const [liveSessionId, expectKilled] of [["sid-new", true], ["sid-1", false]] as const) {
+      const dir = makeTempDir("reaper");
+      const runner = runnerWithSessions(["cs-loop"]);
+      writeHeartbeat(dir, "cs-loop", { ts: NOW - TIMEOUT, state: "idle", scheduled: oneShot(NOW + 600) });
+      const sessionsDir = claudeSessionsDir({ tmux: "cs-loop:@0.%1", status: "idle", sessionId: liveSessionId });
+
+      const result = await tick({ dir, runner, sessionsDir });
+
+      expect(result.killed).toEqual(expectKilled ? ["cs-loop"] : []);
+    }
+  });
+
+  test("予約の持ち主は pid で照合する（/clear で session id が変わっても予約は残る）", async () => {
+    for (const [livePid, expectKilled] of [[4242, false], [5151, true]] as const) {
+      const dir = makeTempDir("reaper");
+      const runner = runnerWithSessions(["cs-loop"]);
+      writeHeartbeat(dir, "cs-loop", {
+        ts: NOW - TIMEOUT, state: "idle", scheduled: oneShot(NOW + 600, { pid: 4242, sessionId: "sid-before-clear" }),
+      });
+      const sessionsDir = claudeSessionsDir({ pid: livePid, tmux: "cs-loop:@0.%1", sessionId: "sid-after-clear" });
+
+      const result = await tick({ dir, runner, sessionsDir, alivePids: [livePid] });
+
+      expect(result.killed).toEqual(expectKilled ? ["cs-loop"] : []);
+    }
+  });
+
+  test("同じ tmux セッションに teammate の Claude がいても、予約の持ち主（リーダー）を見つけて守る", async () => {
+    const dir = makeTempDir("reaper");
+    const runner = runnerWithSessions(["cs-team"]);
+    writeHeartbeat(dir, "cs-team", { ts: NOW - TIMEOUT, state: "idle", scheduled: oneShot(NOW + 600, { pid: 72209 }) });
+    // 辞書順では teammate（100500）が先に並ぶ。
+    const sessionsDir = claudeSessionsDir(
+      { pid: 72209, tmux: "cs-team:@0.%0" },
+      { pid: 100500, tmux: "cs-team:@0.%3" },
+    );
+
+    const result = await tick({ dir, runner, sessionsDir, alivePids: [72209, 100500] });
+
+    expect(result.killed).toEqual([]);
+  });
+
+  test("予約の pid が分かっていれば、状態ファイルの照合が外れても持ち主の生存を直接確かめる", async () => {
+    // 照合が外れる = 置き場の食い違い等で当該セッションの記録が 0 件。
+    for (const [alivePids, expectKilled] of [[[4242], false], [[], true]] as const) {
+      const dir = makeTempDir("reaper");
+      const runner = runnerWithSessions(["cs-loop"]);
+      writeHeartbeat(dir, "cs-loop", { ts: NOW - TIMEOUT, state: "idle", scheduled: oneShot(NOW + 600, { pid: 4242 }) });
+
+      const result = await tick({ dir, runner, sessionsDir: makeTempDir("claude-sessions-empty"), alivePids: [...alivePids] });
+
+      expect(result.killed).toEqual(expectKilled ? ["cs-loop"] : []);
+    }
+  });
+
+  test("エージェントプロセスの死亡で idle へ降格するとき、予約の記録も消す", async () => {
+    const dir = makeTempDir("reaper");
+    const runner = runnerWithSessions(["cs-crash"], "zsh");
+    writeHeartbeat(dir, "cs-crash", { ts: NOW - TIMEOUT, state: "active", scheduled: oneShot(NOW + 600) });
+
+    const result = await tick({ dir, runner, sessionsDir: null });
+
+    expect(result.demoted).toEqual(["cs-crash"]);
+    expect(readHeartbeat(dir, "cs-crash")?.scheduled).toBeUndefined();
+  });
+
+  test("繰り返し予約は最初に見てから 7 日 + 最終発火の猶予、1 回きりも記録から 7 日、解釈不能は 24 時間", () => {
+    const base = { atTs: NOW, oneShotTs: [], recurring: [], unparsed: false };
+    const recurring = { ...base, recurring: [{ id: "c1", firstSeenTs: NOW - 3600 }] };
+    const recurringEnd = NOW - 3600 + SCHEDULED_MAX_SECONDS + SCHEDULED_RECURRING_FINAL_GRACE_SECONDS;
+    // Stop のたびに atTs が進んでも、失効は最初に見た時刻から数える。
+    expect(scheduledPending({ ...recurring, atTs: recurringEnd - 10 }, recurringEnd - 1)).toBe(true);
+    expect(scheduledPending({ ...recurring, atTs: recurringEnd - 10 }, recurringEnd)).toBe(false);
+    expect(scheduledPending({ ...base, unparsed: true }, NOW + SCHEDULED_UNPARSED_MAX_SECONDS - 1)).toBe(true);
+    expect(scheduledPending({ ...base, unparsed: true }, NOW + SCHEDULED_UNPARSED_MAX_SECONDS)).toBe(false);
+    expect(scheduledPending(base, NOW)).toBe(false);
+    // 期限切れの 1 回きりが翌年の一致として記録されても、記録から 7 日で保護を外す。
+    const farOneShot = { ...base, oneShotTs: [NOW + 365 * 24 * 3600] };
+    expect(scheduledPending(farOneShot, NOW + SCHEDULED_MAX_SECONDS - 1)).toBe(true);
+    expect(scheduledPending(farOneShot, NOW + SCHEDULED_MAX_SECONDS)).toBe(false);
+  });
+
+  test("hub の処理完了書込（scheduled 未指定）は Stop hook の予約記録を消さない", () => {
+    const dir = makeTempDir("reaper");
+    const scheduled = oneShot(NOW + 600);
+    writeHeartbeat(dir, "cs-keep", { ts: NOW, state: "idle", event: "Stop", scheduled });
+    writeHeartbeat(dir, "cs-keep", { ts: NOW + 1, state: "idle", event: "hub-processing-done" });
+    expect(readHeartbeat(dir, "cs-keep")?.scheduled).toEqual(scheduled);
+    // Stop hook が予約なし（null）を書いたら消える。
+    writeHeartbeat(dir, "cs-keep", { ts: NOW + 2, state: "idle", event: "Stop", scheduled: null });
+    expect(readHeartbeat(dir, "cs-keep")?.scheduled).toBeUndefined();
   });
 });

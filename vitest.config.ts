@@ -8,5 +8,7 @@ export default defineConfig({
     fileParallelism: false,
     sequence: { concurrent: false },
     testTimeout: 15_000,
+    // reaper が開発機の実物 `~/.claude/sessions`（稼働中の Claude の状態）を読まないよう隔離する。
+    env: { TAILII_CLAUDE_SESSIONS_DIR: "/nonexistent/tailii-test/claude-sessions" },
   },
 });

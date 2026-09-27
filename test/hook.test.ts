@@ -23,6 +23,7 @@ import {
   removeCodexHookSettings,
 } from "../src/commands/hookSettings.js";
 import { decodeControlMessage, type ControlMessage } from "../src/protocol.js";
+import { readHeartbeat } from "../src/sessions/heartbeat.js";
 import { startEngineRelaySocket, type EngineRelayMessage } from "../src/hub/engineRelaySocket.js";
 import {
   SocketLineReader,
@@ -1111,6 +1112,51 @@ describe("Hook — 待機延長・retry-connect（Req 8.1/8.2/8.3）", () => {
     } finally {
       await relay.close();
       fs.rmSync(relayPath, { force: true });
+    }
+  });
+
+  it("Stop は残った予約（session_crons）を heartbeat に記録し、予約なしの Stop で消す", async () => {
+    const heartbeatDir = fs.mkdtempSync(path.join(os.tmpdir(), "hook-hb-"));
+    const stop = (payload: Record<string, unknown>) => runHookCore({
+      stdinData: Buffer.from(JSON.stringify({ hook_event_name: "Stop", session_id: "s1", ...payload })),
+      socketPath: null,
+      deadlineSeconds: 1,
+      session: "cs-cron",
+      engineRelaySocketPath: null,
+      heartbeatDir,
+      resolveClaudePid: () => 4242,
+    });
+    try {
+      await stop({
+        background_tasks: [],
+        session_crons: [{ id: "c1", schedule: "*/5 * * * *", recurring: true, prompt: "/loop tick" }],
+      });
+      expect(readHeartbeat(heartbeatDir, "cs-cron")).toMatchObject({
+        state: "idle",
+        event: "Stop",
+        scheduled: { pid: 4242, sessionId: "s1", oneShotTs: [], recurring: [{ id: "c1" }], unparsed: false },
+      });
+      const firstSeenTs = readHeartbeat(heartbeatDir, "cs-cron")!.scheduled!.recurring[0]!.firstSeenTs;
+
+      // 次のターンのツール hook は予約記録を保持する（Stop だけが書き換える）。
+      await runHookCore({
+        stdinData: Buffer.from(JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "s1" })),
+        socketPath: null,
+        deadlineSeconds: 1,
+        session: "cs-cron",
+        engineRelaySocketPath: null,
+        heartbeatDir,
+      });
+      expect(readHeartbeat(heartbeatDir, "cs-cron")?.scheduled?.recurring).toHaveLength(1);
+
+      // 次の Stop でも同じ予約なら最初に見た時刻を引き継ぐ。
+      await stop({ session_crons: [{ id: "c1", schedule: "*/5 * * * *", recurring: true, prompt: "/loop tick" }] });
+      expect(readHeartbeat(heartbeatDir, "cs-cron")?.scheduled?.recurring).toEqual([{ id: "c1", firstSeenTs }]);
+
+      await stop({ session_crons: [] });
+      expect(readHeartbeat(heartbeatDir, "cs-cron")?.scheduled).toBeUndefined();
+    } finally {
+      fs.rmSync(heartbeatDir, { recursive: true, force: true });
     }
   });
 

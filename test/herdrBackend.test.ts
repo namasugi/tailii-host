@@ -1249,6 +1249,25 @@ describe("HerdrSessionManager", () => {
     expect(await make({ exitCode: 1, stdout: "", stderr: "x" }).agentProcessAlive("s-a")).toBe(true);
   });
 
+  test("agentProcessIds: 前面 pid を返し、pane 不在・herdr 失敗・空の結果は取得不能(null)", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const make = (result: HerdrCommandResult | Error, panes = [{ pane_id: "w4:p2" }]): HerdrSessionManager =>
+      new HerdrSessionManager({
+        runner: new MockHerdrRunner((args) => {
+          if (args[1] === "list") return herdrOk(paneListJson(panes));
+          if (result instanceof Error) throw result;
+          return result;
+        }).runner,
+        store,
+      });
+    expect(await make(herdrOk(processInfoJson("claude"))).agentProcessIds("s-a")).toEqual([1]);
+    expect(await make(herdrOk(processInfoJson("claude")), []).agentProcessIds("s-a")).toBeNull();
+    expect(await make({ exitCode: 1, stdout: "", stderr: "x" }).agentProcessIds("s-a")).toBeNull();
+    expect(await make(new Error("boom")).agentProcessIds("s-a")).toBeNull();
+    expect(await make(herdrOk(JSON.stringify({ result: { process_info: {} } }))).agentProcessIds("s-a")).toBeNull();
+  });
+
   test("agentProcessAlive: launch 直後の猶予窓ではシェル前面を起動中として生存扱い", async () => {
     // pane 作成 → 初期シェル → `exec zsh -lc` → claude exec の間は前面がシェルに見える。
     // 窓内（createdAt が HERDR_LAUNCH_GRACE_SECONDS 未満前）は true、窓外は従来どおり false。
@@ -1961,5 +1980,26 @@ describe("inputBoxRealText (提案/プレースホルダーを除いた実テキ
 
   test("色付き(bright)実テキストも返す(truecolor の 2 を faint と誤認しない)", () => {
     expect(inputBoxRealText(box([`❯ ${ESC}[38;2;255;255;255m色付き下書き${RESET}`]))).toBe("色付き下書き");
+  });
+});
+
+describe("parseHerdrForegroundPids", () => {
+  test("前面プロセスグループ id と前面プロセスの pid を重複なく返す（Claude の状態ファイル照合用）", async () => {
+    const { parseHerdrForegroundPids } = await import("../src/backend/herdr.js");
+    // 実測の形（MCP サーバー等の子も前面グループに並ぶ。先頭が claude とは限らない）。
+    const stdout = JSON.stringify({
+      id: "cli:pane:process_info",
+      result: {
+        process_info: {
+          foreground_process_group_id: 72209,
+          foreground_processes: [
+            { name: "node", pid: 72390 },
+            { name: "claude", pid: 72209 },
+          ],
+        },
+      },
+    });
+    expect(parseHerdrForegroundPids(stdout).sort()).toEqual([72209, 72390]);
+    expect(parseHerdrForegroundPids("not json")).toEqual([]);
   });
 });
