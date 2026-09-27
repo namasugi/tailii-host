@@ -14,6 +14,7 @@ import {
   HERDR_LAUNCH_GRACE_SECONDS,
   HERDR_TAILII_SESSION,
   defaultHerdrPath,
+  envWithoutTmux,
   parseHerdrForegroundCommand,
   parseHerdrPaneList,
   parseHerdrCreatedTabPaneId,
@@ -814,7 +815,8 @@ async function launchHerdrPane(options: {
       const result = await options.runner(
         options.herdrPath,
         ["--session", HERDR_TAILII_SESSION, ...args],
-        { env: options.env },
+        // herdr server の起動元になり得るので TMUX を持ち込まない（envWithoutTmux）。
+        { env: envWithoutTmux(options.env) },
       );
       return { code: result.exitCode, out: result.stdout };
     } catch (error) {

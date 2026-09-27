@@ -97,6 +97,16 @@ const HERDR_TIMEOUT_MS = 15_000;
 export const HERDR_LAUNCH_GRACE_SECONDS = 20;
 
 /**
+ * TMUX / TMUX_PANE を除いた環境。herdr server は最初に `herdr` を叩いたプロセスの環境を引き継ぎ、
+ * その配下の Claude は TMUX があると外側の tmux pane 名を状態ファイルの `tmux` 欄に書く
+ * （reaper の照合を取り違える）。tmux 内の hook / CLI から起動されても持ち込まないよう外す。
+ */
+export function envWithoutTmux(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const { TMUX: _tmux, TMUX_PANE: _tmuxPane, ...rest } = env;
+  return rest;
+}
+
+/**
  * 実 herdr を起動する既定ランナー。herdr 非0 exit は throw せず結果で表現する。
  * `sessionName`（既定 tailii）を `--session` として全コマンドに前置する。
  */
@@ -113,7 +123,7 @@ export function processHerdrCommandRunner(
         // 発行するのは pane list / pane get / tab list など即応するコマンドだけ。無期限に
         // 待つと engine の read loop と hub の tick ループが同時に止まるため上限を切る
         // （tmux ランナー・`gitService` と同じ規約）。
-        { maxBuffer: 16 * 1024 * 1024, timeout: timeoutMs },
+        { maxBuffer: 16 * 1024 * 1024, timeout: timeoutMs, env: envWithoutTmux() },
         (error, stdout, stderr) => {
           if (error && typeof (error as NodeJS.ErrnoException).code === "string") {
             // 実行ファイル起動自体の失敗（ENOENT 等）のみ throw（tmux ランナーと同じ境界）。

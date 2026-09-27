@@ -42,6 +42,32 @@ function spawnRecorder(): { args: string[][]; spawnImpl: typeof import("node:chi
 }
 
 describe("hub lock / ensure", () => {
+  test("hub は TMUX / TMUX_PANE を外した環境で起動する（herdr 配下の Claude の tmux 欄誤記を防ぐ）", () => {
+    const dir = makeTempDir("hub-lock");
+    const saved = { tmux: process.env["TMUX"], pane: process.env["TMUX_PANE"], marker: process.env["TAILII_TEST_MARKER"] };
+    let spawnedEnv: NodeJS.ProcessEnv | undefined;
+    const spawnImpl = ((_command: string, _args: string[], options: { env?: NodeJS.ProcessEnv }) => {
+      spawnedEnv = options.env;
+      return { unref: () => {} };
+    }) as unknown as typeof import("node:child_process").spawn;
+    try {
+      process.env["TMUX"] = "/tmp/tmux-501/default,1,0";
+      process.env["TMUX_PANE"] = "%4";
+      process.env["TAILII_TEST_MARKER"] = "kept";
+      ensureHubDaemon({
+        lockPath: path.join(dir, "hub.lock"), cliPath: "/x/cli.js", logPath: path.join(dir, "hub.log"), spawnImpl,
+      });
+    } finally {
+      for (const [key, value] of [["TMUX", saved.tmux], ["TMUX_PANE", saved.pane], ["TAILII_TEST_MARKER", saved.marker]] as const) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+    expect(spawnedEnv?.["TMUX"]).toBeUndefined();
+    expect(spawnedEnv?.["TMUX_PANE"]).toBeUndefined();
+    expect(spawnedEnv?.["TAILII_TEST_MARKER"]).toBe("kept");
+  });
+
   test("readHubLock は pid 必須・壊れは null、pidAlive は自プロセスで true", () => {
     const lockPath = path.join(makeTempDir("hub-lock"), "hub.lock");
     expect(readHubLock(lockPath)).toBeNull();

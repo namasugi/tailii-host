@@ -25,7 +25,7 @@ import { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
 import { abortableSleep } from "../shared/sleep.js";
 import { resolveHubSocketPath } from "../shared/socketPath.js";
 import { processTmuxCommandRunner, screenInLoginFlow } from "../backend/tmux.js";
-import { screenHasSelectionFooter } from "../backend/herdr.js";
+import { envWithoutTmux, screenHasSelectionFooter } from "../backend/herdr.js";
 import { readPackageVersion } from "../shared/version.js";
 import { ChatTailController } from "../chat/chatTailController.js";
 import { TranscriptTailer } from "../chat/transcriptTailer.js";
@@ -363,9 +363,12 @@ export function ensureHubDaemon(options: EnsureHubDaemonOptions = {}): void {
     const logPath = options.logPath ?? path.join(os.homedir(), ".tailii", "hub.log");
     ensureDirectory0700(path.dirname(logPath));
     logFd = fs.openSync(logPath, "a");
+    // tmux 内の hook から ensure されると TMUX / TMUX_PANE を引き継ぐ。hub が起こす herdr server 経由で
+    // herdr 内の Claude がこの tmux pane 名を状態ファイルの `tmux` 欄に書き、reaper が取り違えるので外す。
     const child = (options.spawnImpl ?? spawn)(process.execPath, [cliPath, "hub"], {
       detached: true,
       stdio: ["ignore", logFd, logFd],
+      env: envWithoutTmux(),
     });
     child.unref();
   } catch {
