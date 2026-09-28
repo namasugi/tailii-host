@@ -27,6 +27,7 @@ import {
 } from "../src/backend/sessionBackend.js";
 import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
 import {
+  ChatInjectionRejectedError,
   extractClaudeInputBox,
   extractInputBoxSuggestion,
   inputBoxHasRealPendingText,
@@ -376,6 +377,8 @@ describe("HerdrSessionManager", () => {
     openDialogOnEnter?: boolean;
     /** 初期状態でダイアログが開いている。 */
     dialogInitiallyOpen?: boolean;
+    /** Esc を打ってもダイアログが閉じない。 */
+    escapeStuck?: boolean;
     /** 初期状態で入力欄に残存テキストがある（中断で queued が書き戻された状態）。 */
     initialInput?: string;
     /** 初期状態でシェルモード（プロンプトが `!`）に入ったままになっている。 */
@@ -436,7 +439,7 @@ describe("HerdrSessionManager", () => {
         return { exitCode: 1, stdout: "", stderr: "agent target not found" };
       }
       if (args[0] === "pane" && args[1] === "send-keys" && args[3] === "Escape") {
-        state.dialogOpen = false;
+        if (options.escapeStuck !== true) state.dialogOpen = false;
         return herdrOk("");
       }
       if (args[0] === "pane" && args[1] === "send-keys" && args[3] === "Backspace") {
@@ -1097,6 +1100,86 @@ describe("HerdrSessionManager", () => {
       ["pane", "send-text", "w4:p2", "こんにちは"],
       ["pane", "send-text", "w4:p2", "\r"],
     ]);
+  });
+
+  test("sendTextSubmit: Esc でダイアログが閉じなければ本文を打たずに失敗する", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const { runner } = makeSubmitHarness({ dialogInitiallyOpen: true, escapeStuck: true });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, choiceCancelPollMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    let cancelled = 0;
+    const attempt = manager.sendTextSubmit("s-a", "こんにちは", {
+      cancelChoiceDialog: true, onChoiceDialogCancelled: () => { cancelled += 1; },
+    });
+    await expect(attempt).rejects.toBeInstanceOf(ChatInjectionRejectedError);
+    await expect(attempt).rejects.toThrow(/選択肢を閉じられなかった/);
+    // Esc は 1 回だけ（撃ち直すと、閉じた後の入力欄で巻き戻し画面が開く）。本文は打たない。
+    expect(submitSends(runner)).toEqual([["pane", "send-keys", "w4:p2", "Escape"]]);
+    expect(cancelled).toBe(0);
+  });
+
+  test("sendTextSubmit: ダイアログを閉じたら onChoiceDialogCancelled を 1 回だけ呼ぶ", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const { runner } = makeSubmitHarness({ dialogInitiallyOpen: true });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, choiceCancelPollMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    let cancelled = 0;
+    await manager.sendTextSubmit("s-a", "こんにちは", {
+      cancelChoiceDialog: true, onChoiceDialogCancelled: () => { cancelled += 1; },
+    });
+    expect(cancelled).toBe(1);
+    expect(submitSends(runner)).toEqual([
+      ["pane", "send-keys", "w4:p2", "Escape"],
+      ["pane", "send-text", "w4:p2", "こんにちは"],
+      ["pane", "send-text", "w4:p2", "\r"],
+    ]);
+  });
+
+  test("sendTextSubmit: cancelChoiceDialog で画面を判別できなければ 1 キーも打たない", async () => {
+    // hub は「未回答の設問がある」と知っている。判別できない画面へ本文を打つと選択肢へ落ちる。
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const rule = "─".repeat(40);
+    // 罫線はある（描画ゲートは通る）が、バーもダイアログのフッターも見えない。
+    const { runner } = makeSubmitHarness({
+      plainScreen: [rule, "  1. りんご", "  2. みかん", rule].join("\n"),
+    });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, choiceCancelPollMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    const attempt = manager.sendTextSubmit("s-a", "1", { cancelChoiceDialog: true });
+    await expect(attempt).rejects.toBeInstanceOf(ChatInjectionRejectedError);
+    await expect(attempt).rejects.toThrow(/設問の画面を確認できなかった/);
+    expect(submitSends(runner)).toEqual([]);
+  });
+
+  test("sendTextSubmit: 本文がフッター文言を引用していても、入力欄を見ているなら Esc を打たない", async () => {
+    // Esc は処理中の Claude を中断するキーでもある。30 行窓は会話本文を含むので、
+    // ボトムバーが見えているフレームでは撃たない。
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const rule = "─".repeat(40);
+    const { runner } = makeSubmitHarness({
+      plainScreen: ["Enter to select · Esc to cancel", rule, "❯ ", rule, "  ⏸ manual mode on"].join("\n"),
+    });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, choiceCancelPollMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    // 画面を固定しているので本文の反映検証は通らない（ここで見たいのは Esc の有無だけ）。
+    await manager.sendTextSubmit("s-a", "ふつうの本文", { cancelChoiceDialog: true }).catch(() => {});
+    expect(submitSends(runner).some((args) => args[3] === "Escape")).toBe(false);
   });
 
   test("sendTextSubmit: シェルモード（先頭 `!`）は 1 回の注入で成立し重ね打ちしない", async () => {

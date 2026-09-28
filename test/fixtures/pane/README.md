@@ -1,7 +1,7 @@
 # pane フィクスチャ（無加工の生キャプチャ）
 
-claude 2.1.278 の実機 TUI を tmux `capture-pane -p -e`（ANSI 付き・viewport のみ）で
-そのまま採取したもの。**編集しないこと**: 空行や罫線を落とすと検出器が偽の緑になる
+claude 2.1.278（`question-dialog-multi` / `question-declined` は 2.1.283）の実機 TUI を
+tmux `capture-pane -p -e`（ANSI 付き・viewport のみ）でそのまま採取したもの。**編集しないこと**: 空行や罫線を落とすと検出器が偽の緑になる
 （2026-07-28 の実障害。空行を `awk 'NF'` で落としたフィクスチャで 2 周分の調査を浪費した）。
 
 | ファイル | 状態 | ボトムバー |
@@ -14,6 +14,8 @@ claude 2.1.278 の実機 TUI を tmux `capture-pane -p -e`（ANSI 付き・viewp
 | `processing.ansi` | 応答生成中（本文は送信済み・入力欄は空） | `⏸ manual mode on · esc to interrupt · ← for agents` |
 | `question-dialog.ansi` | AskUserQuestion の設問ダイアログ | `Enter to select · ↑/↓ to navigate · Esc to cancel` |
 | `approval-dialog.ansi` | ツール承認ダイアログ（Write） | `Esc to cancel · Tab to amend` |
+| `question-dialog-multi.ansi` | AskUserQuestion の複数設問（タブ付き） | `Enter to select · Tab/Arrow keys to navigate · Esc to cancel` |
+| `question-declined.ansi` | 上の設問を Esc で閉じた直後（`User declined to answer questions`・入力欄は空） | `⏵⏵ auto mode on (shift+tab to cycle) · ← for agents` |
 
 ダイアログの 2 枚は `extractClaudeInputBox` が本体の罫線ペアを入力欄と誤認し、
 `inputBoxRealText` がカーソル行（`1. Yes` / 選択肢全文）を「未送信テキスト」として返す。

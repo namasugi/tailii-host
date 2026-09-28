@@ -212,6 +212,15 @@ export interface SendTextSubmitOptions {
    * 本文を明示再送へ倒すと二重送信になり得るため（「配送済み扱い + 可観測化」を選ぶ）。
    */
   onUnconfirmedSubmit?: () => void;
+  /**
+   * 選択ダイアログ（AskUserQuestion の設問 / ❯ メニュー）が開いていたら、Esc で閉じてから本文を送る
+   * （chat-cancel-choice）。利用者が「選択肢に答えずにメッセージを送る」と決めた送信にだけ付く。
+   * 付いていない送信は従来どおり 1 キーも打たずに拒否する（tmux）。
+   * 承認ダイアログと `/login` フローは対象外（どちらも専用の操作経路があり、Esc の意味が重い）。
+   */
+  cancelChoiceDialog?: boolean;
+  /** 選択ダイアログを実際に Esc で閉じたときに 1 回だけ呼ばれる（hub が監査ログへ残す）。 */
+  onChoiceDialogCancelled?: () => void;
 }
 
 /**
@@ -814,6 +823,106 @@ export function screenShowsDialogFooter(screen: string): boolean {
 const DIALOG_FOOTER_WINDOW_LINES = 4;
 
 /**
+ * **Esc で閉じてよい**選択ダイアログ（AskUserQuestion の設問 / ❯ メニュー）が画面下部に出ているか
+ * （chat-cancel-choice, TESTABLE）。実測 2.1.283 のフッター:
+ * - 設問（1 問）: `Enter to select · ↑/↓ to navigate · Esc to cancel`
+ * - 設問（複数問）: `Enter to select · Tab/Arrow keys to navigate · Esc to cancel`
+ * - 自由記述欄にフォーカス中: 上に `· ctrl+g to edit in VS Code` が挟まる（80 桁では折り返す）
+ *
+ * `screenShowsDialogFooter` より狭い: ツール承認（`Esc to cancel · Tab to amend`）と `/login` の
+ * 継続待ちは含めない。承認の Esc は「ツールを拒否してターンを止める」で、選択肢を閉じるのとは
+ * 重さが違う（承認はアプリの承認モーダルが正規の経路）。
+ * 折り返しで `Esc to cancel` が次の行へ落ちるので、同じ行に両方あることは要求しない。
+ * Esc は処理中の Claude を中断するキーでもあるため、**ボトムバーが見えているフレームでは
+ * 決して true にしない**（本文の引用を末尾窓で拾っても、composer を見ているなら撃たない）。
+ */
+export function screenShowsCancellableChoice(screen: string): boolean {
+  if (claudeComposerBarVisible(screen)) return false;
+  return screen
+    .split("\n")
+    .map((line) => stripSgr(line).trimEnd())
+    .filter((line) => line.trim() !== "")
+    .slice(-DIALOG_FOOTER_WINDOW_LINES)
+    .some((line) => line.trim().startsWith("Enter to select"));
+}
+
+/**
+ * 選択ダイアログを Esc で閉じる試行の結果。
+ * - `absent`: 閉じるべき選択ダイアログが見えない（1 キーも打っていない）。
+ * - `cancelled`: Esc を 1 回打ち、ダイアログが消えたことを確認した。
+ * - `stuck`: Esc を打ったが、待ってもダイアログが消えない（または画面を読めない）。
+ */
+export type ChoiceDialogCancelOutcome = "absent" | "cancelled" | "stuck";
+
+/**
+ * 選択ダイアログを Esc で閉じ、消えたことを確認する（tmux / herdr 共通, chat-cancel-choice）。
+ *
+ * **Esc は 1 回しか打たない**。実測 2.1.283 では設問が複数でも、自由記述欄にフォーカスが
+ * あっても 1 回で閉じて 0.3 秒以内に空の入力欄へ戻る。閉じた後の入力欄へもう 1 回届くと
+ * 「Esc 2 回」= 巻き戻し（rewind）の画面が開き、続けて打つ本文がそこへ落ちる。
+ * 消えたかどうかは読めたフレームだけで判断する（capture 不能を「閉じた」と見なさない）。
+ */
+export async function cancelChoiceDialog(io: {
+  /** 呼び出し側が直前に撮ったフレーム（事前確認の capture 回数を増やさない）。null = 撮れなかった。 */
+  screen: string | null;
+  capture: () => Promise<string | null>;
+  sendEscape: () => Promise<void>;
+  /** 既定は `screenShowsCancellableChoice`。herdr は従来の判定窓を渡す。 */
+  detect?: (screen: string) => boolean;
+  pollMs: number;
+  maxPolls: number;
+}): Promise<ChoiceDialogCancelOutcome> {
+  const detect = io.detect ?? screenShowsCancellableChoice;
+  if (io.screen === null || !detect(io.screen)) return "absent";
+  await io.sendEscape();
+  for (let poll = 0; poll < io.maxPolls; poll += 1) {
+    await new Promise((resolve) => setTimeout(resolve, io.pollMs));
+    const after = await io.capture();
+    if (after !== null && !detect(after)) return "cancelled";
+  }
+  return "stuck";
+}
+
+/** Esc 後にダイアログの消滅を確かめる間隔と回数の既定（合計 約 2.4s）。 */
+export const CHOICE_CANCEL_POLL_MS = 300;
+export const CHOICE_CANCEL_MAX_POLLS = 8;
+
+/**
+ * 設問を閉じて送る指定なのに、入力欄へ戻ったことを画面で確かめられなかったときの拒否文言。
+ * hub は「未回答の設問がある」と知っている。判別できない画面へ本文を打つと選択肢へ落ちる。
+ */
+export const CHAT_BLOCKED_BY_UNREADABLE_CHOICE =
+  "設問の画面を確認できなかったため、メッセージを送信しませんでした（少し待って送り直すか、アプリで設問に答えてください）";
+
+/** 設問は閉じたが、その後の入力欄を画面で確かめられなかったときの拒否文言。 */
+export const CHAT_BLOCKED_AFTER_CHOICE_CANCELLED =
+  "設問は閉じましたが、入力欄を確認できなかったためメッセージを送信しませんでした（送り直してください）";
+
+/**
+ * 選択ダイアログを閉じた直後のフレームを、入力欄が描画されるまで撮り直す（tmux / herdr 共通）。
+ * 閉じた直後は描画途中でボトムバーが欠け、`unknown` に見えることがある。ここで諦めると
+ * 「設問は閉じたのに本文は未送信」になるので、`unknown` の間だけ短く待つ。
+ */
+export async function settleFrameAfterChoiceCancel(io: {
+  capture: () => Promise<string | null>;
+  pollMs: number;
+  maxPolls: number;
+}): Promise<{ screen: string | null; frame: SubmitFrameVerdict }> {
+  let screen = await io.capture();
+  let frame = classifySubmitFrame(screen);
+  for (let poll = 0; poll < io.maxPolls && frame === "unknown"; poll += 1) {
+    await new Promise((resolve) => setTimeout(resolve, io.pollMs));
+    screen = await io.capture();
+    frame = classifySubmitFrame(screen);
+  }
+  return { screen, frame };
+}
+
+/** 選択ダイアログを閉じられなかったときの拒否文言（hub が会話本文へそのまま出す）。 */
+export const CHAT_BLOCKED_BY_STUCK_CHOICE =
+  "選択肢を閉じられなかったため、メッセージを送信しませんでした（アプリで選択肢に答えるか、Mac 側の画面で閉じてください）";
+
+/**
  * 画面最下部に composer のボトムバーが出ているか＝「いま見ているのは入力欄であって
  * ダイアログではない」か（TESTABLE。text / ANSI どちらのキャプチャでも使える）。
  *
@@ -885,6 +994,8 @@ export class TmuxSessionManager {
   private readonly submitDelayMs: number;
   /** Enter → 送信成立確認 の間隔 ms（テスト注入用）。 */
   private readonly submitVerifyDelayMs: number;
+  /** 選択ダイアログを Esc で閉じた後の消滅確認の間隔 ms（テスト注入用）。 */
+  private readonly choiceCancelPollMs: number;
 
   constructor(options: {
     runner?: TmuxCommandRunner;
@@ -895,6 +1006,7 @@ export class TmuxSessionManager {
     clearKeyDelayMs?: number;
     submitDelayMs?: number;
     submitVerifyDelayMs?: number;
+    choiceCancelPollMs?: number;
   } = {}) {
     this.runner = options.runner ?? processTmuxCommandRunner();
     this.store = options.store ?? new SessionMetadataStore();
@@ -903,6 +1015,7 @@ export class TmuxSessionManager {
     this.clearKeyDelayMs = options.clearKeyDelayMs ?? 150;
     this.submitDelayMs = options.submitDelayMs ?? 150;
     this.submitVerifyDelayMs = options.submitVerifyDelayMs ?? 700;
+    this.choiceCancelPollMs = options.choiceCancelPollMs ?? CHOICE_CANCEL_POLL_MS;
     this.loginTiming = {
       delayMs: options.loginTiming?.delayMs ?? 150,
       pollMs: options.loginTiming?.pollMs ?? 250,
@@ -1051,8 +1164,43 @@ export class TmuxSessionManager {
     // 残存の有無は **composer フレームでだけ** 意味を持つ。ダイアログ表示中の
     // `inputBoxRealText` はカーソル行（`1. Yes` 等）を返すので、これを残存と信じて
     // Enter を撃つと選択肢を誤確定する（実測 2.1.278）。
-    const ansiScreen = await this.captureVisibleScreenAnsiOrNull(name);
-    const frame = classifySubmitFrame(ansiScreen);
+    let ansiScreen = await this.captureVisibleScreenAnsiOrNull(name);
+    let frame = classifySubmitFrame(ansiScreen);
+    if (frame === "dialog" && options.cancelChoiceDialog === true) {
+      // 利用者が「選択肢に答えずにメッセージを送る」と決めた送信（chat-cancel-choice）。
+      // 選択ダイアログなら Esc で閉じ、消えたのを確かめてから入力欄へ流す（Mac 側で手動 Esc
+      // するのと同じ操作）。承認ダイアログ / `/login` の継続待ちは `absent` になり、下の拒否へ落ちる。
+      const outcome = await cancelChoiceDialog({
+        screen: ansiScreen,
+        capture: () => this.captureVisibleScreenAnsiOrNull(name),
+        sendEscape: () => this.sendKeys(name, ["Escape"]),
+        pollMs: this.choiceCancelPollMs,
+        maxPolls: CHOICE_CANCEL_MAX_POLLS,
+      });
+      if (outcome !== "absent") {
+        const settled = await settleFrameAfterChoiceCancel({
+          capture: () => this.captureVisibleScreenAnsiOrNull(name),
+          pollMs: this.choiceCancelPollMs,
+          maxPolls: outcome === "cancelled" ? CHOICE_CANCEL_MAX_POLLS : 0,
+        });
+        ansiScreen = settled.screen;
+        frame = settled.frame;
+      }
+      if (outcome === "cancelled") options.onChoiceDialogCancelled?.();
+      // Esc は打ったが閉じない。ここで本文を打つとダイアログへ落ちるので、何も打たずに諦める
+      // （Esc 自体は選択肢を確定しない。非配達は確定している）。
+      if (outcome === "stuck" && frame === "dialog") {
+        throw new ChatInjectionRejectedError(CHAT_BLOCKED_BY_STUCK_CHOICE);
+      }
+      if (outcome === "cancelled" && frame === "unknown") {
+        throw new ChatInjectionRejectedError(CHAT_BLOCKED_AFTER_CHOICE_CANCELLED);
+      }
+    }
+    if (options.cancelChoiceDialog === true && frame === "unknown") {
+      // 設問がある前提の送信は fail-closed: 入力欄（ボトムバー）が見えたときだけ打つ。
+      // 指定の無い送信は従来どおり（未知フレームで送信が丸ごと不能にならないよう fail-open）。
+      throw new ChatInjectionRejectedError(CHAT_BLOCKED_BY_UNREADABLE_CHOICE);
+    }
     if (frame === "dialog") {
       // 本文を 1 キーも打たずに諦める（ダイアログへ打ち込むより確実に安全）。
       // 非配達が確定しているので、hub は uncertain に積まず失敗として片付ける。

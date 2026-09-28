@@ -29,7 +29,14 @@ import {
   validateSessionName,
 } from "../sessions/sessionMetadataStore.js";
 import {
+  cancelChoiceDialog,
   CHAT_BLOCKED_BY_LOGIN_PROMPT,
+  CHAT_BLOCKED_AFTER_CHOICE_CANCELLED,
+  CHAT_BLOCKED_BY_STUCK_CHOICE,
+  CHAT_BLOCKED_BY_UNREADABLE_CHOICE,
+  CHOICE_CANCEL_MAX_POLLS,
+  CHOICE_CANCEL_POLL_MS,
+  claudeComposerBarVisible,
   claudeInputBoxRendered,
   extractClaudeInputBox,
   inputBoxHasRealPendingText,
@@ -41,6 +48,7 @@ import {
   screenInLoginFlow,
   ChatInjectionRejectedError,
   classifySubmitFrame,
+  settleFrameAfterChoiceCancel,
   SUBMIT_ATTEMPT_LIMIT,
   submitLoginCode,
   type SubmitOutcome,
@@ -410,6 +418,8 @@ export class HerdrSessionManager {
   private readonly submitDelayMs: number;
   /** sendTextSubmit の CR→残留確認 間隔 ms（テスト注入用）。 */
   private readonly submitVerifyDelayMs: number;
+  /** 選択ダイアログを Esc で閉じた後の消滅確認の間隔 ms（テスト注入用）。 */
+  private readonly choiceCancelPollMs: number;
   /** 入力欄へ本文が反映されなかったときの再投入間隔 ms（RC 切断 limbo 対策）。 */
   private readonly inputRetryDelayMs: number;
   /** clearInputBox の C-u 1回ごとの反映待ち ms（実測レイテンシ 9〜27ms。テスト注入用）。 */
@@ -432,6 +442,7 @@ export class HerdrSessionManager {
     protocolVersion?: number;
     submitDelayMs?: number;
     submitVerifyDelayMs?: number;
+    choiceCancelPollMs?: number;
     inputRetryDelayMs?: number;
     clearKeyDelayMs?: number;
     readyTimeoutMs?: number;
@@ -447,6 +458,7 @@ export class HerdrSessionManager {
     this.protocolVersion = options.protocolVersion ?? PROTOCOL_V1;
     this.submitDelayMs = options.submitDelayMs ?? 600;
     this.submitVerifyDelayMs = options.submitVerifyDelayMs ?? 700;
+    this.choiceCancelPollMs = options.choiceCancelPollMs ?? CHOICE_CANCEL_POLL_MS;
     this.inputRetryDelayMs = options.inputRetryDelayMs ?? 1_500;
     this.clearKeyDelayMs = options.clearKeyDelayMs ?? 150;
     this.readyTimeoutMs = options.readyTimeoutMs ?? 10_000;
@@ -711,9 +723,28 @@ export class HerdrSessionManager {
     }
     // 選択ダイアログ（/remote-control 等）が開いたままだと本文がダイアログに食われる。
     // 注入前に Esc で閉じてから入力欄へ流す（Mac 側で手動 Esc するのと同じ操作）。
-    if (dialogWindow !== null && screenHasSelectionFooter(dialogWindow)) {
-      await this.sendKeys(name, ["Escape"]);
-      await new Promise((resolve) => setTimeout(resolve, 300));
+    // herdr は `cancelChoiceDialog` 指定の有無に関わらず閉じる（従来からの挙動。設問は hub が
+    // 保留で守るので、ここへ来るのは利用者が答えずに送ると決めた送信か ❯ メニューだけ）。
+    // Esc は 1 回だけ打ち、消えたのを確かめてから進む（chat-cancel-choice）。旧実装は 300ms
+    // 待つだけで確認せず、閉じ切る前に本文を打ってダイアログへ落とし得た。
+    // ボトムバーが見えているフレームでは撃たない: Esc は処理中の Claude を中断するキーでもあり、
+    // 30 行窓は会話本文（閉じたダイアログの転写や引用）を含むため。
+    let choiceStuck = false;
+    let choiceCancelled = false;
+    if (dialogWindow !== null) {
+      const outcome = await cancelChoiceDialog({
+        screen: dialogWindow,
+        capture: () => this.captureDialogWindow(name),
+        sendEscape: () => this.sendKeys(name, ["Escape"]),
+        detect: (window) => screenHasSelectionFooter(window) && !claudeComposerBarVisible(window),
+        pollMs: this.choiceCancelPollMs,
+        maxPolls: CHOICE_CANCEL_MAX_POLLS,
+      });
+      // 閉じたかどうかの最終判断は下のフレーム判定に任せる（30 行窓は会話本文を含むので、
+      // 本文に残った文言で「閉じていない」と見誤っても、ダイアログでなければ従来どおり送る）。
+      choiceStuck = outcome === "stuck";
+      choiceCancelled = outcome === "cancelled";
+      if (choiceCancelled) options.onChoiceDialogCancelled?.();
     }
     // 中断（停止）直後の入力欄に残存テキストがあるまま注入すると、今回の本文がその後ろへ
     // 連結され 1 メッセージとして送信される（実機FB 2026-07-29: 停止→送信で「前回本文+今回
@@ -731,8 +762,24 @@ export class HerdrSessionManager {
     // ではないので上の Esc では閉じられない）。ここまで来てバーが見えないなら、本文を
     // 1 キーも打たずに諦める。
     // 見逃し側（未知フレーム）は従来どおり注入へ進む＝送信が丸ごと不能にはならない。
-    const injectFrame = classifySubmitFrame(await this.captureVisibleScreenAnsiOrNull(name));
+    // 閉じた直後は描画途中でボトムバーが欠けることがある。設問を閉じる指定の送信だけ、
+    // 入力欄が描画されるまで短く撮り直す（指定の無い送信は read 回数を増やさない）。
+    const { frame: injectFrame } = await settleFrameAfterChoiceCancel({
+      capture: () => this.captureVisibleScreenAnsiOrNull(name),
+      pollMs: this.choiceCancelPollMs,
+      maxPolls: choiceCancelled && options.cancelChoiceDialog === true ? CHOICE_CANCEL_MAX_POLLS : 0,
+    });
+    if (choiceCancelled && options.cancelChoiceDialog === true && injectFrame === "unknown") {
+      throw new ChatInjectionRejectedError(CHAT_BLOCKED_AFTER_CHOICE_CANCELLED);
+    }
+    if (options.cancelChoiceDialog === true && injectFrame === "unknown") {
+      // 設問がある前提の送信は fail-closed: 入力欄（ボトムバー）が見えたときだけ打つ。
+      // 指定の無い送信は従来どおり（未知フレームで送信が丸ごと不能にならないよう fail-open）。
+      throw new ChatInjectionRejectedError(CHAT_BLOCKED_BY_UNREADABLE_CHOICE);
+    }
     if (injectFrame === "dialog") {
+      // Esc は打ったが閉じない。ここで本文を打つとダイアログへ落ちるので、何も打たずに諦める。
+      if (choiceStuck) throw new ChatInjectionRejectedError(CHAT_BLOCKED_BY_STUCK_CHOICE);
       throw new ChatInjectionRejectedError(
         "ダイアログの表示中はメッセージを送信できません（アプリで選択肢に答えてから送り直してください）",
       );

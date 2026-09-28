@@ -13,6 +13,7 @@ import {
   classifySubmitFrame,
   inputBoxHasRealPendingText,
   inputBoxRealText,
+  screenShowsCancellableChoice,
   screenShowsDialogFooter,
 } from "../src/backend/tmux.js";
 
@@ -33,6 +34,10 @@ const SHELL_MODE = frame("shell-mode");
 const ACCEPT_EDITS = frame("accept-edits");
 const QUESTION_DIALOG = frame("question-dialog");
 const APPROVAL_DIALOG = frame("approval-dialog");
+/** 2.1.283 の複数設問（タブ付き。フッターが `Tab/Arrow keys to navigate` に変わる）。 */
+const QUESTION_DIALOG_MULTI = frame("question-dialog-multi");
+/** 設問を Esc で閉じた直後（`User declined to answer questions` + 空の入力欄）。 */
+const QUESTION_DECLINED = frame("question-declined");
 
 /**
  * バーの**下**に常駐する agents パネル（subagent 実行中に出る）。
@@ -82,6 +87,41 @@ describe("screenShowsDialogFooter（積極的なダイアログ判定）", () =>
     for (const composer of [IDLE, TYPED, INVISIBLE_HOLD, PROCESSING, SHELL_MODE, ACCEPT_EDITS]) {
       expect(screenShowsDialogFooter(composer)).toBe(false);
     }
+  });
+});
+
+describe("screenShowsCancellableChoice（Esc で閉じてよい選択ダイアログ）", () => {
+  test("設問ダイアログ（1 問 / 複数問）だけを拾う", () => {
+    expect(screenShowsCancellableChoice(QUESTION_DIALOG)).toBe(true);
+    expect(screenShowsCancellableChoice(QUESTION_DIALOG_MULTI)).toBe(true);
+  });
+
+  test("承認ダイアログは対象外（Esc はツールの拒否になる）", () => {
+    expect(screenShowsCancellableChoice(APPROVAL_DIALOG)).toBe(false);
+  });
+
+  test("入力欄を見ているフレームでは決して true にしない（Esc は処理中の中断キー）", () => {
+    for (const composer of [IDLE, TYPED, INVISIBLE_HOLD, PROCESSING, SHELL_MODE, ACCEPT_EDITS, QUESTION_DECLINED]) {
+      expect(screenShowsCancellableChoice(composer)).toBe(false);
+    }
+    // 本文の末尾がフッター文言を引用していても、バーが見えていれば撃たない。
+    const quoted = PROCESSING.replace(/\n[^\n]*esc to interrupt/, (bar) => `\nEnter to select · Esc to cancel${bar}`);
+    expect(quoted).not.toBe(PROCESSING);
+    expect(screenShowsCancellableChoice(quoted)).toBe(false);
+  });
+
+  test("80 桁で折り返したフッター（自由記述欄フォーカス中）も拾う", () => {
+    const wrapped = QUESTION_DIALOG_MULTI.replace(
+      "Enter to select · Tab/Arrow keys to navigate · Esc to cancel",
+      "Enter to select · Tab/Arrow keys to navigate · ctrl+g to edit in VS Code · Esc to\ncancel",
+    );
+    expect(wrapped).not.toBe(QUESTION_DIALOG_MULTI);
+    expect(screenShowsCancellableChoice(wrapped)).toBe(true);
+  });
+
+  test("設問を閉じた直後は空の入力欄へ戻る（続けて本文を打てる）", () => {
+    expect(classifySubmitFrame(QUESTION_DIALOG_MULTI)).toBe("dialog");
+    expect(classifySubmitFrame(QUESTION_DECLINED)).toBe("submitted");
   });
 });
 

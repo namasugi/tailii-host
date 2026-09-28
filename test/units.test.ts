@@ -47,6 +47,7 @@ import {
 import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
 import { resolveDefaultAgent } from "../src/engine/engine.js";
 import {
+  ChatInjectionRejectedError,
   classifySubmitFrame,
   loginCodeScreenState,
   screenHasLoginCodePrompt,
@@ -940,6 +941,12 @@ describe("TmuxSessionManager", () => {
     neverSubmits?: boolean;
     /** 最初からダイアログが開いている（送信前に Mac 側で開いた等）。 */
     dialogFromStart?: "selection" | "approval";
+    /** Esc を打っても選択ダイアログが閉じない。 */
+    escapeStuck?: boolean;
+    /** バーもダイアログのフッターも見えない（判別できない画面）。 */
+    unreadable?: boolean;
+    /** Esc でダイアログは閉じるが、その後の数フレームは描画途中でバーが見えない。 */
+    blankFramesAfterEscape?: number;
   } = {}) {
     const state = {
       input: initialInput,
@@ -947,8 +954,11 @@ describe("TmuxSessionManager", () => {
       approval: options.dialogFromStart === "approval",
     };
     let submits = 0;
+    let blankFrames = 0;
     const screen = () => {
       const rule = "─".repeat(40);
+      if (blankFrames > 0) { blankFrames -= 1; return "⏺ User declined to answer questions"; }
+      if (options.unreadable ?? false) return ["⏺ 前の応答", "  1. りんご", "  2. みかん"].join("\n");
       if (state.approval) {
         // 実機 2.1.278 の承認ダイアログ: フッターに `Enter to select` は出ず、
         // ボトムバーも消える。カーソル行 `❯ 1. Yes` は入力欄の残存と区別が付かない。
@@ -965,6 +975,15 @@ describe("TmuxSessionManager", () => {
     const runner = new MockTmuxRunner((args) => {
       if (args[0] === "capture-pane") return ok(screen());
       if (args[0] === "send-keys" && args[3] === "C-u") { state.input = ""; return ok(""); }
+      if (args[0] === "send-keys" && args[3] === "Escape") {
+        // Esc は選択ダイアログを閉じ、承認ダイアログではツールを拒否する（どちらも消える）。
+        if (!(options.escapeStuck ?? false)) {
+          state.dialog = false;
+          state.approval = false;
+          blankFrames = options.blankFramesAfterEscape ?? 0;
+        }
+        return ok("");
+      }
       if (args[0] === "send-keys" && args[3] === "Enter") {
         submits += 1;
         if ((options.dialogOnFirstSubmit ?? false) && submits === 1) { state.dialog = true; return ok(""); }
@@ -1068,6 +1087,108 @@ describe("TmuxSessionManager", () => {
     });
     await expect(mgr.sendTextSubmit("s", "ふつうの質問")).rejects.toThrow(/ダイアログの表示中/);
     expect(h.sends()).toEqual([]);
+  });
+
+  test("sendTextSubmit: cancelChoiceDialog なら選択ダイアログを Esc で閉じてから本文を送る（tmux）", async () => {
+    const h = makeTmuxSubmitHarness("", { dialogFromStart: "selection" });
+    const mgr = new TmuxSessionManager({
+      runner: h.runner.runner, store: makeTempStore(),
+      submitDelayMs: 0, submitVerifyDelayMs: 0, choiceCancelPollMs: 0,
+    });
+    let cancelled = 0;
+    await mgr.sendTextSubmit("s", "その前に相談です", {
+      cancelChoiceDialog: true, onChoiceDialogCancelled: () => { cancelled += 1; },
+    });
+    // Esc は 1 回だけ（2 回届くと閉じた後の入力欄で巻き戻し画面が開く）。
+    expect(h.sends()).toEqual([["Escape"], ["-l", "--", "その前に相談です"], ["Enter"]]);
+    expect(cancelled).toBe(1);
+  });
+
+  test("sendTextSubmit: cancelChoiceDialog でも承認ダイアログには 1 キーも打たない（tmux）", async () => {
+    // 承認の Esc は「ツールを拒否してターンを止める」。選択肢を閉じるのとは重さが違うので対象外。
+    const h = makeTmuxSubmitHarness("", { dialogFromStart: "approval" });
+    const mgr = new TmuxSessionManager({
+      runner: h.runner.runner, store: makeTempStore(),
+      submitDelayMs: 0, submitVerifyDelayMs: 0, choiceCancelPollMs: 0,
+    });
+    await expect(mgr.sendTextSubmit("s", "ふつうの質問", { cancelChoiceDialog: true }))
+      .rejects.toThrow(/ダイアログの表示中/);
+    expect(h.sends()).toEqual([]);
+  });
+
+  test("sendTextSubmit: Esc で選択ダイアログが閉じなければ本文を打たずに失敗する（tmux）", async () => {
+    const h = makeTmuxSubmitHarness("", { dialogFromStart: "selection", escapeStuck: true });
+    const mgr = new TmuxSessionManager({
+      runner: h.runner.runner, store: makeTempStore(),
+      submitDelayMs: 0, submitVerifyDelayMs: 0, choiceCancelPollMs: 0,
+    });
+    let cancelled = 0;
+    const attempt = mgr.sendTextSubmit("s", "その前に相談です", {
+      cancelChoiceDialog: true, onChoiceDialogCancelled: () => { cancelled += 1; },
+    });
+    await expect(attempt).rejects.toBeInstanceOf(ChatInjectionRejectedError);
+    await expect(attempt).rejects.toThrow(/選択肢を閉じられなかった/);
+    // Esc は撃ち直さない。本文も打たない（ダイアログへ落ちる）。
+    expect(h.sends()).toEqual([["Escape"]]);
+    expect(cancelled).toBe(0);
+  });
+
+  test("sendTextSubmit: 設問を閉じた直後の描画途中のフレームは、入力欄が出るまで待ってから送る（tmux）", async () => {
+    const h = makeTmuxSubmitHarness("", { dialogFromStart: "selection", blankFramesAfterEscape: 3 });
+    const mgr = new TmuxSessionManager({
+      runner: h.runner.runner, store: makeTempStore(),
+      submitDelayMs: 0, submitVerifyDelayMs: 0, choiceCancelPollMs: 0,
+    });
+    await mgr.sendTextSubmit("s", "その前に相談です", { cancelChoiceDialog: true });
+    expect(h.sends()).toEqual([["Escape"], ["-l", "--", "その前に相談です"], ["Enter"]]);
+  });
+
+  test("sendTextSubmit: 設問を閉じても入力欄が出てこなければ、閉じたことを伝えて本文は打たない（tmux）", async () => {
+    const h = makeTmuxSubmitHarness("", { dialogFromStart: "selection", blankFramesAfterEscape: 1000 });
+    const mgr = new TmuxSessionManager({
+      runner: h.runner.runner, store: makeTempStore(),
+      submitDelayMs: 0, submitVerifyDelayMs: 0, choiceCancelPollMs: 0,
+    });
+    let cancelled = 0;
+    const attempt = mgr.sendTextSubmit("s", "その前に相談です", {
+      cancelChoiceDialog: true, onChoiceDialogCancelled: () => { cancelled += 1; },
+    });
+    // 設問はもう無い。「設問に答えてください」とは案内しない。
+    await expect(attempt).rejects.toThrow(/設問は閉じましたが/);
+    expect(h.sends()).toEqual([["Escape"]]);
+    expect(cancelled).toBe(1);
+  });
+
+  test("sendTextSubmit: cancelChoiceDialog で画面を判別できなければ 1 キーも打たない（tmux）", async () => {
+    // hub は「未回答の設問がある」と知っている。判別できない画面へ本文を打つと選択肢へ落ちる。
+    const h = makeTmuxSubmitHarness("", { unreadable: true });
+    const mgr = new TmuxSessionManager({
+      runner: h.runner.runner, store: makeTempStore(),
+      submitDelayMs: 0, submitVerifyDelayMs: 0, choiceCancelPollMs: 0,
+    });
+    const attempt = mgr.sendTextSubmit("s", "1", { cancelChoiceDialog: true });
+    await expect(attempt).rejects.toBeInstanceOf(ChatInjectionRejectedError);
+    await expect(attempt).rejects.toThrow(/設問の画面を確認できなかった/);
+    expect(h.sends()).toEqual([]);
+    // 指定の無い送信は従来どおり（未知フレームで送信が丸ごと不能にならない）。
+    const plain = makeTmuxSubmitHarness("", { unreadable: true });
+    const plainMgr = new TmuxSessionManager({
+      runner: plain.runner.runner, store: makeTempStore(),
+      submitDelayMs: 0, submitVerifyDelayMs: 0, choiceCancelPollMs: 0,
+    });
+    await plainMgr.sendTextSubmit("s", "ふつうの本文");
+    expect(plain.sends()).toEqual([["-l", "--", "ふつうの本文"], ["Enter"]]);
+  });
+
+  test("sendTextSubmit: cancelChoiceDialog でも入力欄を見ているなら Esc を打たない（tmux）", async () => {
+    // Esc は処理中の Claude を中断するキーでもある。ダイアログが無ければ従来どおり送るだけ。
+    const h = makeTmuxSubmitHarness("");
+    const mgr = new TmuxSessionManager({
+      runner: h.runner.runner, store: makeTempStore(),
+      submitDelayMs: 0, submitVerifyDelayMs: 0, choiceCancelPollMs: 0,
+    });
+    await mgr.sendTextSubmit("s", "ふつうの本文", { cancelChoiceDialog: true });
+    expect(h.sends()).toEqual([["-l", "--", "ふつうの本文"], ["Enter"]]);
   });
 
   test("sendTextSubmit: 送信が成立しなくても Enter は上限で打ち切り、未確定を通知する（tmux）", async () => {
