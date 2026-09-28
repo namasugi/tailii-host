@@ -51,7 +51,15 @@ export type HubClientMessage =
       status?: string;
       tokenBudget?: number;
     }
-  | { type: "chat_send"; id: string; session: string; clientMessageId: string; text: string; explicitRetry?: boolean }
+  | {
+      type: "chat_send"; id: string; session: string; clientMessageId: string; text: string;
+      explicitRetry?: boolean;
+      /**
+       * 利用者が「この設問に答えずに送る」と決めた送信（chat-cancel-choice）。未回答の設問がこの id の
+       * ときだけ保留を解き、設問を Esc で閉じてから注入する。旧 engine は付けない（従来どおり保留）。
+       */
+      cancelQuestionId?: string;
+    }
   | { type: "pending_message_delete"; id: string; session: string; clientMessageId: string; kind: "chat" | "codex" }
   | { type: "runtime_claim"; id: string; session: string }
   | { type: "runtime_claim_release"; session: string }
@@ -226,11 +234,15 @@ export function decodeHubClientLine(line: string): HubClientMessage | null {
   if (record["type"] === "chat_send") {
     const id = record["id"], session = record["session"], clientMessageId = record["clientMessageId"];
     const text = record["text"], explicitRetry = record["explicitRetry"];
+    const cancelQuestionId = record["cancelQuestionId"];
     return typeof id === "string" && id.length > 0 && typeof session === "string" && session.length > 0 &&
       typeof clientMessageId === "string" && clientMessageId.length > 0 && typeof text === "string" && text.length > 0 &&
-      (explicitRetry === undefined || typeof explicitRetry === "boolean")
+      (explicitRetry === undefined || typeof explicitRetry === "boolean") &&
+      (cancelQuestionId === undefined ||
+        (typeof cancelQuestionId === "string" && cancelQuestionId.length > 0))
       ? { type: "chat_send", id, session, clientMessageId, text,
-          ...(explicitRetry === true ? { explicitRetry: true } : {}) }
+          ...(explicitRetry === true ? { explicitRetry: true } : {}),
+          ...(cancelQuestionId !== undefined ? { cancelQuestionId } : {}) }
       : null;
   }
   if (record["type"] === "pending_message_delete") {

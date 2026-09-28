@@ -666,6 +666,319 @@ describe("SessionHub actor", () => {
     await vi.waitFor(() => expect(chatInjector).toHaveBeenCalledWith("after answer", "work", expect.objectContaining({ recordedPromptText: expect.any(Function) })));
   });
 
+  // MARK: chat-cancel-choice（設問に答えずに送る）
+
+  const QUESTIONS = [{ header: "h", question: "q", options: [], multiSelect: false }];
+  const ANSWER = [{ questionIndex: 0, selectedOptionIndexes: [0], multiSelect: false }];
+
+  test("cancelQuestionId が未回答の設問を指す chat_send は保留せず、設問を閉じる指定で注入して片付ける", async () => {
+    const chatInjector = vi.fn(async (_text: string, _session: string, context: { onChoiceCancelled: () => void }) => {
+      // backend が Esc で閉じたのを見届けた。
+      context.onChoiceCancelled();
+    });
+    const log = vi.fn();
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-chat-cancel-choice"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, chatInjector, log });
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q1", questions: QUESTIONS });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "one", session: "work",
+      clientMessageId: "client-1", text: "その前に相談です", cancelQuestionId: "q1" }));
+    await vi.waitFor(() => expect(received).toContainEqual({
+      type: "chat_send_result", id: "one", status: "accepted",
+    }));
+    expect(chatInjector).toHaveBeenCalledWith("その前に相談です", "work",
+      expect.objectContaining({ cancelChoice: true }));
+    expect(hub.actors.get("work")?.pendingQuestion).toBeNull();
+    expect(hub.actors.get("work")?.cancellingQuestionId).toBeNull();
+    // dismiss は 1 回だけ（閉じた時点と注入成功後の 2 か所で片付けるが、二重に配らない）。
+    expect(received.filter((message) => (message as { type?: string }).type === "question_event"))
+      .toEqual([{ type: "question_event", session: "work", event: "dismiss", id: "q1" }]);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("audit chat-cancel-choice session=work question=q1"));
+    // 片付いた設問への回答は first-wins の敗者と同じ扱い。
+    hub.handleClientMessage(client, JSON.stringify({ type: "question_answer_submit", id: "late", session: "work",
+      questionId: "q1", answers: ANSWER }));
+    expect(received).toContainEqual({ type: "question_answer_result", id: "late", status: "already_resolved" });
+  });
+
+  test("cancelQuestionId が別の設問を指す chat_send は、利用者が見ていない設問を閉じずに保留する", async () => {
+    // queue に残っていた送信（hub 再起動・先頭の uncertain 待ち等）が、後から出た設問に出会う場合。
+    const chatInjector = vi.fn(async () => {});
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-chat-cancel-other"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, chatInjector });
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q2", questions: QUESTIONS });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "one", session: "work",
+      clientMessageId: "client-1", text: "q1 を見て送った発話", cancelQuestionId: "q1" }));
+    await Promise.resolve();
+    expect(chatInjector).not.toHaveBeenCalled();
+    expect(hub.actors.get("work")?.pendingQuestion?.id).toBe("q2");
+    // q2 が解決したら、選択肢を閉じる指定なしで通常どおり届く。
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "dismiss", id: "q2" });
+    await vi.waitFor(() => expect(chatInjector).toHaveBeenCalledWith("q1 を見て送った発話", "work",
+      expect.objectContaining({ cancelChoice: false })));
+  });
+
+  test("設問が無いときの cancelQuestionId 付き送信は、選択肢を閉じる指定を backend へ渡さない", async () => {
+    // hub が設問を持っていないのに Esc を許すと、無関係な確認ダイアログ（モデル切替など）を潰す。
+    const chatInjector = vi.fn(async () => {});
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-chat-cancel-none"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, chatInjector });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "one", session: "work",
+      clientMessageId: "client-1", text: "ふつうの発話", cancelQuestionId: "q1" }));
+    await vi.waitFor(() => expect(received).toContainEqual({
+      type: "chat_send_result", id: "one", status: "accepted",
+    }));
+    expect(chatInjector).toHaveBeenCalledWith("ふつうの発話", "work",
+      expect.objectContaining({ cancelChoice: false }));
+  });
+
+  test("cancelQuestionId 付きの送信は、先に保留されていた発話も FIFO のまま一緒に流す", async () => {
+    const injected: Array<{ text: string; cancelChoice: boolean }> = [];
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-chat-cancel-fifo"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800,
+      chatInjector: async (text, _session, context) => {
+        injected.push({ text, cancelChoice: context.cancelChoice });
+      } });
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q1", questions: QUESTIONS });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "held", session: "work",
+      clientMessageId: "client-held", text: "設問を見る前に送った発話" }));
+    await Promise.resolve();
+    expect(injected).toEqual([]);
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "skip", session: "work",
+      clientMessageId: "client-skip", text: "答えずに送る", cancelQuestionId: "q1" }));
+    await vi.waitFor(() => expect(received).toContainEqual({
+      type: "chat_send_result", id: "skip", status: "accepted",
+    }));
+    // 先頭の注入が設問を閉じる（backend が閉じたと言わなくても、本文が届いた時点で片付ける）。
+    // 2 通目の時点で設問はもう無いので、閉じる指定は付かない。
+    expect(injected).toEqual([
+      { text: "設問を見る前に送った発話", cancelChoice: true },
+      { text: "答えずに送る", cancelChoice: false },
+    ]);
+    expect(received).toContainEqual({ type: "chat_send_result", id: "held", status: "accepted" });
+    expect(hub.actors.get("work")?.pendingQuestion).toBeNull();
+  });
+
+  test("選択肢を閉じられず注入が拒否されたら、設問を保持したまま失敗を返し、回答をまた受け付ける", async () => {
+    const chatInjector = vi.fn()
+      .mockRejectedValueOnce(new ChatInjectionRejectedError("選択肢を閉じられなかったため、メッセージを送信しませんでした"));
+    const questionInjector = vi.fn(async () => {});
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-chat-cancel-stuck"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, chatInjector, questionInjector });
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q1", questions: QUESTIONS });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "one", session: "work",
+      clientMessageId: "client-1", text: "その前に相談です", cancelQuestionId: "q1" }));
+    await vi.waitFor(() => expect(received).toContainEqual({
+      type: "chat_send_result", id: "one", status: "failed",
+      error: "選択肢を閉じられなかったため、メッセージを送信しませんでした",
+    }));
+    // 設問は TUI に残っている。アプリから答え直せるよう hub も保持する（dismiss を配らない）。
+    expect(hub.actors.get("work")?.pendingQuestion?.id).toBe("q1");
+    expect(received).not.toContainEqual(expect.objectContaining({ type: "question_event", event: "dismiss" }));
+    // 非配達が確定しているので uncertain に積まない（同じ id で送り直せる）。
+    expect(hub.actors.get("work")?.uncertainChatMessages.size).toBe(0);
+    // 諦めた後は、その設問への回答をまた受け付ける。
+    expect(hub.actors.get("work")?.cancellingQuestionId).toBeNull();
+    expect(hub.actors.get("work")?.choiceCancelFailed?.questionId).toBe("q1");
+    hub.handleClientMessage(client, JSON.stringify({ type: "question_answer_submit", id: "answer", session: "work",
+      questionId: "q1", answers: ANSWER }));
+    expect(received).toContainEqual({ type: "question_answer_result", id: "answer", status: "accepted" });
+    await vi.waitFor(() => expect(questionInjector).toHaveBeenCalledTimes(1));
+  });
+
+  test("設問を Esc で閉じている最中に届いた回答は、再試行できる失敗で返す（回答キーを入力欄へ落とさない）", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const questionInjector = vi.fn(async () => {});
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-chat-cancel-race-b"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, questionInjector,
+      chatInjector: async () => { await gate; } });
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q1", questions: QUESTIONS });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "one", session: "work",
+      clientMessageId: "client-1", text: "その前に相談です", cancelQuestionId: "q1" }));
+    await Promise.resolve();
+    // chat の注入が Esc → 消滅確認の途中。ここで再表示ピル / 別端末から回答が来る。
+    hub.handleClientMessage(client, JSON.stringify({ type: "question_answer_submit", id: "answer", session: "work",
+      questionId: "q1", answers: ANSWER }));
+    // 「回答済み」とは返さない（閉じるのを諦めた場合に、アプリが回答を捨ててしまう）。
+    expect(received).toContainEqual({ type: "question_answer_result", id: "answer", status: "unknown" });
+    expect(questionInjector).not.toHaveBeenCalled();
+    release();
+    await vi.waitFor(() => expect(received).toContainEqual({
+      type: "chat_send_result", id: "one", status: "accepted",
+    }));
+    expect(questionInjector).not.toHaveBeenCalled();
+    expect(hub.actors.get("work")?.pendingQuestion).toBeNull();
+    // アプリの自動再送が届く頃には決着している: 閉じ終えていれば「解決済み」。
+    hub.handleClientMessage(client, JSON.stringify({ type: "question_answer_submit", id: "answer-retry",
+      session: "work", questionId: "q1", answers: ANSWER }));
+    expect(received).toContainEqual({ type: "question_answer_result", id: "answer-retry", status: "already_resolved" });
+  });
+
+  test("閉じている最中に届いた回答は、閉じるのを諦めた後の再送で受理する（答える手段を失わない）", async () => {
+    let fail!: (error: Error) => void;
+    const gate = new Promise<void>((_resolve, reject) => { fail = reject; });
+    const questionInjector = vi.fn(async () => {});
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-chat-cancel-race-b2"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, questionInjector,
+      chatInjector: async () => { await gate; } });
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q1", questions: QUESTIONS });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "one", session: "work",
+      clientMessageId: "client-1", text: "その前に相談です", cancelQuestionId: "q1" }));
+    await Promise.resolve();
+    hub.handleClientMessage(client, JSON.stringify({ type: "question_answer_submit", id: "answer", session: "work",
+      questionId: "q1", answers: ANSWER }));
+    expect(received).toContainEqual({ type: "question_answer_result", id: "answer", status: "unknown" });
+    fail(new ChatInjectionRejectedError("選択肢を閉じられなかったため、メッセージを送信しませんでした"));
+    await vi.waitFor(() => expect(received).toContainEqual(expect.objectContaining({
+      type: "chat_send_result", id: "one", status: "failed",
+    })));
+    hub.handleClientMessage(client, JSON.stringify({ type: "question_answer_submit", id: "answer-retry",
+      session: "work", questionId: "q1", answers: ANSWER }));
+    expect(received).toContainEqual({ type: "question_answer_result", id: "answer-retry", status: "accepted" });
+    await vi.waitFor(() => expect(questionInjector).toHaveBeenCalledTimes(1));
+  });
+
+  test("設問を閉じられなかったら、保留していた残りの発話で Esc を撃ち直さず保留へ戻す", async () => {
+    const injected: string[] = [];
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-chat-cancel-once"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800,
+      chatInjector: async (text) => {
+        injected.push(text);
+        if (injected.length === 1) {
+          throw new ChatInjectionRejectedError("選択肢を閉じられなかったため、メッセージを送信しませんでした");
+        }
+      } });
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q1", questions: QUESTIONS });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    const send = (id: string, text: string, cancelQuestionId?: string): void =>
+      hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id, session: "work",
+        clientMessageId: `client-${id}`, text, ...(cancelQuestionId !== undefined ? { cancelQuestionId } : {}) }));
+    send("m1", "保留 1");
+    send("m2", "保留 2");
+    send("m3", "答えずに送る", "q1");
+    await vi.waitFor(() => expect(received).toContainEqual(expect.objectContaining({
+      type: "chat_send_result", id: "m1", status: "failed",
+    })));
+    await Promise.resolve();
+    // Esc を試すのは先頭の 1 回だけ。残りは失敗にせず保留のまま。
+    expect(injected).toEqual(["保留 1"]);
+    expect(received.filter((message) => (message as { type?: string }).type === "chat_send_result"))
+      .toHaveLength(1);
+    expect(hub.actors.get("work")?.pendingQuestion?.id).toBe("q1");
+    // 失敗させた発話そのものの再送（アプリの自動再送）では、Esc を撃ち直さない。
+    send("m1", "保留 1", "q1");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(injected).toEqual(["保留 1"]);
+    // 利用者が新しい発話で改めて「答えずに送る」を送ったら、もう一度だけ試す（今度は閉じられた）。
+    send("m4", "もう一度、答えずに送る", "q1");
+    await vi.waitFor(() => expect(received).toContainEqual({
+      type: "chat_send_result", id: "m4", status: "accepted",
+    }));
+    expect(injected).toEqual(["保留 1", "保留 2", "答えずに送る", "保留 1", "もう一度、答えずに送る"]);
+    expect(hub.actors.get("work")?.pendingQuestion).toBeNull();
+  });
+
+  test("回答キーの注入が同期 throw しても、chat の保留は解ける", async () => {
+    const chatInjector = vi.fn(async () => {});
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-chat-cancel-sync-throw"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, chatInjector,
+      questionInjector: () => { throw new Error("sync boom"); } });
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q1", questions: QUESTIONS });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "question_answer_submit", id: "answer", session: "work",
+      questionId: "q1", answers: ANSWER }));
+    await vi.waitFor(() => expect(hub.actors.get("work")?.questionAnswerInjections).toBe(0));
+    // 注入失敗で設問は復元される（既存の自己修復）。設問が解決すれば chat は流れる。
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "one", session: "work",
+      clientMessageId: "client-1", text: "あとから送る" }));
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "dismiss", id: "q1" });
+    await vi.waitFor(() => expect(chatInjector).toHaveBeenCalledTimes(1));
+  });
+
+  test("設問の回答キーを注入している最中は chat を注入しない（注入が終わってから流す）", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const order: string[] = [];
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-chat-cancel-race-a"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800,
+      questionInjector: async () => { order.push("answer:start"); await gate; order.push("answer:end"); },
+      chatInjector: async (text, _session, context) => {
+        order.push(`chat:${text}:cancelChoice=${String(context.cancelChoice)}`);
+      } });
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q1", questions: QUESTIONS });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "question_answer_submit", id: "answer", session: "work",
+      questionId: "q1", answers: ANSWER }));
+    // 受理の時点で pendingQuestion は clear 済みだが、pane にはまだ設問が出ている。
+    expect(hub.actors.get("work")?.pendingQuestion).toBeNull();
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "follow", session: "work",
+      clientMessageId: "client-follow", text: "追撃", cancelQuestionId: "q1" }));
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "plain", session: "work",
+      clientMessageId: "client-plain", text: "通常" }));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(order).toEqual(["answer:start"]);
+    release();
+    await vi.waitFor(() => expect(received).toContainEqual({
+      type: "chat_send_result", id: "plain", status: "accepted",
+    }));
+    // 回答済みの設問を閉じる指定は付かない（Esc を撃たせない）。
+    expect(order).toEqual(["answer:start", "answer:end", "chat:追撃:cancelChoice=false", "chat:通常:cancelChoice=false"]);
+  });
+
+  test("注入の途中で別の設問へ替わっていたら、新しい設問は片付けない", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-chat-cancel-swap"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, chatInjector: async () => { await gate; } });
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q1", questions: QUESTIONS });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "one", session: "work",
+      clientMessageId: "client-1", text: "その前に相談です", cancelQuestionId: "q1" }));
+    await Promise.resolve();
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q2", questions: QUESTIONS });
+    release();
+    await vi.waitFor(() => expect(received).toContainEqual({
+      type: "chat_send_result", id: "one", status: "accepted",
+    }));
+    expect(hub.actors.get("work")?.pendingQuestion?.id).toBe("q2");
+    expect(received).not.toContainEqual({ type: "question_event", session: "work", event: "dismiss", id: "q2" });
+  });
+
+  test("Codex の設問（App Server の request）は cancelQuestionId でも保留を解かない", async () => {
+    const chatInjector = vi.fn(async () => {});
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-chat-cancel-codex"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, chatInjector });
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q1", questions: QUESTIONS });
+    const actor = hub.actors.get("work")!;
+    actor.pendingQuestion = { ...actor.pendingQuestion!, answerRoute: "codex_native" };
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "one", session: "work",
+      clientMessageId: "client-1", text: "その前に相談です", cancelQuestionId: "q1" }));
+    await Promise.resolve();
+    expect(chatInjector).not.toHaveBeenCalled();
+    expect(actor.pendingQuestion?.id).toBe("q1");
+  });
+
   test("chat_send 注入の部分失敗はmarker+failedにしてuncertain receiptで再注入を抑止する", async () => {
     const receiptsPath = path.join(makeTempDir("hub-chat-partial"), "receipts.json");
     const chatInjector = vi.fn()

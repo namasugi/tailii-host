@@ -74,6 +74,15 @@ export interface HubPreviewPump {
 export interface ChatInjectContext {
   /** transcript に記録済みの直近の発話本文（claude 会話のみ。不明は null）。 */
   recordedPromptText: () => string | null;
+  /**
+   * 選択ダイアログが開いていたら Esc で閉じてから送る（chat-cancel-choice）。利用者が
+   * 「この設問に答えずに送る」と決めた送信（`chat_send.cancelQuestionId`）が、いま未回答の
+   * 設問を指しているときだけ true。hub が設問を持っていない送信では決して true にしない
+   * （回答キーの注入中や、無関係な確認ダイアログを Esc で潰さないため）。
+   */
+  cancelChoice: boolean;
+  /** backend が選択ダイアログを実際に閉じたときに呼ぶ（hub は未回答の設問を片付ける）。 */
+  onChoiceCancelled: () => void;
 }
 
 export type HubTailFactory = (
@@ -256,6 +265,24 @@ interface SessionActor {
   chatOrder: string[];
   chatDrainRunning: boolean;
   chatDrainBlocked: boolean;
+  /**
+   * 設問の回答キーを TUI へ注入している最中の件数。この間は chat を注入しない: 回答キーと本文が
+   * 同じ pane で混ざると、回答途中の設問を Esc で潰したり、残りの回答キーが入力欄へ落ちて
+   * 独立メッセージとして送信されたりする（chat-cancel-choice のレビュー指摘）。
+   */
+  questionAnswerInjections: number;
+  /**
+   * chat の注入が Esc で閉じようとしている設問の id（閉じ終わるか、諦めるまで）。この間に届いた
+   * 同じ設問への回答は受理しない（回答キーが、閉じた後の入力欄へ落ちる）。
+   */
+  cancellingQuestionId: string | null;
+  /**
+   * Esc で閉じられなかった設問と、そのとき失敗させた発話。同じ設問に対して、保留していた発話ごとに
+   * Esc を撃ち直して全部を送信失敗にしない（閉じられなかったら残りは保留へ戻す）。
+   * 解くのは、利用者が**新しい発話**で改めて「答えずに送る」を送ったときだけ。失敗させた発話の
+   * 再送（アプリの自動再送は flush のたびに起きる）では解かない = そのたびに Esc を撃ち直さない。
+   */
+  choiceCancelFailed: { questionId: string; clientMessageIds: Set<string> } | null;
   codexQueue: PendingCodexTurn[];
   codexOrder: string[];
   codexDrainRunning: boolean;
@@ -617,6 +644,13 @@ export class SessionHub {
         this.sendTo(client, { type: "question_answer_result", id: message.id, status: "unknown" });
       } else if (actor.pendingQuestion?.id !== message.questionId) {
         this.sendTo(client, { type: "question_answer_result", id: message.id, status: "already_resolved" });
+      } else if (actor.cancellingQuestionId === message.questionId) {
+        // chat の注入がこの設問を Esc で閉じている最中（chat-cancel-choice）。いま回答キーを流すと、
+        // 閉じた後の入力欄へ落ちる。「回答済み」とは返さない: 閉じるのを諦めた場合、設問は未回答の
+        // まま残るのに、アプリは回答を捨ててしまう（設問シートも再表示ピルも無く、答える手段が消える）。
+        // 再試行できる失敗で返す（`unknown` → engine が `question_answer_failed` → アプリが 1s / 3s で
+        // 自動再送）。再送が届く頃には決着している: 閉じていれば `already_resolved`、諦めていれば受理。
+        this.sendTo(client, { type: "question_answer_result", id: message.id, status: "unknown" });
       } else {
         // first-wins の判定と clear は await を挟まず同期的に行い、勝者だけが注入する。
         const answerRoute = actor.pendingQuestion.answerRoute;
@@ -634,7 +668,17 @@ export class SessionHub {
           void this.drainChatQueue(message.session, actor);
         } else {
           this.injectionsInFlight += 1;
-          void (this.options.questionInjector?.(message.answers, message.session) ?? Promise.resolve())
+          // 回答キーの注入が終わるまで chat を注入しない（`chatDrainHeldByQuestion`）。
+          actor.questionAnswerInjections += 1;
+          // 同期 throw でも `.finally` を必ず通す（通らないと回答注入中の件数が戻らず、chat が
+          // 永久に保留される）。
+          let injection: Promise<void>;
+          try {
+            injection = this.options.questionInjector?.(message.answers, message.session) ?? Promise.resolve();
+          } catch (error) {
+            injection = Promise.reject(error);
+          }
+          void injection
             .catch((error) => {
               this.options.log?.(`設問回答注入失敗: ${String(error)}`);
               // 自己修復（question-answer-retry）: pendingQuestion を失ったまま TUI ダイアログが
@@ -666,6 +710,7 @@ export class SessionHub {
             })
             .finally(() => {
               this.injectionsInFlight -= 1;
+              actor.questionAnswerInjections -= 1;
               void this.drainChatQueue(message.session, actor);
             });
         }
@@ -801,6 +846,13 @@ export class SessionHub {
     }
     if (message.type === "chat_send") {
       const actor = this.actor(message.session);
+      // 利用者が新しい発話で改めて「この設問に答えずに送る」を送った。閉じられなかった設問を
+      // もう一度だけ試す（失敗させた発話そのものの再送では試さない）。
+      if (message.cancelQuestionId !== undefined &&
+        actor.choiceCancelFailed?.questionId === message.cancelQuestionId &&
+        !actor.choiceCancelFailed.clientMessageIds.has(message.clientMessageId)) {
+        actor.choiceCancelFailed = null;
+      }
       if (hasDeliveredReceipt(actor.deletedChatMessageIds, message.clientMessageId)) {
         this.sendTo(client, {
           type: "chat_send_result", id: message.id, status: "failed",
@@ -1767,6 +1819,7 @@ export class SessionHub {
         pendingCodexTurns: new Map(), startingCodexMessageIds: new Set(),
         runtimeClaim: null, codexLive: null,
         chatQueue: [], chatOrder: [], chatDrainRunning: false, chatDrainBlocked: false,
+        questionAnswerInjections: 0, cancellingQuestionId: null, choiceCancelFailed: null,
         codexQueue: [], codexOrder: [], codexDrainRunning: false, codexDrainBlocked: false };
       this.actors.set(session, actor);
     }
@@ -1926,11 +1979,35 @@ export class SessionHub {
     void this.drainCodexQueue(session, actor);
   }
 
+  /**
+   * 未回答の設問が chat の注入を止めているか。
+   *
+   * 設問ダイアログの表示中に本文を打つと選択肢へ落ちるので、原則は回答（または TUI 側での解消）まで
+   * durable queue に保留する。回答キーの注入中も同じ（受理の時点で `pendingQuestion` は clear
+   * 済みだが、pane にはまだ設問が出ている）。
+   *
+   * 例外は利用者が「この設問に答えずに送る」と決めた送信が queue にあるとき（chat-cancel-choice）:
+   * 設問を Esc で閉じてから注入するので保留しない。**`cancelQuestionId` がいま未回答の設問の id と
+   * 一致するときだけ**解く。利用者が見ていない別の設問（queue に残っていた送信が、後から出た
+   * 設問に出会う等）は閉じない。queue のどこかに 1 件あれば先頭から順に流す（FIFO を崩して
+   * 後続だけを先に送らない。先に保留されていた発話も同じ利用者の発話で、設問を閉じれば届けられる）。
+   * Codex の設問（App Server の request）は pane のダイアログではなく Esc で閉じられないため対象外。
+   */
+  private chatDrainHeldByQuestion(actor: SessionActor): boolean {
+    if (actor.questionAnswerInjections > 0) return true;
+    const pending = actor.pendingQuestion;
+    if (pending === null) return false;
+    if (pending.answerRoute !== "tui") return true;
+    // 一度閉じられなかった設問は、利用者が新しい発話で改めて送るまで保留に戻す。
+    if (actor.choiceCancelFailed?.questionId === pending.id) return true;
+    return !actor.chatQueue.some((entry) => entry.message.cancelQuestionId === pending.id);
+  }
+
   private async drainChatQueue(session: string, actor: SessionActor): Promise<void> {
-    if (actor.chatDrainRunning || actor.chatDrainBlocked || actor.pendingQuestion !== null) return;
+    if (actor.chatDrainRunning || actor.chatDrainBlocked || this.chatDrainHeldByQuestion(actor)) return;
     actor.chatDrainRunning = true;
     try {
-      while (actor.pendingQuestion === null) {
+      while (!this.chatDrainHeldByQuestion(actor)) {
         const entry = actor.chatQueue[0];
         if (entry === undefined) break;
         const { message } = entry;
@@ -1939,6 +2016,11 @@ export class SessionHub {
         if (actor.chatOrder[0] !== message.clientMessageId) break;
         actor.chatQueue.shift();
         this.injectionsInFlight += 1;
+        // この注入が閉じることになる設問（ここまで来て未回答の設問が残っているのは、それを指す
+        // `cancelQuestionId` 付きの送信が queue にあって保留が解けたときだけ）。注入の前に控える:
+        // await の間に別の設問へ替わっていたら触らない。
+        const cancelledQuestion = actor.pendingQuestion;
+        if (cancelledQuestion !== null) actor.cancellingQuestionId = cancelledQuestion.id;
         try {
           actor.injectingChatMessageIds.add(message.clientMessageId);
           if (!this.persistChatReceipts()) {
@@ -1953,12 +2035,27 @@ export class SessionHub {
             }
             continue;
           }
+          const resolveCancelledQuestion = (): void => {
+            if (cancelledQuestion === null || this.actors.get(session) !== actor ||
+              actor.pendingQuestion?.id !== cancelledQuestion.id) return;
+            this.setPendingQuestion(session, actor, null);
+            this.broadcast({ type: "question_event", session, event: "dismiss", id: cancelledQuestion.id });
+            this.options.log?.(
+              `audit chat-cancel-choice session=${auditValue(session)} question=${auditValue(cancelledQuestion.id)}`,
+            );
+          };
           await (this.options.chatInjector?.(message.text, session, {
             recordedPromptText: () => this.trailingUserPromptText(session),
+            cancelChoice: cancelledQuestion !== null,
+            // 閉じた時点で片付ける（続く本文の注入が失敗しても、TUI に設問はもう無い）。
+            onChoiceCancelled: resolveCancelledQuestion,
           }) ?? Promise.resolve());
           // 明示 kill / reaper kill が注入 await 中に actor を廃棄した場合、同名の新 actorへ
           // 古い receipt を復活させない。waiter は retireSession が既に失敗で解放している。
           if (this.actors.get(session) !== actor) continue;
+          // 本文が入力欄へ届いた = 設問はもう pane を塞いでいない（閉じたのを見届けた場合に加え、
+          // TUI 側で先に解消されていて dismiss だけが届いていなかった場合もここで片付く）。
+          resolveCancelledQuestion();
           actor.injectingChatMessageIds.delete(message.clientMessageId);
           actor.pendingChatMessages.delete(message.clientMessageId);
           removeOrderedID(actor.chatOrder, message.clientMessageId);
@@ -1988,6 +2085,15 @@ export class SessionHub {
           // ここへ積むと削除不能・後続ブロックのゾンビになる（下のコメント参照）。
           const rejectedBeforeSend =
             error instanceof LoginCodeError || error instanceof ChatInjectionRejectedError;
+          // 設問を閉じられなかった（設問はまだ未回答で残っている）。後続の保留分で Esc を
+          // 撃ち直さない。
+          if (cancelledQuestion !== null && actor.pendingQuestion?.id === cancelledQuestion.id) {
+            const failed = actor.choiceCancelFailed?.questionId === cancelledQuestion.id
+              ? actor.choiceCancelFailed
+              : { questionId: cancelledQuestion.id, clientMessageIds: new Set<string>() };
+            failed.clientMessageIds.add(message.clientMessageId);
+            actor.choiceCancelFailed = failed;
+          }
           if (rejectedBeforeSend) {
             removeOrderedID(actor.chatOrder, message.clientMessageId);
           } else {
@@ -2005,11 +2111,15 @@ export class SessionHub {
           this.options.log?.(`chat 注入失敗 session=${session}: ${String(error)}`);
         } finally {
           this.injectionsInFlight -= 1;
+          // 閉じ終えた（設問は片付いた）か、諦めた（設問は残っている = また回答を受け付ける）。
+          if (cancelledQuestion !== null && actor.cancellingQuestionId === cancelledQuestion.id) {
+            actor.cancellingQuestionId = null;
+          }
         }
       }
     } finally {
       actor.chatDrainRunning = false;
-      if (!actor.chatDrainBlocked && actor.pendingQuestion === null && actor.chatQueue.length > 0 &&
+      if (!actor.chatDrainBlocked && !this.chatDrainHeldByQuestion(actor) && actor.chatQueue.length > 0 &&
         actor.chatOrder[0] === actor.chatQueue[0]?.message.clientMessageId) {
         void this.drainChatQueue(session, actor);
       }

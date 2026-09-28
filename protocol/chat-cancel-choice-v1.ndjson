@@ -1,0 +1,3 @@
+{"cancelQuestionId":"toolu_01Qm7cancelchoice0000000001","clientMessageId":"cc11aa22-0000-0000-0000-000000002001","id":"cc11aa22-0000-0000-0000-000000002002","session":"tailii-abc123","text":"その前に、別の方針を相談させてください。","type":"chat_send","v":2}
+{"id":"cc11aa22-0000-0000-0000-000000002002","status":"accepted","type":"chat_send_result","v":2}
+{"error":"選択肢を閉じられなかったため、メッセージを送信しませんでした（アプリで選択肢に答えるか、Mac 側の画面で閉じてください）","id":"cc11aa22-0000-0000-0000-000000002002","status":"failed","type":"chat_send_result","v":2}

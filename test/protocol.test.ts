@@ -93,6 +93,22 @@ describe("golden roundtrip", () => {
     }
   });
 
+  it("chat-cancel-choice v1 golden 全行が byte-exact でラウンドトリップする", () => {
+    const lines = goldenLines("chat-cancel-choice-v1.ndjson");
+    for (const line of lines) {
+      const decoded = decodeControlMessage(line);
+      expect(encodeControlMessage(decoded)).toBe(line);
+    }
+    const send = decodeControlMessage(lines[0]!);
+    expect(send.type === "chat_send" ? send.cancelQuestionId : null).toBe("toolu_01Qm7cancelchoice0000000001");
+    // 省略時は欄ごと出さない（旧 host / 旧アプリとの相互運用）。
+    const plain = decodeControlMessage(
+      '{"clientMessageId":"c1","id":"i1","session":"s","text":"t","type":"chat_send","v":2}',
+    );
+    expect(plain.type === "chat_send" ? plain.cancelQuestionId : null).toBeUndefined();
+    expect(encodeControlMessage(plain)).not.toContain("cancelQuestionId");
+  });
+
   it("login-code v1 golden 全行が byte-exact でラウンドトリップする", () => {
     for (const line of goldenLines("login-code-v1.ndjson")) {
       const decoded = decodeControlMessage(line);

@@ -93,6 +93,21 @@ describe("hubProtocol presence RPC", () => {
   });
 });
 
+describe("hubProtocol chat-cancel-choice", () => {
+  test("chat の cancelQuestionId を往復し、省略時は欄を出さず、空文字・文字列以外は拒否する", () => {
+    const chat: HubClientMessage = {
+      type: "chat_send", id: "chat", session: "work", clientMessageId: "client-chat",
+      text: "その前に相談です", cancelQuestionId: "q1",
+    };
+    expect(decodeHubClientLine(encodeHubMessage(chat))).toEqual(chat);
+    const { cancelQuestionId: _omitted, ...plain } = chat;
+    expect(decodeHubClientLine(encodeHubMessage(plain))).toEqual(plain);
+    expect(encodeHubMessage(plain)).not.toContain("cancelQuestionId");
+    expect(decodeHubClientLine(JSON.stringify({ ...plain, cancelQuestionId: "" }))).toBeNull();
+    expect(decodeHubClientLine(JSON.stringify({ ...plain, cancelQuestionId: true }))).toBeNull();
+  });
+});
+
 describe("hubProtocol durable send retry", () => {
   test("chat / Codex の explicitRetry を往復し、boolean 以外は拒否する", () => {
     const chat: HubClientMessage = {

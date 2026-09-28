@@ -468,6 +468,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         clientMessageId: requireString(raw, "clientMessageId"),
         text,
         explicitRetry: optionalBoolean(raw, "explicitRetry"),
+        cancelQuestionId: optionalString(raw, "cancelQuestionId"),
       });
     }
 

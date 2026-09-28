@@ -485,7 +485,15 @@ export type ControlMessage =
    */
   | { type: "codex_goal_state"; v: number; session: string; goal?: CodexGoalInfo }
   | { type: "session_processing_state"; v: number; session: string; active: boolean }
-  | { type: "chat_send"; v: number; id: string; session: string; clientMessageId: string; text: string; explicitRetry?: boolean }
+  | {
+      type: "chat_send"; v: number; id: string; session: string; clientMessageId: string; text: string;
+      explicitRetry?: boolean;
+      /**
+       * この設問（`question_prompt` の id）に答えずに送る（chat-cancel-choice）。host は未回答の設問が
+       * この id のときだけ、設問を Esc で閉じてから本文を送る。省略 / 別の設問 = 従来どおり回答まで保留。
+       */
+      cancelQuestionId?: string;
+    }
   | { type: "chat_send_result"; v: number; id: string; status: "accepted" | "duplicate" | "failed"; error?: string }
   | { type: "pending_message_delete"; v: number; id: string; session: string; clientMessageId: string; kind: "chat" | "codex" }
   | { type: "pending_message_delete_result"; v: number; id: string; status: "deleted" | "not_found" | "processing" | "failed"; error?: string }

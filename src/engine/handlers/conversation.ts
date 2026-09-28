@@ -54,7 +54,8 @@ export const conversationHandlers: HandlerRegistry = {
       subscribeConversation(ctx, message.session);
     }
     // Hub は設問表示中、durable queue を保持したまま pane 注入可能になるまで応答を
-    // 保留する。read loop 自体がこの RPC を await すると、後続 question_answer を読めず
+    // 保留する（`cancelQuestionId` がその設問を指す送信だけは保留せず、設問を Esc で閉じてから
+    // 注入する）。read loop 自体がこの RPC を await すると、後続 question_answer を読めず
     // 循環待ちになるため相関処理だけを非同期化する。ACK は注入完了の意味を維持する。
     // timeout は無限にしない: hub 側で応答が失われた場合にバブルが永遠に pending の
     // まま固まる（実障害）。アプリは durable Outbox + 同一 clientMessageId 再送で
@@ -67,7 +68,9 @@ export const conversationHandlers: HandlerRegistry = {
         const result = await ctx.hubRpc<Extract<HubServerMessage, { type: "chat_send_result" }>>(
           { type: "chat_send", id: message.id, session: message.session,
             clientMessageId: message.clientMessageId, text: message.text,
-            ...(message.explicitRetry === true ? { explicitRetry: true } : {}) }, message.id, 90_000,
+            ...(message.explicitRetry === true ? { explicitRetry: true } : {}),
+            ...(message.cancelQuestionId !== undefined && message.cancelQuestionId.length > 0
+              ? { cancelQuestionId: message.cancelQuestionId } : {}) }, message.id, 90_000,
         );
         chatSendDiag(`result id=${result.id} status=${result.status}`);
         writer.write({ type: "chat_send_result", v, id: result.id, status: result.status,

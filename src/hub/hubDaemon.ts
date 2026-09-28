@@ -480,6 +480,12 @@ export async function runHubCommand(args: string[]): Promise<number> {
       try {
         await sessionBackend.sendTextSubmit(session, text, {
           recordedPromptText: context.recordedPromptText,
+          // 利用者が未回答の設問に答えずに送った（chat-cancel-choice）。設問を Esc で閉じてから送る。
+          cancelChoiceDialog: context.cancelChoice,
+          onChoiceDialogCancelled: () => {
+            log(`audit chat-choice-dialog-cancelled session=${session}`);
+            context.onChoiceCancelled();
+          },
           // 送信確定を確認できないまま配送済みレシートを返す唯一の経路。無言だと
           // 「送ったのに届かない」の再発に誰も気づけないので 1 行残す（事後解析用）。
           onUnconfirmedSubmit: () => log(`audit chat-submit-unconfirmed session=${session}`),
