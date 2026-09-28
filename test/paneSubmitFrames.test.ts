@@ -13,6 +13,7 @@ import {
   classifySubmitFrame,
   inputBoxHasRealPendingText,
   inputBoxRealText,
+  screenShowsApprovalDialog,
   screenShowsCancellableChoice,
   screenShowsDialogFooter,
 } from "../src/backend/tmux.js";
@@ -87,6 +88,39 @@ describe("screenShowsDialogFooter（積極的なダイアログ判定）", () =>
     for (const composer of [IDLE, TYPED, INVISIBLE_HOLD, PROCESSING, SHELL_MODE, ACCEPT_EDITS]) {
       expect(screenShowsDialogFooter(composer)).toBe(false);
     }
+  });
+});
+
+describe("screenShowsApprovalDialog（hook で通らなかった承認の転写）", () => {
+  const SAFETY_APPROVAL = frame("approval-safety-artifact");
+
+  test("ツール承認と、hook の allow を上書きした安全確認を拾う", () => {
+    expect(screenShowsApprovalDialog(APPROVAL_DIALOG)).toBe(true);
+    expect(screenShowsApprovalDialog(SAFETY_APPROVAL)).toBe(true);
+  });
+
+  test("カーソルを 2 番目へ動かしたフッター（`Esc to cancel` 単独）も拾う", () => {
+    const moved = frame("approval-cursor-moved");
+    expect(moved).not.toContain("Tab to amend");
+    expect(screenShowsApprovalDialog(moved)).toBe(true);
+    expect(screenShowsDialogFooter(moved)).toBe(true);
+  });
+
+  test("設問・入力欄のフレームでは出ない", () => {
+    for (const other of [QUESTION_DIALOG, QUESTION_DIALOG_MULTI, IDLE, TYPED, PROCESSING, ACCEPT_EDITS]) {
+      expect(screenShowsApprovalDialog(other)).toBe(false);
+    }
+  });
+
+  test("本文がフッター文言を引用していても、バーが見えていれば出ない", () => {
+    const quoted = PROCESSING.replace(/\n[^\n]*esc to interrupt/, (bar) => `\nEsc to cancel · Tab to amend${bar}`);
+    expect(quoted).not.toBe(PROCESSING);
+    expect(screenShowsApprovalDialog(quoted)).toBe(false);
+  });
+
+  test("承認表示中は本文を打たない門番（screenShowsDialogFooter）も効いている", () => {
+    expect(screenShowsDialogFooter(SAFETY_APPROVAL)).toBe(true);
+    expect(classifySubmitFrame(SAFETY_APPROVAL)).toBe("dialog");
   });
 });
 

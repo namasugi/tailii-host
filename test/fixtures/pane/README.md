@@ -16,6 +16,8 @@ tmux `capture-pane -p -e`（ANSI 付き・viewport のみ）でそのまま採�
 | `approval-dialog.ansi` | ツール承認ダイアログ（Write） | `Esc to cancel · Tab to amend` |
 | `question-dialog-multi.ansi` | AskUserQuestion の複数設問（タブ付き） | `Enter to select · Tab/Arrow keys to navigate · Esc to cancel` |
 | `question-declined.ansi` | 上の設問を Esc で閉じた直後（`User declined to answer questions`・入力欄は空） | `⏵⏵ auto mode on (shift+tab to cycle) · ← for agents` |
+| `approval-safety-artifact.ansi` | 2.1.283・hook が allow を返しても残る安全確認（作業フォルダ外への Artifact 保存。理由の引用枠 `│` が選択肢と同じ深さ） | `Esc to cancel · Tab to amend` |
+| `approval-cursor-moved.ansi` | 2.1.283・Edit の承認でカーソルを 2 番目へ動かした画面（フッターから `· Tab to amend` が消える。2 番目の選択肢は折り返す） | `Esc to cancel` |
 
 ダイアログの 2 枚は `extractClaudeInputBox` が本体の罫線ペアを入力欄と誤認し、
 `inputBoxRealText` がカーソル行（`1. Yes` / 選択肢全文）を「未送信テキスト」として返す。

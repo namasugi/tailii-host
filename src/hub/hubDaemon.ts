@@ -24,7 +24,7 @@ import { SessionHub } from "./sessionHub.js";
 import { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
 import { abortableSleep } from "../shared/sleep.js";
 import { resolveHubSocketPath } from "../shared/socketPath.js";
-import { processTmuxCommandRunner, screenInLoginFlow } from "../backend/tmux.js";
+import { processTmuxCommandRunner, screenInLoginFlow, screenShowsApprovalDialog } from "../backend/tmux.js";
 import { envWithoutTmux, screenHasSelectionFooter } from "../backend/herdr.js";
 import { readPackageVersion } from "../shared/version.js";
 import { ChatTailController } from "../chat/chatTailController.js";
@@ -462,10 +462,12 @@ export async function runHubCommand(args: string[]): Promise<number> {
       ...(onUsageLimitWait !== undefined ? { onUsageLimitWait } : {}),
       ...(pollIntervalMs !== undefined ? { pollIntervalMs } : {}),
       log,
-      // 静止した入力待ちダイアログ（選択 / /login）は初回フレームから送る（開き直しで転写カードを出す）。
-      // 使用量制限の待機フッター（usage-limit-wait）も静止画面なので初回フレームから送る。
+      // 静止した入力待ちダイアログ（選択 / /login / hook で通らなかった承認）は初回フレームから送る
+      // （開き直しで転写カードを出す）。使用量制限の待機フッター（usage-limit-wait）も静止画面なので
+      // 初回フレームから送る。
       emitInitialIf: (text) =>
-        screenHasSelectionFooter(text) || screenInLoginFlow(text) || parseUsageLimitWait(text) !== null,
+        screenHasSelectionFooter(text) || screenInLoginFlow(text) || screenShowsApprovalDialog(text)
+        || parseUsageLimitWait(text) !== null,
     }),
     questionInjector: (answers, session) => injectQuestionAnswers(answers, session, sessionBackend),
     // 使用量制限の自動再開待ちを push で知らせる（usage-limit-wait。APNs 未設定なら内部で skip）。
