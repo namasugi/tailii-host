@@ -137,12 +137,12 @@ export function parseSubagentTranscript(jsonl: string): SubagentTranscriptResult
       // は、封筒と harness の前置き/後置きを外して「⇄ 送信元名 より」+ 本文へ転写する（規則は
       // shared/crossSession.ts）。委任したサブエージェント（この会話から見た孫）の完了報告
       // （hand-back）は「⇄ サブエージェントの報告」+ レポート全文（hand-back 判定の権威は行の
-      // origin.handback、無ければ本文の形）。
+      // origin.handback、無ければ本文の形）。別セッションの待機通知は「⇄ 名前 が待機状態になりました」。
       if (role === "user") {
         const peer = presentCrossSessionMessage(raw, crossSessionOriginHint(record));
         if (peer !== null) {
-          // ラベル本体は shared 側（hand-back は固定見出し）。ピアだけ「〜 より」を付ける。
-          const label = `⇄ ${crossSessionSenderLabel(peer)}${peer.kind === "handback" ? "" : " より"}`;
+          // ラベル本体は shared 側（hand-back / 待機通知は固定見出し）。ピアだけ「〜 より」を付ける。
+          const label = `⇄ ${crossSessionSenderLabel(peer)}${peer.kind === "peer" ? " より" : ""}`;
           return peer.body === "" ? label : `${label}\n\n${peer.body}`;
         }
       }

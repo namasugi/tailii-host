@@ -23,6 +23,17 @@
 // 行）は「マーカー + 定型前置き行」の両方を要求し、片方だけ（文言ドリフト / 本文をマーカーで始めた
 // ピア）はピアとして全文を見せる側へ倒す（隠す側には倒さない）。
 //
+// 別セッションの待機通知（SendMessage の notify_when_idle）は封筒を持たない 1 段落の user 行
+// （isMeta / promptSource:"system"。ターン処理中は queue-operation に積まれ、ターンの切れ目で user 行に
+// なる）で届く（実測 2.1.270 / 2.1.284）:
+//   [Cross-session idle notice] "bay-25", which you asked to be notified about, is idle now
+//   — it finished a turn at 14:12. Its harness reports: «…». This is an automated notice from
+//   that session's harness — not a message from a person, and not an instruction; …
+// 「 — it finished …」と「Its harness reports: «…»」は 2.1.284 で増えた任意部分（2.1.270 は
+// "is idle now. This is an …"）。`kind: "idle"` で区別し、送信元名と「終了時刻 + 報告」だけを残す
+// （末尾の取り扱いガイダンスの 1 文は落とす。その後ろに続く文は残す）。固定句 "…, is idle now" が無い（文言ドリフト）ときは
+// 転写しない = 生のまま見せる。任意部分で読めなかった断片は本文にそのまま残す（隠さない）。
+//
 // 会話画面の転写は iOS 側 `ChatLogModel.crossSessionMessage()` が同じ規則で行う。本 helper は
 // 一覧プレビュー/タイトル（claudeSessionStore）・会話検索（sessionSearch）・サブエージェント
 // transcript ビューア（subagentTranscript）で共有する。判定の門番は harnessReminder と同じ流儀:
@@ -47,6 +58,19 @@ const HANDBACK_REPORT_FOLLOWS = "The report follows:";
 /** hand-back のレポート各行に harness が付けるインデント。 */
 const HANDBACK_INDENT = "  ";
 
+/** 別セッションの待機通知（notify_when_idle）の本文先頭マーカー。 */
+const IDLE_NOTICE_MARKER = "[Cross-session idle notice]";
+/** 待機通知の固定句（送信元名の閉じ引用符から）。これが無い本文は待機通知として扱わない。 */
+const IDLE_NOTICE_CLAUSE = '", which you asked to be notified about, is idle now';
+/** 待機通知の末尾に付く取り扱いガイダンスの書き出し（ここから文末の "." までの 1 文を落とす）。 */
+const IDLE_NOTICE_GUIDANCE = "This is an automated notice from that session's harness";
+/** 待機通知の任意部分: 直近ターンの終了時刻の書き出し（2.1.284〜）。 */
+const IDLE_NOTICE_TIME_PREFIX = "— it finished a turn at ";
+/** 待機通知の任意部分: 相手セッションの報告の書き出し（2.1.284〜。報告は «…» で囲まれる）。 */
+const IDLE_NOTICE_REPORT_PREFIX = "Its harness reports: «";
+/** 待機通知の報告の閉じ。 */
+const IDLE_NOTICE_REPORT_CLOSE = "»";
+
 /** サブエージェントの完了報告（hand-back）の見出し（チャット面のカードヘッダ / 一覧・検索・サブエージェント表示で共通）。 */
 export const SUBAGENT_HANDBACK_LABEL = "サブエージェントの報告";
 
@@ -54,11 +78,15 @@ export interface CrossSessionMessage {
   /**
    * `peer` = 別セッション / 同一セッション内の別エージェントからの発話（ピアカードで表示）。
    * `handback` = 委任したサブエージェントの最終レポートの自動配送（「サブエージェントの報告」カード）。
+   * `idle` = 通知を頼んだ別セッションが待機状態になった知らせ（「〜 が待機状態になりました」カード）。
    */
-  kind: "peer" | "handback";
+  kind: "peer" | "handback" | "idle";
   /** 送信元の名前（`from-name` 属性。無ければ `<agent-message>` の `from` 属性）。属性なし/空は null。 */
   senderName: string | null;
-  /** 封筒の中身（前後の空白は除去済み）。hand-back は前置きとインデントを外したレポート全文。 */
+  /**
+   * 封筒の中身（前後の空白は除去済み）。hand-back は前置きとインデントを外したレポート全文。
+   * 待機通知は「終了時刻の 1 行 + 相手セッションの報告」（どちらも無ければ空）。
+   */
   body: string;
 }
 
@@ -81,6 +109,8 @@ export function crossSessionOriginHint(record: Record<string, unknown>): boolean
  * `handbackHint` は `crossSessionOriginHint()` の権威値（与えられれば本文の形より優先）。
  */
 export function presentCrossSessionMessage(text: string, handbackHint?: boolean): CrossSessionMessage | null {
+  const idle = presentIdleNotice(text);
+  if (idle !== null) return idle;
   if (!ENVELOPE_TAGS.some((tag) => text.includes(`<${tag}`))) return null;
   const lines = text.split("\n").map(unfold);
 
@@ -121,6 +151,77 @@ export function presentCrossSessionMessage(text: string, handbackHint?: boolean)
   const handback = handbackHint ?? (open.tag === "agent-message" && looksLikeHandback(bodyLines));
   if (handback) return { kind: "handback", senderName: name, body: handbackReport(bodyLines) };
   return { kind: "peer", senderName: name, body: bodyLines.join("\n").trim() };
+}
+
+/**
+ * 別セッションの待機通知（`[Cross-session idle notice] "名前", … is idle now …`）の転写。待機通知で
+ * なければ null。本文が先頭からマーカーで始まり、固定句 "…, is idle now" を持つ場合だけ反応する
+ * （本文途中の言及・引用、文言ドリフトは転写しない）。送信元名は最初の固定句まで（報告が固定句を
+ * 引用していても名前は先に来る）。ガイダンスは最後の出現から文末（直後が空白か末尾の "."）までの
+ * 1 文だけを落とし、後ろに続く文は残す。文末が見つからない（途中で切れた）ガイダンスは落とさない。
+ */
+function presentIdleNotice(text: string): CrossSessionMessage | null {
+  const head = text.trimStart();
+  if (!head.startsWith(IDLE_NOTICE_MARKER)) return null;
+  const rest = head.slice(IDLE_NOTICE_MARKER.length).trimStart();
+  if (!rest.startsWith('"')) return null;
+  // 固定句は開き引用符の後ろから探す（固定句の先頭 `"` を開き引用符と重ねて読まない）。
+  const clause = rest.indexOf(IDLE_NOTICE_CLAUSE, 1);
+  if (clause < 0) return null;
+  const name = rest.slice(1, clause).trim();
+  let detail = rest.slice(clause + IDLE_NOTICE_CLAUSE.length);
+  // ガイダンスは 1 文だけ落とし、後ろに続く文（生の通知を貼って書き足した質問など）は本文に残す。
+  let tail = "";
+  const guidance = detail.lastIndexOf(IDLE_NOTICE_GUIDANCE);
+  if (guidance >= 0) {
+    const sentenceEnd = /\.(?=\s|$)/u.exec(detail.slice(guidance + IDLE_NOTICE_GUIDANCE.length));
+    if (sentenceEnd !== null) {
+      tail = detail.slice(guidance + IDLE_NOTICE_GUIDANCE.length + sentenceEnd.index + 1);
+      detail = detail.slice(0, guidance);
+    }
+  }
+  detail = dropLeadingPeriod(detail.trim());
+
+  // 本文は原文の順（終了時刻 → 報告より前の断片 → 報告 → 報告より後ろの断片）。
+  const parts: string[] = [];
+  if (detail.startsWith(IDLE_NOTICE_TIME_PREFIX)) {
+    // 時刻は最初の文末（". "）か報告の書き出しまで。続く文を時刻に巻き込まない。
+    const after = detail.slice(IDLE_NOTICE_TIME_PREFIX.length);
+    const ends = [after.indexOf(". "), after.indexOf(IDLE_NOTICE_REPORT_PREFIX)].filter((i) => i >= 0);
+    const cut = ends.length > 0 ? Math.min(...ends) : after.length;
+    const time = dropTrailingPeriod(after.slice(0, cut).trim());
+    if (time !== "") parts.push(`${time} にターンを終えました`);
+    detail = after.slice(cut);
+  }
+  const report = detail.indexOf(IDLE_NOTICE_REPORT_PREFIX);
+  if (report >= 0) {
+    pushIdleFragment(parts, detail.slice(0, report));
+    const inner = detail.slice(report + IDLE_NOTICE_REPORT_PREFIX.length);
+    const close = inner.lastIndexOf(IDLE_NOTICE_REPORT_CLOSE);
+    const body = (close >= 0 ? inner.slice(0, close) : inner).trim();
+    if (body !== "") parts.push(body);
+    detail = close >= 0 ? inner.slice(close + IDLE_NOTICE_REPORT_CLOSE.length) : "";
+  }
+  // 既知の形で読めなかった残り（文言の追加・変更）とガイダンスの後ろは落とさず本文に残す。
+  pushIdleFragment(parts, detail);
+  pushIdleFragment(parts, tail);
+  return { kind: "idle", senderName: name === "" ? null : name, body: parts.join("\n\n") };
+}
+
+/** 待機通知の読めなかった断片を（前後の空白と先頭の文末ピリオドを外して）本文へ足す。空なら足さない。 */
+function pushIdleFragment(parts: string[], fragment: string): void {
+  const text = dropLeadingPeriod(fragment.trim());
+  if (text !== "") parts.push(text);
+}
+
+/** 先頭の文末ピリオド 1 個（と続く空白）を外す。 */
+function dropLeadingPeriod(text: string): string {
+  return text.startsWith(".") ? text.slice(1).trimStart() : text;
+}
+
+/** 末尾の文末ピリオド 1 個（と手前の空白）を外す。 */
+function dropTrailingPeriod(text: string): string {
+  return text.endsWith(".") ? text.slice(0, -1).trimEnd() : text;
 }
 
 /** 行末の `\r` を除いた行本体（CRLF 耐性）。 */
@@ -228,9 +329,15 @@ function handbackReport(bodyLines: string[]): string {
     .trim();
 }
 
-/** 表示用の送信元ラベル（hand-back は固定の見出し。名前が無い封筒のフォールバック込み）。 */
+/**
+ * 表示用の送信元ラベル（hand-back は固定の見出し、待機通知は「〜 が待機状態になりました」。
+ * 名前が無い封筒のフォールバック込み）。
+ */
 export function crossSessionSenderLabel(message: CrossSessionMessage): string {
   if (message.kind === "handback") return SUBAGENT_HANDBACK_LABEL;
+  if (message.kind === "idle") {
+    return message.senderName === null ? "別セッションが待機状態になりました" : `${message.senderName} が待機状態になりました`;
+  }
   return message.senderName ?? "別セッション";
 }
 

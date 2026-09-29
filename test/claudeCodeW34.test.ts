@@ -130,6 +130,10 @@ describe("idle-notice: notify_when_idle の informational 行", () => {
   it("`<name> is idle` を ⇄ 注記へ、他の notice 級は従来どおり落とす", () => {
     const rec = { type: "system", subtype: "informational", level: "notice", content: "bay-39 is idle", isMeta: false };
     expect(systemNoticeText(rec)).toBe("⇄ bay-39 は待機状態になりました（別セッションからの通知）");
+    // 2.1.284: 終了時刻と報告が続く（詳細は受信側 user 行のカードが見せるので注記は同じ 1 行）。
+    expect(systemNoticeText({ ...rec, content: "bay-25 is idle — finished a turn at 14:12 · «設計の確認に\n回答しました…»" }))
+      .toBe("⇄ bay-25 は待機状態になりました（別セッションからの通知）");
+    expect(systemNoticeText({ ...rec, content: "bay-39 is idle soon" })).toBeNull();
     expect(systemNoticeText({ ...rec, content: "bay-39 exited" })).toBeNull();
     expect(systemNoticeText({ ...rec, content: "something else" })).toBeNull();
     expect(systemNoticeText({ ...rec, level: "info" })).toBeNull();

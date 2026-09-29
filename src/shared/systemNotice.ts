@@ -167,10 +167,13 @@ export function systemNoticeText(rec: Record<string, unknown>, ctx?: SystemNotic
 
   // --- 別セッションの待機通知（SendMessage の notify_when_idle, Claude Code 2.1.236〜） ---
   // 通知は level=notice の informational 行 `<name> is idle`（実測 2026-09-14。封筒なし）で届く。
+  // 2.1.284 からは `<name> is idle — finished a turn at 14:12 · «報告»` と詳細が続く（実測
+  // 2026-09-29。旧判定は行末一致だったため注記ごと出なくなっていた）。詳細は受信側が通知を
+  // 受け取る user 行のカード（shared/crossSession.ts の待機通知）が見せるので、ここは到着の事実だけ。
   // notice 級は従来一律に落としていたため、この形だけを ⇄ 注記へ転写する（cross-session）。
   if (subtype === "informational" && level === "notice") {
     // 形は `<name> is idle` だけを採る（`… exited` は未観測で、背景コマンドの終了文言と衝突し得る）。
-    const idle = /^(.+?) is idle$/u.exec(content);
+    const idle = /^(.+?) is idle(?: — [\s\S]*)?$/u.exec(content);
     if (idle !== null) return `⇄ ${idle[1]} は待機状態になりました（別セッションからの通知）`;
   }
 

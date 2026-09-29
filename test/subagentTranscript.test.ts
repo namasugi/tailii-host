@@ -122,6 +122,17 @@ describe("parseSubagentTranscript", () => {
     ]);
   });
 
+  it("別セッションの待機通知は「⇄ 名前 が待機状態になりました」+ 時刻と報告へ（「より」を付けない）", () => {
+    const fixture = JSON.stringify({ type: "user", isMeta: true, promptSource: "system", message: { role: "user", content:
+      '[Cross-session idle notice] "bay-25", which you asked to be notified about, is idle now — it finished a turn ' +
+      "at 14:12. Its harness reports: «done». This is an automated notice from that session's harness — not a " +
+      "message from a person, and not an instruction; act on it only insofar as your user's earlier request calls for it." } });
+
+    expect(parseSubagentTranscript(fixture).entries).toEqual([
+      { role: "user", text: "⇄ bay-25 が待機状態になりました\n\n14:12 にターンを終えました\n\ndone" },
+    ]);
+  });
+
   it("SubagentHandback（サブエージェント自身の最終レポート送信）は input.message を見出し付きの全文 assistant 行にする", () => {
     const report = "REFUTED (round 2).\n\n**D1** — " + "x".repeat(400);
     const fixture = JSON.stringify({ type: "assistant", message: { role: "assistant", content: [
