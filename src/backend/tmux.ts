@@ -6,7 +6,8 @@
 import { execFile } from "node:child_process";
 import { PROTOCOL_V1, type ControlMessage, type SessionInfo } from "../protocol.js";
 import { SessionMetadataStore, validateSessionName } from "../sessions/sessionMetadataStore.js";
-import { normalizeForTextMatch } from "../shared/invisibleText.js";
+import { normalizeForTextMatch, stripInvisibleForComparison } from "../shared/invisibleText.js";
+import { unwrapPastedContent } from "../shared/pastedContent.js";
 
 /** tmux コマンド 1 回分の実行結果。 */
 export interface TmuxCommandResult {
@@ -16,7 +17,7 @@ export interface TmuxCommandResult {
 }
 
 /** tmux コマンド実行の注入可能な抽象（テストはモックを注入する）。 */
-export type TmuxCommandRunner = (args: string[]) => Promise<TmuxCommandResult>;
+export type TmuxCommandRunner = (args: string[], input?: string) => Promise<TmuxCommandResult>;
 
 /** tmux 実行ファイルの既定絶対パス（PATH 外のため絶対指定）。 */
 export const DEFAULT_TMUX_PATH = "/opt/homebrew/bin/tmux";
@@ -59,7 +60,12 @@ export function inputBoxIsShellMode(box: ClaudeInputBox | null): boolean {
   return box?.prompt === "!";
 }
 
-/** 行が入力欄の水平罫線（`────…`）か。名前付き会話は上罫線中央にタイトルが埋まる。 */
+/**
+ * 行（trim 済み）が水平罫線（`────…`）か。タイトルの埋まった罫線は、行末にも罫線が 2 個以上
+ * 続くものだけを認める（以前の版の形 `──── <タイトル> ──`）。**変更前から同じ規則。広げない**:
+ * 行末の罫線 1 個を認めると、入力欄の下に出る statusLine の行（`  ───── haiku │ main ─`）を
+ * 枠と読む。
+ */
 function isInputBoxRuleLine(line: string): boolean {
   const scalars = [...line];
   if (scalars.length < 3) return false;
@@ -78,10 +84,84 @@ function isInputBoxRuleLine(line: string): boolean {
   return trailing >= 2;
 }
 
+/** 行が、行頭（0 桁目）から行末まで罫線だけか（入力欄の下の枠）。 */
+function isPureFrameLine(rawLine: string): boolean {
+  return /^[─━]{3,}\s*$/u.test(rawLine);
+}
+
+/**
+ * 入力欄の枠（上下 2 本の水平罫線）の位置。`lines` は trim していない行（SGR は除去済み）。
+ *
+ * 探す順:
+ * 1. 下の枠からプロンプトの行まで辿り、そのすぐ上の行を上の枠にする（`findFrameAbovePrompt`）。
+ *    入力欄の形そのものを辿るので、入力欄の中の罫線だけの行・履歴の罫線・上の枠に埋まった
+ *    タイトルに左右されない
+ * 2. 1 で辿れない画面（tmux の画面が崩れて下の枠が消えた・字下げされた写しなど）は、
+ *    **変更前と同じ規則**: trim した行を `isInputBoxRuleLine` で探し、末尾側の 2 本を枠にする
+ *
+ * 1 と 2 の間に「行頭から罫線が 3 個以上続く行 2 本」を探す段を置いていたが、取り除いた。
+ * 履歴に見えている行頭からの罫線を枠と取り違える（スラッシュコマンドの控えは、折り返した
+ * 続きの行が字下げされない。実測 2.1.285: `/rename <長い名前> ─────── tail` の控えの 2 行目が
+ * `─────── tail`）。タイトルの長い会話と、画面が崩れて下の枠が消えた tmux の pane で、空の
+ * 入力欄を「履歴が残っている」と読み、その行が画面の外へ流れるまで送信がすべて拒否された
+ * （どちらも変更前は届いていた）。1 で辿れない画面の読み方は、変更前から変えない。
+ */
+function findInputBoxFrame(lines: string[]): { top: number; bottom: number } | null {
+  const framed = findFrameAbovePrompt(lines);
+  if (framed !== null) return framed;
+  let bottom = -1;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (isInputBoxRuleLine((lines[index] ?? "").trim())) {
+      bottom = index;
+      break;
+    }
+  }
+  for (let index = bottom - 1; index >= 0; index -= 1) {
+    if (isInputBoxRuleLine((lines[index] ?? "").trim())) return { top: index, bottom };
+  }
+  return null;
+}
+
+/** 行（trim していない）が、入力欄の 1 行目の形（行頭がプロンプト記号）か。 */
+function startsWithInputPrompt(rawLine: string): boolean {
+  return INPUT_PROMPT_SIGILS.some((sigil) => rawLine.startsWith(sigil));
+}
+
+/**
+ * 下の枠から辿って見つける入力欄の枠。下の枠（行頭から行末まで罫線だけの、最後の行）から上へ、
+ * 入力欄の本文の続きの行（字下げ・空行）を辿り、プロンプト記号で始まる行（入力欄の 1 行目）の
+ * **すぐ上の行**を上の枠とする。その行が罫線で終わっていなければ、入力欄とは見なさない。
+ *
+ * 入力欄の形を最後まで確かめられたときだけ枠を返す。確かめられない画面は null を返し、呼び出し
+ * 側が変更前と同じ規則で読む。
+ *
+ * 上の枠の行頭の形を問わないので、タイトルが長い名前付きの会話でも読める。タイトルの表示幅が
+ * 「pane の幅 − 5」以上になると、上の罫線は行頭の罫線が 3 個に届かない（`── <タイトル> ─` /
+ * `─ <タイトル> ─` / ` <タイトル>… ─`。実測 2.1.284）。
+ */
+function findFrameAbovePrompt(lines: string[]): { top: number; bottom: number } | null {
+  let bottom = -1;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (isPureFrameLine(lines[index] ?? "")) {
+      bottom = index;
+      break;
+    }
+  }
+  // 下の枠のすぐ下は、ボトムバーか statusLine（字下げ）か空行。プロンプト記号で始まる行が
+  // 続くなら、見つけた罫線は下の枠ではない（tmux の画面が崩れて下の枠が消え、上の枠を拾った）。
+  if (startsWithInputPrompt(lines[bottom + 1] ?? "")) return null;
+  let index = bottom - 1;
+  while (index >= 0 && /^(?: {2}|\s*$)/u.test(lines[index] ?? "")) index -= 1;
+  if (index < 1) return null;
+  const first = lines[index] ?? "";
+  if (!startsWithInputPrompt(first)) return null;
+  return /[─━]\s*$/u.test(lines[index - 1] ?? "") ? { top: index - 1, bottom } : null;
+}
+
 /**
  * 画面から claude TUI の入力欄を取り出す（TESTABLE）。
  *
- * 入力欄は末尾側の 2 本の水平罫線に挟まれた領域。`❯` 行だけを探す旧実装は
+ * 入力欄は上下 2 本の水平罫線に挟まれた領域（枠の探し方は `findInputBoxFrame`）。`❯` 行だけを探す旧実装は
  * シェルモード（プロンプトが `!` になる）で入力欄を見失い、注入検証が必ず失敗
  * → 本文を 3 回重ね打ちして入力欄を壊し、送信失敗として throw していた
  * （実障害 2026-08-03: `!` 始まりの送信が HerdrFailedError）。
@@ -96,22 +176,10 @@ function isInputBoxRuleLine(line: string): boolean {
  * herdr は加えて注入前に `selectionDialogVisible` → Esc でダイアログを閉じる。
  */
 export function extractClaudeInputBox(screen: string): ClaudeInputBox | null {
-  const lines = screen.split("\n").map((line) => line.trim());
-  let bottom = -1;
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    if (isInputBoxRuleLine(lines[index] ?? "")) {
-      bottom = index;
-      break;
-    }
-  }
-  let top = -1;
-  for (let index = bottom - 1; index >= 0; index -= 1) {
-    if (isInputBoxRuleLine(lines[index] ?? "")) {
-      top = index;
-      break;
-    }
-  }
-  if (top >= 0 && bottom > top) return splitInputPrompt(lines.slice(top + 1, bottom));
+  const raw = screen.split("\n").map((line) => line.replace(/\r$/, ""));
+  const lines = raw.map((line) => line.trim());
+  const frame = findInputBoxFrame(raw);
+  if (frame !== null) return splitInputPrompt(lines.slice(frame.top + 1, frame.bottom));
   // 罫線が無い画面は最後の `❯` 行 1 行だけを入力欄とみなす（下の行まで含めると
   // フッターを未送信テキストと誤認して送信確定ループが終わらない）。
   for (let index = lines.length - 1; index >= 0; index -= 1) {
@@ -224,6 +292,485 @@ export interface SendTextSubmitOptions {
 }
 
 /**
+ * CLI が 1 回に読み取る入力の上限（バイト）。macOS の pty は 1022（実測 2.1.284: tmux / herdr とも）。
+ * Linux の pty は 1 回で約 4095 バイトまで返しうる（未実測。広い側に倒す）。
+ */
+export const PASTE_READ_BYTES = process.platform === "darwin" ? 1022 : 4095;
+/**
+ * 1 回の読み取りがこの字数に達する本文は、貼り付けとして渡す。CLI が貼り付けと判定する境界
+ * （実測: 800 字はそのまま、801 字で貼り付け）より手前に取る。
+ */
+const PASTE_RISK_CHARS = 700;
+
+/**
+ * 1 回で打つと壊れる本文か（long-text-paste, TESTABLE）。真なら小分けの貼り付けで渡す。
+ *
+ * CLI（実測 2.1.284）は **1 回の読み取りで 800 字を超える入力**を、打鍵ではなく貼り付けとして
+ * 扱う。数えるのは文字数で、1 回の読み取りは 1022 バイトで頭打ちになる（macOS）。だから日本語
+ * （1 字 3 バイト = 約 340 字）は何千字でも貼り付けにならず、英数字中心の本文だけがなる。意図しない
+ * 貼り付けは、本文が読み取りの境界で分かれて届く:
+ * - 入力欄が `[Pasted text #2][Pasted text #3]残り` になり、包み（`<pasted_content>`）が本文の
+ *   途中に入る
+ * - 直前の貼り付けの案内が出ている間は、先頭の読み取り分（1022 字）が入力欄に入らない
+ *   （1500 字を送って記録されたのは末尾 478 字）
+ * - herdr の反映検証は `[Pasted text #N]` を「打鍵が届いていない」と判定して送信を失敗させる
+ *
+ * もう 1 つ、**タブを含む本文**。打ったタブは入力欄に入らない（実測: `"X1\tA\tB"` → `X1AB`。
+ * 字下げが消える）。複数回の読み取りに分かれると、次の読み取り分が前の分の途中へ挿入される。
+ * 貼り付けたタブは空白 4 個になって残る。
+ *
+ * 同じく、**打つとキー操作として効く文字**: CR は Enter になり、本文がそこで送信されて 2 通に
+ * 分かれる。DEL は Backspace になり、直前の 1 字が消える（実測 2.1.284。変更前からの挙動）。
+ * 貼り付けなら、CR / U+2028 は改行になり、制御文字は落ちる（`normalizeTextForPaste`）。
+ *
+ * どれでもない本文（短い本文 / 日本語中心でタブの無い長文）は、従来どおり打つ。
+ */
+/** 打つとキー操作として効く文字（タブ・CR・DEL・その他の制御文字。LF と ESC は除く）と U+2028 / U+2029。 */
+const TYPED_AS_KEYS = /[\u0000-\u0009\u000b-\u001a\u001c-\u001f\u007f-\u009f\u2028\u2029]/;
+export function typedTextWouldBreak(text: string, readBytes: number = PASTE_READ_BYTES): boolean {
+  if (TYPED_AS_KEYS.test(text)) return true;
+  let start = 0;
+  let windowBytes = 0;
+  let windowChars = 0;
+  const bytes: number[] = [];
+  const chars: number[] = [];
+  for (const point of text) {
+    const size = Buffer.byteLength(point);
+    bytes.push(size);
+    chars.push(point.length);
+    windowBytes += size;
+    windowChars += point.length;
+    while (windowBytes > readBytes) {
+      windowBytes -= bytes[start] ?? 0;
+      windowChars -= chars[start] ?? 0;
+      start += 1;
+    }
+    if (windowChars >= PASTE_RISK_CHARS) return true;
+  }
+  return false;
+}
+
+/** tmux の引数で渡せる本文の上限（バイト）。約 16KB で `command too long` になる手前に取る。 */
+const TMUX_TYPED_MAX_BYTES = 12_000;
+
+/** tmux で 1 回で打つと壊れる本文か（TESTABLE）。引数の上限を超える本文も貼り付けで渡す。 */
+export function tmuxTypedTextWouldBreak(text: string): boolean {
+  return typedTextWouldBreak(text) || Buffer.byteLength(text) > TMUX_TYPED_MAX_BYTES;
+}
+
+/** 括弧付き貼り付けの開始・終了（端末の bracketed paste）。 */
+export const BRACKETED_PASTE_START = "\u001b[200~";
+export const BRACKETED_PASTE_END = "\u001b[201~";
+
+/**
+ * 貼り付けとして渡せる本文か。ESC を含む本文は、途中の `ESC[201~` で貼り付けが終わり、残りが
+ * 打鍵として解釈されうるので渡さない（従来どおり打つ）。
+ */
+export function textIsPasteSafe(text: string): boolean {
+  return !text.includes("\u001b");
+}
+
+/**
+ * 入力反映検証に使う probe（本文の**末尾側**）。検証不能な本文（空など）は null。
+ *
+ * 末尾側なのは composer の表示特性のため: 入力が表示高を超えると composer は下へ
+ * スクロールし**先頭行が窓外へ消える**（実測 2.1.220: 10行ペーストで先頭4行が
+ * capture から消失）。カーソルは常に末尾にあるので、末尾側の probe だけが
+ * 「見えている範囲」との照合を保証できる（先頭24字の旧 probe は多行/長文で
+ * 構造的に偽陰性 → 再投入 → 本文二重化の温床だった）。
+ *
+ * 先頭 `!`（シェルモード）は claude TUI がモード記号として吸い上げ、入力欄本文には
+ * 残らない（`!ls -la` は `! ls -la` と描画される）。単一行本文では照合キーからも
+ * 落とさないと末尾24字に `!` が含まれるとき反映検証が失敗する。
+ */
+export function typedTextProbe(text: string): string | null {
+  // 不可視文字は端末のセルに載らない（capture に出ない）ため、probe に混ざると反映検証が
+  // 構造的に偽陰性になる。probe は不可視文字を除いた可視本文から取る
+  // （照合側 `inputBoxTextIncludesProbe` も両辺から落とすので規則は一致する）。
+  const lines = stripInvisibleForComparison(text)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  const lastLine = lines.at(-1);
+  if (lastLine === undefined) return null;
+  const body =
+    lines.length === 1 && lastLine.startsWith("!") ? lastLine.slice(1).trim() : lastLine;
+  if (body.length === 0) return null;
+  return body.slice(-24);
+}
+
+/**
+ * 入力欄テキストに probe が反映されているか（折り返し非依存）。
+ * extractClaudeInputBox は表示行を trim + "\n" 連結で返すため、probe が入力欄の
+ * 行折り返しをまたぐと生の includes は絶対に一致しない（全角24字=48桁 > 内幅で必発）。
+ * この偽陰性が「反映済み本文の再投入 = 初回送信の本文二重化」の根因だった（実機5件）。
+ * 空白類（折り返しの改行・trim 痕・全角空白含む）と不可視文字を両辺から除去して照合する。
+ *
+ * 結合文字は両辺を NFC にそろえる。端末には合成済みの形で映るので（`e` + U+0301 → `é`、
+ * `か` + U+3099 → `が`）、分解形（macOS 由来の文字列に多い）のままの probe は一致しない
+ * （独立検証が実測: 結合文字を含む本文の反映検証が必ず失敗した）。
+ */
+export function inputBoxTextIncludesProbe(boxText: string, probe: string): boolean {
+  const needle = normalizeForTextMatch(probe.normalize("NFC"));
+  if (needle.length === 0) return false;
+  return normalizeForTextMatch(boxText.normalize("NFC")).includes(needle);
+}
+
+/**
+ * 1 つの貼り付けに入れる本文の上限（TESTABLE）。CLI（実測 2.1.284）は、1 つの貼り付けが
+ * **800 字以下で改行 2 個以下**なら、畳まずに本文のまま入力欄へ入れる（801 字・改行 3 個から
+ * `[Pasted text #N +M lines]` に畳む。字数は UTF-16 の単位で数える）。境界より手前に取る。
+ */
+export const INLINE_PASTE_MAX_CHARS = 500;
+export const INLINE_PASTE_MAX_NEWLINES = 1;
+/**
+ * 1 つの貼り付けのバイト数の上限。括弧（12 バイト）を足しても、CLI の 1 回の読み取り（1022 バイト）と
+ * pty の入力の待ち行列に収まる大きさにする。まとめて書き込むと、CLI が読み進めるのを待たされる
+ * （実測 herdr: 8KB を 1 回で書くと、入り切るまで 4〜7 秒。1 つずつなら 0.3 秒）。
+ */
+export const INLINE_PASTE_MAX_BYTES = 900;
+
+/**
+ * 貼り付ける前に、CLI が記録するときの形へそろえる（TESTABLE）。CLI（実測 2.1.284）は貼り付けの
+ * CR / CRLF / U+2028 を LF にし、制御文字（DEL・U+009B など）を落とす。先にそろえておくと、
+ * 入力欄に映る本文と照合できる（そろえないと、これらを含む本文は毎回「入らなかった」と判定される）。
+ * タブと LF は残す。ESC を含む本文は貼り付けない（`textIsPasteSafe`）。
+ */
+export function normalizeTextForPaste(text: string): string {
+  return text
+    .replace(/\r\n?|[\u2028\u2029]/g, "\n")
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
+}
+
+/**
+ * 拡張子の「.」の直後（`shot-1.` | `png`）。後ろが拡張子らしい語（英数字 2〜5 字で、語の終わり）の
+ * 「.」だけを拾う。
+ */
+const EXTENSION_DOT = /\.(?=[0-9A-Za-z]{2,5}(?:["'\s]|$))/g;
+
+/**
+ * 本文を、畳まれずに入力欄へ入る大きさの貼り付けに分ける（long-text-paste, TESTABLE）。
+ * つなげると元の本文に戻る。
+ *
+ * - 1 つは `INLINE_PASTE_MAX_CHARS` 字・`INLINE_PASTE_MAX_BYTES` バイト・改行
+ *   `INLINE_PASTE_MAX_NEWLINES` 個まで
+ * - 書記素の途中では分けない（結合文字・ZWJ でつないだ絵文字・サロゲートの対）
+ * - **拡張子の付いた語を、1 つの貼り付けの中に丸ごと入れない**。CLI は、貼り付けの中の実在する
+ *   画像のパスを `[Image #N]` の添付に置き換える（実測 2.1.284: 貼り付けの全体がパスのとき。
+ *   パスが 2 つ以上並ぶときは、後ろに本文が続いていても置き換わり、語の順序まで変わる）。
+ *   アプリは添付のパスを本文の前に空白区切りで並べる（`p1 p2 本文`）。拡張子の「.」の直後で
+ *   分けると、前半は拡張子が無く、後半はパスの形をしていない
+ */
+export function splitForInlinePaste(text: string): string[] {
+  const pieces: string[] = [];
+  let current = "";
+  let bytes = 0;
+  let newlines = 0;
+  const flush = (): void => {
+    if (current === "") return;
+    let start = 0;
+    for (const match of current.matchAll(EXTENSION_DOT)) {
+      pieces.push(current.slice(start, match.index + 1));
+      start = match.index + 1;
+    }
+    if (start < current.length) pieces.push(current.slice(start));
+    current = "";
+    bytes = 0;
+    newlines = 0;
+  };
+  for (const { segment } of GRAPHEMES.segment(text)) {
+    const breaks = segment === "\n" ? 1 : 0;
+    const size = Buffer.byteLength(segment);
+    if (
+      current.length + segment.length > INLINE_PASTE_MAX_CHARS ||
+      bytes + size > INLINE_PASTE_MAX_BYTES ||
+      newlines + breaks > INLINE_PASTE_MAX_NEWLINES
+    ) {
+      flush();
+    }
+    current += segment;
+    bytes += size;
+    newlines += breaks;
+    // 改行で終わる形にそろえる（行の途中から始まる貼り付けを作らない）。
+    if (newlines >= INLINE_PASTE_MAX_NEWLINES) flush();
+  }
+  flush();
+  return pieces;
+}
+
+const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+/** ボトムバーの位置に `paste again to expand` が出ているか（常駐 TUI 行は読み飛ばす, TESTABLE）。 */
+export function screenShowsPasteHint(screen: string): boolean {
+  const lines = screen
+    .split("\n")
+    .map((line) => stripSgr(line).trim())
+    .filter((line) => line !== "");
+  let index = lines.length - 1;
+  while (index >= 0 && isTrailingTuiLine(lines[index] ?? "")) index -= 1;
+  return lines[index] === PASTE_EXPAND_HINT;
+}
+
+/** 照合用にそろえる: 結合文字は合成済み、空白類・不可視文字・制御文字は落とす。 */
+function normalizePastedForMatch(value: string): string {
+  return normalizeForTextMatch(value.normalize("NFC")).replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
+}
+
+/**
+ * 入力欄が長い本文の中ほどを置き換えて映す表示（実測 2.1.284）。入力欄の本文が約 10000 字を
+ * 超えると、CLI は「先頭約 500 字 + `[...Truncated text #N +M lines...]` + 末尾」の形で映す
+ * （表示だけ。送信される本文は全文）。語の途中でも置き換わる。
+ */
+const TRUNCATED_DISPLAY = /\[\.\.\.Truncated text #\d+(?: \+\d+ lines)?\.\.\.\]/g;
+
+/**
+ * 入力欄に映っている本文が、`text` の一部として順に現れるか（TESTABLE）。
+ * 置き換えの表示（`TRUNCATED_DISPLAY`）で区切られた各部分が、`text` の中にこの順で現れることを
+ * 確かめる。`anchoredAtEnd` なら、最後の部分は `text` の末尾と同文でなければならない。
+ * 一致した字数を返す（一致しなければ -1）。照合は空白類・不可視文字を落とした形で行う。
+ */
+export function matchInputBoxAgainstText(boxText: string, text: string, anchoredAtEnd: boolean): number {
+  const body = normalizePastedForMatch(text);
+  // 本文そのものが置き換えの表示と同じ文言を含むことがある。先に、そのままの形で照合する。
+  const whole = normalizePastedForMatch(boxText);
+  if (whole.length > 0 && (anchoredAtEnd ? body.endsWith(whole) : body.includes(whole))) return whole.length;
+  const parts = boxText.split(TRUNCATED_DISPLAY).map(normalizePastedForMatch);
+  let cursor = 0;
+  let matched = 0;
+  for (const [index, part] of parts.entries()) {
+    const last = index === parts.length - 1;
+    if (part.length === 0) {
+      // 置き換えの表示で終わる入力欄は、末尾を確かめられない。
+      if (last && anchoredAtEnd && parts.length > 1) return -1;
+      continue;
+    }
+    if (last && anchoredAtEnd) {
+      if (!body.endsWith(part) || body.length - part.length < cursor) return -1;
+    } else {
+      const at = body.indexOf(part, cursor);
+      if (at === -1) return -1;
+      cursor = at + part.length;
+    }
+    matched += part.length;
+  }
+  return matched === 0 ? -1 : matched;
+}
+
+/**
+ * 貼り付けた本文が入力欄に入ったか（TESTABLE）。**入力欄に映っている全体が、本文の末尾と同文**
+ * であることで確かめる（入力欄は長い本文の末尾側だけを映す）。pty は先入れ先出しなので、最後の
+ * 貼り付けが入っていれば、その前の貼り付けも CLI が読み終えている。
+ * 約 10000 字を超える本文は、中ほどが置き換えの表示になる（`matchInputBoxAgainstText`）。
+ *
+ * 末尾の数十字だけを探す照合にはしない。各行の終わりが同じ文言の本文（表・ログ）だと、途中まで
+ * 入った時点で一致してしまう。CLI の処理が止まっている最中にそうなると、続けて打つ Enter が
+ * 貼り付けの残りと一緒に読まれて改行として本文に入り、送信されないまま入力欄に残る（実測
+ * 2.1.284: 30 行の本文を 11 行まで入った時点で止めた）。
+ */
+export function pastedTextArrived(boxText: string, text: string): boolean {
+  const matched = matchInputBoxAgainstText(boxText, text, true);
+  // 先頭の `!`（シェルモード）は CLI がモード記号として吸い上げ、入力欄の本文には残らない。
+  return matched >= Math.min(24, normalizePastedForMatch(text).replace(/^!/, "").length) && matched > 0;
+}
+
+/**
+ * 入力欄に映っているのが、貼り付けた本文の一部か（TESTABLE）。貼り付けが途中まで入った形
+ * （CLI がまだ読んでいる / 処理が止まっている）を、別の中身と見分ける。
+ */
+export function pastedTextPartlyArrived(boxText: string, text: string): boolean {
+  return matchInputBoxAgainstText(boxText, text, false) > 0;
+}
+
+/** 本文を小分けの貼り付けで渡すための入出力（tmux / herdr が与える）。 */
+export interface PastedTextIo {
+  /** 小分けにした本文を、1 つずつ括弧付き貼り付けとして、順に渡す。 */
+  paste: (pieces: string[]) => Promise<void>;
+  /** viewport を ANSI 付きで撮る（撮れなければ null）。 */
+  capture: () => Promise<string | null>;
+  /** C-u（kill-line）を `count` 回、続けて打つ。 */
+  sendKills: (count: number) => Promise<void>;
+  /** 入力欄に入ったのを確かめる間隔と上限（ms）。 */
+  pollMs: number;
+  timeoutMs: number;
+  /** C-u をまとめて打った後、画面を撮り直すまでの間隔（ms）。 */
+  clearDelayMs: number;
+  /** C-u をまとめて打った後、入力欄が変わるのを待つ上限（ms。既定 `TYPED_TEXT_CLEAR_SETTLE_MS`）。 */
+  clearSettleMs?: number;
+  /** 貼り付けが入るのを待つのを、遅くともこの時刻（epoch ms）で打ち切る。 */
+  verifyDeadlineMs?: number;
+}
+
+/** 貼り付けが入力欄に入るのを待つ上限と、確かめる間隔の既定（ms）。実測は 0.3 秒以内に入る。 */
+export const PASTED_TEXT_TIMEOUT_MS = 3_000;
+/**
+ * tmux で待つ上限の既定（ms）。tmux は確かめられなくても送信確定へ進むので、長く待つ意味が薄い
+ * （画面が崩れて読めない間は、貼り付けで渡す送信のたびにこの時間がかかる）。入っている途中なら延ばす。
+ */
+export const PASTED_TEXT_TIMEOUT_TMUX_MS = 1_500;
+/**
+ * 入っている途中なら待つ時間を延ばす。その上限（`timeoutMs` の何倍まで。既定で 9 秒）。
+ * 注入の全体（前後の確認 約 1 秒・貼り付けの送出 約 1 秒・送信確定 最大 3.4 秒を含む）を、
+ * アプリが応答を待つ 18 秒の内側に収める。herdr は、まれに入り切るまで数秒かかる（実測:
+ * 10000 字が 7.5 秒で入り切らなかった回が 40 回に 1 回）。
+ */
+const PASTED_TEXT_MAX_EXTENSIONS = 3;
+export const PASTED_TEXT_POLL_MS = 100;
+
+/** C-u を 1 回にまとめて打つ数（貼り付けと判定される大きさには遠く届かない）。 */
+const TYPED_TEXT_KILL_BATCH = 40;
+/**
+ * C-u をまとめて打った後、入力欄が変わるのを待つ上限（ms）。長い本文は、1 回消すたびに入力欄の
+ * 描き直しがかかり、40 回ぶんの反映に 1 秒以上かかる（実測 herdr: 10000 字の本文。150ms おきに
+ * 3 回見て変わらなければ諦める作りでは、消している途中で諦め、先頭の 468 字が残った）。
+ */
+export const TYPED_TEXT_CLEAR_SETTLE_MS = 1_500;
+/** まとめて打った後、入力欄を撮り直す間隔の上限（ms）。 */
+const CLEAR_POLL_MS = 50;
+/** まとめて打っても入力欄が変わらない回が続いたら諦める回数。 */
+const TYPED_TEXT_CLEAR_IDLE_LIMIT = 2;
+
+/**
+ * 入れかけの長い本文を入力欄から消す（TESTABLE）。空にできたら true。
+ *
+ * C-u（kill-line）は 1 回で 1 行ぶんしか消えない: 多行の本文は末尾行 → その改行の順に消え、
+ * N 行なら 2N-1 回かかる（実測 2.1.220）。回数を固定（`clearInputBox` は 15 回）にすると
+ * 9 行以上の本文は途中までしか消えない。40 回ずつまとめて打ち、**入力欄が空になるまで、
+ * 進んでいる限り続ける**（上限は本文の大きさから決める）。まとめて打った後は、入力欄が変わるのを
+ * `clearSettleMs` まで待つ。2 回続けて変わらなければ諦める（同じ行が並ぶ本文は、消えていても
+ * 映っている範囲が同じに見えるので、1 回では諦めない）。空の入力欄への C-u は何もしない。
+ * 入力欄のフレームと確かめられないとき（ダイアログ・判別不能）は 1 キーも打たない。
+ */
+export async function clearTypedInput(
+  text: string,
+  io: Pick<PastedTextIo, "capture" | "sendKills" | "clearDelayMs" | "clearSettleMs">,
+): Promise<boolean> {
+  const maxKills = 2 * text.split("\n").length + Math.ceil(Array.from(text).length / 20) + TYPED_TEXT_KILL_BATCH;
+  const settleMs = io.clearSettleMs ?? TYPED_TEXT_CLEAR_SETTLE_MS;
+  let screen = await io.capture();
+  let idle = 0;
+  for (let sent = 0; ; sent += TYPED_TEXT_KILL_BATCH) {
+    const frame = classifySubmitFrame(screen);
+    if (frame === "submitted") return true;
+    if (screen === null || frame !== "pending" || sent >= maxKills) return false;
+    const before = inputBoxRealText(screen);
+    await io.sendKills(TYPED_TEXT_KILL_BATCH);
+    // 打った分が効き終わるのを待つ: 入力欄が変わり始め、その後 3 回続けて同じになるまで。
+    // 効いている途中で次を打つと、上限の回数を先に使い切る（消し切る前に諦める）。
+    const deadline = Date.now() + settleMs;
+    let changed = false;
+    let previous = before;
+    let quiet = 0;
+    for (let polls = 0; quiet < 3 && (changed || polls < 3 || Date.now() < deadline); polls += 1) {
+      await new Promise((resolve) => setTimeout(resolve, Math.min(io.clearDelayMs, CLEAR_POLL_MS)));
+      screen = await io.capture();
+      if (classifySubmitFrame(screen) !== "pending") {
+        changed = true;
+        break;
+      }
+      const now = inputBoxRealText(screen ?? "");
+      if (now !== before) changed = true;
+      quiet = changed && now === previous ? quiet + 1 : 0;
+      previous = now;
+    }
+    idle = changed ? 0 : idle + 1;
+    if (idle >= TYPED_TEXT_CLEAR_IDLE_LIMIT) return false;
+  }
+}
+
+/**
+ * 行数の分からない残存を消すときの上限（`clearTypedInput` の本文の代わりに渡す）。
+ * 400 行ぶん（C-u 約 800 回）まで。
+ */
+export const CLEAR_UNKNOWN_INPUT_BOUND = "\n".repeat(400);
+
+/** 貼り付けの送出が途中で失敗し、入った分を入力欄から消した（= 非配達が確定）ときの拒否文言。 */
+export const CHAT_BLOCKED_BY_UNTYPED_TEXT =
+  "長いメッセージを入力欄へ正しく入力できなかったため、送信しませんでした（もう一度送ってください）";
+
+/**
+ * 注入を始めてから、貼り付けが入ったのを確かめ終えるまでに使ってよい時間（ms）。アプリは応答を
+ * 18 秒待つ。この後の送信確定（最大で tmux 3.4 秒 / herdr 5.2 秒）を引いた残りに収める。
+ */
+export const INJECT_VERIFY_BUDGET_MS = 12_000;
+
+/** 貼り付けた本文が入力欄に入ったのを、確かめられたか。 */
+export type PasteOutcome = "arrived" | "unverified";
+
+/**
+ * 本文を、小分けの括弧付き貼り付けで入力欄へ入れる（tmux / herdr 共通, long-text-paste）。
+ *
+ * ```
+ * 小分けにして順に貼り付ける（splitForInlinePaste）
+ * 100ms ごとに最大 3 秒、入力欄に入ったのを確かめる（pastedTextArrived）→ `arrived`
+ *   （入っている途中で、進んでいる間は延ばす。最大 9 秒。注入を始めてから 12 秒まで）
+ * 確かめられなかった → `unverified`（1 キーも打たない。どう扱うかは backend が決める）
+ * 貼り付けの送出が途中で失敗した:
+ *   入った分が入力欄に映っている → 消す（clearTypedInput）。空にできたら
+ *                                    ChatInjectionRejectedError（非配達が確定）
+ *   それ以外                     → 送出のエラーをそのまま返す
+ * ```
+ *
+ * 貼り付けは打鍵と違い、読み取りの境界・タブ・結合文字で壊れない。1 つが 800 字以下・改行 2 個
+ * 以下なら CLI は畳まずに本文のまま入力欄へ入れるので、**打った場合と同じ本文が記録される**
+ * （`<pasted_content>` の包みが付かない）。
+ *
+ * **確かめられなかったときの扱いは、本文を打つ場合（変更前からの経路）と同じにする**:
+ * - tmux: そのまま送信確定へ進む（Enter を押し、成立を確認できなければ `onUnconfirmedSubmit`）。
+ *   画面を読めないだけのことがある（実測: 肌色付きの ✌🏽 などを含む発話の後、tmux の画面が
+ *   崩れて入力欄が 1 行ずれる）。Enter は貼り付けの後ろに並ぶので、途中までの本文が送信される
+ *   ことは無い
+ * - herdr: 失敗として返す（打つ場合の反映検証と同じ。Remote Control 切断直後は入力が捨てられ、
+ *   確かめずに進むと「送信成立」と誤判定する）
+ *
+ * 採らなかった方式:
+ * - **小分けにして打つ**: タブのカーソルずれ・処理の停止・結合文字で、順序の崩れた本文や先頭が
+ *   重複した本文が黙って届いた（独立検証が実 claude で再現）。
+ * - **全文を 1 つの貼り付けで渡す**: 入力欄は `[Pasted text #N +M lines]` になり、本文は包まれて
+ *   記録される。確かめる根拠が改行の数しか無く、同じ行数の別の貼り付け（Mac 側の下書き）と
+ *   見分けられない。包みは Claude に「利用者が書いたとは限らない内容」と伝えるためのもので、
+ *   利用者の指示の全体をその扱いにしてしまう。会話の一覧・タイトル・検索にも包みが出る。
+ * - **確かめられなかった本文を控えて、後から入った分を消す**（控え・確認用の印）: CLI が止まった
+ *   ときの「ちょうど 1 通」は守れるが、画面の読み取りに頼る判定が増え、それ自体が誤配送と
+ *   送信不能の源になった（独立検証 5 周: 印が発話として届く・下書きを削る・画面が崩れると
+ *   以後の送信がすべて拒否される）。
+ */
+export async function pasteTextInline(text: string, io: PastedTextIo): Promise<PasteOutcome> {
+  const body = normalizeTextForPaste(text);
+  try {
+    await io.paste(splitForInlinePaste(body));
+  } catch (error) {
+    // 途中まで入った本文を残すと、次の送信の冒頭で断片が独立した発話として送られる。
+    const screen = await io.capture();
+    const box = screen === null ? null : inputBoxRealText(screen);
+    if (classifySubmitFrame(screen) === "pending" && box !== null && pastedTextPartlyArrived(box, body) &&
+      (await clearTypedInput(body, io))) {
+      throw new ChatInjectionRejectedError(CHAT_BLOCKED_BY_UNTYPED_TEXT);
+    }
+    throw error;
+  }
+  const started = Date.now();
+  const hardDeadline = Math.min(
+    started + io.timeoutMs * PASTED_TEXT_MAX_EXTENSIONS,
+    io.verifyDeadlineMs ?? Number.POSITIVE_INFINITY,
+  );
+  let deadline = Math.min(started + io.timeoutMs, hardDeadline);
+  let previous: string | null = null;
+  for (;;) {
+    await new Promise((resolve) => setTimeout(resolve, io.pollMs));
+    const screen = await io.capture();
+    const box = screen === null ? null : inputBoxRealText(screen);
+    if (box !== null && pastedTextArrived(box, body)) return "arrived";
+    // 入っている途中（入力欄が本文の一部で、前回から進んだ）なら、待つ時間を延ばす。CLI は
+    // 続けて届いた貼り付けを、1 つずつ時間をかけて取り込むことがある。
+    if (box !== null && box !== previous && previous !== null && pastedTextPartlyArrived(box, body)) {
+      deadline = Math.min(Date.now() + io.timeoutMs, hardDeadline);
+    }
+    previous = box;
+    if (Date.now() >= deadline) return "unverified";
+  }
+}
+
+/**
  * 入力欄の残存テキストが、transcript に記録済みの発話本文と同文か（restored-prompt-discard）。
  *
  * 入力欄の描画は折り返し（trim + 改行連結）・composer スクロールで先頭行が窓外に出る・シェルモード
@@ -237,9 +784,16 @@ export interface SendTextSubmitOptions {
  * 生で比べると、貼り付け由来のゼロ幅文字 1 つで照合が外れる。
  */
 export function inputBoxTextMatchesRecordedPrompt(boxText: string, recordedPrompt: string): boolean {
-  const normalize = (value: string): string => normalizeForTextMatch(value).replace(/^!/, "");
+  // Mac 側で貼り付けて送った発話は、中断で `[Pasted text #N]` として書き戻される。表示からは
+  // 本文が分からない（同じ行数の別の貼り付けと見分けられない）ので、同文とは判定しない。
+  const normalize = (value: string): string =>
+    normalizeForTextMatch(value.normalize("NFC")).replace(/^!/, "");
+  // 約 10000 字を超える発話は、中ほどが置き換えの表示になって書き戻される。
+  if (boxText.search(TRUNCATED_DISPLAY) !== -1) {
+    return matchInputBoxAgainstText(boxText, unwrapPastedContent(recordedPrompt), true) >= 24;
+  }
   const pending = normalize(boxText);
-  const recorded = normalize(recordedPrompt);
+  const recorded = normalize(unwrapPastedContent(recordedPrompt));
   if (pending.length === 0 || recorded.length === 0) return false;
   if (pending === recorded) return true;
   return pending.length >= 24 && recorded.endsWith(pending);
@@ -264,26 +818,14 @@ export function extractInputBoxSuggestion(ansiScreen: string): string | null {
  */
 function analyzeInputBox(ansiScreen: string): { text: string; faintOnly: boolean } | null {
   const rawLines = ansiScreen.split("\n").map((line) => line.replace(/\r$/, ""));
-  const stripped = rawLines.map((line) => stripSgr(line).trim());
+  const plain = rawLines.map((line) => stripSgr(line));
+  const stripped = plain.map((line) => line.trim());
 
   // 罫線ペアで入力欄領域を特定する（extractClaudeInputBox と同じ規則を SGR 除去後の行へ）。
-  let bottom = -1;
-  for (let index = stripped.length - 1; index >= 0; index -= 1) {
-    if (isInputBoxRuleLine(stripped[index] ?? "")) {
-      bottom = index;
-      break;
-    }
-  }
-  let top = -1;
-  for (let index = bottom - 1; index >= 0; index -= 1) {
-    if (isInputBoxRuleLine(stripped[index] ?? "")) {
-      top = index;
-      break;
-    }
-  }
+  const frame = findInputBoxFrame(plain);
   let bodyRaw: string[];
-  if (top >= 0 && bottom > top) {
-    bodyRaw = rawLines.slice(top + 1, bottom);
+  if (frame !== null) {
+    bodyRaw = rawLines.slice(frame.top + 1, frame.bottom);
   } else {
     // 罫線が無い画面は最後の `❯` 行 1 行だけを入力欄とみなす（extractClaudeInputBox と同型）。
     let sigilIndex = -1;
@@ -298,7 +840,8 @@ function analyzeInputBox(ansiScreen: string): { text: string; faintOnly: boolean
   }
 
   // プレースホルダー（文言一致）は "" 扱い（extractClaudeInputBox が担保・後方互換）。
-  const box = extractClaudeInputBox(stripped.join("\n"));
+  // 字下げを残した行を渡す（trim した行を渡すと、入力欄の中の罫線だけの行を枠と取り違える）。
+  const box = extractClaudeInputBox(plain.join("\n"));
   if (box === null) return null;
   return { text: box.text, faintOnly: bodyIsFaintOnly(bodyRaw) };
 }
@@ -537,6 +1080,8 @@ export function loginCodeScreenState(screen: string): LoginCodeScreenState {
   const tail = lines.slice(-LOGIN_TAIL_WINDOW - 8);
   const rules = tail.filter((line) => isInputBoxRuleLine(line.trim())).length;
   if (rules >= 2) return "accepted";
+  // 名前付きの会話は、上の罫線にタイトルが埋まって罫線に数えられない。入力欄の形で読む。
+  if (findFrameAbovePrompt(tail) !== null) return "accepted";
   return "pending";
 }
 
@@ -732,9 +1277,9 @@ export function processTmuxCommandRunner(
   tmuxPath: string = DEFAULT_TMUX_PATH,
   timeoutMs: number = TMUX_TIMEOUT_MS,
 ): TmuxCommandRunner {
-  return (args) =>
+  return (args, input) =>
     new Promise((resolve, reject) => {
-      execFile(tmuxPath, args, {
+      const child = execFile(tmuxPath, args, {
         maxBuffer: 16 * 1024 * 1024, timeout: timeoutMs,
       }, (error, stdout, stderr) => {
         if (error && typeof (error as NodeJS.ErrnoException).code === "string") {
@@ -745,6 +1290,12 @@ export function processTmuxCommandRunner(
         const exitCode = error && typeof error.code === "number" ? error.code : error ? 1 : 0;
         resolve({ exitCode, stdout: String(stdout), stderr: String(stderr) });
       });
+      // 標準入力で渡す本文（`load-buffer -`）。tmux が読まずに終わっても落ちないよう、書き込みの
+      // 失敗は握る（結果は exit code で返る）。
+      if (input !== undefined) {
+        child.stdin?.on("error", () => {});
+        child.stdin?.end(input);
+      }
     });
 }
 
@@ -944,6 +1495,155 @@ export const CHAT_BLOCKED_BY_STUCK_CHOICE =
   "選択肢を閉じられなかったため、メッセージを送信しませんでした（アプリで選択肢に答えるか、Mac 側の画面で閉じてください）";
 
 /**
+ * キュー済みの発話の直下に出る「今すぐ送信」ヒント行の状態（chat-send-now, TESTABLE）。
+ * - `absent`: ヒント行が無い = CLI のキューに利用者の発話は無い。
+ * - `ready`: 既定のキー割り当てのヒントが出ている。
+ * - `rebound`: ヒントは出ているが、キー割り当てが既定と違う（利用者が keybindings を変えた）。
+ */
+export type SendNowHintState = "absent" | "ready" | "rebound";
+
+/** ヒント行の末尾（実測 2.1.283。chord の表記だけが端末で変わる）。 */
+const SEND_NOW_HINT_SUFFIX = " to send now";
+
+/**
+ * 既定の `chat:sendNow` の表記。tmux は `ctrl+x ctrl+s`、拡張キーを解する端末（herdr）は
+ * `ctrl+enter` を出す（どちらの端末でも既定の割り当ては両方生きている）。
+ */
+const SEND_NOW_DEFAULT_CHORDS = new Set(["ctrl+x ctrl+s", "ctrl+enter"]);
+
+/**
+ * chord の表記か（`ctrl+j` / `alt+enter` / `ctrl+x ctrl+k` など。修飾キー + キーが 1〜2 打）。
+ * 過去の発話の折り返しが偶然 ` to send now` で終わっただけの行を、割り当て変更と取り違えない。
+ */
+const CHORD_NOTATION = /^(?:ctrl|alt|shift|meta|cmd|super)\+\S+(?: (?:(?:ctrl|alt|shift|meta|cmd|super)\+)?\S+)?$/;
+
+/** ヒント行を探す viewport 末尾の非空行数（スピナー・Tip・タスク一覧・agents パネルを挟む）。 */
+const SEND_NOW_HINT_WINDOW_LINES = 40;
+
+/** ヒント行から上へ、キュー済み発話の `❯` 行を探す行数（折り返した長い発話・複数件のキュー）。 */
+const SEND_NOW_QUEUE_WALK_LINES = 40;
+
+/**
+ * 画面に「今すぐ送信」のヒントが出ているか。実測 2.1.283 の形:
+ *
+ * ```
+ * ❯ キュー済みの発話（長ければ 2 桁字下げで折り返す）
+ *   ctrl+x ctrl+s to send now
+ * ✽ Proofing… (9s · ↓ 183 tokens)
+ * ────────
+ * ❯ Press up to edit queued messages
+ * ```
+ *
+ * 会話本文がこの文言を引用しただけで拾わないよう、**ヒント行のすぐ上がキュー済みの発話**
+ * （`❯` で始まる行と、その折り返し）であることを要求する。応答本文は `⏺` で始まるので、
+ * 本文中の引用は上へ辿ると先に `⏺` に当たって外れる。
+ * 誤検出しても実害は無い（キューが空のときの chord は何もしない。実測）。
+ */
+export function screenSendNowHint(screen: string): SendNowHintState {
+  const lines = screen.split("\n").map((line) => stripSgr(line).trimEnd());
+  let scanned = 0;
+  for (let index = lines.length - 1; index >= 0 && scanned < SEND_NOW_HINT_WINDOW_LINES; index -= 1) {
+    const line = lines[index] ?? "";
+    const trimmed = line.trim();
+    if (trimmed === "") continue;
+    scanned += 1;
+    if (!line.startsWith("  ") || !trimmed.endsWith(SEND_NOW_HINT_SUFFIX)) continue;
+    if (!lineFollowsQueuedPrompt(lines, index)) continue;
+    const chord = trimmed.slice(0, -SEND_NOW_HINT_SUFFIX.length).trim().toLowerCase();
+    if (SEND_NOW_DEFAULT_CHORDS.has(chord)) return "ready";
+    if (CHORD_NOTATION.test(chord)) return "rebound";
+  }
+  return "absent";
+}
+
+/** `index` の行から上へ折り返し（字下げ行）と空行だけを辿って、`❯` で始まる行に着くか。 */
+function lineFollowsQueuedPrompt(lines: string[], index: number): boolean {
+  for (let walked = 0, cursor = index - 1; cursor >= 0 && walked < SEND_NOW_QUEUE_WALK_LINES; cursor -= 1) {
+    const line = lines[cursor] ?? "";
+    if (line.trim() === "") continue;
+    walked += 1;
+    if (line.codePointAt(0) === 0x276f) return true;
+    if (!line.startsWith("  ")) return false;
+  }
+  return false;
+}
+
+/** `sendQueuedNow` の結果（ワイヤーの `chat_send_now_result.status` と同じ 4 値）。 */
+export type SendQueuedNowOutcome =
+  | { status: "sent" }
+  | { status: "nothing_queued" }
+  | { status: "blocked"; reason: string }
+  | { status: "failed"; reason: string };
+
+export const SEND_NOW_BLOCKED_BY_DIALOG =
+  "ダイアログの表示中は「今すぐ送信」できません（アプリで選択肢に答えてからもう一度試してください）";
+export const SEND_NOW_BLOCKED_BY_DRAFT =
+  "Mac 側の入力欄に入力中の文字があるため「今すぐ送信」しませんでした（その文字ごと送信されるのを防ぐため）";
+export const SEND_NOW_BLOCKED_BY_UNREADABLE =
+  "画面を確認できなかったため「今すぐ送信」しませんでした（少し待ってもう一度試してください）";
+export const SEND_NOW_BLOCKED_BY_REBOUND =
+  "Claude Code のキー割り当てが変更されているため「今すぐ送信」できません（chat:sendNow を既定に戻してください）";
+export const SEND_NOW_UNCONFIRMED =
+  "「今すぐ送信」を送りましたが、届いたことを確認できませんでした";
+export const SEND_NOW_EXPIRED_IN_QUEUE =
+  "先に送ったメッセージの処理に時間がかかったため「今すぐ送信」しませんでした（もう一度試してください）";
+
+/**
+ * chord 後にヒント行の消滅を確かめる間隔と回数の既定（合計 約 6s）。短い発話は 0.7s 以内に消えるが、
+ * 貼り付け扱いの長文（約 800 字超）は 4.5s かかった（実測 2.1.283）。届いているのに `failed` を
+ * 返すと、利用者は届いた発話をもう一度流そうとする。
+ */
+export const SEND_NOW_POLL_MS = 300;
+export const SEND_NOW_MAX_POLLS = 20;
+/** 判別できないフレーム（描画の途中）を撮り直す回数。chord を送る前だけ（合計 約 1.5s）。 */
+export const SEND_NOW_SETTLE_POLLS = 5;
+
+
+/**
+ * CLI のキューに溜まっている発話を今すぐ届ける（tmux / herdr 共通, chat-send-now）。
+ * CLI の `chat:sendNow` を 1 回送り、ヒント行が消えたことを確かめる。
+ *
+ * 実測 2.1.283:
+ * - ツールの実行中: ツールが背景へ回り、発話は同じターンへ届く（`queued_command`）。
+ * - 応答の生成中 / `/` で始まる発話（添付のパス）: そのターンを打ち切り、発話は新しいターンで届く。
+ * - キューが空 / アイドル: 何も起きない。
+ * - **入力欄に文字がある: その文字ごと送信される**。Mac 側の下書きを勝手に送らないよう、
+ *   入力欄が空と確かめられたフレームでだけ送る（fail-closed）。
+ */
+export async function sendQueuedNow(io: {
+  capture: () => Promise<string | null>;
+  sendChord: () => Promise<void>;
+  pollMs: number;
+  maxPolls: number;
+  /** 判別できないフレームを撮り直す回数（既定 `SEND_NOW_SETTLE_POLLS`）。 */
+  settlePolls?: number;
+}): Promise<SendQueuedNowOutcome> {
+  let screen = await io.capture();
+  let frame = classifySubmitFrame(screen);
+  // 描画の途中でバーが欠けたフレームは、少し待つと読める。読めるまで chord は送らない。
+  for (let poll = 0; poll < (io.settlePolls ?? SEND_NOW_SETTLE_POLLS) && frame === "unknown"; poll += 1) {
+    await new Promise((resolve) => setTimeout(resolve, io.pollMs));
+    screen = await io.capture();
+    frame = classifySubmitFrame(screen);
+  }
+  if (frame === "dialog") return { status: "blocked", reason: SEND_NOW_BLOCKED_BY_DIALOG };
+  if (screen === null || frame === "unknown") {
+    return { status: "blocked", reason: SEND_NOW_BLOCKED_BY_UNREADABLE };
+  }
+  if (frame === "pending") return { status: "blocked", reason: SEND_NOW_BLOCKED_BY_DRAFT };
+  const hint = screenSendNowHint(screen);
+  if (hint === "absent") return { status: "nothing_queued" };
+  if (hint === "rebound") return { status: "blocked", reason: SEND_NOW_BLOCKED_BY_REBOUND };
+  await io.sendChord();
+  for (let poll = 0; poll < io.maxPolls; poll += 1) {
+    await new Promise((resolve) => setTimeout(resolve, io.pollMs));
+    const after = await io.capture();
+    if (after !== null && screenSendNowHint(after) === "absent") return { status: "sent" };
+  }
+  return { status: "failed", reason: SEND_NOW_UNCONFIRMED };
+}
+
+/**
  * 画面最下部に composer のボトムバーが出ているか＝「いま見ているのは入力欄であって
  * ダイアログではない」か（TESTABLE。text / ANSI どちらのキャプチャでも使える）。
  *
@@ -966,8 +1666,18 @@ export function claudeComposerBarVisible(screen: string): boolean {
   let index = lines.length - 1;
   while (index >= 0 && isTrailingTuiLine(lines[index] ?? "")) index -= 1;
   const candidate = lines[index];
-  return candidate !== undefined && isComposerBarLine(candidate);
+  if (candidate === undefined) return false;
+  if (isComposerBarLine(candidate)) return true;
+  // 貼り付けを取り込んだ後の十数秒は、バーの位置が `paste again to expand` に替わる（実測
+  // 2.1.283。Mac 側で貼り付けた直後も同じ）。入力欄の罫線が見えているときだけバーの代わりと
+  // 認める。認めないと、その間の送信はすべて成立を確認できない（`unknown`）。
+  // ダイアログはフッターが先に判定される（実測: 貼り付けの直後に承認・設問が出ると、
+  // 案内は残らずダイアログのフッターへ置き換わる）。
+  return candidate.trim() === PASTE_EXPAND_HINT && claudeInputBoxRendered(screen);
 }
+
+/** 貼り付けを取り込んだ直後、ボトムバーの位置に出る案内（実測 2.1.283）。 */
+const PASTE_EXPAND_HINT = "paste again to expand";
 
 /**
  * 送信確定ループ 1 フレーム分の判定（純ロジック, TESTABLE）。
@@ -1017,6 +1727,14 @@ export class TmuxSessionManager {
   private readonly submitVerifyDelayMs: number;
   /** 選択ダイアログを Esc で閉じた後の消滅確認の間隔 ms（テスト注入用）。 */
   private readonly choiceCancelPollMs: number;
+  /** 「今すぐ送信」の chord 後、ヒント行の消滅確認の間隔 ms（テスト注入用）。 */
+  private readonly sendNowPollMs: number;
+  /** 貼り付けた本文が入力欄に入るのを確かめる間隔と上限 ms（テスト注入用）。 */
+  private readonly pastedTextPollMs: number;
+  private readonly pastedTextTimeoutMs: number;
+  private readonly clearSettleMs: number;
+  /** 貼り付けバッファ名の通番。 */
+  private pasteSequence = 0;
 
   constructor(options: {
     runner?: TmuxCommandRunner;
@@ -1028,6 +1746,11 @@ export class TmuxSessionManager {
     submitDelayMs?: number;
     submitVerifyDelayMs?: number;
     choiceCancelPollMs?: number;
+    sendNowPollMs?: number;
+    pastedTextPollMs?: number;
+    pastedTextTimeoutMs?: number;
+    /** C-u をまとめて打った後、入力欄が変わるのを待つ上限（テスト用に短くできる）。 */
+    clearSettleMs?: number;
   } = {}) {
     this.runner = options.runner ?? processTmuxCommandRunner();
     this.store = options.store ?? new SessionMetadataStore();
@@ -1037,6 +1760,10 @@ export class TmuxSessionManager {
     this.submitDelayMs = options.submitDelayMs ?? 150;
     this.submitVerifyDelayMs = options.submitVerifyDelayMs ?? 700;
     this.choiceCancelPollMs = options.choiceCancelPollMs ?? CHOICE_CANCEL_POLL_MS;
+    this.sendNowPollMs = options.sendNowPollMs ?? SEND_NOW_POLL_MS;
+    this.pastedTextPollMs = options.pastedTextPollMs ?? PASTED_TEXT_POLL_MS;
+    this.pastedTextTimeoutMs = options.pastedTextTimeoutMs ?? PASTED_TEXT_TIMEOUT_TMUX_MS;
+    this.clearSettleMs = options.clearSettleMs ?? TYPED_TEXT_CLEAR_SETTLE_MS;
     this.loginTiming = {
       delayMs: options.loginTiming?.delayMs ?? 150,
       pollMs: options.loginTiming?.pollMs ?? 250,
@@ -1167,6 +1894,7 @@ export class TmuxSessionManager {
    * literal 送出 → 150ms（Ink 再描画待ち）→ Enter。
    */
   async sendTextSubmit(name: string, text: string, options: SendTextSubmitOptions = {}): Promise<void> {
+    const startedAtMs = Date.now();
     // 1 回の capture で「/login フロー中か」と「残存テキスト」を判定する（chat 毎の capture を増やさない）。
     const screen = await this.captureVisibleScreenOrNull(name);
     // `/login` フロー中（方式選択 / コード入力待ち / retry）は通常の入力欄が無く、注入した本文が
@@ -1256,8 +1984,64 @@ export class TmuxSessionManager {
     // 記号を消して通常入力へ戻す。`!` 始まりの本文は注入時に自分でシェルモードへ入るので、
     // 常に通常モードから始めるのが決定的で安全（herdr 側 exitShellMode と同じ防御）。
     await this.exitShellMode(name);
-    await this.sendKeys(name, [text], true);
-    if ((await this.submitTypedText(name)) !== "submitted") options.onUnconfirmedSubmit?.();
+    let pasted: PasteOutcome = "arrived";
+    if (tmuxTypedTextWouldBreak(text) && textIsPasteSafe(text) && typedTextProbe(text) !== null) {
+      // 1 回で打つと壊れる本文は、小分けの括弧付き貼り付けで渡す（long-text-paste）。
+      // 入ったのを確かめられなくても、打つ場合と同じく送信確定へ進む（画面を読めないだけの
+      // ことがある。Enter は貼り付けの後ろに並ぶので、途中までの本文が送信されることは無い）。
+      pasted = await pasteTextInline(text, {
+        paste: (pieces) => this.pasteBracketed(name, pieces),
+        capture: () => this.captureVisibleScreenAnsiOrNull(name),
+        sendKills: (count) => this.sendKeys(name, Array.from({ length: count }, () => "C-u")),
+        pollMs: this.pastedTextPollMs,
+        timeoutMs: this.pastedTextTimeoutMs,
+        clearDelayMs: this.clearKeyDelayMs,
+        clearSettleMs: this.clearSettleMs,
+        verifyDeadlineMs: startedAtMs + INJECT_VERIFY_BUDGET_MS,
+      });
+    } else {
+      await this.sendKeys(name, [text], true);
+    }
+    const outcome = await this.submitTypedText(name);
+    // 入ったのを確かめられなかった貼り付けは、送信確定が成立に見えても未確認として残す
+    // （止まっている CLI の画面は、空の入力欄のまま変わらない）。
+    if (outcome !== "submitted" || pasted === "unverified") options.onUnconfirmedSubmit?.();
+  }
+
+  /**
+   * 小分けにした本文を、1 つずつ括弧付き貼り付けとして pane へ渡す（long-text-paste）。
+   * 本文は標準入力から tmux の貼り付けバッファへ載せる（`load-buffer -`）。引数で渡すと、tmux は
+   * 末尾の `;` をコマンドの区切りとして落とし、約 16KB を超えると `command too long` で失敗する
+   * （実測 tmux 3.7）。`paste-buffer -p` で括弧を付け、`-r` で改行を LF のまま渡す（`-r` が無いと
+   * LF を CR に置き換える）。`-d` で貼った後にバッファを消す。バッファ名は呼び出しごとに変える
+   * （並行する注入と取り違えない）。
+   */
+  private async pasteBracketed(name: string, pieces: string[]): Promise<void> {
+    const target = this.paneTarget(name);
+    for (const piece of pieces) {
+      this.pasteSequence += 1;
+      const buffer = `tailii-${process.pid}-${this.pasteSequence}`;
+      const args = ["load-buffer", "-b", buffer, "-", ";", "paste-buffer", "-p", "-r", "-d", "-b", buffer, "-t", target];
+      const result = await this.runner(args, piece);
+      if (result.exitCode !== 0) {
+        // 載せたまま貼れなかったバッファを残さない（本文が tmux に残る）。
+        await this.runner(["delete-buffer", "-b", buffer]).catch(() => undefined);
+        throw new TmuxFailedError(args, result.exitCode, result.stderr);
+      }
+    }
+  }
+
+  /**
+   * CLI のキューに溜まっている発話を今すぐ届ける（chat-send-now, SessionBackend 共通面）。
+   * `C-x C-s` は 1 回の send-keys で続けて送る（chord を分断しない）。
+   */
+  async sendQueuedNow(name: string): Promise<SendQueuedNowOutcome> {
+    return sendQueuedNow({
+      capture: () => this.captureVisibleScreenAnsiOrNull(name),
+      sendChord: () => this.sendKeys(name, ["C-x", "C-s"]),
+      pollMs: this.sendNowPollMs,
+      maxPolls: SEND_NOW_MAX_POLLS,
+    });
   }
 
   /**
@@ -1364,17 +2148,29 @@ export class TmuxSessionManager {
    */
   async clearInputBox(name: string): Promise<boolean> {
     try {
+      let first: string | null = null;
       for (let attempt = 0; attempt < 15; attempt += 1) {
         const ansiScreen = await this.captureVisibleScreenAnsiOrNull(name);
         const realText = ansiScreen === null ? null : inputBoxRealText(ansiScreen);
         if (realText === null) return false;
         if (realText.replace(/\s+/g, "").length === 0) return true;
+        first ??= realText;
         await this.sendKeys(name, ["C-u"]);
         await new Promise((resolve) => setTimeout(resolve, this.clearKeyDelayMs));
       }
       const ansiScreen = await this.captureVisibleScreenAnsiOrNull(name);
       const realText = ansiScreen === null ? null : inputBoxRealText(ansiScreen);
-      return realText !== null && realText.replace(/\s+/g, "").length === 0;
+      if (realText === null) return false;
+      if (realText.replace(/\s+/g, "").length === 0) return true;
+      // 消えてはいるが行が多い（9 行以上の本文は 15 回では消し切れない）。進んでいる限り続ける。
+      // 1 字も消えていない残存（C-u の効かない中身）には、これ以上打たない。
+      if (realText === first) return false;
+      return await clearTypedInput(CLEAR_UNKNOWN_INPUT_BOUND, {
+        capture: () => this.captureVisibleScreenAnsiOrNull(name),
+        sendKills: (count) => this.sendKeys(name, Array.from({ length: count }, () => "C-u")),
+        clearDelayMs: this.clearKeyDelayMs,
+        clearSettleMs: this.clearSettleMs,
+      });
     } catch {
       return false;
     }
@@ -1444,14 +2240,28 @@ export class TmuxSessionManager {
   async sendKeys(name: string, keys: string[], literal = false): Promise<void> {
     validateSessionName(name);
     if (keys.length === 0) return;
-    const args = ["send-keys", "-t", this.paneTarget(name)];
+    const target = this.paneTarget(name);
+    const run = async (args: string[]): Promise<void> => {
+      const result = await this.runner(args);
+      if (result.exitCode !== 0) throw new TmuxFailedError(args, result.exitCode, result.stderr);
+    };
+    if (!literal) {
+      await run(["send-keys", "-t", target, ...keys]);
+      return;
+    }
     // literal は `--` で引数終端を明示する（先頭が `-` の本文 — base64url の OAuth コード等 —
     // を tmux がフラグと誤認して `unknown flag` で失敗する）。
-    if (literal) args.push("-l", "--");
-    args.push(...keys);
-    const result = await this.runner(args);
-    if (result.exitCode !== 0) {
-      throw new TmuxFailedError(args, result.exitCode, result.stderr);
+    // 末尾が `;` の引数は、tmux がコマンドの区切りとして `;` を落とす（実測 tmux 3.7:
+    // `abc;` → `abc`）。末尾の `;` は切り離し、文字コード（`-H 3b`）で打つ。
+    if (!keys.some((key) => key.endsWith(";"))) {
+      await run(["send-keys", "-t", target, "-l", "--", ...keys]);
+      return;
+    }
+    for (const key of keys) {
+      const body = key.replace(/;+$/, "");
+      if (body !== "") await run(["send-keys", "-t", target, "-l", "--", body]);
+      const semicolons = key.length - body.length;
+      if (semicolons > 0) await run(["send-keys", "-t", target, "-H", ...Array.from({ length: semicolons }, () => "3b")]);
     }
   }
 

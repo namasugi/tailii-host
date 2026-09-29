@@ -61,12 +61,12 @@ export class LineQueue {
 /** 記録付きモック tmux ランナー（Swift 版 MockTmuxRunner と対）。 */
 export class MockTmuxRunner {
   readonly recorded: string[][] = [];
-  constructor(private readonly handler: (args: string[]) => TmuxCommandResult) {}
+  constructor(private readonly handler: (args: string[], input?: string) => TmuxCommandResult) {}
 
   get runner(): TmuxCommandRunner {
-    return async (args) => {
+    return async (args, input) => {
       this.recorded.push(args);
-      return this.handler(args);
+      return this.handler(args, input);
     };
   }
 }

@@ -1,0 +1,5 @@
+{"id":"5e0d0a11-0000-0000-0000-000000003001","session":"tailii-abc123","type":"chat_send_now","v":2}
+{"id":"5e0d0a11-0000-0000-0000-000000003001","status":"sent","type":"chat_send_now_result","v":2}
+{"id":"5e0d0a11-0000-0000-0000-000000003002","status":"nothing_queued","type":"chat_send_now_result","v":2}
+{"error":"Mac 側の入力欄に入力中の文字があるため「今すぐ送信」しませんでした（その文字ごと送信されるのを防ぐため）","id":"5e0d0a11-0000-0000-0000-000000003003","status":"blocked","type":"chat_send_now_result","v":2}
+{"error":"「今すぐ送信」を送りましたが、届いたことを確認できませんでした","id":"5e0d0a11-0000-0000-0000-000000003004","status":"failed","type":"chat_send_now_result","v":2}

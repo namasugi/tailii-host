@@ -1,0 +1,45 @@
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.283[39m
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mHaiku 4.5 · Claude Max[39m
+[38;5;174m ▝▝   ▝▝ [39m  [38;5;246m/…/-Users-namasugi-Documents-ClaudeCode-code0630/1a870fa7-aab7-4160-aa3c-3ca54b1548d3/scratchpad/probe[39m
+
+
+[38;5;239m[48;5;237m❯ [38;5;231mRun exactly this bash command in the foreground with a 120000ms timeout: python3 -c "import time; time.sleep(50); [39m
+  [38;5;231mprint(1)"  Then reply with the single word DONE.[39m
+
+[49m  [38;5;246mRan [1m1[0m[38;5;246m shell command [39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mAfter that, also say BANANA.[39m
+[38;5;246m[49m  ⎿  [38;5;211mInvalid tool parameters[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[38;5;174m✳[39m [38;5;174mFiddle-faddling… [38;5;246m(21s · ↓[39m [38;5;246m309 tokens · [38;5;249mthinking[38;5;246m)[39m
+
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[38;5;246m❯ [39m
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246m⏸ manual mode on · [38;5;44m1 shell[38;5;246m · esc to interrupt · ← for agents · ↓ to manage[39m

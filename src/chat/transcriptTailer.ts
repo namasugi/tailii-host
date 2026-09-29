@@ -8,6 +8,7 @@
 // 抽出対象を text ブロックと、CLI が発話として画面に出す narration（shared/narration.ts）に限定し、
 // 秘密（接続鍵）を運ぶ経路を作らない（9.3）。
 
+import { unwrapPastedContent } from "../shared/pastedContent.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
@@ -849,7 +850,8 @@ export function extractTurn(line: string, ctx?: SystemNoticeContext): Turn | nul
         ? (rec["attachment"] as Record<string, unknown>)
         : null;
     if (attachment?.["type"] !== "queued_command") return null;
-    const prompt = typeof attachment["prompt"] === "string" ? attachment["prompt"] : "";
+    // 貼り付けとして送った発話の包み（`<pasted_content>`）は表示しない（long-text-paste）。
+    const prompt = typeof attachment["prompt"] === "string" ? unwrapPastedContent(attachment["prompt"]) : "";
     if (prompt.length === 0) return null;
     return {
       id: typeof rec["uuid"] === "string" ? rec["uuid"] : null,
@@ -917,9 +919,11 @@ export function extractTurn(line: string, ctx?: SystemNoticeContext): Turn | nul
   const rawContent = message?.["content"] ?? rec["content"];
   // assistant は text に加えて narration（thinking ブロックとして記録された途中経過の発話）も本文にする。
   // CLI はどちらも同じ「⏺ 本文」で出す（2026-09-28 実機: narration を読まず途中経過が消えていた）。
+  // user 行は、貼り付けとして送った発話の包み（`<pasted_content>`）を外す（long-text-paste）。
+  // アプリは送った本文そのものと照合するので、包みが付いたままだと同じ発話が二重に出る。
   const plainText = role === "assistant"
     ? extractAssistantText(rawContent)
-    : extractText(rawContent);
+    : unwrapPastedContent(extractText(rawContent));
   // AskUserQuestion の回答行は text ブロックではなく tool_result +
   // top-level toolUseResult.answers に記録される。通常の tool_result は会話ログへ
   // 流さず、設問と回答の構造を持つ行だけ user バブル用の要約へ変換する。

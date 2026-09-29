@@ -1,0 +1,45 @@
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.283[39m
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mHaiku 4.5 · Claude Max[39m
+[38;5;174m ▝▝   ▝▝ [39m  [38;5;246m/…/-Users-namasugi-Documents-ClaudeCode-code0630/1a870fa7-aab7-4160-aa3c-3ca54b1548d3/scratchpad/probe[39m
+
+
+[38;5;239m[48;5;237m❯ [38;5;231mRun exactly this bash command in the foreground with a 120000ms timeout: python3 -c "import time; time.sleep(50); [39m
+  [38;5;231mprint(1)"  Then reply with the single word DONE.[39m
+
+[38;5;246m[49m⏺[39m Running python3 -c "import time; time.sleep(50); print(1)"[38;5;246m · 15s[39m
+[38;5;246m  ⎿  $ python3 -c "import time; time.sleep(50); print(1)" (15s)[39m
+     [38;5;246m(ctrl+b ctrl+b (twice) to run in background)[39m
+
+[38;5;239m[48;5;237m❯ [38;5;246mAfter that, also say BANANA.[39m
+[49m  [38;5;246mctrl+x ctrl+s to send now[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[38;5;174m✳[39m [38;5;216mFiddle-faddling…[38;5;174m [38;5;246m(18s · ↓[39m [38;5;246m168 tokens)[39m
+
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[38;5;246m❯ [2m[39mPress up to edit queued messages[0m
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246m⏸ manual mode on · esc to interrupt · ← for agents[39m

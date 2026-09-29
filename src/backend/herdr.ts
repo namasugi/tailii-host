@@ -22,7 +22,6 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { PROTOCOL_V1, type ControlMessage, type SessionInfo } from "../protocol.js";
-import { normalizeForTextMatch, stripInvisibleForComparison } from "../shared/invisibleText.js";
 import {
   HERDR_PANE_ID_PATTERN,
   SessionMetadataStore,
@@ -46,11 +45,28 @@ import {
   LoginCodeError,
   paneCommandLooksLikeAgent,
   screenInLoginFlow,
+  inputBoxTextIncludesProbe,
+  typedTextProbe,
+  typedTextWouldBreak,
+  textIsPasteSafe,
+  pasteTextInline,
+  clearTypedInput,
+  INJECT_VERIFY_BUDGET_MS,
+  CLEAR_UNKNOWN_INPUT_BOUND,
+  BRACKETED_PASTE_START,
+  BRACKETED_PASTE_END,
+  PASTED_TEXT_POLL_MS,
+  PASTED_TEXT_TIMEOUT_MS,
+  TYPED_TEXT_CLEAR_SETTLE_MS,
   ChatInjectionRejectedError,
   classifySubmitFrame,
+  SEND_NOW_MAX_POLLS,
+  SEND_NOW_POLL_MS,
+  sendQueuedNow,
   settleFrameAfterChoiceCancel,
   SUBMIT_ATTEMPT_LIMIT,
   submitLoginCode,
+  type SendQueuedNowOutcome,
   type SubmitOutcome,
   type CapturePaneOptions,
   type ClaudeInputBox,
@@ -190,6 +206,12 @@ const ENTER_SEQUENCE = "\r";
  * 空 composer への C-u は完全に no-op で、処理中の agent にも干渉しない）。
  */
 const KILL_LINE_SEQUENCE = "\u0015";
+/**
+ * `chat:sendNow` の chord（Ctrl-X Ctrl-S）の生制御文字（chat-send-now）。herdr の send-keys は
+ * キーごとに別プロセスで送るため、2 打の間が空くと chord が成立しない恐れがある。
+ * **1 回の send-text で続けて送る**（実測 herdr 0.7.5 + Claude Code 2.1.283 で成立）。
+ */
+const SEND_NOW_SEQUENCE = "\u0018\u0013";
 
 /**
  * 画面に選択ダイアログのフッター行があるか。チャット本文が「Enter to select」を
@@ -210,47 +232,8 @@ function stripAnsiForMatch(line: string): string {
   return line.replace(/\u001b\[[0-9;:?]*[ -/]*[@-~]/g, "");
 }
 
-/**
- * 入力反映検証に使う probe（本文の**末尾側**）。検証不能な本文（空など）は null。
- *
- * 末尾側なのは composer の表示特性のため: 入力が表示高を超えると composer は下へ
- * スクロールし**先頭行が窓外へ消える**（実測 2.1.220: 10行ペーストで先頭4行が
- * capture から消失）。カーソルは常に末尾にあるので、末尾側の probe だけが
- * 「見えている範囲」との照合を保証できる（先頭24字の旧 probe は多行/長文で
- * 構造的に偽陰性 → 再投入 → 本文二重化の温床だった）。
- *
- * 先頭 `!`（シェルモード）は claude TUI がモード記号として吸い上げ、入力欄本文には
- * 残らない（`!ls -la` は `! ls -la` と描画される）。単一行本文では照合キーからも
- * 落とさないと末尾24字に `!` が含まれるとき反映検証が失敗する。
- */
-export function typedTextProbe(text: string): string | null {
-  // 不可視文字は端末のセルに載らない（capture に出ない）ため、probe に混ざると反映検証が
-  // 構造的に偽陰性になる。probe は不可視文字を除いた可視本文から取る
-  // （照合側 `inputBoxTextIncludesProbe` も両辺から落とすので規則は一致する）。
-  const lines = stripInvisibleForComparison(text)
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
-  const lastLine = lines.at(-1);
-  if (lastLine === undefined) return null;
-  const body =
-    lines.length === 1 && lastLine.startsWith("!") ? lastLine.slice(1).trim() : lastLine;
-  if (body.length === 0) return null;
-  return body.slice(-24);
-}
-
-/**
- * 入力欄テキストに probe が反映されているか（折り返し非依存）。
- * extractClaudeInputBox は表示行を trim + "\n" 連結で返すため、probe が入力欄の
- * 行折り返しをまたぐと生の includes は絶対に一致しない（全角24字=48桁 > 内幅で必発）。
- * この偽陰性が「反映済み本文の再投入 = 初回送信の本文二重化」の根因だった（実機5件）。
- * 空白類（折り返しの改行・trim 痕・全角空白含む）と不可視文字を両辺から除去して照合する。
- */
-export function inputBoxTextIncludesProbe(boxText: string, probe: string): boolean {
-  const needle = normalizeForTextMatch(probe);
-  if (needle.length === 0) return false;
-  return normalizeForTextMatch(boxText).includes(needle);
-}
+// 反映検証の probe は tmux backend と共有する（long-text-paste）。従来の import 元を保つ。
+export { inputBoxTextIncludesProbe, typedTextProbe } from "./tmux.js";
 
 /** herdr CLI の JSON stdout から `result` を取り出す。JSON でない/エラー封筒は null。 */
 export function parseHerdrResult(stdout: string): Record<string, unknown> | null {
@@ -420,6 +403,12 @@ export class HerdrSessionManager {
   private readonly submitVerifyDelayMs: number;
   /** 選択ダイアログを Esc で閉じた後の消滅確認の間隔 ms（テスト注入用）。 */
   private readonly choiceCancelPollMs: number;
+  /** 「今すぐ送信」の chord 後、ヒント行の消滅確認の間隔 ms（テスト注入用）。 */
+  private readonly sendNowPollMs: number;
+  /** 貼り付けた本文が入力欄に入るのを確かめる間隔と上限 ms（テスト注入用）。 */
+  private readonly pastedTextPollMs: number;
+  private readonly pastedTextTimeoutMs: number;
+  private readonly clearSettleMs: number;
   /** 入力欄へ本文が反映されなかったときの再投入間隔 ms（RC 切断 limbo 対策）。 */
   private readonly inputRetryDelayMs: number;
   /** clearInputBox の C-u 1回ごとの反映待ち ms（実測レイテンシ 9〜27ms。テスト注入用）。 */
@@ -443,6 +432,11 @@ export class HerdrSessionManager {
     submitDelayMs?: number;
     submitVerifyDelayMs?: number;
     choiceCancelPollMs?: number;
+    sendNowPollMs?: number;
+    pastedTextPollMs?: number;
+    pastedTextTimeoutMs?: number;
+    /** C-u をまとめて打った後、入力欄が変わるのを待つ上限（テスト用に短くできる）。 */
+    clearSettleMs?: number;
     inputRetryDelayMs?: number;
     clearKeyDelayMs?: number;
     readyTimeoutMs?: number;
@@ -459,6 +453,10 @@ export class HerdrSessionManager {
     this.submitDelayMs = options.submitDelayMs ?? 600;
     this.submitVerifyDelayMs = options.submitVerifyDelayMs ?? 700;
     this.choiceCancelPollMs = options.choiceCancelPollMs ?? CHOICE_CANCEL_POLL_MS;
+    this.sendNowPollMs = options.sendNowPollMs ?? SEND_NOW_POLL_MS;
+    this.pastedTextPollMs = options.pastedTextPollMs ?? PASTED_TEXT_POLL_MS;
+    this.pastedTextTimeoutMs = options.pastedTextTimeoutMs ?? PASTED_TEXT_TIMEOUT_MS;
+    this.clearSettleMs = options.clearSettleMs ?? TYPED_TEXT_CLEAR_SETTLE_MS;
     this.inputRetryDelayMs = options.inputRetryDelayMs ?? 1_500;
     this.clearKeyDelayMs = options.clearKeyDelayMs ?? 150;
     this.readyTimeoutMs = options.readyTimeoutMs ?? 10_000;
@@ -694,6 +692,7 @@ export class HerdrSessionManager {
    * リトライで確定させる。submit 済みの空入力への Enter は no-op なので二重送信は起きない。
    */
   async sendTextSubmit(name: string, text: string, options: SendTextSubmitOptions = {}): Promise<void> {
+    const startedAtMs = Date.now();
     // ブート直後の注入は本文ごと TUI 初期化に破棄され得る（実測: 入力欄にも jsonl にも
     // 残らない）。herdr の claude 検出（agent_status が unknown を抜けるまで）を注入の
     // 準備完了ゲートにする。working（処理中の queue 入力）も注入可。判定不能は fail-open。
@@ -818,6 +817,45 @@ export class HerdrSessionManager {
     // chat_send を uncertain（アプリの明示再送）へ倒す。
     const probe = typedTextProbe(text);
     let typed = probe === null;
+    if (!typed && typedTextWouldBreak(text) && textIsPasteSafe(text)) {
+      // 1 回で打つと壊れる本文は、小分けの括弧付き貼り付けで渡す（long-text-paste）。1 回で打つと
+      // CLI が読み取りの境界ごとに貼り付けとして取り込み、入力欄が `[Pasted text #N]` になって
+      // 下の反映検証が必ず失敗する（実測 2.1.283: 983 字の送信が 3 回打ち直した末に失敗）。
+      const target = await this.paneTarget(name);
+      if (target === null) {
+        throw new HerdrFailedError(["pane", "send-text", name], 1, "pane not found");
+      }
+      const sendRaw = async (payload: string): Promise<void> => {
+        const args = ["pane", "send-text", target, payload];
+        const result = await this.runner(args);
+        if (result.exitCode !== 0) throw new HerdrFailedError(args, result.exitCode, result.stderr);
+      };
+      const outcome = await pasteTextInline(text, {
+        // 1 つずつ書き込む。まとめて書き込むと、CLI が読み進めるのを待たされる（実測: 8KB を
+        // 1 回で書くと入り切るまで 4〜7 秒、20KB は 10 秒でも入り切らない。1 つずつなら 1 秒）。
+        paste: async (pieces) => {
+          for (const piece of pieces) await sendRaw(`${BRACKETED_PASTE_START}${piece}${BRACKETED_PASTE_END}`);
+        },
+        capture: () => this.captureVisibleScreenAnsiOrNull(name),
+        sendKills: (count) => sendRaw(KILL_LINE_SEQUENCE.repeat(count)),
+        pollMs: this.pastedTextPollMs,
+        timeoutMs: this.pastedTextTimeoutMs,
+        clearDelayMs: this.clearKeyDelayMs,
+        clearSettleMs: this.clearSettleMs,
+        verifyDeadlineMs: startedAtMs + INJECT_VERIFY_BUDGET_MS,
+      });
+      if (outcome !== "arrived") {
+        // 打つ場合の反映検証と同じ扱い: 残骸を best-effort で掃除してから失敗として返す。
+        // 貼り直しはしない（CLI が止まっていただけなら、貼り直した分だけ後から重なって入る）。
+        await this.clearInputBox(name);
+        throw new HerdrFailedError(
+          ["pane", "send-text", name],
+          1,
+          "pasted text did not reach the input box (RC limbo / ダイアログ表示中 / 入力欄不可視 / CLI の停止のいずれか)",
+        );
+      }
+      typed = true;
+    }
     for (let attempt = 0; attempt < 3 && !typed; attempt += 1) {
       if (attempt > 0) {
         await new Promise((resolve) => setTimeout(resolve, this.inputRetryDelayMs));
@@ -854,6 +892,16 @@ export class HerdrSessionManager {
       );
     }
     if ((await this.submitTypedText(name)) !== "submitted") options.onUnconfirmedSubmit?.();
+  }
+
+  /** CLI のキューに溜まっている発話を今すぐ届ける（chat-send-now, SessionBackend 共通面）。 */
+  async sendQueuedNow(name: string): Promise<SendQueuedNowOutcome> {
+    return sendQueuedNow({
+      capture: () => this.captureVisibleScreenAnsiOrNull(name),
+      sendChord: () => this.sendKeys(name, [SEND_NOW_SEQUENCE], true),
+      pollMs: this.sendNowPollMs,
+      maxPolls: SEND_NOW_MAX_POLLS,
+    });
   }
 
   /**
@@ -947,6 +995,7 @@ export class HerdrSessionManager {
    */
   async clearInputBox(name: string): Promise<boolean> {
     try {
+      let first: string | null = null;
       for (let attempt = 0; attempt < 15; attempt += 1) {
         // ダイアログ判定は selectionDialogVisible（末尾30行窓）に揃える。全画面を
         // 走査すると、チャット本文に残る閉じたダイアログの転写（「Enter to select」行）を
@@ -957,12 +1006,24 @@ export class HerdrSessionManager {
         const realText = inputBoxRealText(await this.captureVisibleScreenAnsi(name));
         if (realText === null) return false;
         if (realText.replace(/\s+/g, "").length === 0) return true;
+        first ??= realText;
         await this.sendKeys(name, [KILL_LINE_SEQUENCE], true);
         await new Promise((resolve) => setTimeout(resolve, this.clearKeyDelayMs));
       }
       // 上限到達時も最後の C-u の結果は未観測なので、最終状態を見てから判定する。
       const realText = inputBoxRealText(await this.captureVisibleScreenAnsi(name));
-      return realText !== null && realText.replace(/\s+/g, "").length === 0;
+      if (realText === null) return false;
+      if (realText.replace(/\s+/g, "").length === 0) return true;
+      // 消えてはいるが行が多い（9 行以上の本文は 15 回では消し切れない）。進んでいる限り続ける。
+      // 1 字も消えていない残存（C-u の効かない中身）には、これ以上打たない。
+      // ダイアログが出ていたら `clearTypedInput` が 1 キーも打たない（フレームを確かめてから打つ）。
+      if (realText === first) return false;
+      return await clearTypedInput(CLEAR_UNKNOWN_INPUT_BOUND, {
+        capture: () => this.captureVisibleScreenAnsiOrNull(name),
+        sendKills: (count) => this.sendKeys(name, [KILL_LINE_SEQUENCE.repeat(count)], true),
+        clearDelayMs: this.clearKeyDelayMs,
+        clearSettleMs: this.clearSettleMs,
+      });
     } catch {
       return false;
     }

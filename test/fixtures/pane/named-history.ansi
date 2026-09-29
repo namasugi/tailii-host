@@ -1,0 +1,45 @@
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.284[39m
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mHaiku 4.5 · Claude Max[39m
+[38;5;174m ▝▝   ▝▝ [39m  [38;5;246m/…/-Users-namasugi-Documents-ClaudeCode-code0630/1a870fa7-aab7-4160-aa3c-3ca54b1548d3/scratchpad/chk12/wa[39m
+
+
+[38;5;239m[48;5;237m❯ [38;5;231mWithout using any tools, reply with exactly this markdown and nothing else: a line "A", then a horizontal rule line [39m
+  [38;5;231m"---", then a 2x2 markdown table with headers X and Y, then a fenced code block containing a line of 30 box-drawing [39m
+  [38;5;231mcharacters "──────────────────────────────" and a line "━━━━━━━━━━", then "B".[39m
+
+[38;5;231m[49m⏺[39m [1mA[0m
+
+  ┌─────┬─────┐
+  │  X  │  Y  │
+  ├─────┼─────┤
+  │     │     │
+  ├─────┼─────┤
+  │     │     │
+  └─────┴─────┘
+
+  [38;5;153m──────────────────────────────[39m
+  [38;5;153m━━━━━━━━━━[39m
+
+  B
+
+[38;5;246m✻[39m [38;5;246mChurned for 7s · done 9:10 PM[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mUse the Bash tool now to run exactly: echo chk12-approval > note.txt[39m
+
+[49m  [38;5;246mRan [1m1[0m[38;5;246m shell command [39m
+[38;5;246m  ⎿  Interrupted · What should Claude do instead?[39m
+
+[38;5;246m✻[39m [38;5;246mSautéed for 1s · done 9:11 PM[39m
+
+[38;5;239m[48;5;237m❯[39m [38;5;231m/rename chk12-title[39m [49m
+[38;5;246m  ⎿  [39mSession renamed to: chk12-title
+
+
+
+
+
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────── chk12-title ─
+[39m❯ 
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246m⏸ manual mode on · ? for shortcuts · ← for agents[39m

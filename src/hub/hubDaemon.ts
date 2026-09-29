@@ -472,6 +472,8 @@ export async function runHubCommand(args: string[]): Promise<number> {
     questionInjector: (answers, session) => injectQuestionAnswers(answers, session, sessionBackend),
     // 使用量制限の自動再開待ちを push で知らせる（usage-limit-wait。APNs 未設定なら内部で skip）。
     usageLimitNotify: makeUsageLimitPushNotifier(log),
+    // CLI のキューに溜まっている発話を今すぐ届ける（chat-send-now）。
+    sendNowInjector: (session) => sessionBackend.sendQueuedNow(session),
     // 本文+送信確定は backend 側の 1 操作に委ねる（herdr は本文+CR 単一コール必須。
     // 分割すると Ink のペースト取り込み窓に CR が飲まれ送信されない）。
     chatInjector: async (text, session, context) => {

@@ -32,7 +32,13 @@ import type { PanePreviewMode } from "./panePreviewPump.js";
 import { sameUsageLimitWait, type UsageLimitWaitState } from "../shared/usageLimitWait.js";
 import type { QuestionAnswer } from "../protocol.js";
 import { PROTOCOL_V1, PROTOCOL_V2 } from "../protocol.js";
-import { ChatInjectionRejectedError, LoginCodeError } from "../backend/tmux.js";
+import {
+  ChatInjectionRejectedError,
+  LoginCodeError,
+  SEND_NOW_BLOCKED_BY_DIALOG,
+  SEND_NOW_EXPIRED_IN_QUEUE,
+  type SendQueuedNowOutcome,
+} from "../backend/tmux.js";
 import { CodexAppServerManager } from "../codex/codexAppServer.js";
 import {
   CodexNativeTurnController,
@@ -125,6 +131,11 @@ export type SessionHubOptions = Omit<ReaperTickOptions, "now"> & {
    */
   usageLimitNotify?: (session: string, state: UsageLimitWaitState | { kind: "resumed" }) => void;
   chatInjector?: (text: string, session: string, context: ChatInjectContext) => Promise<void>;
+  /**
+   * CLI のキューに溜まっている発話を今すぐ届ける（chat-send-now）。backend の `sendQueuedNow`。
+   * hub は chat の注入・設問の回答キーと重ならないように直列化してから呼ぶ。
+   */
+  sendNowInjector?: (session: string) => Promise<SendQueuedNowOutcome>;
   codexAppServerFactory?: () => CodexAppServerThreadRuntime;
   codexTurnControllerFactory?: (options: CodexNativeTurnControllerOptions) => CodexTurnControllerRuntime;
   /** 未回答設問の永続化先。省略時は永続化しない（daemon は既定パスを明示する）。 */
@@ -283,11 +294,26 @@ interface SessionActor {
    * 再送（アプリの自動再送は flush のたびに起きる）では解かない = そのたびに Esc を撃ち直さない。
    */
   choiceCancelFailed: { questionId: string; clientMessageIds: Set<string> } | null;
+  /**
+   * 「今すぐ送信」の chord を pane へ送っている最中か（chat-send-now）。この間は chat を注入しない:
+   * 本文を打ち終えて Enter を撃つ前に chord が届くと、打ちかけの本文がその場で送信され、
+   * 実行中のターンまで打ち切られる（入力欄に文字がある状態の chord の挙動。実測 2.1.283）。
+   */
+  sendNowRunning: boolean;
+  /** 先行する chat の注入が終わるのを待っている「今すぐ送信」の応答先（受け付けた時刻つき）。 */
+  sendNowWaiters: Array<{ client: object; id: string; receivedAtMs: number }>;
   codexQueue: PendingCodexTurn[];
   codexOrder: string[];
   codexDrainRunning: boolean;
   codexDrainBlocked: boolean;
 }
+
+/**
+ * 「今すぐ送信」が順番（先行する chat の注入）を待てる上限（ms）。engine は hub の応答を 30 秒で
+ * 諦める。それより後に chord を送ると、アプリに失敗と出した後で実行中のターンが打ち切られる。
+ * chord の後の確認（約 6 秒）と撮り直し（約 1.5 秒）を引いた残りより短くする。
+ */
+export const SEND_NOW_QUEUE_WAIT_LIMIT_MS = 20_000;
 
 /** 中断マーカーで done にした後、継続 hook（Pre/PostToolUse）の遅着 active を残響として無視する窓（ms）。 */
 const LATE_HOOK_AFTER_INTERRUPT_MS = 3_000;
@@ -939,6 +965,12 @@ export class SessionHub {
       void this.drainChatQueue(message.session, actor);
       return;
     }
+    if (message.type === "chat_send_now") {
+      const actor = this.actor(message.session);
+      actor.sendNowWaiters.push({ client, id: message.id, receivedAtMs: this.nowMs() });
+      void this.runSendNow(message.session, actor);
+      return;
+    }
     if (message.type === "pending_message_delete") {
       // 対象不在も成功だが、client 保存前 crash で同じ Outbox が復元されても実行しないよう
       // 削除 tombstone は durable に残す。actor 不在でもここだけは軽量 actor を作る。
@@ -1070,6 +1102,9 @@ export class SessionHub {
         });
       }
       entry.waiters.length = 0;
+    }
+    for (const waiter of actor.sendNowWaiters.splice(0)) {
+      this.sendTo(waiter.client, { type: "chat_send_now_result", id: waiter.id, status: "failed", error: reason });
     }
 
     // drain が injector / App Server の await 中でも、復帰後に同じ actor 参照から次の旧入力へ
@@ -1819,6 +1854,7 @@ export class SessionHub {
         runtimeClaim: null, codexLive: null,
         chatQueue: [], chatOrder: [], chatDrainRunning: false, chatDrainBlocked: false,
         questionAnswerInjections: 0, cancellingQuestionId: null, choiceCancelFailed: null,
+        sendNowRunning: false, sendNowWaiters: [],
         codexQueue: [], codexOrder: [], codexDrainRunning: false, codexDrainBlocked: false };
       this.actors.set(session, actor);
     }
@@ -2002,8 +2038,63 @@ export class SessionHub {
     return !actor.chatQueue.some((entry) => entry.message.cancelQuestionId === pending.id);
   }
 
+  /**
+   * 「今すぐ送信」を pane へ送る（chat-send-now）。chat の注入と同じ pane を触るので直列化する:
+   * 注入の最中なら終わるのを待ち（`drainChatQueue` の終わりで呼び直される）、送っている間は
+   * 注入を始めさせない。設問の表示中・回答キーの注入中は 1 キーも送らずに断る（chord は
+   * ダイアログでは効かず、キーだけが選択肢へ落ちる）。
+   */
+  private async runSendNow(session: string, actor: SessionActor): Promise<void> {
+    if (actor.sendNowRunning || actor.chatDrainRunning || actor.sendNowWaiters.length === 0) return;
+    // 待ちすぎた要求には chord を送らない（1 キーも送らずに失敗で返す）。
+    const expired = actor.sendNowWaiters.filter(
+      (waiter) => this.nowMs() - waiter.receivedAtMs > SEND_NOW_QUEUE_WAIT_LIMIT_MS);
+    const waiters = actor.sendNowWaiters.filter((waiter) => !expired.includes(waiter));
+    actor.sendNowWaiters.length = 0;
+    const reply = (outcome: SendQueuedNowOutcome, targets = waiters): void => {
+      this.options.log?.(`audit chat-send-now session=${auditValue(session)} status=${outcome.status}`);
+      for (const waiter of targets) {
+        this.sendTo(waiter.client, {
+          type: "chat_send_now_result", id: waiter.id, status: outcome.status,
+          ...("reason" in outcome ? { error: outcome.reason } : {}),
+        });
+      }
+    };
+    if (expired.length > 0) reply({ status: "failed", reason: SEND_NOW_EXPIRED_IN_QUEUE }, expired);
+    if (waiters.length === 0) {
+      void this.drainChatQueue(session, actor);
+      return;
+    }
+    // 設問を Esc で閉じている最中（`cancellingQuestionId`）は chat の注入の中なので、上の
+    // `chatDrainRunning` で待っている。ここへ来るのは注入が終わった後だけ。
+    if (actor.questionAnswerInjections > 0 || actor.pendingQuestion?.answerRoute === "tui") {
+      reply({ status: "blocked", reason: SEND_NOW_BLOCKED_BY_DIALOG });
+      // 注入の終わりから呼ばれた場合、残りの queue の再開はこちらの役目（門番は drain 側が持つ）。
+      void this.drainChatQueue(session, actor);
+      return;
+    }
+    actor.sendNowRunning = true;
+    this.injectionsInFlight += 1;
+    let outcome: SendQueuedNowOutcome;
+    try {
+      outcome = await (this.options.sendNowInjector?.(session) ??
+        Promise.resolve<SendQueuedNowOutcome>({ status: "failed", reason: "send-now is unavailable" }));
+    } catch (error) {
+      outcome = { status: "failed", reason: error instanceof Error ? error.message : String(error) };
+    } finally {
+      this.injectionsInFlight -= 1;
+      actor.sendNowRunning = false;
+    }
+    reply(outcome);
+    // 明示 kill / reaper kill が await 中に actor を廃棄していたら、古い queue を動かさない。
+    if (this.actors.get(session) !== actor) return;
+    void this.drainChatQueue(session, actor);
+    void this.runSendNow(session, actor);
+  }
+
   private async drainChatQueue(session: string, actor: SessionActor): Promise<void> {
-    if (actor.chatDrainRunning || actor.chatDrainBlocked || this.chatDrainHeldByQuestion(actor)) return;
+    if (actor.chatDrainRunning || actor.chatDrainBlocked || actor.sendNowRunning ||
+      this.chatDrainHeldByQuestion(actor)) return;
     actor.chatDrainRunning = true;
     try {
       while (!this.chatDrainHeldByQuestion(actor)) {
@@ -2118,7 +2209,10 @@ export class SessionHub {
       }
     } finally {
       actor.chatDrainRunning = false;
-      if (!actor.chatDrainBlocked && !this.chatDrainHeldByQuestion(actor) && actor.chatQueue.length > 0 &&
+      if (actor.sendNowWaiters.length > 0) {
+        // 注入が終わるのを待っていた「今すぐ送信」を先に流す（残りの queue はその後で再開する）。
+        void this.runSendNow(session, actor);
+      } else if (!actor.chatDrainBlocked && !this.chatDrainHeldByQuestion(actor) && actor.chatQueue.length > 0 &&
         actor.chatOrder[0] === actor.chatQueue[0]?.message.clientMessageId) {
         void this.drainChatQueue(session, actor);
       }

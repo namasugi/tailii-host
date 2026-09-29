@@ -503,6 +503,18 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
       return compact({ type, v, id: requireString(raw, "id"), status, error: optionalString(raw, "error") });
     }
 
+    case "chat_send_now":
+      return { type, v, id: requireString(raw, "id"), session: requireString(raw, "session") };
+
+    case "chat_send_now_result": {
+      const status = requireString(raw, "status");
+      if (status !== "sent" && status !== "nothing_queued" &&
+        status !== "blocked" && status !== "failed") {
+        throw new ProtocolDecodeError("missing-field", "status");
+      }
+      return compact({ type, v, id: requireString(raw, "id"), status, error: optionalString(raw, "error") });
+    }
+
     case "error":
       return compact({
         type, v,

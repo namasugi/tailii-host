@@ -904,6 +904,47 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
+  test("chat_send_now を Hub へ転送し結果を中継する", async () => {
+    const sent: unknown[] = [];
+    const hubLink: HubLink = {
+      onMessage: null, onReconnect: null,
+      send(message) {
+        sent.push(message);
+        if (message.type === "chat_send_now") {
+          queueMicrotask(() => hubLink.onMessage?.({
+            type: "chat_send_now_result", id: message.id, status: "blocked", error: "理由",
+          }));
+        }
+        return true;
+      },
+      close: vi.fn(),
+    };
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner), hubLink });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine('{"id":"now-1","session":"work","type":"chat_send_now","v":2}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("chat_send_now_result"))).toEqual({
+      type: "chat_send_now_result", v: 2, id: "now-1", status: "blocked", error: "理由",
+    });
+    expect(sent).toContainEqual({ type: "chat_send_now", id: "now-1", session: "work" });
+    // pane へのキー送出は hub（直列化の持ち主）だけが行う。engine は直接送らない。
+    expect(runner.recorded.filter(([command]) => command === "send-keys")).toEqual([]);
+    await engine.teardown();
+  });
+
+  test("codex セッションの chat_send_now は unsupported", async () => {
+    const store = makeTempStore();
+    store.put({ name: "codex-work", cwd: "/tmp/codex-work", createdAt: 1, agent: "codex" });
+    const engine = startEngine({ sessionManager: makeManager(new MockTmuxRunner(() => ok("")), store),
+      metadataStore: store });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine('{"id":"now-1","session":"codex-work","type":"chat_send_now","v":2}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("error"))).toMatchObject({
+      type: "error", id: "now-1", code: "chat_send_now_unsupported",
+    });
+    await engine.teardown();
+  });
+
   // MARK: 1. channel_hello 交換
 
   test("engine は確立直後に channel_hello を送出し、相手 hello 受信後に採用版を決める", async () => {

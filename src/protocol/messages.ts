@@ -497,6 +497,20 @@ export type ControlMessage =
   | { type: "chat_send_result"; v: number; id: string; status: "accepted" | "duplicate" | "failed"; error?: string }
   | { type: "pending_message_delete"; v: number; id: string; session: string; clientMessageId: string; kind: "chat" | "codex" }
   | { type: "pending_message_delete_result"; v: number; id: string; status: "deleted" | "not_found" | "processing" | "failed"; error?: string }
+  /**
+   * 処理中の Claude が CLI 側のキューに溜めている発話を、今すぐ届ける（iOS→host, chat-send-now）。
+   * CLI の `chat:sendNow`（ctrl+enter / ctrl+x ctrl+s）と同じ操作。実行中のツールは背景へ回り、
+   * 応答の生成中ならそのターンを打ち切って、キュー済みの発話が届く。
+   */
+  | { type: "chat_send_now"; v: number; id: string; session: string }
+  /**
+   * `chat_send_now` の結果（host→iOS）。
+   * - `sent`: キーを送り、キューの表示が消えたのを確かめた。
+   * - `nothing_queued`: キュー済みの発話が画面に無い（1 キーも送っていない）。
+   * - `blocked`: いまは送れない（ダイアログの表示中・入力欄に下書きがある等。1 キーも送っていない）。
+   * - `failed`: キーは送ったが、届いたことを確かめられなかった / 送出に失敗した。
+   */
+  | { type: "chat_send_now_result"; v: number; id: string; status: "sent" | "nothing_queued" | "blocked" | "failed"; error?: string }
   | { type: "error"; v: number; id?: string; code: string; message: string }
   | { type: "image_available"; v: number; id: string; path: string; mime: string; thumbnail: string; width: number; height: number; relatedApprovalId?: string }
   | { type: "image_fetch_request"; v: number; id: string }

@@ -113,6 +113,33 @@ export const conversationHandlers: HandlerRegistry = {
     })();
   },
 
+  chat_send_now: (message, ctx) => {
+    const { writer, state, metadataStore } = ctx;
+    const v = state.negotiatedVersion;
+    // Codex は処理中の発話を turn/steer ですぐ届ける（CLI のようなキューが無い）。
+    if (metadataStore?.get(message.session)?.agent === "codex") {
+      writeError(writer, v, message.id, "chat_send_now_unsupported",
+        "Codex セッションでは「今すぐ送信」は不要です（処理中の発話はそのまま届きます）。");
+      return;
+    }
+    // 先行する注入の完了待ち（hub が 20 秒で打ち切る）と、chord の前後の確認（約 1.5 秒 + 約 6 秒）が
+    // あるので read loop を塞がない。
+    void (async () => {
+      chatSendDiag(`send-now recv id=${message.id} session=${message.session}`);
+      try {
+        const result = await ctx.hubRpc<Extract<HubServerMessage, { type: "chat_send_now_result" }>>(
+          { type: "chat_send_now", id: message.id, session: message.session }, message.id, 30_000,
+        );
+        chatSendDiag(`send-now result id=${result.id} status=${result.status}`);
+        writer.write({ type: "chat_send_now_result", v, id: result.id, status: result.status,
+          ...(result.error !== undefined ? { error: result.error } : {}) });
+      } catch (error) {
+        chatSendDiag(`send-now failed id=${message.id} error=${String(error).slice(0, 120)}`);
+        writeError(writer, v, message.id, "chat_send_now_failed", String(error));
+      }
+    })();
+  },
+
   question_answer: async (message, ctx) => {
     const { writer, state } = ctx;
     const v = state.negotiatedVersion;

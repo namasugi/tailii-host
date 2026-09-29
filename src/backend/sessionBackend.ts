@@ -16,6 +16,7 @@ import {
   TmuxSessionManager,
   type CapturePaneOptions,
   type ReattachResult,
+  type SendQueuedNowOutcome,
   type SendTextSubmitOptions,
 } from "./tmux.js";
 
@@ -38,6 +39,12 @@ export interface SessionBackend {
    * （分割すると Ink のペースト取り込み窓に CR が飲まれ送信されない。実測 2026-07-22）。
    */
   sendTextSubmit(name: string, text: string, options?: SendTextSubmitOptions): Promise<void>;
+  /**
+   * 処理中の claude が CLI 側のキューに溜めている発話を、今すぐ届ける（chat-send-now）。
+   * CLI の `chat:sendNow`（ctrl+enter / ctrl+x ctrl+s）と同じ操作。入力欄が空で、キュー済みの
+   * 発話のヒントが見えているフレームでだけキーを送る（それ以外は 1 キーも送らない）。
+   */
+  sendQueuedNow(name: string): Promise<SendQueuedNowOutcome>;
   /**
    * claude TUI の入力欄を C-u で空にする（中断で書き戻された配送済み発話の破棄用,
    * restored-prompt-discard）。空にできたら true。入力欄不可視 / ダイアログ表示中 / 上限回数で
@@ -146,6 +153,10 @@ export class CompositeSessionBackend implements SessionBackend {
 
   sendTextSubmit(name: string, text: string, options?: SendTextSubmitOptions): Promise<void> {
     return this.backendFor(name).sendTextSubmit(name, text, options);
+  }
+
+  sendQueuedNow(name: string): Promise<SendQueuedNowOutcome> {
+    return this.backendFor(name).sendQueuedNow(name);
   }
 
   clearInputBox(name: string): Promise<boolean> {
