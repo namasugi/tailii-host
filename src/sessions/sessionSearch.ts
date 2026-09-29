@@ -4,6 +4,7 @@
 import * as fs from "node:fs";
 import type { ClaudeSessionInfo, SessionSearchResult } from "../protocol.js";
 import { isCompactSummaryRecord } from "../shared/compactSummary.js";
+import { isLocalCommandModelCopyRecord } from "../shared/localCommandModelCopy.js";
 import { narrationText } from "../shared/narration.js";
 import { stripInjectedReminderBlocks, stripReminderTagBlocks } from "../shared/harnessReminder.js";
 import { crossSessionOriginHint, crossSessionPreviewLine, presentCrossSessionMessage } from "../shared/crossSession.js";
@@ -133,6 +134,8 @@ function searchTranscriptFile(
     // 圧縮の要約は過去の発話の言い換えで、ヒットしても英文の要約がスニペットに出るだけ（原文は
     // 圧縮前の行として同じ transcript に残るのでそちらで当たる）。
     if (isCompactSummaryRecord(obj)) continue;
+    // ローカルコマンド出力のモデル向けの写し（`/context` の表）も発話ではないので当てない。
+    if (isLocalCommandModelCopyRecord(obj)) continue;
     const text = extractMessageText(obj);
     if (text === null) continue;
     const normalizedText = text.toLocaleLowerCase();

@@ -552,6 +552,54 @@ describe("TranscriptTailer", () => {
     expect(findTrailingUserPromptText(p)).toBe("圧縮前の発話");
   });
 
+  test("/context の Markdown 写し（isMeta の user 行）は発話バブルにせず、端末向け出力の system 行だけを流す", async () => {
+    // 実測形（2.1.284, 2026-09-30）: command-name の system 行 → ANSI 版 stdout の system 行 →
+    // 同じ内容の Markdown 版（parentUuid = stdout 行）が isMeta の user 行。
+    const p = writeTranscript([
+      '{"type":"user","message":{"role":"user","content":"前の発話"},"uuid":"u1","timestamp":"2026-09-30T04:00:00.000Z"}',
+      '{"type":"system","subtype":"local_command","content":"<command-name>/context</command-name>\\n<command-message>context</command-message>\\n<command-args></command-args>","uuid":"lc1","timestamp":"2026-09-30T04:01:00.000Z"}',
+      '{"type":"system","subtype":"local_command","content":"<local-command-stdout> \\u001b[1mContext Usage\\u001b[22m\\nFable 5.1</local-command-stdout>","uuid":"lc2","timestamp":"2026-09-30T04:01:00.100Z"}',
+      '{"type":"user","isMeta":true,"parentUuid":"lc2","message":{"role":"user","content":"## Context Usage\\n\\n**Model:** claude-fable-5-1  \\n**Tokens:** 976.3k / 1m (98%)\\n\\n| Category | Tokens |\\n|---|---|\\n| Messages | 926.7k |"},"uuid":"m1","timestamp":"2026-09-30T04:01:00.200Z"}',
+    ]);
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
+    const chats = (await collect(tailer.streamTranscript(p))).filter((m) => m.type === "chat_output");
+    const rows = chats.map((m) => (m.type === "chat_output" ? [m.streamId, m.role] : null));
+    expect(rows).toEqual([
+      ["u1", "user"],
+      ["lc1", "user"],
+      ["lc2", "user"],
+    ]);
+    // 写しはターンを始める発話ではない: 末尾の本物の発話は前のもののまま。
+    expect(findTrailingUserPromptText(p)).toBe("前の発話");
+  });
+
+  test("/context の Markdown 写しは発話の観測（turn_start）を出さず、直前の中断マーカーも隠さない", async () => {
+    const p = writeTranscript([
+      '{"type":"user","message":{"role":"user","content":"発話"},"uuid":"u1","timestamp":"2026-09-30T04:00:00.000Z"}',
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"uuid":"u2","timestamp":"2026-09-30T04:00:30.000Z"}',
+      '{"type":"system","subtype":"local_command","content":"<local-command-stdout>Context Usage</local-command-stdout>","uuid":"lc2","timestamp":"2026-09-30T04:01:00.100Z"}',
+      '{"type":"user","isMeta":true,"parentUuid":"lc2","message":{"role":"user","content":"## Context Usage\\n\\n**Model:** claude-fable-5-1"},"uuid":"m1","timestamp":"2026-09-30T04:01:00.200Z"}',
+    ]);
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
+    const events: unknown[] = [];
+    tailer.setTurnLifecycleObserver((event) => events.push(event));
+    await collect(tailer.streamTranscript(p));
+    expect(events).toEqual([
+      { kind: "turn_start", atMs: Date.parse("2026-09-30T04:00:00.000Z") },
+      { kind: "interrupted", atMs: Date.parse("2026-09-30T04:00:30.000Z") },
+    ]);
+    expect(findTrailingTurnEndMarkerMs(p)).toBe(Date.parse("2026-09-30T04:00:30.000Z"));
+  });
+
+  test("isMeta でない利用者の発話は「## Context Usage」で始まっても落とさない", async () => {
+    const p = writeTranscript([
+      '{"type":"user","message":{"role":"user","content":"## Context Usage\\n\\nこの見出しの意味は？"},"uuid":"u1","timestamp":"2026-09-30T04:00:00.000Z"}',
+    ]);
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
+    const chats = (await collect(tailer.streamTranscript(p))).filter((m) => m.type === "chat_output");
+    expect(chats.map((m) => (m.type === "chat_output" ? [m.streamId, m.role] : null))).toEqual([["u1", "user"]]);
+  });
+
   test("圧縮の要約は直前の中断マーカーを隠さない（末尾の終端判定）", () => {
     const p = writeTranscript([
       '{"type":"user","message":{"role":"user","content":"発話"},"uuid":"u1","timestamp":"2026-09-24T12:50:00.000Z"}',

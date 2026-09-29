@@ -1436,6 +1436,23 @@ describe("ClaudeSessionStore", () => {
     expect(list[0]?.title).toBe("最初の質問");
   });
 
+  test("/context の Markdown 写し（isMeta の user 行）は lastMessage / タイトルに採用しない", () => {
+    const root = makeTempDir("claude-sessions-context-copy");
+    const slugDir = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slugDir, { recursive: true });
+    const copy = JSON.stringify({ type: "user", isMeta: true, timestamp: "2026-01-01T00:02:00Z", message: { role: "user", content: "## Context Usage\n\n**Model:** claude-fable-5-1" } }) + "\n";
+    fs.writeFileSync(
+      path.join(slugDir, "cccccccc-1111.jsonl"),
+      copy +
+        '{"type":"user","cwd":"/tmp/proj","timestamp":"2026-01-01T00:00:00Z","message":{"content":"最初の質問"}}\n' +
+        '{"type":"assistant","timestamp":"2026-01-01T00:01:00Z","message":{"content":[{"type":"text","text":"実応答"}]}}\n' +
+        copy,
+    );
+    const list = new ClaudeSessionStore(root).list();
+    expect(list[0]?.lastMessage).toBe("実応答");
+    expect(list[0]?.title).toBe("最初の質問");
+  });
+
   test("assistant text 末尾へ追記された harness 注入（停止境界の背景通知）は lastMessage から除去する", () => {
     const root = makeTempDir("claude-sessions-assistant-reminder");
     const slugDir = path.join(root, "-tmp-proj");
@@ -2073,6 +2090,21 @@ describe("searchClaudeSessions", () => {
     const hit = searchClaudeSessions(store, "ログインが止まる").results;
     expect(hit).toHaveLength(1);
     expect(hit[0]?.snippet).toBe("ログインが止まる");
+  });
+
+  test("/context の Markdown 写し（isMeta の user 行）は検索対象にしない", () => {
+    const root = makeTempDir("session-search-context-copy");
+    const slug = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slug, { recursive: true });
+    fs.writeFileSync(
+      path.join(slug, "cccccccc-search.jsonl"),
+      [
+        JSON.stringify({ type: "user", cwd: "/tmp/proj", timestamp: "2026-01-01T00:00:00Z", message: { content: "質問" } }),
+        JSON.stringify({ type: "user", isMeta: true, timestamp: "2026-01-01T00:02:00Z", message: { content: "## Context Usage\n\n| needle-context | 1k |" } }),
+      ].join("\n") + "\n",
+    );
+    const store = new ClaudeSessionStore(root);
+    expect(searchClaudeSessions(store, "needle-context").results).toEqual([]);
   });
 
   test("harness 注入（assistant 末尾の背景通知 / user のリマインダ）は検索対象にもスニペットにも出さない", () => {

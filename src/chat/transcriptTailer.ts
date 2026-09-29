@@ -21,6 +21,7 @@ import {
   type ToolActivityTodo,
 } from "../protocol.js";
 import { isCompactSummaryRecord } from "../shared/compactSummary.js";
+import { isLocalCommandModelCopyRecord } from "../shared/localCommandModelCopy.js";
 import { narrationText } from "../shared/narration.js";
 import { isInjectedSkillContent } from "../shared/skillInjection.js";
 import { abortableSleep } from "../shared/sleep.js";
@@ -621,6 +622,8 @@ function userLineKind(line: string): UserLineKind {
     if (trimmed.length === 0) return "tool-result";
     // 圧縮の要約（isCompactSummary）は harness が書く文脈で、ターンを始めない。
     if (isCompactSummaryRecord(record)) return "meta";
+    // ローカルコマンド出力のモデル向けの写し（`/context` の Markdown 版）もターンを始めない。
+    if (isLocalCommandModelCopyRecord(record)) return "meta";
     if (record["isMeta"] === true) {
       // スキル本文の注入（sourceToolUseID 付き）と既知の注記だけを「注記」にする。それ以外の isMeta
       // （cross-session の起こし・自動再開プロンプト）はターンを始める発話として扱う。
@@ -903,6 +906,9 @@ export function extractTurn(line: string, ctx?: SystemNoticeContext): Turn | nul
   // 圧縮の要約（isCompactSummary の user 行）は発話ではないので出さない。圧縮の事実は直前の
   // compact_boundary の system 注記が伝える（実機 2026-09-24: 要約全文が発話バブルで出ていた）。
   if (isCompactSummaryRecord(rec)) return null;
+  // ローカルコマンド出力のモデル向けの写し（`/context` の Markdown 版）も発話ではない。同じ内容は
+  // 直前の `<local-command-stdout>` 行が system 行として出す（実機 2026-09-30: 発話バブルで出ていた）。
+  if (isLocalCommandModelCopyRecord(rec)) return null;
 
   const id =
     (typeof rec["uuid"] === "string" ? rec["uuid"] : null) ??

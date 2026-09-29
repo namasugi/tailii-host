@@ -12,6 +12,7 @@ import { isInsideBase } from "../shared/paths.js";
 import { stripInjectedReminderBlocks, stripReminderTagBlocks } from "../shared/harnessReminder.js";
 import { crossSessionOriginHint, crossSessionPreviewLine, presentCrossSessionMessage } from "../shared/crossSession.js";
 import { isCompactSummaryRecord } from "../shared/compactSummary.js";
+import { isLocalCommandModelCopyRecord } from "../shared/localCommandModelCopy.js";
 import { narrationText } from "../shared/narration.js";
 import { isInjectedSkillContent } from "../shared/skillInjection.js";
 
@@ -443,6 +444,8 @@ function extractUserText(obj: Record<string, unknown>): string | null {
 function extractMessageText(obj: Record<string, unknown>, maxLength: number): string | null {
   // 圧縮の要約（isCompactSummary の user 行）は発話ではないので提示しない（前の実発話へ遡る）。
   if (isCompactSummaryRecord(obj)) return null;
+  // ローカルコマンド出力のモデル向けの写し（`/context` の Markdown 版）も同じく提示しない。
+  if (isLocalCommandModelCopyRecord(obj)) return null;
   const message = obj["message"];
   if (typeof message !== "object" || message === null) return null;
   const content = (message as Record<string, unknown>)["content"];
