@@ -4,6 +4,7 @@
 import * as fs from "node:fs";
 import type { ClaudeSessionInfo, SessionSearchResult } from "../protocol.js";
 import { isCompactSummaryRecord } from "../shared/compactSummary.js";
+import { narrationText } from "../shared/narration.js";
 import { stripInjectedReminderBlocks, stripReminderTagBlocks } from "../shared/harnessReminder.js";
 import { crossSessionOriginHint, crossSessionPreviewLine, presentCrossSessionMessage } from "../shared/crossSession.js";
 
@@ -172,6 +173,9 @@ function extractMessageText(obj: Record<string, unknown>): string | null {
         if ((blockType === undefined || blockType === "text") && typeof text === "string") {
           parts.push(strip(text));
         }
+        // thinking ブロックとして記録された途中経過の発話（narration）も会話画面に出るので検索対象。
+        const narration = obj["type"] === "assistant" ? narrationText(block) : null;
+        if (narration !== null) parts.push(strip(narration));
       }
     }
   }

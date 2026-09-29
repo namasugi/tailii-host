@@ -5,7 +5,8 @@
 // `chat_output` デルタ（1 ターン = 1 streamId、確定で eof:true）として生成する。
 // あわせて tool_use → tool_activity / AskUserQuestion → question_prompt / tool_result →
 // question_dismiss / model 変化 → モデルマーカーを送出する。
-// 抽出対象を text ブロックに限定し、秘密（接続鍵）を運ぶ経路を作らない（9.3）。
+// 抽出対象を text ブロックと、CLI が発話として画面に出す narration（shared/narration.ts）に限定し、
+// 秘密（接続鍵）を運ぶ経路を作らない（9.3）。
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -20,6 +21,7 @@ import {
   type ToolActivityTodo,
 } from "../protocol.js";
 import { isCompactSummaryRecord } from "../shared/compactSummary.js";
+import { narrationText } from "../shared/narration.js";
 import { isInjectedSkillContent } from "../shared/skillInjection.js";
 import { abortableSleep } from "../shared/sleep.js";
 import {
@@ -29,6 +31,8 @@ import {
   type SystemNoticeContext,
 } from "../shared/systemNotice.js";
 
+/** 全履歴再生の開始。旧 host が落としていた narration を iOS 側で履歴順へ挿入する。 */
+export const HISTORY_BEGIN_STREAM_ID = "pc:history-begin";
 /** 履歴再生完了マーカーの streamId（iOS 側 `ChatLogModel` と対で解釈する）。 */
 export const HISTORY_DONE_STREAM_ID = "pc:history-done";
 /** 利用中モデル通知マーカーの streamId（iOS 側 `ChatLogModel` と対で解釈する）。 */
@@ -269,7 +273,7 @@ export interface TranscriptTailerOptions {
   tailDeadlineMs?: number | null;
   /** EOF 後も abort まで無期限に tail するか。既定 false（本番 engine は true）。 */
   tailIndefinitely?: boolean;
-  /** 初回 EOF で履歴再生完了マーカーを流すか。既定 false（セッション連動 tail のみ true）。 */
+  /** 履歴再生マーカーを流すか。全履歴は開始+完了、差分は完了のみ。既定 false。 */
   emitReplayDoneMarker?: boolean;
 }
 
@@ -446,6 +450,12 @@ export class TranscriptTailer {
       const start = Date.now();
       let announcedReplayDone = false;
       const chunk = Buffer.alloc(4096);
+      if (this.emitReplayDoneMarker && newerThanMs === null) {
+        yield {
+          type: "chat_output", v: PROTOCOL_V1, streamId: HISTORY_BEGIN_STREAM_ID,
+          role: "system", text: "", eof: true,
+        };
+      }
 
       while (!signal?.aborted) {
         let bytesRead = 0;
@@ -460,7 +470,9 @@ export class TranscriptTailer {
           // 初回 EOF = 既存内容の再生完了。マーカー有効時は完了シグナルを 1 通流す。
           if (this.emitReplayDoneMarker && !announcedReplayDone) {
             announcedReplayDone = true;
-            if (lineBuf.length > 0) {
+            // 購読開始が書き込み途中に重なることがある。未完の最終行は後続の追記と結合するため残す。
+            // 改行だけが無い完全な JSON は従来どおり履歴に含める。
+            if (lineBuf.length > 0 && isCompleteJsonLine(lineBuf)) {
               yield* emitLineAfter(lineBuf, state, newerThanMs);
               lineBuf = Buffer.alloc(0);
             }
@@ -501,6 +513,15 @@ export class TranscriptTailer {
         // 二重 close 等は無視。
       }
     }
+  }
+}
+
+function isCompleteJsonLine(line: Buffer): boolean {
+  try {
+    JSON.parse(line.toString("utf8"));
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -888,7 +909,11 @@ export function extractTurn(line: string, ctx?: SystemNoticeContext): Turn | nul
     (typeof rec["id"] === "string" ? rec["id"] : null);
 
   const rawContent = message?.["content"] ?? rec["content"];
-  const plainText = extractText(rawContent);
+  // assistant は text に加えて narration（thinking ブロックとして記録された途中経過の発話）も本文にする。
+  // CLI はどちらも同じ「⏺ 本文」で出す（2026-09-28 実機: narration を読まず途中経過が消えていた）。
+  const plainText = role === "assistant"
+    ? extractAssistantText(rawContent)
+    : extractText(rawContent);
   // AskUserQuestion の回答行は text ブロックではなく tool_result +
   // top-level toolUseResult.answers に記録される。通常の tool_result は会話ログへ
   // 流さず、設問と回答の構造を持つ行だけ user バブル用の要約へ変換する。
@@ -959,6 +984,28 @@ function extractText(content: unknown): string {
     if (typeof rec["text"] === "string") parts.push(rec["text"]);
   }
   return parts.join("");
+}
+
+/** assistant の content から、text ブロックと narration の本文を出現順に連結する。 */
+function extractAssistantText(content: unknown): string {
+  if (!Array.isArray(content)) return extractText(content);
+  const parts: string[] = [];
+  let hasNarration = false;
+  for (const block of content) {
+    if (typeof block !== "object" || block === null) continue;
+    const rec = block as Record<string, unknown>;
+    if (rec["type"] === "text") {
+      if (typeof rec["text"] === "string") parts.push(rec["text"]);
+      continue;
+    }
+    if (narrationText(rec) !== null && typeof rec["thinking"] === "string") {
+      // ブロックごとに trim すると、narration 末尾の段落区切りが消えて次の text に密着する。
+      parts.push(rec["thinking"]);
+      hasNarration = true;
+    }
+  }
+  const text = parts.join("");
+  return hasNarration ? text.trim() : text;
 }
 
 /** 選択肢を選ばず Notes 欄だけで確定したときに Claude Code が入れる回答値。 */

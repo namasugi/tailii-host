@@ -2152,6 +2152,29 @@ describe("SessionHub conversation stream", () => {
 
   // backfilling 中の購読者は publishConversationEvent が丸ごと飛ばす。センチネルが来ない会話で
   // 旗が立ちっぱなしになり「接続は健全なのに会話だけ永久に更新されない」実障害になった。
+  test("Claude の全履歴が途中で停滞したら、再生を中止してから live へ戻す", async () => {
+    vi.useFakeTimers();
+    try {
+      const { hub, writes } = makeStreamingHub();
+      const a = {}, b = {}, ar: unknown[] = [], br: unknown[] = [];
+      subscribe(hub, a, ar);
+      writes[0]!(output("before"));
+      subscribe(hub, b, br, { afterSeq: 999 });
+      writes[1]!({ type: "chat_output", v: 1, streamId: "pc:history-begin", role: "system", text: "", eof: true });
+      writes[1]!(output("historical-narration"));
+      writes[0]!(output("live-narration"));
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(br).toMatchObject([
+        { payload: { streamId: "pc:history-begin" } },
+        { payload: { streamId: "historical-narration" } },
+        { payload: { streamId: "pc:history-cancelled" } },
+        { payload: { streamId: "live-narration" } },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("履歴 backfill が停滞しても live 配信へ復帰し、境界後のイベントを取りこぼさない", async () => {
     vi.useFakeTimers();
     try {

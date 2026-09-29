@@ -12,6 +12,7 @@ import { isInsideBase } from "../shared/paths.js";
 import { stripInjectedReminderBlocks, stripReminderTagBlocks } from "../shared/harnessReminder.js";
 import { crossSessionOriginHint, crossSessionPreviewLine, presentCrossSessionMessage } from "../shared/crossSession.js";
 import { isCompactSummaryRecord } from "../shared/compactSummary.js";
+import { narrationText } from "../shared/narration.js";
 import { isInjectedSkillContent } from "../shared/skillInjection.js";
 
 /** タイトル抽出の最大長（先頭 ~60 字）。 */
@@ -450,6 +451,13 @@ function extractMessageText(obj: Record<string, unknown>, maxLength: number): st
     raw = content;
   } else if (Array.isArray(content)) {
     raw = firstText(content);
+    // thinking ブロックとして記録された途中経過の発話（narration）も、会話画面に出る応答として扱う。
+    if (raw === null && obj["type"] === "assistant") {
+      for (const block of content) {
+        raw = narrationText(block);
+        if (raw !== null) break;
+      }
+    }
   }
   if (raw === null) return null;
   // 別セッションからのメッセージ封筒（<cross-session-message>）は、生 XML を出さず

@@ -1296,7 +1296,8 @@ describe("EngineControl — 横断制御チャネル", () => {
     engine.writeLine(
       `{"cwd":"${cwd}","id":"S-k1","name":"alias-kill","resumeSessionId":"convkill","type":"session_start","v":1}`,
     );
-    expect(await engine.lines.nextOfType("chat_output")).toContain("hi");
+    expect(await engine.lines.nextOfType("chat_output")).toContain("pc:history-begin");
+    expect(JSON.parse(await engine.lines.nextOfType("chat_output"))).toMatchObject({ streamId: "u0", text: "hi" });
     expect(await engine.lines.nextOfType("chat_output")).toContain("pc:history-done");
 
     // 2. kill（kill 要求への現況一覧応答まで読み進める。S-k1 への一覧応答が
@@ -1313,7 +1314,9 @@ describe("EngineControl — 横断制御チャネル", () => {
     engine.writeLine(
       `{"cwd":"${cwd}","id":"S-k2","name":"cs-convkill","resumeSessionId":"convkill","type":"session_start","v":1}`,
     );
-    expect(await engine.lines.nextOfType("chat_output")).toContain("hi");
+    expect(await engine.lines.nextOfType("chat_output")).toContain("pc:history-begin");
+    expect(JSON.parse(await engine.lines.nextOfType("chat_output"))).toMatchObject({ streamId: "u0", text: "hi" });
+    expect(await engine.lines.nextOfType("chat_output")).toContain("pc:history-done");
 
     await engine.teardown();
   });

@@ -8,6 +8,7 @@ import {
   rolloutResponseItemToolActivities,
 } from "../codex/codexToolActivity.js";
 import { isCompactSummaryRecord } from "../shared/compactSummary.js";
+import { narrationText } from "../shared/narration.js";
 import { stripInjectedReminderBlocks, stripReminderTagBlocks } from "../shared/harnessReminder.js";
 import { crossSessionOriginHint, crossSessionSenderLabel, presentCrossSessionMessage } from "../shared/crossSession.js";
 
@@ -159,6 +160,12 @@ export function parseSubagentTranscript(jsonl: string): SubagentTranscriptResult
       if (block === null) continue;
       if (block["type"] === "text" && typeof block["text"] === "string" && block["text"]) {
         const text = present(block["text"]);
+        if (text.trim()) all.push(entry(role, text, ts));
+      }
+      // thinking ブロックとして記録された途中経過の発話（narration）。CLI は text と同じく発話として出す。
+      const narration = role === "assistant" ? narrationText(block) : null;
+      if (narration !== null) {
+        const text = present(narration);
         if (text.trim()) all.push(entry(role, text, ts));
       }
       if (block["type"] === "tool_use" && typeof block["name"] === "string") {
