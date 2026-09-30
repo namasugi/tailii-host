@@ -85,6 +85,116 @@ describe("PanePreviewPump", () => {
     pump.stop();
   });
 
+  test("holdActiveIf が真の静止フレームでは消灯せず、1 秒おきに送り直す（上へスクロールされた処理中, scroll-pill）", async () => {
+    vi.useFakeTimers();
+    let paneText = "first";
+    const { writer, messages } = memoryWriter();
+    const pump = new PanePreviewPump({
+      writer,
+      capture: async () => paneText,
+      pollIntervalMs: 10,
+      quietThresholdMs: 25,
+      protocolVersion: () => 2,
+      holdActiveIf: (text) => text.startsWith("scrolled"),
+    });
+
+    pump.start("work");
+    await flushMicrotasks();
+    paneText = "scrolled busy";
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.advanceTimersByTimeAsync(900);
+    expect(messages()).toEqual([
+      { type: "pane_preview", v: 2, session: "work", seq: 1, active: true, text: "scrolled busy" },
+    ]);
+    // 確定応答で（旧版の）iOS が表示を消しても、画面が動かないまま点き直す。
+    await vi.advanceTimersByTimeAsync(200);
+    expect(messages()).toEqual([
+      { type: "pane_preview", v: 2, session: "work", seq: 1, active: true, text: "scrolled busy" },
+      { type: "pane_preview", v: 2, session: "work", seq: 2, active: true, text: "scrolled busy" },
+    ]);
+
+    // 処理が終わって画面が変われば、いつもどおり静止で消灯する。
+    paneText = "idle";
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.advanceTimersByTimeAsync(1000);
+    const last = messages().at(-1);
+    expect(last?.type === "pane_preview" && last.active).toBe(false);
+
+    pump.stop();
+  });
+
+  test("iPhone が開いたときだけ 1 回、上へスクロールされた画面を最新位置へ戻す（jump-to-latest）", async () => {
+    vi.useFakeTimers();
+    let paneText = "scrolled";
+    const jumps: string[] = [];
+    const { writer } = memoryWriter();
+    const pump = new PanePreviewPump({
+      writer,
+      capture: async () => paneText,
+      pollIntervalMs: 100,
+      quietThresholdMs: 25,
+      protocolVersion: () => 2,
+      jumpToLatest: async (session) => {
+        jumps.push(session);
+        paneText = "latest"; // 戻った
+      },
+      jumpToLatestIf: (text) => text.startsWith("scrolled"),
+    });
+
+    pump.start("work");
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(jumps).toEqual([]); // 開かれていない（一覧 watch など）なら送らない
+
+    pump.armJumpToLatest();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(jumps).toEqual(["work"]);
+
+    // 戻った後に Mac 側でまた上へスクロールしても、次に開くまでは送らない（読み返しを奪わない）。
+    await vi.advanceTimersByTimeAsync(200);
+    paneText = "scrolled again";
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(jumps).toHaveLength(1);
+
+    // 開き直せばまた 1 回。
+    pump.armJumpToLatest();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(jumps).toHaveLength(2);
+
+    pump.stop();
+  });
+
+  test("開いた時点で最新位置なら何もしない・戻らない環境では 3 回で諦める（jump-to-latest）", async () => {
+    vi.useFakeTimers();
+    let paneText = "latest";
+    const jumps: number[] = [];
+    const { writer } = memoryWriter();
+    const pump = new PanePreviewPump({
+      writer,
+      capture: async () => paneText,
+      pollIntervalMs: 100,
+      quietThresholdMs: 25,
+      protocolVersion: () => 2,
+      jumpToLatest: async () => { jumps.push(Date.now()); }, // 戻らない
+      jumpToLatestIf: (text) => text.startsWith("scrolled"),
+    });
+
+    pump.start("work");
+    await flushMicrotasks();
+    pump.armJumpToLatest();
+    await vi.advanceTimersByTimeAsync(200);
+    paneText = "scrolled"; // 開いた後で Mac 側がスクロールした
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(jumps).toEqual([]);
+
+    pump.armJumpToLatest();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(jumps).toHaveLength(3);
+    expect((jumps[1] ?? 0) - (jumps[0] ?? 0)).toBeGreaterThanOrEqual(5000);
+
+    pump.stop();
+  });
+
   test("pollIntervalMs 関数は毎周期評価される（前面 250ms / 一覧 watch 1s の動的切替）", async () => {
     vi.useFakeTimers();
     let interval = 10;

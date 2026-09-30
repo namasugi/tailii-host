@@ -2448,6 +2448,32 @@ describe("SessionHub conversation stream", () => {
     expect(stops).toBe(1);
   });
 
+  test("前面購読が始まったときだけ、最新位置へ戻す準備をする（jump-to-latest）", () => {
+    const metadataStore = makeTempStore();
+    metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0 });
+    let arms = 0;
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-jump-arm"),
+      metadataStore, timeoutSeconds: 1800,
+      previewPumpFactory: () => ({ start() {}, stop() {}, armJumpToLatest() { arms += 1; } }) });
+    const a = {}, b = {};
+    // 一覧 watch・前面でない購読では準備しない（Mac 側の読み位置を奪わない）。
+    subscribe(hub, a, [], { preview: false });
+    expect(arms).toBe(0);
+    // iPhone が会話を開いた（新しい前面購読）。
+    subscribe(hub, b, [], { afterSeq: 0, preview: true });
+    expect(arms).toBe(1);
+    // 同じ前面購読の再送（開いたまま）では準備し直さない。
+    subscribe(hub, b, [], { afterSeq: 0, preview: true });
+    expect(arms).toBe(1);
+    // 前面でなくなって再び前面になった（開き直し）。
+    subscribe(hub, b, [], { afterSeq: 0, preview: false });
+    subscribe(hub, b, [], { afterSeq: 0, preview: true });
+    expect(arms).toBe(2);
+    // 前面でない購読の昇格も開いたのと同じ。
+    subscribe(hub, a, [], { afterSeq: 0, preview: true });
+    expect(arms).toBe(3);
+  });
+
   test("一覧 watch は処理中会話の pump を前面購読なしで起動し、処理完了で停止する", () => {
     const metadataStore = makeTempStore();
     metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0 });

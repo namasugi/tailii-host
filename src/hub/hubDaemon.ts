@@ -24,7 +24,14 @@ import { SessionHub } from "./sessionHub.js";
 import { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
 import { abortableSleep } from "../shared/sleep.js";
 import { resolveHubSocketPath } from "../shared/socketPath.js";
-import { processTmuxCommandRunner, screenInLoginFlow, screenShowsApprovalDialog } from "../backend/tmux.js";
+import {
+  processTmuxCommandRunner,
+  JUMP_TO_LATEST_SEQUENCE,
+  screenBusyButScrolledAway,
+  screenInLoginFlow,
+  screenShouldJumpToLatest,
+  screenShowsApprovalDialog,
+} from "../backend/tmux.js";
 import { envWithoutTmux, screenHasSelectionFooter } from "../backend/herdr.js";
 import { readPackageVersion } from "../shared/version.js";
 import { ChatTailController } from "../chat/chatTailController.js";
@@ -464,10 +471,18 @@ export async function runHubCommand(args: string[]): Promise<number> {
       log,
       // 静止した入力待ちダイアログ（選択 / /login / hook で通らなかった承認）は初回フレームから送る
       // （開き直しで転写カードを出す）。使用量制限の待機フッター（usage-limit-wait）も静止画面なので
-      // 初回フレームから送る。
+      // 初回フレームから送る。端末側で上へスクロールされた処理中の Claude も静止画面なので同じ
+      // （scroll-pill）。
       emitInitialIf: (text) =>
         screenHasSelectionFooter(text) || screenInLoginFlow(text) || screenShowsApprovalDialog(text)
-        || parseUsageLimitWait(text) !== null,
+        || parseUsageLimitWait(text) !== null || screenBusyButScrolledAway(text),
+      // 上へスクロールされた処理中の Claude は画面が動かない。静止を処理の終わりと読まない。
+      holdActiveIf: screenBusyButScrolledAway,
+      // iPhone が会話を開いたとき端末側で上へスクロールされていたら、1 回だけ最新位置へ戻す
+      // （jump-to-latest。hub が前面購読の開始で armJumpToLatest を呼ぶ）。戻らない環境（キー割り当ての
+      // 変更等）では上の保持が残る。
+      jumpToLatest: (session) => sessionBackend.sendKeys(session, [JUMP_TO_LATEST_SEQUENCE], true),
+      jumpToLatestIf: screenShouldJumpToLatest,
     }),
     questionInjector: (answers, session) => injectQuestionAnswers(answers, session, sessionBackend),
     // 使用量制限の自動再開待ちを push で知らせる（usage-limit-wait。APNs 未設定なら内部で skip）。

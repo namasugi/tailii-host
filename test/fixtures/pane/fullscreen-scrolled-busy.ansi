@@ -1,0 +1,40 @@
+[38;5;239m[48;5;237m❯ Run this exact bash command with the Bash tool: for i in $(seq 1 80); do echo line $i; done; sleep 60 . Then write 5…[39m
+[49m  48. Security patches should be applied promptly.
+  49. Dependency updates maintain compatibility and security.
+  50. Learning never stops in technology and software development.
+
+[38;5;246m✻[39m [38;5;246mBaked for 1m 9s · done 10:50 PM[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mRun with the Bash tool: sleep 90 ; then reply ok.[39m
+[49m
+  [38;5;246mRan [1m2[0m[38;5;246m shell commands [39m
+
+[38;5;231m⏺[39m The sleep command is now running in the background. I'll reply with "ok" once it completes.
+
+[38;5;246m✻[39m [38;5;246mCrunched for 5s · done 10:51 PM[39m
+
+[38;5;114m⏺[39m Background command "sleep 90" completed (exit code 0)
+
+[38;5;231m⏺[39m ok.
+
+[38;5;246m✻[39m [38;5;246mCrunched for 1s · done 10:52 PM[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mUse the Bash tool in the foreground (run_in_background false, timeout 120000) to run: sleep 60 . Do not background [39m
+  [38;5;231mit. Then reply ok.[39m
+[49m
+  [38;5;246mRan [1m1[0m[38;5;246m shell command [39m
+
+[38;5;231m⏺[39m The Bash tool blocks standalone sleep commands in the foreground, even when explicitly requested. The tool enforces
+  this restriction to prevent blocking the session. The only ways to use sleep are:
+
+  1. Run it in the background with [38;5;153mrun_in_background: true[39m
+  2. Use it as part of a command with a condition (e.g., an until-loop with Monitor)
+
+  Would you like me to run the sleep in the background instead, or use a different approach?
+
+[38;5;246m✻[39m [38;5;246mCogitated for 5s · done 10:52 PM[39m          [38;5;231m[48;5;237m Jump to bottom: fn+↓ to scroll [39m[49m
+
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[38;5;246m❯ [39m
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;211m⏵⏵ bypass permissions on[38;5;246m (shift+tab to cycle) · esc to interrupt · ← for agents[39m

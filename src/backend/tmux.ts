@@ -1419,6 +1419,86 @@ export function screenShowsApprovalDialog(screen: string): boolean {
 }
 
 /**
+ * 処理中の Claude が、端末側で会話の途中まで上へスクロールされているか（scroll-pill, TESTABLE）。
+ *
+ * fullscreen 表示（settings の `tui: "fullscreen"`）の Claude は、上へスクロールされると最新位置へ
+ * 自動では戻らず、スクロール領域の最下行の**中央**に案内（pill）を重ねる（実測 2.1.285。前後に
+ * 空白 1 個の余白。背景が無いので左右には下の本文の文字が残る）:
+ * - tmux: `1 new message: fn+↓ to scroll` / `Jump to bottom: fn+↓ to scroll`
+ * - herdr: `…本文…      2 new messages (click) ↓      …本文…`
+ *
+ * この間スピナー行は画面外にあり、画面は処理中でも**まったく変わらない**。pane_preview の「2.5 秒
+ * 静止で消灯」がそのまま効き、処理中表示が消える（開き直すと初回フレームも送られず一度も点かない）。
+ * pill だけでは処理中か分からないので、入力欄の下（ボトムバー。下に agents パネル・⧉ 行・
+ * statusLine が続くことがある）の `esc to interrupt` と両方が見えるときだけ真。
+ * 規則は iOS `PanePreviewInterpreter.scrolledAwayBusy` と揃える。
+ */
+export function screenBusyButScrolledAway(screen: string): boolean {
+  if (!mayContainScrollPill(screen)) return false;
+  const lines = screen.split("\n").map((line) => stripSgr(line.replace(/\r$/, "")));
+  const frame = findInputBoxFrame(lines);
+  if (frame === null) return false;
+  const busy = lines
+    .slice(frame.bottom + 1)
+    .some((line) => !line.trim().startsWith("❯") && line.includes("esc to interrupt"));
+  return busy && scrollPillAboveInputBox(lines, frame.top);
+}
+
+/**
+ * 端末側で上へスクロールされた画面を、最新位置へ戻してよいか（jump-to-latest, TESTABLE）。
+ * 入力欄の直上に案内（pill）があり、入力欄を見ている（ボトムバーが見えていてダイアログが無い）
+ * ときだけ真。ダイアログ中の End キーは選択肢を動かしうるので送らない。処理中かどうかは問わない。
+ */
+export function screenShouldJumpToLatest(screen: string): boolean {
+  if (!mayContainScrollPill(screen)) return false;
+  if (!claudeComposerBarVisible(screen) || screenShowsDialogFooter(screen)) return false;
+  const lines = screen.split("\n").map((line) => stripSgr(line.replace(/\r$/, "")));
+  const frame = findInputBoxFrame(lines);
+  return frame !== null && scrollPillAboveInputBox(lines, frame.top);
+}
+
+/**
+ * 最新位置へ戻るキー（Claude Code の `scroll:bottom` の既定 = ctrl+end, 実測 2.1.285）の生シーケンス。
+ * tmux / herdr とも send-text（literal）で送る。入力欄の下書きとカーソル位置は変わらない（実測）。
+ */
+export const JUMP_TO_LATEST_SEQUENCE = "\u001b[1;5F";
+
+/**
+ * 入力欄の上の枠のすぐ上に pill があるか。pill の行と上の枠の間には空行が 1 行入ることがある（実測。
+ * 入らない画面もある）。キュー済みの発話（`❯ 発話` と `ctrl+x ctrl+s to send now`）が挟まる画面も
+ * 読み飛ばす（iOS の末尾スキップと同じ）。
+ */
+function scrollPillAboveInputBox(lines: string[], frameTop: number): boolean {
+  for (let index = frameTop - 1, scanned = 0; index >= 0 && scanned < SCROLL_PILL_WINDOW_LINES; index -= 1) {
+    const trimmed = (lines[index] ?? "").trim();
+    if (isScrollPillLine(trimmed)) return true;
+    if (trimmed !== "" && !trimmed.startsWith("❯") && !trimmed.endsWith(SEND_NOW_HINT_SUFFIX)) return false;
+    scanned += 1;
+  }
+  return false;
+}
+
+/** pane のフレームは毎秒数回届き、ほとんどに案内は無い。行に分ける前に文言の有無だけを見る。 */
+function mayContainScrollPill(screen: string): boolean {
+  return screen.includes("new message") || screen.includes("Jump to bottom");
+}
+
+/** 入力欄の上の枠から上へ pill を探す行数（空行・キュー済みの発話を読み飛ばす上限）。 */
+const SCROLL_PILL_WINDOW_LINES = 8;
+
+/**
+ * 行（trim 済み）に、スクロール中の案内（pill）があるか。書式は CLI 本体の実装どおり:
+ * `<N> new message(s)` または `Jump to bottom` に、` (click) ↓` / `: <キー> to scroll` /
+ * ` (<キー>) ↓` / ` ↓` のどれかが続き、前後は空白か行の端。端末が極端に狭いと案内の本体だけに
+ * なるが、その形は本文と区別がつかないので、案内だけの行に限って拾う。
+ */
+function isScrollPillLine(trimmed: string): boolean {
+  if (/^(?:\d+ new messages?|Jump to bottom)$/u.test(trimmed)) return true;
+  return /(?:^|\s)(?:\d+ new messages?|Jump to bottom)(?: \(click\) ↓|: \S+ to scroll| \([^)]+\) ↓| ↓)(?=\s|$)/u
+    .test(trimmed);
+}
+
+/**
  * 選択ダイアログを Esc で閉じる試行の結果。
  * - `absent`: 閉じるべき選択ダイアログが見えない（1 キーも打っていない）。
  * - `cancelled`: Esc を 1 回打ち、ダイアログが消えたことを確認した。

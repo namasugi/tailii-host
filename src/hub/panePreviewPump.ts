@@ -50,6 +50,20 @@ export interface PanePreviewPumpOptions {
    * 会話を開き直しても転写カードが出ない（2026-08-25 実障害）。
    */
   emitInitialIf?: (text: string) => boolean;
+  /**
+   * 静止していても消灯しないフレームの判定（claude_status のみ）。端末側で上へスクロールされた
+   * 処理中の Claude はスピナーが画面外に出て画面が動かなくなるため、静止を処理の終わりと
+   * 読まない（scroll-pill）。保持中は直前のフレームを 1 秒おきに送り直す。
+   */
+  holdActiveIf?: (text: string) => boolean;
+  /**
+   * 端末側で上へスクロールされた画面を最新位置へ戻す（jump-to-latest, claude_status のみ）。
+   * `armJumpToLatest()`（iPhone が会話を開いたとき）の後の最初のフレームで `jumpToLatestIf` が
+   * 真なら送る。戻ったら（案内が消えたら）終わり。戻らなければ 5 秒おきに 3 回まで。最初のフレームで
+   * 案内が無ければ何もしない。いずれも次に開くまで送らない（Mac 側での読み返しを奪わない）。
+   */
+  jumpToLatest?: (session: string) => Promise<void>;
+  jumpToLatestIf?: (text: string) => boolean;
 }
 
 /** tmux pane の画面内容が変化したときだけ pane_preview を流す。 */
@@ -76,6 +90,14 @@ export class PanePreviewPump {
   private lastUsageLimitWait: UsageLimitWaitState | null = null;
   private readonly log: ((message: string) => void) | null;
   private readonly emitInitialIf: ((text: string) => boolean) | null;
+  private readonly holdActiveIf: ((text: string) => boolean) | null;
+  private readonly jumpToLatest: ((session: string) => Promise<void>) | null;
+  private readonly jumpToLatestIf: ((text: string) => boolean) | null;
+  /** iPhone が会話を開いてから、最新位置へ戻す判定をまだ終えていないか。 */
+  private jumpArmed = false;
+  private lastJumpAt = 0;
+  /** 今回の準備で送った回数。 */
+  private jumpAttempts = 0;
   private readonly captureSuggestion: ((session: string) => Promise<string>) | null;
   private readonly suggestionIntervalMs: number;
   /** 直近に配信した提案文（null=未配信・"" =提案なし）。変化時だけ流す。 */
@@ -85,6 +107,14 @@ export class PanePreviewPump {
   private lastEmittedDialog = false;
   private emitInitial = false;
   private static readonly minEmitIntervalMs = 500;
+  /**
+   * 静止中も処理中とみなすフレーム（`holdActiveIf`）を送り直す間隔。iOS の完了触覚の取り消し猶予
+   * （1.5 秒）に収まるよう 1 秒（前面購読の 250ms 周期と合わせて最大 1.25 秒で点き直す）。
+   */
+  private static readonly holdResendIntervalMs = 1000;
+  /** 最新位置へ戻すキーを送る最小間隔と、戻らないときに諦めるまでの回数（jump-to-latest）。 */
+  private static readonly jumpIntervalMs = 5000;
+  private static readonly maxJumpAttempts = 3;
 
   constructor(options: PanePreviewPumpOptions) {
     this.writer = options.writer;
@@ -97,6 +127,9 @@ export class PanePreviewPump {
     this.onUsageLimitWait = options.onUsageLimitWait ?? null;
     this.log = options.log ?? null;
     this.emitInitialIf = options.emitInitialIf ?? null;
+    this.holdActiveIf = options.holdActiveIf ?? null;
+    this.jumpToLatest = options.jumpToLatest ?? null;
+    this.jumpToLatestIf = options.jumpToLatestIf ?? null;
     this.captureSuggestion = options.captureSuggestion ?? null;
     this.suggestionIntervalMs = options.suggestionIntervalMs ?? 1000;
   }
@@ -141,6 +174,9 @@ export class PanePreviewPump {
     this.inactiveSent = false;
     this.lastSuggestion = null;
     this.lastSuggestionAt = 0;
+    this.jumpArmed = false;
+    this.lastJumpAt = 0;
+    this.jumpAttempts = 0;
     const ac = new AbortController();
     this.abortController = ac;
     this.task = this.run(session, mode, ac.signal);
@@ -212,6 +248,7 @@ export class PanePreviewPump {
       }
 
       const now = Date.now();
+      if (text !== null && mode === "claude_status") this.maybeJumpToLatest(session, text, now);
       if (text !== null && text !== this.lastText) {
         if (this.lastText === null) {
           this.lastText = text;
@@ -246,9 +283,18 @@ export class PanePreviewPump {
         this.lastChangeAt > 0 &&
         now - this.lastChangeAt >= this.quietThresholdMs
       ) {
-        this.emit(session, false, "");
-        this.inactiveSent = true;
-        this.active = false;
+        if (this.lastText !== null && this.holdActiveIf !== null && this.holdActiveIf(this.lastText)) {
+          // 静止していても処理中（scroll-pill）。消灯せず、直前のフレームを間隔を空けて送り直す:
+          // iOS は確定応答（assistant eof）で表示を消すため、画面が動かないままだと次の変化まで
+          // 点かない。
+          if (now - this.lastEmitAt >= PanePreviewPump.holdResendIntervalMs) {
+            this.emitActive(session, this.lastText, now, mode);
+          }
+        } else {
+          this.emit(session, false, "");
+          this.inactiveSent = true;
+          this.active = false;
+        }
       }
 
       // プロンプト提案（薄字ゴースト）の抽出・配信（claude_status のみ・低頻度・変化時だけ）。
@@ -278,6 +324,30 @@ export class PanePreviewPump {
 
       await abortableSleep(this.pollIntervalMs(), signal);
     }
+  }
+
+  /** iPhone が会話を開いた。次のフレームで上へスクロールされていれば 1 回だけ最新位置へ戻す。 */
+  armJumpToLatest(): void {
+    if (this.jumpToLatest === null || this.jumpToLatestIf === null) return;
+    this.jumpArmed = true;
+    this.jumpAttempts = 0;
+    this.lastJumpAt = 0;
+  }
+
+  private maybeJumpToLatest(session: string, text: string, now: number): void {
+    if (!this.jumpArmed || this.jumpToLatest === null || this.jumpToLatestIf === null) return;
+    // 案内が無い（最初から最新位置・戻せた）なら終わり。以後は次に開くまで送らない。
+    if (!this.jumpToLatestIf(text) || this.jumpAttempts >= PanePreviewPump.maxJumpAttempts) {
+      this.jumpArmed = false;
+      return;
+    }
+    if (now - this.lastJumpAt < PanePreviewPump.jumpIntervalMs) return;
+    this.lastJumpAt = now;
+    this.jumpAttempts += 1;
+    this.log?.(`audit jump-to-latest session=${session} attempt=${this.jumpAttempts}`);
+    this.jumpToLatest(session).catch((error: unknown) => {
+      this.log?.(`audit jump-to-latest-failed session=${session} error=${String(error)}`);
+    });
   }
 
   private emitSuggestion(session: string, text: string): void {

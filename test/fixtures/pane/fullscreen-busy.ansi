@@ -1,0 +1,40 @@
+
+
+[38;5;246m✻[39m [38;5;246mCrunched for 1s · done 10:52 PM[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mUse the Bash tool in the foreground (run_in_background false, timeout 120000) to run: sleep 60 . Do not background [39m
+  [38;5;231mit. Then reply ok.[39m
+
+[49m  [38;5;246mRan [1m1[0m[38;5;246m shell command [39m
+
+[38;5;231m⏺[39m The Bash tool blocks standalone sleep commands in the foreground, even when explicitly requested. The tool enforces
+  this restriction to prevent blocking the session. The only ways to use sleep are:
+
+  1. Run it in the background with [38;5;153mrun_in_background: true[39m
+  2. Use it as part of a command with a condition (e.g., an until-loop with Monitor)
+
+  Would you like me to run the sleep in the background instead, or use a different approach?
+
+[38;5;246m✻[39m [38;5;246mCogitated for 5s · done 10:52 PM[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mRun in the foreground with the Bash tool: python3 -c "import time; [time.sleep(1) for i in range(60)]" ; then reply [39m
+  [38;5;231mok.[39m
+
+[49m  [38;5;246mRan [1m1[0m[38;5;246m shell command [39m
+
+[38;5;231m⏺[39m ok.
+
+[38;5;246m✻[39m [38;5;246mCogitated for 1m 10s · done 10:54 PM[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mRun in the foreground with the Bash tool: python3 -c "import time; [time.sleep(1) for i in range(40)]" ; then reply [39m
+  [38;5;231mok.[39m
+
+[38;5;246m[49m⏺[39m Running python3 -c "import time; [time.sleep(1) for i in …[38;5;246m · 2s[39m
+[38;5;246m  ⎿  $ python3 -c "import time; [time.sleep(1) for i in range(40)]"[39m
+
+[38;5;174m✢[39m [38;5;174mFrolicking… [38;5;246m(4s · ↓[39m [38;5;246m172 tokens · thought for 1s)[39m
+
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[38;5;246m❯ [39m
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;211m⏵⏵ bypass permissions on[38;5;246m (shift+tab to cycle) · esc to interrupt · ← for agents[39m

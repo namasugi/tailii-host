@@ -47,6 +47,9 @@ tmux `capture-pane -p -e`（ANSI 付き・viewport のみ）でそのまま採�
 | `pasted-inline-shifted.ansi` | 肌色付きの ✌🏽 を含む発話を表示して tmux の画面が崩れた後に、30 行を小分けの貼り付けで渡した直後。入力欄が 1 行ずれ、下の罫線の位置に空の `❯` が 2 行出る。本文は入力欄に入っているが、入力欄として読めない（`unknown`） | （モード行が出ない） |
 | `typed-as-paste.ansi` | 1200 字を括弧なしで 1 回で打った直後（直前の貼り付けの案内が出ていた）。先頭の 1022 字は入力欄に入らず、残り 178 字だけが本文 | `paste again to expand` |
 | `queued-sent.ansi` | 「今すぐ送信」の直後（ヒントが消え、実行中だったシェルが背景へ回った） | `⏸ manual mode on · 1 shell · esc to interrupt · ← for agents · ↓ to manage` |
+| `fullscreen-busy.ansi` | fullscreen 表示（`tui: "fullscreen"`, 2.1.285）でシェルの実行中。最新位置を見ている（スピナーが見える） | `⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents` |
+| `fullscreen-scrolled-busy.ansi` | 同じ実行中に PgUp で上へスクロールした画面。スピナーは画面外で、スクロール領域の最下行（過去のターンの `✻ Cogitated for 5s …`）の中央に案内 `Jump to bottom: fn+↓ to scroll` が重なる（背景が無いので、長い行なら案内の左右に下の本文が残る）。処理中でも画面は変わらない | 同上 |
+| `fullscreen-scrolled-idle.ansi` | スクロールしたまま処理が終わった画面。案内は `1 new message: fn+↓ to scroll` に変わる | `⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents` |
 
 キュー済みの 7 枚（chat-send-now）は、発話の直下に `ctrl+x ctrl+s to send now`
 （herdr は `ctrl+enter to send now`）のヒント行が出る。入力欄は空でも薄字のプレースホルダー

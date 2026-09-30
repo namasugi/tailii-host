@@ -13,6 +13,8 @@ import {
   classifySubmitFrame,
   inputBoxHasRealPendingText,
   inputBoxRealText,
+  screenBusyButScrolledAway,
+  screenShouldJumpToLatest,
   screenShowsApprovalDialog,
   screenShowsCancellableChoice,
   screenShowsDialogFooter,
@@ -197,5 +199,96 @@ describe("classifySubmitFrame（実機キャプチャ）", () => {
 
   test("capture 不能は unknown（撃ち続けないし、配送も主張しない）", () => {
     expect(classifySubmitFrame(null)).toBe("unknown");
+  });
+});
+
+describe("screenBusyButScrolledAway（端末側で上へスクロールされた処理中の Claude, scroll-pill）", () => {
+  const FULLSCREEN_BUSY = frame("fullscreen-busy");
+  const SCROLLED_BUSY = frame("fullscreen-scrolled-busy");
+  const SCROLLED_IDLE = frame("fullscreen-scrolled-idle");
+  const PILL = "Jump to bottom: fn+↓ to scroll";
+  /** pill が重なっている行（実機採取）。 */
+  const pillLine = (screen: string): string => {
+    const line = screen.split("\n").find((candidate) => candidate.includes(PILL));
+    if (line === undefined) throw new Error("pill の行が無い");
+    return line;
+  };
+
+  test("処理中にスクロールされた画面（案内が過去の行に重なる形）を拾う", () => {
+    expect(screenBusyButScrolledAway(SCROLLED_BUSY)).toBe(true);
+  });
+
+  test("案内は行の中央に重なり、右側に下の本文が残る形でも拾う", () => {
+    const line = pillLine(SCROLLED_BUSY);
+    const centered = SCROLLED_BUSY.replace(
+      line,
+      "⏺ The Bash tool blocks standalone sleep comm Jump to bottom: fn+↓ to scroll n explicitly requested. The tool enforces",
+    );
+    expect(centered).not.toBe(SCROLLED_BUSY);
+    expect(screenBusyButScrolledAway(centered)).toBe(true);
+  });
+
+  test("herdr の案内（`N new messages (click) ↓`）ほかの書式も拾う", () => {
+    for (const pill of ["2 new messages (click) ↓", "1 new message (ctrl+end) ↓", "3 new messages ↓"]) {
+      const variant = SCROLLED_BUSY.replace(PILL, pill);
+      expect(variant).not.toBe(SCROLLED_BUSY);
+      expect(screenBusyButScrolledAway(variant)).toBe(true);
+    }
+    // 案内の本体だけの形は、案内だけの行のときに限って拾う（本文の中と区別がつかない）。
+    const bare = SCROLLED_BUSY.replace(pillLine(SCROLLED_BUSY), "                                    Jump to bottom");
+    expect(bare).not.toBe(SCROLLED_BUSY);
+    expect(screenBusyButScrolledAway(bare)).toBe(true);
+  });
+
+  test("バーの下に agents パネル・⧉ 行が続いても処理中と読む（iOS の末尾スキップと同じ）", () => {
+    const panel = "\n\n  ⏺ main\n  ◯ design-team:designer  …  11m 0s · ↓ 32.9k tokens\n  ⧉  tailii-ux-redesign";
+    expect(screenBusyButScrolledAway(SCROLLED_BUSY + panel)).toBe(true);
+    expect(screenBusyButScrolledAway(SCROLLED_IDLE + panel)).toBe(false);
+  });
+
+  test("案内と入力欄の間にキュー済みの発話が挟まっても拾う", () => {
+    const lines = SCROLLED_BUSY.split("\n");
+    const pillIndex = lines.findIndex((line) => line.includes(PILL));
+    lines.splice(pillIndex + 1, 0, "❯ あとで送る発話", "  ctrl+x ctrl+s to send now");
+    expect(screenBusyButScrolledAway(lines.join("\n"))).toBe(true);
+  });
+
+  test("最新位置を見ている処理中・スクロールしたままの待機中・普段の画面では出ない", () => {
+    for (const other of [FULLSCREEN_BUSY, SCROLLED_IDLE, IDLE, TYPED, PROCESSING, QUESTION_DIALOG, APPROVAL_DIALOG]) {
+      expect(screenBusyButScrolledAway(other)).toBe(false);
+    }
+  });
+
+  test("案内の文言が入力欄から離れた本文にあるだけ・単語の一部なだけでは出ない", () => {
+    const quoted = FULLSCREEN_BUSY.replace(/\n([^\n]*Frolicking)/, "\n  3 new messages ↓\n\n$1");
+    expect(quoted).not.toBe(FULLSCREEN_BUSY);
+    expect(screenBusyButScrolledAway(quoted)).toBe(false);
+    const glued = SCROLLED_BUSY.replace(PILL, "Jump to bottom: fn+↓ to scrolling");
+    expect(screenBusyButScrolledAway(glued)).toBe(false);
+  });
+});
+
+describe("screenShouldJumpToLatest（上へスクロールされた画面を最新位置へ戻すか, jump-to-latest）", () => {
+  const FULLSCREEN_BUSY = frame("fullscreen-busy");
+  const SCROLLED_BUSY = frame("fullscreen-scrolled-busy");
+  const SCROLLED_IDLE = frame("fullscreen-scrolled-idle");
+
+  test("処理中でも待機中でも、入力欄の直上に案内があれば戻す", () => {
+    expect(screenShouldJumpToLatest(SCROLLED_BUSY)).toBe(true);
+    expect(screenShouldJumpToLatest(SCROLLED_IDLE)).toBe(true);
+    // 本文の行の途中に重なり、空行を挟まない形（実測 2.1.285）。
+    const glued = SCROLLED_IDLE.replace(/\n[^\n]*1 new message: fn\+↓ to scroll[^\n]*\n\s*\n/,
+      "\n  28. Single responsibility, multiple benefi Jump to bottom: fn+↓ to scroll\n");
+    expect(glued).not.toBe(SCROLLED_IDLE);
+    expect(screenShouldJumpToLatest(glued)).toBe(true);
+  });
+
+  test("最新位置を見ている画面・ダイアログ（End キーが選択肢を動かしうる）では戻さない", () => {
+    for (const other of [FULLSCREEN_BUSY, IDLE, TYPED, PROCESSING, QUESTION_DIALOG, APPROVAL_DIALOG]) {
+      expect(screenShouldJumpToLatest(other)).toBe(false);
+    }
+    // ダイアログの本文に案内の文言があっても戻さない。
+    const quotedInDialog = APPROVAL_DIALOG.replace(/\n/, "\n  3 new messages ↓\n");
+    expect(screenShouldJumpToLatest(quotedInDialog)).toBe(false);
   });
 });

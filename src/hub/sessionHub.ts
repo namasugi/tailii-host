@@ -71,6 +71,11 @@ export interface HubPreviewPump {
   stop(): void;
   /** 前面購読者の参加時に、直近の入力待ちフレームを再送する（任意実装）。 */
   resendLastIfInteractive?(): void;
+  /**
+   * iPhone が会話を開いた（前面購読が始まった）ときに 1 回だけ、端末側で上へスクロールされた画面を
+   * 最新位置へ戻す準備をする（任意実装, jump-to-latest）。以後は次に開くまで Mac 側のスクロールを尊重する。
+   */
+  armJumpToLatest?(): void;
 }
 
 /**
@@ -1170,7 +1175,10 @@ export class SessionHub {
       }
       // 会話を開き直したとき（pump は一覧 watch で稼働中）、静止した入力待ちダイアログの
       // フレームは変化しないので再送しないと転写カードが出ない。
-      if (preview && !wasPreview) actor.previewPump?.resendLastIfInteractive?.();
+      if (preview && !wasPreview) {
+        actor.previewPump?.resendLastIfInteractive?.();
+        actor.previewPump?.armJumpToLatest?.();
+      }
       // preview=false 中に engine が route できなかった image/subagent event を、同じ
       // subscriber の前面昇格時にも afterSeq から回収する。既存購読だからと no-op にしない。
       if (!existing.backfilling && afterSeq !== undefined) {
@@ -1194,7 +1202,10 @@ export class SessionHub {
     }
     // 初回 backfill が同期的に多数の行を生成する前に pane capture を開始する。
     this.syncPreview(session, actor);
-    if (preview) actor.previewPump?.resendLastIfInteractive?.();
+    if (preview) {
+      actor.previewPump?.resendLastIfInteractive?.();
+      actor.previewPump?.armJumpToLatest?.();
+    }
     if (first) {
       this.startSharedTail(session, actor, newerThanMs ?? null);
       // processing 完了で一度 unsubscribe された後も、actor の replay buffer が残る間は
