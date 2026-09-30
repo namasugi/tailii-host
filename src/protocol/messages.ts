@@ -513,7 +513,12 @@ export type ControlMessage =
   | { type: "chat_send_now_result"; v: number; id: string; status: "sent" | "nothing_queued" | "blocked" | "failed"; error?: string }
   | { type: "error"; v: number; id?: string; code: string; message: string }
   | { type: "image_available"; v: number; id: string; path: string; mime: string; thumbnail: string; width: number; height: number; relatedApprovalId?: string }
-  | { type: "image_fetch_request"; v: number; id: string }
+  /**
+   * 画像原本の取得要求（iOS→host）。`maxPixelSize` は全画面表示に要る長辺の上限（px, image-fetch-display）。
+   * 指定があれば host は長辺をそこまで縮めた HEIC を返す（縮めても軽くならないときは原本）。
+   * 省略時・旧クライアントは従来どおり原本をそのまま返す。
+   */
+  | { type: "image_fetch_request"; v: number; id: string; maxPixelSize?: number }
   | { type: "image_fetch_response"; v: number; id: string; seq: number; data: string; eof: boolean; mime: string }
   | { type: "subagent_transcript_request"; v: number; id: string; nodeId: string }
   | { type: "subagent_transcript_response"; v: number; id: string; nodeId: string; entries: SubagentTranscriptEntry[]; omitted: number }

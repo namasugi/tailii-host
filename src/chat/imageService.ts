@@ -34,6 +34,18 @@ export type Thumbnailer = (imagePath: string, maxPixelSize: number) => Promise<T
 
 type ImageAvailable = Extract<ControlMessage, { type: "image_available" }>;
 
+/** 全画面表示用の縮小結果（image-fetch-display）。 */
+export interface ResizedImage {
+  data: Buffer;
+  mime: string;
+}
+
+/**
+ * 全画面表示用に長辺 `maxPixelSize` まで縮めた画像を作る注入可能な抽象。縮める必要が無い・
+ * 縮められない（アニメーション GIF・変換失敗）ときは null（呼び出し側が原本を返す）。
+ */
+export type ImageResizer = (imagePath: string, maxPixelSize: number) => Promise<ResizedImage | null>;
+
 /** 原本 fetch の分割チャンクサイズ（生バイト, ≈32KiB）。base64 化前の生バイトで数える。 */
 const FETCH_CHUNK_SIZE = 32 * 1024;
 
@@ -120,6 +132,87 @@ export function sipsThumbnailer(sipsPath = "/usr/bin/sips"): Thumbnailer {
   };
 }
 
+/**
+ * macOS 標準 `sips` による全画面表示用の縮小（既定 resizer, image-fetch-display）。
+ * 長辺が `maxPixelSize` を超えるものは縮め、形式は HEIC にする（PNG スクリーンショットで大きく効く）。
+ * 長辺が収まっている JPEG / HEIC は原本のままで十分軽いので触らない。GIF はアニメーションが
+ * 止まるので触らない。拡大はしない（`-Z` は小さい画像を引き伸ばすため、収まるときは付けない）。
+ */
+export function sipsResizer(sipsPath = "/usr/bin/sips", timeoutMs = 15_000): ImageResizer {
+  // sips が固まっても応答を返せるよう打ち切る（打ち切りは失敗扱い = 原本へフォールバック）。
+  const run = (args: string[]): Promise<number> =>
+    new Promise((resolve) => {
+      execFile(sipsPath, args, { maxBuffer: 4 * 1024 * 1024, timeout: timeoutMs }, (error) => {
+        resolve(error ? (typeof error.code === "number" ? error.code : 1) : 0);
+      });
+    });
+  const probe = (imagePath: string): Promise<{ width: number; height: number } | null> =>
+    new Promise((resolve) => {
+      execFile(sipsPath, ["-g", "pixelWidth", "-g", "pixelHeight", imagePath], { timeout: timeoutMs }, (error, stdout) => {
+        if (error) return resolve(null);
+        const width = parseSipsProperty(String(stdout), "pixelWidth");
+        const height = parseSipsProperty(String(stdout), "pixelHeight");
+        resolve(width !== null && height !== null && width > 0 && height > 0 ? { width, height } : null);
+      });
+    });
+
+  return async (imagePath, maxPixelSize) => {
+    const ext = path.extname(imagePath).slice(1).toLowerCase();
+    if (ext === "gif") return null;
+    const size = await probe(imagePath);
+    if (size === null) return null;
+    const fits = Math.max(size.width, size.height) <= maxPixelSize;
+    if (fits && ["jpg", "jpeg", "heic", "heif"].includes(ext)) return null;
+
+    const tmp = path.join(
+      os.tmpdir(),
+      `tailii-display-${process.pid}-${Math.random().toString(36).slice(2)}.heic`,
+    );
+    try {
+      const args = ["-s", "format", "heic"];
+      if (!fits) args.push("-Z", String(maxPixelSize));
+      args.push(imagePath, "--out", tmp);
+      if (await run(args) !== 0) return null;
+      const data = fs.readFileSync(tmp);
+      return data.length > 0 ? { data, mime: "image/heic" } : null;
+    } catch {
+      return null;
+    } finally {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        // 一時ファイル掃除の失敗は無視。
+      }
+    }
+  };
+}
+
+/** 画像バイト列を `image_fetch_response` の seq/eof 分割メッセージ列にする。 */
+function chunkedFetchResponse(id: string, data: Buffer, mime: string): ControlMessage[] {
+  if (data.length === 0) {
+    // 空原本でも 1 チャンク（eof:true, data 空）を返す。
+    return [{ type: "image_fetch_response", v: PROTOCOL_V1, id, seq: 0, data: "", eof: true, mime }];
+  }
+  const messages: ControlMessage[] = [];
+  let offset = 0;
+  let seq = 0;
+  while (offset < data.length) {
+    const end = Math.min(offset + FETCH_CHUNK_SIZE, data.length);
+    messages.push({
+      type: "image_fetch_response",
+      v: PROTOCOL_V1,
+      id,
+      seq,
+      data: data.subarray(offset, end).toString("base64"),
+      eof: end === data.length,
+      mime,
+    });
+    offset = end;
+    seq += 1;
+  }
+  return messages;
+}
+
 function parseSipsProperty(stdout: string, name: string): number | null {
   const match = stdout.match(new RegExp(`${name}:\\s*(\\d+)`));
   if (!match || match[1] === undefined) return null;
@@ -140,12 +233,24 @@ export class ImageService {
    */
   private readonly thumbnailMemo = new Map<string, ThumbnailResult>();
   private static readonly THUMBNAIL_MEMO_LIMIT = 256;
+  private readonly resizer: ImageResizer;
+  /**
+   * 全画面表示用の縮小結果のメモ（key = path + mtimeMs + size + maxPixelSize, image-fetch-display）。
+   * 開き直しや別端末から同じ画像を開くたびに sips を走らせない。合計バイト数の上限を
+   * 超えたら古いものから捨てる（挿入順 = LRU 順）。
+   */
+  private readonly displayMemo = new Map<string, ResizedImage>();
+  private displayMemoBytes = 0;
+  /** 縮小中の要求（同じ画像への同時要求で sips を二重に走らせない）。 */
+  private readonly displayInFlight = new Map<string, Promise<ResizedImage | null>>();
+  private static readonly DISPLAY_MEMO_BYTE_LIMIT = 64 * 1024 * 1024;
 
   constructor(options: {
     pendingBase?: string;
     indexBase?: string;
     thumbnailMaxPixelSize?: number;
     thumbnailer?: Thumbnailer;
+    resizer?: ImageResizer;
   } = {}) {
     const home = os.homedir();
     this.pendingBase = options.pendingBase ?? path.join(home, ".tailii", "images", "pending");
@@ -153,6 +258,7 @@ export class ImageService {
     // サムネ最大辺（px）。インライン表示は 120pt 枠なので粗めで十分。WebP と併せて転送量を抑える。
     this.thumbnailMaxPixelSize = options.thumbnailMaxPixelSize ?? 160;
     this.thumbnailer = options.thumbnailer ?? sipsThumbnailer();
+    this.resizer = options.resizer ?? sipsResizer();
   }
 
   /**
@@ -175,43 +281,65 @@ export class ImageService {
 
   /**
    * `id` を index 逆引きし、原本を `image_fetch_response` の seq/eof 分割メッセージ列で返す。
+   * `maxPixelSize` があれば全画面表示用に縮めたものを返す（縮めても軽くならなければ原本,
+   * image-fetch-display）。
    * index に無い / 原本消失 / 読み取り不可 → `error(image_not_found)` を単一要素で返す。
    */
-  fetch(id: string): ControlMessage[] {
+  async fetch(id: string, maxPixelSize?: number): Promise<ControlMessage[]> {
     const p = this.readIndexPath(id);
     if (p === null) return [notFound(id)];
 
     let data: Buffer;
+    let stat: fs.Stats;
     try {
+      stat = fs.statSync(p);
       data = fs.readFileSync(p);
     } catch {
       return [notFound(id)];
     }
 
-    const mime = mimeTypeForExtension(path.extname(p).slice(1));
-    if (data.length === 0) {
-      // 空原本でも 1 チャンク（eof:true, data 空）を返す。
-      return [{ type: "image_fetch_response", v: PROTOCOL_V1, id, seq: 0, data: "", eof: true, mime }];
+    let mime = mimeTypeForExtension(path.extname(p).slice(1));
+    if (maxPixelSize !== undefined && data.length > 0) {
+      const resized = await this.displayImage(p, stat, maxPixelSize);
+      if (resized !== null && resized.data.length < data.length) {
+        data = resized.data;
+        mime = resized.mime;
+      }
     }
+    return chunkedFetchResponse(id, data, mime);
+  }
 
-    const messages: ControlMessage[] = [];
-    let offset = 0;
-    let seq = 0;
-    while (offset < data.length) {
-      const end = Math.min(offset + FETCH_CHUNK_SIZE, data.length);
-      messages.push({
-        type: "image_fetch_response",
-        v: PROTOCOL_V1,
-        id,
-        seq,
-        data: data.subarray(offset, end).toString("base64"),
-        eof: end === data.length,
-        mime,
-      });
-      offset = end;
-      seq += 1;
+  /** 全画面表示用の縮小結果をメモ経由で得る（image-fetch-display）。 */
+  private async displayImage(
+    imagePath: string,
+    stat: fs.Stats,
+    maxPixelSize: number,
+  ): Promise<ResizedImage | null> {
+    const key = `${imagePath}\u0000${stat.mtimeMs}\u0000${stat.size}\u0000${maxPixelSize}`;
+    const hit = this.displayMemo.get(key);
+    if (hit !== undefined) {
+      this.displayMemo.delete(key);
+      this.displayMemo.set(key, hit);
+      return hit;
     }
-    return messages;
+    const inFlight = this.displayInFlight.get(key);
+    if (inFlight !== undefined) return inFlight;
+    const pending = this.resizer(imagePath, maxPixelSize).catch(() => null);
+    this.displayInFlight.set(key, pending);
+    const resized = await pending;
+    this.displayInFlight.delete(key);
+    // 縮めなかった・縮められなかった（sips の失敗・打ち切りを含む）結果は覚えない。一時的な
+    // 失敗でその画像がファイルが変わるまで原本で返り続けないようにする（判定は probe 1 回で安い）。
+    if (resized === null) return null;
+    this.displayMemo.set(key, resized);
+    this.displayMemoBytes += resized.data.length;
+    while (this.displayMemoBytes > ImageService.DISPLAY_MEMO_BYTE_LIMIT && this.displayMemo.size > 1) {
+      const oldest = this.displayMemo.keys().next().value;
+      if (oldest === undefined) break;
+      this.displayMemoBytes -= this.displayMemo.get(oldest)?.data.length ?? 0;
+      this.displayMemo.delete(oldest);
+    }
+    return resized;
   }
 
   /**

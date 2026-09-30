@@ -50,6 +50,10 @@ import {
   type Raw,
 } from "./common.js";
 
+/** `image_fetch_request.maxPixelSize` の受理範囲（px, image-fetch-display）。範囲外は指定なし扱い。 */
+export const IMAGE_FETCH_MIN_PIXEL_SIZE = 256;
+export const IMAGE_FETCH_MAX_PIXEL_SIZE = 16384;
+
 // MARK: - decode
 /** NDJSON 1 行（改行なし）を `ControlMessage` へデコードする。失敗は `ProtocolDecodeError`。 */
 export function decodeControlMessage(line: string | Buffer): ControlMessage {
@@ -544,7 +548,19 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
       });
     }
 
-    case "image_fetch_request":
+    case "image_fetch_request": {
+      // 表示サイズ（image-fetch-display）。範囲外・非整数は指定なし扱いにして原本を返す
+      // （要求そのものは拒否しない＝画像が開けなくなる側へ倒さない）。
+      const maxPixelSize = optionalNumber(raw, "maxPixelSize");
+      return compact({
+        type, v,
+        id: requireString(raw, "id"),
+        maxPixelSize: maxPixelSize !== undefined && Number.isInteger(maxPixelSize)
+          && maxPixelSize >= IMAGE_FETCH_MIN_PIXEL_SIZE && maxPixelSize <= IMAGE_FETCH_MAX_PIXEL_SIZE
+          ? maxPixelSize : undefined,
+      });
+    }
+
     case "file_fetch_cancel":
     case "account_usage_request":
     case "question_dismiss":

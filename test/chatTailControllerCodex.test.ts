@@ -130,7 +130,7 @@ describe("ChatTailController — codex モード", () => {
       });
       controller.stop();
     }
-    expect(imageService.fetch("att-codex-turn-1-1")).toEqual([{
+    expect(await imageService.fetch("att-codex-turn-1-1")).toEqual([{
       type: "image_fetch_response", v: 1, id: "att-codex-turn-1-1",
       seq: 0, data: original.toString("base64"), eof: true, mime: "image/jpeg",
     }]);

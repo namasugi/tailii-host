@@ -348,15 +348,27 @@ export const conversationHandlers: HandlerRegistry = {
       writeError(writer, v, message.id, "image_not_found", "画像機能は無効です。");
       return;
     }
-    for (const response of ctx.imageService.fetch(message.id)) {
+    // 表示サイズの指定があれば縮めたものを送る（image-fetch-display）。縮小（sips）の間も
+    // read loop を止めないよう非同期にする（応答は行単位で書くので他の応答と混ざらない）。
+    const imageService = ctx.imageService;
+    void (async () => {
+      let responses: ControlMessage[];
       try {
-        writer.write(response);
+        responses = await imageService.fetch(message.id, message.maxPixelSize);
       } catch (error) {
-        process.stderr.write(
-          `[tailii-host engine] image_fetch_response 書込失敗: ${String(error)}\n`,
-        );
-        break;
+        writeError(writer, v, message.id, "image_not_found", `画像を読み込めませんでした: ${String(error)}`);
+        return;
       }
-    }
+      for (const response of responses) {
+        try {
+          writer.write(response);
+        } catch (error) {
+          process.stderr.write(
+            `[tailii-host engine] image_fetch_response 書込失敗: ${String(error)}\n`,
+          );
+          break;
+        }
+      }
+    })();
   },
 };
