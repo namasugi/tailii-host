@@ -3,11 +3,13 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import {
   HERDR_LAUNCH_GRACE_SECONDS,
   HerdrFailedError,
   HerdrSessionManager,
+  herdrErrorCode,
+  resolveHerdrSessionPane,
   inputBoxTextIncludesProbe,
   parseHerdrCreatedTabPaneId,
   parseHerdrForegroundCommand,
@@ -1473,6 +1475,116 @@ describe("HerdrSessionManager", () => {
   });
 });
 
+describe("resolveHerdrSessionPane（記録 pane ID の取り違え防止）", () => {
+  const pane = (paneId: string, label: string | null) => ({ paneId, label, tabId: null });
+  const known = new Set(["s-a", "s-other"]);
+  const names = (label: string) => known.has(label);
+
+  test("記録 ID の pane が同じ label なら採用する", () => {
+    expect(resolveHerdrSessionPane([pane("w1:p1", "s-a")], "s-a", "w1:p1", names)?.paneId).toBe("w1:p1");
+  });
+
+  test("記録 ID が振り直されて別の Tailii 会話の pane を指すときは label で引き直す", () => {
+    const panes = [pane("w1:p1", "s-other"), pane("w1:p2", "s-a")];
+    expect(resolveHerdrSessionPane(panes, "s-a", "w1:p1", names)?.paneId).toBe("w1:p2");
+    expect(resolveHerdrSessionPane([pane("w1:p1", "s-other")], "s-a", "w1:p1", names)).toBeNull();
+  });
+
+  test("利用者が herdr 上で pane 名を変えた会話は記録 ID で追い続ける", () => {
+    expect(resolveHerdrSessionPane([pane("w1:p1", "my work")], "s-a", "w1:p1", names)?.paneId).toBe("w1:p1");
+  });
+
+  test("label の無い pane は記録 ID を信じる", () => {
+    expect(resolveHerdrSessionPane([pane("w1:p1", null)], "s-a", "w1:p1", names)?.paneId).toBe("w1:p1");
+  });
+
+  test("記録 ID か label で解決できるときは Tailii セッション名を引かない（メタ読み込みは重い）", () => {
+    let calls = 0;
+    const counting = (label: string) => {
+      calls += 1;
+      return known.has(label);
+    };
+    resolveHerdrSessionPane([pane("w1:p1", "s-a")], "s-a", "w1:p1", counting);
+    resolveHerdrSessionPane([pane("w1:p1", "s-other"), pane("w1:p2", "s-a")], "s-a", "w1:p1", counting);
+    expect(calls).toBe(0);
+  });
+});
+
+describe("pane 名を変えられた会話・旧サーバー（HerdrSessionManager）", () => {
+  const mismatch = JSON.stringify({
+    id: "cli:pane:list",
+    error: { code: "protocol_mismatch", message: "client protocol 22 is newer than server protocol 17" },
+  });
+
+  test("利用者が pane 名を変えても生存扱い（reaper の誤回収・二重起動を防ぐ）", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w1:p1" });
+    const runner = new MockHerdrRunner((args) =>
+      args[1] === "list" ? herdrOk(paneListJson([{ pane_id: "w1:p1", label: "my work" }])) : herdrOk(""),
+    );
+    const manager = new HerdrSessionManager({ runner: runner.runner, store });
+    expect((await manager.list()).find((info) => info.name === "s-a")?.alive).toBe(true);
+    expect((await manager.listLive())?.find((info) => info.name === "s-a")?.alive).toBe(true);
+  });
+
+  test("通常の入出力経路（findPane）はメタ全件を読まない", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w1:p1" });
+    const all = vi.spyOn(store, "all");
+    const runner = new MockHerdrRunner((args) =>
+      args[1] === "list" ? herdrOk(paneListJson([{ pane_id: "w1:p1", label: "s-a" }])) : herdrOk("x"),
+    );
+    const manager = new HerdrSessionManager({ runner: runner.runner, store });
+    await manager.capturePane("s-a");
+    await manager.sendKeys("s-a", ["Escape"]);
+    expect(all).not.toHaveBeenCalled();
+  });
+
+  test("旧サーバーで pane list が拒否されると、送信・読み取りの失敗は更新の案内になる", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w1:p1" });
+    const runner = new MockHerdrRunner(() => ({ exitCode: 1, stdout: "", stderr: mismatch }));
+    const manager = new HerdrSessionManager({ runner: runner.runner, store });
+    await expect(manager.sendKeys("s-a", ["Escape"])).rejects.toThrow("herdr session stop tailii");
+    await expect(manager.capturePane("s-a")).rejects.toThrow("herdr session stop tailii");
+    // reaper 向けの listLive は従来どおり「取得不能 = null」。
+    expect(await manager.listLive()).toBeNull();
+  });
+
+  test("pane が本当に無いときは従来どおり pane not found", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w1:p1" });
+    const runner = new MockHerdrRunner(() => herdrOk(paneListJson([])));
+    const manager = new HerdrSessionManager({ runner: runner.runner, store });
+    await expect(manager.sendKeys("s-a", ["Escape"])).rejects.toThrow("pane not found");
+  });
+});
+
+describe("herdr のエラー JSON（herdr 更新後の旧サーバー）", () => {
+  const mismatch = JSON.stringify({
+    id: "cli:pane:list",
+    error: {
+      code: "protocol_mismatch",
+      message: "client protocol 22 is newer than server protocol 17; restart the Herdr server before using this command.",
+    },
+  });
+
+  test("stderr のエラー JSON から code を読む。JSON でなければ null", () => {
+    expect(herdrErrorCode(mismatch)).toBe("protocol_mismatch");
+    expect(herdrErrorCode('{"error":{"code":"workspace_not_found"}}\n')).toBe("workspace_not_found");
+    expect(herdrErrorCode("")).toBeNull();
+    expect(herdrErrorCode("pane not found")).toBeNull();
+    expect(herdrErrorCode('{"result":{}}')).toBeNull();
+  });
+
+  test("protocol_mismatch の失敗は再起動の手順を伝える（送信・読み取りの失敗表示に出る）", () => {
+    const error = new HerdrFailedError(["pane", "read", "w1:p1"], 1, mismatch);
+    expect(error.message).toContain("herdr session stop tailii && herdr session delete tailii");
+    const other = new HerdrFailedError(["pane", "read", "w1:p1"], 1, "pane not found");
+    expect(other.message).toBe("herdr pane read w1:p1 failed (exit 1): pane not found");
+  });
+});
+
 describe("CompositeSessionBackend", () => {
   test("メタの backend 欄で tmux / herdr へルーティングし、list は和になる", async () => {
     const store = makeStore();
@@ -1756,7 +1868,9 @@ describe("launchCore herdr backend", () => {
     // --settings 合成込みで shell single-quote 包み）。
     const run = recorded.find((call) => call.args[0] === "pane" && call.args[1] === "run");
     expect(run?.args[2]).toBe("w9:p7");
-    expect(run?.args[3]).toMatch(/^exec \/bin\/zsh -lc 'sleep 300 --settings /);
+    // HERDR_ENV を外す: herdr の claude 連携が会話 id を申告しないようにし、サーバー再起動後に
+    // herdr が Tailii のフック抜きで `claude --resume` するのを防ぐ（0.9.3 実測）。
+    expect(run?.args[3]).toMatch(/^exec env -u HERDR_ENV \/bin\/zsh -lc 'sleep 300 --settings /);
     expect(run?.args).toHaveLength(4);
 
     expect(store.get("s-h")).toEqual({
@@ -1792,6 +1906,19 @@ describe("launchCore herdr backend", () => {
       processName: "claude",
     });
 
+    expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
+    expect(recorded.some((call) => call.args[0] === "tab" && call.args[1] === "create")).toBe(false);
+    expect(store.get("s-h")?.herdrPaneId).toBe("w9:p7");
+  });
+
+  test("利用者が pane 名を変えた生存 pane は作り直さない（同じ会話の二重起動を防ぐ）", async () => {
+    const dir = makeTempDir("herdr-launch-renamed");
+    const store = makeStore();
+    store.put({ name: "s-h", cwd: dir, createdAt: 1, backend: "herdr", herdrPaneId: "w9:p7" });
+    const { runner, recorded } = herdrProcessRunner({
+      panes: [{ pane_id: "w9:p7", label: "my work" }],
+      processName: "claude",
+    });
     expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
     expect(recorded.some((call) => call.args[0] === "tab" && call.args[1] === "create")).toBe(false);
     expect(store.get("s-h")?.herdrPaneId).toBe("w9:p7");
@@ -1899,6 +2026,142 @@ describe("launchCore herdr backend", () => {
     };
     expect(await launchCore(launchOptions(dir, store, runner))).toBe(1);
     expect(store.get("s-h")).toBeNull();
+  });
+
+  test("workspace が無いサーバーでは workspace create の root pane で起動する（workspace_not_found）", async () => {
+    const dir = makeTempDir("herdr-launch-empty");
+    const store = makeStore();
+    const recorded: string[][] = [];
+    const runner: ProcessRunner = async (_exe, rawArgs) => {
+      const args = rawArgs[0] === "--session" ? rawArgs.slice(2) : rawArgs;
+      recorded.push(args);
+      if (args[0] === "pane" && args[1] === "list") return { exitCode: 0, stdout: paneListJson([]) };
+      if (args[0] === "tab" && args[1] === "create") {
+        // 0.7.5 / 0.9.3 実測: エラー JSON は stderr、stdout は空。
+        return {
+          exitCode: 1,
+          stdout: "",
+          stderr: '{"error":{"code":"workspace_not_found","message":"no active workspace"},"id":"cli:tab:create"}\n',
+        };
+      }
+      if (args[0] === "workspace" && args[1] === "create") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            result: { type: "workspace_created", root_pane: { pane_id: "w1:p1", tab_id: "w1:t1" } },
+          }),
+        };
+      }
+      return { exitCode: 0, stdout: "{}" };
+    };
+    expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
+    expect(recorded).toContainEqual([
+      "workspace", "create", "--cwd", dir, "--env", "PATH=/usr/bin:/bin", "--no-focus", "--label", "tailii",
+    ]);
+    expect(recorded).toContainEqual(["pane", "rename", "w1:p1", "s-h"]);
+    expect(store.get("s-h")?.herdrPaneId).toBe("w1:p1");
+  });
+
+  test("tab create の workspace_not_found 以外の失敗では workspace を作らない", async () => {
+    const dir = makeTempDir("herdr-launch-other-fail");
+    const store = makeStore();
+    const recorded: string[][] = [];
+    const runner: ProcessRunner = async (_exe, rawArgs) => {
+      const args = rawArgs[0] === "--session" ? rawArgs.slice(2) : rawArgs;
+      recorded.push(args);
+      if (args[0] === "pane" && args[1] === "list") return { exitCode: 0, stdout: paneListJson([]) };
+      if (args[0] === "tab" && args[1] === "create") {
+        return { exitCode: 1, stdout: "", stderr: '{"error":{"code":"invalid_cwd","message":"x"}}' };
+      }
+      return { exitCode: 0, stdout: "{}" };
+    };
+    expect(await launchCore(launchOptions(dir, store, runner))).toBe(1);
+    expect(recorded.some((args) => args[0] === "workspace")).toBe(false);
+    expect(store.get("s-h")).toBeNull();
+  });
+
+  test("herdr 更新後に旧サーバーが残っている（protocol_mismatch）なら server を起動し直さず原因を伝える", async () => {
+    const dir = makeTempDir("herdr-launch-mismatch");
+    const store = makeStore();
+    const spawned: string[][] = [];
+    const errors: string[] = [];
+    const runner: ProcessRunner = async (_exe, rawArgs) => {
+      const args = rawArgs[0] === "--session" ? rawArgs.slice(2) : rawArgs;
+      if (args[0] === "pane" && args[1] === "list") {
+        return {
+          exitCode: 1,
+          stdout: "",
+          stderr: JSON.stringify({
+            id: "cli:pane:list",
+            error: { code: "protocol_mismatch", message: "client protocol 22 is newer than server protocol 17" },
+          }),
+        };
+      }
+      return { exitCode: 0, stdout: "{}" };
+    };
+    const options = {
+      ...launchOptions(dir, store, runner),
+      errorSink: (message: string) => errors.push(message),
+      spawnDetached: (_exe: string, args: string[]) => spawned.push(args),
+    };
+    expect(await launchCore(options)).toBe(1);
+    expect(spawned).toEqual([]);
+    expect(errors.join("")).toContain("herdr session stop tailii");
+    expect(store.get("s-h")).toBeNull();
+  });
+
+  test("起動コマンドが長いときは一時スクリプトへ書き出して短いコマンドで起動する（端末の行バッファ上限）", async () => {
+    const dir = makeTempDir("herdr-launch-long");
+    const scriptDir = makeTempDir("herdr-launch-script");
+    const store = makeStore();
+    const { runner, recorded } = herdrProcessRunner();
+    const inner = `sleep 300 # ${"x".repeat(1200)}`;
+
+    expect(
+      await launchCore({ ...launchOptions(dir, store, runner), innerCommand: inner, herdrLaunchScriptDir: scriptDir }),
+    ).toBe(0);
+    const run = recorded.find((call) => call.args[0] === "pane" && call.args[1] === "run");
+    const script = path.join(scriptDir, "herdr-launch-s-h.zsh");
+    expect(run?.args[3]).toBe(`exec env -u HERDR_ENV /bin/zsh -l '${script}'`);
+    const body = fs.readFileSync(script, "utf8");
+    expect(body.startsWith('rm -f -- "$0"\n')).toBe(true);
+    expect(body).toContain(inner);
+    expect(body).toContain("--settings ");
+    expect(fs.statSync(script).mode & 0o777).toBe(0o600);
+  });
+
+  test("pane run が失敗したら書き出した起動スクリプトを消す", async () => {
+    const dir = makeTempDir("herdr-launch-long-fail");
+    const scriptDir = makeTempDir("herdr-launch-script3");
+    const store = makeStore();
+    const runner: ProcessRunner = async (_exe, rawArgs) => {
+      const args = rawArgs.slice(2);
+      if (args[0] === "pane" && args[1] === "list") return { exitCode: 0, stdout: paneListJson([]) };
+      if (args[0] === "tab" && args[1] === "create") {
+        return { exitCode: 0, stdout: JSON.stringify({ result: { root_pane: { pane_id: "w9:p7" } } }) };
+      }
+      if (args[0] === "pane" && args[1] === "run") {
+        expect(fs.existsSync(path.join(scriptDir, "herdr-launch-s-h.zsh"))).toBe(true);
+        return { exitCode: 1, stdout: "" };
+      }
+      return { exitCode: 0, stdout: "{}" };
+    };
+    const inner = `sleep 300 # ${"x".repeat(1200)}`;
+    expect(
+      await launchCore({ ...launchOptions(dir, store, runner), innerCommand: inner, herdrLaunchScriptDir: scriptDir }),
+    ).toBe(1);
+    expect(fs.existsSync(path.join(scriptDir, "herdr-launch-s-h.zsh"))).toBe(false);
+  });
+
+  test("短い起動コマンドはスクリプトを書かずそのまま打つ", async () => {
+    const dir = makeTempDir("herdr-launch-short");
+    const scriptDir = path.join(makeTempDir("herdr-launch-script2"), "run");
+    const store = makeStore();
+    const { runner } = herdrProcessRunner();
+    expect(
+      await launchCore({ ...launchOptions(dir, store, runner), hookGlobalMarkerPath: dir, herdrLaunchScriptDir: scriptDir }),
+    ).toBe(0);
+    expect(fs.existsSync(scriptDir)).toBe(false);
   });
 
   test("pane run 失敗は作った pane を閉じ、非0で返しメタを書かない", async () => {

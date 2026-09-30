@@ -10,6 +10,7 @@ import {
   findCommand,
   formatDoctorChecks,
   herdrRemediation,
+  herdrStatusRestartNeeded,
   parseNumericVersion,
   probeVersion,
   quicServiceDoctorCheck,
@@ -133,6 +134,22 @@ describe("診断バージョン判定", () => {
       detail: "見つかりません",
       remediation: "brew install tmux",
     }])).toBe("  ✗ tmux : 見つかりません\n      対処: brew install tmux");
+  });
+});
+
+describe("herdrStatusRestartNeeded", () => {
+  it("herdr 更新後の旧サーバー（0.9.3 CLI × 0.7.5 server の実出力）は再起動が必要", () => {
+    const out = [
+      "client:", "  version: 0.9.3", "  protocol: 22", "",
+      "server:", "  status: running", "  version: 0.7.5", "  private_protocol_compatible: no", "",
+      "update:", "  restart_needed: yes", "  server_binary_stale: yes",
+    ].join("\n");
+    expect(herdrStatusRestartNeeded(out)).toBe(true);
+  });
+
+  it("同じ版なら不要。書式が読めなければ null", () => {
+    expect(herdrStatusRestartNeeded("update:\n  restart_needed: no\n")).toBe(false);
+    expect(herdrStatusRestartNeeded("server:\n  status: running\n")).toBeNull();
   });
 });
 

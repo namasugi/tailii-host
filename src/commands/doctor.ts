@@ -18,6 +18,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { defaultInjectedPath } from "./launch.js";
 import { resolveSessionBackendKind } from "../backend/sessionBackend.js";
+import { HERDR_RESTART_COMMAND } from "../backend/herdr.js";
 // 型だけ。実体は quicGateway が doctor の findCommand を import する循環を避けるため動的 import。
 import type { QuicGatewayServiceState } from "../services/quicGateway.js";
 import {
@@ -142,6 +143,48 @@ export const DOCTOR_QUIC_STATUS_TIMEOUT_MS = 2_000;
  * 診断用の短いバージョン取得。
  * 実体パスを直接起動しつつ、`#!/usr/bin/env node` 等のシバンにも検査時の PATH を渡す。
  */
+/**
+ * `herdr status` の出力から「サーバーの再起動が必要か」を読む（`update:` 節の
+ * `restart_needed: yes|no`。0.7.5 / 0.9.3 とも同じ書式）。読めなければ null。
+ */
+export function herdrStatusRestartNeeded(output: string): boolean | null {
+  const match = /^\s*restart_needed:\s*(yes|no)\s*$/m.exec(output);
+  if (match === null) return null;
+  return match[1] === "yes";
+}
+
+/**
+ * Tailii 用 herdr サーバー（named session `tailii`）が旧版のまま動いていないかを調べる。
+ * herdr の更新後に旧サーバーが残ると、新しい CLI は全コマンドを `protocol_mismatch` で拒否する。
+ * サーバーが動いていない・読めないときは null（検査項目を出さない）。
+ */
+function probeHerdrServerRestartNeeded(herdr: string | null, envPath: string): Promise<boolean | null> {
+  if (herdr === null) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    // herdr pane 内から doctor を叩いたときに外側のソケットを向かないよう HERDR_* を外す。
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    for (const key of Object.keys(env)) if (key.startsWith("HERDR_")) delete env[key];
+    env["PATH"] = [envPath, process.env["PATH"] ?? ""].filter(Boolean).join(":");
+    execFile(
+      herdr,
+      ["--session", "tailii", "status"],
+      { cwd: os.homedir(), timeout: 3_000, maxBuffer: 64 * 1024, env },
+      (error, stdout) => {
+        if (error) {
+          resolve(null);
+          return;
+        }
+        const text = String(stdout);
+        if (!/^server:\s*$/m.test(text) || /^\s*status:\s*not running/m.test(text)) {
+          resolve(null);
+          return;
+        }
+        resolve(herdrStatusRestartNeeded(text));
+      },
+    );
+  });
+}
+
 export function probeVersion(
   command: string | null,
   args: readonly string[],
@@ -376,6 +419,8 @@ export async function collectDoctorChecks(envPath: string = defaultInjectedPath(
   const quicChecksPromise = process.platform === "darwin"
     ? collectDarwinQuicChecks().catch(() => [])
     : Promise.resolve([]);
+  // herdr サーバーの版照合も並行して始める（直列だと最大 3 秒上乗せされ、アプリ向け診断の上限を圧迫する）。
+  const herdrRestartNeededPromise = probeHerdrServerRestartNeeded(herdr, envPath);
   const [tmuxVersion, herdrVersion, claudeVersion, codexVersion] = await Promise.all([
     probeVersion(tmux, ["-V"], envPath),
     probeVersion(herdr, ["--version"], envPath),
@@ -411,6 +456,24 @@ export async function collectDoctorChecks(envPath: string = defaultInjectedPath(
       ? { remediation: herdrRemediation(herdr) }
       : {}),
   });
+
+  if (herdrVersionOK) {
+    const restartNeeded = await herdrRestartNeededPromise;
+    if (restartNeeded !== null) {
+      checks.push({
+        id: "herdr-server",
+        label: "herdr サーバー(tailii)",
+        ok: !restartNeeded,
+        required: backendKind === "herdr",
+        detail: restartNeeded
+          ? "herdr の更新前の版のまま動いています（herdr 会話の操作がすべて失敗します）"
+          : "herdr と同じ版で稼働中",
+        ...(restartNeeded
+          ? { remediation: `${HERDR_RESTART_COMMAND}（実行中の herdr 会話は終了し、開き直すと再開します）` }
+          : {}),
+      });
+    }
+  }
 
   const claudeVersionOK = versionCompatibility(
     claude,

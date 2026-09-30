@@ -12,12 +12,15 @@ import * as path from "node:path";
 import { CodexAppServerManager, type CodexThreadStartOptions } from "../codex/codexAppServer.js";
 import {
   HERDR_LAUNCH_GRACE_SECONDS,
+  HERDR_RESTART_NEEDED_MESSAGE,
   HERDR_TAILII_SESSION,
   defaultHerdrPath,
   envWithoutTmux,
+  herdrErrorCode,
   parseHerdrForegroundCommand,
   parseHerdrPaneList,
   parseHerdrCreatedTabPaneId,
+  resolveHerdrSessionPane,
 } from "../backend/herdr.js";
 import { claudeHookLaunchSettings, removeCodexHookSettings } from "./hookSettings.js";
 import { tailiiWorktreeRepoRoot } from "../services/gitService.js";
@@ -274,7 +277,7 @@ export type ProcessRunner = (
   executable: string,
   args: string[],
   options: { cwd?: string; env?: NodeJS.ProcessEnv },
-) => Promise<{ exitCode: number; stdout: string }>;
+) => Promise<{ exitCode: number; stdout: string; stderr?: string }>;
 
 function defaultProcessRunner(): ProcessRunner {
   return (executable, args, options) =>
@@ -283,13 +286,13 @@ function defaultProcessRunner(): ProcessRunner {
         executable,
         args,
         { cwd: options.cwd, env: options.env, maxBuffer: 16 * 1024 * 1024 },
-        (error, stdout) => {
+        (error, stdout, stderr) => {
           if (error && typeof (error as NodeJS.ErrnoException).code === "string") {
             reject(error);
             return;
           }
           const exitCode = error && typeof error.code === "number" ? error.code : error ? 1 : 0;
-          resolve({ exitCode, stdout: String(stdout) });
+          resolve({ exitCode, stdout: String(stdout), stderr: String(stderr) });
         },
       );
     });
@@ -602,6 +605,8 @@ export async function launchCore(options: {
   spawnDetached?: (executable: string, args: string[]) => void;
   /** herdr ensure のポーリング待機 ms（テストは 0 に差し替え可能）。 */
   ensurePollMs?: number;
+  /** herdr の長い起動コマンドを書き出す一時スクリプトの置き場（テスト注入用。既定 ~/.tailii/run）。 */
+  herdrLaunchScriptDir?: string;
   /** 起動対象エージェント（既定 claude）。codex は claude 固有の事前信頼/フック注入を行わない。 */
   agent?: LaunchAgent;
   /** host が `--session-id` で固定した Claude 会話 id。新規 claude 起動だけに記録する。 */
@@ -692,6 +697,9 @@ export async function launchCore(options: {
       ...(options.displayTitle !== undefined ? { displayTitle: options.displayTitle } : {}),
       ...(options.spawnDetached !== undefined ? { spawnDetached: options.spawnDetached } : {}),
       ...(options.ensurePollMs !== undefined ? { ensurePollMs: options.ensurePollMs } : {}),
+      ...(options.herdrLaunchScriptDir !== undefined
+        ? { launchScriptDir: options.herdrLaunchScriptDir }
+        : {}),
     });
   }
 
@@ -783,7 +791,7 @@ export async function launchCore(options: {
  * 1. tailii セッションサーバーの ensure（不在ならヘッドレス起動）→
  * 2. stale pane 掃除（claude が終了してシェル化した pane）→
  * 3. `tab create --cwd --env` で新タブ+pane 生成 → 4. `pane rename` で label=session 名 →
- * 5. `pane run "exec /bin/zsh -lc '<inner>'"` で起動 → 6. backend/herdrPaneId 込みでメタ権威記録。
+ * 5. `pane run "exec env -u HERDR_ENV /bin/zsh -lc '<inner>'"` で起動（長いときは一時スクリプト経由） → 6. backend/herdrPaneId 込みでメタ権威記録。
  * （herdr 0.7.5 で `agent start` の pane 生成/cwd/env 指定が廃止されたため tab create 方式）
  */
 async function launchHerdrPane(options: {
@@ -808,9 +816,11 @@ async function launchHerdrPane(options: {
   spawnDetached?: (executable: string, args: string[]) => void;
   /** ensure のポーリング待機（テストは 0ms に差し替え可能）。 */
   ensurePollMs?: number;
+  /** 長い起動コマンドを書き出す一時スクリプトの置き場（既定 ~/.tailii/run）。 */
+  launchScriptDir?: string;
 }): Promise<number> {
   const { session, dir, agent, store, now, errorSink } = options;
-  const runHerdr = async (args: string[]): Promise<{ code: number; out: string }> => {
+  const runHerdr = async (args: string[]): Promise<{ code: number; out: string; err: string }> => {
     try {
       const result = await options.runner(
         options.herdrPath,
@@ -818,10 +828,10 @@ async function launchHerdrPane(options: {
         // herdr server の起動元になり得るので TMUX を持ち込まない（envWithoutTmux）。
         { env: envWithoutTmux(options.env) },
       );
-      return { code: result.exitCode, out: result.stdout };
+      return { code: result.exitCode, out: result.stdout, err: result.stderr ?? "" };
     } catch (error) {
       errorSink(`tailii launch: herdr 起動失敗 (${options.herdrPath}): ${String(error)}\n`);
-      return { code: 127, out: "" };
+      return { code: 127, out: "", err: "" };
     }
   };
   const spawnDetached =
@@ -833,6 +843,13 @@ async function launchHerdrPane(options: {
 
   // --- 1. tailii セッションサーバーの ensure（`pane list` が通れば稼働中） ---
   let paneList = await runHerdr(["pane", "list"]);
+  if (paneList.code !== 0 && herdrErrorCode(paneList.err) === "protocol_mismatch") {
+    // herdr 更新後、旧版サーバーが動いたまま（新しい CLI は全コマンドを拒否する）。
+    // ここで server を起動し直そうとしても既存ソケットに阻まれ「起動できません」と誤案内に
+    // なるので、原因をそのまま伝える。止めると実行中の会話が終わるため自動では止めない。
+    errorSink(`tailii launch: ${HERDR_RESTART_NEEDED_MESSAGE}\n`);
+    return 1;
+  }
   if (paneList.code !== 0) {
     spawnDetached(options.herdrPath, ["--session", HERDR_TAILII_SESSION, "server"]);
     const deadline = Date.now() + 5000;
@@ -852,10 +869,12 @@ async function launchHerdrPane(options: {
   const panes = parseHerdrPaneList(paneList.out);
   const recordedMeta = store.get(session);
   const recordedPaneId = recordedMeta?.herdrPaneId;
-  let existing =
-    (recordedPaneId !== undefined ? panes.find((pane) => pane.paneId === recordedPaneId) : undefined) ??
-    panes.find((pane) => pane.label === session) ??
-    null;
+  let existing = resolveHerdrSessionPane(
+    panes,
+    session,
+    recordedPaneId,
+    (label) => store.get(label)?.name === label,
+  );
   if (existing !== null && agent === "claude") {
     // Claude が終了してシェルだけ残った pane は入力先として無効なので閉じて作り直す。
     // ただし launch 直後の猶予窓（HERDR_LAUNCH_GRACE_SECONDS, メタ createdAt 起点）は
@@ -878,15 +897,18 @@ async function launchHerdrPane(options: {
   let herdrPaneId: string | null = existing?.paneId ?? null;
   if (existing === null) {
     // --- 3. tab create で新タブ+pane を生成（0.7.5 で agent start の pane 生成/cwd/env 指定が
-    //     廃止されたため。anchor pane 不要なので pane ゼロの空セッションでも成立する）。
-    //     タブラベルは付けず herdr 既定表示（連番）に任せる（session-title のタブ反映は
-    //     2026-07-30 撤去）。 ---
-    const created = await runHerdr([
-      "tab", "create",
-      "--cwd", dir,
-      "--env", `PATH=${options.injectedPath}`,
-      "--no-focus",
-    ]);
+    //     廃止されたため）。タブラベルは付けず herdr 既定表示（連番）に任せる
+    //     （session-title のタブ反映は 2026-07-30 撤去）。
+    //     workspace がゼロのサーバー（初回起動・全 pane を閉じた後の復元）では tab create が
+    //     `workspace_not_found` になる（0.7.5 / 0.9.3 とも実測）ので、workspace create で
+    //     workspace ごと作り、その root pane を使う（出力の root_pane 形は tab create と同じ）。 ---
+    const placement = ["--cwd", dir, "--env", `PATH=${options.injectedPath}`, "--no-focus"];
+    let created = await runHerdr(["tab", "create", ...placement]);
+    if (created.code !== 0 && herdrErrorCode(created.err) === "workspace_not_found") {
+      created = await runHerdr([
+        "workspace", "create", ...placement, "--label", HERDR_TAILII_SESSION,
+      ]);
+    }
     if (created.code !== 0) {
       errorSink(`tailii launch: herdr が非0終了 (${created.code})\n`);
       return created.code === 0 ? 1 : created.code;
@@ -907,12 +929,30 @@ async function launchHerdrPane(options: {
 
     // --- 5. innerCommand を起動。pane run はタイプ注入で argv のクォートを保持しないため
     //     単一文字列で渡す。exec 前置で claude 終了と同時に pane が閉じる
-    //     （旧 agent start の「コマンド終了 = pane close」と同義。stale shell を残さない）。 ---
-    const ran = await runHerdr([
-      "pane", "run", herdrPaneId,
-      `exec /bin/zsh -lc ${shellSingleQuote(options.innerCommand)}`,
-    ]);
+    //     （旧 agent start の「コマンド終了 = pane close」と同義。stale shell を残さない）。
+    //     HERDR_ENV を外すのは herdr の claude 連携フックに会話 id を申告させないため:
+    //     申告があると herdr ≥0.8 はサーバー再起動後に `claude --resume <id>` を自前で打ち、
+    //     Tailii の `--settings`（承認・Stop などのフック）も環境も無い claude で会話が
+    //     黙って再開される（実測 2026-09-30, 0.9.3）。申告が無ければ pane は素のシェルで
+    //     復元され、次に開いたとき Tailii が stale 掃除 → 自前の起動で resume する（0.7.5 と同じ）。
+    //     フックは HERDR_ENV=1 を必須条件にしている（連携 v7 / v10 とも）。herdr の状態検出
+    //     （agent_status）と HERDR_PANE_ID / HERDR_SOCKET_PATH はそのまま残る。 ---
+    let runCommand: string;
+    try {
+      runCommand = herdrPaneRunCommand(
+        options.innerCommand,
+        session,
+        options.launchScriptDir ?? path.join(os.homedir(), ".tailii", "run"),
+      );
+    } catch (error) {
+      await runHerdr(["pane", "close", herdrPaneId]);
+      errorSink(`tailii launch: 起動スクリプトを書き出せませんでした: ${String(error)}\n`);
+      return 1;
+    }
+    const ran = await runHerdr(["pane", "run", herdrPaneId, runCommand]);
     if (ran.code !== 0) {
+      // 書き出した起動スクリプト（`--settings` 入り）は実行されないので消す。
+      removeHerdrLaunchScript(session, options.launchScriptDir ?? path.join(os.homedir(), ".tailii", "run"));
       await runHerdr(["pane", "close", herdrPaneId]);
       errorSink(`tailii launch: herdr pane run が非0終了 (${ran.code})\n`);
       return ran.code;
@@ -942,6 +982,40 @@ async function launchHerdrPane(options: {
     return 1;
   }
   return 0;
+}
+
+/**
+ * `pane run` は新しい pane のシェルへコマンドを**タイプ注入**する。シェルの行編集が立ち上がる前の
+ * 入力は端末の行バッファ（macOS は 1024 バイト）に溜まり、超えた分は黙って捨てられて起動しない
+ * （実測 2026-09-30: 0.7.5 / 0.9.3 とも 940 バイトは起動・1040 バイト以上はシェルのまま）。
+ * 普段の claude 起動は約 800 バイト（承認フックの `--settings` がパスを 7 回含む）で余裕が薄く、
+ * パスの長い環境やモデル・出力スタイル指定で超え得るため、長いときは inner を一時スクリプトへ
+ * 書き出して短いコマンドで起動する（スクリプトは実行と同時に自分を消す）。
+ */
+export const HERDR_TYPED_COMMAND_LIMIT = 900;
+
+function herdrLaunchScriptPath(session: string, scriptDir: string): string {
+  return path.join(scriptDir, `herdr-launch-${session}.zsh`);
+}
+
+/** 実行されなかった起動スクリプトの後始末（無ければ何もしない）。 */
+function removeHerdrLaunchScript(session: string, scriptDir: string): void {
+  try {
+    fs.rmSync(herdrLaunchScriptPath(session, scriptDir), { force: true });
+  } catch {
+    // 後始末の失敗は起動失敗の報告を妨げない（次の起動で上書きされる）。
+  }
+}
+
+/** `pane run` へ渡すコマンド（長いときは一時スクリプトを書き出す）。 */
+export function herdrPaneRunCommand(innerCommand: string, session: string, scriptDir: string): string {
+  // HERDR_ENV を外す理由は launchHerdrPane の手順 5 を参照。
+  const direct = `exec env -u HERDR_ENV /bin/zsh -lc ${shellSingleQuote(innerCommand)}`;
+  if (Buffer.byteLength(direct) <= HERDR_TYPED_COMMAND_LIMIT) return direct;
+  fs.mkdirSync(scriptDir, { recursive: true, mode: 0o700 });
+  const script = herdrLaunchScriptPath(session, scriptDir);
+  fs.writeFileSync(script, `rm -f -- "$0"\n${innerCommand}\n`, { mode: 0o600 });
+  return `exec env -u HERDR_ENV /bin/zsh -l ${shellSingleQuote(script)}`;
 }
 
 /**
