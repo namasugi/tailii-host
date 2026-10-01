@@ -734,7 +734,7 @@ export class SessionHub {
                   this.publishCodexMarker(
                     message.session,
                     `question-inject-error-${restoreSnapshot.id}`,
-                    "⚠️ 設問回答の反映に失敗しました。会話を開き直して再回答するか、Mac 側の画面で回答してください。",
+                    "⚠️ 設問回答の反映に失敗しました。会話を開き直して再回答するか、ホスト側の画面で回答してください。",
                   );
                 }
               }

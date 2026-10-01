@@ -1142,7 +1142,7 @@ export const CHAT_BLOCKED_BY_LOGIN_PROMPT =
 
 /** コード送出は届いたが、待ってもコード欄が消えない（CR 取りこぼし・TUI 停止）。 */
 export const LOGIN_CODE_NOT_ACCEPTED =
-  "コードが Claude に受理されませんでした（もう一度送るか、Mac 側の画面を確認してください）";
+  "コードが Claude に受理されませんでした（もう一度送るか、ホスト側の画面を確認してください）";
 
 /** コード本文がコード欄に反映されなかった（send-text 取りこぼし）。CR は撃たない。 */
 export const LOGIN_CODE_NOT_ECHOED =
@@ -1150,7 +1150,7 @@ export const LOGIN_CODE_NOT_ECHOED =
 
 /** 交換が長引き、受理も拒否も確定しなかった。 */
 export const LOGIN_CODE_UNSETTLED =
-  "ログインの結果を確認できませんでした（Mac 側の画面を確認してください）";
+  "ログインの結果を確認できませんでした（ホスト側の画面を確認してください）";
 
 /** login_code_send の失敗を利用者向け文言へ写す（コード本文・内部 args を漏らさない）。 */
 export function loginCodeErrorMessage(error: unknown): string {
@@ -1572,7 +1572,7 @@ export async function settleFrameAfterChoiceCancel(io: {
 
 /** 選択ダイアログを閉じられなかったときの拒否文言（hub が会話本文へそのまま出す）。 */
 export const CHAT_BLOCKED_BY_STUCK_CHOICE =
-  "選択肢を閉じられなかったため、メッセージを送信しませんでした（アプリで選択肢に答えるか、Mac 側の画面で閉じてください）";
+  "選択肢を閉じられなかったため、メッセージを送信しませんでした（アプリで選択肢に答えるか、ホスト側の画面で閉じてください）";
 
 /**
  * キュー済みの発話の直下に出る「今すぐ送信」ヒント行の状態（chat-send-now, TESTABLE）。
@@ -1658,7 +1658,7 @@ export type SendQueuedNowOutcome =
 export const SEND_NOW_BLOCKED_BY_DIALOG =
   "ダイアログの表示中は「今すぐ送信」できません（アプリで選択肢に答えてからもう一度試してください）";
 export const SEND_NOW_BLOCKED_BY_DRAFT =
-  "Mac 側の入力欄に入力中の文字があるため「今すぐ送信」しませんでした（その文字ごと送信されるのを防ぐため）";
+  "ホスト側の入力欄に入力中の文字があるため「今すぐ送信」しませんでした（その文字ごと送信されるのを防ぐため）";
 export const SEND_NOW_BLOCKED_BY_UNREADABLE =
   "画面を確認できなかったため「今すぐ送信」しませんでした（少し待ってもう一度試してください）";
 export const SEND_NOW_BLOCKED_BY_REBOUND =

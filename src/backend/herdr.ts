@@ -193,7 +193,7 @@ export const HERDR_RESTART_COMMAND = "herdr session stop tailii && herdr session
  */
 export const HERDR_RESTART_NEEDED_MESSAGE =
   "herdr が更新されましたが、Tailii 用の herdr サーバーは古い版のまま動いています。" +
-  `Mac で \`${HERDR_RESTART_COMMAND}\` を実行してから会話を開き直してください` +
+  `ホストで \`${HERDR_RESTART_COMMAND}\` を実行してから会話を開き直してください` +
   "（実行中の会話は一度終了し、開き直すと続きから再開します）。";
 
 /** HerdrSessionManager が投げる型付きエラー。 */

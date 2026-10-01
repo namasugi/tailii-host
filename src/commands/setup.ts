@@ -466,7 +466,7 @@ export async function runSetupCommand(argv: string[]): Promise<number> {
       quicLine +
       "  iPhone の Tailii →「ペアリング」→「QR をスキャン」で下の QR を読む\n" +
       "  ※ QR はこのコマンドの実行中のみ有効です（秘密鍵は含まれません。\n" +
-      "     iPhone 側で生成した公開鍵をこの Mac に登録します）\n" +
+      "     iPhone 側で生成した公開鍵をこのホストに登録します）\n" +
       "==================================================\n\n" +
       `${qr}\n`,
   );
