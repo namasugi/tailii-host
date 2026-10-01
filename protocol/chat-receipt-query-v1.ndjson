@@ -1,0 +1,3 @@
+{"clientMessageId":"8966C951-9F4C-4E00-B5F3-C31BFF404715","id":"rq1","session":"s-80979d14","type":"chat_receipt_query","v":1}
+{"id":"rq1","status":"delivered","type":"chat_receipt_query_result","v":1}
+{"id":"rq2","status":"unknown","type":"chat_receipt_query_result","v":1}

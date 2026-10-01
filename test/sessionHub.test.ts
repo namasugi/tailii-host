@@ -568,6 +568,77 @@ describe("SessionHub actor", () => {
     expect(chatInjector).toHaveBeenCalledWith("new command", "work", expect.objectContaining({ recordedPromptText: expect.any(Function) }));
   });
 
+  test("chat_receipt_query は何も登録せず配送状態だけを答え、retire 後も配送済みを答える", async () => {
+    const receiptsPath = path.join(makeTempDir("hub-chat-receipt-query"), "receipts.json");
+    const chatInjector = vi.fn(async () => {});
+    const hub = new SessionHub({ runner: async () => ok(""),
+      heartbeatDir: makeTempDir("hub-chat-receipt-query-hb"), metadataStore: makeTempStore(),
+      timeoutSeconds: 1800, chatReceiptsPath: receiptsPath, chatInjector });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    const query = (id: string, session: string, clientMessageId: string) =>
+      hub.handleClientMessage(client, JSON.stringify({ type: "chat_receipt_query", id, session, clientMessageId }));
+
+    // 未知の ID: 新規として受け付けず（注入しない・actor も作らない）unknown を返す。
+    query("q-unknown", "work", "never-sent");
+    expect(received).toContainEqual({ type: "chat_receipt_query_result", id: "q-unknown", status: "unknown" });
+    expect(hub.actors.has("work")).toBe(false);
+
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "send", session: "work",
+      clientMessageId: "delivered-client", text: "run once" }));
+    await vi.waitFor(() => expect(received).toContainEqual({
+      type: "chat_send_result", id: "send", status: "accepted",
+    }));
+    query("q-delivered", "work", "delivered-client");
+    expect(received).toContainEqual({ type: "chat_receipt_query_result", id: "q-delivered", status: "delivered" });
+
+    // 片付け（reaper kill 等）で actor ごと消えても、配送済みの事実は台帳から答える。
+    hub.handleClientMessage(client, JSON.stringify({ type: "session_retire", session: "work" }));
+    expect(hub.actors.has("work")).toBe(false);
+    query("q-after-retire", "work", "delivered-client");
+    expect(received).toContainEqual({ type: "chat_receipt_query_result", id: "q-after-retire", status: "delivered" });
+    expect(hub.actors.has("work")).toBe(false);
+
+    // Hub の再起動もまたぐ（receipts ファイルの台帳から復元）。
+    const restartedInjector = vi.fn(async () => {});
+    const restarted = new SessionHub({ runner: async () => ok(""),
+      heartbeatDir: makeTempDir("hub-chat-receipt-query-hb2"), metadataStore: makeTempStore(),
+      timeoutSeconds: 1800, chatReceiptsPath: receiptsPath, chatInjector: restartedInjector });
+    restarted.restoreChatReceipts();
+    const restartedClient = {}, restartedReceived: unknown[] = [];
+    restarted.registerClient(restartedClient, (line) => restartedReceived.push(decodeHubServerLine(line)));
+    restarted.handleClientMessage(restartedClient, JSON.stringify({
+      type: "chat_receipt_query", id: "q-restart", session: "work", clientMessageId: "delivered-client" }));
+    expect(restartedReceived).toContainEqual({
+      type: "chat_receipt_query_result", id: "q-restart", status: "delivered" });
+    expect(restartedInjector).not.toHaveBeenCalled();
+    expect(chatInjector).toHaveBeenCalledOnce();
+  });
+
+  test("chat_receipt_query は削除済み・キュー中を区別して答える", async () => {
+    const hub = new SessionHub({ runner: async () => ok(""),
+      heartbeatDir: makeTempDir("hub-chat-receipt-query-states-hb"), metadataStore: makeTempStore(),
+      timeoutSeconds: 1800, chatInjector: vi.fn(async () => {}) });
+    // 設問中は通常発話を保留する（キュー中のまま）。
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q-hold",
+      questions: [{ header: "h", question: "q", options: [], multiSelect: false }] });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "held", session: "work",
+      clientMessageId: "held-client", text: "held" }));
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_receipt_query", id: "q-pending",
+      session: "work", clientMessageId: "held-client" }));
+    expect(received).toContainEqual({ type: "chat_receipt_query_result", id: "q-pending", status: "pending" });
+
+    hub.handleClientMessage(client, JSON.stringify({ type: "pending_message_delete", id: "del",
+      session: "work", clientMessageId: "held-client", kind: "chat" }));
+    await vi.waitFor(() => expect(received).toContainEqual(expect.objectContaining({
+      type: "pending_message_delete_result", id: "del", status: "deleted" })));
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_receipt_query", id: "q-deleted",
+      session: "work", clientMessageId: "held-client" }));
+    expect(received).toContainEqual({ type: "chat_receipt_query_result", id: "q-deleted", status: "deleted" });
+  });
+
   test("restore は同名でもsession世代が異なる旧queueを新paneへ注入しない", async () => {
     const receiptsPath = path.join(makeTempDir("hub-chat-generation"), "receipts.json");
     const metadataStore = makeTempStore();

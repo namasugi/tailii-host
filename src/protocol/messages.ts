@@ -498,6 +498,13 @@ export type ControlMessage =
   | { type: "pending_message_delete"; v: number; id: string; session: string; clientMessageId: string; kind: "chat" | "codex" }
   | { type: "pending_message_delete_result"; v: number; id: string; status: "deleted" | "not_found" | "processing" | "failed"; error?: string }
   /**
+   * Claude 発話（`chat_send` の clientMessageId）の配送状態を、何も登録せずに照会する（iOS→host,
+   * restored-receipt-probe）。`chat_send` と違い、未知の ID を新規として注入しない。iOS は ACK を
+   * 取りこぼしたまま復元された配送不明の Outbox を、delivered / deleted のときだけ解決する。
+   */
+  | { type: "chat_receipt_query"; v: number; id: string; session: string; clientMessageId: string }
+  | { type: "chat_receipt_query_result"; v: number; id: string; status: "delivered" | "deleted" | "uncertain" | "pending" | "unknown" }
+  /**
    * 処理中の Claude が CLI 側のキューに溜めている発話を、今すぐ届ける（iOS→host, chat-send-now）。
    * CLI の `chat:sendNow`（ctrl+enter / ctrl+x ctrl+s）と同じ操作。実行中のツールは背景へ回り、
    * 応答の生成中ならそのターンを打ち切って、キュー済みの発話が届く。

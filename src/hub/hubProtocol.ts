@@ -61,6 +61,8 @@ export type HubClientMessage =
       cancelQuestionId?: string;
     }
   | { type: "pending_message_delete"; id: string; session: string; clientMessageId: string; kind: "chat" | "codex" }
+  /** Claude 発話の配送状態の照会（engine→hub, restored-receipt-probe）。何も登録しない。 */
+  | { type: "chat_receipt_query"; id: string; session: string; clientMessageId: string }
   /** CLI のキューに溜まっている発話を今すぐ届ける（engine→hub, chat-send-now）。 */
   | { type: "chat_send_now"; id: string; session: string }
   | { type: "runtime_claim"; id: string; session: string }
@@ -106,6 +108,7 @@ export type HubServerMessage =
   | { type: "codex_goal_result"; id: string; status: "ok" | "failed"; goal?: CodexGoalInfo; cleared?: boolean; error?: string }
   | { type: "chat_send_result"; id: string; status: "accepted" | "duplicate" | "failed"; error?: string }
   | { type: "pending_message_delete_result"; id: string; status: "deleted" | "not_found" | "processing" | "failed"; error?: string }
+  | { type: "chat_receipt_query_result"; id: string; status: "delivered" | "deleted" | "uncertain" | "pending" | "unknown" }
   | { type: "chat_send_now_result"; id: string; status: "sent" | "nothing_queued" | "blocked" | "failed"; error?: string }
   | { type: "runtime_claim_result"; id: string; status: "granted" | "held" }
   | EngineRelayMessage;
@@ -258,6 +261,14 @@ export function decodeHubClientLine(line: string): HubClientMessage | null {
       ? { type: "pending_message_delete", id, session, clientMessageId, kind }
       : null;
   }
+  if (record["type"] === "chat_receipt_query") {
+    const id = record["id"], session = record["session"], clientMessageId = record["clientMessageId"];
+    return typeof id === "string" && id.length > 0 &&
+      typeof session === "string" && session.length > 0 &&
+      typeof clientMessageId === "string" && clientMessageId.length > 0
+      ? { type: "chat_receipt_query", id, session, clientMessageId }
+      : null;
+  }
   if (record["type"] === "chat_send_now") {
     const id = record["id"], session = record["session"];
     return typeof id === "string" && id.length > 0 && typeof session === "string" && session.length > 0
@@ -384,6 +395,13 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
       status,
       ...(typeof error === "string" ? { error } : {}),
     };
+  }
+  if (record["type"] === "chat_receipt_query_result") {
+    const id = record["id"], status = record["status"];
+    if (typeof id !== "string" ||
+      (status !== "delivered" && status !== "deleted" && status !== "uncertain" &&
+        status !== "pending" && status !== "unknown")) return null;
+    return { type: "chat_receipt_query_result", id, status };
   }
   if (record["type"] === "chat_send_now_result") {
     const id = record["id"], status = record["status"], error = record["error"];

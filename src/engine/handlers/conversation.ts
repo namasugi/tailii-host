@@ -121,6 +121,30 @@ export const conversationHandlers: HandlerRegistry = {
     })();
   },
 
+  chat_receipt_query: (message, ctx) => {
+    const { writer, state } = ctx;
+    const v = state.negotiatedVersion;
+    void (async () => {
+      try {
+        const result = await ctx.hubRpc<
+          Extract<HubServerMessage, { type: "chat_receipt_query_result" }>
+        >(
+          {
+            type: "chat_receipt_query",
+            id: message.id,
+            session: message.session,
+            clientMessageId: message.clientMessageId,
+          },
+          message.id,
+          5_000,
+        );
+        writer.write({ type: "chat_receipt_query_result", v, id: result.id, status: result.status });
+      } catch (error) {
+        writeError(writer, v, message.id, "chat_receipt_query_failed", String(error));
+      }
+    })();
+  },
+
   chat_send_now: (message, ctx) => {
     const { writer, state, metadataStore } = ctx;
     const v = state.negotiatedVersion;

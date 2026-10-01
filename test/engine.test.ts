@@ -905,6 +905,33 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
+  test("chat_receipt_query を Hub へ転送し結果を中継する", async () => {
+    const sent: unknown[] = [];
+    const hubLink: HubLink = {
+      onMessage: null, onReconnect: null,
+      send(message) {
+        sent.push(message);
+        if (message.type === "chat_receipt_query") {
+          queueMicrotask(() => hubLink.onMessage?.({
+            type: "chat_receipt_query_result", id: message.id, status: "delivered",
+          }));
+        }
+        return true;
+      },
+      close: vi.fn(),
+    };
+    const engine = startEngine({ sessionManager: makeManager(new MockTmuxRunner(() => ok(""))), hubLink });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine('{"clientMessageId":"client-1","id":"rq-1","session":"work","type":"chat_receipt_query","v":2}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("chat_receipt_query_result"))).toEqual({
+      type: "chat_receipt_query_result", v: 2, id: "rq-1", status: "delivered",
+    });
+    expect(sent).toContainEqual({
+      type: "chat_receipt_query", id: "rq-1", session: "work", clientMessageId: "client-1",
+    });
+    await engine.teardown();
+  });
+
   test("chat_send_now を Hub へ転送し結果を中継する", async () => {
     const sent: unknown[] = [];
     const hubLink: HubLink = {

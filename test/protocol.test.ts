@@ -136,6 +136,19 @@ describe("golden roundtrip", () => {
     )).toThrow();
   });
 
+  it("chat-receipt-query v1 golden 全行が byte-exact でラウンドトリップする", () => {
+    for (const line of goldenLines("chat-receipt-query-v1.ndjson")) {
+      const decoded = decodeControlMessage(line);
+      expect(encodeControlMessage(decoded)).toBe(line);
+    }
+  });
+
+  it("chat_receipt_query_result は未知の status を decode で拒否する", () => {
+    expect(() => decodeControlMessage(
+      '{"id":"x","status":"accepted","type":"chat_receipt_query_result","v":1}',
+    )).toThrow();
+  });
+
   it("session-preview-watch v1 golden 全行が byte-exact でラウンドトリップする", () => {
     for (const line of goldenLines("session-preview-watch-v1.ndjson")) {
       const decoded = decodeControlMessage(line);

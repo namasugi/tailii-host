@@ -352,6 +352,13 @@ export class SessionHub {
   private codexStartsInFlight = 0;
   private modePushSeq = 0;
   private chatReceiptsDirty = false;
+  /**
+   * 片付け（retire）・世代不一致で actor ごと消えた会話の Claude 配送済み receipt（clientMessageId →
+   * 配送時刻）。clientMessageId は UUID で会話をまたいで一意なので、actor が消えても「配送済み」の
+   * 事実は変わらない。`chat_receipt_query` がこれを見て、ACK を取りこぼした iOS の Outbox を
+   * 安全に解決できるようにする（restored-receipt-probe）。保持は通常の receipt と同じ 30 日。
+   */
+  private retiredChatDeliveries = new Map<string, number>();
   private readonly activeCodexTurns = new Set<string>();
   private codexTurnController: CodexTurnControllerRuntime | null = null;
 
@@ -464,12 +471,21 @@ export class SessionHub {
   /** daemon 再起動前に durable enqueue 済みだった chat_send と receipt を復元する。 */
   restoreChatReceipts(): void {
     const persisted = this.readChatReceipts();
+    const restoredLedgerAt = Date.now();
+    for (const [clientMessageId, deliveredAt] of Object.entries(this.readRetiredChatDeliveries())) {
+      this.retiredChatDeliveries.set(clientMessageId, deliveredAt);
+    }
+    compactRetiredChatDeliveries(this.retiredChatDeliveries, restoredLedgerAt);
     let discardedStaleSession = false;
     for (const [session, state] of Object.entries(persisted)) {
       const currentSessionIdentity = receiptSessionIdentity(this.options.metadataStore.get(session));
       if (state.sessionIdentity !== undefined && state.sessionIdentity !== currentSessionIdentity) {
         // session 名は再利用される。旧世代の durable queue を同名の新 pane へ注入しない。
         // metadata が消失・破損した場合も identity を証明できないため安全側で破棄する。
+        // 配送済みの事実（UUID の clientMessageId）だけは照会用の台帳へ残す。
+        adoptRetiredChatDeliveries(this.retiredChatDeliveries, new Map(
+          state.delivered.map((id) => [id, state.deliveredAtMs?.[id] ?? restoredLedgerAt] as const),
+        ), restoredLedgerAt);
         discardedStaleSession = true;
         this.options.log?.(`stale chat receipt 破棄 session=${session}`);
         continue;
@@ -976,6 +992,13 @@ export class SessionHub {
       void this.runSendNow(message.session, actor);
       return;
     }
+    if (message.type === "chat_receipt_query") {
+      this.sendTo(client, {
+        type: "chat_receipt_query_result", id: message.id,
+        status: this.chatReceiptStatus(message.session, message.clientMessageId),
+      });
+      return;
+    }
     if (message.type === "pending_message_delete") {
       // 対象不在も成功だが、client 保存前 crash で同じ Outbox が復元されても実行しないよう
       // 削除 tombstone は durable に残す。actor 不在でもここだけは軽量 actor を作る。
@@ -1114,6 +1137,7 @@ export class SessionHub {
 
     // drain が injector / App Server の await 中でも、復帰後に同じ actor 参照から次の旧入力へ
     // 進めないよう durable queue の実体も空にする。現在実行中の1件は復帰時のidentity検査で捨てる。
+    adoptRetiredChatDeliveries(this.retiredChatDeliveries, actor.deliveredChatMessageIds);
     actor.chatQueue.length = 0;
     actor.chatOrder.length = 0;
     actor.pendingChatMessages.clear();
@@ -2781,7 +2805,12 @@ export class SessionHub {
       };
     }
     try {
-      const contents = JSON.stringify({ version: 1, sessions });
+      compactRetiredChatDeliveries(this.retiredChatDeliveries);
+      const contents = JSON.stringify({
+        version: 1, sessions,
+        ...(this.retiredChatDeliveries.size > 0
+          ? { retiredChatDeliveredAtMs: Object.fromEntries(this.retiredChatDeliveries) } : {}),
+      });
       if (this.options.chatReceiptsWriter !== undefined) {
         this.options.chatReceiptsWriter(target, contents);
       } else {
@@ -2797,6 +2826,39 @@ export class SessionHub {
       this.options.log?.(`chat receipt 書込失敗: ${String(error)}`);
       return false;
     }
+  }
+
+  private readRetiredChatDeliveries(): Record<string, number> {
+    const target = this.options.chatReceiptsPath;
+    if (target === undefined) return {};
+    try {
+      const parsed = JSON.parse(fs.readFileSync(target, "utf8")) as unknown;
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+      const ledger = (parsed as Record<string, unknown>)["retiredChatDeliveredAtMs"];
+      if (typeof ledger !== "object" || ledger === null || Array.isArray(ledger)) return {};
+      const result: Record<string, number> = {};
+      for (const [clientMessageId, deliveredAt] of Object.entries(ledger as Record<string, unknown>)) {
+        if (typeof deliveredAt === "number" && Number.isFinite(deliveredAt)) result[clientMessageId] = deliveredAt;
+      }
+      return result;
+    } catch { return {}; }
+  }
+
+  /**
+   * Claude 発話の配送状態を、何も登録せずに答える（`chat_receipt_query`, restored-receipt-probe）。
+   * `chat_send` と違い、どの記録にも無い ID を新規として受け付けない（unknown を返すだけ）。
+   * 会話が片付いた後も配送済みは台帳から答える。actor が無ければ作らない。
+   */
+  private chatReceiptStatus(session: string, clientMessageId: string): ChatReceiptStatus {
+    const actor = this.actors.get(session);
+    if (actor !== undefined) {
+      if (hasDeliveredReceipt(actor.deletedChatMessageIds, clientMessageId)) return "deleted";
+      if (hasDeliveredReceipt(actor.deliveredChatMessageIds, clientMessageId)) return "delivered";
+      if (actor.uncertainChatMessages.has(clientMessageId)) return "uncertain";
+      if (actor.pendingChatMessages.has(clientMessageId)) return "pending";
+    }
+    if (hasDeliveredReceipt(this.retiredChatDeliveries, clientMessageId)) return "delivered";
+    return "unknown";
   }
 
   private readChatReceipts(): PersistedChatReceipts {
@@ -2972,6 +3034,32 @@ function compactDeliveredReceipts(receipts: Map<string, number>, now = Date.now(
     const oldest = receipts.keys().next().value as string | undefined;
     if (oldest === undefined) break;
     receipts.delete(oldest);
+  }
+}
+
+/** 片付けた会話の配送済み receipt の上限（全会話合計）。 */
+const MAX_RETIRED_CHAT_DELIVERIES = 20_000;
+
+type ChatReceiptStatus = "delivered" | "deleted" | "uncertain" | "pending" | "unknown";
+
+function adoptRetiredChatDeliveries(
+  ledger: Map<string, number>, delivered: Map<string, number>, now = Date.now(),
+): void {
+  for (const [clientMessageId, deliveredAt] of delivered) {
+    ledger.delete(clientMessageId);
+    ledger.set(clientMessageId, deliveredAt);
+  }
+  compactRetiredChatDeliveries(ledger, now);
+}
+
+function compactRetiredChatDeliveries(ledger: Map<string, number>, now = Date.now()): void {
+  for (const [id, deliveredAt] of ledger) {
+    if (now - deliveredAt > DELIVERED_RECEIPT_TTL_MS) ledger.delete(id);
+  }
+  while (ledger.size > MAX_RETIRED_CHAT_DELIVERIES) {
+    const oldest = ledger.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    ledger.delete(oldest);
   }
 }
 

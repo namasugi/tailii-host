@@ -507,6 +507,23 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
       return compact({ type, v, id: requireString(raw, "id"), status, error: optionalString(raw, "error") });
     }
 
+    case "chat_receipt_query":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        session: requireString(raw, "session"),
+        clientMessageId: requireString(raw, "clientMessageId"),
+      };
+
+    case "chat_receipt_query_result": {
+      const status = requireString(raw, "status");
+      if (status !== "delivered" && status !== "deleted" && status !== "uncertain" &&
+        status !== "pending" && status !== "unknown") {
+        throw new ProtocolDecodeError("missing-field", "status");
+      }
+      return { type, v, id: requireString(raw, "id"), status };
+    }
+
     case "chat_send_now":
       return { type, v, id: requireString(raw, "id"), session: requireString(raw, "session") };
 
