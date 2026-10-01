@@ -117,6 +117,30 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
+  test("開き直しの newerThanMs（reattach-since）をそのまま Hub の購読へ渡す", async () => {
+    const store = makeTempStore();
+    store.put({ name: "work", cwd: "/tmp/work", createdAt: 1, agent: "claude" });
+    const log = vi.fn();
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir: makeTempDir("reattach-since-hub"),
+      metadataStore: store, timeoutSeconds: 1_800, log,
+    });
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("work\n") : ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner, store), metadataStore: store, hub });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"id":"open","name":"work","newerThanMs":1759300000000,"type":"session_reattach","v":2}');
+    await engine.lines.nextOfType("session_list_response");
+    engine.writeLine('{"id":"probe1","type":"image_fetch_request","v":2}');
+    await engine.lines.nextOfType("error");
+    const subscribes = log.mock.calls.filter(
+      ([message]) => typeof message === "string" && message.startsWith("audit subscribe session=work"),
+    );
+    expect(subscribes).toHaveLength(1);
+    expect(subscribes[0]![0]).toContain("afterSeq=- newerThanMs=1759300000000");
+    await engine.teardown();
+  });
+
   test("処理中会話からの離脱（session_idle_hint）は背景購読を残す（即時 unsubscribe で engine と Hub が食い違わない）", async () => {
     const store = makeTempStore();
     store.put({ name: "work", cwd: "/tmp/work", createdAt: 1, agent: "claude" });

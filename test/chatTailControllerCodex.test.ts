@@ -165,11 +165,11 @@ describe("ChatTailController — codex モード", () => {
     const chats = messages().filter(
       (m): m is Extract<ControlMessage, { type: "chat_output" }> => m.type === "chat_output",
     );
-    expect(chats.map((c) => [c.role, c.text])).toEqual([
+    expect(chats.map((c) => [c.role, c.streamId === "pc:history-done" ? "<host-now>" : c.text])).toEqual([
       ["system", ""], // pc:history-begin
       ["user", "コンパイルして"],
       ["assistant", "完了しました"],
-      ["system", ""], // pc:history-done
+      ["system", "<host-now>"], // pc:history-done（本文は追いついた時点の host 時刻）
     ]);
     expect(lifecycle).toEqual([{ state: "done", turnId: "turn-x" }]);
     // codex モードでは usage 集計対象パスは返さない。

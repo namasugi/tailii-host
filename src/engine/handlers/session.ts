@@ -47,6 +47,10 @@ export const sessionHandlers: HandlerRegistry = {
   },
 
   session_reattach: async (message, ctx) => {
+    // iPhone の時計が host より進んでいると、起点が未来になり共有 tail が新着まで捨て続ける（全購読者）。
+    // host の現在時刻で頭打ちにする（reattach-since）。
+    const reattachSince = (newerThanMs: number | undefined): number | undefined =>
+      newerThanMs === undefined ? undefined : Math.min(newerThanMs, Date.now());
     const { writer, state, sessionManager, metadataStore } = ctx;
     const v = state.negotiatedVersion;
     // 再アクティブ化（heartbeat 更新 = アイドル計時リセット）→ 生存なら即 reattach /
@@ -55,7 +59,7 @@ export const sessionHandlers: HandlerRegistry = {
       const result = await sessionManager.reattach(message.name);
       if (result.kind === "attached") {
         writeSessionListResponse(writer, v, message.id, [result.info], null);
-        subscribeConversation(ctx, message.name);
+        subscribeConversation(ctx, message.name, reattachSince(message.newerThanMs));
         await emitPendingQuestion(ctx, message.name);
       } else {
         const meta = metadataStore?.get(message.name) ?? null;
@@ -79,7 +83,7 @@ export const sessionHandlers: HandlerRegistry = {
             const appeared = await waitForLiveSession(sessionManager, (info) => info.name === message.name);
             if (appeared !== null) {
               writeSessionListResponse(writer, v, message.id, [appeared], null);
-              subscribeConversation(ctx, message.name);
+              subscribeConversation(ctx, message.name, reattachSince(message.newerThanMs));
               await emitPendingQuestion(ctx, message.name);
             } else {
               writeError(writer, v, message.id, "launch_failed", "他の接続による会話の起動を確認できませんでした。");
@@ -101,7 +105,7 @@ export const sessionHandlers: HandlerRegistry = {
             // 会話 id）から組む。backend を欠くと iOS が herdr 会話を tmux 表示する。
             const info = sessionInfoFromMeta(metadataStore, message.name, meta.cwd);
             writeSessionListResponse(writer, v, message.id, [info], null);
-            subscribeConversation(ctx, message.name);
+            subscribeConversation(ctx, message.name, reattachSince(message.newerThanMs));
             await emitPendingQuestion(ctx, message.name);
           } else {
             const m = res.errorText || `resume 失敗 (exit ${res.exitCode})`;

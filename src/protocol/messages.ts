@@ -452,7 +452,11 @@ export type ControlMessage =
   | { type: "session_list_request"; v: number; id: string; limit?: number; cursor?: string }
   | { type: "session_list_response"; v: number; id: string; sessions: SessionInfo[]; nextCursor?: string; adoptedName?: string; worktreePath?: string; worktreeRemoved?: boolean; worktreeDirty?: boolean }
   | { type: "session_start"; v: number; id: string; cwd: string; name: string; baseDir?: string; resumeSessionId?: string; title?: string; agentType?: "claude" | "codex"; model?: string; permissionMode?: "default" | "acceptEdits" | "plan" | "auto"; effort?: "low" | "medium" | "high" | "xhigh" | "max"; codexModel?: string; codexSandbox?: "read-only" | "workspace-write" | "danger-full-access"; deferSubscribe?: boolean; outputStyle?: string; worktree?: string; todoTools?: boolean }
-  | { type: "session_reattach"; v: number; id: string; name: string }
+  /**
+   * 会話の開き直し（iOS→host）。`newerThanMs` はキャッシュ済みログが追いついていた時刻（epoch ms,
+   * reattach-since）。指定時は全履歴を頭から再送せず、この時刻より後の行だけを送る（古い順）。
+   */
+  | { type: "session_reattach"; v: number; id: string; name: string; newerThanMs?: number }
   | { type: "session_kill"; v: number; id: string; name: string }
   | { type: "session_idle_hint"; v: number; id: string; name: string }
   | { type: "codex_model_list_request"; v: number; id: string }

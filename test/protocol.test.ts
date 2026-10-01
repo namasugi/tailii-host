@@ -149,6 +149,21 @@ describe("golden roundtrip", () => {
     )).toThrow();
   });
 
+  it("session-reattach-since v1 golden 全行が byte-exact でラウンドトリップする", () => {
+    for (const line of goldenLines("session-reattach-since-v1.ndjson")) {
+      const decoded = decodeControlMessage(line);
+      expect(encodeControlMessage(decoded)).toBe(line);
+    }
+  });
+
+  it("session_reattach の newerThanMs は負数・非整数なら指定なし扱いにする（全履歴の再送へ倒す）", () => {
+    for (const bad of ["-1", "1.5", '"1759300000000"']) {
+      expect(decodeControlMessage(
+        `{"id":"r","name":"w","newerThanMs":${bad},"type":"session_reattach","v":1}`,
+      )).toEqual({ type: "session_reattach", v: 1, id: "r", name: "w" });
+    }
+  });
+
   it("session-preview-watch v1 golden 全行が byte-exact でラウンドトリップする", () => {
     for (const line of goldenLines("session-preview-watch-v1.ndjson")) {
       const decoded = decodeControlMessage(line);

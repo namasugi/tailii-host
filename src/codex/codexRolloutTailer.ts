@@ -104,6 +104,8 @@ interface TailState {
     text: string;
     phase: string | undefined;
     legacyStreamId: string;
+    /** newerThanMs より古い行（差分の起点より前）から生まれた保留。確定しても出力しない。 */
+    beforeNewerThan?: boolean;
   } | null;
   pendingAssistantEOFStartedAtMs: number | null;
   /** 直近に注記した目標の照合キー（進捗だけの thread_goal_updated では注記しない）。 */
@@ -181,6 +183,9 @@ export class CodexRolloutTailer {
    * `sessionsRoot` 配下（日付階層）から `cwd` 一致の rollout を解決する。
    * 各 *.jsonl の先頭行 `session_meta.payload.cwd` を canonical 比較し、mtime 最新を選ぶ。
    * newerThanMs 指定時はそれより後に更新された rollout のみを候補にする。無ければ null。
+   * ただし会話 id（preferredSessionId）で指定した rollout は更新時刻で除外しない: 起点より後に書き込みの
+   * 無い会話でも開いて、差分（空）と履歴完了マーカーを返す（除外すると出現待ちのまま done が出ない,
+   * reattach-since）。起点より前の行は tail 側が行の timestamp で落とす。
    */
   static resolveRollout(
     cwd: string,
@@ -193,7 +198,7 @@ export class CodexRolloutTailer {
     // 最新から順に見て、cwd 一致の最初の 1 本を返す（新しい会話を優先）。
     files.sort((a, b) => b.mtimeMs - a.mtimeMs);
     for (const file of files) {
-      if (newerThanMs !== null && file.mtimeMs <= newerThanMs) continue;
+      if (preferredSessionId === null && newerThanMs !== null && file.mtimeMs <= newerThanMs) continue;
       const meta = readRolloutMeta(file.path);
       if (meta === null) continue;
       if (preferredSessionId !== null && meta.id !== preferredSessionId) continue;
@@ -293,7 +298,9 @@ export class CodexRolloutTailer {
               v: PROTOCOL_V1,
               streamId: HISTORY_DONE_STREAM_ID,
               role: "system",
-              text: "",
+              // 追いついた時点の host 時刻（epoch ms）。iOS は同期済み時刻を host の時計で持ち、
+              // 次の開き直しの起点に使う（端末との時計のずれで差分が欠けない, reattach-since）。
+              text: String(Date.now()),
               eof: true,
             };
           }
@@ -355,13 +362,22 @@ export class CodexRolloutTailer {
   }
 }
 
-/** Hub 世代変更時は切断後の rollout 行だけを再送し、既表示本文を backfill しない。 */
+/**
+ * 差分（newerThanMs）では起点より後の rollout 行だけを再送し、既表示本文を backfill しない。
+ * 起点より前の行も読んで状態（`codex-turn-N` の連番・保留・現在モデル等）だけは進める。捨てると
+ * 連番が 1 から振り直され、新しい応答が既表示の行と同じ streamId になって iOS に読み飛ばされる
+ * （reattach-since）。
+ */
 function* emitLineAfter(
   line: Buffer,
   state: TailState,
   newerThanMs: number | null,
 ): Generator<ControlMessage, void, void> {
-  if (newerThanMs !== null && lineTimestampMs(line) <= newerThanMs) return;
+  if (newerThanMs !== null && lineTimestampMs(line) <= newerThanMs) {
+    for (const _ of emitLine(line, state)) { /* 起点より前: 状態だけ進めて出力しない */ }
+    if (state.pendingAssistantEvent !== null) state.pendingAssistantEvent.beforeNewerThan = true;
+    return;
+  }
   yield* emitLine(line, state);
 }
 
@@ -520,6 +536,7 @@ export function* emitLine(line: Buffer, state: TailState): Generator<ControlMess
         phasesMatch(pending.phase, mirroredAssistant.phase)) {
       state.pendingAssistantEvent = null;
       state.pendingAssistantEOFStartedAtMs = null;
+      if (pending.beforeNewerThan === true) return;
       yield {
         type: "chat_stream_alias",
         v: PROTOCOL_V1,
@@ -721,6 +738,7 @@ function* flushPendingAssistantEvent(
   if (pending === null) return;
   state.pendingAssistantEvent = null;
   state.pendingAssistantEOFStartedAtMs = null;
+  if (pending.beforeNewerThan === true) return;
   yield {
     type: "chat_output",
     v: PROTOCOL_V1,

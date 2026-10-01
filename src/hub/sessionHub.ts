@@ -1203,6 +1203,22 @@ export class SessionHub {
         actor.previewPump?.resendLastIfInteractive?.();
         actor.previewPump?.armJumpToLatest?.();
       }
+      // 開き直し（reattach-since）は iOS のキャッシュが追いついていた時刻以降を transcript から
+      // 読み直す。背景購読の replay buffer だけでは履歴完了マーカーが届かず、iOS の
+      // 「最新分を取り込み中」が解けない。
+      if (!existing.backfilling && newerThanMs !== undefined) {
+        if (this.options.tailFactory === undefined || this.options.metadataStore.get(session) === null) {
+          // 読み直せない会話でも完了を知らせる（iOS の「最新分を取り込み中」と遡りの待ちを解く）。
+          this.sendTo(client, {
+            type: "conversation_event", session, serverSeq: 0,
+            payload: { type: "chat_output", v: PROTOCOL_V1, streamId: "pc:history-cancelled",
+              role: "system", text: "", eof: true },
+          });
+          return;
+        }
+        this.startBackfill(client, session, actor, newerThanMs);
+        return;
+      }
       // preview=false 中に engine が route できなかった image/subagent event を、同じ
       // subscriber の前面昇格時にも afterSeq から回収する。既存購読だからと no-op にしない。
       if (!existing.backfilling && afterSeq !== undefined) {

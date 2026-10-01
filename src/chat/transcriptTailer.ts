@@ -483,7 +483,9 @@ export class TranscriptTailer {
               v: PROTOCOL_V1,
               streamId: HISTORY_DONE_STREAM_ID,
               role: "system",
-              text: "",
+              // 追いついた時点の host 時刻（epoch ms）。iOS は同期済み時刻を host の時計で持ち、
+              // 次の開き直しの起点に使う（端末との時計のずれで差分が欠けない, reattach-since）。
+              text: String(Date.now()),
               eof: true,
             };
           }
@@ -527,13 +529,27 @@ function isCompleteJsonLine(line: Buffer): boolean {
   }
 }
 
-/** 世代変更後の backfill は切断後に記録された行だけを通す。timestamp 不明行は重複回避を優先して除外。 */
+/**
+ * 差分（newerThanMs）は起点より後に記録された行だけを通す。timestamp 不明行は重複回避を優先して除外。
+ * 起点より前の行も読んで状態（Artifact / Skill / 設問の対応表・現在モデル等）だけは進める。捨てると
+ * 起点をまたぐ結果（公開 URL・Skill 本文・設問の解消）を元のカードへ結び付けられない（reattach-since）。
+ */
 function* emitLineAfter(
   line: Buffer,
   state: TailState,
   newerThanMs: number | null,
 ): Generator<ControlMessage, void, void> {
-  if (newerThanMs !== null && lineTimestampMs(line) <= newerThanMs) return;
+  if (newerThanMs !== null && lineTimestampMs(line) <= newerThanMs) {
+    // 起点より前のライフサイクル（中断・API エラー等）は過去の出来事なので処理中状態へ流さない。
+    const onLifecycle = state.onLifecycle;
+    state.onLifecycle = null;
+    try {
+      for (const _ of emitLine(line, state)) { /* 起点より前: 状態だけ進めて出力しない */ }
+    } finally {
+      state.onLifecycle = onLifecycle;
+    }
+    return;
+  }
   yield* emitLine(line, state);
 }
 

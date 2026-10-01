@@ -2478,6 +2478,53 @@ describe("SessionHub conversation stream", () => {
     expect(br.at(-1)).toMatchObject({ serverSeq: 4 });
   });
 
+  test("背景購読中の開き直し（newerThanMs, reattach-since）はその時刻以降を読み直し履歴完了まで届ける", () => {
+    const metadataStore = makeTempStore();
+    metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0, providerSessionId: "provider-1" });
+    const writes: Array<(payload: ControlMessage) => void> = [];
+    const opened: Array<number | null> = [];
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir: makeTempDir("session-hub-reattach-since"), metadataStore,
+      timeoutSeconds: 1800,
+      tailFactory: (write) => {
+        writes.push(write);
+        return { open(_cwd, _id, newerThanMs) { opened.push(newerThanMs); }, stop() {} };
+      },
+    });
+    const client = {}, received: unknown[] = [];
+    subscribe(hub, client, received, { preview: false });
+    writes[0]!(output("background"));
+    received.length = 0;
+
+    subscribe(hub, client, received, { newerThanMs: 500, preview: true });
+    expect(opened).toEqual([null, 500]);
+    writes[1]!(output("since-500"));
+    writes[1]!(output(HISTORY_DONE_STREAM_ID));
+    expect(received).toContainEqual(expect.objectContaining({
+      serverSeq: 0, payload: expect.objectContaining({ streamId: "since-500" }),
+    }));
+    expect(received).toContainEqual(expect.objectContaining({
+      serverSeq: 0, payload: expect.objectContaining({ streamId: HISTORY_DONE_STREAM_ID }),
+    }));
+  });
+
+  test("背景購読中の開き直しで会話の記録が無ければ history-cancelled を返す（取り込み中表示を残さない）", () => {
+    const { hub } = makeStreamingHub();
+    const client = {}, received: unknown[] = [];
+    hub.handleClientMessage = hub.handleClientMessage.bind(hub);
+    subscribe(hub, client, received, { preview: false });
+    received.length = 0;
+    hub.handleClientMessage(client, JSON.stringify({
+      type: "conversation_subscribe", session: "missing", newerThanMs: 1, preview: true,
+    }));
+    hub.handleClientMessage(client, JSON.stringify({
+      type: "conversation_subscribe", session: "missing", newerThanMs: 1, preview: true,
+    }));
+    expect(received).toContainEqual(expect.objectContaining({
+      session: "missing", payload: expect.objectContaining({ streamId: "pc:history-cancelled" }),
+    }));
+  });
+
   test("pump の permission mode 通知を preview subscriber だけへ conversation_mode で配る", () => {
     const metadataStore = makeTempStore();
     metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0 });

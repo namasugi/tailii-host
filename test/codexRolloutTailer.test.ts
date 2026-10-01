@@ -177,7 +177,7 @@ describe("CodexRolloutTailer.streamForCwd（有限 tail）", () => {
       role: "system", text: "", eof: true }]);
   });
 
-  test("newerThanMs は rollout 内の切断前本文を除外する", async () => {
+  test("newerThanMs は rollout 内の切断前本文を除外し、連番は全履歴と同じに保つ（reattach-since）", async () => {
     const root = makeTempDir("codex-stream-newer-lines");
     const cwd = makeTempDir("codex-stream-newer-cwd");
     const line = (timestamp: string, text: string) => JSON.stringify({ timestamp, type: "event_msg",
@@ -191,10 +191,48 @@ describe("CodexRolloutTailer.streamForCwd（有限 tail）", () => {
     for await (const message of tailer.streamForCwd(
       cwd, Date.parse("2020-01-01T00:00:01.000Z"), undefined, "abc",
     )) messages.push(message);
+    // 起点より前の行も数えるので、全履歴で読んだときと同じ codex-turn-2（1 から振り直すと既表示の
+    // codex-turn-1 と衝突し、iOS が新しい応答を読み飛ばす）。
     expect(messages.filter((message) => message.type === "chat_output")).toEqual([
-      { type: "chat_output", v: 1, streamId: "codex-turn-1", role: "assistant",
+      { type: "chat_output", v: 1, streamId: "codex-turn-2", role: "assistant",
         text: "停止中の追記", eof: true },
     ]);
+  });
+
+  test("newerThanMs: 起点より後に書き込みの無い rollout も会話 id 指定なら開き、空の差分と履歴完了を返す", async () => {
+    const root = makeTempDir("codex-stream-newer-stale");
+    const cwd = makeTempDir("codex-stream-newer-stale-cwd");
+    const file = writeRollout(root, "2026/07/12", "r.jsonl", cwd, [
+      JSON.stringify({ timestamp: "2020-01-01T00:00:00.000Z", type: "event_msg",
+        payload: { type: "agent_message", message: "既表示", phase: "final_answer" } }),
+    ]);
+    const past = new Date("2020-01-01T00:00:00.000Z");
+    fs.utimesSync(file, past, past);
+    const tailer = new CodexRolloutTailer({ sessionsRoot: root, tailDeadlineMs: 0, emitReplayDoneMarker: true });
+    const messages: ControlMessage[] = [];
+    for await (const message of tailer.streamForCwd(cwd, Date.parse("2020-01-01T00:55:00.000Z"), undefined, "abc")) {
+      messages.push(message);
+    }
+    expect(messages.filter((message) => message.type === "chat_output").map((message) =>
+      message.type === "chat_output" ? message.streamId : "")).toEqual(["pc:history-done"]);
+  });
+
+  test("newerThanMs: 起点より前の行が保留した本文は、次の行で確定しても出力しない", async () => {
+    const root = makeTempDir("codex-stream-newer-pending");
+    const cwd = makeTempDir("codex-stream-newer-pending-cwd");
+    const line = (timestamp: string, text: string) => JSON.stringify({ timestamp, type: "event_msg",
+      payload: { type: "agent_message", message: text, phase: "final_answer" } });
+    writeRollout(root, "2026/07/12", "r.jsonl", cwd, [
+      line("2020-01-01T00:00:00.000Z", "既表示（mirror 無しの旧形式で保留される）"),
+      line("2020-01-01T00:00:02.000Z", "停止中の追記"),
+    ]);
+    const tailer = new CodexRolloutTailer({ sessionsRoot: root, tailDeadlineMs: 0 });
+    const messages: ControlMessage[] = [];
+    for await (const message of tailer.streamForCwd(
+      cwd, Date.parse("2020-01-01T00:00:01.000Z"), undefined, "abc",
+    )) messages.push(message);
+    const outputs = messages.filter((message) => message.type === "chat_output");
+    expect(outputs.map((message) => message.type === "chat_output" ? message.text : "")).toEqual(["停止中の追記"]);
   });
 
   test("初回EOFでは履歴中の最新turn状態だけを通知する", async () => {

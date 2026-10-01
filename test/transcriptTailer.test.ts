@@ -648,7 +648,10 @@ describe("TranscriptTailer", () => {
       (m) => m.type === "chat_output" && m.streamId === HISTORY_DONE_STREAM_ID,
     );
     expect(marker).toHaveLength(1);
-    expect(marker[0]).toMatchObject({ role: "system", text: "", eof: true });
+    expect(marker[0]).toMatchObject({ role: "system", eof: true });
+    // 本文は追いついた時点の host 時刻（epoch ms, reattach-since）。
+    const doneAt = Number((marker[0] as { text: string }).text);
+    expect(Math.abs(doneAt - Date.now())).toBeLessThan(60_000);
   });
 
   test("assistant の message.model が変わるたびにモデルマーカーを流す", async () => {

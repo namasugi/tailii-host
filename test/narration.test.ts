@@ -287,8 +287,9 @@ describe("TranscriptTailer — narration", () => {
     ].join("\n") + "\n");
     const messages = await collect(new TranscriptTailer({ emitReplayDoneMarker: true })
       .streamProjectDir(dir, "session", Date.parse("2026-09-28T06:06:50.000Z")));
+    // 起点より前の行も読んで現在モデルを知っているので、変わらないモデルの印は出し直さない（全履歴と同じ, reattach-since）。
     expect(messages.filter((message) => message.type === "chat_output")
-      .map((message) => message.streamId)).toEqual(["pc:model", "new", "pc:history-done"]);
+      .map((message) => message.streamId)).toEqual(["new", "pc:history-done"]);
   });
 
   test("改行の無い完成済み narration も履歴完了前に一度だけ配信する", async () => {

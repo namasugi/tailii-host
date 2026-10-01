@@ -241,7 +241,18 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
       });
     }
 
-    case "session_reattach":
+    case "session_reattach": {
+      // 範囲外・非整数は指定なし扱い（全履歴の再送へ倒す。開き直し自体は拒否しない）。
+      const newerThanMs = optionalNumber(raw, "newerThanMs");
+      return compact({
+        type, v,
+        id: requireString(raw, "id"),
+        name: requireString(raw, "name"),
+        newerThanMs: newerThanMs !== undefined && Number.isSafeInteger(newerThanMs) && newerThanMs >= 0
+          ? newerThanMs : undefined,
+      });
+    }
+
     case "session_kill":
     case "session_idle_hint":
       return { type, v, id: requireString(raw, "id"), name: requireString(raw, "name") };
