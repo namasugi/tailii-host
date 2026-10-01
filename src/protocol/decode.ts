@@ -50,6 +50,9 @@ import {
   type Raw,
 } from "./common.js";
 
+/** `history_page_request.limit` の上限（1 回の応答を際限なく大きくしない, history-page）。 */
+export const HISTORY_PAGE_MAX_LIMIT = 200;
+
 /** `image_fetch_request.maxPixelSize` の受理範囲（px, image-fetch-display）。範囲外は指定なし扱い。 */
 export const IMAGE_FETCH_MIN_PIXEL_SIZE = 256;
 export const IMAGE_FETCH_MAX_PIXEL_SIZE = 16384;
@@ -607,6 +610,29 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
 
     case "subagent_transcript_request":
       return { type, v, id: requireString(raw, "id"), nodeId: requireString(raw, "nodeId") };
+
+    case "history_page_request": {
+      const limit = requireNumber(raw, "limit");
+      if (!Number.isInteger(limit) || limit < 1) throw new ProtocolDecodeError("missing-field", "limit");
+      return compact({
+        type, v,
+        id: requireString(raw, "id"),
+        name: requireString(raw, "name"),
+        beforeStreamId: optionalString(raw, "beforeStreamId"),
+        beforeToolId: optionalString(raw, "beforeToolId"),
+        limit: Math.min(limit, HISTORY_PAGE_MAX_LIMIT),
+      });
+    }
+
+    case "history_page_response":
+      return compact({
+        type, v,
+        id: requireString(raw, "id"),
+        lines: requireStringArray(raw, "lines"),
+        hasMore: requireBoolean(raw, "hasMore"),
+        hostNowMs: requireNumber(raw, "hostNowMs"),
+        anchorMissing: raw["anchorMissing"] === true ? true : undefined,
+      });
 
     case "subagent_transcript_response":
       return {

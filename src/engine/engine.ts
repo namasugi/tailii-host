@@ -791,7 +791,8 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
         message.type === "chat_receipt_query_result" ||
         message.type === "chat_send_now_result" ||
         message.type === "presence_response" ||
-        message.type === "conversation_subagent_transcript_response") {
+        message.type === "conversation_subagent_transcript_response" ||
+        message.type === "conversation_history_page_response") {
         rpcWaiters.get(message.id)?.(message);
         rpcWaiters.delete(message.id);
         rpcDisconnectFailures.delete(message.id);
@@ -1079,6 +1080,8 @@ export const CONCURRENT_MESSAGE_TYPES: ReadonlySet<ControlMessage["type"]> = new
   "codex_model_list_request",
   "official_app_status_request",
   "subagent_transcript_request",
+  // 履歴ページは transcript 全体を読むことがあり時間がかかる。読み取り専用で応答は id 相関。
+  "history_page_request",
 ]);
 
 /** 1行（改行なし）をデコードし、type に対応するドメインハンドラへ dispatch する。decode 失敗は破棄。 */

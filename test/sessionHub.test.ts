@@ -2508,6 +2508,54 @@ describe("SessionHub conversation stream", () => {
     }));
   });
 
+  test("履歴ページ（history-page）: 最新は読み直し、遡るページは直近の読み取りから切り出す", async () => {
+    const metadataStore = makeTempStore();
+    metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0, providerSessionId: "provider-1" });
+    let opens = 0;
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir: makeTempDir("session-hub-history-page"), metadataStore,
+      timeoutSeconds: 1800,
+      tailFactory: (write) => ({
+        open() {
+          opens += 1;
+          for (const id of ["a1", "a2", "a3", "a4"]) write(output(id));
+          write(output(HISTORY_DONE_STREAM_ID));
+        },
+        stop() {},
+      }),
+    });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    const request = (extra: object) => hub.handleClientMessage(client, JSON.stringify({
+      type: "conversation_history_page_request", session: "work", ...extra,
+    }));
+    const responses = () => received.filter((m) =>
+      (m as { type?: string }).type === "conversation_history_page_response") as Array<{
+      id: string; lines: string[]; hasMore: boolean; failed?: boolean;
+    }>;
+    const streamIds = (lines: string[]) => lines.map((line) => (JSON.parse(line) as { streamId: string }).streamId);
+
+    request({ id: "p1", limit: 2 });
+    await vi.waitFor(() => expect(responses()).toHaveLength(1));
+    expect(streamIds(responses()[0]!.lines)).toEqual(["a3", "a4"]);
+    expect(responses()[0]!.hasMore).toBe(true);
+
+    request({ id: "p2", limit: 2, beforeStreamId: "a3" });
+    await vi.waitFor(() => expect(responses()).toHaveLength(2));
+    expect(streamIds(responses()[1]!.lines)).toEqual(["a1", "a2"]);
+    expect(responses()[1]!.hasMore).toBe(false);
+    expect(opens).toBe(1);
+
+    request({ id: "p3", limit: 2 });
+    await vi.waitFor(() => expect(responses()).toHaveLength(3));
+    expect(opens).toBe(2);
+
+    // 終端の行が host に無い: 「過去なし」と区別して返す（iOS は次の行を終端に取り直す）。
+    request({ id: "p4", limit: 2, beforeStreamId: "live-only" });
+    await vi.waitFor(() => expect(responses()).toHaveLength(4));
+    expect(responses()[3]).toMatchObject({ lines: [], hasMore: false, anchorMissing: true });
+  });
+
   test("背景購読中の開き直しで会話の記録が無ければ history-cancelled を返す（取り込み中表示を残さない）", () => {
     const { hub } = makeStreamingHub();
     const client = {}, received: unknown[] = [];
@@ -2523,6 +2571,22 @@ describe("SessionHub conversation stream", () => {
     expect(received).toContainEqual(expect.objectContaining({
       session: "missing", payload: expect.objectContaining({ streamId: "pc:history-cancelled" }),
     }));
+  });
+
+  test("履歴ページ: 会話の記録が無ければ failed で返す（空のページと取り違えさせない）", async () => {
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir: makeTempDir("session-hub-history-page-fail"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800,
+      tailFactory: () => ({ open() {}, stop() {} }),
+    });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({
+      type: "conversation_history_page_request", id: "p1", session: "missing", limit: 24,
+    }));
+    await vi.waitFor(() => expect(received).toContainEqual(expect.objectContaining({
+      type: "conversation_history_page_response", id: "p1", lines: [], failed: true,
+    })));
   });
 
   test("pump の permission mode 通知を preview subscriber だけへ conversation_mode で配る", () => {

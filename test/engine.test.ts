@@ -22,7 +22,7 @@ import type { HubLink } from "../src/hub/hubClient.js";
 import { ClaudeSessionStore } from "../src/sessions/claudeSessionStore.js";
 import { decodeControlMessage } from "../src/protocol.js";
 import { readHeartbeat } from "../src/sessions/heartbeat.js";
-import { TranscriptTailer } from "../src/chat/transcriptTailer.js";
+import { HISTORY_DONE_STREAM_ID, TranscriptTailer } from "../src/chat/transcriptTailer.js";
 import { TmuxSessionManager } from "../src/backend/tmux.js";
 import { SessionHub } from "../src/hub/sessionHub.js";
 import { injectQuestionAnswers } from "../src/hub/questionInjection.js";
@@ -114,6 +114,36 @@ describe("EngineControl — 横断制御チャネル", () => {
     );
     expect(subscribes).toHaveLength(1);
     expect(hub.actors.get("bg-work")?.subscribers.size).toBe(1);
+    await engine.teardown();
+  });
+
+  test("history_page_request は Hub のページを history_page_response で返し、読めなければ error で返す", async () => {
+    const store = makeTempStore();
+    store.put({ name: "work", cwd: "/tmp/work", createdAt: 1, agent: "claude", providerSessionId: "p-1" });
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir: makeTempDir("history-page-engine-hub"),
+      metadataStore: store, timeoutSeconds: 1_800,
+      tailFactory: (write) => ({
+        open() {
+          write({ type: "chat_output", v: 1, streamId: "a1", role: "assistant", text: "hi", eof: true });
+          write({ type: "chat_output", v: 1, streamId: HISTORY_DONE_STREAM_ID, role: "system", text: "", eof: true });
+        },
+        stop() {},
+      }),
+    });
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("work\n") : ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner, store), metadataStore: store, hub });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"id":"hp1","limit":24,"name":"work","type":"history_page_request","v":2}');
+    const page = decodeControlMessage(await engine.lines.nextOfType("history_page_response"));
+    expect(page).toMatchObject({ type: "history_page_response", id: "hp1", hasMore: false });
+    expect((page as { lines: string[] }).lines.map((line) => JSON.parse(line).streamId)).toEqual(["a1"]);
+
+    engine.writeLine('{"id":"hp2","limit":24,"name":"missing","type":"history_page_request","v":2}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("error"))).toMatchObject({
+      id: "hp2", code: "history_page_failed",
+    });
     await engine.teardown();
   });
 

@@ -164,6 +164,19 @@ describe("golden roundtrip", () => {
     }
   });
 
+  it("history-page v1 golden 全行が byte-exact でラウンドトリップする", () => {
+    for (const line of goldenLines("history-page-v1.ndjson")) {
+      const decoded = decodeControlMessage(line);
+      expect(encodeControlMessage(decoded)).toBe(line);
+    }
+  });
+
+  it("history_page_request の limit は 1 以上の整数のみ受け、上限で切る", () => {
+    expect(() => decodeControlMessage('{"id":"x","limit":0,"name":"w","type":"history_page_request","v":1}')).toThrow();
+    expect(decodeControlMessage('{"id":"x","limit":5000,"name":"w","type":"history_page_request","v":1}'))
+      .toMatchObject({ limit: 200 });
+  });
+
   it("session-preview-watch v1 golden 全行が byte-exact でラウンドトリップする", () => {
     for (const line of goldenLines("session-preview-watch-v1.ndjson")) {
       const decoded = decodeControlMessage(line);

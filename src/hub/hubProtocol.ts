@@ -19,6 +19,15 @@ export type HubClientMessage =
   | { type: "conversation_unsubscribe"; session: string }
   | { type: "session_retire"; session: string }
   | { type: "conversation_subagent_transcript_request"; id: string; session: string; nodeId: string }
+  /** 会話履歴のページ取得（history-page）。before* の行より前の最後の limit 行ぶん。 */
+  | {
+      type: "conversation_history_page_request";
+      id: string;
+      session: string;
+      beforeStreamId?: string;
+      beforeToolId?: string;
+      limit: number;
+    }
   | { type: "hub_state_request"; id: string; session: string }
   | { type: "presence_request"; id: string; session: string }
   | { type: "question_answer_submit"; id: string; session: string; questionId: string; answers: QuestionAnswer[] }
@@ -86,6 +95,18 @@ export type HubServerMessage =
       id: string;
       session: string;
       payload: Extract<ControlMessage, { type: "subagent_transcript_response" }>;
+    }
+  /** 履歴ページ（history-page）。`lines` は ControlMessage の wire 行（古い順）。読めなければ `failed`。 */
+  | {
+      type: "conversation_history_page_response";
+      id: string;
+      session: string;
+      lines: string[];
+      hasMore: boolean;
+      hostNowMs: number;
+      failed?: boolean;
+      /** 終端の行が host の履歴に見つからない（iOS は次の行を終端にして取り直す）。 */
+      anchorMissing?: boolean;
     }
   | { type: "conversation_pane_preview"; session: string; payload: ControlMessage }
   | { type: "conversation_mode"; session: string; payload: ControlMessage }
@@ -160,6 +181,17 @@ export function decodeHubClientLine(line: string): HubClientMessage | null {
       typeof nodeId === "string" && nodeId.length > 0
       ? { type: "conversation_subagent_transcript_request", id, session, nodeId }
       : null;
+  }
+  if (record["type"] === "conversation_history_page_request") {
+    const id = record["id"], session = record["session"], limit = record["limit"];
+    const beforeStreamId = record["beforeStreamId"], beforeToolId = record["beforeToolId"];
+    if (typeof id !== "string" || id.length === 0 || typeof session !== "string" || session.length === 0 ||
+      typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 ||
+      (beforeStreamId !== undefined && typeof beforeStreamId !== "string") ||
+      (beforeToolId !== undefined && typeof beforeToolId !== "string")) return null;
+    return { type: "conversation_history_page_request", id, session, limit,
+      ...(typeof beforeStreamId === "string" ? { beforeStreamId } : {}),
+      ...(typeof beforeToolId === "string" ? { beforeToolId } : {}) };
   }
   if (record["type"] === "hub_state_request") {
     const id = record["id"];
@@ -431,6 +463,19 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
     return payload.type === "subagent_transcript_response" && payload.id === id
       ? { type: record["type"], id, session, payload }
       : null;
+  }
+  if (record["type"] === "conversation_history_page_response") {
+    const id = record["id"], session = record["session"], lines = record["lines"];
+    const hasMore = record["hasMore"], hostNowMs = record["hostNowMs"], failed = record["failed"];
+    const anchorMissing = record["anchorMissing"];
+    if (typeof id !== "string" || id.length === 0 || typeof session !== "string" || session.length === 0 ||
+      !Array.isArray(lines) || !lines.every((line) => typeof line === "string") ||
+      typeof hasMore !== "boolean" || typeof hostNowMs !== "number" ||
+      (failed !== undefined && typeof failed !== "boolean") ||
+      (anchorMissing !== undefined && typeof anchorMissing !== "boolean")) return null;
+    return { type: "conversation_history_page_response", id, session, lines: lines as string[], hasMore, hostNowMs,
+      ...(failed === true ? { failed: true } : {}),
+      ...(anchorMissing === true ? { anchorMissing: true } : {}) };
   }
   if (record["type"] === "conversation_liveness") {
     // live-pill Phase 2: 死亡だけを配る（alive:true は送らない設計上の割り切り）。

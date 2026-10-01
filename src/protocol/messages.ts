@@ -532,6 +532,18 @@ export type ControlMessage =
   | { type: "image_fetch_request"; v: number; id: string; maxPixelSize?: number }
   | { type: "image_fetch_response"; v: number; id: string; seq: number; data: string; eof: boolean; mime: string }
   | { type: "subagent_transcript_request"; v: number; id: string; nodeId: string }
+  /**
+   * 会話履歴のページ取得（iOS→host, history-page）。`beforeStreamId` / `beforeToolId` の行より前の
+   * 最後の `limit` 行ぶんを返す（どちらも無ければ最新のページ）。キャッシュの無い会話の初回表示と、
+   * キャッシュより古い過去を遡るときに使う。
+   */
+  | { type: "history_page_request"; v: number; id: string; name: string; beforeStreamId?: string; beforeToolId?: string; limit: number }
+  /**
+   * 履歴ページ（host→iOS）。`lines` は全履歴の再送と同じ ControlMessage の wire 行（古い順）。
+   * `hostNowMs` は読み始めた host の時刻（初回表示はここから少し巻き戻した `session_reattach.newerThanMs`
+   * で続きを購読する）。
+   */
+  | { type: "history_page_response"; v: number; id: string; lines: string[]; hasMore: boolean; hostNowMs: number; anchorMissing?: boolean }
   | { type: "subagent_transcript_response"; v: number; id: string; nodeId: string; entries: SubagentTranscriptEntry[]; omitted: number }
   /** 同一 chat item の履歴/live stream ID 対応。直後の chat_output より先に配送する。 */
   | { type: "chat_stream_alias"; v: number; streamId: string; aliasStreamIds: string[] }

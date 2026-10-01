@@ -9,6 +9,7 @@ import * as path from "node:path";
 import { bumpHeartbeat, listHeartbeatSessions, readHeartbeat, writeHeartbeat } from "../sessions/heartbeat.js";
 import { claudeProjectSlug, ensureDirectory0700 } from "../shared/paths.js";
 import type { EngineRelayMessage } from "./engineRelaySocket.js";
+import { encodeControlMessage } from "../protocol.js";
 import {
   decodeHubClientLine,
   encodeHubMessage,
@@ -27,6 +28,7 @@ import {
   type ClaudeTurnLifecycleEvent,
 } from "../chat/transcriptTailer.js";
 import type { ChatAgent } from "../chat/chatTailController.js";
+import { sliceHistoryPage, type HistoryPageAnchor } from "./historyPage.js";
 import type { ImageService } from "../chat/imageService.js";
 import type { PanePreviewMode } from "./panePreviewPump.js";
 import { sameUsageLimitWait, type UsageLimitWaitState } from "../shared/usageLimitWait.js";
@@ -169,6 +171,12 @@ interface PendingCodexTurn {
  * ければ強制的に live へ切り替える。進捗があるうちは延長するので、巨大な transcript の再生を
  * 途中で打ち切ることはない。
  */
+/** 履歴ページ用に transcript を読み切るまでの上限（画像の多い巨大な会話でも返事を返す）。 */
+const HISTORY_PAGE_READ_TIMEOUT_MS = 20_000;
+/** 履歴ページ用に全履歴を覚えておく会話の数。 */
+const HISTORY_PAGE_CACHE_LIMIT = 3;
+/** 履歴ページ用に覚えた全履歴を使い回す期間（遡り中の連続要求だけを速くし、メモリに長く残さない）。 */
+const HISTORY_PAGE_CACHE_TTL_MS = 10 * 60_000;
 const BACKFILL_STALL_TIMEOUT_MS = 15_000;
 const DELIVERED_RECEIPT_TTL_MS = 30 * 24 * 60 * 60 * 1_000;
 const MAX_DELIVERED_RECEIPTS_PER_SESSION = 10_000;
@@ -644,6 +652,10 @@ export class SessionHub {
           for (const actor of this.actors.values()) actor.previewPump?.resendLastIfInteractive?.();
         }
       }
+      return;
+    }
+    if (message.type === "conversation_history_page_request") {
+      void this.answerHistoryPage(client, message);
       return;
     }
     if (message.type === "conversation_subagent_transcript_request") {
@@ -1794,6 +1806,114 @@ export class SessionHub {
       return;
     }
     if (!finished) armStallTimer(BACKFILL_STALL_TIMEOUT_MS);
+  }
+
+  // ---- 履歴ページ（history-page） ----
+
+  /** 直近に読んだ会話の全履歴（ページを遡るたびに transcript を頭から読み直さない）。 */
+  private readonly historyPageCache = new Map<string, { events: ControlMessage[]; hostNowMs: number }>();
+  /** 会話ごとの読み取り中の Promise（同じ会話の全履歴を並行して二重に読まない）。 */
+  private readonly historyPageReads = new Map<string, Promise<{ events: ControlMessage[]; hostNowMs: number }>>();
+
+  private async answerHistoryPage(
+    client: object,
+    message: Extract<HubClientMessage, { type: "conversation_history_page_request" }>,
+  ): Promise<void> {
+    const anchor: HistoryPageAnchor | null =
+      message.beforeStreamId !== undefined || message.beforeToolId !== undefined
+        ? { ...(message.beforeStreamId !== undefined ? { streamId: message.beforeStreamId } : {}),
+          ...(message.beforeToolId !== undefined ? { toolId: message.beforeToolId } : {}) }
+        : null;
+    let response: Extract<HubServerMessage, { type: "conversation_history_page_response" }>;
+    try {
+      // 最新のページは常に読み直す（新しい行が増えている）。遡るページは直近の読み取りを使い、
+      // 終端の行がそこに無いときだけ読み直す。
+      // 期限切れの全履歴は要求のたびに捨てる（常駐 daemon に base64 サムネごと残し続けない）。
+      for (const [session, cached] of this.historyPageCache) {
+        if (Date.now() - cached.hostNowMs > HISTORY_PAGE_CACHE_TTL_MS) this.historyPageCache.delete(session);
+      }
+      let history = anchor === null ? undefined : this.historyPageCache.get(message.session);
+      let slice = history === undefined ? null : sliceHistoryPage(history.events, anchor, message.limit);
+      if (slice === null || !slice.anchorFound) {
+        history = await this.readFullHistory(message.session);
+        slice = sliceHistoryPage(history.events, anchor, message.limit);
+      }
+      response = {
+        type: "conversation_history_page_response", id: message.id, session: message.session,
+        lines: slice.events.map((event) => encodeControlMessage(event)),
+        hasMore: slice.hasMore, hostNowMs: history!.hostNowMs,
+        ...(slice.anchorFound ? {} : { anchorMissing: true }),
+      };
+    } catch (error) {
+      this.options.log?.(`audit history-page-failed session=${message.session} error=${String(error)}`);
+      response = {
+        type: "conversation_history_page_response", id: message.id, session: message.session,
+        lines: [], hasMore: false, hostNowMs: Date.now(), failed: true,
+      };
+    }
+    this.sendTo(client, response);
+  }
+
+  /** 全履歴の再送と同じ tail で transcript を最後まで読み、出力を集める（購読者へは流さない）。 */
+  private readFullHistory(session: string): Promise<{ events: ControlMessage[]; hostNowMs: number }> {
+    const inFlight = this.historyPageReads.get(session);
+    if (inFlight !== undefined) return inFlight;
+    const read = new Promise<{ events: ControlMessage[]; hostNowMs: number }>((resolve, reject) => {
+      const factory = this.options.tailFactory;
+      const meta = this.options.metadataStore.get(session);
+      if (factory === undefined || meta === null) {
+        reject(new Error(factory === undefined ? "tail unavailable" : "session metadata not found"));
+        return;
+      }
+      const hostNowMs = Date.now();
+      const events: ControlMessage[] = [];
+      let settled = false;
+      let tail: HubTail | null = null;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const settle = (error: Error | null): void => {
+        if (settled) return;
+        settled = true;
+        if (timer !== null) clearTimeout(timer);
+        tail?.stop();
+        if (error !== null) {
+          reject(error);
+          return;
+        }
+        const history = { events, hostNowMs };
+        // 直近数件だけ持つ（会話を行き来しても読み直しを減らし、メモリは際限なく持たない）。
+        this.historyPageCache.delete(session);
+        this.historyPageCache.set(session, history);
+        while (this.historyPageCache.size > HISTORY_PAGE_CACHE_LIMIT) {
+          this.historyPageCache.delete(this.historyPageCache.keys().next().value!);
+        }
+        resolve(history);
+      };
+      tail = factory((payload) => {
+        if (settled) return;
+        if (payload.type === "chat_output" && payload.streamId === HISTORY_DONE_STREAM_ID) {
+          settle(null);
+          return;
+        }
+        events.push(payload);
+      });
+      if (settled) {
+        tail.stop();
+        return;
+      }
+      timer = setTimeout(() => settle(new Error("history read timed out")), HISTORY_PAGE_READ_TIMEOUT_MS);
+      timer.unref();
+      try {
+        tail.open(meta.cwd, meta.providerSessionId ?? meta.claudeSessionId ?? null, null, meta.agent ?? "claude");
+      } catch (error) {
+        settle(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+    this.historyPageReads.set(session, read);
+    const clear = (): void => {
+      if (this.historyPageReads.get(session) === read) this.historyPageReads.delete(session);
+    };
+    read.then(clear, clear);
+    return read;
   }
 
   private canReplay(actor: SessionActor, afterSeq: number): boolean {

@@ -24,6 +24,9 @@ import {
 } from "../context.js";
 import { killSessionForUser } from "./session.js";
 
+/** 履歴ページの Hub 待ち上限。Hub 側の読み切り上限（20 秒）より少し長く待つ（history-page）。 */
+const HISTORY_PAGE_RPC_TIMEOUT_MS = 22_000;
+
 /** chat_send 経路の常時診断ログ（pending 固まり事案の事後解析用）。失敗しても本処理を妨げない。 */
 function chatSendDiag(message: string): void {
   try {
@@ -194,6 +197,46 @@ export const conversationHandlers: HandlerRegistry = {
       }
     } catch (error) {
       writeError(writer, v, message.id, "question_answer_failed", String(error));
+    }
+  },
+
+  history_page_request: async (message, ctx) => {
+    const { writer, state } = ctx;
+    // 読めなかったときは error で返す（iOS は空のページを「履歴なし」と取り違えず、全履歴の取得へ戻る）。
+    try {
+      const response = await ctx.hubRpc<Extract<HubServerMessage, {
+        type: "conversation_history_page_response";
+      }>>(
+        {
+          type: "conversation_history_page_request",
+          id: message.id,
+          session: message.name,
+          limit: message.limit,
+          ...(message.beforeStreamId !== undefined ? { beforeStreamId: message.beforeStreamId } : {}),
+          ...(message.beforeToolId !== undefined ? { beforeToolId: message.beforeToolId } : {}),
+        },
+        message.id,
+        HISTORY_PAGE_RPC_TIMEOUT_MS,
+      );
+      if (response.failed === true) {
+        writeError(writer, state.negotiatedVersion, message.id, "history_page_failed", "履歴を読み込めませんでした。");
+        return;
+      }
+      writer.write({
+        type: "history_page_response",
+        v: state.negotiatedVersion,
+        id: message.id,
+        lines: response.lines,
+        hasMore: response.hasMore,
+        hostNowMs: response.hostNowMs,
+        ...(response.anchorMissing === true ? { anchorMissing: true } : {}),
+      });
+    } catch (error) {
+      try {
+        writeError(writer, state.negotiatedVersion, message.id, "history_page_failed", String(error));
+      } catch (writeFailure) {
+        process.stderr.write(`[tailii-host engine] history_page_response 書込失敗: ${String(writeFailure)}\n`);
+      }
     }
   },
 

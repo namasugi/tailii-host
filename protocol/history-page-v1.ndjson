@@ -1,0 +1,5 @@
+{"id":"hp1","limit":24,"name":"s-d4e23109","type":"history_page_request","v":1}
+{"beforeStreamId":"msg-uuid-1","id":"hp2","limit":48,"name":"s-d4e23109","type":"history_page_request","v":1}
+{"beforeToolId":"toolu_01","id":"hp3","limit":48,"name":"s-d4e23109","type":"history_page_request","v":1}
+{"hasMore":true,"hostNowMs":1759300000000,"id":"hp1","lines":["{\"eof\":true,\"role\":\"assistant\",\"streamId\":\"a1\",\"text\":\"hi\",\"type\":\"chat_output\",\"v\":1}"],"type":"history_page_response","v":1}
+{"anchorMissing":true,"hasMore":false,"hostNowMs":1759300000000,"id":"hp2","lines":[],"type":"history_page_response","v":1}
