@@ -330,13 +330,16 @@ export async function gitStatus(repositoryPath: string): Promise<{
   if (!(await isGitRepository(repositoryPath))) {
     return { isRepo: false, branch: "", upstream: null, ahead: 0, behind: 0, files: [] };
   }
-  const result = await runGit(repositoryPath, ["status", "--porcelain=v2", "--branch", "-z"]);
+  // 読むだけの status / diff は index.lock を取らない（--no-optional-locks）。engine は読み取りの
+  // 要求を並行に処理する（engine-concurrent-rpc）ので、取ると並行中の checkout / discard や
+  // エージェント自身の git 操作が「index.lock が既にある」で失敗する。
+  const result = await runGit(repositoryPath, ["--no-optional-locks", "status", "--porcelain=v2", "--branch", "-z"]);
   if (!result.ok) return { isRepo: false, branch: "", upstream: null, ahead: 0, behind: 0, files: [] };
   const repoRootResult = await runGit(repositoryPath, ["rev-parse", "--show-toplevel"]);
-  const headDiffstat = await runGit(repositoryPath, ["diff", "--shortstat", "HEAD"]);
+  const headDiffstat = await runGit(repositoryPath, ["--no-optional-locks", "diff", "--shortstat", "HEAD"]);
   const diffstat = headDiffstat.ok
     ? headDiffstat
-    : await runGit(repositoryPath, ["diff", "--shortstat"]);
+    : await runGit(repositoryPath, ["--no-optional-locks", "diff", "--shortstat"]);
   const { additions: diffAdditions, deletions: diffDeletions } = parseDiffShortstat(diffstat.stdout);
   return {
     isRepo: true,
@@ -683,8 +686,10 @@ export async function gitEntryStatuses(
   directoryPath: string,
   names: string[],
 ): Promise<Map<string, string>> {
+  // 読むだけなので index.lock を取らない（gitStatus と同じ理由, engine-concurrent-rpc）。
   const result = await runGit(directoryPath, [
-    "-c", "core.quotePath=false", "status", "--porcelain=v2", "--untracked-files=all", "--", ".",
+    "--no-optional-locks", "-c", "core.quotePath=false",
+    "status", "--porcelain=v2", "--untracked-files=all", "--", ".",
   ]);
   if (!result.ok) return new Map();
 

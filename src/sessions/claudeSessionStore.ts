@@ -40,6 +40,13 @@ export function cwdFromSlug(slug: string): string {
 /** Claude Code のマシン内会話一覧を導出する値型サービス。 */
 export class ClaudeSessionStore {
   private readonly root: string;
+  /**
+   * `list()` の 1 ファイル分の導出結果（key = jsonl パス, 照合 = mtimeMs + size, session-list-memo）。
+   * 導出は transcript の先頭と末尾を同期で読むため、数百件を毎回読み直すと 1 回 2〜6 秒 engine の
+   * イベントループを止めていた（その間は応答の書き出しも含めて何も進まない）。中身が変わらない
+   * ファイルは前回の結果を使い、変わったものだけ読み直す。今回の列挙に無かったパスは捨てる。
+   */
+  private readonly infoMemo = new Map<string, { mtimeMs: number; size: number; info: ClaudeSessionInfo }>();
 
   constructor(root?: string) {
     this.root = root ?? path.join(os.homedir(), ".claude", "projects");
@@ -99,6 +106,7 @@ export class ClaudeSessionStore {
     // 同一 sessionId は 1 行へ畳む。cwd/updatedAt の権威は「会話本体を持つ方」なので、
     // baseDir 絞り込みより **先に** 畳む（残骸の lossy cwd で絞り込ませない）。
     const bySessionId = new Map<string, ClaudeSessionInfo>();
+    const seenPaths = new Set<string>();
     for (const slug of slugs) {
       const slugDir = path.join(this.root, slug);
       let stat: fs.Stats;
@@ -118,10 +126,14 @@ export class ClaudeSessionStore {
         if (!file.endsWith(".jsonl")) continue;
         const sessionId = file.slice(0, -".jsonl".length);
         if (!sessionId) continue;
-        const info = deriveInfo(path.join(slugDir, file), sessionId, slug);
+        const info = this.memoizedInfo(path.join(slugDir, file), sessionId, slug, seenPaths);
         const existing = bySessionId.get(sessionId);
         bySessionId.set(sessionId, existing === undefined ? info : richerInfo(existing, info));
       }
+    }
+
+    for (const memoPath of this.infoMemo.keys()) {
+      if (!seenPaths.has(memoPath)) this.infoMemo.delete(memoPath);
     }
 
     let result: ClaudeSessionInfo[] = [...bySessionId.values()];
@@ -135,6 +147,28 @@ export class ClaudeSessionStore {
       if (l !== r) return r - l;
       return lhs.sessionId < rhs.sessionId ? -1 : lhs.sessionId > rhs.sessionId ? 1 : 0;
     });
+  }
+
+  /** 1 ファイル分の一覧行を、中身が前回と同じならメモから返す（呼び出し側が書き換えても良いよう複製）。 */
+  private memoizedInfo(
+    filePath: string,
+    sessionId: string,
+    slug: string,
+    seenPaths: Set<string>,
+  ): ClaudeSessionInfo {
+    seenPaths.add(filePath);
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(filePath);
+    } catch {
+      this.infoMemo.delete(filePath);
+      return deriveInfo(filePath, sessionId, slug);
+    }
+    const hit = this.infoMemo.get(filePath);
+    if (hit !== undefined && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size) return { ...hit.info };
+    const info = deriveInfo(filePath, sessionId, slug);
+    this.infoMemo.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, info: { ...info } });
+    return info;
   }
 }
 

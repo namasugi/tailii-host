@@ -1016,6 +1016,15 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           codexTurnController,
           officialApps,
           previewServer,
+          trackBackground: (task) => {
+            background.push(task);
+            // 終わったものは外す（読み取り専用 RPC は数秒おきに来るので、溜めると増え続ける）。
+            const remove = (): void => {
+              const index = background.indexOf(task);
+              if (index >= 0) background.splice(index, 1);
+            };
+            task.then(remove, remove);
+          },
         });
         if (didProcessMessage && isStaleDist(staleDistGuard)) {
           process.stderr.write("[tailii-host engine] stale dist を検出、再起動のため終了\n");
@@ -1032,14 +1041,44 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     lifecycleAbort.abort();
     for (const timer of backgroundUnwatchTimers.values()) clearTimeout(timer);
     backgroundUnwatchTimers.clear();
+    // 切り離した処理（conversation-delete の kill→削除）は Hub へ session_retire 等を送るので、
+    // Hub 接続を閉じる前に終わらせる（閉じた後の送信は届かず、Hub に旧 actor / queue が残る）。
+    await Promise.allSettled(background);
     hubLink.close();
     codexTurnController?.close();
     await previewServer?.closeAll();
-    await Promise.allSettled(background);
   }
 }
 
 // MARK: - 1 行の処理
+
+/**
+ * 完了を待たずに並行で処理してよい要求（engine-concurrent-rpc）。載せてよい条件:
+ * - 読み取り専用で、engine の共有状態を書き換えない（読むのはハンドラ冒頭の同期部分で、受信時点の値になる）
+ * - 応答は要求 id で相関され、届く順序に意味が無い（iOS が「後から届いた古い応答」で状態を巻き戻さない）
+ * - 直列の書き込み系とロックを取り合わない（git は --no-optional-locks で読む）
+ * 状態を変える要求・開いている会話や一覧の状態に順序で効く要求は載せない（従来どおり直列）。
+ */
+export const CONCURRENT_MESSAGE_TYPES: ReadonlySet<ControlMessage["type"]> = new Set<ControlMessage["type"]>([
+  "claude_session_list_request",
+  // session_list_request は載せない: iOS は応答を届いた順に一覧へ反映し、終了済みの印（tombstone）も
+  // 外す。並行にすると、終了より前に要求した古い一覧が後から届いて終了した会話を生き返らせる。
+  "session_search_request",
+  "serve_list_request",
+  "git_status_request",
+  "git_diff_request",
+  "git_log_request",
+  "git_branch_list_request",
+  "file_list_request",
+  "file_read_request",
+  "file_search_request",
+  "usage_request",
+  "account_usage_request",
+  "claude_model_list_request",
+  "codex_model_list_request",
+  "official_app_status_request",
+  "subagent_transcript_request",
+]);
 
 /** 1行（改行なし）をデコードし、type に対応するドメインハンドラへ dispatch する。decode 失敗は破棄。 */
 async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean> {
@@ -1063,6 +1102,20 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
   const handler = ENGINE_HANDLERS[message.type] as
     | ((m: ControlMessage, c: HandlerContext) => void | Promise<void>)
     | undefined;
-  if (handler !== undefined) await handler(message, ctx);
+  if (handler === undefined) return true;
+  if (CONCURRENT_MESSAGE_TYPES.has(message.type)) {
+    // 読み取り専用で応答を id で返すだけの要求は、完了を待たずに次の行へ進む（engine-concurrent-rpc）。
+    // tmux 一覧・git 状態・外部プロセス確認など数秒かかる要求が read loop を塞ぎ、後ろに並んだ
+    // ファイル取り出し・画像取得・送信まで待たされていた。順序が意味を持つ要求（開始・送信・
+    // モード・削除など）は従来どおり 1 件ずつ await する。
+    const task = Promise.resolve()
+      .then(() => handler(message, ctx))
+      .catch((error: unknown) => {
+        process.stderr.write(`[tailii-host engine] ${message.type} 処理失敗: ${String(error)}\n`);
+      });
+    ctx.trackBackground(task);
+    return true;
+  }
+  await handler(message, ctx);
   return true;
 }

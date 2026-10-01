@@ -9,6 +9,7 @@ import {
   type CodexAppServerThreadOptions,
 } from "../src/codex/codexAppServer.js";
 import { ImageService } from "../src/chat/imageService.js";
+import { CONCURRENT_MESSAGE_TYPES } from "../src/engine/engine.js";
 import { CLIENT_BUILD_PIN } from "../src/shared/clientBuild.js";
 import {
   sendQuestionEventToEngine,
@@ -2442,6 +2443,52 @@ describe("EngineControl — 横断制御チャネル", () => {
     expect(err).toContain('"id":"nope"');
 
     await engine.teardown();
+  });
+
+  // MARK: 8b. 読み取り専用 RPC は read loop を塞がない（engine-concurrent-rpc）
+
+  test("遅い claude_session_list_request の後ろに並んだ image_fetch_request が先に応答される", async () => {
+    const img = makeImageRoot();
+    writeIndexedBlob("behind-list", 100, "png", img.index);
+    const imageService = new ImageService({ pendingBase: img.pending, indexBase: img.index });
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const manager = new TmuxSessionManager({
+      runner: async (args) => {
+        // 会話一覧の生存セッション突き合わせ（tmux の一覧取得）だけを止めて「数秒かかる一覧」を再現する。
+        if (args.includes("list-sessions") || args.includes("list-panes")) await gate;
+        return ok("");
+      },
+      store: makeTempStore(),
+    });
+    const engine = startEngine({ sessionManager: manager, imageService });
+
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine('{"id":"slow-list","type":"claude_session_list_request","v":2}');
+    engine.writeLine('{"id":"behind-list","type":"image_fetch_request","v":1}');
+
+    // 一覧が止まったままでも画像は返る（以前は一覧の完了まで次の行が読まれなかった）。
+    const image = await engine.lines.nextOfType("image_fetch_response");
+    expect(image).toContain('"id":"behind-list"');
+
+    release();
+    const list = await engine.lines.nextOfType("claude_session_list_response");
+    expect(list).toContain('"id":"slow-list"');
+    await engine.teardown();
+  });
+
+  test("並行にしてよい要求は読み取り専用の RPC だけ（順序が意味を持つ要求は含めない）", () => {
+    for (const type of ["claude_session_list_request", "git_status_request", "file_list_request"] as const) {
+      expect(CONCURRENT_MESSAGE_TYPES.has(type)).toBe(true);
+    }
+    for (const type of [
+      // 応答を届いた順に一覧へ反映するため、古い一覧が終了済みの会話を生き返らせる（直列のまま）。
+      "session_list_request",
+      "session_start", "session_reattach", "chat_send", "mode_set", "mode_get", "session_kill",
+      "conversation_delete", "git_checkout_request", "serve_stop_request", "question_answer",
+    ] as const) {
+      expect(CONCURRENT_MESSAGE_TYPES.has(type)).toBe(false);
+    }
   });
 
   // MARK: 9. image_available を engine チャネルへ送出（drainPending）

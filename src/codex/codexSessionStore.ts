@@ -43,7 +43,24 @@ interface IndexEntry {
   updatedAt: number | null;
 }
 
+/** 列挙した rollout 1 本（size は stat 失敗で -1）。 */
+interface RolloutFile {
+  path: string;
+  mtimeMs: number;
+  size: number;
+}
+
+/** rollout 1 本分の読み取り結果のメモ（undefined = まだ読んでいない, session-list-memo）。 */
+interface RolloutMemo {
+  mtimeMs: number;
+  size: number;
+  meta?: ReturnType<typeof readSessionMeta>;
+  firstUserMessage?: string | null;
+  lastMessage?: string | null;
+}
+
 interface RolloutEntry {
+  file: RolloutFile;
   path: string;
   cwd: string | null;
   isBackgroundSession: boolean;
@@ -54,6 +71,12 @@ export class CodexSessionStore {
   private readonly sessionsRoot: string;
   private readonly indexPath: string;
   private readonly maxSessions: number;
+  /**
+   * rollout 1 本分の読み取り結果（key = パス, 照合 = mtimeMs + size, session-list-memo）。
+   * 一覧のたびに数百本の先頭・最初の発話・末尾を同期で読み直すと engine のイベントループを
+   * 数秒止めていた。中身が変わらないファイルは前回の結果を使う。列挙に無かったパスは捨てる。
+   */
+  private readonly rolloutMemo = new Map<string, RolloutMemo>();
 
   /**
    * @param home codex ホーム（既定 `~/.codex`）。テストは一時 dir を注入する。
@@ -78,7 +101,7 @@ export class CodexSessionStore {
     const seen = new Set<string>();
     for (const file of files) {
       if (result.length >= this.maxSessions) break;
-      const meta = readSessionMeta(file.path);
+      const meta = this.sessionMeta(file);
       if (meta === null || meta.cwd === null || meta.isBackgroundSession) continue;
       const sessionId = meta.id ?? path.basename(file.path);
       if (seen.has(sessionId)) continue;
@@ -87,7 +110,7 @@ export class CodexSessionStore {
       const idx = meta.id !== null ? index.get(meta.id) : undefined;
       // thread_name が無ければ最初の実ユーザー発話からタイトルを作る（codex アプリ準拠）。
       // それも取れなければ id 先頭 8 字。index にある会話は毎回のファイル走査を避けて thread_name を使う。
-      const title = idx?.title ?? readFirstUserMessage(file.path) ?? sessionId.slice(0, 8);
+      const title = idx?.title ?? this.firstUserMessage(file) ?? sessionId.slice(0, 8);
       const updatedAt =
         idx?.updatedAt ?? (file.mtimeMs > 0 ? Math.floor(file.mtimeMs / 1000) : undefined);
 
@@ -100,7 +123,7 @@ export class CodexSessionStore {
       };
       if (updatedAt !== undefined) info.updatedAt = updatedAt;
       if (baseDir && !isInsideBase(info.cwd, baseDir)) continue;
-      const lastMessage = readLastRolloutMessage(file.path);
+      const lastMessage = this.lastMessage(file);
       if (lastMessage !== null) info.lastMessage = lastMessage;
       result.push(info);
     }
@@ -146,7 +169,7 @@ export class CodexSessionStore {
       if (rollout?.isBackgroundSession === true) continue;
       const cwd = thread.cwd ?? rollout?.cwd ?? null;
       if (cwd === null || (baseDir !== undefined && !isInsideBase(cwd, baseDir))) continue;
-      const fallbackTitle = rollout === undefined ? null : readFirstUserMessage(rollout.path);
+      const fallbackTitle = rollout === undefined ? null : this.firstUserMessage(rollout.file);
       const rawTitle = nonEmptyString(thread.name) ?? nonEmptyString(thread.preview);
       const info: ClaudeSessionInfo = {
         sessionId: thread.id,
@@ -157,7 +180,7 @@ export class CodexSessionStore {
         hasProviderTitle: nonEmptyString(thread.name) !== null,
       };
       if (rollout !== undefined) {
-        const lastMessage = readLastRolloutMessage(rollout.path);
+        const lastMessage = this.lastMessage(rollout.file);
         if (lastMessage !== null) info.lastMessage = lastMessage;
       }
       result.push(info);
@@ -169,9 +192,10 @@ export class CodexSessionStore {
     const result = new Map<string, RolloutEntry>();
     const files = this.listRollouts().sort((a, b) => b.mtimeMs - a.mtimeMs);
     for (const file of files) {
-      const meta = readSessionMeta(file.path);
+      const meta = this.sessionMeta(file);
       if (meta?.id === null || meta === null || result.has(meta.id)) continue;
       result.set(meta.id, {
+        file,
         path: file.path,
         cwd: meta.cwd,
         isBackgroundSession: meta.isBackgroundSession,
@@ -216,8 +240,8 @@ export class CodexSessionStore {
   }
 
   /** rollout ファイル（`rollout-*.jsonl`）を再帰列挙する（path + mtimeMs）。 */
-  private listRollouts(): { path: string; mtimeMs: number }[] {
-    const out: { path: string; mtimeMs: number }[] = [];
+  private listRollouts(): RolloutFile[] {
+    const out: RolloutFile[] = [];
     const walk = (dir: string): void => {
       let entries: fs.Dirent[];
       try {
@@ -231,17 +255,51 @@ export class CodexSessionStore {
           walk(p);
         } else if (entry.isFile() && entry.name.endsWith(".jsonl") && entry.name.startsWith("rollout-")) {
           let mtimeMs = 0;
+          let size = -1;
           try {
-            mtimeMs = fs.statSync(p).mtimeMs;
+            const stat = fs.statSync(p);
+            mtimeMs = stat.mtimeMs;
+            size = stat.size;
           } catch {
             mtimeMs = 0;
           }
-          out.push({ path: p, mtimeMs });
+          out.push({ path: p, mtimeMs, size });
         }
       }
     };
     walk(this.sessionsRoot);
+    const seen = new Set(out.map((file) => file.path));
+    for (const memoPath of this.rolloutMemo.keys()) {
+      if (!seen.has(memoPath)) this.rolloutMemo.delete(memoPath);
+    }
     return out;
+  }
+
+  /** rollout 1 本分のメモ（中身が変わっていれば作り直す）。読めない（size < 0）ものは覚えない。 */
+  private memoFor(file: RolloutFile): RolloutMemo {
+    const hit = this.rolloutMemo.get(file.path);
+    if (hit !== undefined && hit.mtimeMs === file.mtimeMs && hit.size === file.size) return hit;
+    const memo: RolloutMemo = { mtimeMs: file.mtimeMs, size: file.size };
+    if (file.size >= 0) this.rolloutMemo.set(file.path, memo);
+    return memo;
+  }
+
+  private sessionMeta(file: RolloutFile): ReturnType<typeof readSessionMeta> {
+    const memo = this.memoFor(file);
+    if (memo.meta === undefined) memo.meta = readSessionMeta(file.path);
+    return memo.meta;
+  }
+
+  private firstUserMessage(file: RolloutFile): string | null {
+    const memo = this.memoFor(file);
+    if (memo.firstUserMessage === undefined) memo.firstUserMessage = readFirstUserMessage(file.path);
+    return memo.firstUserMessage;
+  }
+
+  private lastMessage(file: RolloutFile): string | null {
+    const memo = this.memoFor(file);
+    if (memo.lastMessage === undefined) memo.lastMessage = readLastRolloutMessage(file.path);
+    return memo.lastMessage;
   }
 }
 

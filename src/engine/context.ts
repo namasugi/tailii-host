@@ -149,6 +149,11 @@ export interface HandlerContext {
   officialApps: OfficialAppsService | null;
   /** Web プレビュー用 loopback 静的ファイルサーバー。 */
   previewServer: PreviewServer;
+  /**
+   * read loop から切り離した処理を engine の終了待ちへ載せる（チャネル断・stale dist 終了でも
+   * 途中で打ち切らない。conversation-delete の kill→削除）。
+   */
+  trackBackground: (task: Promise<unknown>) => void;
 }
 
 /** ドメイン別ハンドラの契約: message type ごとに narrow された ControlMessage を受ける。 */
