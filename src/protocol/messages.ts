@@ -570,6 +570,13 @@ export type ControlMessage =
   /** Codex App Server の正式な thread.name を設定する。空 title はApp Serverが拒否する。 */
   | { type: "codex_thread_title_set"; v: number; id: string; threadId: string; title: string }
   | { type: "codex_thread_title_set_result"; v: number; id: string; ok: boolean; error: string | null }
+  /**
+   * 会話をホストから完全に削除する（iOS→host, conversation-delete）。host は会話を収容中の
+   * Tailii セッションを終了し、Claude は会話記録ファイル、Codex は App Server `thread/delete` で消す。
+   * Tailii 外（Mac の端末など）で実行中なら ok=false で拒否する。対象が既に無いのは ok=true。
+   */
+  | { type: "conversation_delete"; v: number; id: string; sessionId: string; agent: "claude" | "codex" }
+  | { type: "conversation_delete_result"; v: number; id: string; ok: boolean; error: string | null }
   | { type: "question_prompt"; v: number; id: string; questions: QuestionPromptQuestion[] }
   | { type: "question_answer"; v: number; id: string; session: string; answers: QuestionAnswer[] }
   | { type: "question_dismiss"; v: number; id: string }

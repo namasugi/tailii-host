@@ -2670,6 +2670,184 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
+  // MARK: conversation-delete: conversation_delete → conversation_delete_result
+
+  test("conversation_delete は収容中の Tailii セッションを終了し、全 slug の会話記録を消す", async () => {
+    const id = "12121212-3434-5656-7878-909090909090";
+    const keepId = "abababab-cdcd-efef-0101-232323232323";
+    const projects = makeTempDir("tailii-cd-projects");
+    const main = path.join(projects, "-tmp-proj");
+    const remnant = path.join(projects, "-tmp-proj-wt");
+    fs.mkdirSync(path.join(main, id, "subagents"), { recursive: true });
+    fs.mkdirSync(remnant, { recursive: true });
+    fs.writeFileSync(path.join(main, `${id}.jsonl`), '{"type":"user","cwd":"/tmp/proj","message":{"content":"消す"}}\n');
+    fs.writeFileSync(path.join(main, id, "subagents", "agent-1.jsonl"), "{}\n");
+    fs.writeFileSync(path.join(remnant, `${id}.jsonl`), '{"type":"mode"}\n');
+    fs.writeFileSync(path.join(main, `${keepId}.jsonl`), '{"type":"user","cwd":"/tmp/proj","message":{"content":"残す"}}\n');
+
+    vi.stubEnv("TAILII_CLAUDE_SESSIONS_DIR", makeTempDir("tailii-cd-registry"));
+    const store = makeTempStore();
+    store.put({ name: "cs-12121212", cwd: "/tmp/proj", createdAt: 1, agent: "claude", claudeSessionId: id });
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("cs-12121212\n") : ok(""));
+    const hubSend = vi.fn();
+    const hubLink: HubLink = { onMessage: null, onReconnect: null, send: hubSend, close: vi.fn() };
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store),
+      metadataStore: store,
+      claudeSessionStore: new ClaudeSessionStore(projects),
+      homeDir: makeTempDir("tailii-cd-home"),
+      hubLink,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine(`{"agent":"claude","id":"D1","sessionId":"${id}","type":"conversation_delete","v":2}`);
+    expect(await engine.lines.nextOfType("conversation_delete_result")).toBe(
+      '{"error":null,"id":"D1","ok":true,"type":"conversation_delete_result","v":2}',
+    );
+    expect(await waitForCommand(runner, ["kill-session", "-t", "cs-12121212"])).toBe(true);
+    expect(hubSend).toHaveBeenCalledWith({ type: "session_retire", session: "cs-12121212" });
+    expect(fs.existsSync(path.join(main, `${id}.jsonl`))).toBe(false);
+    expect(fs.existsSync(path.join(main, id))).toBe(false);
+    expect(fs.existsSync(path.join(remnant, `${id}.jsonl`))).toBe(false);
+    expect(fs.existsSync(path.join(main, `${keepId}.jsonl`))).toBe(true);
+
+    // 既に無い会話の削除は成功扱い（冪等）。
+    engine.writeLine(`{"agent":"claude","id":"D2","sessionId":"${id}","type":"conversation_delete","v":2}`);
+    expect(await engine.lines.nextOfType("conversation_delete_result")).toContain('"ok":true');
+    await engine.teardown();
+    vi.unstubAllEnvs();
+  });
+
+  test("conversation_delete は UUID でない会話 id を拒否し、何も消さない", async () => {
+    const projects = makeTempDir("tailii-cd-invalid");
+    fs.mkdirSync(path.join(projects, "-tmp-proj"), { recursive: true });
+    const victim = path.join(projects, "victim.jsonl");
+    fs.writeFileSync(victim, "{}\n");
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({
+      sessionManager: makeManager(runner),
+      claudeSessionStore: new ClaudeSessionStore(path.join(projects, "-tmp-proj")),
+      homeDir: makeTempDir("tailii-cd-invalid-home"),
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine('{"agent":"claude","id":"D3","sessionId":"../victim","type":"conversation_delete","v":2}');
+    expect(await engine.lines.nextOfType("conversation_delete_result")).toBe(
+      '{"error":"会話 id が不正です。","id":"D3","ok":false,"type":"conversation_delete_result","v":2}',
+    );
+    expect(fs.existsSync(victim)).toBe(true);
+    await engine.teardown();
+  });
+
+  test("conversation_delete は Tailii 外で実行中の Claude 会話を終了せずに拒否する", async () => {
+    const id = "34343434-5656-7878-9090-121212121212";
+    const projects = makeTempDir("tailii-cd-peer");
+    fs.mkdirSync(path.join(projects, "-tmp-proj"), { recursive: true });
+    const transcript = path.join(projects, "-tmp-proj", `${id}.jsonl`);
+    fs.writeFileSync(transcript, "{}\n");
+    const registry = makeTempDir("tailii-cd-peer-registry");
+    vi.stubEnv("TAILII_CLAUDE_SESSIONS_DIR", registry);
+    // 生存 pid（このテストプロセス自身）で登録簿に載せる = Mac の端末で実行中。
+    fs.writeFileSync(
+      path.join(registry, `${process.pid}.json`),
+      JSON.stringify({ pid: process.pid, sessionId: id, cwd: "/tmp/proj", name: "mac-terminal" }),
+    );
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({
+      sessionManager: makeManager(runner),
+      claudeSessionStore: new ClaudeSessionStore(projects),
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine(`{"agent":"claude","id":"D4","sessionId":"${id}","type":"conversation_delete","v":2}`);
+    const result = decodeControlMessage(await engine.lines.nextOfType("conversation_delete_result"));
+    expect(result).toMatchObject({ ok: false });
+    expect(JSON.stringify(result)).toContain("mac-terminal");
+    expect(fs.existsSync(transcript)).toBe(true);
+    expect(runner.recorded.some((args) => args[0] === "kill-session")).toBe(false);
+    await engine.teardown();
+    vi.unstubAllEnvs();
+  });
+
+  test("conversation_delete は Codex を App Server の thread/delete で消す", async () => {
+    const id = "019a0000-1111-7222-8333-444455556666";
+    const manager = new CodexAppServerManager();
+    const deleteThread = vi.spyOn(manager, "deleteThread").mockResolvedValue();
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({
+      sessionManager: makeManager(runner),
+      codexAppServer: manager,
+      homeDir: makeTempDir("tailii-cd-codex-home"),
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine(`{"agent":"codex","id":"D5","sessionId":"${id}","type":"conversation_delete","v":2}`);
+    expect(await engine.lines.nextOfType("conversation_delete_result")).toBe(
+      '{"error":null,"id":"D5","ok":true,"type":"conversation_delete_result","v":2}',
+    );
+    expect(deleteThread).toHaveBeenCalledWith(id);
+
+    // 想定外の失敗は生の英語メッセージを出さず定型文にする。
+    deleteThread.mockRejectedValueOnce(new Error("Codex App Server request timed out: thread/delete"));
+    engine.writeLine(`{"agent":"codex","id":"D6","sessionId":"${id}","type":"conversation_delete","v":2}`);
+    expect(await engine.lines.nextOfType("conversation_delete_result")).toBe(
+      '{"error":"会話を削除できませんでした。","id":"D6","ok":false,"type":"conversation_delete_result","v":2}',
+    );
+    await engine.teardown();
+  });
+
+  test("CodexAppServerManager.deleteThread は既に無い thread（no rollout found）を成功扱いにする", async () => {
+    const manager = new CodexAppServerManager();
+    const request = vi.fn(async (): Promise<unknown> => {
+      throw new Error("no rollout found for thread id 019a0000-1111-7222-8333-444455556666");
+    });
+    const internals = manager as unknown as { ensureRunning: () => Promise<void>; connect: () => Promise<unknown> };
+    vi.spyOn(internals, "ensureRunning").mockResolvedValue();
+    vi.spyOn(internals, "connect").mockResolvedValue({ initialize: async () => ({}), request, close: () => {} });
+
+    await expect(manager.deleteThread("019a0000-1111-7222-8333-444455556666")).resolves.toBeUndefined();
+    expect(request).toHaveBeenCalledWith("thread/delete", { threadId: "019a0000-1111-7222-8333-444455556666" });
+
+    request.mockRejectedValueOnce(new Error("permission denied"));
+    await expect(manager.deleteThread("019a0000-1111-7222-8333-444455556666")).rejects.toThrow("permission denied");
+  });
+
+  test("conversation_delete の終了待ち中も read loop は後続の要求を処理する", async () => {
+    const id = "56565656-1212-3434-5656-787878787878";
+    const registry = makeTempDir("tailii-cd-nonblock-registry");
+    vi.stubEnv("TAILII_CLAUDE_SESSIONS_DIR", registry);
+    // Tailii のセッション（tmux 欄で照合）の claude が kill 後も死なない = 終了待ちが猶予いっぱい続く。
+    fs.writeFileSync(
+      path.join(registry, `${process.pid}.json`),
+      JSON.stringify({ pid: process.pid, sessionId: id, cwd: "/tmp/proj", name: "stubborn", tmux: "cs-56565656:@1.%1" }),
+    );
+    const projects = makeTempDir("tailii-cd-nonblock-projects");
+    fs.mkdirSync(path.join(projects, "-tmp-proj"), { recursive: true });
+    const transcript = path.join(projects, "-tmp-proj", `${id}.jsonl`);
+    fs.writeFileSync(transcript, "{}\n");
+    const store = makeTempStore();
+    store.put({ name: "cs-56565656", cwd: "/tmp/proj", createdAt: 1, agent: "claude", claudeSessionId: id });
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("cs-56565656\n") : ok(""));
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store),
+      metadataStore: store,
+      claudeSessionStore: new ClaudeSessionStore(projects),
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine(`{"agent":"claude","id":"D7","sessionId":"${id}","type":"conversation_delete","v":2}`);
+    expect(await waitForCommand(runner, ["kill-session", "-t", "cs-56565656"])).toBe(true);
+    engine.writeLine('{"id":"L7","type":"claude_session_list_request","v":2}');
+    expect(await engine.lines.nextOfType("claude_session_list_response")).toContain('"id":"L7"');
+
+    expect(await engine.lines.nextOfType("conversation_delete_result", 10_000)).toBe(
+      '{"error":"実行中のセッションの終了を待ちきれなかったため削除できませんでした。少し待ってから再度お試しください。","id":"D7","ok":false,"type":"conversation_delete_result","v":2}',
+    );
+    expect(fs.existsSync(transcript)).toBe(true);
+    await engine.teardown();
+    vi.unstubAllEnvs();
+  }, 15_000);
+
   // MARK: session_search_request → session_search_response
 
   test("session_search_request に本文検索結果を返す（store 橋渡し）", async () => {

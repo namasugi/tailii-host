@@ -23,6 +23,7 @@ import {
   waitForLiveSession,
   writeError,
   writeSessionListResponse,
+  type HandlerContext,
   type HandlerRegistry,
   type WorktreeResponseFields,
 } from "../context.js";
@@ -121,49 +122,10 @@ export const sessionHandlers: HandlerRegistry = {
   },
 
   session_kill: async (message, ctx) => {
-    const { writer, state, sessionManager, metadataStore } = ctx;
+    const { writer, state, sessionManager } = ctx;
     const v = state.negotiatedVersion;
     try {
-      // cwd の権威は tmux の現在位置ではなく永続 SessionMetadataStore。
-      const killedCwd = metadataStore?.get(message.name)?.cwd ?? null;
-      // 明示 kill はユーザー意思なので処理中保護より優先する（保護記録も掃除）。
-      ctx.processingSessions.delete(message.name);
-      ctx.backgroundChatSessions.delete(message.name);
-      ctx.hubLink.send({ type: "conversation_unsubscribe", session: message.name });
-      ctx.codexTurnController?.closeSession(message.name);
-      // kill する会話を tail 中なら止める（生かしたままだと再オープンの open() が
-      // 「同一会話 tail 中」でスキップし、履歴が再生されず空表示になる）。
-      if (ctx.activeChatSession.name === message.name) {
-        ctx.activeChatSession.name = null;
-      }
-      await sessionManager.kill(message.name);
-      // kill 成功後だけ Hub の actor / durable queue / delivered receipt を廃棄する。
-      // 同名セッションを後日作り直しても、旧会話の queued 入力を注入させない。
-      ctx.hubLink.send({ type: "session_retire", session: message.name });
-      let worktreeResponse: WorktreeResponseFields | null = null;
-      if (killedCwd !== null && isTailiiWorktreePath(killedCwd)) {
-        worktreeResponse = { worktreePath: killedCwd };
-        try {
-          if (await gitWorktreeIsClean(killedCwd)) {
-            const removed = await gitWorktreeRemove(killedCwd, false);
-            if (removed.ok) {
-              worktreeResponse.worktreeRemoved = true;
-            } else {
-              engineDiag(`session_kill worktree 削除失敗 path=${killedCwd}: ${removed.error ?? "unknown"}`);
-            }
-          } else {
-            engineDiag(`session_kill worktree dirty または clean 判定不能のため保持 path=${killedCwd}`);
-            worktreeResponse.worktreeDirty = true;
-            const unlocked = await gitWorktreeUnlock(killedCwd);
-            if (!unlocked.ok) {
-              engineDiag(`session_kill worktree unlock 失敗 path=${killedCwd}: ${unlocked.error ?? "unknown"}`);
-            }
-          }
-        } catch (error) {
-          // worktree の判定・掃除は fail-open。ユーザーが要求した tmux kill の成功を覆さない。
-          engineDiag(`session_kill worktree 掃除失敗 path=${killedCwd}: ${String(error)}`);
-        }
-      }
+      const worktreeResponse = await killSessionForUser(ctx, message.name);
       // kill 成功は list 応答（現況一覧）で返す（疎通確認）。
       let sessions: SessionInfo[] = [];
       try {
@@ -406,3 +368,53 @@ export const sessionHandlers: HandlerRegistry = {
     }
   },
 };
+
+/**
+ * 利用者の明示操作によるセッション終了（session_kill / conversation_delete 共用）。
+ * 端末の kill に失敗したら throw する。Tailii 作成の worktree は clean なら掃除する（fail-open）。
+ */
+export async function killSessionForUser(
+  ctx: HandlerContext,
+  name: string,
+): Promise<WorktreeResponseFields | null> {
+  const { sessionManager, metadataStore } = ctx;
+  // cwd の権威は tmux の現在位置ではなく永続 SessionMetadataStore。
+  const killedCwd = metadataStore?.get(name)?.cwd ?? null;
+  // 明示 kill はユーザー意思なので処理中保護より優先する（保護記録も掃除）。
+  ctx.processingSessions.delete(name);
+  ctx.backgroundChatSessions.delete(name);
+  ctx.hubLink.send({ type: "conversation_unsubscribe", session: name });
+  ctx.codexTurnController?.closeSession(name);
+  // kill する会話を tail 中なら止める（生かしたままだと再オープンの open() が
+  // 「同一会話 tail 中」でスキップし、履歴が再生されず空表示になる）。
+  if (ctx.activeChatSession.name === name) {
+    ctx.activeChatSession.name = null;
+  }
+  await sessionManager.kill(name);
+  // kill 成功後だけ Hub の actor / durable queue / delivered receipt を廃棄する。
+  // 同名セッションを後日作り直しても、旧会話の queued 入力を注入させない。
+  ctx.hubLink.send({ type: "session_retire", session: name });
+  if (killedCwd === null || !isTailiiWorktreePath(killedCwd)) return null;
+  const worktreeResponse: WorktreeResponseFields = { worktreePath: killedCwd };
+  try {
+    if (await gitWorktreeIsClean(killedCwd)) {
+      const removed = await gitWorktreeRemove(killedCwd, false);
+      if (removed.ok) {
+        worktreeResponse.worktreeRemoved = true;
+      } else {
+        engineDiag(`session_kill worktree 削除失敗 path=${killedCwd}: ${removed.error ?? "unknown"}`);
+      }
+    } else {
+      engineDiag(`session_kill worktree dirty または clean 判定不能のため保持 path=${killedCwd}`);
+      worktreeResponse.worktreeDirty = true;
+      const unlocked = await gitWorktreeUnlock(killedCwd);
+      if (!unlocked.ok) {
+        engineDiag(`session_kill worktree unlock 失敗 path=${killedCwd}: ${unlocked.error ?? "unknown"}`);
+      }
+    }
+  } catch (error) {
+    // worktree の判定・掃除は fail-open。ユーザーが要求した kill の成功を覆さない。
+    engineDiag(`session_kill worktree 掃除失敗 path=${killedCwd}: ${String(error)}`);
+  }
+  return worktreeResponse;
+}

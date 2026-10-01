@@ -8,7 +8,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, test } from "vitest";
 import { ChatTailController } from "../src/chat/chatTailController.js";
-import { ClaudeSessionStore, cwdFromSlug, transcriptTitle } from "../src/sessions/claudeSessionStore.js";
+import { ClaudeSessionStore, cwdFromSlug, isConversationId, transcriptTitle } from "../src/sessions/claudeSessionStore.js";
 import { dirCanCreate, dirChildren, dirCreate, dirList } from "../src/services/dirLister.js";
 import { parsePermissionMode } from "../src/shared/permissionMode.js";
 import { resolveHostDisplayName } from "../src/shared/hostDisplayName.js";
@@ -710,6 +710,41 @@ describe("PlanUsageFetcher", () => {
 });
 
 // MARK: - SessionMetadataStore
+
+describe("ClaudeSessionStore.deleteConversation", () => {
+  const id = "56565656-7878-9090-1212-343434343434";
+
+  test("root が projects なら ~/.claude 直下の会話単位ディレクトリも消し、他の会話は残す", () => {
+    const claudeHome = makeTempDir("tailii-delete-home");
+    const projects = path.join(claudeHome, "projects");
+    fs.mkdirSync(path.join(projects, "-tmp-proj"), { recursive: true });
+    fs.writeFileSync(path.join(projects, "-tmp-proj", `${id}.jsonl`), "{}\n");
+    for (const dir of ["file-history", "session-env", "tasks"]) {
+      fs.mkdirSync(path.join(claudeHome, dir, id), { recursive: true });
+      fs.mkdirSync(path.join(claudeHome, dir, "other"), { recursive: true });
+    }
+    fs.writeFileSync(path.join(claudeHome, "history.jsonl"), `{"sessionId":"${id}"}\n`);
+
+    const removed = new ClaudeSessionStore(projects).deleteConversation(id);
+
+    expect(removed).toHaveLength(4);
+    expect(fs.existsSync(path.join(projects, "-tmp-proj", `${id}.jsonl`))).toBe(false);
+    for (const dir of ["file-history", "session-env", "tasks"]) {
+      expect(fs.existsSync(path.join(claudeHome, dir, id))).toBe(false);
+      expect(fs.existsSync(path.join(claudeHome, dir, "other"))).toBe(true);
+    }
+    // 共有ファイルは書き換えない。
+    expect(fs.readFileSync(path.join(claudeHome, "history.jsonl"), "utf8")).toContain(id);
+  });
+
+  test("UUID でない id は throw してパスへ埋め込まない", () => {
+    expect(isConversationId(id)).toBe(true);
+    for (const bad of ["../x", "", "a/b", `${id}/..`, "x".repeat(36)]) {
+      expect(isConversationId(bad)).toBe(false);
+      expect(() => new ClaudeSessionStore(makeTempDir("tailii-delete-bad")).deleteConversation(bad)).toThrow();
+    }
+  });
+});
 
 describe("SessionMetadataStore", () => {
   test("put/get 往復と all 列挙（壊れたファイルは無視）", () => {

@@ -31,6 +31,17 @@ const TAIL_CHUNK_BYTES = 16 * 1024;
 /** 最終会話時刻の後方スキャンの上限バイト数（超巨大な無タイムスタンプ行への保険）。 */
 const TAIL_BYTES_CAP = 256 * 1024;
 
+/** `~/.claude` 直下で会話 id をディレクトリ名に持つ保存先（conversation-delete で一緒に消す）。 */
+const CONVERSATION_SCOPED_DIRS = ["file-history", "session-env", "tasks"] as const;
+
+/**
+ * 会話 id（Claude / Codex とも UUID）か。パスへ埋め込む前の唯一の関門なので UUID 以外は通さない
+ * （`..` や `/` を含む値で projects の外を消させない）。
+ */
+export function isConversationId(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
 /** slug（`/`→`-` 置換済み）から cwd を復元する（lossy フォールバック）。 */
 export function cwdFromSlug(slug: string): string {
   const replaced = slug.replaceAll("-", "/");
@@ -87,6 +98,45 @@ export class ClaudeSessionStore {
       }
     }
     return best ?? candidates[0] ?? null;
+  }
+
+  /**
+   * 指定会話をホストから完全に削除する（conversation-delete）。消したパスを返す（無ければ空）。
+   *
+   * Claude Code に会話記録を消す公式手段は無い（`claude rm` はバックグラウンドセッション用）ため、
+   * 会話 id をファイル名に持つものだけを消す:
+   *   - 全 slug の `<id>.jsonl` と同名ディレクトリ（サブエージェント記録・大きなツール結果）
+   *     — duplicate-transcript の残骸 slug も含めて消さないと一覧に残骸が戻る
+   *   - `~/.claude` 直下の会話単位ディレクトリ（`file-history/<id>` 等）。root が `projects`
+   *     という名前のときだけ（テストの一時 root から外へ消しに行かない）
+   * 共有ファイル（`history.jsonl` 等）は書き換えない。呼び出し側は生存プロセスが無いことを
+   * 確かめてから呼ぶ（動いている claude は transcript へ追記し直す）。
+   */
+  deleteConversation(sessionId: string): string[] {
+    if (!isConversationId(sessionId)) throw new Error(`会話 id が不正です: ${sessionId}`);
+    const targets: string[] = [];
+    let slugs: string[] = [];
+    try {
+      slugs = fs.readdirSync(this.root);
+    } catch {
+      // projects が無ければ消す transcript も無い。
+    }
+    for (const slug of slugs) {
+      targets.push(path.join(this.root, slug, `${sessionId}.jsonl`));
+      targets.push(path.join(this.root, slug, sessionId));
+    }
+    if (path.basename(this.root) === "projects") {
+      const claudeHome = path.dirname(this.root);
+      for (const dir of CONVERSATION_SCOPED_DIRS) targets.push(path.join(claudeHome, dir, sessionId));
+    }
+    const removed: string[] = [];
+    for (const target of targets) {
+      if (!fs.existsSync(target)) continue;
+      // symlink はリンク自体だけ消える（rmSync は辿らない）。
+      fs.rmSync(target, { recursive: true, force: true });
+      removed.push(target);
+    }
+    return removed;
   }
 
   /**

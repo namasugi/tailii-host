@@ -1010,6 +1010,31 @@ export class CodexAppServerManager {
     }
   }
 
+  /**
+   * thread を完全に削除する（conversation-delete）。公式 `codex delete` と同じ App Server の
+   * `thread/delete`（rollout と状態 DB の両方から消える）。停止中なら起動してから呼ぶ。
+   * 既に無い thread は成功扱い（冪等）。
+   */
+  async deleteThread(threadId: string): Promise<void> {
+    const normalizedThreadId = threadId.trim();
+    if (normalizedThreadId.length === 0) {
+      throw new Error("Codex thread id must not be empty");
+    }
+    await this.ensureRunning();
+    const connection = await this.connect(this.socketPath);
+    try {
+      await connection.initialize();
+      await connection.request("thread/delete", { threadId: normalizedThreadId });
+    } catch (error) {
+      // 既に無い thread（2 度目の削除・別経路で削除済み・存在しない id）は 0.158 実測で
+      // `no rollout found for thread id …` が返る。削除の目的は達しているので成功扱い（冪等）。
+      if (error instanceof Error && /no rollout found/i.test(error.message)) return;
+      throw error;
+    } finally {
+      connection.close();
+    }
+  }
+
   /** 現在共有中の App Server から Remote Control 状態を読む。 */
   async remoteControlStatus(): Promise<CodexRemoteControlStatus | null> {
     return this.remoteControlRequest("remoteControl/status/read", {}, parseRemoteControlStatus);

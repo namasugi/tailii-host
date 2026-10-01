@@ -13,8 +13,16 @@ import {
   buildLiveSessionIndex,
 } from "../../sessions/liveSessionJoin.js";
 import { annotatePeerSessions, listPeerSessions } from "../../services/peerSessions.js";
+import { defaultClaudeSessionsDir } from "../../sessions/claudeLiveStatus.js";
+import { CONVERSATION_DELETE_MESSAGES, deleteConversation } from "../../sessions/conversationDelete.js";
 import { searchClaudeSessions } from "../../sessions/sessionSearch.js";
-import { engineDiag, subscribeConversation, writeError, type HandlerRegistry } from "../context.js";
+import {
+  engineDiag,
+  subscribeConversation,
+  writeError,
+  type HandlerRegistry,
+} from "../context.js";
+import { killSessionForUser } from "./session.js";
 
 /** chat_send 経路の常時診断ログ（pending 固まり事案の事後解析用）。失敗しても本処理を妨げない。 */
 function chatSendDiag(message: string): void {
@@ -316,6 +324,45 @@ export const conversationHandlers: HandlerRegistry = {
         error: String(error),
       });
     }
+  },
+
+  conversation_delete: (message, ctx) => {
+    const { writer, state } = ctx;
+    const v = state.negotiatedVersion;
+    engineDiag(`conversation_delete id=${message.id} agent=${message.agent} sessionId=${message.sessionId}`);
+    // セッション終了とプロセスの終了待ち（最大 5 秒）を含むので read loop を塞がない
+    // （await すると後続の chat_send / image_fetch_request がその間待たされる）。チャネル断でも
+    // kill から削除までを打ち切らないよう engine の終了待ち（background）へ載せる。
+    ctx.trackBackground((async () => {
+      let error: string | null;
+      try {
+        error = await deleteConversation({
+          sessionId: message.sessionId,
+          agent: message.agent,
+          listSessions: () => ctx.sessionManager.list(),
+          killSession: (name) => killSessionForUser(ctx, name),
+          paneProcessIds: (name) => ctx.sessionManager.agentProcessIds?.(name) ?? Promise.resolve(null),
+          claudeSessionsDir: defaultClaudeSessionsDir(),
+          deleteClaude: ctx.claudeSessionStore === null
+            ? null
+            : (sessionId) => ctx.claudeSessionStore!.deleteConversation(sessionId),
+          deleteCodex: ctx.codexAppServer === null
+            ? null
+            : (threadId) => ctx.codexAppServer!.deleteThread(threadId),
+          log: engineDiag,
+        });
+      } catch (thrown) {
+        // 生の例外（tmux / App Server の英語メッセージ等）は利用者へ出さず診断ログにだけ残す。
+        engineDiag(`conversation_delete 失敗 id=${message.id}: ${String(thrown)}`);
+        error = CONVERSATION_DELETE_MESSAGES.failed;
+      }
+      engineDiag(`conversation_delete_result id=${message.id} ok=${error === null}${error !== null ? ` error=${error}` : ""}`);
+      try {
+        writer.write({ type: "conversation_delete_result", v, id: message.id, ok: error === null, error });
+      } catch (writeFailure) {
+        process.stderr.write(`[tailii-host engine] conversation_delete_result 書込失敗: ${String(writeFailure)}\n`);
+      }
+    })());
   },
 
   session_search_request: (message, ctx) => {

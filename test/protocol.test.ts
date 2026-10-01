@@ -123,6 +123,19 @@ describe("golden roundtrip", () => {
     }
   });
 
+  it("conversation-delete v1 golden 全行が byte-exact でラウンドトリップする", () => {
+    for (const line of goldenLines("conversation-delete-v1.ndjson")) {
+      const decoded = decodeControlMessage(line);
+      expect(encodeControlMessage(decoded)).toBe(line);
+    }
+  });
+
+  it("conversation_delete は agent が claude / codex 以外なら decode で拒否する", () => {
+    expect(() => decodeControlMessage(
+      '{"agent":"gemini","id":"x","sessionId":"11111111-2222-3333-4444-555555555555","type":"conversation_delete","v":1}',
+    )).toThrow();
+  });
+
   it("session-preview-watch v1 golden 全行が byte-exact でラウンドトリップする", () => {
     for (const line of goldenLines("session-preview-watch-v1.ndjson")) {
       const decoded = decodeControlMessage(line);

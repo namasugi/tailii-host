@@ -719,6 +719,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
     case "login_code_send_result":
     case "session_title_set_result":
     case "codex_thread_title_set_result":
+    case "conversation_delete_result":
       return {
         type, v,
         id: requireString(raw, "id"),
@@ -741,6 +742,17 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         threadId: requireString(raw, "threadId"),
         title: requireString(raw, "title"),
       };
+
+    case "conversation_delete": {
+      const agent = requireString(raw, "agent");
+      if (agent !== "claude" && agent !== "codex") throw new ProtocolDecodeError("missing-field", "agent");
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        sessionId: requireString(raw, "sessionId"),
+        agent,
+      };
+    }
 
     case "question_prompt":
       return {

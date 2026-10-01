@@ -63,6 +63,8 @@ export interface SessionBackend {
    */
   captureVisibleAnsi(name: string): Promise<string>;
   agentProcessAlive(name: string): Promise<boolean>;
+  /** pane の前面プロセスの pid 群（herdr のみ。取得不能・非対応は null / 未実装）。 */
+  agentProcessIds?(name: string): Promise<number[] | null>;
   /**
    * 会話カスタムタイトルの端末表示追随（session-title）。herdr はタブラベルへ反映、
    * tmux はセッション名自体が識別子のため no-op。title=null/空はセッション名へ戻す。
@@ -177,6 +179,10 @@ export class CompositeSessionBackend implements SessionBackend {
 
   agentProcessAlive(name: string): Promise<boolean> {
     return this.backendFor(name).agentProcessAlive(name);
+  }
+
+  agentProcessIds(name: string): Promise<number[] | null> {
+    return this.backendFor(name).agentProcessIds?.(name) ?? Promise.resolve(null);
   }
 
   setDisplayTitle(name: string, title: string | null): Promise<void> {
