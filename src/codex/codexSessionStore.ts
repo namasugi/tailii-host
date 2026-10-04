@@ -18,6 +18,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ClaudeSessionInfo } from "../protocol.js";
 import { isInsideBase } from "../shared/paths.js";
+import { noteReadFailure, readFailureCount } from "../shared/readFailures.js";
+import type { ListMemoFile } from "../sessions/listMemoFile.js";
 import type { CodexAppServerManager, CodexAppServerThreadInfo } from "./codexAppServer.js";
 
 /** session_meta 先頭行を読む最大バイト数（先頭 1 行のみ使用。base_instructions を含み得るため広め）。 */
@@ -59,6 +61,24 @@ interface RolloutMemo {
   lastMessage?: string | null;
 }
 
+/** 保存ファイルから読んだ値がメモとして使えるか（壊れた・古い形の値は読み直させる）。 */
+function isRolloutMemo(value: unknown): value is RolloutMemo {
+  if (typeof value !== "object" || value === null) return false;
+  const memo = value as Record<string, unknown>;
+  if (typeof memo["mtimeMs"] !== "number" || typeof memo["size"] !== "number") return false;
+  const isOptionalText = (field: unknown): boolean =>
+    field === undefined || field === null || typeof field === "string";
+  if (!isOptionalText(memo["firstUserMessage"]) || !isOptionalText(memo["lastMessage"])) return false;
+  const meta = memo["meta"];
+  if (meta === undefined || meta === null) return true;
+  if (typeof meta !== "object") return false;
+  const fields = meta as Record<string, unknown>;
+  return (fields["id"] === null || typeof fields["id"] === "string")
+    && (fields["cwd"] === null || typeof fields["cwd"] === "string")
+    && (fields["timestamp"] === null || typeof fields["timestamp"] === "string")
+    && typeof fields["isBackgroundSession"] === "boolean";
+}
+
 interface RolloutEntry {
   file: RolloutFile;
   path: string;
@@ -77,16 +97,27 @@ export class CodexSessionStore {
    * 数秒止めていた。中身が変わらないファイルは前回の結果を使う。列挙に無かったパスは捨てる。
    */
   private readonly rolloutMemo = new Map<string, RolloutMemo>();
+  /** `rolloutMemo` の保存先（engine だけが渡す。次の engine の最初の一覧へ引き継ぐ, session-list-memo-persist）。 */
+  private readonly memoFile: ListMemoFile | null;
+  private memoFileLoaded = false;
+  /** 前回の書き出しから `rolloutMemo` が変わったか。 */
+  private memoDirty = false;
 
   /**
    * @param home codex ホーム（既定 `~/.codex`）。テストは一時 dir を注入する。
    * @param maxSessions 返却上限（既定 200、mtime 新しい順）。
+   * @param options.memoFile 読み取りメモの保存先（engine だけが渡す）。
    */
-  constructor(home?: string, maxSessions: number = DEFAULT_MAX_SESSIONS) {
+  constructor(
+    home?: string,
+    maxSessions: number = DEFAULT_MAX_SESSIONS,
+    options: { memoFile?: ListMemoFile } = {},
+  ) {
     const base = home ?? defaultCodexHome();
     this.sessionsRoot = path.join(base, "sessions");
     this.indexPath = path.join(base, "session_index.jsonl");
     this.maxSessions = maxSessions;
+    this.memoFile = options.memoFile ?? null;
   }
 
   /**
@@ -127,6 +158,7 @@ export class CodexSessionStore {
       if (lastMessage !== null) info.lastMessage = lastMessage;
       result.push(info);
     }
+    this.flushMemoFile();
 
     return result.sort((lhs, rhs) => {
       const l = lhs.updatedAt ?? Number.MIN_SAFE_INTEGER;
@@ -185,6 +217,7 @@ export class CodexSessionStore {
       }
       result.push(info);
     }
+    this.flushMemoFile();
     return result.sort(compareSessions);
   }
 
@@ -241,6 +274,7 @@ export class CodexSessionStore {
 
   /** rollout ファイル（`rollout-*.jsonl`）を再帰列挙する（path + mtimeMs）。 */
   private listRollouts(): RolloutFile[] {
+    this.loadMemoFileOnce();
     const out: RolloutFile[] = [];
     const walk = (dir: string): void => {
       let entries: fs.Dirent[];
@@ -270,9 +304,28 @@ export class CodexSessionStore {
     walk(this.sessionsRoot);
     const seen = new Set(out.map((file) => file.path));
     for (const memoPath of this.rolloutMemo.keys()) {
-      if (!seen.has(memoPath)) this.rolloutMemo.delete(memoPath);
+      if (!seen.has(memoPath)) {
+        this.rolloutMemo.delete(memoPath);
+        this.memoDirty = true;
+      }
     }
     return out;
+  }
+
+  /** 最初の列挙の前に、前の engine が書き出したメモを読み戻す。 */
+  private loadMemoFileOnce(): void {
+    if (this.memoFile === null || this.memoFileLoaded) return;
+    this.memoFileLoaded = true;
+    for (const [filePath, memo] of this.memoFile.load(isRolloutMemo)) {
+      if (!this.rolloutMemo.has(filePath)) this.rolloutMemo.set(filePath, memo);
+    }
+  }
+
+  /** 変わったメモだけ書き出す（中身が同じ一覧のたびに書かない）。 */
+  private flushMemoFile(): void {
+    if (this.memoFile === null || !this.memoDirty) return;
+    this.memoDirty = false;
+    this.memoFile.save(this.rolloutMemo);
   }
 
   /** rollout 1 本分のメモ（中身が変わっていれば作り直す）。読めない（size < 0）ものは覚えない。 */
@@ -280,26 +333,44 @@ export class CodexSessionStore {
     const hit = this.rolloutMemo.get(file.path);
     if (hit !== undefined && hit.mtimeMs === file.mtimeMs && hit.size === file.size) return hit;
     const memo: RolloutMemo = { mtimeMs: file.mtimeMs, size: file.size };
-    if (file.size >= 0) this.rolloutMemo.set(file.path, memo);
+    if (file.size >= 0) {
+      this.rolloutMemo.set(file.path, memo);
+      this.memoDirty = true;
+    }
     return memo;
   }
 
   private sessionMeta(file: RolloutFile): ReturnType<typeof readSessionMeta> {
     const memo = this.memoFor(file);
-    if (memo.meta === undefined) memo.meta = readSessionMeta(file.path);
-    return memo.meta;
+    if (memo.meta !== undefined) return memo.meta;
+    return this.remember(memo, "meta", () => readSessionMeta(file.path));
   }
 
   private firstUserMessage(file: RolloutFile): string | null {
     const memo = this.memoFor(file);
-    if (memo.firstUserMessage === undefined) memo.firstUserMessage = readFirstUserMessage(file.path);
-    return memo.firstUserMessage;
+    if (memo.firstUserMessage !== undefined) return memo.firstUserMessage;
+    return this.remember(memo, "firstUserMessage", () => readFirstUserMessage(file.path));
   }
 
   private lastMessage(file: RolloutFile): string | null {
     const memo = this.memoFor(file);
-    if (memo.lastMessage === undefined) memo.lastMessage = readLastRolloutMessage(file.path);
-    return memo.lastMessage;
+    if (memo.lastMessage !== undefined) return memo.lastMessage;
+    return this.remember(memo, "lastMessage", () => readLastRolloutMessage(file.path));
+  }
+
+  /** 読み取り結果をメモへ入れる。I/O エラーで失敗した劣化結果は覚えない（直ったら次の一覧で読み直す）。 */
+  private remember<K extends "meta" | "firstUserMessage" | "lastMessage">(
+    memo: RolloutMemo,
+    key: K,
+    read: () => NonNullable<RolloutMemo[K]> | null,
+  ): NonNullable<RolloutMemo[K]> | null {
+    const failuresBefore = readFailureCount();
+    const value = read();
+    if (readFailureCount() === failuresBefore) {
+      memo[key] = value as RolloutMemo[K];
+      this.memoDirty = true;
+    }
+    return value;
   }
 }
 
@@ -315,7 +386,8 @@ function readSessionMeta(
   let fd: number;
   try {
     fd = fs.openSync(rolloutPath, "r");
-  } catch {
+  } catch (error) {
+    noteReadFailure(error);
     return null;
   }
   try {
@@ -347,7 +419,8 @@ function readSessionMeta(
       source === "subagent" ||
       (typeof source === "object" && source !== null && "subagent" in source);
     return { id, cwd, timestamp, isBackgroundSession };
-  } catch {
+  } catch (error) {
+    noteReadFailure(error);
     return null;
   } finally {
     try {
@@ -369,7 +442,8 @@ function readFirstUserMessage(rolloutPath: string): string | null {
   let fd: number;
   try {
     fd = fs.openSync(rolloutPath, "r");
-  } catch {
+  } catch (error) {
+    noteReadFailure(error);
     return null;
   }
   try {
@@ -399,7 +473,8 @@ function readFirstUserMessage(rolloutPath: string): string | null {
       }
     }
     return null;
-  } catch {
+  } catch (error) {
+    noteReadFailure(error);
     return null;
   } finally {
     try {
@@ -450,7 +525,8 @@ function readLastRolloutMessage(rolloutPath: string): string | null {
   let fd: number;
   try {
     fd = fs.openSync(rolloutPath, "r");
-  } catch {
+  } catch (error) {
+    noteReadFailure(error);
     return null;
   }
   try {
@@ -482,7 +558,8 @@ function readLastRolloutMessage(rolloutPath: string): string | null {
       if (span >= size) return null;
     }
     return null;
-  } catch {
+  } catch (error) {
+    noteReadFailure(error);
     return null;
   } finally {
     try {

@@ -36,7 +36,8 @@ import {
   type CodexTurnControllerRuntime,
 } from "../codex/codexNativeTurnController.js";
 import { ClaudeSessionStore } from "../sessions/claudeSessionStore.js";
-import { CodexSessionStore } from "../codex/codexSessionStore.js";
+import { CodexSessionStore, defaultCodexHome } from "../codex/codexSessionStore.js";
+import { defaultListMemoDir, ListMemoFile } from "../sessions/listMemoFile.js";
 import { ensureHubDaemon } from "../hub/hubDaemon.js";
 import { connectHubSocket, type HubLink } from "../hub/hubClient.js";
 import type { HubClientMessage, HubServerMessage } from "../hub/hubProtocol.js";
@@ -184,8 +185,15 @@ export async function runEngineCommand(args: string[]): Promise<number> {
   // 「次に起動するセッション」から反映され、既存セッションは元のバックエンドで操作し続ける。
   const backendKind = resolveSessionBackendKind;
   const sessionManager = makeSessionBackend({ store });
-  const claudeSessionStore = new ClaudeSessionStore(claudeProjectsRoot);
-  const codexSessionStore = new CodexSessionStore();
+  // 一覧の読み取りメモはディスクにも置き、接続ごとに立つ次の engine へ引き継ぐ
+  // （接続直後の 1 回目に全件を読み直さない, session-list-memo-persist）。
+  const claudeSessionStore = new ClaudeSessionStore(claudeProjectsRoot, {
+    memoFile: new ListMemoFile(path.join(defaultListMemoDir(), "claude-session-list.json"), claudeProjectsRoot),
+  });
+  const codexHome = defaultCodexHome();
+  const codexSessionStore = new CodexSessionStore(codexHome, undefined, {
+    memoFile: new ListMemoFile(path.join(defaultListMemoDir(), "codex-session-list.json"), codexHome),
+  });
   const sessionListService = new SessionListService(
     sessionManager,
     ownTranscriptActivityProvider({

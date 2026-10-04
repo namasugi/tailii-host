@@ -15,6 +15,8 @@ import { isCompactSummaryRecord } from "../shared/compactSummary.js";
 import { isLocalCommandModelCopyRecord } from "../shared/localCommandModelCopy.js";
 import { narrationText } from "../shared/narration.js";
 import { isInjectedSkillContent } from "../shared/skillInjection.js";
+import { noteReadFailure, readFailureCount } from "../shared/readFailures.js";
+import type { ListMemoFile } from "./listMemoFile.js";
 
 /** タイトル抽出の最大長（先頭 ~60 字）。 */
 const TITLE_MAX_LENGTH = 60;
@@ -57,10 +59,16 @@ export class ClaudeSessionStore {
    * イベントループを止めていた（その間は応答の書き出しも含めて何も進まない）。中身が変わらない
    * ファイルは前回の結果を使い、変わったものだけ読み直す。今回の列挙に無かったパスは捨てる。
    */
-  private readonly infoMemo = new Map<string, { mtimeMs: number; size: number; info: ClaudeSessionInfo }>();
+  private readonly infoMemo = new Map<string, InfoMemoEntry>();
+  /** `infoMemo` の保存先（engine だけが渡す。次の engine の最初の一覧へ引き継ぐ, session-list-memo-persist）。 */
+  private readonly memoFile: ListMemoFile | null;
+  private memoFileLoaded = false;
+  /** 前回の書き出しから `infoMemo` が変わったか。 */
+  private memoDirty = false;
 
-  constructor(root?: string) {
+  constructor(root?: string, options: { memoFile?: ListMemoFile } = {}) {
     this.root = root ?? path.join(os.homedir(), ".claude", "projects");
+    this.memoFile = options.memoFile ?? null;
   }
 
   /**
@@ -146,6 +154,7 @@ export class ClaudeSessionStore {
    * `transcriptPath` と同じ「会話本体を持つ方が正」の判定）。
    */
   list(baseDir?: string): ClaudeSessionInfo[] {
+    this.loadMemoFileOnce();
     let slugs: string[];
     try {
       slugs = fs.readdirSync(this.root);
@@ -183,8 +192,12 @@ export class ClaudeSessionStore {
     }
 
     for (const memoPath of this.infoMemo.keys()) {
-      if (!seenPaths.has(memoPath)) this.infoMemo.delete(memoPath);
+      if (!seenPaths.has(memoPath)) {
+        this.infoMemo.delete(memoPath);
+        this.memoDirty = true;
+      }
     }
+    this.flushMemoFile();
 
     let result: ClaudeSessionInfo[] = [...bySessionId.values()];
     if (baseDir) {
@@ -211,15 +224,63 @@ export class ClaudeSessionStore {
     try {
       stat = fs.statSync(filePath);
     } catch {
-      this.infoMemo.delete(filePath);
+      if (this.infoMemo.delete(filePath)) this.memoDirty = true;
       return deriveInfo(filePath, sessionId, slug);
     }
     const hit = this.infoMemo.get(filePath);
     if (hit !== undefined && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size) return { ...hit.info };
+    const failuresBefore = readFailureCount();
     const info = deriveInfo(filePath, sessionId, slug);
+    if (readFailureCount() !== failuresBefore) {
+      // 読み取りに失敗した劣化結果は覚えない（直ったら次の一覧で読み直す）。
+      if (this.infoMemo.delete(filePath)) this.memoDirty = true;
+      return info;
+    }
     this.infoMemo.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, info: { ...info } });
+    this.memoDirty = true;
     return info;
   }
+
+  /** 最初の一覧の前に、前の engine が書き出したメモを読み戻す。 */
+  private loadMemoFileOnce(): void {
+    if (this.memoFile === null || this.memoFileLoaded) return;
+    this.memoFileLoaded = true;
+    for (const [filePath, entry] of this.memoFile.load(isInfoMemoEntry)) {
+      if (!this.infoMemo.has(filePath)) this.infoMemo.set(filePath, entry);
+    }
+  }
+
+  /** 変わったメモだけ書き出す（中身が同じ一覧のたびに書かない）。 */
+  private flushMemoFile(): void {
+    if (this.memoFile === null || !this.memoDirty) return;
+    this.memoDirty = false;
+    this.memoFile.save(this.infoMemo);
+  }
+}
+
+/** `list()` の 1 ファイル分のメモ。 */
+interface InfoMemoEntry {
+  mtimeMs: number;
+  size: number;
+  info: ClaudeSessionInfo;
+}
+
+/** 保存ファイルから読んだ値がメモとして使えるか（壊れた・古い形の値は読み直させる）。 */
+function isInfoMemoEntry(value: unknown): value is InfoMemoEntry {
+  if (typeof value !== "object" || value === null) return false;
+  const entry = value as Record<string, unknown>;
+  if (typeof entry["mtimeMs"] !== "number" || typeof entry["size"] !== "number") return false;
+  const info = entry["info"];
+  if (typeof info !== "object" || info === null) return false;
+  const fields = info as Record<string, unknown>;
+  const isOptional = (field: unknown, type: "number" | "string" | "boolean"): boolean =>
+    field === undefined || typeof field === type;
+  return typeof fields["sessionId"] === "string"
+    && typeof fields["cwd"] === "string"
+    && typeof fields["title"] === "string"
+    && isOptional(fields["updatedAt"], "number")
+    && isOptional(fields["lastMessage"], "string")
+    && isOptional(fields["hasProviderTitle"], "boolean");
 }
 
 /**
@@ -263,7 +324,8 @@ export function scanTranscriptTail(filePath: string): TranscriptTailSummary {
   let fd: number;
   try {
     fd = fs.openSync(filePath, "r");
-  } catch {
+  } catch (error) {
+    noteReadFailure(error);
     return { updatedAt: null, lastMessage: null };
   }
   let updatedAt: number | null = null;
@@ -319,7 +381,8 @@ export function scanTranscriptTail(filePath: string): TranscriptTailSummary {
       scanTailTitleCheckpoints(fd, size, titles);
     }
     return summary();
-  } catch {
+  } catch (error) {
+    noteReadFailure(error);
     return summary();
   } finally {
     fs.closeSync(fd);
@@ -338,7 +401,8 @@ function scanTailTitleCheckpoints(fd: number, size: number, titles: TranscriptTi
   const buf = Buffer.alloc(span);
   try {
     bytesRead = fs.readSync(fd, buf, 0, span, size - span);
-  } catch {
+  } catch (error) {
+    noteReadFailure(error);
     return;
   }
   const lines = buf.subarray(0, bytesRead).toString("utf8").split("\n");
@@ -435,8 +499,9 @@ export function scanTranscriptHead(filePath: string): TranscriptHeadSummary {
     } finally {
       fs.closeSync(fd);
     }
-  } catch {
+  } catch (error) {
     // 読めないファイルは null/null を返す（呼び出し側がフォールバック）。
+    noteReadFailure(error);
   }
   return { cwd, title, ...titles };
 }
