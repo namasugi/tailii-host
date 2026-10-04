@@ -27,6 +27,7 @@ import {
   type HandlerRegistry,
   type WorktreeResponseFields,
 } from "../context.js";
+import { isNonBlockingQuestionId } from "../../codex/codexAsyncQuestion.js";
 
 export const sessionHandlers: HandlerRegistry = {
   session_list_request: async (message, ctx) => {
@@ -159,7 +160,8 @@ export const sessionHandlers: HandlerRegistry = {
       }
       // 未回答の設問を残して離脱した → 一覧バッジへ引き継ぐ（question-hook-relay）。
       const pending = await ctx.requestHubState(message.name);
-      if (pending !== null) {
+      // turn を止めない設問（Codex の非同期質問）は「あなたの番」のバッジにしない（作業中表示が消える）。
+      if (pending !== null && !isNonBlockingQuestionId(pending.id)) {
         const first = pending.questions[0];
         writer.write({
           type: "remote_pending",

@@ -1,5 +1,6 @@
 // Codex App Server の長寿命 thread 接続、native approval、turn/start を Tailii へ結線する。
 
+import { randomBytes } from "node:crypto";
 import * as net from "node:net";
 import type {
   CodexAppServerApprovalPolicy,
@@ -9,7 +10,7 @@ import type {
   CodexThreadTitleGenerationResult,
   CodexThreadTitleSource,
 } from "./codexAppServer.js";
-import { codexGoalFromWire } from "./codexAppServer.js";
+import { codexGoalFromWire, codexItemTurnId } from "./codexAppServer.js";
 import {
   decodeControlMessage,
   encodeControlMessage,
@@ -40,9 +41,19 @@ import {
   codexGoalClearedNotice,
   codexGoalNotice,
   codexGoalNoticeKey,
+  codexAsyncAnswerFailedNotice,
   codexMcpItemErrorNotice,
   codexSystemNoticeContentKey,
 } from "./codexSystemNotice.js";
+import {
+  CODEX_ASYNC_QUESTION_ID_PREFIX,
+  codexAsyncQuestionItem,
+  codexAsyncQuestionReplyDisplayText,
+  codexAsyncQuestionReplyTargets,
+  codexAsyncQuestionReplyText,
+  type CodexAsyncQuestion,
+  type CodexAsyncQuestionReply,
+} from "./codexAsyncQuestion.js";
 
 const TITLE_GENERATION_MAX_ATTEMPTS = 3;
 const TITLE_GENERATION_RETRY_BASE_MS = 250;
@@ -75,6 +86,8 @@ export interface CodexNativeTurnControllerOptions {
     questions: QuestionPromptQuestion[];
   }) => void;
   onQuestionDismiss?: (session: string, id: string) => void;
+  /** 非同期質問の設問 id に入れる起動ごとの値（テストで固定する。既定は乱数）。 */
+  asyncPromptNonce?: string;
   onChatItem?: (event: { session: string; itemId: string; payload: ControlMessage }) => void;
   /**
    * 目標の現在値（codex-goal）。`thread/goal/updated` / `cleared`、goal RPC の結果、会話オープン時の
@@ -294,6 +307,41 @@ interface PendingUserInput {
 }
 
 /**
+ * 未回答の非同期質問（codex-async-question）。turn は止まらないので App Server の request ではなく、
+ * 回答は通常のユーザー入力（封筒）として steer で送る。会話ごとに未回答分をまとめて 1 枚の設問として
+ * iOS へ出す（hub の未回答の設問は会話に 1 つなので、後から来た質問は前の分と束ねて出し直す）。
+ */
+interface PendingAsyncQuestions {
+  threadId: string;
+  entries: { itemId: string; question: CodexAsyncQuestion }[];
+  /** いま iOS へ出している設問 id。null は未提示（止まる設問の表示中など）。 */
+  promptId: string | null;
+  /**
+   * 提示中の設問に載せた質問（提示した時点の写し）。回答の questionIndex はこの並びを指す。質問の並びが
+   * 1 件でも変われば設問 id を変えるので、hub が受理する回答は必ずこの写しと同じ並びに対するもの。
+   */
+  presentedEntries: { itemId: string; question: CodexAsyncQuestion }[];
+  /** 提示中の内容の照合キー（同じ内容の出し直しを省く）。 */
+  presentedKey: string | null;
+  /** 一度受け取った item（同じ item/completed の再送や、回答済みの質問を出し直さない）。 */
+  seenItemIds: Set<string>;
+  /** 回答の封筒で回答済みと分かった質問（`itemId#index`、旧形式は item id だけ）。 */
+  answeredKeys: Set<string>;
+}
+
+/** 非同期質問 1 件の照合キー（`itemId#index`）。 */
+function asyncEntryKey(entry: { itemId: string; question: CodexAsyncQuestion }): string {
+  return `${entry.itemId}#${entry.question.index}`;
+}
+
+function isAnsweredAsyncEntry(
+  pending: PendingAsyncQuestions,
+  entry: { itemId: string; question: CodexAsyncQuestion },
+): boolean {
+  return pending.answeredKeys.has(entry.itemId) || pending.answeredKeys.has(asyncEntryKey(entry));
+}
+
+/**
  * Tailii から開始した Codex turn を同じ App Server 接続で保持する。
  * server-initiated approval は既存 per-session serve socket へ渡すため、Codex hook は不要。
  */
@@ -330,6 +378,15 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
   /** 開始中（opening）に close を要求された session。開き終わった時点で畳む。 */
   private readonly closeRequestedWhileOpening = new Set<string>();
   private readonly pendingUserInput = new Map<string, PendingUserInput>();
+  /** session → 未回答の非同期質問（codex-async-question）。 */
+  private readonly pendingAsyncQuestions = new Map<string, PendingAsyncQuestions>();
+  /** 非同期質問の設問 id の通し番号（質問の並びが変わるたびに新しい id にする）。 */
+  private asyncPromptSeq = 0;
+  /**
+   * 設問 id に入れる起動ごとの値。通し番号は hub の再起動で 1 に戻るので、これが無いと再起動前に iOS が
+   * 出した回答の自動再送が、復元後の別の並びの設問 id と一致して受理されてしまう。
+   */
+  private readonly asyncPromptNonce: string;
 
   private rememberPlanRestoreSnapshot(session: string, threadId: string, thread: CodexThreadClient): void {
     const snapshot = thread.planRestoreSnapshot;
@@ -346,6 +403,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     this.onTokenUsage = options.onTokenUsage ?? (() => {});
     this.onQuestion = options.onQuestion ?? (() => {});
     this.onQuestionDismiss = options.onQuestionDismiss ?? (() => {});
+    this.asyncPromptNonce = options.asyncPromptNonce ?? randomBytes(3).toString("hex");
     this.onChatItem = options.onChatItem ?? (() => {});
     this.onGoal = options.onGoal ?? (() => {});
     this.onCollaborationMode = options.onCollaborationMode ?? (() => {});
@@ -641,6 +699,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     this.open.delete(session);
     opened.thread.close();
     this.resolvePendingQuestionsForSession(session);
+    this.pendingAsyncQuestions.delete(session);
     this.onProcessing(session, "done");
   }
 
@@ -650,6 +709,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
 
   /** iOS の既存 QuestionPromptSheet 回答を native requestUserInput response へ戻す。 */
   answerQuestion(id: string, answers: QuestionAnswer[]): boolean {
+    if (this.answerAsyncQuestions(id, answers)) return true;
     const pending = this.pendingUserInput.get(id);
     if (pending === undefined) return false;
     this.pendingUserInput.delete(id);
@@ -672,7 +732,208 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     }
     pending.resolve({ answers: wireAnswers });
     this.onQuestionDismiss(pending.session, id);
+    // 止まる設問の間は出せなかった非同期質問を、ここで出し直す。
+    this.presentAsyncQuestions(pending.session);
     return true;
+  }
+
+  /**
+   * 非同期質問の回答（codex-async-question）。iOS の設問シートは提示中の全問の回答を求めるので、
+   * 回答した分を片付け、提示後に届いて答えていない分があれば出し直す。回答は封筒にまとめ、質問した
+   * 実行中の turn へ steer する（新しい turn は始めない: hub の送信キューを迂回して turn/start が競合
+   * しないように。turn が終わっていれば TUI と同じく締め切り扱い）。送信は待たない（hub の回答受付は
+   * 同期の真偽で返す）。届かなかったときは会話へ注記する。
+   */
+  private answerAsyncQuestions(id: string, answers: QuestionAnswer[]): boolean {
+    let session: string | null = null;
+    for (const [candidate, pending] of this.pendingAsyncQuestions) {
+      if (pending.promptId === id) {
+        session = candidate;
+        break;
+      }
+    }
+    if (session === null) return false;
+    const pending = this.pendingAsyncQuestions.get(session)!;
+    const presented = pending.presentedEntries;
+    const replies: CodexAsyncQuestionReply[] = [];
+    for (const answer of answers) {
+      const entry = presented[answer.questionIndex];
+      if (entry === undefined) continue;
+      const selected = answer.selectedOptionIndexes.flatMap((index) => {
+        const label = entry.question.options[index];
+        return label === undefined ? [] : [label];
+      });
+      const other = answer.otherText?.trim() ?? "";
+      const text = [...selected, ...(other.length > 0 ? [other] : [])].join("\n").trim();
+      if (text.length === 0) continue;
+      replies.push({
+        itemId: entry.itemId, index: entry.question.index, title: entry.question.title, answer: text,
+      });
+    }
+    // 提示した分は（回答の有無にかかわらず）終わり。残りがあれば新しい id で出し直す。
+    const presentedKeys = new Set(presented.map(asyncEntryKey));
+    pending.entries = pending.entries.filter((entry) => !presentedKeys.has(asyncEntryKey(entry)));
+    pending.promptId = null;
+    pending.presentedEntries = [];
+    pending.presentedKey = null;
+    this.onQuestionDismiss(session, id);
+    this.presentAsyncQuestions(session);
+    if (replies.length > 0) void this.sendAsyncAnswer(session, pending.threadId, replies);
+    return true;
+  }
+
+  /** 回答の封筒を、質問した実行中の turn へ steer する（turn が替わっていれば締め切り扱い）。 */
+  private async sendAsyncAnswer(session: string, threadId: string, replies: CodexAsyncQuestionReply[]): Promise<void> {
+    const failedItemId = replies[0]!.itemId;
+    const fail = (kind: "expired" | "uncertain", error: unknown): void => {
+      this.log(`Codex 非同期質問の回答送信失敗（${kind}） session=${session}: ${String(error)}`);
+      const notice = codexAsyncAnswerFailedNotice(failedItemId, kind);
+      this.onChatItem({ session, itemId: notice.itemId, payload: notice.payload });
+    };
+    const opened = this.open.get(session);
+    const turnId = opened?.threadId === threadId ? opened.activeTurnId : null;
+    if (opened === undefined || turnId === null) {
+      fail("expired", "no active turn");
+      return;
+    }
+    try {
+      await opened.thread.steerTurn(turnId, codexAsyncQuestionReplyText(replies), null);
+    } catch (error) {
+      // 別の turn が active（質問した turn は終わった）/ steer 不可は締め切り。timeout・切断は届いたか不明。
+      fail(activeTurnIdFromMismatch(error) !== null || isDefinitiveSteerRejection(error) ? "expired" : "uncertain", error);
+    }
+  }
+
+  /** item/completed の agentMessage が非同期質問なら未回答に積む（`present` で iOS へ出す）。 */
+  private ingestAsyncQuestions(
+    session: string,
+    opened: OpenThread,
+    item: Record<string, unknown>,
+    present = true,
+  ): void {
+    const asked = codexAsyncQuestionItem(item);
+    if (asked === null) return;
+    const pending = this.asyncQuestionsFor(session, opened);
+    if (pending.seenItemIds.has(asked.itemId)) return;
+    pending.seenItemIds.add(asked.itemId);
+    for (const question of asked.questions) {
+      const entry = { itemId: asked.itemId, question };
+      if (!isAnsweredAsyncEntry(pending, entry)) pending.entries.push(entry);
+    }
+    if (present) this.presentAsyncQuestions(session);
+  }
+
+  /**
+   * ユーザー入力が回答の封筒なら、指された質問を未回答から外す（他クライアント = TUI / デスクトップの
+   * 回答で Tailii の設問を閉じ、二重回答を防ぐ。TUI の `resolve_answers` と同じ照合。自分の回答の
+   * こだまは既に片付け済みなので何も起きない）。
+   */
+  private resolveAsyncAnswersFromInput(
+    session: string,
+    opened: OpenThread,
+    item: Record<string, unknown>,
+    present = true,
+  ): void {
+    if (item["type"] !== "userMessage") return;
+    const content = item["content"];
+    if (!Array.isArray(content)) return;
+    const text = content.flatMap((part) => {
+      const record = asRecord(part);
+      return record?.["type"] === "text" && typeof record["text"] === "string" ? [record["text"] as string] : [];
+    }).join("\n");
+    const targets = codexAsyncQuestionReplyTargets(text);
+    if (targets === null) return;
+    const pending = this.asyncQuestionsFor(session, opened);
+    for (const target of targets) {
+      // 開き直しの再生で、後から出る質問を回答済みとして覚えておく（item id 全体の旧形式も）。
+      pending.answeredKeys.add(target.index === null ? target.itemId : `${target.itemId}#${target.index}`);
+    }
+    const before = pending.entries.length;
+    pending.entries = pending.entries.filter((entry) => !isAnsweredAsyncEntry(pending, entry));
+    if (pending.entries.length === before) return;
+    // 並びが変わったので新しい id で出し直す（同じ id のまま詰めると、iOS の回答の位置がずれる）。
+    if (present) this.presentAsyncQuestions(session);
+  }
+
+  private asyncQuestionsFor(session: string, opened: OpenThread): PendingAsyncQuestions {
+    let pending = this.pendingAsyncQuestions.get(session);
+    if (pending === undefined || pending.threadId !== opened.threadId) {
+      if (pending?.promptId != null) this.onQuestionDismiss(session, pending.promptId);
+      pending = {
+        threadId: opened.threadId, entries: [], promptId: null, presentedEntries: [], presentedKey: null,
+        seenItemIds: new Set(), answeredKeys: new Set(),
+      };
+      this.pendingAsyncQuestions.set(session, pending);
+    }
+    return pending;
+  }
+
+  /**
+   * 未回答の非同期質問を 1 枚の設問として iOS へ出す（出し直す）。**質問の並びが 1 件でも変われば
+   * 設問 id を変える**（追記・他クライアントの回答で外れた分）: hub は設問 id が一致する回答しか
+   * 受理しないので、回答は必ず提示した並びに対するものになる（同じ id で中身を差し替えると、すれ違った
+   * 回答の位置がずれて別の質問へ届く・追記分が回答済み扱いで消える。iOS のシートも同じ id では
+   * 作り直されず下書きの件数とずれる）。答えかけの下書きは iOS が前の id から先頭の一致分を引き継ぐ。
+   * 答えないと進まない設問（requestUserInput）が出ている間は待つ: hub の未回答の設問は会話に 1 つで、
+   * 上書きすると答えないと進まない設問が消える。
+   */
+  private presentAsyncQuestions(session: string): void {
+    const pending = this.pendingAsyncQuestions.get(session);
+    if (pending === undefined) return;
+    if ([...this.pendingUserInput.values()].some((input) => input.session === session)) return;
+    const previous = pending.promptId;
+    const first = pending.entries[0];
+    if (first === undefined) {
+      pending.promptId = null;
+      pending.presentedEntries = [];
+      pending.presentedKey = null;
+      if (previous !== null) this.onQuestionDismiss(session, previous);
+      return;
+    }
+    const key = pending.entries.map(asyncEntryKey).join("\u0000");
+    if (previous !== null && pending.presentedKey === key) return;
+    this.asyncPromptSeq += 1;
+    const id = `${CODEX_ASYNC_QUESTION_ID_PREFIX}${pending.threadId}:${asyncEntryKey(first)}:` +
+      `${this.asyncPromptNonce}-${this.asyncPromptSeq}`;
+    // 置き換えでは前の id の dismiss を送らない: hub は未回答の設問を新しい id で上書きし、iOS は手元の
+    // 前の設問と見比べて下書きを引き継ぐ（先に dismiss が届くと比べる相手が消える）。
+    pending.promptId = id;
+    pending.presentedEntries = [...pending.entries];
+    pending.presentedKey = key;
+    const questions: QuestionPromptQuestion[] = pending.entries.map(({ question }) => ({
+      header: "Codex の質問",
+      question: question.title,
+      multiSelect: false,
+      options: question.options.map((label) => ({ label, description: "" })),
+    }));
+    this.onQuestion({ session, id, questions });
+  }
+
+  /** turn の終わり / 接続を畳むときに未回答の非同期質問を締め切る（TUI と同じ: 回答はターン中だけ）。 */
+  private expireAsyncQuestions(session: string): void {
+    const pending = this.pendingAsyncQuestions.get(session);
+    if (pending === undefined) return;
+    pending.entries = [];
+    pending.presentedEntries = [];
+    pending.presentedKey = null;
+    const previous = pending.promptId;
+    pending.promptId = null;
+    if (previous !== null) this.onQuestionDismiss(session, previous);
+  }
+
+  /**
+   * 開いた時点で実行中の turn にある未回答の非同期質問を復元する（hub 再起動・開き直しの後も答えられる
+   * ように。TUI の ThreadSnapshot 再生と同じ）。turn 所属が分からない item（旧 App Server）は対象外。
+   */
+  private restoreAsyncQuestions(session: string, opened: OpenThread, items: readonly Record<string, unknown>[]): void {
+    const turnId = opened.activeTurnId;
+    if (turnId === null) return;
+    for (const item of items) {
+      if (codexItemTurnId(item) !== turnId) continue;
+      this.ingestAsyncQuestions(session, opened, item, false);
+      this.resolveAsyncAnswersFromInput(session, opened, item, false);
+    }
+    this.presentAsyncQuestions(session);
   }
 
   /**
@@ -775,6 +1036,8 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     if (opened.activeTurnId !== null) this.onProcessing(session, "active");
     // 目標は rollout に現在値が無い（SQLite 保存）ため、開くたびに App Server から読む（失敗無視）。
     // Hub の close 判定（hasActiveGoal）が open 直後から正しい値を返すよう、ここで待つ。
+    // 実行中 turn の未回答の非同期質問は、待ち（目標の読み取り）の間に届く live の質問より先に並べる。
+    this.restoreAsyncQuestions(session, opened, thread.initialItems ?? []);
     await this.loadGoal(session, opened);
     if (this.open.get(session) !== opened) return opened;
     const restoredSubagents = [];
@@ -912,6 +1175,12 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       if (notification.method === "item/completed" && item !== null && typeof id === "string") {
         const payload = codexItemToChatOutput(item);
         if (payload !== null) this.onChatItem({ session, itemId: id, payload });
+        // 非同期質問（codex-async-question）は本文を最終回答と同じ吹き出しで残しつつ、回答できる設問として出す。
+        // 子 thread（サブエージェント）は質問しない（ツールが root thread だけに登録される）。
+        if (current?.threadId === threadId && current.activeTurnId !== null) {
+          this.ingestAsyncQuestions(session, current, item);
+          this.resolveAsyncAnswersFromInput(session, current, item);
+        }
         const mcpNotice = current?.threadId === threadId ? codexMcpItemErrorNotice(item) : null;
         if (mcpNotice !== null) {
           this.onChatItem({ session, itemId: mcpNotice.itemId, payload: mcpNotice.payload });
@@ -1069,13 +1338,18 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       const reason = typeof params["reason"] === "string" ? params["reason"] : null;
       const cwd = typeof params["cwd"] === "string" ? params["cwd"] : fallbackCwd;
       const isCommand = request.method === "item/commandExecution/requestApproval";
-      const summary = isCommand
-        ? (command ?? reason ?? "コマンドの実行を許可しますか？")
-        : fileChangeSummary(item, reason);
+      // 0.158+ は実行中の端末への入力（stdin）も同じ request で承認を求める（`kind: "writeStdin"`）。
+      // 新しいコマンドの実行と見分けられるよう、ツール名と要約を分ける。
+      const writesStdin = isCommand && params["kind"] === "writeStdin";
+      const summary = writesStdin
+        ? codexWriteStdinApprovalSummary(command, reason)
+        : isCommand
+          ? (command ?? reason ?? "コマンドの実行を許可しますか？")
+          : fileChangeSummary(item, reason);
       const decision = await this.approvalBroker({
         id: `codex:${String(params["threadId"] ?? "thread")}:${String(request.id)}`,
         session,
-        tool: isCommand ? "Bash" : "Edit",
+        tool: writesStdin ? CODEX_WRITE_STDIN_TOOL_LABEL : isCommand ? "Bash" : "Edit",
         summary,
         cwd,
       });
@@ -1106,6 +1380,13 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
             })
           : [],
       }));
+      // 提示中の非同期質問は hub で上書きされる。止まる設問が終わったら出し直す（未提示に戻す）。
+      const asyncPending = this.pendingAsyncQuestions.get(session);
+      if (asyncPending !== undefined) {
+        asyncPending.promptId = null;
+        asyncPending.presentedEntries = [];
+        asyncPending.presentedKey = null;
+      }
       this.onQuestion({ session, id, questions });
       return new Promise((resolve) => {
         this.pendingUserInput.set(id, {
@@ -1129,7 +1410,121 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       pending.resolve({ answers: {} });
       this.onQuestionDismiss(session, id);
     }
+    this.expireAsyncQuestions(session);
   }
+}
+
+/** 実行中の端末への入力（stdin）承認のツール名（iOS の承認カードはツール名をそのまま見出しに出す）。 */
+export const CODEX_WRITE_STDIN_TOOL_LABEL = "端末への入力";
+
+/** stdin 承認の要約に載せる入力の上限（文字）。超えた分は省略を明記する（承認カード・通知に巨大な本文を流さない）。 */
+const WRITE_STDIN_INPUT_DISPLAY_LIMIT = 2000;
+
+/**
+ * stdin 承認（`kind: "writeStdin"`）の要約。App Server は `command` に
+ * `shlex_join(["write_stdin", "--session-id", <端末 id>, <入力>])` を入れる（codex-rs core の
+ * tools/approvals.rs → app-server bespoke_event_handling.rs）。読めれば端末 id と入力を、読めなければ
+ * 生の command を出す。見た目を偽装できる文字（制御文字・C1・書式文字＝bidi 制御 / ゼロ幅・行区切り）は
+ * `\u{…}` で見せる（TUI の `Input: {input:?}` = Rust Debug 相当。承認カードで中身を取り違えさせない）。
+ */
+export function codexWriteStdinApprovalSummary(command: string | null, reason: string | null): string {
+  const words = command === null ? null : splitShellWords(command);
+  const lines: string[] = [];
+  if (words !== null && words[0] === "write_stdin" && words[1] === "--session-id" && words.length >= 4) {
+    lines.push(`実行中の端末 ${escapeInvisible(words[2]!)} へ入力を送ります`);
+    const input = words.slice(3).join(" ");
+    const shown = [...input];
+    const clipped = shown.length > WRITE_STDIN_INPUT_DISPLAY_LIMIT;
+    const body = clipped ? shown.slice(0, WRITE_STDIN_INPUT_DISPLAY_LIMIT).join("") : input;
+    lines.push(`入力: "${escapeInvisible(body, true)}"${clipped ? `…（残り ${shown.length - WRITE_STDIN_INPUT_DISPLAY_LIMIT} 文字を省略）` : ""}`);
+  } else {
+    lines.push("実行中の端末へ入力を送ります");
+    if (command !== null) lines.push(escapeInvisible(command));
+  }
+  if (reason !== null && reason.trim().length > 0) lines.push(`理由: ${escapeInvisible(reason.trim())}`);
+  return lines.join("\n");
+}
+
+/**
+ * 見た目を偽装できる文字を `\u{…}` / `\n` 等で見せる。`quoted` は `"` と `\\` もエスケープする（引用符で
+ * 囲んで見せる入力用）。対象: C0 / DEL / C1 制御文字、書式文字（\p{Cf}: bidi 制御・ゼロ幅・BOM 等）、
+ * 行区切り U+2028 / U+2029。
+ */
+function escapeInvisible(text: string, quoted = false): string {
+  let result = "";
+  for (const char of text) {
+    const code = char.codePointAt(0)!;
+    if (char === "\n") result += "\\n";
+    else if (char === "\r") result += "\\r";
+    else if (char === "\t") result += "\\t";
+    else if (quoted && (char === "\"" || char === "\\")) result += `\\${char}`;
+    else if (code < 0x20 || (code >= 0x7f && code <= 0x9f) || code === 0x2028 || code === 0x2029 || /\p{Cf}/u.test(char)) {
+      result += `\\u{${code.toString(16)}}`;
+    } else {
+      result += char;
+    }
+  }
+  return result;
+}
+
+/**
+ * POSIX shell の単語分割（クォートと `\` だけ。展開はしない）。閉じていないクォートは null。
+ * `shlex_join` の出力（単語をシングル / ダブルクォートで包む）を元の単語列へ戻すのに使う。
+ */
+export function splitShellWords(text: string): string[] | null {
+  const words: string[] = [];
+  let current = "";
+  let inWord = false;
+  let index = 0;
+  while (index < text.length) {
+    const char = text[index]!;
+    if (char === " " || char === "\t" || char === "\n") {
+      if (inWord) words.push(current);
+      current = "";
+      inWord = false;
+      index += 1;
+      continue;
+    }
+    inWord = true;
+    if (char === "'") {
+      const end = text.indexOf("'", index + 1);
+      if (end < 0) return null;
+      current += text.slice(index + 1, end);
+      index = end + 1;
+      continue;
+    }
+    if (char === "\"") {
+      index += 1;
+      let closed = false;
+      while (index < text.length) {
+        const inner = text[index]!;
+        if (inner === "\"") {
+          closed = true;
+          index += 1;
+          break;
+        }
+        if (inner === "\\" && index + 1 < text.length && "$`\"\\\n".includes(text[index + 1]!)) {
+          if (text[index + 1] !== "\n") current += text[index + 1];
+          index += 2;
+          continue;
+        }
+        current += inner;
+        index += 1;
+      }
+      if (!closed) return null;
+      continue;
+    }
+    if (char === "\\") {
+      if (index + 1 >= text.length) return null;
+      if (text[index + 1] !== "\n") current += text[index + 1];
+      index += 2;
+      continue;
+    }
+    current += char;
+    index += 1;
+  }
+  if (inWord) words.push(current);
+  return words;
 }
 
 /** rollout の event_msg(user_message / agent_message) と同じ表示範囲へ写像する。 */
@@ -1147,12 +1542,14 @@ export function codexItemToChatOutput(item: Record<string, unknown>): ControlMes
         : [];
     }).join("\n");
     if (text.length === 0) return null;
+    // 非同期質問への回答（封筒）は `> 質問\n\n回答` で見せる（rollout 経路と同じ写像）。
+    const displayText = codexAsyncQuestionReplyDisplayText(text) ?? text;
     // iOS の楽観バブルと rollout の client_id に合わせ、添付サムネのアンカーも一致させる。
     const clientId = item["clientId"];
     const streamId = typeof clientId === "string" && clientId.length > 0
       ? `codex-user-${clientId}` : `codex-item-${id}`;
     return { type: "chat_output", v: PROTOCOL_V1, streamId,
-      role: "user", text, eof: true };
+      role: "user", text: displayText, eof: true };
   }
   if (type === "agentMessage") {
     const phase = item["phase"];

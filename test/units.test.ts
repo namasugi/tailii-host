@@ -50,6 +50,9 @@ import {
   ChatInjectionRejectedError,
   classifySubmitFrame,
   loginCodeScreenState,
+  loginStorageFailure,
+  loginStorageFailureMessage,
+  LoginCodeError,
   screenHasLoginCodePrompt,
   screenInLoginFlow,
   submitLoginCode,
@@ -2746,6 +2749,138 @@ describe("login-code 成功後の継続待ち（Login successful. Press Enter to
     await submitLoginCode("AbC#123", ops);
     // コード確定の Enter + 継続待ちを閉じる Enter。
     expect(sent).toEqual(["literal:AbC#123", "enter", "enter"]);
+  });
+});
+
+describe("login-code 保存失敗（2.1.288+ storage_failed）", () => {
+  // 2.1.289 のバイナリから組み立てを写したフレーム（Dialog タイトル `Login` + 本文 + `Esc to cancel`）。
+  // 状態行は端末幅で折り返す（狭い pane を想定して途中で割る）。
+  const storageFrame = (status: string[], enterLine: string) => [
+    "❯ /login",
+    "──────",
+    "  Login",
+    "",
+    ...status.map((line) => `  ${line}`),
+    "",
+    "  To avoid having to log in again each session:",
+    "    • fix access to the macOS Keychain, then run /login again",
+    "    • or run claude setup-token and set CLAUDE_CODE_OAUTH_TOKEN",
+    "",
+    `  ${enterLine}`,
+    "",
+    "  Esc to cancel",
+  ].join("\n");
+  const sessionOnly = storageFrame([
+    "Logged in for now, but your new credentials could not be",
+    "saved to the macOS Keychain.",
+    "This login may expire mid-session and will not persist after you exit Claude Code.",
+  ], "Press Enter to continue…");
+  const previousKept = storageFrame([
+    "Sign-in completed in the browser, but your new credentials could not be saved to the macOS Keychain —",
+    "a previous login's credentials are still in place and will be used instead.",
+    "(Your new sign-in did not replace the existing credentials.)",
+  ], "Press Enter to retry. (esc to continue without logging in)");
+  const notLoggedIn = storageFrame([
+    "Sign-in completed in the browser, but your credentials could not be saved to the macOS Keychain — you",
+    "are not logged in.",
+    "(No previous login on this machine is usable right now either.)",
+  ], "Press Enter to retry.");
+
+  test("3 種類を折り返しを跨いで見分け、通常の retry / continue は保存失敗にしない", () => {
+    expect(loginStorageFailure(sessionOnly)).toBe("session_only");
+    expect(loginStorageFailure(previousKept)).toBe("previous_kept");
+    expect(loginStorageFailure(notLoggedIn)).toBe("not_logged_in");
+    expect(loginCodeScreenState(sessionOnly)).toBe("continue");
+    expect(loginCodeScreenState(previousKept)).toBe("retry");
+    expect(loginCodeScreenState(notLoggedIn)).toBe("retry");
+    expect(loginStorageFailure("  Login\n  OAuth error: Request failed with status code 400\n  Press Enter to retry.\n  Esc to cancel"))
+      .toBeNull();
+    expect(loginStorageFailure("  Login\n  Login successful. Press Enter to continue…")).toBeNull();
+    // 確認できなかった（transient）変種も今回だけログイン済み。
+    const transient = sessionOnly.replace(
+      "Logged in for now, but your new credentials could not be",
+      "Logged in for now, but Claude Code couldn't confirm your new credentials were",
+    );
+    expect(loginStorageFailure(transient)).toBe("session_only");
+    // 狭い pane で状態行が何行にも折り返しても、retry の門番と保存失敗の判定が効く。
+    const narrow = storageFrame([
+      "Sign-in completed in the", "browser, but your", "credentials could not be", "saved to the macOS",
+      "Keychain — you are not", "logged in.", "(No previous login on", "this machine is usable", "right now either.)",
+    ], "Press Enter to retry.");
+    expect(loginCodeScreenState(narrow)).toBe("retry");
+    expect(screenInLoginFlow(narrow)).toBe(true);
+    expect(loginStorageFailure(narrow)).toBe("not_logged_in");
+  });
+
+  test("ダイアログの上の会話本文（保存失敗の文言の引用）では、正常なログイン / OAuth の失敗を保存失敗にしない", async () => {
+    const quoted = [
+      "> Logged in for now, but your new credentials could not be saved to the macOS Keychain. What should I do?",
+      "⏺ キーチェーンのロックを解除してから /login をやり直してください。",
+      "> Sign-in completed in the browser, but your credentials could not be saved to the macOS Keychain — you are not logged in.",
+      "⏺ 同じ対処です。",
+      "❯ /login",
+      "──────",
+    ];
+    const success = [...quoted, "  Login", "  Logged in as n***@example.com", "  Login successful. Press Enter to continue…"].join("\n");
+    expect(loginCodeScreenState(success)).toBe("continue");
+    expect(loginStorageFailure(success)).toBeNull();
+    const oauthRetry = [...quoted, "  Login", "  OAuth error: Request failed with status code 400", "  Press Enter to retry.", "  Esc to cancel"].join("\n");
+    expect(loginCodeScreenState(oauthRetry)).toBe("retry");
+    expect(loginStorageFailure(oauthRetry)).toBeNull();
+    // 本文に保存失敗のダイアログ全体（`Login` タイトル・Enter 行つき）が貼られていても、本物の成功行を
+    // Enter 行として読むので引用を読まない。
+    const pastedDialog = [
+      "> この画面が出ました:", "  Login",
+      "  Logged in for now, but your new credentials could not be saved to the macOS Keychain.",
+      "  Press Enter to continue…", "⏺ キーチェーンを解錠してから /login してください。", "❯ /login", "──────",
+      "  Login", "  Logged in as n***@example.com", "  Login successful. Press Enter to continue…",
+    ].join("\n");
+    expect(loginCodeScreenState(pastedDialog)).toBe("continue");
+    expect(loginStorageFailure(pastedDialog)).toBeNull();
+    // submitLoginCode も通常どおり: 成功は継続待ちを閉じ、OAuth の失敗は理由つきの拒否。
+    const ok = opsShowing(success);
+    await submitLoginCode("AbC#123", ok.ops).catch(() => undefined);
+    expect(ok.sent).toEqual(["literal:AbC#123", "enter", "enter", "enter"]);
+    const rejected = opsShowing(oauthRetry);
+    await expect(submitLoginCode("AbC#123", rejected.ops)).rejects.toThrow(/status code 400/);
+  });
+
+  /** コード確定の Enter の後、`after` の画面を出し続ける。 */
+  function opsShowing(after: string) {
+    const promptScreen = "  Login\nhttps://claude.com/cai/oauth/authorize?code=true\n  Paste code here if prompted >\n  Esc to cancel";
+    const sent: string[] = [];
+    let clock = 0;
+    let typed = "";
+    let entered = false;
+    const ops = {
+      capture: async () => {
+        if (entered) return after;
+        return typed.length > 0
+          ? promptScreen.replace("  Paste code here if prompted >", `  Paste code here if prompted > ****${typed.slice(-6)}`)
+          : promptScreen;
+      },
+      sendLiteral: async (text: string) => { typed += text; sent.push(`literal:${text}`); },
+      sendEnter: async () => { sent.push("enter"); entered = true; },
+      delayMs: 0, pollMs: 0, settleMs: 1_000,
+      now: () => { clock += 400; return clock; },
+    };
+    return { ops, sent };
+  }
+
+  test("submitLoginCode: 保存失敗は「コードが拒否された」と言わず、Enter も追加で押さない", async () => {
+    for (const [screen, failure] of [
+      [sessionOnly, "session_only"],
+      [previousKept, "previous_kept"],
+      [notLoggedIn, "not_logged_in"],
+    ] as const) {
+      const { ops, sent } = opsShowing(screen);
+      const error = await submitLoginCode("AbC#123", ops).then(() => null, (caught: unknown) => caught);
+      expect(error).toBeInstanceOf(LoginCodeError);
+      expect((error as Error).message).toBe(loginStorageFailureMessage(failure));
+      expect((error as Error).message).not.toMatch(/拒否/);
+      // コード確定の Enter だけ（継続待ちを閉じる / retry を押す Enter は撃たない）。
+      expect(sent).toEqual(["literal:AbC#123", "enter"]);
+    }
   });
 });
 

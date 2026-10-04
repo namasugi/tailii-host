@@ -1086,6 +1086,79 @@ export function loginCodeScreenState(screen: string): LoginCodeScreenState {
 }
 
 /**
+ * `/login` でブラウザのサインインは済んだが、ログイン情報を保存できなかった画面（2.1.288+ の
+ * `storage_failed`。キーチェーンがロックされた SSH 越しなどで起きる）の種別。
+ * - `session_only`: 今回の起動中だけログイン済み（`Logged in for now, but …`。下に `Press Enter to continue…`）
+ * - `previous_kept`: 以前のログインのまま（`… a previous login's credentials are still in place …`。`Press Enter to retry.`）
+ * - `not_logged_in`: ログインできていない（`… you are not logged in.`。`Press Enter to retry.`）
+ */
+export type LoginStorageFailure = "session_only" | "previous_kept" | "not_logged_in";
+
+/**
+ * 保存失敗の文言を探す範囲の上限: Enter 行から `Login` タイトルまでの行数。状態行（最大 2 文）と対処案内
+ * 3 行が狭い pane で折り返しても届く幅（iOS `ClaudeLoginPromptParser.storageTitleReach` と同値）。
+ */
+const LOGIN_STORAGE_TITLE_REACH = 48;
+
+/**
+ * 画面が `/login` の保存失敗画面か（TESTABLE。iOS `ClaudeLoginPromptParser.storageFailure` と同値）。
+ * 読むのは**生きたダイアログの中だけ** = 最後の Enter 行（`Press Enter to retry` / `Press Enter to continue` /
+ * `Login successful. Press Enter to continue…`）
+ * から上へ、最も近い `Login` タイトル行までの間。ダイアログの上に見えている会話本文（保存失敗の文言を
+ * 利用者が貼って相談した引用など）を読むと、正常なログインや OAuth の失敗を保存失敗と取り違える。
+ * Ink は端末幅で折り返すので、範囲の行を空白 1 つで繋いでから文言を探す。
+ * 2.1.289 の文言（バイナリ実読。`<保存先>` は `the macOS Keychain` / `the credentials file` 等）:
+ * - `Logged in for now, but your new credentials could not be saved to <保存先>.`
+ * - `Logged in for now, but Claude Code couldn't confirm your new credentials were saved to <保存先>.`
+ * - `Sign-in completed in the browser, but your new credentials could not be saved to <保存先> — a previous login's credentials are still in place and will be used instead.`
+ * - `Sign-in completed in the browser, but your credentials could not be saved to <保存先> — you are not logged in.`
+ * 呼び出し側は retry / continue の画面と判定済みのときだけ使う。
+ */
+export function loginStorageFailure(screen: string): LoginStorageFailure | null {
+  const lines = screen.split("\n").map((line) => stripSgr(line).trim());
+  let marker = -1;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const text = lines[index]!.toLowerCase();
+    // 成功画面の `Login successful. Press Enter to continue…` も Enter 行（iOS `isContinueLine` と同値）。
+    // これを落とすと、本文に貼られたダイアログの Enter 行を拾って引用内の `Login` から読んでしまう。
+    if (text.startsWith("press enter to retry") || text.startsWith("press enter to continue")
+      || (text.includes("login successful") && text.includes(LOGIN_CONTINUE_MARKER))) {
+      marker = index;
+      break;
+    }
+  }
+  if (marker < 0) return null;
+  let title = -1;
+  for (let index = marker - 1; index >= Math.max(0, marker - LOGIN_STORAGE_TITLE_REACH); index -= 1) {
+    if (lines[index]!.toLowerCase() === LOGIN_TITLE_LINE) {
+      title = index;
+      break;
+    }
+  }
+  if (title < 0) return null;
+  const joined = lines.slice(title + 1, marker).filter((line) => line.length > 0)
+    .join(" ").replace(/\s+/g, " ").toLowerCase();
+  const failed = joined.includes("credentials could not be saved to")
+    || joined.includes("confirm your new credentials were saved to");
+  if (!failed) return null;
+  if (joined.includes("logged in for now")) return "session_only";
+  if (joined.includes("previous login's credentials are still in place")) return "previous_kept";
+  return "not_logged_in";
+}
+
+/** 保存失敗の種別ごとの利用者向け文言（login_code_send_result.error にそのまま載る）。 */
+export function loginStorageFailureMessage(failure: LoginStorageFailure): string {
+  switch (failure) {
+    case "session_only":
+      return "ログインはできましたが、ログイン情報をホストに保存できませんでした（この Claude を終了すると、もう一度ログインが必要です）";
+    case "previous_kept":
+      return "サインインは完了しましたが、ログイン情報をホストに保存できなかったため、以前のログインのままです";
+    case "not_logged_in":
+      return "サインインは完了しましたが、ログイン情報をホストに保存できず、ログインできていません";
+  }
+}
+
+/**
  * retry 画面の理由行。`OAuth error` で始まる行（末尾窓内の最後のもの）だけを採用する。
  * 直上行フォールバックは持たない（コードをエコーしたコード欄の行が理由として result / ログへ
  * 漏れる）。念のためコード欄マーカーを含む行は採用しない。
@@ -1233,6 +1306,13 @@ export async function submitLoginCode(code: string, ops: LoginCodeSubmitOps): Pr
       await sleep(ops.pollMs);
       const screen = await ops.capture();
       state = screen === null ? "pending" : loginCodeScreenState(screen);
+      // 保存失敗（2.1.288+）はコードの拒否ではない。retry / continue どちらの形でも Enter は押さず、
+      // 事情を返して利用者に委ねる（continue の形は「今回だけログイン済み」で、Enter で閉じると
+      // 警告が画面から消える。retry の形で Enter を押すとサインインからやり直しになる）。
+      const storageFailure = screen !== null && (state === "retry" || state === "continue")
+        ? loginStorageFailure(screen)
+        : null;
+      if (storageFailure !== null) throw new LoginCodeError(loginStorageFailureMessage(storageFailure));
       if (state === "retry") {
         const reason = screen === null ? null : loginCodeErrorLine(screen);
         throw new LoginCodeError(

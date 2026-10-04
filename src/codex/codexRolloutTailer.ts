@@ -28,6 +28,7 @@ import {
   codexGoalNoticeKey,
   codexRolloutSystemNotice,
 } from "./codexSystemNotice.js";
+import { codexAsyncQuestionItem, codexAsyncQuestionReplyDisplayText } from "./codexAsyncQuestion.js";
 import { codexGoalFromWire } from "./codexAppServer.js";
 import {
   codexPlanChatOutput,
@@ -629,15 +630,36 @@ export function* emitLine(line: Buffer, state: TailState): Generator<ControlMess
       if (plan !== null) yield plan;
       return;
     }
+    if (item?.["type"] === "AgentMessage") {
+      // 非同期質問（codex-async-question）は `event_msg/agent_message` に出ず、ここにだけ残る。live の
+      // item/completed(agentMessage) と同じ streamId / 本文で出す（回答カードは live だけ。履歴では締め切り済み）。
+      if (codexAsyncQuestionItem(item) === null) return;
+      const id = item["id"] as string;
+      const content = item["content"];
+      if (!Array.isArray(content)) return;
+      const text = content.flatMap((part) => {
+        const record = asRecord(part);
+        return record?.["type"] === "Text" && typeof record["text"] === "string" ? [record["text"]] : [];
+      }).join("\n");
+      if (text.length === 0) return;
+      yield {
+        type: "chat_output", v: PROTOCOL_V1,
+        streamId: `codex-item-${id}`,
+        role: "assistant", text, eof: true,
+      };
+      return;
+    }
     if (item?.["type"] !== "UserMessage") return;
     const id = item["id"];
     const content = item["content"];
     if (typeof id !== "string" || id.length === 0 || !Array.isArray(content)) return;
-    const text = content.flatMap((part) => {
+    const rawText = content.flatMap((part) => {
       const record = asRecord(part);
       return record?.["type"] === "text" && typeof record["text"] === "string" ? [record["text"]] : [];
     }).join("\n");
-    if (text.length === 0) return;
+    if (rawText.length === 0) return;
+    // 非同期質問への回答（封筒）は `> 質問\n\n回答` で見せる（live の codexItemToChatOutput と同じ写像）。
+    const text = codexAsyncQuestionReplyDisplayText(rawText) ?? rawText;
     state.seq += 1;
     const clientId = item["client_id"];
     const streamId = typeof clientId === "string" && clientId.length > 0
@@ -702,7 +724,7 @@ export function* emitLine(line: Buffer, state: TailState): Generator<ControlMess
       v: PROTOCOL_V1,
       streamId,
       role: "user",
-      text: message,
+      text: codexAsyncQuestionReplyDisplayText(message) ?? message,
       eof: true,
     };
     return;

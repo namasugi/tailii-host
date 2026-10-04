@@ -252,6 +252,20 @@ function mcpErrorText(serverValue: unknown, toolValue: unknown, detailValue: str
   return `❌ MCP「${server} / ${tool}」エラー: ${detail}`;
 }
 
+/**
+ * 非同期質問（codex-async-question）への回答を Codex へ届けられなかったときの注記（live 専用）。
+ * - `expired`: 質問した turn が終わっていた（TUI と同じく締め切り。新しい turn は始めない）
+ * - `uncertain`: 送ったが受理を確かめられなかった（timeout・切断。届いている可能性がある）
+ * identity に質問の item id と種別を入れ、同じ質問への同じ失敗は 1 行にまとめる。
+ */
+export function codexAsyncAnswerFailedNotice(itemId: string, kind: "expired" | "uncertain"): CodexSystemNotice {
+  const identity = `async-answer-failed:${kind}:${itemId}`;
+  const text = kind === "expired"
+    ? "⚠️ 質問した作業が終わっていたため、回答は Codex へ届きませんでした（必要ならメッセージで伝えてください）"
+    : "⚠️ 質問への回答が Codex へ届いたか確認できませんでした（会話に回答が出ていなければメッセージで伝えてください）";
+  return notice(identity, identity, text);
+}
+
 function notice(itemId: string, identity: string, text: string): CodexSystemNotice {
   const digest = createHash("sha256").update(identity).digest("hex").slice(0, 24);
   return {

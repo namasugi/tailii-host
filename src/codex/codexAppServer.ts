@@ -1979,6 +1979,8 @@ async function listThreadItems(
           (typeof record?.["type"] === "string" ? record : null);
         if (item === null) continue;
         accepted += 1;
+        // 0.153.4+ の `{turnId, item}` 封筒の turn 所属を残す（非同期質問の復元が実行中 turn の item を選ぶ）。
+        if (item !== record) tagCodexItemTurn(item, record?.["turnId"]);
         if (rememberId(seen, item["id"])) items.push(item);
       }
       if (data.length > 0 && accepted === 0) {
@@ -2112,10 +2114,28 @@ function itemsOfTurns(turns: readonly Record<string, unknown>[]): Record<string,
     if (!Array.isArray(items)) continue;
     for (const item of items) {
       const record = objectRecord(item);
-      if (record !== null) result.push(record);
+      if (record === null) continue;
+      tagCodexItemTurn(record, turn["id"]);
+      result.push(record);
     }
   }
   return result;
+}
+
+/**
+ * 履歴 item の turn 所属。wire / JSON には出ない（列挙されない symbol キー）ので、item を そのまま
+ * 他所へ流しても形は変わらない。turn 所属が分からない item（旧形の items/list）は null。
+ */
+const CODEX_ITEM_TURN_ID = Symbol("codexItemTurnId");
+
+export function tagCodexItemTurn(item: Record<string, unknown>, turnId: unknown): void {
+  if (typeof turnId !== "string" || turnId.length === 0) return;
+  Object.defineProperty(item, CODEX_ITEM_TURN_ID, { value: turnId, enumerable: false, configurable: true });
+}
+
+export function codexItemTurnId(item: Record<string, unknown>): string | null {
+  const value = (item as Record<symbol, unknown>)[CODEX_ITEM_TURN_ID];
+  return typeof value === "string" ? value : null;
 }
 
 /** turn 一覧から、別 client が開始した実行中 turn を復元する（末尾から最初の inProgress）。 */

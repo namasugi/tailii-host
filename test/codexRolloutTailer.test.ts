@@ -624,6 +624,44 @@ describe("CodexRolloutTailer plan mode / goal（codex-plan-mode / codex-goal）"
     expect(chats.filter((c) => c.streamId === COLLABORATION_MODE_STREAM_ID)).toEqual([]);
   });
 
+  test("非同期質問（item_completed/AgentMessage delivery:async）を live と同じ streamId で出し、回答の封筒は `> 質問` で出す", async () => {
+    const root = makeTempDir("codex-async-q");
+    const cwd = makeTempDir("codex-async-q-cwd");
+    const envelope = '<send_user_message_question_reply>\n[{"answer":"A","question":"どちら？","questionItemId":"[\\"request_user_input_async\\",\\"call_q\\",0]"}]\n</send_user_message_question_reply>';
+    writeRollout(root, "2026/10/04", "r.jsonl", cwd, [
+      // 実機 rollout（2026-09-27）の形。event_msg/agent_message には出ない。
+      JSON.stringify({ type: "response_item", payload: {
+        type: "function_call", name: "request_user_input_async", call_id: "call_q",
+        arguments: '{"questions":[{"title":"どちら？","options":["A","B"]}]}',
+      } }),
+      JSON.stringify({ type: "event_msg", payload: {
+        type: "item_completed", turn_id: "turn-1", item: {
+          type: "AgentMessage", id: "call_q", content: [{ type: "Text", text: "どちら？\n- A\n- B" }],
+          phase: "final_answer", delivery: "async", questions: [{ title: "どちら？", options: ["A", "B"] }],
+        },
+      } }),
+      JSON.stringify({ type: "event_msg", payload: {
+        type: "item_completed", turn_id: "turn-1", item: {
+          type: "UserMessage", id: "u-1", content: [{ type: "text", text: envelope }],
+        },
+      } }),
+      // 非同期でない AgentMessage は従来どおり（agent_message / response_item 側で出す）。
+      JSON.stringify({ type: "event_msg", payload: {
+        type: "item_completed", turn_id: "turn-1", item: {
+          type: "AgentMessage", id: "msg-x", content: [{ type: "Text", text: "普通" }], phase: "final_answer",
+        },
+      } }),
+    ]);
+    const tailer = new CodexRolloutTailer({ sessionsRoot: root, tailDeadlineMs: 0 });
+    const chats = (await collect(tailer, cwd))
+      .filter((m): m is Extract<ControlMessage, { type: "chat_output" }> => m.type === "chat_output")
+      .filter((c) => c.role === "assistant" || c.role === "user");
+    expect(chats).toEqual([
+      { type: "chat_output", v: 1, streamId: "codex-item-call_q", role: "assistant", text: "どちら？\n- A\n- B", eof: true },
+      { type: "chat_output", v: 1, streamId: "codex-item-u-1", role: "user", text: "> どちら？\n\nA", eof: true },
+    ]);
+  });
+
   test("thread_goal_updated は状態 / 内容が変わったときだけ 🎯 注記にし、解除も 1 回だけ出す", async () => {
     const root = makeTempDir("codex-goal");
     const cwd = makeTempDir("codex-goal-cwd");

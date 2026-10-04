@@ -58,6 +58,7 @@ import {
 } from "../codex/codexRolloutTailer.js";
 import type { SessionMeta } from "../sessions/sessionMetadataStore.js";
 import { claudeTranscriptPathFor } from "../sessions/transcriptPath.js";
+import { isNonBlockingQuestionId } from "../codex/codexAsyncQuestion.js";
 
 export interface HubTail {
   open(cwd: string, preferredSessionId: string | null, newerThanMs?: number | null, agent?: ChatAgent): void;
@@ -2833,7 +2834,9 @@ export class SessionHub {
         // 再起動後の中断マーカー照合用に開始時刻を残す（bump は保持する）。
         ...(actor.processingSinceMs !== null ? { sinceMs: actor.processingSinceMs } : {}) });
     } catch (error) { this.options.log?.(`heartbeat 書込失敗: ${String(error)}`); }
-    if (state === "done" && actor.pendingQuestion !== null) {
+    // turn を止めない設問（Codex の非同期質問）は turn controller が turn の終わりに締め切る。処理中表示の
+    // done（steer の不確定失敗などでも来る）で消すと、controller は提示済みのままで出し直さない。
+    if (state === "done" && actor.pendingQuestion !== null && !isNonBlockingQuestionId(actor.pendingQuestion.id)) {
       const id = actor.pendingQuestion.id;
       this.setPendingQuestion(session, actor, null);
       this.broadcast({ type: "question_event", session, event: "dismiss", id });

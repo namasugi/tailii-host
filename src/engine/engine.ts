@@ -90,6 +90,7 @@ import {
   type ModeTiming,
 } from "./context.js";
 import { ENGINE_HANDLERS } from "./handlers/index.js";
+import { isNonBlockingQuestionId } from "../codex/codexAsyncQuestion.js";
 
 // MARK: - エントリポイント（cli から呼ばれる）
 
@@ -554,6 +555,10 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
       }
       const questions = message.questions ?? [];
       const first = questions[0];
+      // Codex の非同期質問（id 接頭辞 `codex-async:`）は turn を止めない。別会話の一覧バッジ
+      // （remote_pending kind=question = 「あなたの番」）にすると作業中表示が消えるので出さない。
+      // 会話を開けば hub_state の再配信で設問が届く。
+      if (message.session !== activeChatSession.name && isNonBlockingQuestionId(message.id)) return;
       const wire: ControlMessage =
         message.session === activeChatSession.name
           ? { type: "question_prompt", v: PROTOCOL_V1, id: message.id, questions }
