@@ -166,6 +166,24 @@ describe("parseSubagentTranscript", () => {
     ].join("\n");
 
     expect(parseSubagentTranscript(fixture).entries).toEqual([
+      { role: "user", text: "⚙️ Background command finished" },
+      { role: "user", text: "⚙️ Monitor event: progress" },
+    ]);
+  });
+
+  it("通知の summary は実体参照を戻して 1 行に詰め、summary が無ければ状態だけの 1 行（iOS と同値）", () => {
+    const fixture = [
+      JSON.stringify({ type: "user", message: { role: "user", content: "<task-notification>\n<task-id>b1</task-id>\n<status>failed</status>\n<summary>Background command \"python3 - &lt;&lt;'EOF'\nprint(1 &amp;&amp; 2)\nEOF\" failed with exit code 1</summary>\n</task-notification>" } }),
+      JSON.stringify({ type: "user", message: { role: "user", content: "<task-notification>\n<task-id>b2</task-id>\n<summary>Agent <em>Checker: docs</em> subagent</summary>\n</task-notification>" } }),
+      JSON.stringify({ type: "user", message: { role: "user", content: `<task-notification>\n<task-id>b3</task-id>\n<summary>${"a".repeat(300)}</summary>\n</task-notification>` } }),
+      JSON.stringify({ type: "user", message: { role: "user", content: "<task-notification>\n<task-id>b4</task-id>\n<status>completed</status>\n</task-notification>" } }),
+      JSON.stringify({ type: "user", message: { role: "user", content: "<task-notification>\n<task-id>b5</task-id>\n<summary> </summary>\n</task-notification>" } }),
+    ].join("\n");
+
+    expect(parseSubagentTranscript(fixture).entries).toEqual([
+      { role: "user", text: "⚙️ Background command \"python3 - <<'EOF' print(1 && 2) EOF\" failed with exit code 1" },
+      { role: "user", text: "⚙️ Agent \"Checker: docs\" subagent" },
+      { role: "user", text: `⚙️ ${"a".repeat(200)}…` },
       { role: "user", text: "⚙️ バックグラウンドタスク通知（completed）" },
       { role: "user", text: "⚙️ バックグラウンドタスク通知" },
     ]);

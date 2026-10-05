@@ -124,7 +124,10 @@ export function parseSubagentTranscript(jsonl: string): SubagentTranscriptResult
       // チャット面（iOS present()）と同じく生 XML を出さずコンパクトな 1 行に畳む。
       // 判定は strip 前の raw に対して封筒の形を要求する（タグに言及しただけの委任
       // プロンプトを潰さない。<system-reminder> に包まれた封筒も畳む）。
+      // CLI と同じく <summary>（何が終わったか）を出し、無ければ状態だけの 1 行。
       if (role === "user" && isNotificationEnvelope(raw)) {
+        const summary = taskNotificationSummary(raw);
+        if (summary !== null) return `⚙️ ${summary}`;
         const status = /<status>([^<]*)<\/status>/u.exec(raw)?.[1]?.trim() ?? "";
         return status === "" ? "⚙️ バックグラウンドタスク通知" : `⚙️ バックグラウンドタスク通知（${status}）`;
       }
@@ -344,6 +347,30 @@ function isNotificationEnvelope(raw: string): boolean {
   if (raw.startsWith("[SYSTEM NOTIFICATION")) return true;
   const head = raw.startsWith("<system-reminder>\n") ? raw.slice("<system-reminder>\n".length) : raw;
   return /^<task-notification>\r?\n/u.test(head) && /<task-id>[^<\n]+<\/task-id>/u.test(raw);
+}
+
+/**
+ * 通知封筒の `<summary>` を 1 行の表示文にする（無い・空なら null。iOS の
+ * ChatLogModel.taskNotificationSummary と同じ規則）。`<em>` は引用符へ、その他のタグは除去し、
+ * XML 実体参照を戻して空白を 1 つに詰め、200 字を超える分は「…」で切る。
+ */
+function taskNotificationSummary(raw: string): string | null {
+  const inner = /<summary>([\s\S]*?)<\/summary>/u.exec(raw)?.[1];
+  if (inner === undefined) return null;
+  const text = inner
+    .replace(/<\/?em>/gu, "\"")
+    .replace(/<\/?[A-Za-z][^<>]*>/gu, "")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", "\"")
+    .replaceAll("&apos;", "'")
+    .replaceAll("&#39;", "'")
+    .replaceAll("&amp;", "&")
+    .replace(/\s+/gu, " ")
+    .trim();
+  if (text === "") return null;
+  const chars = Array.from(text);
+  return chars.length > 200 ? `${chars.slice(0, 200).join("")}…` : text;
 }
 
 function entry(
