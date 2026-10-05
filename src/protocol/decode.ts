@@ -734,6 +734,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
     }
 
     case "input_suggestion":
+    case "input_residue":
     case "chat_prompt_cancelled":
       return {
         type, v,
@@ -760,6 +761,20 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         key: requireString(raw, "key"),
       };
 
+    case "input_residue_action": {
+      const action = requireString(raw, "action");
+      if (action !== "submit" && action !== "clear") {
+        throw new ProtocolDecodeError("missing-field", "action");
+      }
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        session: requireString(raw, "session"),
+        action,
+        text: requireString(raw, "text"),
+      };
+    }
+
     case "login_code_send":
       return {
         type, v,
@@ -770,6 +785,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
 
     case "pane_choice_send_result":
     case "pane_key_send_result":
+    case "input_residue_action_result":
     case "login_code_send_result":
     case "session_title_set_result":
     case "codex_thread_title_set_result":

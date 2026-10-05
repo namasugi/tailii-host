@@ -176,6 +176,26 @@ export async function injectQuestionAnswers(
   }
 }
 
+/** 設問ダイアログが描かれ終わるのを待つ猶予（回答前の確認で 1 回だけ読み直す）。 */
+const PRESENCE_RETRY_DELAY_MS = 300;
+
+/**
+ * 回答キーを打つ前に、TUI に AskUserQuestion の設問ダイアログが出ているかを確かめる（question-stale）。
+ * 出ていないのに数字キーを打つと入力欄へ落ち、Enter を送らない単一選択では「1」が入ったまま
+ * 会話が止まる（実機 2026-10-05）。描画の途中を取り違えないよう、見えなければ 1 回だけ読み直す。
+ * @returns true = 出ている / false = 出ていない / null = pane を読めず判定できない。
+ */
+export async function questionDialogVisible(
+  session: string, sessionManager: SessionBackend,
+): Promise<boolean | null> {
+  const first = await capturedFrame(session, sessionManager);
+  if (first !== null && isQuestionDialogFrame(first)) return true;
+  await sleep(PRESENCE_RETRY_DELAY_MS);
+  const second = await capturedFrame(session, sessionManager);
+  if (second === null) return first === null ? null : false;
+  return isQuestionDialogFrame(second);
+}
+
 /** pane 読取失敗は「検証不能」= 残存扱いにしない（誤復元でユーザーを二重回答に誘導しない）。 */
 async function questionDialogStillVisible(
   session: string, sessionManager: SessionBackend,

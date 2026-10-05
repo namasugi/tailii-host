@@ -4,7 +4,7 @@
 import type { LineWriter } from "../shared/lineWriter.js";
 import { parsePermissionMode } from "../shared/permissionMode.js";
 import { parseUsageLimitWait, sameUsageLimitWait, type UsageLimitWaitState } from "../shared/usageLimitWait.js";
-import { extractInputBoxSuggestion } from "../backend/tmux.js";
+import { extractInputBoxSuggestion, inputBoxResidueText, inputResidueExcerpt } from "../backend/tmux.js";
 import { PROTOCOL_V2 } from "../protocol.js";
 import { abortableSleep } from "../shared/sleep.js";
 
@@ -44,6 +44,14 @@ export interface PanePreviewPumpOptions {
   captureSuggestion?: (session: string) => Promise<string>;
   /** 提案抽出のポーリング間隔（ms）。既定 1000ms（提案はターン間 idle 時のみ現れるため低頻度で足りる）。 */
   suggestionIntervalMs?: number;
+  /**
+   * 会話が待機中（処理中でない）か（input-residue）。真の間だけ、入力欄に残った実テキストを
+   * `input_residue` で知らせる（処理中の打ち込みは CLI のキューへ入る通常操作なので知らせない）。
+   * 省略時は知らせない。判定は提案抽出と同じ ANSI キャプチャで行う（追加の capture は無い）。
+   */
+  isIdle?: () => boolean;
+  /** 入力欄の実テキストがこの時間変わらず残ったら知らせる（ms）。既定 3000ms（打鍵中を拾わない）。 */
+  residueStableMs?: number;
   /**
    * 初回 capture を送るかの判定（emitInitial=false のとき）。静止した入力待ちダイアログ
    * （選択 / /login）で始まる pane は、変化しないため従来の「初回は黙って基準保持」だと
@@ -102,6 +110,13 @@ export class PanePreviewPump {
   private readonly suggestionIntervalMs: number;
   /** 直近に配信した提案文（null=未配信・"" =提案なし）。変化時だけ流す。 */
   private lastSuggestion: string | null = null;
+  private readonly isIdle: (() => boolean) | null;
+  private readonly residueStableMs: number;
+  /** 直近に配信した残留テキスト（null=未配信・"" =残留なし）。変化時だけ流す（input-residue）。 */
+  private lastResidue: string | null = null;
+  /** 静止判定中の残留テキストと、その値になった時刻。 */
+  private residueCandidate = "";
+  private residueSince = 0;
   private lastSuggestionAt = 0;
   private lastPermissionMode: string | null = null;
   private lastEmittedDialog = false;
@@ -132,6 +147,8 @@ export class PanePreviewPump {
     this.jumpToLatestIf = options.jumpToLatestIf ?? null;
     this.captureSuggestion = options.captureSuggestion ?? null;
     this.suggestionIntervalMs = options.suggestionIntervalMs ?? 1000;
+    this.isIdle = options.isIdle ?? null;
+    this.residueStableMs = options.residueStableMs ?? 3000;
   }
 
   /**
@@ -140,6 +157,11 @@ export class PanePreviewPump {
    * 送るのは `emitInitialIf` が真のフレームだけ（静止 pane の古い status 行で誤点灯しない）。
    */
   resendLastIfInteractive(): void {
+    // 入力欄に残った文字（input-residue）は変化時だけ流すので、後から加わった前面購読者（再接続した
+    // engine・別端末）には届かない。参加のたびに知らせ直す。
+    if (this.session !== null && this.lastResidue !== null && this.lastResidue !== "") {
+      this.emitResidue(this.session, this.lastResidue);
+    }
     const session = this.session;
     const text = this.lastText;
     if (session === null || text === null || this.emitInitialIf === null) return;
@@ -174,6 +196,7 @@ export class PanePreviewPump {
     this.inactiveSent = false;
     this.lastSuggestion = null;
     this.lastSuggestionAt = 0;
+    this.resetResidue();
     this.jumpArmed = false;
     this.lastJumpAt = 0;
     this.jumpAttempts = 0;
@@ -197,6 +220,11 @@ export class PanePreviewPump {
     }
     this.lastSuggestion = null;
     this.lastSuggestionAt = 0;
+    // 残留の表示も離脱時に消す（前面でなくなった会話のバナーを残さない）。
+    if (this.session !== null && this.lastResidue !== null && this.lastResidue !== "") {
+      this.emitResidue(this.session, "");
+    }
+    this.resetResidue();
     this.session = null;
     this.mode = "claude_status";
     this.emitInitial = false;
@@ -317,6 +345,7 @@ export class PanePreviewPump {
             this.emitSuggestion(session, suggestion);
           }
           this.lastSuggestion = suggestion;
+          this.trackResidue(session, ansi, now);
         } catch {
           // capture 失敗は無視（次周期で再試行。提案は補助機能なので表に出さない）。
         }
@@ -348,6 +377,39 @@ export class PanePreviewPump {
     this.jumpToLatest(session).catch((error: unknown) => {
       this.log?.(`audit jump-to-latest-failed session=${session} error=${String(error)}`);
     });
+  }
+
+  /**
+   * 入力欄に残った実テキスト（input-residue）を追う。待機中に同じ文字が `residueStableMs` 以上
+   * 残ったら知らせ、消えた（送られた・消された・処理が始まった）らすぐ解消を流す。
+   * 入力欄が見つからない・先頭がプロンプト記号でないフレーム（選択ダイアログ表示中など）は「残留なし」とみなす。
+   */
+  private trackResidue(session: string, ansi: string, now: number): void {
+    if (this.isIdle === null) return;
+    const text = this.isIdle() ? inputResidueExcerpt(inputBoxResidueText(ansi)) : "";
+    if (text !== this.residueCandidate) {
+      this.residueCandidate = text;
+      this.residueSince = now;
+    }
+    if (text !== "" && now - this.residueSince < this.residueStableMs) return;
+    // 未配信（null）から「残留なし」への遷移も 1 回だけ流す: pump が作り直された（hub の再起動・購読の
+    // 切り替え）後、アプリに前の pump が出したバナーが残っていれば消す。
+    if (text !== this.lastResidue) {
+      this.emitResidue(session, text);
+    }
+    this.lastResidue = text;
+  }
+
+  private resetResidue(): void {
+    this.lastResidue = null;
+    this.residueCandidate = "";
+    this.residueSince = 0;
+  }
+
+  private emitResidue(session: string, text: string): void {
+    const v = this.protocolVersion();
+    if (v < PROTOCOL_V2) return;
+    this.writer.write({ type: "input_residue", v, session, text });
   }
 
   private emitSuggestion(session: string, text: string): void {

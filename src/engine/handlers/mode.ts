@@ -6,7 +6,10 @@ import { parsePermissionMode } from "../../shared/permissionMode.js";
 import { parseUsageLimitWait, usageLimitAutoContinueCancelled } from "../../shared/usageLimitWait.js";
 import { sleep } from "../../shared/sleep.js";
 import type { SessionBackend } from "../../backend/sessionBackend.js";
-import { inputBoxRealText, inputBoxTextMatchesRecordedPrompt, loginCodeErrorMessage } from "../../backend/tmux.js";
+import {
+  classifySubmitFrame, inputBoxRealText, inputBoxResidueText, inputBoxTextMatchesRecordedPrompt, inputResidueExcerpt,
+  loginCodeErrorMessage, type SubmitFrameVerdict,
+} from "../../backend/tmux.js";
 import { findTrailingUserPromptText } from "../../chat/transcriptTailer.js";
 import type { ControlMessage } from "../../protocol.js";
 import {
@@ -137,6 +140,12 @@ export const modeHandlers: HandlerRegistry = {
     }
   },
 
+  input_residue_action: async (message, ctx) => {
+    // 入力欄に残った文字（input-residue）を送る / 消す。read loop を塞がないよう detached で処理する
+    // （消去は入力欄が空になるまで C-u を数回打って確かめるため数百 ms かかる）。
+    ctx.trackBackground(runInputResidueAction(message, ctx));
+  },
+
   login_code_send: async (message, ctx) => {
     // 結果確定まで最大 ~10s 待つ（OAuth 交換の待ち）。engine の read loop は handler を直列 await
     // するため、ここで待つと chat_send / interrupt / pane_preview が全部止まる。起動だけして
@@ -144,6 +153,92 @@ export const modeHandlers: HandlerRegistry = {
     void runLoginCodeSend(message, ctx);
   },
 };
+
+/** 残留文字の送信後、入力欄から消えたかを読み直す間隔（ms）。 */
+const INPUT_RESIDUE_SUBMIT_SETTLE_MS = 400;
+/** 1 回の Enter の後に読み直す回数（`/clear` 等は再描画が遅いことがあるので 1 回で判断しない）。 */
+const INPUT_RESIDUE_SUBMIT_POLLS = 3;
+/** 入力欄の残り文字が見えなかったときに読み直すまでの待ち（ms）。 */
+const INPUT_RESIDUE_REREAD_MS = 200;
+/** 送信の Enter を打つ上限（2.1.277+ は不可視文字を含む本文の 1 回目の Enter を確認待ちで保留する）。 */
+const INPUT_RESIDUE_SUBMIT_ATTEMPTS = 2;
+
+/**
+ * input_residue_action の実体。いまの入力欄の実テキスト（薄字の提案を除く）がアプリの見た文字と
+ * 同じときだけ操作する。消えていれば `input_residue_gone`、変わっていれば `input_residue_changed` で
+ * 何もしない（打ち足された入力・別経路で送られた入力を巻き込まない）。
+ */
+async function runInputResidueAction(
+  message: Extract<ControlMessage, { type: "input_residue_action" }>,
+  ctx: HandlerContext,
+): Promise<void> {
+  const { writer, state, sessionManager } = ctx;
+  const v = state.negotiatedVersion;
+  const reply = (ok: boolean, error: string | null): void => {
+    writer.write({ type: "input_residue_action_result", v, id: message.id, ok, error });
+  };
+  // pump が知らせたのと同じ判定・同じ抜粋で読み直す（選択ダイアログの本文を入力欄の文字と取り違えない）。
+  const readResidue = async (): Promise<string> =>
+    inputResidueExcerpt(inputBoxResidueText(await sessionManager.captureVisibleAnsi(message.session)));
+  try {
+    let current = await readResidue();
+    if (current === "") {
+      // ボトムバーの位置に一時的な案内が出ていただけのフレームで「消えた」と答えない（アプリはバナーを
+      // 下げ、pump は同じ文字を知らせ直さない）。少し待って 1 回だけ読み直す。
+      await sleep(INPUT_RESIDUE_REREAD_MS);
+      current = await readResidue();
+    }
+    if (current === "") {
+      reply(false, "input_residue_gone");
+      return;
+    }
+    if (current !== message.text) {
+      reply(false, "input_residue_changed");
+      return;
+    }
+    if (message.action === "submit") {
+      // 送れたかは送信確定ループと同じ判定（`classifySubmitFrame`）で確かめる。「文字が変わった」を送信と
+      // 読むと、2.1.277+ の不可視文字の確認待ち（不可視文字だけ除いた本文を残して 2 回目の Enter を待つ）を
+      // 送信成立と取り違える（ok を返すとアプリはバナーを下げて処理中表示を張る）。
+      // - submitted（バーが見えて入力欄が空）/ dialog（コマンドが選択画面を開いた・承認が出た）= 成立。
+      //   dialog へは決して Enter を撃たない。
+      // - pending（文字が残っている）: 元と違う文字なら確認待ちなのですぐ次の Enter、同じなら再描画を待つ。
+      // - unknown（バーもダイアログも判別できない）: 待って読み直す。最後まで判別できなければ次の Enter は
+      //   撃たずに不明と返す（送信確定ループと同じ規則。フッターを知らないダイアログ＝`Enter to confirm` の
+      //   確認等も unknown になり、そこへの Enter は選択肢を勝手に確定する）。
+      // `/` で始まる本文は 1 回だけ打つ: `/model` 等は選択画面を開くので、再描画が遅れて古い画面を読むと
+      // 2 回目の Enter が開いた選択画面の選択肢を確定してしまう（不可視文字の確認待ちはコマンドには無い）。
+      const attempts = message.text.startsWith("/") ? 1 : INPUT_RESIDUE_SUBMIT_ATTEMPTS;
+      let verdict: SubmitFrameVerdict = "pending";
+      for (let attempt = 0; attempt < attempts && verdict !== "submitted" && verdict !== "dialog"; attempt += 1) {
+        await sessionManager.sendKeys(message.session, ["Enter"]);
+        for (let poll = 0; poll < INPUT_RESIDUE_SUBMIT_POLLS; poll += 1) {
+          await sleep(INPUT_RESIDUE_SUBMIT_SETTLE_MS);
+          const ansi = await sessionManager.captureVisibleAnsi(message.session);
+          verdict = classifySubmitFrame(ansi);
+          if (verdict === "submitted" || verdict === "dialog") break;
+          if (verdict === "pending" && inputResidueExcerpt(inputBoxResidueText(ansi)) !== message.text) break;
+        }
+        if (verdict === "unknown") break;
+      }
+      if (verdict === "unknown") {
+        reply(false, "input_residue_unconfirmed");
+        return;
+      }
+      if (verdict === "pending") {
+        reply(false, "input_residue_not_submitted");
+        return;
+      }
+    } else if (!(await sessionManager.clearInputBox(message.session))) {
+      reply(false, "input_residue_clear_failed");
+      return;
+    }
+    reply(true, null);
+  } catch (error) {
+    engineDiag(`input_residue_action 失敗 id=${message.id}: ${String(error)}`);
+    reply(false, String(error));
+  }
+}
 
 async function runLoginCodeSend(
   message: Extract<ControlMessage, { type: "login_code_send" }>,

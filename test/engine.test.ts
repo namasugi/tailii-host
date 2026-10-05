@@ -2381,6 +2381,49 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
+  test("question_answer: 設問ダイアログが TUI に出ていなければ打たずに question_stale で返す（question-stale）", async () => {
+    const runner = new MockTmuxRunner(() => ok(""));
+    const manager = makeManager(runner);
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("question-hub-stale"),
+      metadataStore: manager.store, timeoutSeconds: 1800,
+      questionInjector: (answers, session) => injectQuestionAnswers(answers, session, manager),
+      questionDialogVisible: async () => false });
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "Q1",
+      questions: [{ header: "h", question: "q", options: [], multiSelect: false }] });
+    const engine = startEngine({ sessionManager: manager, hub });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine('{"answers":[{"multiSelect":false,"questionIndex":0,"selectedOptionIndexes":[0]}],' +
+      '"id":"Q1","session":"work","type":"question_answer","v":1}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("error"))).toMatchObject({
+      id: "Q1", code: "question_stale",
+    });
+    expect(runner.recorded.some((cmd) => cmd[0] === "send-keys")).toBe(false);
+    await engine.teardown();
+  });
+
+  test("question_answer: hub の設問確認を待つ間も read loop は次の要求を処理する（question-stale）", async () => {
+    const runner = new MockTmuxRunner(() => ok(""));
+    const manager = makeManager(runner);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("question-hub-slow"),
+      metadataStore: manager.store, timeoutSeconds: 1800,
+      questionInjector: async () => {},
+      questionDialogVisible: async () => { await gate; return false; } });
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "Q1",
+      questions: [{ header: "h", question: "q", options: [], multiSelect: false }] });
+    const engine = startEngine({ sessionManager: manager, hub });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine('{"answers":[{"multiSelect":false,"questionIndex":0,"selectedOptionIndexes":[0]}],' +
+      '"id":"Q1","session":"work","type":"question_answer","v":1}');
+    engine.writeLine('{"id":"L9","type":"session_list_request","v":1}');
+    // 設問の確認が終わる前に一覧の応答が返る。
+    expect(await engine.lines.nextOfType("session_list_response")).toContain('"id":"L9"');
+    release();
+    expect(decodeControlMessage(await engine.lines.nextOfType("error"))).toMatchObject({ id: "Q1", code: "question_stale" });
+    await engine.teardown();
+  });
+
   test("question_answer: 複数の単一選択は各回答後にレビューを Submit する", async () => {
     const runner = new MockTmuxRunner(() => ok(""));
     const manager = makeManager(runner);

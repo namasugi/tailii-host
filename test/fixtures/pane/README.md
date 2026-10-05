@@ -62,3 +62,6 @@ tmux `capture-pane -p -e`（ANSI 付き・viewport のみ）でそのまま採�
 一方「本文を打つかどうか」の門番は `screenShowsDialogFooter` の**積極判定**で行う:
 バー非検出をダイアログ扱いにすると、未知のフレーム（起動直後・制限待ち等）で送信が
 丸ごと不能になるため。見逃し側は従来動作に落ちるだけで済む。
+| `question-dialog-multiselect-single.ansi` | 2.1.289・AskUserQuestion の 1 問だけの multiSelect（`[ ]` 付き・`Type something` は末尾ドット無し・`Chat about this` は罫線の下） | `Enter to select · ↑/↓ to navigate · Esc to cancel` |
+| `question-dialog-preview.ansi` | 2.1.289・preview 付き単一選択（左に選択肢・右にプレビュー枠。Other 行は無く `Notes: press n to add notes`） | `Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel` |
+| `typed-digit-idle.ansi` | 2.1.289・待機中の入力欄に `1` が残った画面（設問の回答キーが入力欄へ落ちた 2026-10-05 の障害と同じ形） | `⏸ manual mode on` |

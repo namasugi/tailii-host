@@ -563,6 +563,19 @@ export type ControlMessage =
    * prompt-suggestion-chip）。`text` 空文字は提案なし（チップを隠す）。foreground 購読者にだけ届く。
    */
   | { type: "input_suggestion"; v: number; session: string; text: string }
+  /**
+   * 会話が待機中なのに claude TUI の入力欄へ未送信の文字（薄字の提案・プレースホルダーではない実テキスト）が
+   * 残ったまま静止している（host→iOS, input-residue）。設問の回答キーが入力欄へ落ちた・端末で打ちかけた等で
+   * 会話が止まって見えるのを、アプリで気づけるようにする。`text` 空文字は解消（表示を消す）。
+   */
+  | { type: "input_residue"; v: number; session: string; text: string }
+  /**
+   * 入力欄に残った文字（input_residue）の始末（iOS→host）。`submit` = Enter で送る / `clear` = 消す。
+   * `text` はアプリが見た残留文字で、host はいまの入力欄が同じときだけ操作する（打ち足された・既に
+   * 送られた入力を巻き込まない）。
+   */
+  | { type: "input_residue_action"; v: number; id: string; session: string; action: "submit" | "clear"; text: string }
+  | { type: "input_residue_action_result"; v: number; id: string; ok: boolean; error: string | null }
   /** 一覧 Mission Control: 有効な間、処理中会話すべての pane_preview を配信する（iOS→host）。 */
   | { type: "session_preview_watch"; v: number; enabled: boolean }
   /**

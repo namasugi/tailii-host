@@ -1,0 +1,6 @@
+{"session":"s-1a2b3c4d","text":"1","type":"input_residue","v":2}
+{"session":"s-1a2b3c4d","text":"","type":"input_residue","v":2}
+{"action":"submit","id":"ir1","session":"s-1a2b3c4d","text":"1","type":"input_residue_action","v":1}
+{"error":null,"id":"ir1","ok":true,"type":"input_residue_action_result","v":1}
+{"action":"clear","id":"ir2","session":"s-1a2b3c4d","text":"1","type":"input_residue_action","v":1}
+{"error":"input_residue_changed","id":"ir2","ok":false,"type":"input_residue_action_result","v":1}

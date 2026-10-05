@@ -47,7 +47,7 @@ import {
   PROTOCOL_MAX_SUPPORTED,
   type ControlMessage,
 } from "../protocol.js";
-import { injectQuestionAnswers } from "./questionInjection.js";
+import { injectQuestionAnswers, questionDialogVisible } from "./questionInjection.js";
 import {
   EFFORT_COMMAND_PATTERN,
   MODEL_COMMAND_PATTERN,
@@ -460,11 +460,13 @@ export async function runHubCommand(args: string[]): Promise<number> {
       onCodexTurnLifecycle,
       onClaudeTurnLifecycle,
     }),
-    previewPumpFactory: (write, onPermissionMode, pollIntervalMs, onUsageLimitWait) => new PanePreviewPump({
+    previewPumpFactory: (write, onPermissionMode, pollIntervalMs, onUsageLimitWait, isIdle) => new PanePreviewPump({
       writer: controlMessageCallbackWriter(write),
       capture: (session) => sessionBackend.capturePane(session, { lines: 60, joinWrappedLines: true }),
       // プロンプト提案（薄字ゴースト）抽出用の viewport ANSI キャプチャ（prompt-suggestion-chip）。
       captureSuggestion: (session) => sessionBackend.captureVisibleAnsi(session),
+      // 待機中に入力欄へ残った文字をアプリへ知らせる（input-residue）。
+      ...(isIdle !== undefined ? { isIdle } : {}),
       onPermissionMode,
       ...(onUsageLimitWait !== undefined ? { onUsageLimitWait } : {}),
       ...(pollIntervalMs !== undefined ? { pollIntervalMs } : {}),
@@ -485,6 +487,8 @@ export async function runHubCommand(args: string[]): Promise<number> {
       jumpToLatestIf: screenShouldJumpToLatest,
     }),
     questionInjector: (answers, session) => injectQuestionAnswers(answers, session, sessionBackend),
+    // 回答キーは設問ダイアログが TUI に出ているときだけ打つ（question-stale）。
+    questionDialogVisible: (session) => questionDialogVisible(session, sessionBackend),
     // 使用量制限の自動再開待ちを push で知らせる（usage-limit-wait。APNs 未設定なら内部で skip）。
     usageLimitNotify: makeUsageLimitPushNotifier(log),
     // CLI のキューに溜まっている発話を今すぐ届ける（chat-send-now）。

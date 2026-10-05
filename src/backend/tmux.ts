@@ -265,6 +265,37 @@ export function inputBoxRealText(ansiScreen: string): string | null {
 }
 
 /**
+ * 入力欄に残っている未送信の文字（input-residue。アプリへ知らせて送信 / 消去を選ばせる対象）。
+ * `inputBoxRealText` に加えて、入力欄の先頭行がプロンプト記号（`❯` / シェルモードの `!` 等）で
+ * 始まることを要求する。罫線で挟まれた選択ダイアログ（AskUserQuestion の設問・ツール承認・❯ メニュー）は
+ * 入力欄と同じ位置に描かれ、その本文を実テキストと読んでしまうため（実測フィクスチャ question-dialog /
+ * approval-dialog）。加えて画面下部にボトムバーが見えている（＝入力欄を見ている）ことを要求する。
+ * シェルモード・長い本文で入力欄の先頭が画面外に出た形も "" になる（知らせない側へ倒す）。
+ * "" = 残っていない / 判定できない。
+ */
+export function inputBoxResidueText(ansiScreen: string): string {
+  const analysis = analyzeInputBox(ansiScreen);
+  // シェルモード（`!`）は知らせない: 本文だけを見せて［送信］させると、会話への発話のつもりで
+  // シェルコマンドを実行させてしまう。
+  if (analysis === null || analysis.faintOnly || analysis.prompt === "" || analysis.prompt === "!") return "";
+  // 入力欄だと積極的に言える画面だけを信じる（fail-closed）。ダイアログのフッターを列挙する方式は
+  // 取りこぼす（`Enter to confirm` のフォルダ信頼確認・`/model` のピッカー等。承認は選択カーソルも
+  // `❯` なので記号でも外れない）。ダイアログ表示中の viewport にボトムバーは出ない（実測 2.1.278）。
+  if (!claudeComposerBarVisible(ansiScreen)) return "";
+  return analysis.text;
+}
+
+/**
+ * 残留文字の抜粋（input-residue）。コードポイント単位で切る（UTF-16 単位で切るとサロゲートペアを割り、
+ * iOS で別の文字に化けて照合が永久に外れる）。pump の配信と engine の照合で同じ関数を使う。
+ */
+export function inputResidueExcerpt(text: string, maxCodePoints = 2000): string {
+  const trimmed = text.trim();
+  const points = Array.from(trimmed);
+  return points.length <= maxCodePoints ? trimmed : points.slice(0, maxCodePoints).join("");
+}
+
+/**
  * chat 注入（sendTextSubmit）の呼び出し側が渡す補助情報。
  */
 export interface SendTextSubmitOptions {
@@ -816,7 +847,7 @@ export function extractInputBoxSuggestion(ansiScreen: string): string | null {
  * 準拠）と「本文がすべて薄字(faint)か」を返す。罫線ペア or 末尾 `❯` 行で領域を特定する
  * （extractClaudeInputBox と同型）。入力欄が見つからなければ null。
  */
-function analyzeInputBox(ansiScreen: string): { text: string; faintOnly: boolean } | null {
+function analyzeInputBox(ansiScreen: string): { text: string; faintOnly: boolean; prompt: string } | null {
   const rawLines = ansiScreen.split("\n").map((line) => line.replace(/\r$/, ""));
   const plain = rawLines.map((line) => stripSgr(line));
   const stripped = plain.map((line) => line.trim());
@@ -843,7 +874,7 @@ function analyzeInputBox(ansiScreen: string): { text: string; faintOnly: boolean
   // 字下げを残した行を渡す（trim した行を渡すと、入力欄の中の罫線だけの行を枠と取り違える）。
   const box = extractClaudeInputBox(plain.join("\n"));
   if (box === null) return null;
-  return { text: box.text, faintOnly: bodyIsFaintOnly(bodyRaw) };
+  return { text: box.text, faintOnly: bodyIsFaintOnly(bodyRaw), prompt: box.prompt };
 }
 
 /**

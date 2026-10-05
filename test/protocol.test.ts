@@ -85,6 +85,17 @@ describe("golden roundtrip", () => {
     }
   });
 
+  it("input-residue v1 golden 全行が byte-exact でラウンドトリップする", () => {
+    const lines = goldenLines("input-residue-v1.ndjson");
+    expect(lines.length).toBe(6);
+    for (const line of lines) {
+      expect(encodeControlMessage(decodeControlMessage(line))).toBe(line);
+    }
+    expect(() => decodeControlMessage(
+      '{"action":"send","id":"x","session":"s","text":"1","type":"input_residue_action","v":1}',
+    )).toThrow();
+  });
+
   it("prompt-cancelled v1 golden 全行が byte-exact でラウンドトリップする", () => {
     for (const line of goldenLines("prompt-cancelled-v1.ndjson")) {
       const decoded = decodeControlMessage(line);

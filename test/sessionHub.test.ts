@@ -865,6 +865,114 @@ describe("SessionHub actor", () => {
     await vi.waitFor(() => expect(questionInjector).toHaveBeenCalledTimes(1));
   });
 
+  test("設問ダイアログが TUI に出ていなければ回答キーを打たず stale で返し、設問を復元しない（question-stale）", async () => {
+    const questionInjector = vi.fn(async () => {});
+    const log: string[] = [];
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-question-stale"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, questionInjector,
+      questionDialogVisible: async () => false, staleQuestionRecheckMs: 10, log: (line) => log.push(line) });
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q1", questions: QUESTIONS });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "question_answer_submit", id: "answer", session: "work",
+      questionId: "q1", answers: ANSWER }));
+    await vi.waitFor(() => expect(received).toContainEqual({ type: "question_answer_result", id: "answer", status: "stale" }));
+    expect(received).not.toContainEqual(expect.objectContaining({ type: "question_answer_result", status: "accepted" }));
+    expect(questionInjector).not.toHaveBeenCalled();
+    // 設問は閉じたまま（再提示しない）。
+    expect(hub.actors.get("work")?.pendingQuestion).toBeNull();
+    expect(received).toContainEqual({ type: "question_event", session: "work", event: "dismiss", id: "q1" });
+    expect(received.filter((m) => (m as { type?: string; event?: string }).type === "question_event" &&
+      (m as { event?: string }).event === "prompt")).toEqual([]);
+    expect(log.some((line) => line.includes("audit question-stale session=work question=q1"))).toBe(true);
+    // 少し後の確認でも出ていなければ戻さない。
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(hub.actors.get("work")?.pendingQuestion).toBeNull();
+    // 回答注入中の保留も残さない（次の chat がすぐ流れる）。
+    await vi.waitFor(() => expect(hub.actors.get("work")?.questionAnswerInjections).toBe(0));
+  });
+
+  test("stale で捨てた設問は、少し後にダイアログが出ていたら戻して再提示する（遅い hook で描画前に答えた, question-stale）", async () => {
+    const questionInjector = vi.fn(async () => {});
+    const visible = [false, true];
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-question-stale-restore"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, questionInjector, staleQuestionRecheckMs: 10,
+      questionDialogVisible: async () => visible.shift() ?? true });
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q1", questions: QUESTIONS });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "question_answer_submit", id: "answer", session: "work",
+      questionId: "q1", answers: ANSWER }));
+    await vi.waitFor(() => expect(received).toContainEqual({ type: "question_answer_result", id: "answer", status: "stale" }));
+    // 回答時の確認では見えず stale。少し後の確認で見えたので設問を戻して再提示する。
+    await vi.waitFor(() => expect(hub.actors.get("work")?.pendingQuestion?.id).toBe("q1"));
+    expect(received).toContainEqual({ type: "question_event", session: "work", event: "prompt", id: "q1", questions: QUESTIONS });
+    expect(questionInjector).not.toHaveBeenCalled();
+    // 戻した設問へは改めて答えられる。
+    hub.handleClientMessage(client, JSON.stringify({ type: "question_answer_submit", id: "answer-2", session: "work",
+      questionId: "q1", answers: ANSWER }));
+    await vi.waitFor(() => expect(questionInjector).toHaveBeenCalledTimes(1));
+  });
+
+  test("stale 後の再確認は間隔を広げて数回まで続け、CLI 側で片付いた・hub を閉じたら止める（question-stale）", async () => {
+    // 3 回目の確認で初めて見える（遅い hook）。
+    const calls: number[] = [];
+    const visibleAt = (n: number) => async () => { calls.push(Date.now()); return calls.length >= n; };
+    const make = (visible: () => Promise<boolean>) => {
+      const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-question-stale-multi"),
+        metadataStore: makeTempStore(), timeoutSeconds: 1800, questionInjector: vi.fn(async () => {}),
+        staleQuestionRecheckMs: 10, questionDialogVisible: visible });
+      hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q1", questions: QUESTIONS });
+      const client = {}, received: unknown[] = [];
+      hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+      hub.handleClientMessage(client, JSON.stringify({ type: "question_answer_submit", id: "answer", session: "work",
+        questionId: "q1", answers: ANSWER }));
+      return { hub, received };
+    };
+
+    const first = make(visibleAt(3));
+    await vi.waitFor(() => expect(first.hub.actors.get("work")?.pendingQuestion?.id).toBe("q1"));
+    // 回答時 1 回 + 再確認 2 回目で見えた。
+    expect(calls.length).toBe(3);
+    first.hub.close();
+
+    // CLI 側で設問が片付いた（PostToolUse の dismiss）ら確認をやめる。
+    calls.length = 0;
+    const second = make(visibleAt(99));
+    await vi.waitFor(() => expect(second.received).toContainEqual(expect.objectContaining({ status: "stale" })));
+    second.hub.handleRelayMessage({ type: "question_event", session: "work", event: "dismiss", id: "q1" });
+    const afterDismiss = calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(calls.length).toBe(afterDismiss);
+    expect(second.hub.actors.get("work")?.pendingQuestion).toBeNull();
+    second.hub.close();
+
+    // hub を閉じたら確認をやめる。
+    calls.length = 0;
+    const third = make(visibleAt(99));
+    await vi.waitFor(() => expect(third.received).toContainEqual(expect.objectContaining({ status: "stale" })));
+    third.hub.close();
+    const afterClose = calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(calls.length).toBe(afterClose);
+  });
+
+  test("設問ダイアログが出ている / 判定できないときは受理して回答キーを打つ（question-stale）", async () => {
+    for (const visible of [true, null] as const) {
+      const questionInjector = vi.fn(async () => {});
+      const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-question-visible"),
+        metadataStore: makeTempStore(), timeoutSeconds: 1800, questionInjector,
+        questionDialogVisible: async () => visible });
+      hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q1", questions: QUESTIONS });
+      const client = {}, received: unknown[] = [];
+      hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+      hub.handleClientMessage(client, JSON.stringify({ type: "question_answer_submit", id: "answer", session: "work",
+        questionId: "q1", answers: ANSWER }));
+      await vi.waitFor(() => expect(questionInjector).toHaveBeenCalledTimes(1));
+      expect(received).toContainEqual({ type: "question_answer_result", id: "answer", status: "accepted" });
+    }
+  });
+
   test("設問を Esc で閉じている最中に届いた回答は、再試行できる失敗で返す（回答キーを入力欄へ落とさない）", async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });

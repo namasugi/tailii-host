@@ -796,6 +796,118 @@ describe("Engine — アイドルライフサイクル/ページング", () => {
     await engine.teardown();
   });
 
+  // MARK: input_residue_action（入力欄に残った文字の送信 / 消去, input-residue）
+
+  test("input_residue_action: いまの入力欄がアプリの見た文字と同じときだけ Enter / C-u を打つ", async () => {
+    const rule = "─".repeat(40);
+    const state = { input: "1" };
+    const screen = () => ["⏺ 前の応答", rule, `❯ ${state.input}`, rule, "  ⏵⏵ auto mode on"].join("\n");
+    let swallowEnter = 0;
+    let picker = false;
+    let confirmDialog = false;
+    const confirmScreen = () => [
+      " Do you trust the files in this folder?", "", rule, " ❯ 1. Yes, I trust this folder", "   2. No, exit", rule,
+      " Enter to confirm · Esc to exit",
+    ].join("\n");
+    const pickerScreen = () => [
+      " Select model", "", rule, " ❯ 1. Default (recommended)", "   2. Sonnet", rule,
+      " Enter to select · ↑/↓ to navigate · Esc to cancel",
+    ].join("\n");
+    const runner = new MockTmuxRunner((args) => {
+      if (args[0] === "send-keys" && args[3] === "C-u") { state.input = ""; return ok(""); }
+      if (args[0] === "send-keys" && args[3] === "Enter") {
+        // swallowEnter 回までは Enter を飲む（取りこぼし）。
+        if (swallowEnter > 0) swallowEnter -= 1;
+        // 2.1.277+ の不可視文字の確認待ち: 1 回目の Enter は不可視文字だけ除いて本文を残す。
+        else if (state.input.includes("\u200b")) state.input = state.input.replaceAll("\u200b", "");
+        // `/model` は選択画面を開く。
+        else if (state.input === "/model") { state.input = ""; picker = true; }
+        // フッターを知らないダイアログ（classifySubmitFrame は unknown）が出る。
+        else if (state.input === "trust") { state.input = ""; confirmDialog = true; }
+        else state.input = "";
+        return ok("");
+      }
+      if (args[0] === "capture-pane") return ok(picker ? pickerScreen() : confirmDialog ? confirmScreen() : screen());
+      return ok("");
+    });
+    const enterCount = () => runner.recorded.filter((cmd) => cmd[0] === "send-keys" && cmd[3] === "Enter").length;
+    const mgr = new TmuxSessionManager({ runner: runner.runner, store: makeTempStore(), clearKeyDelayMs: 0 });
+    const engine = startEngine({ sessionManager: mgr });
+    await engine.lines.nextOfType("channel_hello");
+
+    // 文字が変わっていれば何もしない。
+    engine.writeLine('{"action":"submit","id":"IR0","session":"work","text":"2","type":"input_residue_action","v":1}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("input_residue_action_result"))).toMatchObject({
+      id: "IR0", ok: false, error: "input_residue_changed",
+    });
+    expect(runner.recorded.some((cmd) => cmd[0] === "send-keys")).toBe(false);
+
+    engine.writeLine('{"action":"submit","id":"IR1","session":"work","text":"1","type":"input_residue_action","v":1}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("input_residue_action_result"))).toMatchObject({
+      id: "IR1", ok: true, error: null,
+    });
+    expect(runner.recorded.map((cmd) => JSON.stringify(cmd))).toContain(JSON.stringify(["send-keys", "-t", "work", "Enter"]));
+
+    // 1 回目の Enter が飲まれても、読み直して 2 回目で送る。2 回とも飲まれたら送れていないと返す。
+    state.input = "1";
+    swallowEnter = 1;
+    engine.writeLine('{"action":"submit","id":"IR1b","session":"work","text":"1","type":"input_residue_action","v":1}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("input_residue_action_result"))).toMatchObject({
+      id: "IR1b", ok: true,
+    });
+    state.input = "1";
+    swallowEnter = 2;
+    engine.writeLine('{"action":"submit","id":"IR1c","session":"work","text":"1","type":"input_residue_action","v":1}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("input_residue_action_result"))).toMatchObject({
+      id: "IR1c", ok: false, error: "input_residue_not_submitted",
+    });
+
+    // 不可視文字の確認待ち: 1 回目の Enter で文字が変わっても送信とは読まず、2 回目の Enter で送る。
+    state.input = "hello\u200bworld";
+    let before = enterCount();
+    engine.writeLine(JSON.stringify({ action: "submit", id: "IR1d", session: "work", text: "hello\u200bworld",
+      type: "input_residue_action", v: 1 }));
+    expect(decodeControlMessage(await engine.lines.nextOfType("input_residue_action_result"))).toMatchObject({
+      id: "IR1d", ok: true,
+    });
+    expect(enterCount() - before).toBe(2);
+    expect(state.input).toBe("");
+
+    // `/` で始まる本文は 1 回だけ打ち、開いた選択画面は送信成立とみなす（選択画面へ Enter を撃たない）。
+    state.input = "/model";
+    before = enterCount();
+    engine.writeLine('{"action":"submit","id":"IR1e","session":"work","text":"/model","type":"input_residue_action","v":1}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("input_residue_action_result"))).toMatchObject({
+      id: "IR1e", ok: true,
+    });
+    expect(enterCount() - before).toBe(1);
+    picker = false;
+
+    // Enter の後に判別できない画面（フッターを知らないダイアログ）になったら、次の Enter は撃たず不明と返す。
+    state.input = "trust";
+    before = enterCount();
+    engine.writeLine('{"action":"submit","id":"IR1f","session":"work","text":"trust","type":"input_residue_action","v":1}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("input_residue_action_result"))).toMatchObject({
+      id: "IR1f", ok: false, error: "input_residue_unconfirmed",
+    });
+    expect(enterCount() - before).toBe(1);
+    confirmDialog = false;
+
+    state.input = "1";
+    engine.writeLine('{"action":"clear","id":"IR2","session":"work","text":"1","type":"input_residue_action","v":1}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("input_residue_action_result"))).toMatchObject({
+      id: "IR2", ok: true,
+    });
+    expect(state.input).toBe("");
+
+    // 既に空なら gone。
+    engine.writeLine('{"action":"clear","id":"IR3","session":"work","text":"1","type":"input_residue_action","v":1}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("input_residue_action_result"))).toMatchObject({
+      id: "IR3", ok: false, error: "input_residue_gone",
+    });
+    await engine.teardown();
+  });
+
   test("pane_key_send は選択ダイアログ操作キー（Up/Enter）も受理する", async () => {
     const runner = new MockTmuxRunner(() => ok(""));
     const mgr = new TmuxSessionManager({ runner: runner.runner, store: makeTempStore() });

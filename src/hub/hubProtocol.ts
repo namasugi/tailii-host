@@ -123,7 +123,11 @@ export type HubServerMessage =
    * 一覧向けの `conversation_liveness`（watcher 限定）とは別経路。
    */
   | { type: "conversation_retired"; session: string }
-  | { type: "question_answer_result"; id: string; status: "accepted" | "already_resolved" | "unknown" }
+  /**
+   * `stale` = hub は設問を持っていたが、TUI に設問ダイアログが出ていなかった（回答キーを打てば入力欄へ
+   * 落ちる）。キーは 1 つも打たずに設問を閉じた（question-stale）。
+   */
+  | { type: "question_answer_result"; id: string; status: "accepted" | "already_resolved" | "unknown" | "stale" }
   | { type: "input_claim_result"; id: string; status: "granted" | "duplicate" }
   | { type: "codex_turn_result"; id: string; status: "started" | "duplicate" | "failed"; error?: string }
   | { type: "codex_goal_result"; id: string; status: "ok" | "failed"; goal?: CodexGoalInfo; cleared?: boolean; error?: string }
@@ -383,7 +387,8 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
   }
   if (record["type"] === "question_answer_result") {
     const id = record["id"], status = record["status"];
-    return typeof id === "string" && (status === "accepted" || status === "already_resolved" || status === "unknown")
+    return typeof id === "string" &&
+      (status === "accepted" || status === "already_resolved" || status === "unknown" || status === "stale")
       ? { type: "question_answer_result", id, status } : null;
   }
   if (record["type"] === "input_claim_result") {
@@ -500,7 +505,9 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
       // pane_preview 封筒は pane_preview 本体に加え、pump が同じ writer で流す input_suggestion
       // （プロンプト提案チップ）も運ぶ。ここを pane_preview 限定にすると提案が hub→engine 境界で
       // 落ち、iOS に届かない（prompt-suggestion-chip 配信の実体）。
-      return payload.type === "pane_preview" || payload.type === "input_suggestion"
+      // 入力欄に残った文字の通知（input_residue）も同じ pump が流す。
+      return payload.type === "pane_preview" || payload.type === "input_suggestion" ||
+        payload.type === "input_residue"
         ? { type: record["type"], session, payload }
         : null;
     }

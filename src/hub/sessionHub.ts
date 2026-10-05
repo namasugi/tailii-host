@@ -111,6 +111,8 @@ export type HubPreviewPumpFactory = (
   pollIntervalMs?: () => number,
   /** 使用量制限の自動再開待ち（pane フッター）の遷移通知（usage-limit-wait）。 */
   onUsageLimitWait?: (state: UsageLimitWaitState | null) => void,
+  /** 会話が待機中（処理中でない）か。入力欄に残った文字の通知（input-residue）の条件。 */
+  isIdle?: () => boolean,
 ) => HubPreviewPump;
 
 export type SessionHubOptions = Omit<ReaperTickOptions, "now"> & {
@@ -132,6 +134,14 @@ export type SessionHubOptions = Omit<ReaperTickOptions, "now"> & {
   previewPumpFactory?: HubPreviewPumpFactory;
   replayLimit?: number;
   questionInjector?: (answers: QuestionAnswer[], session: string) => Promise<void>;
+  /**
+   * TUI に AskUserQuestion の設問ダイアログが出ているか（回答キーを打つ前の確認, question-stale）。
+   * false = 出ていない（キーを打たず `stale` で返す）。null = 判定できない（従来どおり打つ）。
+   * 省略時は確認しない。
+   */
+  questionDialogVisible?: (session: string) => Promise<boolean | null>;
+  /** `stale` の後、設問ダイアログを確かめ直す最初の待ち（ms, 既定 1500。以後 2 倍・4 倍で計 3 回。テスト注入用）。 */
+  staleQuestionRecheckMs?: number;
   /**
    * 使用量制限の自動再開待ちの遷移を利用者へ知らせる（APNs push, usage-limit-wait）。制限到達
    * （`api_error` の `rate_limit`）後は購読者が居なくても pane を低頻度で見張り、待機表示の出現・
@@ -349,10 +359,20 @@ function defaultTranscriptPathFor(meta: SessionMeta): string | null {
   return claudeTranscriptPathFor(meta);
 }
 
+/** 設問の回答時に TUI へ設問ダイアログが出ていなかった（question-stale）。キーは 1 つも打っていない。 */
+class StaleQuestionError extends Error {
+  constructor() {
+    super("AskUserQuestion dialog is not on screen");
+    this.name = "StaleQuestionError";
+  }
+}
+
 export class SessionHub {
   private readonly clients = new Map<object, (line: string) => void>();
   /** 一覧 Mission Control の watcher（処理中会話全体の pane_preview 配信先）。 */
   private readonly previewWatchers = new Set<object>();
+  /** `stale` で捨てた設問の再確認タイマー（会話ごとに 1 本, question-stale）。 */
+  private readonly staleQuestionRechecks = new Map<string, { id: string; timer: ReturnType<typeof setTimeout> }>();
   readonly actors = new Map<string, SessionActor>();
   private readonly now: () => number;
   private readonly nowMs: () => number;
@@ -610,6 +630,10 @@ export class SessionHub {
 
   handleRelayMessage(message: EngineRelayMessage): void {
     if (message.type === "question_event") {
+      // 新しい設問が来た / CLI 側でその設問が片付いた（PostToolUse）なら、捨てた設問の再確認は要らない。
+      if (message.event === "prompt" || this.staleQuestionRechecks.get(message.session)?.id === message.id) {
+        this.cancelStaleQuestionRecheck(message.session);
+      }
       const actor = this.actor(message.session);
       this.setPendingQuestion(message.session, actor, message.event === "prompt"
         ? { id: message.id, questions: message.questions ?? [], answerRoute: "tui" } : null);
@@ -718,8 +742,8 @@ export class SessionHub {
         const restoreSnapshot: PendingQuestion = actor.pendingQuestion;
         this.setPendingQuestion(message.session, actor, null);
         this.broadcast({ type: "question_event", session: message.session, event: "dismiss", id: message.questionId });
-        this.sendTo(client, { type: "question_answer_result", id: message.id, status: "accepted" });
         if (answerRoute === "codex_native") {
+          this.sendTo(client, { type: "question_answer_result", id: message.id, status: "accepted" });
           try {
             if (this.codexTurnController?.answerQuestion?.(message.questionId, message.answers) !== true) {
               this.options.log?.(`Codex native 設問回答失敗: pending 不在 (${message.questionId})`);
@@ -732,14 +756,38 @@ export class SessionHub {
           actor.questionAnswerInjections += 1;
           // 同期 throw でも `.finally` を必ず通す（通らないと回答注入中の件数が戻らず、chat が
           // 永久に保留される）。
+          // 回答キーは TUI に設問ダイアログが出ているときだけ打つ（question-stale）。出ていなければ
+          // 数字キーは入力欄へ落ち、Enter の無い単一選択では「1」が入ったまま会話が止まる
+          // （実機 2026-10-05: 設問カードに答えたら CLI の入力欄に 1 が残り、アプリは処理中のまま）。
+          // 判定できない（pane を読めない）ときは従来どおり打つ。確認しない構成では従来どおり即受理。
+          const dialogVisible = this.options.questionDialogVisible;
+          const accept = (): void => {
+            this.sendTo(client, { type: "question_answer_result", id: message.id, status: "accepted" });
+          };
+          if (dialogVisible === undefined) accept();
           let injection: Promise<void>;
           try {
-            injection = this.options.questionInjector?.(message.answers, message.session) ?? Promise.resolve();
+            injection = (async () => {
+              if (dialogVisible !== undefined) {
+                if (await dialogVisible(message.session) === false) throw new StaleQuestionError();
+                accept();
+              }
+              await this.options.questionInjector?.(message.answers, message.session);
+            })();
           } catch (error) {
             injection = Promise.reject(error);
           }
           void injection
             .catch((error) => {
+              if (error instanceof StaleQuestionError) {
+                // 設問はもう TUI に無い（回答済み・取り消し済み・表示されなかった）。復元も再提示もしない。
+                this.sendTo(client, { type: "question_answer_result", id: message.id, status: "stale" });
+                this.options.log?.(
+                  `audit question-stale session=${auditValue(message.session)} question=${auditValue(message.questionId)}`,
+                );
+                this.recheckStaleQuestion(message.session, actor, restoreSnapshot);
+                return;
+              }
               this.options.log?.(`設問回答注入失敗: ${String(error)}`);
               // 自己修復（question-answer-retry）: pendingQuestion を失ったまま TUI ダイアログが
               // 残ると、アプリから再回答する手段が無く会話が詰む。失敗の度に必ず復元し、
@@ -1086,6 +1134,8 @@ export class SessionHub {
   }
 
   close(): void {
+    for (const recheck of this.staleQuestionRechecks.values()) clearTimeout(recheck.timer);
+    this.staleQuestionRechecks.clear();
     for (const actor of this.actors.values()) {
       if (actor.tailRetryTimer !== null) clearTimeout(actor.tailRetryTimer);
       actor.tailRetryTimer = null;
@@ -1998,6 +2048,10 @@ export class SessionHub {
         return 1000;
       },
       (state) => this.handleUsageLimitWait(session, actor, state),
+      // 入力欄に残った文字の通知（input-residue）は処理中でない間だけ。hub 自身が発話・設問の回答・
+      // 今すぐ送信を打っている最中の入力欄も、残り文字とみなさない。
+      () => actor.processingSince === null && !actor.chatDrainRunning && actor.questionAnswerInjections === 0 &&
+        !actor.sendNowRunning,
     );
     actor.previewPump = pump;
     pump.start(
@@ -2848,6 +2902,62 @@ export class SessionHub {
   private bumpSafe(session: string, event: string, fallbackState: "active" | "idle" = "idle"): void {
     try { bumpHeartbeat(this.options.heartbeatDir, session, this.now(), event, fallbackState); }
     catch (error) { this.options.log?.(`heartbeat 書込失敗: ${String(error)}`); }
+  }
+
+  /**
+   * `stale` で捨てた設問を、少し後に確かめ直す（question-stale）。設問の通知は PreToolUse hook が allow を
+   * 返す前に届くので、利用者の他の遅い hook があるとダイアログはまだ描かれていないことがある。その窓で
+   * 答えられた設問は、ダイアログが出てきたら戻して再提示する。間隔を広げて数回まで確かめ、別の設問が来た・
+   * CLI 側で片付いた（PostToolUse の dismiss）・会話が入れ替わった・hub を閉じたら止める。
+   */
+  private recheckStaleQuestion(session: string, actor: SessionActor, snapshot: PendingQuestion): void {
+    const dialogVisible = this.options.questionDialogVisible;
+    if (dialogVisible === undefined) return;
+    this.cancelStaleQuestionRecheck(session);
+    const delays = this.options.staleQuestionRecheckMs !== undefined
+      ? [this.options.staleQuestionRecheckMs, this.options.staleQuestionRecheckMs * 2, this.options.staleQuestionRecheckMs * 4]
+      : [1_500, 3_000, 6_000];
+    const schedule = (attempt: number): void => {
+      const delay = delays[attempt];
+      if (delay === undefined) {
+        this.cancelStaleQuestionRecheck(session);
+        return;
+      }
+      const timer = setTimeout(() => {
+        void (async () => {
+          const mine = (): boolean => this.staleQuestionRechecks.get(session)?.timer === timer;
+          const alive = (): boolean => mine() && this.actors.get(session) === actor && actor.pendingQuestion === null;
+          const settle = (): void => { if (mine()) this.staleQuestionRechecks.delete(session); };
+          if (!alive()) {
+            settle();
+            return;
+          }
+          const visible = await dialogVisible(session);
+          if (!alive()) {
+            settle();
+            return;
+          }
+          if (visible !== true) {
+            schedule(attempt + 1);
+            return;
+          }
+          this.cancelStaleQuestionRecheck(session);
+          this.setPendingQuestion(session, actor, snapshot);
+          this.broadcast({ type: "question_event", session, event: "prompt", id: snapshot.id, questions: snapshot.questions });
+          this.options.log?.(`audit question-stale-restored session=${auditValue(session)} question=${auditValue(snapshot.id)}`);
+        })().catch(() => { /* 確認は best-effort。 */ });
+      }, delay);
+      timer.unref?.();
+      this.staleQuestionRechecks.set(session, { id: snapshot.id, timer });
+    };
+    schedule(0);
+  }
+
+  private cancelStaleQuestionRecheck(session: string): void {
+    const recheck = this.staleQuestionRechecks.get(session);
+    if (recheck === undefined) return;
+    clearTimeout(recheck.timer);
+    this.staleQuestionRechecks.delete(session);
   }
 
   private setPendingQuestion(session: string, actor: SessionActor, pending: PendingQuestion | null): void {

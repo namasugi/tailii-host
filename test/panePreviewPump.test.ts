@@ -526,4 +526,87 @@ describe("PanePreviewPump", () => {
     expect(messages().some((m) => m.type === "input_suggestion")).toBe(false);
     pump.stop();
   });
+  test("isIdle: 待機中に入力欄へ残った実テキストを静止後に input_residue で流し、消えたら解消する（input-residue）", async () => {
+    vi.useFakeTimers();
+    const ESC = "\u001b";
+    const RULE = "─".repeat(40);
+    const BAR = "  ⏵⏵ auto mode on (shift+tab to cycle)";
+    const screen = (body: string) => [RULE, `❯ ${body}`, RULE, BAR].join("\n");
+    const ghost = (body: string) => [RULE, `❯ ${ESC}[0m${ESC}[2m${body}${ESC}[0m`, RULE, BAR].join("\n");
+
+    let ansi = screen("");
+    let idle = true;
+    const { writer, messages } = memoryWriter();
+    const pump = new PanePreviewPump({
+      writer,
+      capture: async () => "static",
+      captureSuggestion: async () => ansi,
+      isIdle: () => idle,
+      residueStableMs: 30,
+      pollIntervalMs: 10,
+      suggestionIntervalMs: 10,
+      protocolVersion: () => 2,
+    });
+    const residues = () =>
+      messages().filter((m): m is Extract<ControlMessage, { type: "input_residue" }> =>
+        m.type === "input_residue").map((m) => m.text);
+
+    pump.start("work");
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(20);
+    // 空入力の初回も 1 回だけ流す（作り直された pump の前に出ていたバナーを消す）。
+    expect(residues()).toEqual([""]);
+
+    // 薄字の提案は残留ではない。
+    ansi = ghost("1");
+    await vi.advanceTimersByTimeAsync(60);
+    expect(residues()).toEqual([""]);
+
+    // 実テキストは静止時間に満たないうちは流さない（打鍵中を拾わない）。
+    ansi = screen("1");
+    await vi.advanceTimersByTimeAsync(10);
+    expect(residues()).toEqual([""]);
+    await vi.advanceTimersByTimeAsync(40);
+    expect(residues()).toEqual(["", "1"]);
+
+    // 変わらなければ再送しない。
+    await vi.advanceTimersByTimeAsync(40);
+    expect(residues()).toEqual(["", "1"]);
+
+    // 処理が始まったら（待機中でない）すぐ解消を流す。
+    idle = false;
+    await vi.advanceTimersByTimeAsync(10);
+    expect(residues()).toEqual(["", "1", ""]);
+
+    // 待機に戻って再び静止したら知らせ直す。
+    idle = true;
+    await vi.advanceTimersByTimeAsync(60);
+    expect(residues()).toEqual(["", "1", "", "1"]);
+    // 後から加わった前面購読者へは、変化が無くても知らせ直す。
+    pump.resendLastIfInteractive();
+    expect(residues()).toEqual(["", "1", "", "1", "1"]);
+    // 離脱時は解消を流す。
+    pump.stop();
+    expect(residues()).toEqual(["", "1", "", "1", "1", ""]);
+  });
+
+  test("isIdle 未指定なら input_residue を流さない", async () => {
+    vi.useFakeTimers();
+    const RULE = "─".repeat(40);
+    const { writer, messages } = memoryWriter();
+    const pump = new PanePreviewPump({
+      writer,
+      capture: async () => "static",
+      captureSuggestion: async () => [RULE, "❯ 1", RULE, "  ⏵⏵ auto mode on"].join("\n"),
+      pollIntervalMs: 10,
+      suggestionIntervalMs: 10,
+      residueStableMs: 10,
+      protocolVersion: () => 2,
+    });
+    pump.start("work");
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(80);
+    expect(messages().some((m) => m.type === "input_residue")).toBe(false);
+    pump.stop();
+  });
 });

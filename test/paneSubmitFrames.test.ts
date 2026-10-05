@@ -13,6 +13,7 @@ import {
   classifySubmitFrame,
   inputBoxHasRealPendingText,
   inputBoxRealText,
+  inputBoxResidueText,
   screenBusyButScrolledAway,
   screenShouldJumpToLatest,
   screenShowsApprovalDialog,
@@ -290,5 +291,48 @@ describe("screenShouldJumpToLatest（上へスクロールされた画面を最�
     // ダイアログの本文に案内の文言があっても戻さない。
     const quotedInDialog = APPROVAL_DIALOG.replace(/\n/, "\n  3 new messages ↓\n");
     expect(screenShouldJumpToLatest(quotedInDialog)).toBe(false);
+  });
+});
+
+describe("inputBoxResidueText（入力欄に残った文字, input-residue）", () => {
+  test("打ちかけの文字・端末側の下書きは拾う", () => {
+    expect(inputBoxResidueText(TYPED)).toBe("pending text frame");
+    // 2.1.289 実機: 設問の回答キーが入力欄へ落ちて残った形（2026-10-05 の障害）。
+    expect(inputBoxResidueText(frame("typed-digit-idle"))).toBe("1");
+    expect(inputBoxResidueText(frame("queued-with-draft"))).toBe("a draft typed on the Mac side");
+  });
+
+  test("シェルモードの入力は拾わない（本文だけ見せて送らせるとシェルコマンドを実行させる）", () => {
+    expect(inputBoxRealText(SHELL_MODE)).toBe("echo hi");
+    expect(inputBoxResidueText(SHELL_MODE)).toBe("");
+  });
+
+  test("ボトムバーの無い画面（Enter to confirm の確認・ピッカー）は入力欄と信じない", () => {
+    const rule = "─".repeat(60);
+    const trust = [
+      " Do you trust the files in this folder?", "", rule,
+      " ❯ 1. Yes, I trust this folder", "   2. No, exit", rule,
+      " Enter to confirm · Esc to cancel",
+    ].join("\n");
+    expect(inputBoxResidueText(trust)).toBe("");
+    // 同じ入力欄の形でも、下にボトムバーがあれば入力欄として読む。
+    const typed = [rule, "❯ 1", rule, "  ⏵⏵ auto mode on (shift+tab to cycle)"].join("\n");
+    expect(inputBoxResidueText(typed)).toBe("1");
+  });
+
+  test("空の入力欄・処理中は拾わない", () => {
+    expect(inputBoxResidueText(IDLE)).toBe("");
+    expect(inputBoxResidueText(PROCESSING)).toBe("");
+    expect(inputBoxResidueText(frame("named-idle-herdr"))).toBe("");
+  });
+
+  test("入力欄の位置に描かれる選択ダイアログ（設問・承認）の本文は拾わない", () => {
+    // inputBoxRealText はダイアログ本体を入力欄の文字と読む（だから専用の判定を設けた）。
+    expect(inputBoxRealText(QUESTION_DIALOG)).not.toBe("");
+    for (const name of ["question-dialog", "question-dialog-multi", "question-dialog-multiselect-single",
+      "question-dialog-preview", "approval-dialog",
+      "approval-cursor-moved", "approval-safety-artifact"]) {
+      expect(inputBoxResidueText(frame(name)), name).toBe("");
+    }
   });
 });

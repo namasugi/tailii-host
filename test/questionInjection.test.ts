@@ -3,7 +3,7 @@
 
 import { expect, test } from "vitest";
 import {
-  injectQuestionAnswers, isPreviewQuestionFrame, isQuestionDialogFrame,
+  injectQuestionAnswers, isPreviewQuestionFrame, isQuestionDialogFrame, questionDialogVisible,
 } from "../src/hub/questionInjection.js";
 import type { SessionBackend } from "../src/backend/sessionBackend.js";
 import type { QuestionAnswer } from "../src/protocol.js";
@@ -204,4 +204,48 @@ test("pane 読取失敗は検証不能として正常完了扱いにする（誤
   await expect(
     injectQuestionAnswers(SINGLE_ANSWER, "work", backend),
   ).resolves.toBeUndefined();
+});
+
+/** 会話本文の番号付きリストの下に空の入力欄があるだけの画面（設問ダイアログは出ていない）。 */
+const IDLE_PROMPT_WITH_NUMBERED_TEXT = [
+  "  どう進めますか？",
+  "",
+  "  1. 向こうの作業が終わるのを待ってから、私がまとめて直す",
+  "  2. 同期の修正は向こうに任せ、私は同期以外の指摘を直す",
+  "  3. 向こうを止めて、私がすべて引き受ける",
+  "",
+  "─".repeat(40),
+  "❯ ",
+  "─".repeat(40),
+  "  ⏵⏵ auto mode on (shift+tab to cycle)",
+].join("\n");
+
+test("questionDialogVisible: 設問ダイアログが出ていれば true、本文の番号付きリストだけなら読み直しても false（question-stale）", async () => {
+  expect(await questionDialogVisible("work", stubBackend([QUESTION_DIALOG]).backend)).toBe(true);
+  expect(await questionDialogVisible("work", stubBackend([IDLE_PROMPT_WITH_NUMBERED_TEXT]).backend)).toBe(false);
+  // 描画途中で 1 回目に見えなくても、読み直しで出ていれば true。
+  expect(await questionDialogVisible(
+    "work", stubBackend([IDLE_PROMPT_WITH_NUMBERED_TEXT, QUESTION_DIALOG]).backend,
+  )).toBe(true);
+});
+
+test("questionDialogVisible: pane を読めなければ null（判定不能 = 従来どおり打つ側へ倒す）", async () => {
+  const backend = {
+    capturePane: async () => { throw new Error("pane not found"); },
+  } as unknown as SessionBackend;
+  expect(await questionDialogVisible("work", backend)).toBeNull();
+});
+
+test("実機 2.1.289 の 1 問 multiSelect / preview の設問は「出ている」、入力欄に数字が残った待機画面は「出ていない」（question-stale）", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const dir = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "pane");
+  const plain = (name: string) => fs.readFileSync(path.join(dir, `${name}.ansi`), "utf8")
+    // eslint-disable-next-line no-control-regex
+    .replace(/\u001b\[[0-9;:?]*[ -/]*[@-~]/g, "");
+  expect(await questionDialogVisible("work", stubBackend([plain("question-dialog-multiselect-single")]).backend)).toBe(true);
+  expect(isPreviewQuestionFrame(plain("question-dialog-preview"))).toBe(true);
+  expect(await questionDialogVisible("work", stubBackend([plain("question-dialog-preview")]).backend)).toBe(true);
+  expect(await questionDialogVisible("work", stubBackend([plain("typed-digit-idle")]).backend)).toBe(false);
 });

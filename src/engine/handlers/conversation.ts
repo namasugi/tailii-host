@@ -175,29 +175,42 @@ export const conversationHandlers: HandlerRegistry = {
     })();
   },
 
-  question_answer: async (message, ctx) => {
+  question_answer: (message, ctx) => {
     const { writer, state } = ctx;
     const v = state.negotiatedVersion;
-    try {
-      const requestId = randomUUID();
-      const result = await ctx.hubRpc<Extract<HubServerMessage, { type: "question_answer_result" }>>(
-        { type: "question_answer_submit", id: requestId, session: message.session,
-          questionId: message.id, answers: message.answers }, requestId, 2_000,
-      );
-      if (result.status === "accepted") {
-        writer.write({ type: "remote_pending_cleared", v, id: message.id,
-          session: message.session, kind: "question" });
-      } else if (result.status === "already_resolved") {
-        // 送信失敗（要リトライ）と区別できるコードで返す。iOS はこのコードでは
-        // 設問シートを復元しない（他所で回答済みの正常系, question-answer-retry）。
-        writeError(writer, v, message.id, "question_already_answered", "この設問は既に回答済みです。");
-      } else {
-        writeError(writer, v, message.id, "question_answer_failed",
-          "設問が見つかりませんでした。時間をおいて再試行してください。");
+    const requestId = randomUUID();
+    // hub への送出はここで同期的に済ませる（後続の chat_send / 中断より先に hub へ届く順序を保つ）。応答は
+    // 待たずに次の行へ進む: hub は回答キーを打つ前に設問ダイアログの有無を pane で確かめる（question-stale。
+    // capture 2 回 + 300ms、負荷時は数秒）ので、await すると read loop が止まり中断キーまで待たされる。
+    const reply = ctx.hubRpc<Extract<HubServerMessage, { type: "question_answer_result" }>>(
+      { type: "question_answer_submit", id: requestId, session: message.session,
+        questionId: message.id, answers: message.answers }, requestId,
+      // host 負荷で capture が遅れても受理/stale を取りこぼさない幅。
+      5_000,
+    );
+    ctx.trackBackground((async () => {
+      try {
+        const result = await reply;
+        if (result.status === "accepted") {
+          writer.write({ type: "remote_pending_cleared", v, id: message.id,
+            session: message.session, kind: "question" });
+        } else if (result.status === "stale") {
+          // 設問は TUI に出ていなかった。回答キーは打っていない（question-stale）。iOS は
+          // シートを戻さず、処理中表示を解除して会話内に知らせる。
+          writeError(writer, v, message.id, "question_stale",
+            "設問が画面に出ていなかったため、回答は送っていません。");
+        } else if (result.status === "already_resolved") {
+          // 送信失敗（要リトライ）と区別できるコードで返す。iOS はこのコードでは
+          // 設問シートを復元しない（他所で回答済みの正常系, question-answer-retry）。
+          writeError(writer, v, message.id, "question_already_answered", "この設問は既に回答済みです。");
+        } else {
+          writeError(writer, v, message.id, "question_answer_failed",
+            "設問が見つかりませんでした。時間をおいて再試行してください。");
+        }
+      } catch (error) {
+        writeError(writer, v, message.id, "question_answer_failed", String(error));
       }
-    } catch (error) {
-      writeError(writer, v, message.id, "question_answer_failed", String(error));
-    }
+    })());
   },
 
   history_page_request: async (message, ctx) => {
