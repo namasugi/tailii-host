@@ -101,6 +101,25 @@ export function apiErrorAssistantKind(text: string): string | null {
  */
 const AUTO_CONTINUE_NOTICE = "⏱️ 使用量制限がリセットされ、Claude Code が作業を自動再開しました";
 
+/**
+ * 予約した再開（ScheduleWakeup / `/loop` / CronCreate の発火）で Claude Code が流すプロンプトの注記
+ * （scheduled-prompt）。transcript では user 行（`isMeta: true` / `turnOrigin: "scheduled"` /
+ * `scheduledTaskId`）として書かれ、そのままだと利用者が発話したように見える（実機 2026-10-05: 作業中の
+ * Claude が予約した保険の再開が、利用者の吹き出しで出た）。本文は予約時のプロンプトなので添える。
+ */
+const SCHEDULED_PROMPT_NOTICE_PREFIX = "⏰ 予約していた再開";
+/** 注記に添える予約プロンプトの上限（コードポイント）。 */
+const SCHEDULED_PROMPT_NOTICE_MAX = 200;
+
+/** 予約した再開の注記本文。 */
+function scheduledPromptNotice(prompt: string): string {
+  const points = Array.from(prompt.trim().replaceAll(/\s+/g, " "));
+  const body = points.length > SCHEDULED_PROMPT_NOTICE_MAX
+    ? `${points.slice(0, SCHEDULED_PROMPT_NOTICE_MAX).join("")}…`
+    : points.join("");
+  return body.length > 0 ? `${SCHEDULED_PROMPT_NOTICE_PREFIX}: ${body}` : SCHEDULED_PROMPT_NOTICE_PREFIX;
+}
+
 /** 制限到達から自動再開プロンプトを待つ時間窓（週次制限のリセットでも一晩は待つ）。 */
 const AUTO_CONTINUE_WINDOW_MS = 12 * 60 * 60 * 1000;
 
@@ -295,6 +314,8 @@ interface Turn {
   skillInjection?: { toolUseId: string; text: string };
   /** user 行の `isMeta`（harness 注入のプロンプト。制限リセット後の自動再開プロンプト判定に使う）。 */
   isMeta?: boolean;
+  /** 予約した再開の発火で流れたプロンプトの user 行（`turnOrigin: "scheduled"` / `scheduledTaskId`）。 */
+  scheduled?: boolean;
   /** Artifact ツールの tool_result から拾った公開 URL（該当ツールカードへ後付けする, artifact-card）。 */
   artifactResults?: { toolUseId: string; url: string }[];
 }
@@ -690,7 +711,11 @@ function* emitLine(line: Buffer, state: TailState): Generator<ControlMessage, vo
     state.rateLimitArmed = false;
   }
   let foldAutoContinue = false;
-  if (turn.role === "user" && turn.text.length > 0 && userLineKind(text) === "utterance") {
+  // 予約した再開のプロンプト（scheduled-prompt）は自動再開の判定より先に見る: どちらも isMeta の user 行で、
+  // 制限に当たった後に保険の予約が発火すると「制限がリセットされ自動再開した」と誤って畳んでしまう。
+  // 予約の行は制限待ちの武装も解かない（後から来る本物の自動再開プロンプトを畳めるように残す）。
+  const scheduledPrompt = turn.role === "user" && turn.scheduled === true && turn.text.length > 0;
+  if (!scheduledPrompt && turn.role === "user" && turn.text.length > 0 && userLineKind(text) === "utterance") {
     const lineAtMs = lineTimestampMs(line);
     const inWindow =
       state.rateLimitArmedAtMs === null || !Number.isFinite(lineAtMs) ||
@@ -733,6 +758,11 @@ function* emitLine(line: Buffer, state: TailState): Generator<ControlMessage, vo
   if (foldAutoContinue) {
     turn.role = "system";
     turn.text = AUTO_CONTINUE_NOTICE;
+  } else if (scheduledPrompt) {
+    // 予約した再開のプロンプト（scheduled-prompt）: ターンは始める（turn_start は上で観測済み）が、
+    // 利用者の発話ではないので表示は注記へ畳む。
+    turn.role = "system";
+    turn.text = scheduledPromptNotice(turn.text);
   }
 
   for (const prompt of turn.questionPrompts) {
@@ -977,6 +1007,9 @@ export function extractTurn(line: string, ctx?: SystemNoticeContext): Turn | nul
   }
   if (role === "user") {
     if (rec["isMeta"] === true) turn.isMeta = true;
+    if (rec["turnOrigin"] === "scheduled" || (rec["isMeta"] === true && typeof rec["scheduledTaskId"] === "string")) {
+      turn.scheduled = true;
+    }
     const artifactResults = extractArtifactResults(rawContent);
     if (artifactResults.length > 0) turn.artifactResults = artifactResults;
   }

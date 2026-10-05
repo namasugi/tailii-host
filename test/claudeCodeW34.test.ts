@@ -386,3 +386,62 @@ describe("golden: claude-code-w34-v1.ndjson", () => {
     expect(start).toMatchObject({ type: "session_start", outputStyle: "Concise", todoTools: true, worktree: "#1234" });
   });
 });
+
+describe("scheduled-prompt: 予約した再開のプロンプトは利用者の発話ではなく注記へ", () => {
+  async function run(lines: string[]): Promise<{ out: { role: string; text: string }[]; events: unknown[] }> {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tailii-scheduled-"));
+    try {
+      const file = path.join(dir, "s.jsonl");
+      fs.writeFileSync(file, lines.join("\n") + "\n");
+      const tailer = new TranscriptTailer({ tailDeadlineMs: 200, pollIntervalMs: 10 });
+      const events: unknown[] = [];
+      tailer.setTurnLifecycleObserver((event) => events.push(event));
+      const out: { role: string; text: string }[] = [];
+      for await (const message of tailer.streamTranscript(file)) {
+        if (message.type === "chat_output" && message.streamId.startsWith("pc:") === false) out.push({ role: message.role, text: message.text });
+      }
+      return { out, events };
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it("ScheduleWakeup の発火行（turnOrigin: scheduled）は system 注記にし、turn_start は出す", async () => {
+    // 実測 2.1.289: 発火は system/scheduled_task_fire の直後に isMeta の user 行として書かれる。
+    const fire = JSON.stringify({ type: "system", subtype: "scheduled_task_fire", uuid: "f1",
+      timestamp: "2026-10-04T21:07:00.330Z", content: "Claude resuming /loop wakeup (Oct 5 6:07am)", isMeta: false });
+    const prompt = JSON.stringify({ type: "user", uuid: "p1", isMeta: true, promptSource: "system",
+      turnOrigin: "scheduled", scheduledTaskId: "e2e80f73", timestamp: "2026-10-04T21:07:00.381Z",
+      message: { role: "user", content: "HEAD でのフォーカス系テスト結果を確認し、反映を続ける" } });
+    const real = JSON.stringify({ type: "user", uuid: "r1", timestamp: "2026-10-04T21:10:00.000Z",
+      message: { role: "user", content: "発話していない会話が入った" } });
+    const { out, events } = await run([fire, prompt, real]);
+    const userTexts = out.filter((m) => m.role === "user").map((m) => m.text);
+    expect(userTexts).toEqual(["発話していない会話が入った"]);
+    expect(out).toContainEqual({ role: "system", text: "⏰ 予約していた再開: HEAD でのフォーカス系テスト結果を確認し、反映を続ける" });
+    expect(events).toContainEqual({ kind: "turn_start", atMs: Date.parse("2026-10-04T21:07:00.381Z") });
+  });
+
+  it("使用量制限の直後に発火した予約は予約の注記にし、制限待ちの武装は残す（後の本物の自動再開は畳む）", async () => {
+    const apiError = JSON.stringify({ type: "assistant", uuid: "e1", timestamp: "2026-10-04T21:00:00.000Z", isApiErrorMessage: true,
+      error: "rate_limit", message: { role: "assistant", model: "<synthetic>", content: [{ type: "text", text: "You've hit your session limit · resets 3pm" }] } });
+    const scheduled = JSON.stringify({ type: "user", uuid: "p1", isMeta: true, promptSource: "system",
+      turnOrigin: "scheduled", scheduledTaskId: "t1", timestamp: "2026-10-04T21:30:00.000Z",
+      message: { role: "user", content: "テスト結果を確認する" } });
+    const autoContinue = JSON.stringify({ type: "user", uuid: "m1", isMeta: true, timestamp: "2026-10-04T21:40:00.000Z",
+      message: { role: "user", content: "Continue the task you were working on before the usage limit." } });
+    const { out } = await run([apiError, scheduled, autoContinue]);
+    const notices = out.filter((m) => m.role === "system").map((m) => m.text);
+    expect(notices[0]).toBe("⏰ 予約していた再開: テスト結果を確認する");
+    expect(notices[1]).toContain("自動再開");
+    expect(out.some((m) => m.role === "user")).toBe(false);
+  });
+
+  it("scheduledTaskId だけ（isMeta 付き）でも予約の発火とみなし、長いプロンプトは切り詰める", async () => {
+    const long = "あ".repeat(250);
+    const prompt = JSON.stringify({ type: "user", uuid: "p2", isMeta: true, scheduledTaskId: "loop-1",
+      timestamp: "2026-10-04T21:07:00.381Z", message: { role: "user", content: long } });
+    const { out } = await run([prompt]);
+    expect(out).toEqual([{ role: "system", text: `⏰ 予約していた再開: ${"あ".repeat(200)}…` }]);
+  });
+});
