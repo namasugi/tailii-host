@@ -45,6 +45,14 @@ const QUEUED_STREAMING_MULTI = frame("queued-streaming-multi");
 const QUEUED_WRAPPED = frame("queued-wrapped");
 /** herdr（拡張キーを解する端末。ヒントは `ctrl+enter to send now`）。 */
 const QUEUED_HERDR = frame("queued-herdr");
+/**
+ * fullscreen（`tui: fullscreen`）で `/diff` の差分パネルを右に開いたまま、ツール実行中にキュー済み 1 件
+ * （herdr 0.9.3 + 2.1.292 の生キャプチャ。pane 214×62）。本文の各行は 125 桁目の縦線 `│` でパネルと区切られ、
+ * ヒント行も `…to send now …│` になる。会話が短いのでヒント行の下に本文側が空の行（`…│`）が 37 行続く。
+ */
+const QUEUED_FULLSCREEN_DIFF = frame("queued-fullscreen-diff");
+/** 同じ画面で chord を送った直後（ヒントが消え、発話は本文の `❯` 行になり、入力欄は空に戻る）。 */
+const QUEUED_FULLSCREEN_DIFF_SENT = frame("queued-fullscreen-diff-sent");
 /** chord を送った直後（ヒントが消え、バーに `1 shell` が出る）。 */
 const QUEUED_SENT = frame("queued-sent");
 /** キュー済み 1 件 + 入力欄に Mac 側で打った下書き（未送信）。 */
@@ -69,16 +77,18 @@ describe("screenSendNowHint（実機キャプチャ）", () => {
     expect(screenSendNowHint(QUEUED_WRAPPED)).toBe("ready");
     expect(screenSendNowHint(QUEUED_HERDR)).toBe("ready");
     expect(screenSendNowHint(QUEUED_PASTE_HINT)).toBe("ready");
+    expect(screenSendNowHint(QUEUED_FULLSCREEN_DIFF)).toBe("ready");
   });
 
   test("キューが無いフレームは absent（chord を送った直後を含む）", () => {
     expect(screenSendNowHint(QUEUED_SENT)).toBe("absent");
+    expect(screenSendNowHint(QUEUED_FULLSCREEN_DIFF_SENT)).toBe("absent");
     for (const name of NOT_QUEUED) expect(screenSendNowHint(frame(name)), name).toBe("absent");
   });
 
   test("キュー済みのフレームは入力欄が空と判定される（プレースホルダーを下書きと数えない）", () => {
     // `Press up to edit queued messages` を実テキストと数えると、下書きありで常に断ってしまう。
-    for (const screen of [QUEUED_TOOL, QUEUED_STREAMING_MULTI, QUEUED_WRAPPED, QUEUED_HERDR]) {
+    for (const screen of [QUEUED_TOOL, QUEUED_STREAMING_MULTI, QUEUED_WRAPPED, QUEUED_HERDR, QUEUED_FULLSCREEN_DIFF]) {
       expect(classifySubmitFrame(screen)).toBe("submitted");
     }
   });
@@ -199,6 +209,12 @@ function makeIo(frames: Array<string | null>) {
 describe("sendQueuedNow", () => {
   test("ヒントが見えていれば chord を 1 回送り、消えたら sent", async () => {
     const { io, sendChord } = makeIo([QUEUED_TOOL, QUEUED_TOOL, QUEUED_SENT]);
+    expect(await sendQueuedNow(io)).toEqual({ status: "sent" });
+    expect(sendChord).toHaveBeenCalledTimes(1);
+  });
+
+  test("fullscreen の差分パネル（縦線 │ 付きの行）でも chord を送り、消えたら sent", async () => {
+    const { io, sendChord } = makeIo([QUEUED_FULLSCREEN_DIFF, QUEUED_FULLSCREEN_DIFF, QUEUED_FULLSCREEN_DIFF_SENT]);
     expect(await sendQueuedNow(io)).toEqual({ status: "sent" });
     expect(sendChord).toHaveBeenCalledTimes(1);
   });

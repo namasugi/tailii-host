@@ -23,6 +23,8 @@ tmux `capture-pane -p -e`（ANSI 付き・viewport のみ）でそのまま採�
 | `queued-streaming-multi.ansi` | 応答の生成中にキュー済み 2 件（スピナー行が無い） | `⏸ manual mode on · 1 monitor · esc to interrupt · ← for agents · ↓ to manage` |
 | `queued-wrapped.ansi` | 添付のパスで始まる長い発話（2 桁字下げで折り返す） | `⏸ manual mode on · esc to interrupt · ← for agents` |
 | `queued-herdr.ansi` | herdr で採取したキュー済み 1 件（ヒントが `ctrl+enter to send now`） | `⏸ manual mode on · esc to interrupt · ← for agents` |
+| `queued-fullscreen-diff.ansi` | 2.1.292・herdr 0.9.3（`pane read --source visible --format ansi`。pane は 214×62、herdr のウインドウは 240×63）・`tui: fullscreen` で `/diff` の差分パネルを開いたままツール実行中にキュー済み 1 件。本文の各行は 125 桁目の縦線 `│` でパネルと区切られ、ヒント行も `ctrl+enter to send now …│`。会話が短いので本文は上に寄り、ヒント行の下に 本文側が空の行（`…│`）が 37 行続く | `⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← 1 agent` |
+| `queued-fullscreen-diff-sent.ansi` | 上の画面で chord（`ctrl+x ctrl+s`）を送った直後。ヒント行が消え、発話は本文の `❯` 行になり、ツールは背景へ（`1 shell`） | `⏵⏵ auto mode on · 1 shell · esc to interrupt · ← 1 agent · ↓ to manage` |
 | `queued-with-draft.ansi` | キュー済み 1 件 + 入力欄に未送信の下書き | `⏸ manual mode on` |
 | `queued-paste-hint.ansi` | 貼り付け扱いの長文（924 字）を送った直後。キュー済み 1 件 | **`paste again to expand`**（バーの位置が案内に替わる。十数秒続く） |
 | `queued-paste-hint-draft.ansi` | 同上 + 入力欄に未送信の下書き | `paste again to expand` |

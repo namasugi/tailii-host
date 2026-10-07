@@ -1731,7 +1731,13 @@ const SEND_NOW_QUEUE_WALK_LINES = 40;
  * 誤検出しても実害は無い（キューが空のときの chord は何もしない。実測）。
  */
 export function screenSendNowHint(screen: string): SendNowHintState {
-  const lines = screen.split("\n").map((line) => stripSgr(line).trimEnd());
+  // fullscreen（`tui: fullscreen`）の差分パネルは縦線 `│` 1 本で本文と区切られ、本文の各行は末尾まで
+  // 空白で埋められてから `│` とパネルの断片が続く（2.1.292 実測: `  ctrl+enter to send now …│`）。
+  // 末尾一致のままだとヒント行を見失い、iOS の「今すぐ送信」が一切出ず、chord も打たない
+  // （2026-10-07 実障害）。さらに本文の空行も `…│` で非空になり、画面を埋める fullscreen では
+  // キュー済みの発話の下に空行が 40 行近く続いて走査窓がヒント行に届かない（生キャプチャで判明）。
+  // 行はすべて縦線より左だけを見る（CLI のヒント行そのものに `│` は無い）。
+  const lines = screen.split("\n").map((line) => mainColumnText(stripSgr(line)));
   let scanned = 0;
   for (let index = lines.length - 1; index >= 0 && scanned < SEND_NOW_HINT_WINDOW_LINES; index -= 1) {
     const line = lines[index] ?? "";
@@ -1745,6 +1751,12 @@ export function screenSendNowHint(screen: string): SendNowHintState {
     if (CHORD_NOTATION.test(chord)) return "rebound";
   }
   return "absent";
+}
+
+/** 右の差分パネル（縦線 `│` 区切り）より左の本文（末尾の空白は落とす）。縦線が無ければそのまま。 */
+function mainColumnText(line: string): string {
+  const divider = line.indexOf("│");
+  return (divider < 0 ? line : line.slice(0, divider)).trimEnd();
 }
 
 /** `index` の行から上へ折り返し（字下げ行）と空行だけを辿って、`❯` で始まる行に着くか。 */
