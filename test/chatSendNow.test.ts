@@ -29,6 +29,14 @@ import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
 import { makeTempDir, makeTempStore, MockTmuxRunner, ok } from "./helpers.js";
 
 const FIXTURE_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "pane");
+const DERIVED_FIXTURE_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "pane-derived");
+
+/** 実機キャプチャの幾何を保った匿名化フレーム（`fixtures/pane-derived/README.md`）。 */
+function derivedFrame(name: string): string {
+  const lines = fs.readFileSync(path.join(DERIVED_FIXTURE_DIR, `${name}.txt`), "utf8").split("\n");
+  while (lines.length > 0 && (lines[lines.length - 1] ?? "").trim() === "") lines.pop();
+  return lines.join("\n");
+}
 
 /** 生キャプチャを読む（末尾の空行だけは backend の capture と同じく落とす）。 */
 function frame(name: string): string {
@@ -53,6 +61,16 @@ const QUEUED_HERDR = frame("queued-herdr");
 const QUEUED_FULLSCREEN_DIFF = frame("queued-fullscreen-diff");
 /** 同じ画面で chord を送った直後（ヒントが消え、発話は本文の `❯` 行になり、入力欄は空に戻る）。 */
 const QUEUED_FULLSCREEN_DIFF_SENT = frame("queued-fullscreen-diff-sent");
+/**
+ * fullscreen の差分パネルが**変更ファイルの差分**を描いた形（2.1.293 実機の幾何・匿名化。
+ * `fixtures/pane-derived/README.md`。文字は同じ表示幅の無意味な文字に置換済み）。縦線は無く、本文の列は 150 桁、
+ * パネルは表示桁（0 起点）で 151 桁目（罫線・パス）/ 152 桁目（行番号）から。折り返した本文は 148 桁目（幅 149）まで
+ * 届き（パネルとの空白は 2〜3 桁）、
+ * ヒント行の右にもパネルの断片が乗る。
+ */
+const QUEUED_FULLSCREEN_DIFF_FILE = derivedFrame("queued-fullscreen-diff-file");
+/** 同じ画面で chord を送った後（ヒント行だけが消える）。 */
+const QUEUED_FULLSCREEN_DIFF_FILE_SENT = derivedFrame("queued-fullscreen-diff-file-sent");
 /** chord を送った直後（ヒントが消え、バーに `1 shell` が出る）。 */
 const QUEUED_SENT = frame("queued-sent");
 /** キュー済み 1 件 + 入力欄に Mac 側で打った下書き（未送信）。 */
@@ -78,17 +96,21 @@ describe("screenSendNowHint（実機キャプチャ）", () => {
     expect(screenSendNowHint(QUEUED_HERDR)).toBe("ready");
     expect(screenSendNowHint(QUEUED_PASTE_HINT)).toBe("ready");
     expect(screenSendNowHint(QUEUED_FULLSCREEN_DIFF)).toBe("ready");
+    expect(screenSendNowHint(QUEUED_FULLSCREEN_DIFF_FILE)).toBe("ready");
   });
 
   test("キューが無いフレームは absent（chord を送った直後を含む）", () => {
     expect(screenSendNowHint(QUEUED_SENT)).toBe("absent");
     expect(screenSendNowHint(QUEUED_FULLSCREEN_DIFF_SENT)).toBe("absent");
+    expect(screenSendNowHint(QUEUED_FULLSCREEN_DIFF_FILE_SENT)).toBe("absent");
     for (const name of NOT_QUEUED) expect(screenSendNowHint(frame(name)), name).toBe("absent");
   });
 
   test("キュー済みのフレームは入力欄が空と判定される（プレースホルダーを下書きと数えない）", () => {
     // `Press up to edit queued messages` を実テキストと数えると、下書きありで常に断ってしまう。
-    for (const screen of [QUEUED_TOOL, QUEUED_STREAMING_MULTI, QUEUED_WRAPPED, QUEUED_HERDR, QUEUED_FULLSCREEN_DIFF]) {
+    for (const screen of [
+      QUEUED_TOOL, QUEUED_STREAMING_MULTI, QUEUED_WRAPPED, QUEUED_HERDR, QUEUED_FULLSCREEN_DIFF, QUEUED_FULLSCREEN_DIFF_FILE,
+    ]) {
       expect(classifySubmitFrame(screen)).toBe("submitted");
     }
   });
@@ -215,6 +237,12 @@ describe("sendQueuedNow", () => {
 
   test("fullscreen の差分パネル（縦線 │ 付きの行）でも chord を送り、消えたら sent", async () => {
     const { io, sendChord } = makeIo([QUEUED_FULLSCREEN_DIFF, QUEUED_FULLSCREEN_DIFF, QUEUED_FULLSCREEN_DIFF_SENT]);
+    expect(await sendQueuedNow(io)).toEqual({ status: "sent" });
+    expect(sendChord).toHaveBeenCalledTimes(1);
+  });
+
+  test("差分パネルが縦線なしで本文の直後に続く形（ファイル差分）でも chord を送り、消えたら sent", async () => {
+    const { io, sendChord } = makeIo([QUEUED_FULLSCREEN_DIFF_FILE, QUEUED_FULLSCREEN_DIFF_FILE, QUEUED_FULLSCREEN_DIFF_FILE_SENT]);
     expect(await sendQueuedNow(io)).toEqual({ status: "sent" });
     expect(sendChord).toHaveBeenCalledTimes(1);
   });

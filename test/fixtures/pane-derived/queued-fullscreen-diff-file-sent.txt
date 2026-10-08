@@ -1,0 +1,60 @@
+                                                                                                                                                       xxx/xxx/xxx/xxx_xx_xxx.xxx
+⏺ 〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇xxxxxxxx 〇 xxxxxxxx 〇〇〇〇〇〇〇〇〇〇〇〇〇                          xxx/xxxxxxxxxxxx.xxxxxxxxx/xxxxxxxxxxxx/xxxxxxxxx/xxxxxxxxxxxx.xxxxxxxx               +0
+                                                                                                                                                       xxx/xxxxxxxxxxxx/xxxxxxxxx.xxxxx                                                      +0
+  xxx 0 xxxxx xxxxxxx                                                                                                                                  xxx/xxxxxxx.xxx                                                                    +0 -0
+                                                                                                                                                       xxxxxxx/xxxxxxxxx.xx                                                               +0 -0
+⏺ 〇〇〇〇〇〇〇xxxxx〇〇〇〇〇〇〇〇〇〇〇〇〇xxxxxxx〇〇〇〇〇〇〇〇〇xxxxx 0〇〇〇xxxxxxxx〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇
+                                                                                                                                                       ────────────────────────────────────────────────────────────────────────────────────────
+  xxx 0 xxxxx xxxxxxxx                                                                                                                                 xxx/xxx/xxx/xxx_xx_xxx.xxx (xxxxxxxxx)
+                                                                                                                                                       ────────────────────────────────────────────────────────────────────────────────────────
+⏺ xxxxx 0〇〇〇〇〇〇〇〇〇〇〇〇〇xxxxxxxx〇0〇〇xxxx〇xxxxxxxxx〇xxxxxxxxxx〇xxxx〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇xxxxxxxx〇  xxx xxxx xxx xxx xxxxxx.
+  〇〇〇〇〇〇〇〇〇〇〇                                                                                                                               xxx `xxx xxx :/xxx/xxx/xxx/xxx_xx_xxx.xxx` xx xxx xxxx xxxxxx.
+
+  xxxxxx xxxxxx-xx-xxxxxx 0 xxxxx                                                                                                                      ────────────────────────────────────────────────────────────────────────────────────────
+                                                                                                                                                       xxx/xxxxxxxxxxxx.xxxxxxxxx/xxxxxxxxxxxx/xxxxxxxxx/xxxxxxxxxxxx.xxxxxxxx
+⏺ xxxxxxxx xxxxxxx 〇〇〇〇〇〇〇〇〇〇〇〇 xxxxxxxx 〇0〇〇〇〇〇〇〇〇〇〇〇〇〇                                                                     ────────────────────────────────────────────────────────────────────────────────────────
+                                                                                                                                                        00           </xxxxxxxxxxxxxxxxxx>
+  xxxxxx xxxxxx-xx-xxxxxx 00 xxxxx                                                                                                                      00        </xxxxxxxxxxxxxxxxxxxxxxxx>
+                                                                                                                                                        00        <xxxxxxxxxxxxxxxxxxxx>
+⏺ 0〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇 xxxxxx 〇〇〇〇                                                                                                 00 +         <xxxxxxxxxxxxxxxxxxx
+                                                                                                                                                        00 +            xxxxxxxx = "-xxxxxxxxx"
+  xxxxxx xxxxxx-xx-xxxxxx 0 xxxxx                                                                                                                       00 +            xxxxxxxxx = "xx">
+                                                                                                                                                        00 +         </xxxxxxxxxxxxxxxxxxx>
+⏺ xxx xxxx xx xxxxxxx xxx 0 xxxxxxxx xxxxxx. xxxxxxxxx.                                                                                                 00        </xxxxxxxxxxxxxxxxxxxx>
+                                                                                                                                                        00        <xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  xxxxxx xxxxxx-xx-xxxxxx 0 xxxxx                                                                                                                       00           xxxxxxxxxx = "../../xxxxxxxxxxxx.xxxxxxxx">
+                                                                                                                                                        00
+⏺ xxxxxxxxx xxxx xxx xxxxxx xxxxxxx xxxxxxxxxx.
+                                                                                                                                                       ────────────────────────────────────────────────────────────────────────────────────────
+  xxxxxx xxxxxx-xx-xxxxxx 0 xxxxx                                                                                                                      xxx/xxxxxxxxxxxx/xxxxxxxxx.xxxxx
+                                                                                                                                                       ────────────────────────────────────────────────────────────────────────────────────────
+⏺ 〇〇〇〇0〇〇〇〇〇〇〇〇〇〇〇〇〇xxxxx 〇〇〇 0 〇〇〇〇〇〇〇〇 → 〇〇〇〇〇 → 〇〇〇〇〇〇〇〇〇〇                                                000          xx xxxx.xxxxxxxx("-xxxxxxxxxxxxxx") { xxxxxx xxxxxxxxx(xxxxx: .xxxxxxx) }
+                                                                                                                                                        000          // -xxxxxxxxxxxxxxx: 〇〇〇〇〇〇〇 〇〇〇〇〇 〇〇〇〇 〇〇 〇〇〇〇 〇〇
+⏺ xxxxxx(xxx/xxxxxxx.xxx)                                                                                                                                    〇(〇〇〇 〇〇 〇〇〇〇〇〇〇〇〇)
+  ⎿  xxxxx 0 xxxx, xxxxxxx 0 xxxx                                                                                                                       000          xx xxxx.xxxxxxxx("-xxxxxxxxxxxxxxx") { xxxxxx xxxxxxxxx(xxxxx: .xxxxxxxxxx
+      00      xxxxxxxxxxx_xxxx: 00x0xxxxxx                                                                                                                   , xxxxxxxxxxxx: "¥000") }
+      00      xxxxx_xxxxxxx: "0.0"                                                                                                                      000 +        // 〇〇〇〇 〇〇〇〇 〇〇〇(xxxxx)〇〇 〇〇 〇〇〇〇 〇〇〇〇〇〇〇〇 〇〇
+      00      xxxxxxxxx_xxxxxxx: "0.0"                                                                                                                      +〇〇 -xxxxxxxxx 〇 〇〇〇
+      00 -    xxxxxxx_xxxxxxx_xxxxxxx: "0"                                                                                                              000 +        xx !xxxx.xxxxxxxx("-xxxxxxxxx") { xxxxxx xxxxxxxxx(xxxxx: .xxxx(xxxxxxxxxx
+      00 +    xxxxxxx_xxxxxxx_xxxxxxx: "0"                                                                                                                  +xx: xxxxx)) }
+      00  xxxxxxx:                                                                                                                                      000          #xxxxx
+      00    xxxxxxxxxxxx:                                                                                                                               000          xxx xxxxxxx = xxxxxxxxxxx.xxxxxxxxxxx.xxxxxxxxxxx["xxxxxxxxxxxxxxxxxxxxxxx
+      00      xxxx: xxxxxxxxxxx                                                                                                                              xxxx"] != xxx
+                                                                                                                                                        000          xxxxxx xxxxxxx || xxxx.xxxxxxxx("-xxxxxxxx") ? xxxxxxxxx(xxxxx: .xxxx(xxxx
+  〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇 · 00x                                                                                                                   xxxxxxxx: xxxxx)) : xxxxxxxxx()
+  ⎿  $ xx /xxxxx/xxxxxxxx/xxxx/xxxxx/xxxxx/xxx && xxxxxxxx xxxxxxxx -x && xxxxxxxxxx xxxx -xxxxxxx xxxxxxxxxxxx.xxxxxxxxx -xxxxxx xxxxxxxxxxxx          000
+     -xxxxxxxxxxx 'xxxxxxxx=xxx xxxxxxxxx,xxxx=xxxxxx 00' -xxxxxxxxxxxxxxx xxxxx -xxxxx 0>&0 | xxxx -x "xxxxx:" | xxxx -0; x=$(xx -xx
+     xxxxx/xxxx/xxxx/*.xxxxxxxx | xxx… (00x)                                                                                                           ────────────────────────────────────────────────────────────────────────────────────────
+     (xxxx+x xx xxx xx xxxxxxxxxx)                                                                                                                     xxx/xxxxxxx.xxx
+⏺ 〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇   ────────────────────────────────────────────────────────────────────────────────────────
+  〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇    00      xxxxxxxxxxx_xxxx: 00x0xxxxxx
+  〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇〇。                                                                                                            00      xxxxx_xxxxxxx: "0.0"
+                                                                                                                                                        00      xxxxxxxxx_xxxxxxx: "0.0"
+❯ ビルドを新しく                                                                                                                                        00 -    xxxxxxx_xxxxxxx_xxxxxxx: "0"
+                                                                                                                                                        00 +    xxxxxxx_xxxxxxx_xxxxxxx: "0"
+✳ Grooving… (2m 51s · ↓ 8.8k tokens)                                                                                                                    00  xxxxxxx:
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← 1 agent

@@ -1731,22 +1731,26 @@ const SEND_NOW_QUEUE_WALK_LINES = 40;
  * 誤検出しても実害は無い（キューが空のときの chord は何もしない。実測）。
  */
 export function screenSendNowHint(screen: string): SendNowHintState {
-  // fullscreen（`tui: fullscreen`）の差分パネルは縦線 `│` 1 本で本文と区切られ、本文の各行は末尾まで
-  // 空白で埋められてから `│` とパネルの断片が続く（2.1.292 実測: `  ctrl+enter to send now …│`）。
-  // 末尾一致のままだとヒント行を見失い、iOS の「今すぐ送信」が一切出ず、chord も打たない
-  // （2026-10-07 実障害）。さらに本文の空行も `…│` で非空になり、画面を埋める fullscreen では
-  // キュー済みの発話の下に空行が 40 行近く続いて走査窓がヒント行に届かない（生キャプチャで判明）。
-  // 行はすべて縦線より左だけを見る（CLI のヒント行そのものに `│` は無い）。
+  // fullscreen（`tui: fullscreen`）の差分パネルが右に出ていると、本文の各行は本文の列（約 150 桁）まで
+  // 空白で埋められてからパネルの断片が続く。区切りはファイル一覧なら縦線 `│`（2.1.292 実測:
+  // `  ctrl+enter to send now …│`）、ファイルの差分なら空白だけ（2.1.293 実測: `  ctrl+enter to send now …
+  // 13 +    CURRENT_PROJECT_VERSION: "2"`。折り返した本文はパネルの 2〜3 桁手前まで届くので、
+  // 空白の溝の幅は当てにできない）。末尾一致のままだとヒント行を見失い、iOS の「今すぐ送信」が一切
+  // 出ず、chord も打たない（2026-10-07/08 実障害）。さらに本文側が空の行もパネルの断片で非空になり、
+  // 画面を埋める fullscreen ではキュー済みの発話の下にそれが 40 行近く続いて走査窓がヒント行に届かない。
+  // → ヒント行は「2 桁字下げの後、最初の空白 2 桁の並びまで」の語句で照合し（ヒントの文言そのものに
+  //   空白 2 桁の並びは無い）、本文側が空の行（行頭の空白が長い行）は空行として数えない。
   const lines = screen.split("\n").map((line) => mainColumnText(stripSgr(line)));
   let scanned = 0;
   for (let index = lines.length - 1; index >= 0 && scanned < SEND_NOW_HINT_WINDOW_LINES; index -= 1) {
     const line = lines[index] ?? "";
-    const trimmed = line.trim();
-    if (trimmed === "") continue;
+    if (mainColumnBlank(line)) continue;
     scanned += 1;
-    if (!line.startsWith("  ") || !trimmed.endsWith(SEND_NOW_HINT_SUFFIX)) continue;
+    if (!line.startsWith("  ")) continue;
+    const text = hintCandidateText(line);
+    if (!text.endsWith(SEND_NOW_HINT_SUFFIX)) continue;
     if (!lineFollowsQueuedPrompt(lines, index)) continue;
-    const chord = trimmed.slice(0, -SEND_NOW_HINT_SUFFIX.length).trim().toLowerCase();
+    const chord = text.slice(0, -SEND_NOW_HINT_SUFFIX.length).trim().toLowerCase();
     if (SEND_NOW_DEFAULT_CHORDS.has(chord)) return "ready";
     if (CHORD_NOTATION.test(chord)) return "rebound";
   }
@@ -1759,11 +1763,33 @@ function mainColumnText(line: string): string {
   return (divider < 0 ? line : line.slice(0, divider)).trimEnd();
 }
 
+/**
+ * 本文側が空とみなす行頭の空白の桁数。本文の字下げは深くても十数桁（ツール出力の継続行 5 桁 + その中の
+ * コードの字下げ）。サイドパネルだけの行は、本文の列（100 桁以上）が空白のまま右に断片が乗る。
+ */
+const SIDEBAR_ONLY_INDENT = 40;
+
+/** 空行、または本文側が空で右にサイドパネルの断片だけが乗っている行。 */
+function mainColumnBlank(line: string): boolean {
+  const body = line.trimStart();
+  return body === "" || line.length - body.length >= SIDEBAR_ONLY_INDENT;
+}
+
+/**
+ * 2 桁字下げの後に続く最初の語句（空白 2 桁以上の並びの手前まで）。ヒント行の文言そのものに空白 2 桁の
+ * 並びは無いので、右にサイドパネルの断片が乗っていても文言だけを取り出せる。
+ */
+function hintCandidateText(line: string): string {
+  const body = line.trimStart();
+  const gap = body.search(/ {2}/);
+  return (gap < 0 ? body : body.slice(0, gap)).trim();
+}
+
 /** `index` の行から上へ折り返し（字下げ行）と空行だけを辿って、`❯` で始まる行に着くか。 */
 function lineFollowsQueuedPrompt(lines: string[], index: number): boolean {
   for (let walked = 0, cursor = index - 1; cursor >= 0 && walked < SEND_NOW_QUEUE_WALK_LINES; cursor -= 1) {
     const line = lines[cursor] ?? "";
-    if (line.trim() === "") continue;
+    if (mainColumnBlank(line)) continue;
     walked += 1;
     if (line.codePointAt(0) === 0x276f) return true;
     if (!line.startsWith("  ")) return false;
