@@ -94,6 +94,11 @@ export interface SubagentNode {
    * Codex: 子 thread の `model`、無ければ spawnAgent の `model`）。判明するまで省略。
    */
   model?: string | null;
+  /**
+   * 実行時の工数（Claude: サブエージェント transcript の assistant 行 `effort` / Codex 0.162+:
+   * `subAgentActivity.reasoningEffort`。値は CLI のものそのまま, additive, subagent-effort）。判明するまで省略。
+   */
+  effort?: string | null;
 }
 
 /** セッション一覧応答の 1 要素。 */

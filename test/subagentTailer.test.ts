@@ -2840,4 +2840,65 @@ describe("SubagentTailer モデル", () => {
     });
     ac.abort();
   });
+
+  test("assistant 行の effort を工数として載せ、変われば最新行へ追随する（subagent-effort）", async () => {
+    const project = makeTempDir("subagent-tailer-effort");
+    const sessionId = "11111111-2222-3333-4444-777777777777";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    const subagents = path.join(project, sessionId, "subagents");
+    fs.mkdirSync(subagents, { recursive: true });
+    fs.writeFileSync(main, JSON.stringify({
+      message: { role: "assistant", content: [
+        { type: "tool_use", id: "toolu_effort", name: "Agent", input: { description: "Review", effort: "low" } },
+      ] },
+      timestamp: "2026-10-11T01:00:00.000Z",
+    }) + "\n");
+    fs.writeFileSync(path.join(subagents, "agent-effortchild.meta.json"), JSON.stringify({
+      agentType: "general-purpose", description: "Review", toolUseId: "toolu_effort", spawnDepth: 1,
+    }));
+    const jsonl = path.join(subagents, "agent-effortchild.jsonl");
+    // 各行はツール呼び出しを 1 つ持つ（現在の作業が変わるので、工数が変わらない行でもノードが 1 通届く）。
+    const assistantLine = (effort: unknown, model: string, command: string, second: number): string => JSON.stringify({
+      agentId: "effortchild", isSidechain: true, type: "assistant", effort,
+      message: {
+        role: "assistant", model, stop_reason: "tool_use",
+        content: [{ type: "tool_use", id: `toolu_step_${second}`, name: "Bash", input: { command } }],
+      },
+      timestamp: `2026-10-11T01:00:0${second}.000Z`,
+    }) + "\n";
+    // user 行の effort は工数として読まない（実行モデルが読める assistant 行だけ）。
+    fs.writeFileSync(jsonl, JSON.stringify({
+      agentId: "effortchild", isSidechain: true, type: "user", effort: "max",
+      message: { role: "user", content: "start" }, timestamp: "2026-10-11T01:00:01.000Z",
+    }) + "\n");
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10 });
+    const gen = tailer.streamSession(main, ac.signal);
+    const running = await nextOfType(gen, "subagent_node");
+    expect((running as { node: SubagentNode }).node.effort).toBeUndefined();
+
+    const next = async (): Promise<SubagentNode> =>
+      ((await nextOfType(gen, "subagent_node")) as { node: SubagentNode }).node;
+
+    fs.appendFileSync(jsonl, assistantLine("high", "claude-opus-5-5", "step-two", 2));
+    expect(await next()).toMatchObject({ nodeId: "effortchild", model: "claude-opus-5-5", effort: "high" });
+
+    // 合成行（実行モデルなし）の effort では上書きしない。この行だけを追記し、届いたノードで確かめる。
+    fs.appendFileSync(jsonl, assistantLine("max", "<synthetic>", "step-three", 3));
+    const afterSynthetic = await next();
+    expect(afterSynthetic.currentActivity).toContain("step-three");
+    expect(afterSynthetic.effort).toBe("high");
+
+    // 工数として読めない値でも上書きしない。
+    fs.appendFileSync(jsonl, assistantLine("Very High!", "claude-opus-5-5", "step-four", 4));
+    const afterUnreadable = await next();
+    expect(afterUnreadable.currentActivity).toContain("step-four");
+    expect(afterUnreadable.effort).toBe("high");
+
+    // 読める値に変われば最新行へ追随する。
+    fs.appendFileSync(jsonl, assistantLine("xhigh", "claude-opus-5-5", "step-five", 5));
+    expect(await next()).toMatchObject({ model: "claude-opus-5-5", effort: "xhigh" });
+    ac.abort();
+  });
 });

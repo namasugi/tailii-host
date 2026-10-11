@@ -171,6 +171,8 @@ export class CodexSubagentTracker {
         // wait / sendInput 等の item に model が入る版でも、親側の値で子のモデルを上書きしない。
         model: metadata?.model ?? existing?.model ?? this.pendingModels.get(nodeId)
           ?? (tool === "spawnAgent" ? stringValue(item["model"]) : null),
+        // 工数は spawnAgent の要求値（既に子の確定値を知っていればそちらを残す, subagent-effort）。
+        effort: existing?.effort ?? (tool === "spawnAgent" ? effortValue(item["reasoningEffort"]) : null),
         status: mappedStatus,
         currentActivity: mappedStatus === "running" ? stateMessage : null,
       }, nowMs));
@@ -191,6 +193,13 @@ export class CodexSubagentTracker {
       depth: existing?.depth ?? metadata?.depth,
       label: existing?.label ?? metadata?.label ?? labelFromAgentPath(agentPath),
       agentType: metadata?.agentType ?? existing?.agentType,
+      // Codex 0.162+ は生成時に確定したモデルと工数を載せる（旧版・started 以外は null）。モデルは子 thread
+      // 自身の申告（生成後の切替も映す。ノード未生成のうちに届いた保留分も含む）を優先し、未判明のとき
+      // だけ採る。工数は確定値なので、spawnAgent の
+      // 要求値より優先する（subagent-effort）。
+      model: metadata?.model ?? existing?.model ?? this.pendingModels.get(nodeId)
+        ?? stringValue(item["model"]),
+      effort: effortValue(item["reasoningEffort"]) ?? existing?.effort,
       status: kind === "interrupted" ? "completed" : "running",
       currentActivity: kind === "interacted" ? "親エージェントと連携中" : null,
     }, nowMs);
@@ -205,6 +214,7 @@ export class CodexSubagentTracker {
       label?: string | null;
       agentType?: string | null;
       model?: string | null;
+      effort?: string | null;
       status: SubagentNodeStatus;
       currentActivity?: string | null;
     },
@@ -222,6 +232,7 @@ export class CodexSubagentTracker {
     const pendingModel = existing === undefined ? (this.pendingModels.get(nodeId) ?? null) : null;
     this.pendingModels.delete(nodeId);
     const model = update.model ?? existing?.model ?? pendingModel;
+    const effort = update.effort ?? existing?.effort ?? null;
     const node: SubagentNode = {
       nodeId,
       toolUseId: update.toolUseId ?? existing?.toolUseId ?? `thread:${nodeId}`,
@@ -235,6 +246,7 @@ export class CodexSubagentTracker {
         : null,
       ts,
       ...(model !== null ? { model } : {}),
+      ...(effort !== null ? { effort } : {}),
     };
     if (existing !== undefined && stableNodeKey(existing) === stableNodeKey(node)) return [];
     this.nodes.set(nodeId, node);
@@ -365,7 +377,13 @@ function stableNodeKey(node: SubagentNode): string {
     node.currentActivity ?? null,
     node.ts,
     node.model ?? null,
+    node.effort ?? null,
   ]);
+}
+
+/** `reasoningEffort`（App Server では任意の文字列）を表示値として読む。短い小文字の識別子だけを通す。 */
+function effortValue(value: unknown): string | null {
+  return typeof value === "string" && /^[a-z][a-z0-9_-]{0,23}$/.test(value) ? value : null;
 }
 
 function firstNonEmptyString(...values: Array<string | null>): string | null {

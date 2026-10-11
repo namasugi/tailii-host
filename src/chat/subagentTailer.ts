@@ -100,6 +100,11 @@ interface TrackedNode {
    * 最新行の値へ追随する。
    */
   model: string | null;
+  /**
+   * 自 transcript の assistant 行 `effort`（サブエージェントが実際に走った工数, subagent-effort）。
+   * model と同じく最初の assistant 行まで null、変われば最新行へ追随する。
+   */
+  effort: string | null;
   lastKey: string | null;
 }
 
@@ -347,6 +352,7 @@ export class SubagentTailer {
               node.finalDefinite = shape.definite;
               node.apiErrorMarker = shape.apiError;
               if (shape.model !== null) node.model = shape.model;
+              if (shape.effort !== null) node.effort = shape.effort;
             }
             const activity = latestActivitySummary(line);
             if (activity !== null) node.currentActivity = activity;
@@ -582,6 +588,7 @@ export class SubagentTailer {
           currentActivity: status === "running" ? node.currentActivity : null,
           ts,
           ...(node.model !== null ? { model: node.model } : {}),
+          ...(node.effort !== null ? { effort: node.effort } : {}),
         };
         const key = stableNodeKey(messageNode);
         if (key === node.lastKey) continue;
@@ -701,6 +708,7 @@ function discoverMetaFiles(
       apiErrorMarker: false,
       currentActivity: null,
       model: null,
+      effort: null,
       lastKey: null,
     });
     changed = true;
@@ -1032,6 +1040,11 @@ interface MessageShape {
    * user 行・`<synthetic>`（API エラー等でハーネスが合成した行）は null。
    */
   model: string | null;
+  /**
+   * assistant 行 top-level の `effort`（その行を生成したときの工数, subagent-effort）。実行モデルが
+   * 読めない行（user 行・合成行）と、工数として読めない値は null。
+   */
+  effort: string | null;
 }
 
 /** message の生成完了を示す stop_reason（これ以外は「続きがある」か「不明」）。 */
@@ -1068,14 +1081,17 @@ function messageShape(line: string): MessageShape | null {
     const rec = message as Record<string, unknown>;
     const content = rec["content"];
     if (content === undefined || content === null) return null;
-    if (rec["role"] !== "assistant") return { final: false, definite: false, apiError: false, model: null };
+    if (rec["role"] !== "assistant") {
+      return { final: false, definite: false, apiError: false, model: null, effort: null };
+    }
     const model = executionModel(rec["model"]);
-    const notFinal: MessageShape = { final: false, definite: false, apiError: false, model };
+    const effort = model === null ? null : executionEffort(obj["effort"]);
+    const notFinal: MessageShape = { final: false, definite: false, apiError: false, model, effort };
     const apiError = obj["isApiErrorMessage"] === true;
     const stopReason = typeof rec["stop_reason"] === "string" ? rec["stop_reason"] : null;
     if (stopReason !== null && CONTINUING_STOP_REASONS.has(stopReason)) return notFinal;
     const definite = stopReason !== null && TERMINAL_STOP_REASONS.has(stopReason);
-    if (typeof content === "string") return { final: true, definite, apiError, model };
+    if (typeof content === "string") return { final: true, definite, apiError, model, effort };
     if (!Array.isArray(content)) return null;
     const types = content.map((block) =>
       typeof block === "object" && block !== null
@@ -1085,7 +1101,7 @@ function messageShape(line: string): MessageShape | null {
     const thinkingOnly = types.length > 0
       && types.every((type) => type === "thinking" || type === "redacted_thinking");
     if (thinkingOnly) return notFinal;
-    return { final: true, definite, apiError, model };
+    return { final: true, definite, apiError, model, effort };
   } catch {
     return null;
   }
@@ -1099,6 +1115,15 @@ function executionModel(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed.length === 0 || trimmed.startsWith("<") ? null : trimmed;
+}
+
+/**
+ * assistant 行 top-level `effort` を工数の表示値として読む（`low` / `medium` / `high` / `xhigh` / `max`。
+ * 2.1.296 の実 transcript で確認）。CLI が値を増やしても出せるよう許可リストにはせず、短い小文字の
+ * 識別子だけを通す（それ以外は null）。
+ */
+function executionEffort(value: unknown): string | null {
+  return typeof value === "string" && /^[a-z][a-z0-9_-]{0,23}$/.test(value) ? value : null;
 }
 
 function latestActivitySummary(line: string): string | null {
@@ -1311,5 +1336,6 @@ function stableNodeKey(node: SubagentNode): string {
     node.ts,
     node.kind ?? null,
     node.model ?? null,
+    node.effort ?? null,
   ]);
 }

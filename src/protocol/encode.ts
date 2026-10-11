@@ -56,6 +56,7 @@ function wireObject(message: ControlMessage): Raw {
     out["depth"] = node.depth;
     out["label"] = node.label;
     if (node.model !== undefined) out["model"] = node.model;
+    if (node.effort !== undefined) out["effort"] = node.effort;
     out["nodeId"] = node.nodeId;
     if (node.parentNodeId !== undefined) out["parentNodeId"] = node.parentNodeId;
     out["status"] = node.status;

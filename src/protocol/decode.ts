@@ -1499,6 +1499,7 @@ function decodeSubagentNode(raw: Raw): SubagentNode {
     ts: requireNumber(raw, "ts"),
     kind,
     model: optionalNullableString(raw, "model"),
+    effort: optionalNullableString(raw, "effort"),
   });
 }
 
