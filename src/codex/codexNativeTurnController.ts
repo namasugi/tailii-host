@@ -24,6 +24,7 @@ import {
   type QuestionPromptQuestion,
 } from "../protocol.js";
 import type { ControlMessage } from "../protocol.js";
+import { isVisibleCodexMessagePhase } from "./codexMessagePhase.js";
 import { codexPlanChatOutput } from "./codexPlanItem.js";
 import { resolveSocketPath } from "../shared/socketPath.js";
 import { sleep } from "../shared/sleep.js";
@@ -1553,7 +1554,7 @@ export function codexItemToChatOutput(item: Record<string, unknown>): ControlMes
   }
   if (type === "agentMessage") {
     const phase = item["phase"];
-    if (phase !== undefined && phase !== "commentary" && phase !== "final_answer") return null;
+    if (!isVisibleCodexMessagePhase(phase)) return null;
     const text = item["text"];
     if (typeof text !== "string" || text.length === 0) return null;
     return { type: "chat_output", v: PROTOCOL_V1, streamId: `codex-item-${id}`,

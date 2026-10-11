@@ -324,6 +324,19 @@ describe("CodexSessionStore.list", () => {
     expect(new CodexSessionStore(home).list()[0]?.lastMessage).toBe("最後の実発話");
   });
 
+  test("partial_answer の本文も一覧の要約に使う（Codex 0.162+）", () => {
+    const home = makeTempDir("codex-store-preview-partial");
+    const p = writeRollout(home, "2026/10/11", "rollout-partial.jsonl", "partial-id", "/work/partial");
+    fs.appendFileSync(p, [
+      { type: "event_msg", payload: { type: "agent_message", message: "古い最終回答", phase: "final_answer" } },
+      { type: "response_item", payload: {
+        type: "message", role: "assistant", phase: "partial_answer",
+        content: [{ type: "output_text", text: "回答の前半" }],
+      } },
+    ].map((record) => JSON.stringify(record)).join("\n") + "\n");
+    expect(new CodexSessionStore(home).list()[0]?.lastMessage).toBe("回答の前半");
+  });
+
   test("新形式の本文が読み取りチャンクをまたいでも 80 字のプレビューを返す", () => {
     const home = makeTempDir("codex-store-preview-chunk");
     const p = writeRollout(home, "2026/09/08", "rollout-chunk.jsonl", "chunk-id", "/work/chunk");

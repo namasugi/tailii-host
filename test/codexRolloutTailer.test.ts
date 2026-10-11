@@ -318,13 +318,15 @@ describe("CodexRolloutTailer.streamForCwd（有限 tail）", () => {
     await pump;
   });
 
-  test("user_message / agent_message(commentary, final_answer) を chat_output に変換する", async () => {
+  test("user_message / agent_message(commentary, partial_answer, final_answer) を chat_output に変換する", async () => {
     const root = makeTempDir("codex-stream");
     const cwd = makeTempDir("codex-stream-cwd");
     writeRollout(root, "2026/07/06", "r.jsonl", cwd, [
       userMsg("質問です", "client-user-1"),
       agentMsg("途中経過", "commentary"),
       agentMsg("未知の phase", "answer"),
+      // Codex 0.162+: 後ろに出力やツールが続く回答の断片。本文として出す。
+      agentMsg("回答の前半", "partial_answer"),
       agentMsg("最終回答"),
     ]);
     const tailer = new CodexRolloutTailer({ sessionsRoot: root, tailDeadlineMs: 0 });
@@ -336,12 +338,13 @@ describe("CodexRolloutTailer.streamForCwd（有限 tail）", () => {
     expect(chats.map((c) => [c.role, c.text])).toEqual([
       ["user", "質問です"],
       ["assistant", "途中経過"],
+      ["assistant", "回答の前半"],
       ["assistant", "最終回答"],
     ]);
     expect(chats[0]?.streamId).toBe("codex-user-client-user-1");
     expect(chats.every((c) => c.eof)).toBe(true);
     // streamId はターンごとに一意。
-    expect(new Set(chats.map((c) => c.streamId)).size).toBe(3);
+    expect(new Set(chats.map((c) => c.streamId)).size).toBe(4);
   });
 
   test("assistant の rollout/live ID を alias で結び再接続時の二重表示を防ぐ", async () => {

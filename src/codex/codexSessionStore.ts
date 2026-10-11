@@ -21,6 +21,7 @@ import { isInsideBase } from "../shared/paths.js";
 import { noteReadFailure, readFailureCount } from "../shared/readFailures.js";
 import type { ListMemoFile } from "../sessions/listMemoFile.js";
 import type { CodexAppServerManager, CodexAppServerThreadInfo } from "./codexAppServer.js";
+import { isVisibleCodexMessagePhase } from "./codexMessagePhase.js";
 
 /** session_meta 先頭行を読む最大バイト数（先頭 1 行のみ使用。base_instructions を含み得るため広め）。 */
 const META_READ_LIMIT_BYTES = 512 * 1024;
@@ -598,8 +599,9 @@ function rolloutMessageText(value: unknown): string | null {
 }
 
 function isVisiblePhase(message: Record<string, unknown>): boolean {
+  // 一覧の要約は従来から明示の null も本文として読む（会話面の判定より緩い）。
   const phase = message["phase"];
-  return phase === undefined || phase === null || phase === "commentary" || phase === "final_answer";
+  return phase === null || isVisibleCodexMessagePhase(phase);
 }
 
 function contentText(content: unknown, textType: string): string | null {

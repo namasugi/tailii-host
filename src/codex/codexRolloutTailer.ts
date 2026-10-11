@@ -30,6 +30,7 @@ import {
 } from "./codexSystemNotice.js";
 import { codexAsyncQuestionItem, codexAsyncQuestionReplyDisplayText } from "./codexAsyncQuestion.js";
 import { codexGoalFromWire } from "./codexAppServer.js";
+import { isVisibleCodexMessagePhase } from "./codexMessagePhase.js";
 import {
   codexPlanChatOutput,
   containsProposedPlanBlock,
@@ -697,7 +698,7 @@ export function* emitLine(line: Buffer, state: TailState): Generator<ControlMess
     const message = (payload as { message?: unknown }).message;
     if (typeof message !== "string" || message.length === 0) return;
     const phase = (payload as { phase?: unknown }).phase;
-    if (phase !== undefined && phase !== "commentary" && phase !== "final_answer") return;
+    if (!isVisibleCodexMessagePhase(phase)) return;
     state.seq += 1;
     state.pendingAssistantEvent = {
       text: message,
@@ -780,7 +781,7 @@ function responseItemAssistant(
   const id = payload["id"];
   if (typeof id !== "string" || id.length === 0) return null;
   const phase = payload["phase"];
-  if (phase !== undefined && phase !== "commentary" && phase !== "final_answer") return null;
+  if (!isVisibleCodexMessagePhase(phase)) return null;
   const content = payload["content"];
   if (!Array.isArray(content)) return null;
   const text = content.flatMap((part) => {
