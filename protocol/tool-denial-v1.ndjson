@@ -1,0 +1,4 @@
+{"command":"npm publish","commandTruncated":false,"denial":"automode-unavailable","id":"toolu_01","label":"実行 npm publish","name":"Bash","type":"tool_activity","v":1}
+{"addedLines":1,"denial":"user-rejected","file":"/Users/alice/project/main.swift","id":"toolu_02","label":"編集 main.swift","name":"Edit","removedLines":1,"type":"tool_activity","v":1}
+{"command":"rm -rf build","commandTruncated":false,"denial":"permission-rule","id":"toolu_03","label":"実行 rm -rf build","name":"Bash","serverSeq":44,"session":"proj-bg","type":"session_tool_activity","v":1}
+{"command":"sleep 600","commandTruncated":false,"denial":"interrupted","id":"toolu_04","label":"実行 sleep 600","name":"Bash","type":"tool_activity","v":1}

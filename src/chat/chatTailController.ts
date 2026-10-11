@@ -200,7 +200,8 @@ export class ChatTailController {
             // id は tool_use id 由来で決定的（read-<id>）→ 再 tail/再オープンでも二重挿入されない。
             // 添付（att-）で発行済みのパスだけ再発行しない（同一画像のサムネ二重表示防止）。
             // 同一パスの再 Read はその Read の id で毎回発行する（chat-image-reread）。
-            if (imageService !== null && message.type === "tool_activity") {
+            // 拒否 / 中断の札を付けた再送（tool-denial）は同じ tool_use の 2 通目なので、ここでは発行しない。
+            if (imageService !== null && message.type === "tool_activity" && message.activity.denial === undefined) {
               const readPath = ChatTailController.readImagePath(message.activity);
               if (readPath !== null && !attachedImagePaths.has(readPath)) {
                 const available = await imageService.makeAvailable(

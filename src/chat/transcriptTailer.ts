@@ -17,9 +17,11 @@ import {
   type ControlMessage,
   type QuestionOption,
   type QuestionPromptQuestion,
+  isToolDenialKind,
   type ToolActivity,
   type ToolActivityDiff,
   type ToolActivityTodo,
+  type ToolDenialKind,
 } from "../protocol.js";
 import { isCompactSummaryRecord } from "../shared/compactSummary.js";
 import { isLocalCommandModelCopyRecord } from "../shared/localCommandModelCopy.js";
@@ -287,6 +289,8 @@ const MAX_TODO_ITEMS = 50;
 const MAX_TODO_CONTENT_CHARACTERS = 300;
 /** スキル本文の後付けを待つ Skill カードの最大保持数。 */
 const MAX_PENDING_SKILL_ACTIVITIES = 16;
+/** 結果待ちのツールカードを持つ上限（並列呼び出し + 結果が届かないまま残るぶん, tool-denial）。 */
+const MAX_AWAITING_RESULT_ACTIVITIES = 64;
 
 export interface TranscriptTailerOptions {
   /** 追記ポーリング間隔（ms）。既定 50ms。 */
@@ -323,6 +327,8 @@ interface Turn {
   companionOf?: string;
   /** Artifact ツールの tool_result から拾った公開 URL（該当ツールカードへ後付けする, artifact-card）。 */
   artifactResults?: { toolUseId: string; url: string }[];
+  /** 実行されなかった / 中断されたツール呼び出し（行の `toolDenialKind` + エラーの tool_result, tool-denial）。 */
+  toolDenials?: { toolUseId: string; kind: ToolDenialKind }[];
 }
 
 /** tail 中の可変状態（1 ストリームぶん）。 */
@@ -338,6 +344,11 @@ interface TailState {
   pendingSkillActivities: Map<string, ToolActivity>;
   /** 公開 URL 待ちの Artifact ツールカード（tool_use id → 発行済み activity, artifact-card）。 */
   pendingArtifactActivities: Map<string, ToolActivity>;
+  /**
+   * 結果待ちのツールカード（tool_use id → 発行済み activity, tool-denial）。tool_result が拒否 / 中断
+   * だったときに理由付きで再送するために持つ。結果が届いたら外し、届かないものは上限で最古から捨てる。
+   */
+  awaitingResultActivities: Map<string, ToolActivity>;
   /**
    * 直近の API エラー終端が使用量制限（`error: "rate_limit"`）で、その後まだ本物の発話が無い
    * （usage-limit-wait）。この間に届く isMeta の user 発話は Claude Code の自動再開プロンプト
@@ -475,6 +486,7 @@ export class TranscriptTailer {
         activeQuestionIds: new Set(),
         pendingSkillActivities: new Map(),
         pendingArtifactActivities: new Map(),
+        awaitingResultActivities: new Map(),
         rateLimitArmed: false,
         rateLimitArmedAtMs: null,
         live: false,
@@ -808,6 +820,11 @@ function* emitLine(line: Buffer, state: TailState): Generator<ControlMessage, vo
         if (oldest !== undefined) state.pendingSkillActivities.delete(oldest);
       }
     }
+    state.awaitingResultActivities.set(activity.id, activity);
+    if (state.awaitingResultActivities.size > MAX_AWAITING_RESULT_ACTIVITIES) {
+      const oldest = state.awaitingResultActivities.keys().next().value;
+      if (oldest !== undefined) state.awaitingResultActivities.delete(oldest);
+    }
     yield { type: "tool_activity", v: PROTOCOL_V1, activity };
   }
 
@@ -831,6 +848,18 @@ function* emitLine(line: Buffer, state: TailState): Generator<ControlMessage, vo
     state.pendingArtifactActivities.delete(result.toolUseId);
     yield { type: "tool_activity", v: PROTOCOL_V1, activity: { ...pending, url: result.url } };
   }
+
+  // 拒否 / 中断で終わったツール呼び出しは、該当カードを理由付きで再送する（tool-denial）。成功した
+  // 呼び出しは何も送らない。結果が届いたカードは待ち行列から外す。
+  for (const denial of turn.toolDenials ?? []) {
+    const awaiting = state.awaitingResultActivities.get(denial.toolUseId);
+    if (awaiting === undefined) continue;
+    yield {
+      type: "tool_activity", v: PROTOCOL_V1,
+      activity: { ...awaiting, label: notRunToolLabel(awaiting.label), denial: denial.kind },
+    };
+  }
+  for (const id of turn.toolResultIds) state.awaitingResultActivities.delete(id);
 
   for (const id of turn.toolResultIds) {
     if (!state.activeQuestionIds.has(id)) continue;
@@ -1032,6 +1061,8 @@ export function extractTurn(line: string, ctx?: SystemNoticeContext): Turn | nul
     }
     const artifactResults = extractArtifactResults(rawContent);
     if (artifactResults.length > 0) turn.artifactResults = artifactResults;
+    const toolDenials = extractToolDenials(rec["toolDenialKind"], rawContent);
+    if (toolDenials.length > 0) turn.toolDenials = toolDenials;
   }
   return turn;
 }
@@ -1507,6 +1538,45 @@ function extractArtifactResults(content: unknown): { toolUseId: string; url: str
     if (match !== null) out.push({ toolUseId: rec["tool_use_id"], url: match[0] });
   }
   return out;
+}
+
+/**
+ * 拒否 / 中断で終わった tool_result を拾う（tool-denial）。Claude Code は tool_result を運ぶ user 行の
+ * top-level に `toolDenialKind` を書く（2.1.283 以降の実 transcript で確認）。成功した結果と同じ行に
+ * 混ざっても誤って印を付けないよう、`is_error` の付いたブロックだけを対象にする。
+ */
+function extractToolDenials(kind: unknown, content: unknown): { toolUseId: string; kind: ToolDenialKind }[] {
+  if (!isToolDenialKind(kind) || !Array.isArray(content)) return [];
+  const out: { toolUseId: string; kind: ToolDenialKind }[] = [];
+  for (const block of content) {
+    if (typeof block !== "object" || block === null) continue;
+    const rec = block as Record<string, unknown>;
+    if (rec["type"] !== "tool_result" || rec["is_error"] !== true) continue;
+    if (typeof rec["tool_use_id"] === "string") out.push({ toolUseId: rec["tool_use_id"], kind });
+  }
+  return out;
+}
+
+/**
+ * カードのラベルは「実行済み …」「編集済み …」のように済んだ形で作る（tool_use の時点で出すため）。
+ * 拒否 / 中断で終わった呼び出しにそのまま札を付けると「実行済み … 拒否」と食い違うので、札を付ける
+ * 再送では済んだ形の接頭辞を外す（tool-denial）。`makeToolActivity` が出す接頭辞と対で保つこと。
+ * `Artifact を公開 …` は iOS が公開カードの判定に使うので変えない（`ファイルを送信 …` も済んだ形ではない）。
+ */
+const NOT_RUN_LABEL_PREFIXES: readonly (readonly [string, string])[] = [
+  ["実行済み ", "実行 "],
+  ["編集済み ", "編集 "],
+  ["作成済み ", "作成 "],
+  ["検索済み ", "検索 "],
+  ["既読 ", "読み取り "],
+];
+
+export function notRunToolLabel(label: string): string {
+  if (label === "Todoを更新しました") return "Todoを更新";
+  for (const [done, plain] of NOT_RUN_LABEL_PREFIXES) {
+    if (label.startsWith(done)) return plain + label.slice(done.length);
+  }
+  return label;
 }
 
 /** tool_result の content（文字列 / text ブロック配列）を平文へ。 */

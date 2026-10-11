@@ -46,6 +46,7 @@ function wireObject(message: ControlMessage): Raw {
     if (activity.todos !== undefined) out["todos"] = activity.todos;
     if (activity.files !== undefined) out["files"] = activity.files;
     if (activity.url !== undefined) out["url"] = activity.url;
+    if (activity.denial !== undefined) out["denial"] = activity.denial;
   }
 
   if (message.type === "subagent_node") {

@@ -32,6 +32,26 @@ export interface ToolActivityTodo {
   status: string;
 }
 
+/**
+ * ツール呼び出しが実行されなかった / 最後まで走らなかった理由（Claude Code transcript の
+ * tool_result 行に付く `toolDenialKind` の値そのまま, tool-denial）。
+ * - `user-rejected`: 利用者が承認ダイアログで断った。
+ * - `permission-rule`: 許可ルール / hook が拒否した。
+ * - `automode-blocked`: auto mode の判定が危険とみなした。
+ * - `automode-unavailable`: auto mode の判定が得られなかった（公式 CLI は薄い「Not run」行, 2.1.296）。
+ * - `automode-parsing-error`: auto mode の判定を読み取れなかった。
+ * - `interrupted` / `cancelled`: 実行中の中断 / 取り消し。
+ */
+export const TOOL_DENIAL_KINDS = [
+  "user-rejected", "permission-rule", "automode-blocked", "automode-unavailable",
+  "automode-parsing-error", "interrupted", "cancelled",
+] as const;
+export type ToolDenialKind = (typeof TOOL_DENIAL_KINDS)[number];
+
+export function isToolDenialKind(value: unknown): value is ToolDenialKind {
+  return typeof value === "string" && (TOOL_DENIAL_KINDS as readonly string[]).includes(value);
+}
+
 /** Claude Code transcript の tool_use を chat timeline に表示するための構造化通知。 */
 export interface ToolActivity {
   id: string;
@@ -50,6 +70,8 @@ export interface ToolActivity {
   files?: string[];
   /** Artifact ツールが公開したページの URL（tool_result から後付け, additive, artifact-card）。 */
   url?: string;
+  /** 実行されなかった / 中断された理由（tool_result から後付け, additive, tool-denial）。成功時は省略。 */
+  denial?: ToolDenialKind;
 }
 
 export type SubagentNodeStatus = "running" | "completed" | "error";

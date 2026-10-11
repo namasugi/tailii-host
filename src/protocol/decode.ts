@@ -19,6 +19,7 @@ import {
   type GitStatusFile,
   type HostUpdateStatus,
   type HostVersions,
+  isToolDenialKind,
   type OfficialAppProvider,
   type QuestionAnswer,
   type QuestionOption,
@@ -1453,6 +1454,8 @@ function decodeToolActivity(raw: Raw): ToolActivity {
     todos,
     files,
     url: optionalString(raw, "url"),
+    // 未知の値は捨てる（将来の区分が増えてもカード自体は落とさない）。
+    denial: isToolDenialKind(raw["denial"]) ? raw["denial"] : undefined,
   });
 }
 
