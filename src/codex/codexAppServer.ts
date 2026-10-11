@@ -52,6 +52,9 @@ const THREAD_TITLE_CONFIG = {
   web_search: "disabled",
 } as const;
 
+/** `thread/goal/set` / `clear` の `origin`（Codex 0.161+ の `ThreadGoalMutationOrigin`）。 */
+const GOAL_MUTATION_ORIGIN_USER = "user";
+
 export type CodexAppServerSandbox = "read-only" | "workspace-write" | "danger-full-access";
 export type CodexAppServerApprovalPolicy = "untrusted" | "on-request" | "never";
 
@@ -510,10 +513,16 @@ export class CodexAppServerThread {
     return parsed;
   }
 
-  /** 目標の作成 / 更新（`thread/goal/set`）。指定したフィールドだけを送る。 */
+  /**
+   * 目標の作成 / 更新（`thread/goal/set`）。指定したフィールドだけを送る。
+   * 呼び元はアプリの目標シート（利用者の明示操作）だけなので `origin: "user"` を付ける。Codex 0.161+ は
+   * これが無い変更を利用者の指示としてモデルの履歴へ残さない。旧版は未知のフィールドとして無視する
+   * （0.158 / 0.160 で実測）。
+   */
   async goalSet(params: { objective?: string; status?: string; tokenBudget?: number }): Promise<CodexGoalInfo> {
     const response = objectRecord(await this.connection.request("thread/goal/set", {
       threadId: this.threadId,
+      origin: GOAL_MUTATION_ORIGIN_USER,
       ...(params.objective !== undefined ? { objective: params.objective } : {}),
       ...(params.status !== undefined ? { status: params.status } : {}),
       ...(params.tokenBudget !== undefined ? { tokenBudget: params.tokenBudget } : {}),
@@ -523,10 +532,12 @@ export class CodexAppServerThread {
     return parsed;
   }
 
-  /** 目標の解除（`thread/goal/clear`）。 */
+  /** 目標の解除（`thread/goal/clear`）。goalSet と同じく利用者の明示操作として送る。 */
   async goalClear(): Promise<boolean> {
     const response = objectRecord(
-      await this.connection.request("thread/goal/clear", { threadId: this.threadId }),
+      await this.connection.request("thread/goal/clear", {
+        threadId: this.threadId, origin: GOAL_MUTATION_ORIGIN_USER,
+      }),
     );
     return response?.["cleared"] === true;
   }

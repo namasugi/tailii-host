@@ -2386,8 +2386,9 @@ describe("CodexAppServerThread collaboration mode / goal（codex-plan-mode / cod
     expect(connection.requests.filter((request) => request.method.startsWith("thread/goal/")).map((request) => request.params))
       .toEqual([
         { threadId: "thread-plan" },
-        { threadId: "thread-plan", objective: "ベンチ整備", status: "paused", tokenBudget: 1000 },
-        { threadId: "thread-plan" },
+        // 設定 / 解除は利用者の明示操作として送る（Codex 0.161+ の origin）。読み取りには付けない。
+        { threadId: "thread-plan", origin: "user", objective: "ベンチ整備", status: "paused", tokenBudget: 1000 },
+        { threadId: "thread-plan", origin: "user" },
       ]);
   });
 });
