@@ -5,6 +5,7 @@ import * as fs from "node:fs";
 import type { ClaudeSessionInfo, SessionSearchResult } from "../protocol.js";
 import { isCompactSummaryRecord } from "../shared/compactSummary.js";
 import { isLocalCommandModelCopyRecord } from "../shared/localCommandModelCopy.js";
+import { isTurnCompanionRecord } from "../shared/commandExpansion.js";
 import { narrationText } from "../shared/narration.js";
 import { stripInjectedReminderBlocks, stripReminderTagBlocks } from "../shared/harnessReminder.js";
 import { crossSessionOriginHint, crossSessionPreviewLine, presentCrossSessionMessage } from "../shared/crossSession.js";
@@ -136,6 +137,9 @@ function searchTranscriptFile(
     if (isCompactSummaryRecord(obj)) continue;
     // ローカルコマンド出力のモデル向けの写し（`/context` の表）も発話ではないので当てない。
     if (isLocalCommandModelCopyRecord(obj)) continue;
+    // ターンの同伴行（isMeta + turnCompanion: `/doctor` 等の展開済みプロンプト・スキル本文の注入・
+    // 画像の寸法注記）は会話画面に出ない内部コンテキストなので当てない（command-expansion）。
+    if (isTurnCompanionRecord(obj)) continue;
     const text = extractMessageText(obj);
     if (text === null) continue;
     const normalizedText = text.toLocaleLowerCase();

@@ -25,6 +25,7 @@ import { isCompactSummaryRecord } from "../shared/compactSummary.js";
 import { isLocalCommandModelCopyRecord } from "../shared/localCommandModelCopy.js";
 import { narrationText } from "../shared/narration.js";
 import { isInjectedSkillContent } from "../shared/skillInjection.js";
+import { isPromptCommandText, isTurnCompanionRecord } from "../shared/commandExpansion.js";
 import { abortableSleep } from "../shared/sleep.js";
 import {
   createSystemNoticeContext,
@@ -316,6 +317,10 @@ interface Turn {
   isMeta?: boolean;
   /** 予約した再開の発火で流れたプロンプトの user 行（`turnOrigin: "scheduled"` / `scheduledTaskId`）。 */
   scheduled?: boolean;
+  /** プロンプト展開系スラッシュコマンドの起動行（`<command-message>` 先頭, command-expansion）。 */
+  promptCommand?: true;
+  /** ターンの同伴行（isMeta + turnCompanion）の parentUuid。直前の起動行なら展開済みプロンプト。 */
+  companionOf?: string;
   /** Artifact ツールの tool_result から拾った公開 URL（該当ツールカードへ後付けする, artifact-card）。 */
   artifactResults?: { toolUseId: string; url: string }[];
 }
@@ -343,6 +348,11 @@ interface TailState {
   rateLimitArmedAtMs: number | null;
   /** 既存内容の再生が終わり live 追尾に入ったか（診断ログは live 行だけに出す）。 */
   live: boolean;
+  /**
+   * 直前に見たプロンプト展開系スラッシュコマンド起動行の uuid（command-expansion）。次の行がこれを
+   * parentUuid に持つ同伴行なら展開済みプロンプトなので表示しない。他の行を見たら消す。
+   */
+  lastPromptCommandUuid: string | null;
   /** ターン権威ライフサイクルの観測者（hub が処理中状態の補完に使う）。 */
   onLifecycle: ((event: ClaudeTurnLifecycleEvent) => void) | null;
 }
@@ -468,6 +478,7 @@ export class TranscriptTailer {
         rateLimitArmed: false,
         rateLimitArmedAtMs: null,
         live: false,
+        lastPromptCommandUuid: null,
         onLifecycle: this.lifecycleObserver,
       };
       const start = Date.now();
@@ -706,6 +717,13 @@ function* emitLine(line: Buffer, state: TailState): Generator<ControlMessage, vo
   }
   const turn = extractTurn(text, state.noticeCtx);
   if (turn === null) return;
+  // 組み込みのプロンプト展開系コマンド（`/doctor` 等）の展開済みプロンプト: 起動行（`▶ /doctor`）の
+  // 直後に isMeta + turnCompanion の user 行として書かれる。利用者の発話ではなく CLI も表示しない
+  // 内部コンテキストなので流さない（実機 2026-10-06: 長い本文が発話バブルで出ていた）。ターンは
+  // 起動行で始まっている（turn_start 済み）ので、ここで落としても境界は変わらない。
+  const promptCommandUuid = state.lastPromptCommandUuid;
+  state.lastPromptCommandUuid = turn.promptCommand === true ? turn.id : null;
+  if (turn.companionOf !== undefined && promptCommandUuid !== null && turn.companionOf === promptCommandUuid) return;
   if (state.rateLimitArmed && turn.role === "assistant" && apiErrorKind === null) {
     // 自動再開プロンプトを挟まず assistant が動いた（queued 発話の自動 dequeue 等）→ 武装解除。
     state.rateLimitArmed = false;
@@ -1007,6 +1025,8 @@ export function extractTurn(line: string, ctx?: SystemNoticeContext): Turn | nul
   }
   if (role === "user") {
     if (rec["isMeta"] === true) turn.isMeta = true;
+    if (isPromptCommandText(plainText)) turn.promptCommand = true;
+    if (isTurnCompanionRecord(rec) && typeof rec["parentUuid"] === "string") turn.companionOf = rec["parentUuid"];
     if (rec["turnOrigin"] === "scheduled" || (rec["isMeta"] === true && typeof rec["scheduledTaskId"] === "string")) {
       turn.scheduled = true;
     }

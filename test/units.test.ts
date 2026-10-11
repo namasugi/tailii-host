@@ -1545,6 +1545,23 @@ describe("ClaudeSessionStore", () => {
     expect(list[0]?.title).toBe("実際の質問");
   });
 
+  test("ターンの同伴行（isMeta + turnCompanion: /doctor の展開済みプロンプト）は lastMessage/title に採用しない", () => {
+    const root = makeTempDir("claude-sessions-companion");
+    const slugDir = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slugDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(slugDir, "jjjjjjjj-0000.jsonl"),
+      '{"type":"user","cwd":"/tmp/proj","timestamp":"2026-01-01T00:00:00Z","uuid":"c1","message":{"content":"<command-message>doctor</command-message>\\n<command-name>/doctor</command-name>"}}\n' +
+        '{"type":"user","timestamp":"2026-01-01T00:00:00Z","uuid":"e1","parentUuid":"c1","isMeta":true,"turnCompanion":true,"message":{"content":[{"type":"text","text":"# Claude Code Doctor\\n\\nHealth-check…"}]}}\n' +
+        '{"type":"user","timestamp":"2026-01-01T00:01:00Z","message":{"content":"実際の質問"}}\n' +
+        '{"type":"assistant","timestamp":"2026-01-01T00:02:00Z","message":{"content":[{"type":"text","text":"最後の実応答"}]}}\n' +
+        '{"type":"user","timestamp":"2026-01-01T00:03:00Z","isMeta":true,"turnCompanion":true,"message":{"content":[{"type":"text","text":"[Your previous response had no text. Continue.]"}]}}\n',
+    );
+    const list = new ClaudeSessionStore(root).list();
+    expect(list[0]?.lastMessage).toBe("最後の実応答");
+    expect(list[0]?.title).toBe("実際の質問");
+  });
+
   test("custom-title エントリ（/rename・hook 由来）が導出タイトルより優先される", () => {
     const root = makeTempDir("claude-sessions-custom-title");
     const slugDir = path.join(root, "-tmp-proj");
@@ -2143,6 +2160,21 @@ describe("searchClaudeSessions", () => {
     );
     const store = new ClaudeSessionStore(root);
     expect(searchClaudeSessions(store, "needle-context").results).toEqual([]);
+  });
+
+  test("ターンの同伴行（isMeta + turnCompanion: /doctor の展開済みプロンプト）は検索対象にしない", () => {
+    const root = makeTempDir("session-search-companion");
+    const slug = path.join(root, "-tmp-proj");
+    fs.mkdirSync(slug, { recursive: true });
+    fs.writeFileSync(
+      path.join(slug, "dddddddd-search.jsonl"),
+      [
+        JSON.stringify({ type: "user", cwd: "/tmp/proj", timestamp: "2026-01-01T00:00:00Z", uuid: "c1", message: { content: "<command-message>doctor</command-message>\n<command-name>/doctor</command-name>" } }),
+        JSON.stringify({ type: "user", isMeta: true, turnCompanion: true, parentUuid: "c1", timestamp: "2026-01-01T00:00:00Z", message: { content: [{ type: "text", text: "# Claude Code Doctor\n\nneedle-doctor health check" }] } }),
+      ].join("\n") + "\n",
+    );
+    const store = new ClaudeSessionStore(root);
+    expect(searchClaudeSessions(store, "needle-doctor").results).toEqual([]);
   });
 
   test("harness 注入（assistant 末尾の背景通知 / user のリマインダ）は検索対象にもスニペットにも出さない", () => {

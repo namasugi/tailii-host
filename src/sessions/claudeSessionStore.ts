@@ -15,6 +15,7 @@ import { isCompactSummaryRecord } from "../shared/compactSummary.js";
 import { isLocalCommandModelCopyRecord } from "../shared/localCommandModelCopy.js";
 import { narrationText } from "../shared/narration.js";
 import { isInjectedSkillContent } from "../shared/skillInjection.js";
+import { isTurnCompanionRecord } from "../shared/commandExpansion.js";
 import { noteReadFailure, readFailureCount } from "../shared/readFailures.js";
 import type { ListMemoFile } from "./listMemoFile.js";
 
@@ -650,6 +651,9 @@ function extractMessageText(obj: Record<string, unknown>, maxLength: number): st
   }
   // スキル実行時に注入される展開済み SKILL.md 本文も提示しない（前の実発話へ遡る）。
   if (isInjectedSkillContent(obj, raw)) return null;
+  // ターンの同伴行（isMeta + turnCompanion: `/doctor` 等の展開済みプロンプト・継続の促し）も
+  // 利用者の発話ではないので提示しない（command-expansion）。
+  if (isTurnCompanionRecord(obj)) return null;
   if (text.length > maxLength) text = text.slice(0, maxLength);
   return text;
 }

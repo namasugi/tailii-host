@@ -383,6 +383,51 @@ describe("TranscriptTailer", () => {
     ]);
   });
 
+  test("組み込みのプロンプト展開系コマンド（/doctor）の展開済みプロンプトは会話へ流さない（command-expansion）", async () => {
+    // 実測 claude 2.1.289: 起動行の直後に isMeta + turnCompanion + parentUuid=起動行 の user 行で展開本文が書かれる。
+    const p = writeTranscript([
+      JSON.stringify({
+        type: "user",
+        message: { role: "user", content: "<command-message>doctor</command-message>\n<command-name>/doctor</command-name>" },
+        uuid: "cmd-doctor",
+        timestamp: "2026-10-05T17:45:40.019Z",
+      }),
+      JSON.stringify({
+        type: "user",
+        isMeta: true,
+        turnCompanion: true,
+        parentUuid: "cmd-doctor",
+        message: { role: "user", content: [{ type: "text", text: "# Claude Code Doctor\n\nHealth-check my Claude Code setup…" }] },
+        uuid: "doctor-expansion",
+        timestamp: "2026-10-05T17:45:40.019Z",
+      }),
+      JSON.stringify({
+        type: "assistant",
+        message: { role: "assistant", content: [{ type: "text", text: "Running the Claude Code health check now." }] },
+        uuid: "a-doctor",
+      }),
+      // 起動行に続かない同伴行（継続の促し等）は従来どおり落とさない（境界判定を変えない）。
+      JSON.stringify({
+        type: "user",
+        isMeta: true,
+        turnCompanion: true,
+        parentUuid: "a-doctor",
+        message: { role: "user", content: [{ type: "text", text: "[Your previous response had no text. Continue.]" }] },
+        uuid: "nudge",
+      }),
+    ]);
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
+    const chats = (await collect(tailer.streamTranscript(p)))
+      .filter((message) => message.type === "chat_output")
+      .map((message) => (message.type === "chat_output" ? [message.streamId, message.role] : null));
+
+    expect(chats).toEqual([
+      ["cmd-doctor", "user"],
+      ["a-doctor", "assistant"],
+      ["nudge", "user"],
+    ]);
+  });
+
   test("Skill ツールカードはスキル名ラベル+注入本文の後付け再送（同 id 更新）", async () => {
     const p = writeTranscript([
       JSON.stringify({
