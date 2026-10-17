@@ -1197,3 +1197,48 @@ describe("questionsFromToolInput — hook 用の tool_input 抽出", () => {
     expect(questionsFromToolInput({ questions: [{ header: "H" }] })).toEqual([]);
   });
 });
+
+describe("api-request-blob（Claude Code 2.1.300+ の API リクエスト複製行）", () => {
+  // 実機 2026-10-17（claude 2.1.302）: 送信のたびに直前の user / assistant message が
+  // `type: "api-request-blob"`（role 付き・timestamp / uuid 無し）として transcript に複製され、
+  // message.role だけで判定すると発話・応答が二重に出て、ToolSearch の tool_result 行に同居する
+  // text「Tool loaded.」が発話バブルになっていた。
+  const blob = (role: string, content: unknown) => JSON.stringify({
+    type: "api-request-blob", sessionId: "s", hash: `h-${role}-${JSON.stringify(content).length}`,
+    message: { role, content },
+  });
+
+  test("複製行は user / assistant の表示行にしない（本物の行だけが流れる）", async () => {
+    const p = writeTranscript([
+      JSON.stringify({ type: "user", timestamp: "2026-10-17T05:34:00.000Z", uuid: "u1",
+        message: { role: "user", content: "非公開にした カバーはAで" } }),
+      blob("system", [{ type: "text", text: "You are Claude Code" }]),
+      blob("user", [{ type: "text", text: "非公開にした カバーはAで" }]),
+      blob("user", [
+        { type: "tool_result", tool_use_id: "toolu_ts", content: [{ type: "tool_reference", tool_name: "x" }] },
+        { type: "text", text: "Tool loaded." },
+      ]),
+      JSON.stringify({ type: "assistant", timestamp: "2026-10-17T05:34:51.000Z", uuid: "a1",
+        message: { role: "assistant", content: [{ type: "text", text: "The first click didn't open the dialog." }] } }),
+      blob("assistant", [{ type: "text", text: "The first click didn't open the dialog." }]),
+    ]);
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
+    const messages = await collect(tailer.streamTranscript(p));
+    const outputs = messages.filter((m) => m.type === "chat_output").map((m) => [m.role, m.text]);
+    expect(outputs).toEqual([
+      ["user", "非公開にした カバーはAで"],
+      ["assistant", "The first click didn't open the dialog."],
+    ]);
+  });
+
+  test("末尾走査（終端マーカー / 直近の発話本文）も複製行を発話に数えない", () => {
+    const p = writeTranscript([
+      JSON.stringify({ type: "user", timestamp: "2026-10-17T05:34:00.000Z", uuid: "u1",
+        message: { role: "user", content: "[Request interrupted by user]" } }),
+      blob("user", [{ type: "text", text: "中断前の発話" }]),
+      blob("assistant", [{ type: "text", text: "応答の複製" }]),
+    ]);
+    expect(findTrailingTurnEndMarkerMs(p)).toBe(Date.parse("2026-10-17T05:34:00.000Z"));
+    expect(findTrailingUserPromptText(p)).toBeNull();
+  });
+});

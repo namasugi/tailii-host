@@ -2901,4 +2901,65 @@ describe("SubagentTailer モデル", () => {
     expect(await next()).toMatchObject({ model: "claude-opus-5-5", effort: "xhigh" });
     ac.abort();
   });
+
+  test("subagent jsonl の api-request-blob（2.1.300+ の複製行）は活動・最終報告に数えない", async () => {
+    const project = makeTempDir("subagent-tailer-request-blob");
+    const sessionId = "33333333-4444-5555-6666-7777777777ab";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    const subagents = path.join(project, sessionId, "subagents");
+    const childJsonl = path.join(subagents, "agent-blob.jsonl");
+    fs.mkdirSync(subagents, { recursive: true });
+    fs.writeFileSync(main, JSON.stringify({
+      message: { role: "assistant", content: [
+        { type: "tool_use", id: "toolu_blob", name: "Agent", input: { description: "Blob" } },
+      ] },
+      timestamp: "2026-10-17T05:34:00.000Z",
+    }) + "\n");
+    fs.writeFileSync(path.join(subagents, "agent-blob.meta.json"), JSON.stringify({
+      agentType: "general-purpose", description: "Run tests", toolUseId: "toolu_blob", spawnDepth: 1,
+    }));
+    fs.writeFileSync(childJsonl, JSON.stringify({
+      agentId: "blob", isSidechain: true, type: "user",
+      message: { role: "user", content: "start" }, timestamp: "2026-10-17T05:34:01.000Z",
+    }) + "\n");
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10 });
+    const gen = tailer.streamSession(main, ac.signal);
+    expect(await nextOfType(gen, "subagent_node")).toMatchObject({
+      node: { nodeId: "blob", status: "running", currentActivity: null },
+    });
+
+    // 複製行だけ（tool_use の複製と text だけの assistant 複製）: 活動にも最終報告にもならず、
+    // ノード更新は流れない（複製を読んでいれば次の更新は "Bash: npm run copy" になる）。
+    // generator は next() を待たせている間だけ tick が進むので、先に next() を取ってから書く。
+    const pending = gen.next();
+    fs.appendFileSync(childJsonl, [
+      JSON.stringify({ type: "api-request-blob", sessionId, agentId: "blob", hash: "h1",
+        message: { role: "assistant", content: [
+          { type: "tool_use", id: "toolu_bash_copy", name: "Bash", input: { command: "npm run copy" } },
+        ] } }),
+      JSON.stringify({ type: "api-request-blob", sessionId, agentId: "blob", hash: "h2",
+        message: { role: "assistant", content: [{ type: "text", text: "報告の複製" }] } }),
+    ].join("\n") + "\n");
+    expect(await Promise.race([
+      pending.then(() => "resolved" as const),
+      // pollInterval 10ms の 30 tick 分。短いと高負荷時に複製行を読む前に窓が閉じ、修正なしでも通る。
+      sleep(300).then(() => "timeout" as const),
+    ])).toBe("timeout");
+
+    // 本物の tool_use 行は従来どおり活動になる。
+    fs.appendFileSync(childJsonl, JSON.stringify({
+      agentId: "blob", isSidechain: true, type: "assistant",
+      message: { role: "assistant", content: [
+        { type: "tool_use", id: "toolu_bash", name: "Bash", input: { command: "npm test", description: "Run host tests" } },
+      ] },
+      timestamp: "2026-10-17T05:34:30.000Z",
+    }) + "\n");
+    expect((await pending).value).toMatchObject({
+      type: "subagent_node",
+      node: { nodeId: "blob", status: "running", currentActivity: "Bash: npm test" },
+    });
+    ac.abort();
+  });
 });

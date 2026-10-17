@@ -10,6 +10,7 @@ import * as path from "node:path";
 import { PROTOCOL_V2, type ControlMessage, type SubagentNode, type SubagentNodeStatus, type ToolActivity } from "../protocol.js";
 import { injectedReminderBodies } from "../shared/harnessReminder.js";
 import { abortableSleep } from "../shared/sleep.js";
+import { isApiRequestBlobLine } from "../shared/transcriptRecord.js";
 import { extractToolActivities, TranscriptTailer } from "./transcriptTailer.js";
 
 export interface SubagentTailerOptions {
@@ -278,6 +279,10 @@ export class SubagentTailer {
         if (node !== null) node.firstJsonlTimestampMs = read.state.firstTimestampMs;
         if (read.lines.length > 0) aggregateDirty = true;
         for (const line of read.lines) {
+          // 2.1.300+ の `api-request-blob`（API へ送った message の複製。timestamp 無し）は
+          // 行動でも通知でもない。text だけの assistant 複製を最終報告と誤認したり、tool_result /
+          // task-notification の複製を再登録したりしないよう、行ごと読み飛ばす。
+          if (isApiRequestBlobLine(line)) continue;
           const lineTs = timestampMs(line);
           if (lineTs !== null && (lastActivityTsMs === null || lineTs > lastActivityTsMs)) {
             lastActivityTsMs = lineTs;

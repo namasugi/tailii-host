@@ -23,6 +23,22 @@ describe("parseSubagentTranscript", () => {
     ]);
   });
 
+  it("api-request-blob（2.1.300+ の API リクエスト複製行）はタイムラインに出さない", () => {
+    const fixture = [
+      JSON.stringify({ timestamp: "2026-10-17T05:34:00.000Z", type: "user", message: { role: "user", content: "調べて" } }),
+      JSON.stringify({ type: "api-request-blob", sessionId: "s", agentId: "a", hash: "h1",
+        message: { role: "user", content: [{ type: "text", text: "調べて" }] } }),
+      JSON.stringify({ type: "api-request-blob", sessionId: "s", agentId: "a", hash: "h2",
+        message: { role: "assistant", content: [{ type: "text", text: "確認します。" }] } }),
+      JSON.stringify({ timestamp: "2026-10-17T05:34:05.000Z", type: "assistant",
+        message: { role: "assistant", content: [{ type: "text", text: "確認します。" }] } }),
+    ].join("\n");
+    expect(parseSubagentTranscript(fixture).entries).toEqual([
+      { role: "user", text: "調べて", ts: Date.parse("2026-10-17T05:34:00.000Z") },
+      { role: "assistant", text: "確認します。", ts: Date.parse("2026-10-17T05:34:05.000Z") },
+    ]);
+  });
+
   it("user/assistant/tool_use/tool_result を表示行へ変換する", () => {
     const fixture = [
       JSON.stringify({

@@ -8,6 +8,7 @@ import {
   rolloutResponseItemToolActivities,
 } from "../codex/codexToolActivity.js";
 import { isCompactSummaryRecord } from "../shared/compactSummary.js";
+import { isNonMessageRecordType } from "../shared/transcriptRecord.js";
 import { narrationText } from "../shared/narration.js";
 import { stripInjectedReminderBlocks, stripReminderTagBlocks } from "../shared/harnessReminder.js";
 import { crossSessionOriginHint, crossSessionSenderLabel, presentCrossSessionMessage } from "../shared/crossSession.js";
@@ -108,6 +109,8 @@ export function parseSubagentTranscript(jsonl: string): SubagentTranscriptResult
     }
     const ts = parseTimestamp(record["timestamp"]);
     const message = object(record["message"]);
+    // 2.1.300+ の `api-request-blob`（role 付きの複製行）は行動ではない（二重表示になる）。
+    if (isNonMessageRecordType(record["type"])) continue;
     const role = message?.["role"] ?? record["type"];
     if (role !== "user" && role !== "assistant") continue;
     // サブエージェント自身の文脈圧縮の要約（isCompactSummary の user 行）は行動ではない。

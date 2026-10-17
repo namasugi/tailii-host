@@ -29,6 +29,7 @@ import { narrationText } from "../shared/narration.js";
 import { isInjectedSkillContent } from "../shared/skillInjection.js";
 import { isPromptCommandText, isTurnCompanionRecord } from "../shared/commandExpansion.js";
 import { abortableSleep } from "../shared/sleep.js";
+import { isNonMessageRecordType } from "../shared/transcriptRecord.js";
 import {
   createSystemNoticeContext,
   fallbackBlockNotice,
@@ -993,6 +994,10 @@ export function extractTurn(line: string, ctx?: SystemNoticeContext): Turn | nul
     typeof rec["message"] === "object" && rec["message"] !== null
       ? (rec["message"] as Record<string, unknown>)
       : null;
+  // 2.1.300+ の `api-request-blob`（API へ送った message の複製。role 付き）等、user / assistant
+  // 以外の種別は message.role があっても表示しない（直前の発話・応答が二重に出て、tool_result と
+  // 同居する text「Tool loaded.」が発話バブルになる）。
+  if (isNonMessageRecordType(rec["type"])) return null;
   const roleStr = (message?.["role"] as string | undefined) ?? (rec["type"] as string | undefined);
   let role: ChatRole;
   if (roleStr === "assistant") role = "assistant";
