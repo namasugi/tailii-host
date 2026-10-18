@@ -2962,4 +2962,226 @@ describe("SubagentTailer モデル", () => {
     });
     ac.abort();
   });
+
+  test("背景作業待ちの暫定通知（2.1.299+）は完了にせず running + 「背景作業待ち」で出し、次の通知で完了する", async () => {
+    const project = makeTempDir("subagent-tailer-waiting-bg");
+    const sessionId = "66666666-7777-8888-9999-aaaaaaaaaabb";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    const subagents = path.join(project, sessionId, "subagents");
+    const childJsonl = path.join(subagents, "agent-bgw.jsonl");
+    fs.mkdirSync(subagents, { recursive: true });
+    const notify = (ts: string, summary: string) => JSON.stringify({
+      type: "user", timestamp: ts,
+      message: { role: "user", content: `<task-notification>\n<task-id>bgw</task-id>\n<status>completed</status>\n<summary>${summary}</summary>\n</task-notification>` },
+    });
+    fs.writeFileSync(main, [
+      JSON.stringify({ message: { role: "assistant", content: [
+        { type: "tool_use", id: "toolu_bgw", name: "Agent", input: { description: "BG waiter" } },
+      ] }, timestamp: "2026-10-18T01:00:00.000Z" }),
+      JSON.stringify({ message: { role: "user", content: [{
+        type: "tool_result", tool_use_id: "toolu_bgw", content: "Async agent launched successfully. agentId: bgw …",
+      }] }, timestamp: "2026-10-18T01:00:00.300Z" }),
+      // 実物（2.1.302）: status は completed のまま summary が「is waiting on its own background work」。
+      notify("2026-10-18T01:05:00.000Z", "Agent \"BG waiter\" is waiting on its own background work"),
+    ].join("\n") + "\n");
+    fs.writeFileSync(path.join(subagents, "agent-bgw.meta.json"), JSON.stringify({
+      agentType: "general-purpose", description: "BG waiter", toolUseId: "toolu_bgw", spawnDepth: 1,
+    }));
+    fs.writeFileSync(childJsonl, JSON.stringify({
+      agentId: "bgw", isSidechain: true, type: "user",
+      message: { role: "user", content: "start" }, timestamp: "2026-10-18T01:00:01.000Z",
+    }) + "\n");
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10 });
+    const gen = tailer.streamSession(main, ac.signal);
+    expect(await nextOfType(gen, "subagent_node")).toMatchObject({
+      node: { nodeId: "bgw", status: "running", currentActivity: "背景作業待ち" },
+    });
+
+    // 自分の背景作業が終わると「finished」の通知が来て、そこで完了する。
+    fs.appendFileSync(main, notify("2026-10-18T01:09:00.000Z", "Agent \"BG waiter\" finished") + "\n");
+    expect(await nextOfType(gen, "subagent_node")).toMatchObject({
+      node: { nodeId: "bgw", status: "completed", currentActivity: null, ts: Date.parse("2026-10-18T01:09:00.000Z") },
+    });
+    ac.abort();
+  });
+
+  describe("背景作業待ちの暫定通知の端（REFUTE 1 周目の再現ケース）", () => {
+    // フィクスチャの時刻は 2026-01-01（確実に過去）: 孤児 settle / 死亡 sweep の猶予は Date.now() 起点
+    // なので、未来の時刻を書くと「まだ猶予中」になり終端しない（テストを書いた当日の時刻で 1 回踏んだ）。
+    /** 期限まで gen を回し、対象ノードの更新を集める（next() を抱えたまま期限で抜ける）。 */
+    const pending = new WeakMap<object, Promise<ControlMessage | null>>();
+    async function drain(
+      gen: AsyncGenerator<ControlMessage, void, void>, ms: number, nodeId: string,
+    ): Promise<SubagentNode[]> {
+      const out: SubagentNode[] = [];
+      const end = Date.now() + ms;
+      while (Date.now() < end) {
+        let p = pending.get(gen);
+        if (p === undefined) { p = gen.next().then((x) => x.value ?? null); pending.set(gen, p); }
+        const t = new Promise<"timeout">((r) => setTimeout(() => r("timeout"), Math.max(1, end - Date.now())));
+        const n = await Promise.race([p, t]);
+        if (n === "timeout") break;
+        pending.delete(gen);
+        if (n === null) break;
+        if (n.type === "subagent_node" && n.node.nodeId === nodeId) out.push(n.node);
+      }
+      return out;
+    }
+    const envelope = (id: string, summary: string) =>
+      `<task-notification>\n<task-id>${id}</task-id>\n<status>completed</status>\n<summary>${summary}</summary>\n</task-notification>`;
+    const deliver = (ts: string, summary: string, id = "bgw") => JSON.stringify({
+      type: "user", timestamp: ts, message: { role: "user", content: envelope(id, summary) },
+    });
+    const enqueue = (ts: string, summary: string, id = "bgw") => JSON.stringify({
+      type: "queue-operation", operation: "enqueue", timestamp: ts, content: envelope(id, summary),
+    });
+    const WAITING = 'Agent "BG waiter" is waiting on its own background work';
+    const FINISHED = 'Agent "BG waiter" finished';
+    function setup(name: string, extraMain: string[], meta: Record<string, unknown> = {}): string {
+      const project = makeTempDir(name);
+      const sessionId = "66666666-7777-8888-9999-aaaaaaaaaabb";
+      const main = path.join(project, `${sessionId}.jsonl`);
+      const subagents = path.join(project, sessionId, "subagents");
+      fs.mkdirSync(subagents, { recursive: true });
+      fs.writeFileSync(main, [
+        JSON.stringify({ message: { role: "assistant", content: [
+          { type: "tool_use", id: "toolu_bgw", name: "Agent", input: { description: "BG waiter" } },
+        ] }, timestamp: "2026-01-01T01:00:00.000Z" }),
+        JSON.stringify({ message: { role: "user", content: [{
+          type: "tool_result", tool_use_id: "toolu_bgw", content: "Async agent launched successfully. agentId: bgw",
+        }] }, timestamp: "2026-01-01T01:00:00.300Z" }),
+        ...extraMain,
+      ].join("\n") + "\n");
+      fs.writeFileSync(path.join(subagents, "agent-bgw.meta.json"), JSON.stringify({
+        agentType: "general-purpose", description: "BG waiter", toolUseId: "toolu_bgw", spawnDepth: 1, ...meta,
+      }));
+      // 最終レポートの形（end_turn の text だけ）で静止している = 孤児 settle / 死亡 sweep の候補。
+      fs.writeFileSync(path.join(subagents, "agent-bgw.jsonl"), [
+        JSON.stringify({ agentId: "bgw", isSidechain: true, type: "user",
+          message: { role: "user", content: "start" }, timestamp: "2026-01-01T01:00:01.000Z" }),
+        JSON.stringify({ agentId: "bgw", isSidechain: true, type: "assistant",
+          message: { role: "assistant", content: [{ type: "text", text: "done; waiting" }], stop_reason: "end_turn" },
+          timestamp: "2026-01-01T01:04:59.000Z" }),
+      ].join("\n") + "\n");
+      return main;
+    }
+    const statuses = (nodes: SubagentNode[]) => nodes.map((n) => [n.status, n.currentActivity]);
+
+    test("セッション死亡: 待機中のノードも死亡 sweep で終端する（永久に実行中が残らない）", async () => {
+      const main = setup("subagent-waiting-dead", [deliver("2026-01-01T01:05:00.000Z", WAITING)]);
+      const ac = new AbortController();
+      const tailer = new SubagentTailer({
+        pollIntervalMs: 10, probeSessionAlive: () => Promise.resolve(false), orphanProbeIntervalMs: 0, agentOrphanGraceMs: 1,
+      });
+      const nodes = await drain(tailer.streamSession(main, ac.signal), 600, "bgw");
+      ac.abort();
+      // ts が sweep の静止時刻（最終レポート行）なら、待機通知を普通の completed と読んだのではなく
+      // sweep で終端したと分かる（通知の ts 01:05:00 ではない）。
+      expect(nodes.at(-1)).toMatchObject({
+        status: "completed", currentActivity: null, ts: Date.parse("2026-01-01T01:04:59.000Z"),
+      });
+    });
+
+    test("待機の enqueue の後に enqueue 無しの finished が届いたら完了する（同一判定は待機フラグを含む）", async () => {
+      const main = setup("subagent-waiting-then-finished", [enqueue("2026-01-01T01:05:00.000Z", WAITING)]);
+      const ac = new AbortController();
+      const tailer = new SubagentTailer({ pollIntervalMs: 10, probeSessionAlive: () => Promise.resolve(true) });
+      const gen = tailer.streamSession(main, ac.signal);
+      expect(statuses(await drain(gen, 300, "bgw"))).toEqual([["running", "背景作業待ち"]]);
+      // status / exitCode は同じ completed / null でも別イベント（finished）なので上書きされる。
+      fs.appendFileSync(main, deliver("2026-01-01T01:09:00.000Z", FINISHED) + "\n");
+      const done = await drain(gen, 300, "bgw");
+      expect(done.at(-1)).toMatchObject({ status: "completed", currentActivity: null, ts: Date.parse("2026-01-01T01:09:00.000Z") });
+      ac.abort();
+    });
+
+    test("利用者停止の刻印（stoppedByUser）は待機通知より優先して終端する", async () => {
+      const main = setup("subagent-waiting-stopped", [deliver("2026-01-01T01:05:00.000Z", WAITING)], { stoppedByUser: true });
+      const ac = new AbortController();
+      const tailer = new SubagentTailer({ pollIntervalMs: 10, probeSessionAlive: () => Promise.resolve(true) });
+      const nodes = await drain(tailer.streamSession(main, ac.signal), 400, "bgw");
+      ac.abort();
+      expect(nodes.at(-1)).toMatchObject({ status: "completed", currentActivity: null });
+    });
+
+    test("enqueue で finished を見た後の待機通知の遅配は無視する（completed → running → completed と揺れない）", async () => {
+      const main = setup("subagent-waiting-late", [
+        enqueue("2026-01-01T01:05:00.000Z", WAITING),
+        enqueue("2026-01-01T01:09:00.000Z", FINISHED),
+      ]);
+      const ac = new AbortController();
+      const tailer = new SubagentTailer({ pollIntervalMs: 10, probeSessionAlive: () => Promise.resolve(true) });
+      const gen = tailer.streamSession(main, ac.signal);
+      const first = await drain(gen, 300, "bgw");
+      expect(statuses(first)).toEqual([["completed", null]]);
+      expect(first[0]?.ts).toBe(Date.parse("2026-01-01T01:09:00.000Z"));
+      // main のターンが明けて、溜まっていた 2 通が user 行で遅配される（待機 → finished の順）。
+      fs.appendFileSync(main, deliver("2026-01-01T01:10:00.000Z", WAITING) + "\n");
+      expect(statuses(await drain(gen, 300, "bgw"))).toEqual([]);
+      fs.appendFileSync(main, deliver("2026-01-01T01:10:01.000Z", FINISHED) + "\n");
+      expect(statuses(await drain(gen, 300, "bgw"))).toEqual([]);
+      // 1 行に 2 ブロック束ねた遅配も同じ。
+      fs.appendFileSync(main, JSON.stringify({
+        type: "user", timestamp: "2026-01-01T01:10:02.000Z",
+        message: { role: "user", content: envelope("bgw", WAITING) + "\n" + envelope("bgw", FINISHED) },
+      }) + "\n");
+      expect(statuses(await drain(gen, 300, "bgw"))).toEqual([]);
+      ac.abort();
+    });
+
+    test("説明文に同じ句が入った finished は待機と誤認しない", async () => {
+      const main = setup("subagent-waiting-desc", [
+        deliver("2026-01-01T01:05:00.000Z", 'Agent "check is waiting on its own background work path" finished'),
+      ]);
+      const ac = new AbortController();
+      const tailer = new SubagentTailer({ pollIntervalMs: 10, probeSessionAlive: () => Promise.resolve(true) });
+      const nodes = await drain(tailer.streamSession(main, ac.signal), 300, "bgw");
+      ac.abort();
+      expect(statuses(nodes)).toEqual([["completed", null]]);
+    });
+
+    test("起動元が終端した深さ 2 の待機ノードは孤児 settle で終端する", async () => {
+      const project = makeTempDir("subagent-waiting-owner");
+      const sessionId = "66666666-7777-8888-9999-aaaaaaaaaabc";
+      const main = path.join(project, `${sessionId}.jsonl`);
+      const sub = path.join(project, sessionId, "subagents");
+      fs.mkdirSync(sub, { recursive: true });
+      fs.writeFileSync(main, [
+        JSON.stringify({ message: { role: "assistant", content: [
+          { type: "tool_use", id: "toolu_p", name: "Agent", input: { description: "P" } },
+        ] }, timestamp: "2026-01-01T01:00:00.000Z" }),
+        JSON.stringify({ message: { role: "user", content: [{
+          type: "tool_result", tool_use_id: "toolu_p", content: "Async agent launched successfully. agentId: pp",
+        }] }, timestamp: "2026-01-01T01:00:00.300Z" }),
+        JSON.stringify({ type: "user", timestamp: "2026-01-01T01:06:00.000Z", message: { role: "user",
+          content: "<task-notification>\n<task-id>pp</task-id>\n<status>failed</status>\n<summary>Agent \"P\" failed</summary>\n</task-notification>" } }),
+      ].join("\n") + "\n");
+      fs.writeFileSync(path.join(sub, "agent-pp.meta.json"), JSON.stringify({
+        agentType: "general-purpose", description: "P", toolUseId: "toolu_p", spawnDepth: 1,
+      }));
+      fs.writeFileSync(path.join(sub, "agent-pp.jsonl"), [
+        JSON.stringify({ agentId: "pp", type: "assistant", message: { role: "assistant", content: [
+          { type: "tool_use", id: "toolu_c", name: "Agent", input: { description: "C" } },
+        ] }, timestamp: "2026-01-01T01:01:00.000Z" }),
+        JSON.stringify({ agentId: "pp", type: "user", message: { role: "user", content: [{
+          type: "tool_result", tool_use_id: "toolu_c", content: "Async agent launched successfully. agentId: cc",
+        }] }, timestamp: "2026-01-01T01:01:00.300Z" }),
+        deliver("2026-01-01T01:05:00.000Z", 'Agent "C" is waiting on its own background work', "cc"),
+      ].join("\n") + "\n");
+      fs.writeFileSync(path.join(sub, "agent-cc.meta.json"), JSON.stringify({
+        agentType: "general-purpose", description: "C", toolUseId: "toolu_c", spawnDepth: 2,
+      }));
+      fs.writeFileSync(path.join(sub, "agent-cc.jsonl"), JSON.stringify({
+        agentId: "cc", type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "final" }], stop_reason: "end_turn" },
+        timestamp: "2026-01-01T01:04:00.000Z",
+      }) + "\n");
+      const ac = new AbortController();
+      const tailer = new SubagentTailer({ pollIntervalMs: 10, probeSessionAlive: () => Promise.resolve(true), agentOrphanGraceMs: 1 });
+      const nodes = await drain(tailer.streamSession(main, ac.signal), 600, "cc");
+      ac.abort();
+      expect(nodes.at(-1)).toMatchObject({ status: "completed", currentActivity: null, parentNodeId: "pp" });
+    });
+  });
 });

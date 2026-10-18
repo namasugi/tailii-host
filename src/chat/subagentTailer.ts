@@ -122,6 +122,14 @@ interface TaskNotification {
   exitCode: number | null;
   ts: number | null;
   /**
+   * 背景作業待ちの暫定通知（Claude Code 2.1.299+: `<status>completed` のまま `<summary>` が
+   * 「… is waiting on its own background work」。エージェントのターンは終わったが自分の背景
+   * 作業がまだ動いていて、終わればもう一度通知が来る）。完了ではなく running + 「背景作業待ち」
+   * として出す。同じ task-id の「finished」通知とは別イベントなので、enqueue 由来の ts 権威
+   * （同一イベントの遅い配達で前進させない）の同一判定にもこのフラグを含める。
+   */
+  waitingOnBackground?: boolean;
+  /**
    * TaskStop の停止 ack（"Successfully stopped task"）由来。明示的な停止は ts の前後に
    * かかわらず killed/stopped 通知より優先する（静かな完了として扱う）。
    */
@@ -340,14 +348,17 @@ export class SubagentTailer {
             // 古い」と誤認して running のエージェントを completed に塗ってしまう。再完了は新しい
             // enqueue が先に書かれるので latest-wins のまま拾える。
             if (existing !== undefined && existing.enqueue === true && !notification.enqueue
-              && existing.status === notification.status && existing.exitCode === notification.exitCode) {
+              && existing.status === notification.status && existing.exitCode === notification.exitCode
+              && (existing.waitingOnBackground === true) === notification.waitingOnBackground) {
               continue;
             }
+            if (isLateWaitingDelivery(existing, notification)) continue;
             read.state.notificationByTaskId.set(notification.taskId, {
               status: notification.status,
               exitCode: notification.exitCode,
               ts,
               ...(notification.enqueue ? { enqueue: true } : {}),
+              ...(notification.waitingOnBackground ? { waitingOnBackground: true } : {}),
             });
           }
           if (node !== null) {
@@ -381,9 +392,11 @@ export class SubagentTailer {
             // 前進させない。
             if (existing?.enqueue === true && notification.enqueue !== true
               && notification.stopAck !== true
-              && existing.status === notification.status && existing.exitCode === notification.exitCode) {
+              && existing.status === notification.status && existing.exitCode === notification.exitCode
+              && (existing.waitingOnBackground === true) === (notification.waitingOnBackground === true)) {
               continue;
             }
+            if (isLateWaitingDelivery(existing, notification)) continue;
             if (existing === undefined || notification.stopAck === true
               || (notification.ts ?? 0) >= (existing.ts ?? 0)) {
               notificationByTaskId.set(id, notification);
@@ -404,7 +417,9 @@ export class SubagentTailer {
         // 深さ1は起動元が main（root）と確定できる（forked-skill 親もここに落ちる）。
         return correlated ?? (node.meta.spawnDepth <= 1 ? "root" : undefined);
       };
-      const resolveAgentStatus = (node: TrackedNode): { status: SubagentNodeStatus; ts: number } => {
+      const resolveAgentStatus = (
+        node: TrackedNode,
+      ): { status: SubagentNodeStatus; ts: number; waitingOnBackground?: boolean } => {
         const result = node.meta.toolUseId === null
           ? null
           : resultByToolUseId.get(node.meta.toolUseId) ?? null;
@@ -421,7 +436,13 @@ export class SubagentTailer {
         const notification = notificationByTaskId.get(node.nodeId) ?? null;
         const resumedAfter = notification !== null && notification.ts !== null
           && (node.lastJsonlTimestampMs ?? 0) > notification.ts;
-        if (notification !== null && !resumedAfter) {
+        // 背景作業待ちの暫定通知（2.1.299+）は終端ではない: 自分の背景作業が終わると再通知が
+        // 来るので、それまでは「通知なし」と同じく後段（停止刻印 → 孤児 settle → 死亡 sweep）を
+        // 通し、どれにも当たらなければ running + 「背景作業待ち」。早期 return にすると、再通知が
+        // 二度と届かない状況（利用者停止・起動元の終端・セッション死亡）で永久に実行中が残る。
+        const waitingOnBackground = notification !== null && !resumedAfter
+          && notification.waitingOnBackground === true && notification.status === "completed";
+        if (notification !== null && !resumedAfter && !waitingOnBackground) {
           return {
             status: notification.status === "completed" ? "completed" : "error",
             ts: notification.ts ?? node.lastJsonlTimestampMs ?? mtimeMs(node.metaPath),
@@ -450,7 +471,11 @@ export class SubagentTailer {
             return { status: sweep.status, ts: sweep.ts };
           }
         }
-        return { status: "running", ts: node.firstJsonlTimestampMs ?? mtimeMs(node.metaPath) };
+        return {
+          status: "running",
+          ts: node.firstJsonlTimestampMs ?? mtimeMs(node.metaPath),
+          ...(waitingOnBackground ? { waitingOnBackground: true } : {}),
+        };
       };
 
       const nowMs = Date.now();
@@ -579,7 +604,7 @@ export class SubagentTailer {
       }
 
       for (const node of tracked.values()) {
-        const { status, ts } = resolveAgentStatus(node);
+        const { status, ts, waitingOnBackground } = resolveAgentStatus(node);
         const parentNodeId = ownerOf(node) ?? fallbackParent(node.meta.spawnDepth);
         const messageNode: SubagentNode = {
           nodeId: node.nodeId,
@@ -590,7 +615,9 @@ export class SubagentTailer {
           label: node.meta.description,
           depth: node.meta.spawnDepth,
           status,
-          currentActivity: status === "running" ? node.currentActivity : null,
+          currentActivity: status !== "running" ? null
+            : waitingOnBackground === true ? WAITING_ON_BACKGROUND_ACTIVITY
+            : node.currentActivity,
           ts,
           ...(node.model !== null ? { model: node.model } : {}),
           ...(node.effort !== null ? { effort: node.effort } : {}),
@@ -935,6 +962,8 @@ interface TaskNotificationExtract {
   status: string;
   exitCode: number | null;
   ts: number | null;
+  /** `<summary>` が背景作業待ち（2.1.299+ の暫定通知）。 */
+  waitingOnBackground: boolean;
   /** queue-operation enqueue 行由来（ts が完了時点の正確な時刻）。 */
   enqueue: boolean;
 }
@@ -996,6 +1025,31 @@ function notificationText(line: string): { text: string; enqueue: boolean } | nu
 }
 
 /**
+ * 背景作業待ちの暫定通知（Claude Code 2.1.299+）。`<status>completed` のまま `<summary>` が
+ * `Agent "<説明>" is waiting on its own background work` になる（文言は summary の末尾。2.1.302 の
+ * 実装: `${_jt}${r}" ${Dt}`）。説明文に同じ句が入っても誤認しないよう、閉じ引用符 + 句 + `</summary>`
+ * の並びで判定する（summary の本文に `<` が入って `<summary>([^<]*)` の抽出が外れても拾える）。
+ */
+const WAITING_ON_BACKGROUND_SUMMARY = /" is waiting on its own background work\s*<\/summary>/;
+/** 背景作業待ち中のノードの活動表示（iOS は running ノードの currentActivity をそのまま出す）。 */
+const WAITING_ON_BACKGROUND_ACTIVITY = "背景作業待ち";
+
+/**
+ * 遅配された「背景作業待ち」か。enqueue（完了時点の正確な ts）で既に「finished」（非待機の
+ * completed）を見ている task に、あとから非 enqueue の待機配達が届いたら、それは finished より
+ * 前に起きたイベントの遅い配達なので記録を上書きしない（上書きすると completed → running →
+ * completed と揺れ、ts も配達時刻まで進む）。
+ */
+function isLateWaitingDelivery(
+  existing: TaskNotification | undefined,
+  incoming: { enqueue?: boolean; waitingOnBackground?: boolean; status: string; stopAck?: boolean },
+): boolean {
+  return existing !== undefined && existing.enqueue === true && existing.stopAck !== true
+    && existing.status === "completed" && existing.waitingOnBackground !== true
+    && incoming.enqueue !== true && incoming.stopAck !== true && incoming.waitingOnBackground === true;
+}
+
+/**
  * 行に含まれる `<task-notification>` を全て解析する（1 行に複数ブロックが束ねられる:
  * 同時に終わった背景コマンド 2 件が 1 つの [SYSTEM NOTIFICATION] で届く等）。
  * バックグラウンドのエージェント/コマンド共通の完了信号で、task-id はエージェントの
@@ -1024,6 +1078,7 @@ function extractTaskNotifications(line: string): TaskNotificationExtract[] {
       exitCode: exitCode === undefined ? null : Number(exitCode),
       ts,
       enqueue: carried.enqueue,
+      waitingOnBackground: WAITING_ON_BACKGROUND_SUMMARY.test(block),
     });
   }
   return out;
