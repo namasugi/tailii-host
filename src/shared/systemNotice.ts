@@ -214,7 +214,12 @@ export function systemNoticeText(rec: Record<string, unknown>, ctx?: SystemNotic
     const pre = meta !== null ? num(meta, "preTokens") : null;
     const post = meta !== null ? num(meta, "postTokens") : null;
     const trigger = meta !== null ? str(meta, "trigger") : null;
-    const how = trigger === "auto" ? "自動で" : trigger === "manual" ? "/compact で" : "";
+    // idle = Claude Code 2.1.299 の idle 圧縮（200K+ tokens の会話を約 54 分放置すると、1 時間の
+    // プロンプトキャッシュが切れる前に自動で圧縮する。利用者の操作なしに起きる）。
+    const how = trigger === "auto" ? "自動で"
+      : trigger === "manual" ? "/compact で"
+      : trigger === "idle" ? "放置中に自動で"
+      : "";
     const tokens = pre !== null && post !== null
       ? `（${Math.round(pre).toLocaleString("en-US")} → ${Math.round(post).toLocaleString("en-US")} tokens）`
       : "";

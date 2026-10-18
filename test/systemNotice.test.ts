@@ -175,6 +175,10 @@ describe("systemNoticeText: 会話圧縮・汎用・落とす行", () => {
     expect(systemNoticeText(rec)).toBe(
       "🧹 会話を自動で圧縮しました（999,849 → 8,622 tokens）。Claude 側の文脈は要約に置き換わりました（アプリの表示はそのまま）。",
     );
+    // idle 圧縮（2.1.299: 200K+ tokens の会話を約 54 分放置すると利用者の操作なしに圧縮される）は
+    // 「放置中に」と分かる文言にする（理由なしの「圧縮しました」だと身に覚えのない圧縮に見える）。
+    expect(systemNoticeText({ ...rec, compactMetadata: { trigger: "idle", preTokens: 250000, postTokens: 9000 } }))
+      .toBe("🧹 会話を放置中に自動で圧縮しました（250,000 → 9,000 tokens）。Claude 側の文脈は要約に置き換わりました（アプリの表示はそのまま）。");
     // trigger 未知値 / metadata 欠落でも落ちない。
     expect(systemNoticeText({ ...rec, compactMetadata: { trigger: "weird", preTokens: 1, postTokens: 2 } }))
       .toBe("🧹 会話を圧縮しました（1 → 2 tokens）。Claude 側の文脈は要約に置き換わりました（アプリの表示はそのまま）。");
