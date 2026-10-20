@@ -3039,7 +3039,10 @@ describe("SubagentTailer モデル", () => {
     });
     const WAITING = 'Agent "BG waiter" is waiting on its own background work';
     const FINISHED = 'Agent "BG waiter" finished';
-    function setup(name: string, extraMain: string[], meta: Record<string, unknown> = {}): string {
+    function setup(
+      name: string, extraMain: string[], meta: Record<string, unknown> = {},
+      finalLines?: string[],
+    ): string {
       const project = makeTempDir(name);
       const sessionId = "66666666-7777-8888-9999-aaaaaaaaaabb";
       const main = path.join(project, `${sessionId}.jsonl`);
@@ -3061,12 +3064,28 @@ describe("SubagentTailer モデル", () => {
       fs.writeFileSync(path.join(subagents, "agent-bgw.jsonl"), [
         JSON.stringify({ agentId: "bgw", isSidechain: true, type: "user",
           message: { role: "user", content: "start" }, timestamp: "2026-01-01T01:00:01.000Z" }),
-        JSON.stringify({ agentId: "bgw", isSidechain: true, type: "assistant",
-          message: { role: "assistant", content: [{ type: "text", text: "done; waiting" }], stop_reason: "end_turn" },
-          timestamp: "2026-01-01T01:04:59.000Z" }),
+        ...(finalLines ?? [
+          JSON.stringify({ agentId: "bgw", isSidechain: true, type: "assistant",
+            message: { role: "assistant", content: [{ type: "text", text: "done; waiting" }], stop_reason: "end_turn" },
+            timestamp: "2026-01-01T01:04:59.000Z" }),
+        ]),
       ].join("\n") + "\n");
       return main;
     }
+    /** 2.1.302+ の停止形: SubagentHandback を呼び、成功（または失敗）の tool_result で終わる。 */
+    const handbackLines = (success: boolean) => [
+      JSON.stringify({ agentId: "bgw", isSidechain: true, type: "assistant",
+        message: { role: "assistant", model: "claude-opus-5-5", content: [
+          { type: "tool_use", id: "toolu_hb", name: "SubagentHandback", input: { message: "final report" } },
+        ], stop_reason: null },
+        timestamp: "2026-01-01T01:04:58.000Z" }),
+      JSON.stringify({ agentId: "bgw", isSidechain: true, type: "user",
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_hb",
+          ...(success
+            ? { content: [{ type: "text", text: '{"success":true,"message":"Report delivered to your caller."}' }] }
+            : { content: "report rejected", is_error: true }) }] },
+        timestamp: "2026-01-01T01:04:59.000Z" }),
+    ];
     const statuses = (nodes: SubagentNode[]) => nodes.map((n) => [n.status, n.currentActivity]);
 
     test("セッション死亡: 待機中のノードも死亡 sweep で終端する（永久に実行中が残らない）", async () => {
@@ -3129,6 +3148,19 @@ describe("SubagentTailer モデル", () => {
       }) + "\n");
       expect(statuses(await drain(gen, 300, "bgw"))).toEqual([]);
       ac.abort();
+    });
+
+    test("SubagentHandback で終わったノードは最終報告済み: 死亡 sweep で completed、失敗結果なら error", async () => {
+      for (const [success, expected] of [[true, "completed"], [false, "error"]] as const) {
+        const main = setup(`subagent-handback-dead-${success}`, [], {}, handbackLines(success));
+        const ac = new AbortController();
+        const tailer = new SubagentTailer({
+          pollIntervalMs: 10, probeSessionAlive: () => Promise.resolve(false), orphanProbeIntervalMs: 0, agentOrphanGraceMs: 1,
+        });
+        const nodes = await drain(tailer.streamSession(main, ac.signal), 400, "bgw");
+        ac.abort();
+        expect(nodes.at(-1)).toMatchObject({ status: expected, ts: Date.parse("2026-01-01T01:04:59.000Z") });
+      }
     });
 
     test("説明文に同じ句が入った finished は待機と誤認しない", async () => {

@@ -94,6 +94,11 @@ interface TrackedNode {
    * 孤児 settle / 死亡 sweep で completed ではなく error に分けるための印。
    */
   apiErrorMarker: boolean;
+  /**
+   * 自 transcript の最後の assistant 行が `SubagentHandback`（2.1.302+ の最終報告ツール）の呼び出しで、
+   * その tool_result をまだ見ていないときの tool_use id。結果が成功なら最終報告の確定形として扱う。
+   */
+  handbackToolUseId: string | null;
   currentActivity: string | null;
   /**
    * 自 transcript の assistant 行 `message.model`（サブエージェントが実際に使ったモデル）。
@@ -279,6 +284,7 @@ export class SubagentTailer {
             node.finalReportMarker = null;
             node.finalDefinite = false;
             node.apiErrorMarker = false;
+            node.handbackToolUseId = null;
             // model は「一度判明したら消えない」。truncate 直後の再読込で assistant 行が
             // まだ無い tick に model 無しのノードを配信しないよう、直前値を保持する
             // （再読込で別の値が出れば最新行が勝つ）。
@@ -362,11 +368,23 @@ export class SubagentTailer {
             });
           }
           if (node !== null) {
-            const shape = messageShape(line);
-            if (shape !== null) {
+            // SubagentHandback（2.1.302+）の tool_result は走行の終わりを告げる行。成功なら最終報告の
+            // 確定形、失敗（届かなかった）なら続きがあるので最終形ではない。他の user 行と違い
+            // 「再開注入」ではないので、ここで最終形を倒さない。
+            const handback = node.handbackToolUseId === null
+              ? null
+              : handbackOutcome(line, node.handbackToolUseId);
+            const shape = handback === null ? messageShape(line) : null;
+            if (handback !== null) {
+              node.finalReportMarker = handback;
+              node.finalDefinite = handback;
+              node.apiErrorMarker = false;
+              node.handbackToolUseId = null;
+            } else if (shape !== null) {
               node.finalReportMarker = shape.final;
               node.finalDefinite = shape.definite;
               node.apiErrorMarker = shape.apiError;
+              node.handbackToolUseId = shape.handbackToolUseId;
               if (shape.model !== null) node.model = shape.model;
               if (shape.effort !== null) node.effort = shape.effort;
             }
@@ -738,6 +756,7 @@ function discoverMetaFiles(
       finalReportMarker: null,
       finalDefinite: false,
       apiErrorMarker: false,
+      handbackToolUseId: null,
       currentActivity: null,
       model: null,
       effort: null,
@@ -1105,7 +1124,15 @@ interface MessageShape {
    * 読めない行（user 行・合成行）と、工数として読めない値は null。
    */
   effort: string | null;
+  /**
+   * `SubagentHandback` だけを呼ぶ assistant 行の tool_use id（それ以外は null）。2.1.302+ の
+   * サブエージェントは最終報告を text ではなくこのツールで返し、呼び出しで走行が終わる。
+   */
+  handbackToolUseId: string | null;
 }
+
+/** 2.1.302+ のサブエージェントが最終報告を返すツール（呼び出しで走行が終わる）。 */
+const SUBAGENT_HANDBACK_TOOL = "SubagentHandback";
 
 /** message の生成完了を示す stop_reason（これ以外は「続きがある」か「不明」）。 */
 const TERMINAL_STOP_REASONS: ReadonlySet<string> = new Set(["end_turn", "stop_sequence", "max_tokens", "refusal"]);
@@ -1114,7 +1141,9 @@ const CONTINUING_STOP_REASONS: ReadonlySet<string> = new Set(["tool_use", "pause
 
 /**
  * message 行の「最終レポートらしさ」を返す:
- *   final=true  = text のみの assistant 行（サブエージェントはこの形で停止する）
+ *   final=true  = text のみの assistant 行（サブエージェントはこの形で停止する）、または
+ *                 `SubagentHandback` だけを呼ぶ assistant 行（2.1.302+ の停止形。暫定形で、
+ *                 呼び出し側が tool_result の成功を見て確定形にする）
  *   final=false = それ以外の message 行（user 行・tool_use を含む assistant 行・
  *                 生成途中の thinking のみの assistant 行・stop_reason が「続きあり」の text 行）
  *   null        = message を持たない行（summary 等。判定を変えない）
@@ -1142,26 +1171,63 @@ function messageShape(line: string): MessageShape | null {
     const content = rec["content"];
     if (content === undefined || content === null) return null;
     if (rec["role"] !== "assistant") {
-      return { final: false, definite: false, apiError: false, model: null, effort: null };
+      return { final: false, definite: false, apiError: false, model: null, effort: null, handbackToolUseId: null };
     }
     const model = executionModel(rec["model"]);
     const effort = model === null ? null : executionEffort(obj["effort"]);
-    const notFinal: MessageShape = { final: false, definite: false, apiError: false, model, effort };
+    const notFinal: MessageShape = {
+      final: false, definite: false, apiError: false, model, effort, handbackToolUseId: null,
+    };
     const apiError = obj["isApiErrorMessage"] === true;
     const stopReason = typeof rec["stop_reason"] === "string" ? rec["stop_reason"] : null;
     if (stopReason !== null && CONTINUING_STOP_REASONS.has(stopReason)) return notFinal;
     const definite = stopReason !== null && TERMINAL_STOP_REASONS.has(stopReason);
-    if (typeof content === "string") return { final: true, definite, apiError, model, effort };
+    if (typeof content === "string") {
+      return { final: true, definite, apiError, model, effort, handbackToolUseId: null };
+    }
     if (!Array.isArray(content)) return null;
-    const types = content.map((block) =>
-      typeof block === "object" && block !== null
-        ? (block as Record<string, unknown>)["type"]
-        : undefined);
-    if (types.includes("tool_use")) return notFinal;
-    const thinkingOnly = types.length > 0
-      && types.every((type) => type === "thinking" || type === "redacted_thinking");
+    const blocks = content.map((block) =>
+      typeof block === "object" && block !== null ? block as Record<string, unknown> : {});
+    const toolUses = blocks.filter((block) => block["type"] === "tool_use");
+    if (toolUses.length > 0) {
+      // 最終報告ツールだけを呼ぶ行は最終報告の暫定形（結果の成功を見て確定形にする）。
+      // stop_reason は実物で null（"tool_use" でも同じ扱い: 呼び出しで走行が終わる）。
+      const handback = toolUses.length === 1 && toolUses[0]!["name"] === SUBAGENT_HANDBACK_TOOL
+        && typeof toolUses[0]!["id"] === "string"
+        ? toolUses[0]!["id"]
+        : null;
+      if (handback === null) return notFinal;
+      return { final: true, definite: false, apiError: false, model, effort, handbackToolUseId: handback };
+    }
+    const thinkingOnly = blocks.length > 0
+      && blocks.every((block) => block["type"] === "thinking" || block["type"] === "redacted_thinking");
     if (thinkingOnly) return notFinal;
-    return { final: true, definite, apiError, model, effort };
+    return { final: true, definite, apiError, model, effort, handbackToolUseId: null };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `SubagentHandback` の tool_result 行なら、報告が届いたか（true = 成功 / false = 失敗）を返す。
+ * それ以外の行は null。実物（2.1.303）の成功結果は `{"success":true,"message":"Report delivered to
+ * your caller."}`。is_error や success が true でない結果は「届かず続きがある」とみなす。
+ */
+function handbackOutcome(line: string, toolUseId: string): boolean | null {
+  try {
+    const obj = JSON.parse(line) as Record<string, unknown>;
+    const message = obj["message"];
+    if (typeof message !== "object" || message === null) return null;
+    const content = (message as Record<string, unknown>)["content"];
+    if (!Array.isArray(content)) return null;
+    for (const block of content) {
+      if (typeof block !== "object" || block === null) continue;
+      const rec = block as Record<string, unknown>;
+      if (rec["type"] !== "tool_result" || rec["tool_use_id"] !== toolUseId) continue;
+      if (rec["is_error"] === true) return false;
+      return /"success"\s*:\s*true/.test(toolResultPlainText(rec["content"]));
+    }
+    return null;
   } catch {
     return null;
   }
