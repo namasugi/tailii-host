@@ -1050,6 +1050,16 @@ function notificationText(line: string): { text: string; enqueue: boolean } | nu
  * の並びで判定する（summary の本文に `<` が入って `<summary>([^<]*)` の抽出が外れても拾える）。
  */
 const WAITING_ON_BACKGROUND_SUMMARY = /" is waiting on its own background work\s*<\/summary>/;
+
+/**
+ * 待機通知の `<result>` が「報告は SubagentHandback で届いた」と言っている（2.1.302+）。CLI の文言
+ * （2.1.304）: 報告済みなら `This agent's report was delivered to you as a message from "…" (its
+ * SubagentHandback call)…`、未報告なら `This agent has not reported yet: it is waiting on its own
+ * background work and will deliver its report through SubagentHandback when that finishes.`。
+ * 報告済みの待機は、エージェントの仕事としては完了（起動元は報告を受け取って先へ進む）。残った
+ * 背景作業は背景コマンドのノードとして別に見える。
+ */
+const REPORT_DELIVERED_RESULT = /<result>\s*This agent's report was delivered to you\b/;
 /** 背景作業待ち中のノードの活動表示（iOS は running ノードの currentActivity をそのまま出す）。 */
 const WAITING_ON_BACKGROUND_ACTIVITY = "背景作業待ち";
 
@@ -1097,7 +1107,7 @@ function extractTaskNotifications(line: string): TaskNotificationExtract[] {
       exitCode: exitCode === undefined ? null : Number(exitCode),
       ts,
       enqueue: carried.enqueue,
-      waitingOnBackground: WAITING_ON_BACKGROUND_SUMMARY.test(block),
+      waitingOnBackground: WAITING_ON_BACKGROUND_SUMMARY.test(block) && !REPORT_DELIVERED_RESULT.test(block),
     });
   }
   return out;

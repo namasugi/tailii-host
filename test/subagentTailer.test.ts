@@ -3150,6 +3150,59 @@ describe("SubagentTailer モデル", () => {
       ac.abort();
     });
 
+    /** 待機通知の `<result>` 付き（2.1.302+ の実物の 2 形）。 */
+    const waitingWithResult = (ts: string, delivered: boolean) => JSON.stringify({
+      type: "queue-operation", operation: "enqueue", timestamp: ts,
+      content: "<task-notification>\n<task-id>bgw</task-id>\n<tool-use-id>toolu_bgw</tool-use-id>\n<status>completed</status>\n"
+        + `<summary>${WAITING}</summary>\n`
+        + "<note>This agent stopped with background work of its own still running. It may resume on its own when that work completes or reports, and the same task-id notifies again if it does; the result below may be interim.</note>\n"
+        + (delivered
+          ? "<result>This agent's report was delivered to you as a message from \"bgw\" (its SubagentHandback call). Read it there; it is not repeated here.\n</result>\n"
+          : "<result>This agent has not reported yet: it is waiting on its own background work and will deliver its report through SubagentHandback when that finishes.\n</result>\n")
+        + "</task-notification>",
+    });
+
+    test("報告を SubagentHandback で届け終えた待機通知は完了にする（root 起動・生存セッションでも）", async () => {
+      // 実例（2.1.303）: 報告を返した直後、タイムアウトで背景へ回った撮影スクリプトが止まったまま
+      // 残っていたため待機通知になり、9 時間「1 agents 実行中」が残った。
+      const main = setup("subagent-waiting-delivered", [
+        waitingWithResult("2026-01-01T01:05:00.000Z", true),
+      ], {}, handbackLines(true));
+      const ac = new AbortController();
+      const tailer = new SubagentTailer({ pollIntervalMs: 10, probeSessionAlive: () => Promise.resolve(true) });
+      const nodes = await drain(tailer.streamSession(main, ac.signal), 300, "bgw");
+      ac.abort();
+      expect(statuses(nodes)).toEqual([["completed", null]]);
+      expect(nodes[0]?.ts).toBe(Date.parse("2026-01-01T01:05:00.000Z"));
+    });
+
+    test("未報告の待機通知は従来どおり running + 「背景作業待ち」", async () => {
+      const main = setup("subagent-waiting-unreported", [
+        waitingWithResult("2026-01-01T01:05:00.000Z", false),
+      ]);
+      const ac = new AbortController();
+      const tailer = new SubagentTailer({ pollIntervalMs: 10, probeSessionAlive: () => Promise.resolve(true) });
+      const nodes = await drain(tailer.streamSession(main, ac.signal), 300, "bgw");
+      ac.abort();
+      expect(statuses(nodes)).toEqual([["running", "背景作業待ち"]]);
+    });
+
+    test("報告済みの待機で完了にした後、再開（自 transcript の追記）したら running へ戻る", async () => {
+      const main = setup("subagent-waiting-delivered-resume", [
+        waitingWithResult("2026-01-01T01:05:00.000Z", true),
+      ], {}, handbackLines(true));
+      const ac = new AbortController();
+      const tailer = new SubagentTailer({ pollIntervalMs: 10, probeSessionAlive: () => Promise.resolve(true) });
+      const gen = tailer.streamSession(main, ac.signal);
+      expect(statuses(await drain(gen, 300, "bgw"))).toEqual([["completed", null]]);
+      const childJsonl = path.join(path.dirname(main), path.basename(main, ".jsonl"), "subagents", "agent-bgw.jsonl");
+      fs.appendFileSync(childJsonl, JSON.stringify({ agentId: "bgw", isSidechain: true, type: "user",
+        message: { role: "user", content: "background work reported" },
+        timestamp: "2026-01-01T01:30:00.000Z" }) + "\n");
+      expect(statuses(await drain(gen, 300, "bgw")).at(-1)?.[0]).toBe("running");
+      ac.abort();
+    });
+
     test("SubagentHandback で終わったノードは最終報告済み: 死亡 sweep で completed、失敗結果なら error", async () => {
       for (const [success, expected] of [[true, "completed"], [false, "error"]] as const) {
         const main = setup(`subagent-handback-dead-${success}`, [], {}, handbackLines(success));
