@@ -150,6 +150,8 @@ interface TaskNotification {
 interface BackgroundSpawn {
   label: string;
   ts: number | null;
+  /** run_in_background で起動した Bash（false = 前面。途中で背景へ回された確証があるときだけ登録する）。 */
+  background: boolean;
 }
 
 interface BackgroundCommand {
@@ -310,7 +312,7 @@ export class SubagentTailer {
           }
           for (const id of extractSpawnToolUseIds(line)) read.state.ownerByToolUseId.set(id, transcript.owner);
           for (const spawn of extractBackgroundSpawns(line)) {
-            read.state.bgSpawnByToolUseId.set(spawn.id, { label: spawn.label, ts: lineTs });
+            read.state.bgSpawnByToolUseId.set(spawn.id, { label: spawn.label, ts: lineTs, background: spawn.background });
           }
           for (const hit of extractToolResults(line)) {
             read.state.resultByToolUseId.set(hit.id, {
@@ -320,7 +322,8 @@ export class SubagentTailer {
             });
             const launch = hit.backgroundLaunch;
             const spawn = read.state.bgSpawnByToolUseId.get(hit.id);
-            if (launch !== null && spawn !== undefined) {
+            read.state.bgSpawnByToolUseId.delete(hit.id);
+            if (launch !== null && spawn !== undefined && (spawn.background || launch.confirmed)) {
               read.state.bgCommandByTaskId.set(launch.taskId, {
                 taskId: launch.taskId,
                 toolUseId: hit.id,
@@ -909,7 +912,12 @@ interface ToolResultExtract {
   isError: boolean;
   ts: number | null;
   asyncLaunch: boolean;
-  backgroundLaunch: { taskId: string; outputPath: string | null } | null;
+  /**
+   * 背景起動の ack。confirmed = 結果の先頭が CLI の背景起動の文言で、かつ行の構造化フィールド
+   * `toolUseResult.backgroundTaskId` が同じ ID。
+   * 前面の Bash（途中で背景へ回された形）は confirmed のときだけ背景コマンドにする。
+   */
+  backgroundLaunch: { taskId: string; outputPath: string | null; confirmed: boolean } | null;
   /** TaskStop の停止 ack。停止されたタスクは task-notification を残さないため、これが終了信号。 */
   stoppedTaskId: string | null;
 }
@@ -918,6 +926,8 @@ function extractToolResults(line: string): ToolResultExtract[] {
   const content = messageContent(line);
   const ts = timestampMs(line);
   if (!Array.isArray(content)) return [];
+  // ack が見つかったときだけ行を解析し直す（毎行の二重 JSON.parse を避ける）。
+  let structuredTaskId: string | null | undefined;
   const out: ToolResultExtract[] = [];
   for (const block of content) {
     if (typeof block !== "object" || block === null) continue;
@@ -925,8 +935,22 @@ function extractToolResults(line: string): ToolResultExtract[] {
     if (rec["type"] !== "tool_result") continue;
     if (typeof rec["tool_use_id"] !== "string") continue;
     const text = toolResultPlainText(rec["content"]);
-    const bgMatch = /Command running in background with ID: (\S+?)\.?(?:\s|$)/.exec(text);
+    // 背景起動の ack: run_in_background の「Command running in background with ID: X.」と、前面の
+    // Bash が途中で背景へ回された形（CLI 2.1.304 の 4 通り。どれも結果の先頭に来る）:
+    //   - タイムアウト: 「Command did not complete within its Ns timeout and was moved to the background (ID: X)」
+    //   - 割り込みメッセージ: 「Command was moved to the background (ID: X) so that a message … can reach you」
+    //   - 利用者の Ctrl+B: 「Command was manually backgrounded by user with ID: X」
+    //   - ターン中断: 「Command running in background with ID: X」（run_in_background と同じ文言）
+    // どれも完了通知・孤児判定は run_in_background と同じ（通知の来ないまま止まったスクリプトが、
+    // 待機通知の理由として残る実例あり）。前面の Bash の出力がたまたまこの文言で始まる（transcript を
+    // `grep -o` した結果など）ことがあるので、前面の分は行の構造化フィールド
+    // `toolUseResult.backgroundTaskId` が同じ ID のときだけ登録する（confirmed）。CLI 2.1.304 は 4 形とも
+    // このフィールドを持つ結果からしか ack 文を作らない。grep / cat の出力には無い。
+    const movedMatch = /^Command (?:did not complete within its \d+s timeout and was moved to the background \(ID: |was moved to the background \(ID: |was manually backgrounded by user with ID: |running in background with ID: )([A-Za-z0-9_-]+)/.exec(text);
+    const bgMatch = movedMatch ?? /Command running in background with ID: (\S+?)\.?(?:\s|$)/.exec(text);
     const outputMatch = /Output is being written to: (\S+?)\.?(?:\s|$)/.exec(text);
+    const confirmed = movedMatch !== null
+      && (structuredTaskId ??= backgroundTaskIdOf(line)) === movedMatch[1];
     const stopMatch = /Successfully stopped task: ([A-Za-z0-9_-]+)/.exec(text);
     out.push({
       id: rec["tool_use_id"],
@@ -935,11 +959,23 @@ function extractToolResults(line: string): ToolResultExtract[] {
       asyncLaunch: text.startsWith("Async agent launched successfully"),
       backgroundLaunch: bgMatch === null
         ? null
-        : { taskId: bgMatch[1]!, outputPath: outputMatch?.[1] ?? null },
+        : { taskId: bgMatch[1]!, outputPath: outputMatch?.[1] ?? null, confirmed },
       stoppedTaskId: stopMatch?.[1] ?? null,
     });
   }
   return out;
+}
+
+/** 行の構造化フィールド `toolUseResult.backgroundTaskId`（背景起動の ack に CLI が付ける）。 */
+function backgroundTaskIdOf(line: string): string | null {
+  try {
+    const result = (JSON.parse(line) as Record<string, unknown>)["toolUseResult"];
+    if (typeof result !== "object" || result === null) return null;
+    const id = (result as Record<string, unknown>)["backgroundTaskId"];
+    return typeof id === "string" ? id : null;
+  } catch {
+    return null;
+  }
 }
 
 function toolResultPlainText(content: unknown): string {
@@ -954,11 +990,15 @@ function toolResultPlainText(content: unknown): string {
   return parts.join("\n");
 }
 
-/** Bash の run_in_background 起動（バックグラウンドコマンド）の tool_use を抽出する。 */
-function extractBackgroundSpawns(line: string): { id: string; label: string }[] {
+/**
+ * Bash の tool_use を抽出する（背景起動の ack が来たら背景コマンドとして登録するため）。
+ * run_in_background に限らない: 前面の Bash もタイムアウトで背景へ回ることがある。ack の無い
+ * 前面完了の分は tool_result を見た時点で捨てる。
+ */
+function extractBackgroundSpawns(line: string): { id: string; label: string; background: boolean }[] {
   const content = messageContent(line);
   if (!Array.isArray(content)) return [];
-  const out: { id: string; label: string }[] = [];
+  const out: { id: string; label: string; background: boolean }[] = [];
   for (const block of content) {
     if (typeof block !== "object" || block === null) continue;
     const rec = block as Record<string, unknown>;
@@ -967,11 +1007,15 @@ function extractBackgroundSpawns(line: string): { id: string; label: string }[] 
     const input = typeof rec["input"] === "object" && rec["input"] !== null
       ? rec["input"] as Record<string, unknown>
       : null;
-    if (input?.["run_in_background"] !== true) continue;
+    if (input === null) continue;
     const description = typeof input["description"] === "string" ? input["description"] : "";
     const command = typeof input["command"] === "string" ? input["command"] : "";
     const label = description.length > 0 ? description : truncateActivityLabel(command);
-    out.push({ id: rec["id"], label: label.length > 0 ? label : "background command" });
+    out.push({
+      id: rec["id"],
+      label: label.length > 0 ? label : "background command",
+      background: input["run_in_background"] === true,
+    });
   }
   return out;
 }

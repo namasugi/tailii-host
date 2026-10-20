@@ -605,6 +605,136 @@ describe("SubagentTailer", () => {
     ac.abort();
   });
 
+  test("前面の Bash がタイムアウトで背景へ回った ack も背景コマンドとして出し、前面で終わった Bash は出さない", async () => {
+    const project = makeTempDir("subagent-tailer-bg-moved");
+    const sessionId = "55555555-6666-7777-8888-99999999999a";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    fs.mkdirSync(path.join(project, sessionId, "subagents"), { recursive: true });
+    const outputPath = path.join(project, "tasks", "b1sf98mak.output");
+    const bash = (id: string, description: string, ts: string) => JSON.stringify({
+      message: { role: "assistant", content: [{ type: "tool_use", id, name: "Bash", input: { command: "zsh ui.sh", description, timeout: 400000 } }] },
+      timestamp: ts,
+    });
+    const result = (id: string, text: string, ts: string, toolUseResult?: Record<string, unknown>) => JSON.stringify({
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: text }] }, timestamp: ts,
+      ...(toolUseResult !== undefined ? { toolUseResult } : {}),
+    });
+    fs.writeFileSync(main, [
+      bash("toolu_fg", "前面で終わる撮影", "2026-01-01T01:00:00.000Z"),
+      result("toolu_fg", "ok", "2026-01-01T01:00:05.000Z"),
+      bash("toolu_moved", "UI 撮影", "2026-01-01T01:01:00.000Z"),
+      // 実物（2.1.303）の文言。
+      result("toolu_moved", `Command did not complete within its 400s timeout and was moved to the background (ID: b1sf98mak). Output is being written to: ${outputPath}. You will be notified when it completes. To check interim output, use Read on that file path.`, "2026-01-01T01:07:40.000Z",
+        { stdout: "", stderr: "", interrupted: false, backgroundTaskId: "b1sf98mak", timedOutAfterMs: 400000 }),
+    ].join("\n") + "\n");
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10, probeOutputOpen: () => Promise.resolve(true) });
+    const gen = tailer.streamSession(main, ac.signal);
+    expect(await nextOfType(gen, "subagent_node")).toMatchObject({
+      node: { nodeId: "b1sf98mak", toolUseId: "toolu_moved", label: "UI 撮影", status: "running", kind: "command",
+        ts: Date.parse("2026-01-01T01:01:00.000Z") },
+    });
+    expect(tailer.outputPath("b1sf98mak")).toBe(outputPath);
+    fs.appendFileSync(main, JSON.stringify({
+      type: "user", timestamp: "2026-01-01T01:20:00.000Z",
+      message: { role: "user", content: "<task-notification>\n<task-id>b1sf98mak</task-id>\n<status>completed</status>\n<summary>Background command \"UI 撮影\" completed (exit code 0)</summary>\n</task-notification>" },
+    }) + "\n");
+    expect(await nextOfType(gen, "subagent_node")).toMatchObject({
+      node: { nodeId: "b1sf98mak", status: "completed", kind: "command" },
+    });
+    ac.abort();
+  });
+
+  test("前面の Bash が背景へ回る他の 3 形（割り込みメッセージ / Ctrl+B / ターン中断）も背景コマンドとして出す", async () => {
+    const acks: [string, string][] = [
+      ["bmsg1", "Command was moved to the background (ID: bmsg1) so that a message that arrived while it was running can reach you; it was not interrupted. Output is being written to: /tmp/t/bmsg1.output."],
+      ["bctlb1", "Command was manually backgrounded by user with ID: bctlb1. Output is being written to: /tmp/t/bctlb1.output."],
+      ["babrt1", "Command running in background with ID: babrt1. Output is being written to: /tmp/t/babrt1.output."],
+    ];
+    for (const [i, [taskId, ack]] of acks.entries()) {
+      const project = makeTempDir(`subagent-tailer-bg-moved-${i}`);
+      const sessionId = "55555555-6666-7777-8888-99999999999b";
+      const main = path.join(project, `${sessionId}.jsonl`);
+      fs.mkdirSync(path.join(project, sessionId, "subagents"), { recursive: true });
+      fs.writeFileSync(main, [
+        JSON.stringify({ message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_m", name: "Bash", input: { command: "make", description: "ビルド" } }] }, timestamp: "2026-01-01T01:00:00.000Z" }),
+        // 実物は 4 形とも toolUseResult.backgroundTaskId を持つ（CLI はこれがある結果からしか ack 文を作らない）。
+        JSON.stringify({ message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_m", content: ack }] },
+          toolUseResult: { stdout: "", stderr: "", backgroundTaskId: taskId }, timestamp: "2026-01-01T01:00:30.000Z" }),
+      ].join("\n") + "\n");
+      const ac = new AbortController();
+      const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10, probeOutputOpen: () => Promise.resolve(true) });
+      const node = await nextOfType(tailer.streamSession(main, ac.signal), "subagent_node");
+      ac.abort();
+      expect(node).toMatchObject({ node: { toolUseId: "toolu_m", label: "ビルド", status: "running", kind: "command" } });
+    }
+  });
+
+  test("前面 Bash の出力が ack の文言で始まっても backgroundTaskId が無ければ登録せず、本物の登録も上書きしない", async () => {
+    const project = makeTempDir("subagent-tailer-bg-grep-o");
+    const sessionId = "55555555-6666-7777-8888-99999999999d";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    fs.mkdirSync(path.join(project, sessionId, "subagents"), { recursive: true });
+    const bash = (id: string, description: string, input: Record<string, unknown>, ts: string) => JSON.stringify({
+      message: { role: "assistant", content: [{ type: "tool_use", id, name: "Bash", input: { command: "x", description, ...input } }] }, timestamp: ts,
+    });
+    fs.writeFileSync(main, [
+      // 本物の背景起動（構造化フィールド付き）。
+      bash("toolu_real", "本物", { run_in_background: true }, "2026-01-01T01:00:00.000Z"),
+      JSON.stringify({ message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_real",
+        content: "Command running in background with ID: breal1. Output is being written to: /tmp/t/breal1.output." }] },
+        toolUseResult: { stdout: "", backgroundTaskId: "breal1" }, timestamp: "2026-01-01T01:00:01.000Z" }),
+      // transcript を grep -o した前面 Bash（実 ID と別 ID を含む。構造化フィールドもパスも無い）。
+      bash("toolu_grep", "list bg ids", {}, "2026-01-01T01:01:00.000Z"),
+      JSON.stringify({ message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_grep",
+        // 1 行目は output パスまで続く完全な文型（grep した ack 行そのもの）でも、構造化フィールドが無ければ確証にしない。
+        content: "Command running in background with ID: breal1. Output is being written to: /tmp/t/fake.output.\nCommand running in background with ID: bfake9" }] },
+        toolUseResult: { stdout: "Command running in background with ID: breal1. Output is being written to: /tmp/t/fake.output.\nCommand running in background with ID: bfake9", stderr: "" },
+        timestamp: "2026-01-01T01:01:01.000Z" }),
+      // ターン中断形（前面）。本物は構造化フィールドを持つ（パスが無くても確証になる）。
+      bash("toolu_abort", "中断で背景へ", {}, "2026-01-01T01:02:00.000Z"),
+      JSON.stringify({ message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_abort",
+        content: "Command running in background with ID: babrt2" }] },
+        toolUseResult: { stdout: "", backgroundTaskId: "babrt2" }, timestamp: "2026-01-01T01:02:01.000Z" }),
+    ].join("\n") + "\n");
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10, probeOutputOpen: () => Promise.resolve(true) });
+    const gen = tailer.streamSession(main, ac.signal);
+    const seen = new Map<string, SubagentNode>();
+    const end = Date.now() + 400;
+    while (Date.now() < end) {
+      const n = await Promise.race([gen.next(), new Promise<null>((r) => setTimeout(() => r(null), Math.max(1, end - Date.now())))]);
+      if (n === null || n.done) break;
+      if (n.value.type === "subagent_node") seen.set(n.value.node.nodeId, n.value.node);
+    }
+    ac.abort();
+    expect([...seen.keys()].sort()).toEqual(["babrt2", "breal1"]);
+    expect(seen.get("breal1")).toMatchObject({ toolUseId: "toolu_real", label: "本物" });
+    expect(tailer.outputPath("breal1")).toBe("/tmp/t/breal1.output");
+  });
+
+  test("前面 Bash の出力に ack と同じ文字列が混ざっても（先頭でなければ）背景コマンドにしない", async () => {
+    const project = makeTempDir("subagent-tailer-bg-grep");
+    const sessionId = "55555555-6666-7777-8888-99999999999c";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    fs.mkdirSync(path.join(project, sessionId, "subagents"), { recursive: true });
+    fs.writeFileSync(main, [
+      JSON.stringify({ message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_g", name: "Bash", input: { command: "grep -n ack src", description: "grep" } }] }, timestamp: "2026-01-01T01:00:00.000Z" }),
+      JSON.stringify({ message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_g",
+        content: "src/a.ts:12: // Command running in background with ID: bfake1. Output is being written to: /tmp/x\nsrc/a.ts:13: was moved to the background (ID: bfake2)" }] }, timestamp: "2026-01-01T01:00:01.000Z" }),
+    ].join("\n") + "\n");
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10, probeOutputOpen: () => Promise.resolve(true) });
+    const gen = tailer.streamSession(main, ac.signal);
+    const first = await Promise.race([
+      nextOfType(gen, "subagent_node"),
+      new Promise<null>((r) => setTimeout(() => r(null), 300)),
+    ]);
+    ac.abort();
+    expect(first).toBeNull();
+  });
+
   test("停止境界注入(assistant text 内の system-reminder)の task-notification でも完了する", async () => {
     const project = makeTempDir("subagent-tailer-inline-notify");
     const sessionId = "77777777-8888-9999-aaaa-bbbbbbbbbbbb";
