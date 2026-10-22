@@ -8,6 +8,7 @@ import { PROTOCOL_V1, type ControlMessage, type SessionInfo } from "../protocol.
 import { SessionMetadataStore, validateSessionName } from "../sessions/sessionMetadataStore.js";
 import { normalizeForTextMatch, stripInvisibleForComparison } from "../shared/invisibleText.js";
 import { unwrapPastedContent } from "../shared/pastedContent.js";
+import { scrollBottomKeyIsDefault } from "../shared/claudeKeybindings.js";
 
 /** tmux コマンド 1 回分の実行結果。 */
 export interface TmuxCommandResult {
@@ -320,6 +321,11 @@ export interface SendTextSubmitOptions {
   cancelChoiceDialog?: boolean;
   /** 選択ダイアログを実際に Esc で閉じたときに 1 回だけ呼ばれる（hub が監査ログへ残す）。 */
   onChoiceDialogCancelled?: () => void;
+  /**
+   * 入力欄に残っていた文字（設問の回答キーの取り残し・ホスト側の打ちかけ等）を、送らずに消したときに
+   * 1 回だけ呼ばれる（residue-clear）。hub は消した内容を会話内に出す（黙って消さない）。
+   */
+  onResidueDiscarded?: (text: string) => void;
 }
 
 /**
@@ -1569,6 +1575,106 @@ export function screenShouldJumpToLatest(screen: string): boolean {
 }
 
 /**
+ * fullscreen 表示で上へスクロールされ、画面の下側（設問・承認ダイアログや入力欄）が見えていないか
+ * （scrolled-hiding-bottom, TESTABLE）。
+ *
+ * fullscreen の Claude は、選択ダイアログ（AskUserQuestion 等）をスクロール領域の中に描く。上へ
+ * スクロールされているとダイアログは画面外へ出て、入力欄もボトムバーも無い画面の最下行に案内（pill）
+ * だけが重なる（実測 2.1.306: `… Jump to bottom: fn+↓ to scroll`。差分パネルを開いていれば行の右側に
+ * パネルが続く）。この間は設問も入力欄も読めないので、回答前の確認は「設問が無い」と誤認し
+ * （実機 2026-10-21: 回答したのに「設問が画面に出ていなかった」で回答を捨てた）、送信は入力欄を
+ * 待ちきれず失敗する。
+ *
+ * 案内が画面の末尾数行にあり、入力欄（ボトムバー）もダイアログのフッターも見えないときだけ真。
+ * このときは最新位置へ戻すキー（`JUMP_TO_LATEST_SEQUENCE`）を送ってよい: ダイアログ表示中に送っても
+ * 選択肢のカーソルは動かない（実測 2.1.306）。
+ */
+export function screenScrolledAwayHidingBottom(screen: string): boolean {
+  if (!mayContainScrollPill(screen)) return false;
+  if (claudeComposerBarVisible(screen) || screenShowsDialogFooter(screen)) return false;
+  return screen
+    .split("\n")
+    .map((line) => stripSgr(line.replace(/\r$/, "")).trim())
+    .filter((line) => line !== "" && line !== "│")
+    .slice(-SCROLL_PILL_BOTTOM_LINES)
+    .some(isScrollPillLine);
+}
+
+/**
+ * 上へスクロールされて下側が隠れた画面をどう片付けたか（scrolled-hiding-bottom）。
+ * - `revealed`: 最新位置へ戻り、隠れていた下側（入力欄やダイアログ）が見えた。
+ * - `dialog-cancelled`: 戻せなかったので、隠れていたダイアログを Esc で閉じ、入力欄が見えた。
+ * - `escaped-unconfirmed`: Esc は送ったが、入力欄が出たのを読み直しの間に確かめられなかった。Esc は
+ *   ダイアログをほぼ確実に閉じる（実測）ので、呼び出し側は「閉じた」として扱い（設問を再提示して Esc を
+ *   重ねない）、本文は打たない。
+ * - `stuck`: 戻せず、Esc も送らなかった・送れなかった（戻すキーの後に画面を読めない場合も含む）。
+ *   以降は本文を 1 キーも打たない。
+ */
+export type HiddenBottomOutcome = "revealed" | "dialog-cancelled" | "escaped-unconfirmed" | "stuck";
+
+/**
+ * 上へスクロールされて入力欄・ダイアログが画面外にある画面を片付ける（scrolled-hiding-bottom, TESTABLE）。
+ *
+ * 1. `jumpAllowed`（「一番下へ戻る」が既定の ctrl+End のままだと設定ファイルで確かめられた）なら
+ *    ctrl+End を送り、隠れていない画面になるまで読み直す。ダイアログ表示中でも選択肢は動かない（実測）。
+ * 2. 戻らない・送れないとき、`cancelHiddenDialog`（利用者がこの設問に答えずに送る＝文字で回答する送信）
+ *    なら Esc を **1 回だけ**送る。隠れていたダイアログが閉じ、スクロールしたままでも入力欄が下に出る
+ *    （実測 2.1.306: 設問は「答えなかった」扱いで閉じる。承認ダイアログなら「許可しない」側に働く）。
+ *    入力欄（ボトムバー）が見えるまで読み直す。2 回目の Esc は送らない（巻き戻し画面が開くため）。
+ * どの段でも、キーを送った後に画面を読めなければそこで止める（何が起きたか分からない画面へ続けて打たない）。
+ */
+export async function revealHiddenBottom(io: {
+  capture: () => Promise<string | null>;
+  sendJump: () => Promise<void>;
+  sendEscape: () => Promise<void>;
+  jumpAllowed: boolean;
+  cancelHiddenDialog: boolean;
+  settleMs: number;
+  maxReads: number;
+}): Promise<{ outcome: HiddenBottomOutcome; screen: string | null }> {
+  let screen: string | null = null;
+  const settle = async (done: (frame: string) => boolean): Promise<"done" | "pending" | "unreadable"> => {
+    for (let reads = 0; reads < io.maxReads; reads += 1) {
+      await new Promise((resolve) => setTimeout(resolve, io.settleMs));
+      screen = await io.capture();
+      if (screen === null) return "unreadable";
+      if (done(screen)) return "done";
+    }
+    return "pending";
+  };
+  if (io.jumpAllowed) {
+    const sent = await io.sendJump().then(() => true, () => false);
+    if (sent) {
+      const jumped = await settle((frame) => !screenScrolledAwayHidingBottom(frame));
+      if (jumped === "done") return { outcome: "revealed", screen };
+      if (jumped === "unreadable") return { outcome: "stuck", screen: null };
+    }
+  }
+  if (!io.cancelHiddenDialog) return { outcome: "stuck", screen };
+  const escaped = await io.sendEscape().then(() => true, () => false);
+  if (!escaped) return { outcome: "stuck", screen };
+  const cancelled = await settle((frame) => !screenScrolledAwayHidingBottom(frame) && claudeComposerBarVisible(frame));
+  if (cancelled === "done") return { outcome: "dialog-cancelled", screen };
+  return { outcome: "escaped-unconfirmed", screen: cancelled === "unreadable" ? null : screen };
+}
+
+/** 案内（pill）を画面の末尾から探す行数（空行を除く）。案内はスクロール領域の最下行に重なる。 */
+const SCROLL_PILL_BOTTOM_LINES = 3;
+
+/** 最新位置へ戻すキーを送ってから画面を読み直すまでの猶予（fullscreen の再描画待ち）の既定。 */
+export const JUMP_SETTLE_MS = 500;
+/** 戻すキーの後に画面を読み直す回数の上限（再描画が遅い環境向け）。 */
+export const JUMP_SETTLE_READS = 3;
+
+/**
+ * 会話を開いたときの jump-to-latest で戻してよいか（`screenShouldJumpToLatest` + 「一番下へ戻る」の割り当てが
+ * 既定の ctrl+End のまま）。割り当てを変えた後の ctrl+End が何をするかは分からないので送らない。
+ */
+export function jumpToLatestAllowed(screen: string, keyIsDefault: () => boolean = () => scrollBottomKeyIsDefault()): boolean {
+  return screenShouldJumpToLatest(screen) && keyIsDefault();
+}
+
+/**
  * 最新位置へ戻るキー（Claude Code の `scroll:bottom` の既定 = ctrl+end, 実測 2.1.285）の生シーケンス。
  * tmux / herdr とも send-text（literal）で送る。入力欄の下書きとカーソル位置は変わらない（実測）。
  */
@@ -1680,6 +1786,24 @@ export async function settleFrameAfterChoiceCancel(io: {
   }
   return { screen, frame };
 }
+
+/**
+ * 入力欄に残っていた文字（Tailii が打って送信を確かめられなかった本文など）を送り出せなかったときの
+ * 拒否文言。今回の本文は 1 キーも打っていない。
+ */
+export const CHAT_BLOCKED_BY_UNSENT_OWN_TEXT =
+  "入力欄に残っていた文字を送り切れなかったため、メッセージを送信しませんでした（連結送信の防止）";
+
+/** 入力欄に残っていた文字を消せなかったときの拒否文言（residue-clear）。本文は 1 キーも打っていない。 */
+export const CHAT_BLOCKED_BY_UNCLEARABLE_RESIDUE =
+  "ホスト側の入力欄に残っていた文字を消せなかったため、メッセージを送信しませんでした（ホスト側の入力欄を空にしてから送り直してください）";
+
+/**
+ * fullscreen 表示で上へスクロールされたまま最新位置へ戻らず、入力欄も設問も見えないときの拒否文言
+ * （scrolled-hiding-bottom）。1 キーも打っていない。
+ */
+export const CHAT_BLOCKED_BY_SCROLLED_AWAY =
+  "ホスト側の画面が上へスクロールされていて入力欄が見えないため、メッセージを送信しませんでした（ホスト側の画面を一番下へ戻してから送り直してください）";
 
 /** 選択ダイアログを閉じられなかったときの拒否文言（hub が会話本文へそのまま出す）。 */
 export const CHAT_BLOCKED_BY_STUCK_CHOICE =
@@ -1956,6 +2080,10 @@ export class TmuxSessionManager {
   private readonly submitVerifyDelayMs: number;
   /** 選択ダイアログを Esc で閉じた後の消滅確認の間隔 ms（テスト注入用）。 */
   private readonly choiceCancelPollMs: number;
+  private readonly jumpSettleMs: number;
+  private readonly scrollBottomKeyAvailable: () => boolean;
+  /** 会話ごとの、打ったが送信を確かめられていない本文（residue-clear で自分の本文を消さないため）。 */
+  private readonly ownUnsubmittedText = new Map<string, string>();
   /** 「今すぐ送信」の chord 後、ヒント行の消滅確認の間隔 ms（テスト注入用）。 */
   private readonly sendNowPollMs: number;
   /** 貼り付けた本文が入力欄に入るのを確かめる間隔と上限 ms（テスト注入用）。 */
@@ -1975,6 +2103,10 @@ export class TmuxSessionManager {
     submitDelayMs?: number;
     submitVerifyDelayMs?: number;
     choiceCancelPollMs?: number;
+    /** 最新位置へ戻すキーの後に画面を読み直すまでの猶予（テストで 0 にする）。 */
+    jumpSettleMs?: number;
+    /** 「一番下へ戻る」が既定の ctrl+End のままか（既定は keybindings.json を読む。テストで差し替える）。 */
+    scrollBottomKeyAvailable?: () => boolean;
     sendNowPollMs?: number;
     pastedTextPollMs?: number;
     pastedTextTimeoutMs?: number;
@@ -1989,6 +2121,8 @@ export class TmuxSessionManager {
     this.submitDelayMs = options.submitDelayMs ?? 150;
     this.submitVerifyDelayMs = options.submitVerifyDelayMs ?? 700;
     this.choiceCancelPollMs = options.choiceCancelPollMs ?? CHOICE_CANCEL_POLL_MS;
+    this.jumpSettleMs = options.jumpSettleMs ?? JUMP_SETTLE_MS;
+    this.scrollBottomKeyAvailable = options.scrollBottomKeyAvailable ?? (() => scrollBottomKeyIsDefault());
     this.sendNowPollMs = options.sendNowPollMs ?? SEND_NOW_POLL_MS;
     this.pastedTextPollMs = options.pastedTextPollMs ?? PASTED_TEXT_POLL_MS;
     this.pastedTextTimeoutMs = options.pastedTextTimeoutMs ?? PASTED_TEXT_TIMEOUT_TMUX_MS;
@@ -2125,7 +2259,30 @@ export class TmuxSessionManager {
   async sendTextSubmit(name: string, text: string, options: SendTextSubmitOptions = {}): Promise<void> {
     const startedAtMs = Date.now();
     // 1 回の capture で「/login フロー中か」と「残存テキスト」を判定する（chat 毎の capture を増やさない）。
-    const screen = await this.captureVisibleScreenOrNull(name);
+    let screen = await this.captureVisibleScreenOrNull(name);
+    let hiddenDialogCancelled = false;
+    // fullscreen 表示で上へスクロールされ、入力欄やダイアログが画面外にあると、以降の判定が
+    // 何も読めない（実機 2026-10-21）。最新位置へ戻すか、答えずに送る送信なら隠れたダイアログを
+    // Esc で閉じてから読み直す。どちらもできなければ 1 キーも打たない（隠れた設問ダイアログへ
+    // 本文が入ると選択肢や自由記述が動く）。
+    if (screen !== null && screenScrolledAwayHidingBottom(screen)) {
+      const revealed = await revealHiddenBottom({
+        capture: () => this.captureVisibleScreenOrNull(name),
+        sendJump: () => this.sendKeys(name, [JUMP_TO_LATEST_SEQUENCE], true),
+        sendEscape: () => this.sendKeys(name, ["Escape"]),
+        jumpAllowed: this.scrollBottomKeyAvailable(),
+        cancelHiddenDialog: options.cancelChoiceDialog === true,
+        settleMs: this.jumpSettleMs,
+        maxReads: JUMP_SETTLE_READS,
+      });
+      if (revealed.outcome === "stuck") throw new ChatInjectionRejectedError(CHAT_BLOCKED_BY_SCROLLED_AWAY);
+      if (revealed.outcome === "dialog-cancelled" || revealed.outcome === "escaped-unconfirmed") {
+        hiddenDialogCancelled = true;
+        options.onChoiceDialogCancelled?.();
+      }
+      if (revealed.outcome === "escaped-unconfirmed") throw new ChatInjectionRejectedError(CHAT_BLOCKED_AFTER_CHOICE_CANCELLED);
+      screen = revealed.screen;
+    }
     // `/login` フロー中（方式選択 / コード入力待ち / retry）は通常の入力欄が無く、注入した本文が
     // 選択リストやコード欄へ入る。明示エラーで chat_send を失敗させる（コードは login_code_send、
     // 再試行/中断は pane_key_send の専用経路）。
@@ -2133,17 +2290,30 @@ export class TmuxSessionManager {
       throw new LoginCodeError(CHAT_BLOCKED_BY_LOGIN_PROMPT);
     }
     // 中断（停止）直後の入力欄に残存テキストがあるまま注入すると、今回の本文がその後ろへ連結され
-    // 1 メッセージになる（実機FB 2026-07-29）。残存の身元で扱いを分ける（herdr 側と同じ規則）:
+    // 1 メッセージになる（実機FB 2026-07-29）。残存は送らずに消して（C-u）から注入する（residue-clear,
+    // herdr 側と同じ規則）:
     // - transcript の直近の発話と同文 = 出力前の中断で claude が書き戻した「配送済みの発話」
-    //   → 破棄（C-u）。Enter で送り直すと同じ発話が二重に届く（実機 2026-09-08）。
-    // - それ以外（旧版の queued 書き戻し / Mac 側の下書き）→ 従来どおり Enter で独立送信し切る。
+    //   → 黙って破棄。Enter で送り直すと同じ発話が二重に届く（実機 2026-09-08）。
+    // - Tailii 自身が前に打って送信を確かめられなかった本文（CLI が止まっていた等。アプリでは
+    //   送信済みとして見えている）→ 従来どおり Enter で独立送信し切る（消すと送ったはずの発話が失われる）。
+    // - それ以外（設問の回答キーの取り残し「1」・Mac 側の打ちかけ等）→ 破棄し、消した内容を
+    //   `onResidueDiscarded` で知らせる。以前は Enter で独立送信していたが、取り残しの「1」や
+    //   打ちかけが Claude へ勝手に届いていた（2026-10-22 利用者提案で変更）。
     // 判定は ANSI で行い、薄字（faint）のプロンプト提案/プレースホルダーを実テキストと
     // 数えない（実障害 2026-09-03: 提案を残留と誤認し Enter で勝手に送信していた）。
     // 残存の有無は **composer フレームでだけ** 意味を持つ。ダイアログ表示中の
     // `inputBoxRealText` はカーソル行（`1. Yes` 等）を返すので、これを残存と信じて
     // Enter を撃つと選択肢を誤確定する（実測 2.1.278）。
-    let ansiScreen = await this.captureVisibleScreenAnsiOrNull(name);
-    let frame = classifySubmitFrame(ansiScreen);
+    // 隠れていたダイアログを閉じた直後は描画途中でボトムバーが欠けることがある。入力欄が描画されるまで
+    // 短く撮り直し、それでも読めなければ「閉じたが確かめられない」で返す（herdr と同じ扱い）。
+    let { screen: ansiScreen, frame } = await settleFrameAfterChoiceCancel({
+      capture: () => this.captureVisibleScreenAnsiOrNull(name),
+      pollMs: this.choiceCancelPollMs,
+      maxPolls: hiddenDialogCancelled ? CHOICE_CANCEL_MAX_POLLS : 0,
+    });
+    if (hiddenDialogCancelled && frame === "unknown") {
+      throw new ChatInjectionRejectedError(CHAT_BLOCKED_AFTER_CHOICE_CANCELLED);
+    }
     if (frame === "dialog" && options.cancelChoiceDialog === true) {
       // 利用者が「選択肢に答えずにメッセージを送る」と決めた送信（chat-cancel-choice）。
       // 選択ダイアログなら Esc で閉じ、消えたのを確かめてから入力欄へ流す（Mac 側で手動 Esc
@@ -2189,52 +2359,71 @@ export class TmuxSessionManager {
     }
     const pending = frame === "pending" ? (inputBoxRealText(ansiScreen ?? "") ?? "") : "";
     if (pending.length > 0) {
+      // 判定の順序が肝心: 中断で書き戻された直前の発話（配送済み）は、Tailii が打って送信を確かめられ
+      // なかった本文と同文でもありうる（届いていたが確認できなかった → Mac 側で中断 → 書き戻し）。
+      // 自分の本文として送り出すと同じ発話が二重に届く（2026-09-08 の重複投稿と同型）ので、先に書き戻しを見る。
       const recorded = options.recordedPromptText?.() ?? null;
-      if (recorded !== null && inputBoxTextMatchesRecordedPrompt(pending, recorded)) {
-        if (!(await this.clearInputBox(name))) {
-          throw new TmuxFailedError(
-            ["send-keys", "-t", this.paneTarget(name), "C-u"],
-            1,
-            "restored prompt could not be cleared from the input box (中断で書き戻された発話が残存)",
-          );
+      const restored = recorded !== null && inputBoxTextMatchesRecordedPrompt(pending, recorded);
+      const own = this.ownUnsubmittedText.get(name);
+      if (restored) {
+        this.ownUnsubmittedText.delete(name);
+        // 空にできないまま本文を打つと、今回の本文が残存の後ろへ連結されて 1 メッセージになる。
+        if (!(await this.clearInputBox(name))) throw new ChatInjectionRejectedError(CHAT_BLOCKED_BY_UNCLEARABLE_RESIDUE);
+      } else if ((own !== undefined && inputBoxTextMatchesRecordedPrompt(pending, own)) || options.onResidueDiscarded === undefined) {
+        // Tailii 自身が前に打って送信を確かめられなかった本文（CLI が止まっていた・貼り付けが後から
+        // 入った等。アプリでは送信済み／配送不明として見えている）は、消すと送ったはずの発話が失われる
+        // ので送り出す。消したことを知らせる手段の無い呼び出し（hub 以外: 公式アプリ連携・kick）も、
+        // 黙って消さないよう従来どおり送り出す。2.1.277+ は不可視文字入りを 1 回の Enter で流さないので、
+        // 送信確定ループで流す。流し切れなければ本文を打たずに失敗させる（連結送信の防止）。
+        if ((await this.submitTypedText(name)) !== "submitted") {
+          throw new ChatInjectionRejectedError(CHAT_BLOCKED_BY_UNSENT_OWN_TEXT);
         }
-      } else if ((await this.submitTypedText(name)) !== "submitted") {
-        // 残存を送信し切れないまま本文を打つと、今回の本文が残存の後ろへ連結されて
-        // 1 メッセージになる（実機FB 2026-07-29）。2.1.277+ は残存に不可視文字があると
-        // 1 回目の Enter で送信せず確認待ちにするため、裸の Enter 1 発では流し切れない。
-        // 流せなかったら何も打たずに失敗させ、明示再送へ倒す（「重複より欠落」）。
-        throw new ChatInjectionRejectedError(
-          "入力欄に残っていた文字を送り切れなかったため、メッセージを送信しませんでした（連結送信の防止）",
-        );
+        this.ownUnsubmittedText.delete(name);
+      } else {
+        // それ以外（設問の回答キーの取り残し「1」・ホスト側の打ちかけ等）は送らずに消し、知らせる。
+        if (!(await this.clearInputBox(name))) throw new ChatInjectionRejectedError(CHAT_BLOCKED_BY_UNCLEARABLE_RESIDUE);
+        options.onResidueDiscarded(pending);
       }
     }
+
     // 入力欄がシェルモード（プロンプト `!`）のまま残っていると、注入した通常メッセージが
     // そのままシェルコマンドとして実行される。空入力の Backspace（tmux キー名は BSpace）で
     // 記号を消して通常入力へ戻す。`!` 始まりの本文は注入時に自分でシェルモードへ入るので、
     // 常に通常モードから始めるのが決定的で安全（herdr 側 exitShellMode と同じ防御）。
     await this.exitShellMode(name);
+    // ここから本文を打つ。送信を確かめられるまでは「自分が打った本文」として覚えておく（次の送信で
+    // 入力欄に残っていたら、消さずに送り出す）。
+    this.ownUnsubmittedText.set(name, text);
     let pasted: PasteOutcome = "arrived";
-    if (tmuxTypedTextWouldBreak(text) && textIsPasteSafe(text) && typedTextProbe(text) !== null) {
-      // 1 回で打つと壊れる本文は、小分けの括弧付き貼り付けで渡す（long-text-paste）。
-      // 入ったのを確かめられなくても、打つ場合と同じく送信確定へ進む（画面を読めないだけの
-      // ことがある。Enter は貼り付けの後ろに並ぶので、途中までの本文が送信されることは無い）。
-      pasted = await pasteTextInline(text, {
-        paste: (pieces) => this.pasteBracketed(name, pieces),
-        capture: () => this.captureVisibleScreenAnsiOrNull(name),
-        sendKills: (count) => this.sendKeys(name, Array.from({ length: count }, () => "C-u")),
-        pollMs: this.pastedTextPollMs,
-        timeoutMs: this.pastedTextTimeoutMs,
-        clearDelayMs: this.clearKeyDelayMs,
-        clearSettleMs: this.clearSettleMs,
-        verifyDeadlineMs: startedAtMs + INJECT_VERIFY_BUDGET_MS,
-      });
-    } else {
-      await this.sendKeys(name, [text], true);
+    try {
+      if (tmuxTypedTextWouldBreak(text) && textIsPasteSafe(text) && typedTextProbe(text) !== null) {
+        // 1 回で打つと壊れる本文は、小分けの括弧付き貼り付けで渡す（long-text-paste）。
+        // 入ったのを確かめられなくても、打つ場合と同じく送信確定へ進む（画面を読めないだけの
+        // ことがある。Enter は貼り付けの後ろに並ぶので、途中までの本文が送信されることは無い）。
+        pasted = await pasteTextInline(text, {
+          paste: (pieces) => this.pasteBracketed(name, pieces),
+          capture: () => this.captureVisibleScreenAnsiOrNull(name),
+          sendKills: (count) => this.sendKeys(name, Array.from({ length: count }, () => "C-u")),
+          pollMs: this.pastedTextPollMs,
+          timeoutMs: this.pastedTextTimeoutMs,
+          clearDelayMs: this.clearKeyDelayMs,
+          clearSettleMs: this.clearSettleMs,
+          verifyDeadlineMs: startedAtMs + INJECT_VERIFY_BUDGET_MS,
+        });
+      } else {
+        await this.sendKeys(name, [text], true);
+      }
+    } catch (error) {
+      // 打つ途中で失敗した（配送不明）。後から入った分を「自分の本文」として送り出すと、利用者の
+      // 明示再送と二重に届く。覚えを消し、後から入った分は「消して知らせる」側に倒す。
+      this.ownUnsubmittedText.delete(name);
+      throw error;
     }
     const outcome = await this.submitTypedText(name);
     // 入ったのを確かめられなかった貼り付けは、送信確定が成立に見えても未確認として残す
     // （止まっている CLI の画面は、空の入力欄のまま変わらない）。
     if (outcome !== "submitted" || pasted === "unverified") options.onUnconfirmedSubmit?.();
+    else this.ownUnsubmittedText.delete(name);
   }
 
   /**

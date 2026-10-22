@@ -985,16 +985,45 @@ describe("TmuxSessionManager", () => {
     unreadable?: boolean;
     /** Esc でダイアログは閉じるが、その後の数フレームは描画途中でバーが見えない。 */
     blankFramesAfterEscape?: number;
+    /** fullscreen で上へスクロールされ、入力欄・ダイアログが画面外（最下行に案内だけ）。 */
+    scrolledFromStart?: boolean;
+    /** 最新位置へ戻すキー（ctrl+end）が効かない。 */
+    jumpIgnored?: boolean;
+    /** 戻すキーの後、この回数の読み取りはまだ隠れた画面のまま（再描画が遅い）。 */
+    scrolledReadsAfterJump?: number;
+    /** 戻すキーの後は画面を読めない（capture-pane が失敗する）。 */
+    captureFailsAfterJump?: boolean;
+    /** 隠れた画面で Esc を送ると、隠れていたダイアログが閉じて入力欄が下に出る（実測 2.1.306）。 */
+    escapeRevealsInput?: boolean;
+    /** C-u で入力欄が空にならない（消えない残骸）。 */
+    clearIgnored?: boolean;
+    /** Esc の後、この回数より後の読み取りは描画途中（入力欄もダイアログも無い）の画面になる。 */
+    unknownAfterEscapeReads?: number;
+    /** 上の描画途中の画面が続く回数（既定は以後ずっと）。 */
+    unknownFrames?: number;
   } = {}) {
     const state = {
       input: initialInput,
       dialog: options.dialogFromStart === "selection",
       approval: options.dialogFromStart === "approval",
+      scrolled: options.scrolledFromStart ?? false,
+      lagReads: 0,
+      jumped: false,
+      readsAfterEscape: -1,
+      unknownServed: 0,
     };
     let submits = 0;
     let blankFrames = 0;
     const screen = () => {
       const rule = "─".repeat(40);
+      if (state.lagReads > 0) {
+        state.lagReads -= 1;
+        return ["⏺ 前の応答", "⏺ 続き      Jump to bottom: fn+↓ to scroll      "].join("\n");
+      }
+      if (state.scrolled) {
+        // 本文の途中に罫線だけの行（図・区切り線）があっても、入力欄と取り違えない。
+        return ["⏺ 前の応答", "  " + "─".repeat(60), "  1. りんご", "⏺ 続き      Jump to bottom: fn+↓ to scroll      "].join("\n");
+      }
       if (blankFrames > 0) { blankFrames -= 1; return "⏺ User declined to answer questions"; }
       if (options.unreadable ?? false) return ["⏺ 前の応答", "  1. りんご", "  2. みかん"].join("\n");
       if (state.approval) {
@@ -1011,9 +1040,25 @@ describe("TmuxSessionManager", () => {
       return ["⏺ 前の応答", rule, body, rule, "  ⏸ manual mode on"].join("\n");
     };
     const runner = new MockTmuxRunner((args) => {
-      if (args[0] === "capture-pane") return ok(screen());
-      if (args[0] === "send-keys" && args[3] === "C-u") { state.input = ""; return ok(""); }
+      if (args[0] === "capture-pane") {
+        if (state.jumped && (options.captureFailsAfterJump ?? false)) return { exitCode: 1, stdout: "", stderr: "can't find pane" };
+        if (state.readsAfterEscape >= 0 && options.unknownAfterEscapeReads !== undefined) {
+          state.readsAfterEscape += 1;
+          if (state.readsAfterEscape > options.unknownAfterEscapeReads &&
+            state.unknownServed < (options.unknownFrames ?? Number.POSITIVE_INFINITY)) {
+            state.unknownServed += 1;
+            return ok("⏺ 描画途中");
+          }
+        }
+        return ok(screen());
+      }
+      if (args[0] === "send-keys" && args[3] === "C-u") {
+        if (!(options.clearIgnored ?? false)) state.input = "";
+        return ok("");
+      }
       if (args[0] === "send-keys" && args[3] === "Escape") {
+        if (state.scrolled && (options.escapeRevealsInput ?? false)) state.scrolled = false;
+        state.readsAfterEscape = 0;
         // Esc は選択ダイアログを閉じ、承認ダイアログではツールを拒否する（どちらも消える）。
         if (!(options.escapeStuck ?? false)) {
           state.dialog = false;
@@ -1035,6 +1080,14 @@ describe("TmuxSessionManager", () => {
         state.input = "";
         return ok("");
       }
+      if (args[0] === "send-keys" && args[3] === "-l" && args[5] === "\u001b[1;5F") {
+        state.jumped = true;
+        if (!(options.jumpIgnored ?? false)) {
+          state.scrolled = false;
+          state.lagReads = options.scrolledReadsAfterJump ?? 0;
+        }
+        return ok("");
+      }
       if (args[0] === "send-keys" && args[3] === "-l") { state.input += args[5] ?? ""; return ok(""); }
       return ok("");
     });
@@ -1049,15 +1102,22 @@ describe("TmuxSessionManager", () => {
     expect(sends()).toEqual([["C-u"], ["-l", "--", "軌道は抽選でいい"], ["Enter"]]);
   });
 
-  test("sendTextSubmit: 残存が記録本文と別文 / 照合材料なしなら従来どおり Enter で独立送信してから注入する（tmux）", async () => {
+  test("sendTextSubmit: 残存が記録本文と別文 / 照合材料なしなら、送らずに消して知らせてから注入する（tmux, residue-clear）", async () => {
+    // 設問の回答キーの取り残し「1」やホスト側の打ちかけ。以前は Enter で独立送信していた。
     const a = makeTmuxSubmitHarness("queued だった本文");
-    const mgrA = new TmuxSessionManager({ runner: a.runner.runner, store: makeTempStore(), submitDelayMs: 0, submitVerifyDelayMs: 0 });
-    await mgrA.sendTextSubmit("s", "今回の本文", { recordedPromptText: () => "直近の発話" });
-    expect(a.sends()).toEqual([["Enter"], ["-l", "--", "今回の本文"], ["Enter"]]);
-    const b = makeTmuxSubmitHarness("残存");
-    const mgrB = new TmuxSessionManager({ runner: b.runner.runner, store: makeTempStore(), submitDelayMs: 0, submitVerifyDelayMs: 0 });
-    await mgrB.sendTextSubmit("s", "今回の本文");
-    expect(b.sends()).toEqual([["Enter"], ["-l", "--", "今回の本文"], ["Enter"]]);
+    const mgrA = new TmuxSessionManager({ runner: a.runner.runner, store: makeTempStore(), clearKeyDelayMs: 0, submitDelayMs: 0, submitVerifyDelayMs: 0 });
+    const discardedA: string[] = [];
+    await mgrA.sendTextSubmit("s", "今回の本文", {
+      recordedPromptText: () => "直近の発話", onResidueDiscarded: (text) => discardedA.push(text),
+    });
+    expect(a.sends()).toEqual([["C-u"], ["-l", "--", "今回の本文"], ["Enter"]]);
+    expect(discardedA).toEqual(["queued だった本文"]);
+    const b = makeTmuxSubmitHarness("1");
+    const mgrB = new TmuxSessionManager({ runner: b.runner.runner, store: makeTempStore(), clearKeyDelayMs: 0, submitDelayMs: 0, submitVerifyDelayMs: 0 });
+    const discardedB: string[] = [];
+    await mgrB.sendTextSubmit("s", "今回の本文", { onResidueDiscarded: (text) => discardedB.push(text) });
+    expect(b.sends()).toEqual([["C-u"], ["-l", "--", "今回の本文"], ["Enter"]]);
+    expect(discardedB).toEqual(["1"]);
   });
 
   test("sendTextSubmit: 送信が成立したら Enter は 1 回だけで終える（tmux）", async () => {
@@ -1140,6 +1200,130 @@ describe("TmuxSessionManager", () => {
     // Esc は 1 回だけ（2 回届くと閉じた後の入力欄で巻き戻し画面が開く）。
     expect(h.sends()).toEqual([["Escape"], ["-l", "--", "その前に相談です"], ["Enter"]]);
     expect(cancelled).toBe(1);
+  });
+
+  test("sendTextSubmit: 上へスクロールされて設問が画面外なら、最新位置へ戻してから判定する（tmux, 実機 2026-10-21）", async () => {
+    // 戻すと設問ダイアログが見える → 答えずに送る指定が無ければ 1 キーも打たない（従来の門番）。
+    const blocked = makeTmuxSubmitHarness("", { scrolledFromStart: true, dialogFromStart: "selection" });
+    const mgrA = new TmuxSessionManager({
+      runner: blocked.runner.runner, store: makeTempStore(), submitDelayMs: 0, submitVerifyDelayMs: 0, jumpSettleMs: 0, scrollBottomKeyAvailable: () => true,
+    });
+    await expect(mgrA.sendTextSubmit("s", "どういう状況？")).rejects.toThrow(/ダイアログの表示中/);
+    expect(blocked.sends()).toEqual([["-l", "--", "\u001b[1;5F"]]);
+    // 答えずに送る指定なら、戻す → Esc で閉じる → 本文。
+    const cancel = makeTmuxSubmitHarness("", { scrolledFromStart: true, dialogFromStart: "selection" });
+    const mgrB = new TmuxSessionManager({
+      runner: cancel.runner.runner, store: makeTempStore(),
+      submitDelayMs: 0, submitVerifyDelayMs: 0, choiceCancelPollMs: 0, jumpSettleMs: 0, scrollBottomKeyAvailable: () => true,
+    });
+    await mgrB.sendTextSubmit("s", "どういう状況？", { cancelChoiceDialog: true });
+    expect(cancel.sends()).toEqual([["-l", "--", "\u001b[1;5F"], ["Escape"], ["-l", "--", "どういう状況？"], ["Enter"]]);
+    // 入力欄が隠れていただけなら、戻してそのまま送る。
+    const idle = makeTmuxSubmitHarness("", { scrolledFromStart: true });
+    const mgrC = new TmuxSessionManager({
+      runner: idle.runner.runner, store: makeTempStore(), submitDelayMs: 0, submitVerifyDelayMs: 0, jumpSettleMs: 0, scrollBottomKeyAvailable: () => true,
+    });
+    await mgrC.sendTextSubmit("s", "ふつうの本文");
+    expect(idle.sends()).toEqual([["-l", "--", "\u001b[1;5F"], ["-l", "--", "ふつうの本文"], ["Enter"]]);
+  });
+
+  test("sendTextSubmit: 戻すキーも Esc も効かず画面外のままなら、本文は 1 キーも打たずに失敗する（tmux）", async () => {
+    const h = makeTmuxSubmitHarness("", { scrolledFromStart: true, dialogFromStart: "selection", jumpIgnored: true });
+    const mgr = new TmuxSessionManager({
+      runner: h.runner.runner, store: makeTempStore(), submitDelayMs: 0, submitVerifyDelayMs: 0, jumpSettleMs: 0,
+      scrollBottomKeyAvailable: () => true,
+    });
+    // 本文を 1 キーも打っていない「打つ前の拒否」（配送不明にすると hub が以降の送信を止める）。
+    let cancelled = 0;
+    const error = await mgr.sendTextSubmit("s", "本文", {
+      cancelChoiceDialog: true, onChoiceDialogCancelled: () => { cancelled += 1; },
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ChatInjectionRejectedError);
+    // Esc は送ったので「閉じた」扱い（設問を再提示して Esc を重ねない）。
+    expect(String(error)).toMatch(/設問は閉じましたが/);
+    expect(cancelled).toBe(1);
+    // 戻す → だめなら Esc を 1 回だけ（2 回目は巻き戻し画面を開く）。本文は打たない。
+    expect(h.sends()).toEqual([["-l", "--", "\u001b[1;5F"], ["Escape"]]);
+    // 答えずに送る指定の無い送信は、隠れたダイアログを Esc で閉じない。
+    const plain = makeTmuxSubmitHarness("", { scrolledFromStart: true, dialogFromStart: "selection", jumpIgnored: true });
+    const mgrP = new TmuxSessionManager({
+      runner: plain.runner.runner, store: makeTempStore(), submitDelayMs: 0, submitVerifyDelayMs: 0, jumpSettleMs: 0,
+      scrollBottomKeyAvailable: () => true,
+    });
+    await expect(mgrP.sendTextSubmit("s", "本文")).rejects.toBeInstanceOf(ChatInjectionRejectedError);
+    expect(plain.sends()).toEqual([["-l", "--", "\u001b[1;5F"]]);
+  });
+
+  test("sendTextSubmit: 隠れた設問を閉じた直後の描画途中は撮り直し、読めないままなら「閉じたが確かめられない」で返す（tmux）", async () => {
+    const make = (unknownFrames?: number) => {
+      const h = makeTmuxSubmitHarness("", {
+        scrolledFromStart: true, dialogFromStart: "selection", jumpIgnored: true, escapeRevealsInput: true,
+        unknownAfterEscapeReads: 1, unknownFrames,
+      });
+      const mgr = new TmuxSessionManager({
+        runner: h.runner.runner, store: makeTempStore(), submitDelayMs: 0, submitVerifyDelayMs: 0, jumpSettleMs: 0,
+        choiceCancelPollMs: 0, scrollBottomKeyAvailable: () => false,
+      });
+      return { h, mgr };
+    };
+    // 描画途中が 1 枚だけなら、撮り直して入力欄が出たところで送る。
+    const recovered = make(1);
+    await recovered.mgr.sendTextSubmit("s", "回答", { cancelChoiceDialog: true });
+    expect(recovered.h.sends()).toEqual([["Escape"], ["-l", "--", "回答"], ["Enter"]]);
+    // 読めないままなら本文は打たず、「設問は閉じた」と返す（「設問に答えて」と誤って案内しない）。
+    const stuck = make();
+    const error = await stuck.mgr.sendTextSubmit("s", "回答", { cancelChoiceDialog: true }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ChatInjectionRejectedError);
+    expect(String(error)).toMatch(/設問は閉じましたが/);
+    expect(stuck.h.sends()).toEqual([["Escape"]]);
+  });
+
+  test("sendTextSubmit: 戻せないとき、答えずに送る送信は隠れたダイアログを Esc で閉じて入力欄へ送る（tmux）", async () => {
+    for (const jumpAllowed of [true, false]) {
+      const h = makeTmuxSubmitHarness("", {
+        scrolledFromStart: true, dialogFromStart: "selection", jumpIgnored: true, escapeRevealsInput: true,
+      });
+      const mgr = new TmuxSessionManager({
+        runner: h.runner.runner, store: makeTempStore(), submitDelayMs: 0, submitVerifyDelayMs: 0, jumpSettleMs: 0,
+        choiceCancelPollMs: 0, scrollBottomKeyAvailable: () => jumpAllowed,
+      });
+      let cancelled = 0;
+      await mgr.sendTextSubmit("s", "（設問への回答）", {
+        cancelChoiceDialog: true, onChoiceDialogCancelled: () => { cancelled += 1; },
+      });
+      // 割り当てが既定でなければ戻すキーは送らず、いきなり Esc。
+      expect(h.sends()).toEqual([
+        ...(jumpAllowed ? [["-l", "--", "\u001b[1;5F"]] : []),
+        ["Escape"], ["-l", "--", "（設問への回答）"], ["Enter"],
+      ]);
+      expect(cancelled).toBe(1);
+    }
+  });
+
+  test("sendTextSubmit: 戻した後に画面を読めなければ、隠れたダイアログへ打たないよう 1 キーも打たずに失敗する（tmux）", async () => {
+    // 戻す前は「隠れている」と分かっている。読めないまま進むと判定が unknown → 打鍵（fail-open）になる。
+    const h = makeTmuxSubmitHarness("", { scrolledFromStart: true, dialogFromStart: "selection", captureFailsAfterJump: true });
+    const mgr = new TmuxSessionManager({
+      runner: h.runner.runner, store: makeTempStore(), submitDelayMs: 0, submitVerifyDelayMs: 0, jumpSettleMs: 0, scrollBottomKeyAvailable: () => true,
+    });
+    await expect(mgr.sendTextSubmit("s", "本文")).rejects.toBeInstanceOf(ChatInjectionRejectedError);
+    expect(h.sends()).toEqual([["-l", "--", "\u001b[1;5F"]]);
+  });
+
+  test("sendTextSubmit: 戻した後の再描画が遅くても、読み直しの上限内なら送る（tmux）", async () => {
+    const ok2 = makeTmuxSubmitHarness("", { scrolledFromStart: true, scrolledReadsAfterJump: 2 });
+    const mgrA = new TmuxSessionManager({
+      runner: ok2.runner.runner, store: makeTempStore(), submitDelayMs: 0, submitVerifyDelayMs: 0, jumpSettleMs: 0, scrollBottomKeyAvailable: () => true,
+    });
+    await mgrA.sendTextSubmit("s", "本文");
+    expect(ok2.sends()).toEqual([["-l", "--", "\u001b[1;5F"], ["-l", "--", "本文"], ["Enter"]]);
+    // 上限（3 回）を超えて隠れたままなら打たない。
+    const late = makeTmuxSubmitHarness("", { scrolledFromStart: true, scrolledReadsAfterJump: 3 });
+    const mgrB = new TmuxSessionManager({
+      runner: late.runner.runner, store: makeTempStore(), submitDelayMs: 0, submitVerifyDelayMs: 0, jumpSettleMs: 0, scrollBottomKeyAvailable: () => true,
+    });
+    await expect(mgrB.sendTextSubmit("s", "本文")).rejects.toBeInstanceOf(ChatInjectionRejectedError);
+    expect(late.sends()).toEqual([["-l", "--", "\u001b[1;5F"]]);
   });
 
   test("sendTextSubmit: cancelChoiceDialog でも承認ダイアログには 1 キーも打たない（tmux）", async () => {
@@ -1244,15 +1428,59 @@ describe("TmuxSessionManager", () => {
     expect(unconfirmed).toEqual(["unconfirmed"]);
   });
 
-  test("sendTextSubmit: 残存を送信し切れないときは本文を打たずに失敗する（連結送信の防止）", async () => {
-    // 2.1.277+ は残存に不可視文字があると 1 回目の Enter で送信せず確認待ちにする。
-    // 裸の Enter 1 発で流せたつもりになると、今回の本文が残存の後ろへ連結される。
-    const h = makeTmuxSubmitHarness("消えない残存", { neverSubmits: true });
-    const mgr = new TmuxSessionManager({
-      runner: h.runner.runner, store: makeTempStore(), submitDelayMs: 0, submitVerifyDelayMs: 0,
+  test("sendTextSubmit: 中断で書き戻された直前の発話は知らせずに消す。自分の未確定本文と同文でも送り直さない（tmux）", async () => {
+    // 1 通目は Enter が効かず送信を確かめられない（実際には届いていた想定）→ 自分の未確定本文として覚える。
+    const h = makeTmuxSubmitHarness("", { neverSubmits: true });
+    const mgr = new TmuxSessionManager({ runner: h.runner.runner, store: makeTempStore(), clearKeyDelayMs: 0, submitDelayMs: 0, submitVerifyDelayMs: 0 });
+    let unconfirmed = 0;
+    await mgr.sendTextSubmit("s", "届いていた本文", { onUnconfirmedSubmit: () => { unconfirmed += 1; } });
+    expect(unconfirmed).toBe(1);
+    h.runner.recorded.length = 0;
+    const discarded: string[] = [];
+    await mgr.sendTextSubmit("s", "次の本文", {
+      recordedPromptText: () => "届いていた本文", onResidueDiscarded: (text) => discarded.push(text),
     });
-    await expect(mgr.sendTextSubmit("s", "今回の本文", { recordedPromptText: () => null }))
-      .rejects.toThrow(/送り切れなかった/);
+    // 書き戻しは C-u で黙って消す（Enter で送り直さない）。
+    expect(h.sends()[0]).toEqual(["C-u"]);
+    expect(h.sends().slice(0, 2)).toEqual([["C-u"], ["-l", "--", "次の本文"]]);
+    expect(discarded).toEqual([]);
+  });
+
+  test("sendTextSubmit: 送信を確かめられなかった自分の本文が残っていたら、消さずに送り出してから注入する（tmux）", async () => {
+    // 1 通目は CLI が止まっていて Enter が効かない → 自分の未確定本文として覚える（アプリでは送信済み）。
+    const harnessOptions = { neverSubmits: true };
+    const h = makeTmuxSubmitHarness("", harnessOptions);
+    const mgr = new TmuxSessionManager({ runner: h.runner.runner, store: makeTempStore(), clearKeyDelayMs: 0, submitDelayMs: 0, submitVerifyDelayMs: 0 });
+    await mgr.sendTextSubmit("s", "止まっていた間の本文", { onUnconfirmedSubmit: () => {} });
+    expect(h.state.input).toBe("止まっていた間の本文");
+    harnessOptions.neverSubmits = false;
+    h.runner.recorded.length = 0;
+    const discarded: string[] = [];
+    await mgr.sendTextSubmit("s", "次の本文", {
+      recordedPromptText: () => "もっと前の発話", onResidueDiscarded: (text) => discarded.push(text),
+    });
+    expect(h.sends()).toEqual([["Enter"], ["-l", "--", "次の本文"], ["Enter"]]);
+    expect(discarded).toEqual([]);
+  });
+
+  test("sendTextSubmit: 消したことを知らせる手段の無い呼び出し（hub 以外）は、残り物を黙って消さず従来どおり送り出す（tmux）", async () => {
+    const h = makeTmuxSubmitHarness("Mac 側の下書き");
+    const mgr = new TmuxSessionManager({ runner: h.runner.runner, store: makeTempStore(), submitDelayMs: 0, submitVerifyDelayMs: 0 });
+    await mgr.sendTextSubmit("s", "/remote-control");
+    expect(h.sends()).toEqual([["Enter"], ["-l", "--", "/remote-control"], ["Enter"]]);
+  });
+
+  test("sendTextSubmit: 残存を消し切れないときは本文を打たずに失敗する（連結送信の防止）", async () => {
+    // 消せたつもりで打つと、今回の本文が残存の後ろへ連結される。
+    const h = makeTmuxSubmitHarness("消えない残存", { clearIgnored: true });
+    const mgr = new TmuxSessionManager({
+      runner: h.runner.runner, store: makeTempStore(), clearKeyDelayMs: 0, submitDelayMs: 0, submitVerifyDelayMs: 0,
+    });
+    const error = await mgr.sendTextSubmit("s", "今回の本文", {
+      recordedPromptText: () => null, onResidueDiscarded: () => {},
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ChatInjectionRejectedError);
+    expect(String(error)).toMatch(/残っていた文字を消せなかった/);
     // 本文は 1 文字も打っていない（明示再送へ倒す）。
     expect(h.sends().some((keys) => keys[0] === "-l")).toBe(false);
   });

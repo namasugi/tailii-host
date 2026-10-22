@@ -1365,8 +1365,11 @@ describe("tmux: 長い本文の注入", () => {
     expect(tui.state.submitted).toEqual([spaced(RULE_LINE_TEXT), "普通の短文"]);
     expect(unconfirmed).toBe(0);
     tui.state.input = "下書き\n──────────";
-    await manager.sendTextSubmit("s", "次の短文");
-    expect(tui.state.submitted.slice(2)).toEqual(["下書き\n──────────", "次の短文"]);
+    const discarded: string[] = [];
+    await manager.sendTextSubmit("s", "次の短文", { onResidueDiscarded: (residue) => discarded.push(residue) });
+    // 罫線だけの行を含む下書きも、罫線の行まで消し切ってから送る（つながらない）。
+    expect(tui.state.submitted.slice(2)).toEqual(["次の短文"]);
+    expect(discarded).toEqual(["下書き\n──────────"]);
   });
 
   test("名前付きの会話でも、複数行の本文・罫線だけの行を含む本文が届く", async () => {
@@ -1381,14 +1384,17 @@ describe("tmux: 長い本文の注入", () => {
     }
   });
 
-  test("タイトルの長い会話で下書きがあっても、下書きと本文がつながらない（statusLine の行があっても）", async () => {
+  test("タイトルの長い会話で下書きがあっても、下書きを消してから送り、本文とつながらない（statusLine の行があっても）", async () => {
     const title = "長い会話タイトルのテスト".repeat(8);
     for (const text of ["[SL] Reply only OK.", RULE_LINE_TEXT, LONG_MULTILINE]) {
       const tui = makeTui({ title, statusLine: "───── haiku │ main ─" });
       tui.state.input = "mac draft line";
       const { manager } = makeManager(tui);
-      await manager.sendTextSubmit("s", text);
-      expect(tui.state.submitted).toEqual(["mac draft line", spaced(text)]);
+      const discarded: string[] = [];
+      await manager.sendTextSubmit("s", text, { onResidueDiscarded: (residue) => discarded.push(residue) });
+      // ホスト側の下書きは送らずに消し、消したことを知らせる（residue-clear）。本文とつながらない。
+      expect(tui.state.submitted).toEqual([spaced(text)]);
+      expect(discarded).toEqual(["mac draft line"]);
     }
   });
 
@@ -1396,20 +1402,27 @@ describe("tmux: 長い本文の注入", () => {
     const tui = makeTui();
     tui.state.input = "the prefix is tailii-sync-0123abcd ok";
     const { manager } = makeManager(tui);
-    await manager.sendTextSubmit("s", `a\tb [Pasted text #3] [...Truncated text #3 +0 lines...]`);
-    expect(tui.state.submitted).toEqual([
-      "the prefix is tailii-sync-0123abcd ok",
-      "a    b [Pasted text #3] [...Truncated text #3 +0 lines...]",
-    ]);
+    const discarded: string[] = [];
+    await manager.sendTextSubmit("s", `a\tb [Pasted text #3] [...Truncated text #3 +0 lines...]`, {
+      onResidueDiscarded: (residue) => discarded.push(residue),
+    });
+    expect(tui.state.submitted).toEqual(["a    b [Pasted text #3] [...Truncated text #3 +0 lines...]"]);
+    expect(discarded).toEqual(["the prefix is tailii-sync-0123abcd ok"]);
   });
 
-  test("Mac 側で貼り付けた下書き（畳まれた表示）は、従来どおり独立に送ってから注入する", async () => {
+  test("Mac 側で貼り付けた下書き（畳まれた表示）は、送らずに消し、消したことを知らせてから注入する", async () => {
+    // 畳まれた表示は本文が分からず、書き戻された発話とも見分けられない。どちらでも送らずに消せば
+    // 二重送信にならない（書き戻しなら配送済み、下書きなら消したことを知らせる）。
     const tui = makeTui();
     tui.write(`${BRACKETED_PASTE_START}${LONG_ASCII}${BRACKETED_PASTE_END}`);
     expect(tui.state.input).toBe("[Pasted text #1]");
     const recorded = `\n\n<pasted_content id="0baf">\n${LONG_ASCII}\n</pasted_content id="0baf">\n`;
-    await makeManager(tui).manager.sendTextSubmit("s", "短い本文", { recordedPromptText: () => recorded });
-    expect(tui.state.submitted).toEqual([LONG_ASCII, "短い本文"]);
+    const discarded: string[] = [];
+    await makeManager(tui).manager.sendTextSubmit("s", "短い本文", {
+      recordedPromptText: () => recorded, onResidueDiscarded: (residue) => discarded.push(residue),
+    });
+    expect(tui.state.submitted).toEqual(["短い本文"]);
+    expect(discarded).toEqual(["[Pasted text #1]"]);
   });
 
   test("中断で書き戻された長い発話は、送り直さずに消す（30 行でも消し切る）", async () => {
@@ -1561,10 +1574,12 @@ describe("herdr: 長い本文の注入", () => {
     await manager.sendTextSubmit("s-a", RULE_LINE_TEXT);
     await manager.sendTextSubmit("s-a", "普通の短文");
     expect(tui.state.submitted).toEqual([spaced(RULE_LINE_TEXT), "普通の短文"]);
-    // 罫線だけの行を含む下書きが残っていても、独立に送ってから注入する。
+    // 罫線だけの行を含む下書きが残っていても、罫線の行まで消し切ってから注入する。
     tui.state.input = "下書き\n──────────";
-    await manager.sendTextSubmit("s-a", "次の短文");
-    expect(tui.state.submitted.slice(2)).toEqual(["下書き\n──────────", "次の短文"]);
+    const discarded: string[] = [];
+    await manager.sendTextSubmit("s-a", "次の短文", { onResidueDiscarded: (residue) => discarded.push(residue) });
+    expect(tui.state.submitted.slice(2)).toEqual(["次の短文"]);
+    expect(discarded).toEqual(["下書き\n──────────"]);
     // 消すときも、罫線の行より前まで消し切る。
     tui.state.input = spaced(RULE_LINE_TEXT);
     expect(await manager.clearInputBox("s-a")).toBe(true);
@@ -1593,14 +1608,17 @@ describe("herdr: 長い本文の注入", () => {
     }
   });
 
-  test("タイトルの長い会話でも、複数行の本文が届き、下書きとつながらない", async () => {
+  test("タイトルの長い会話でも、複数行の本文が届き、下書きは消して本文とつながらない", async () => {
     const title = "長い会話タイトルのテスト".repeat(8);
     for (const text of ["1 行目の本文です\n2 行目の本文です", RULE_LINE_TEXT, LONG_MULTILINE]) {
       const tui = makeTui({ title, statusLine: "───── haiku │ main ─" });
       tui.state.input = "mac draft line";
       const { manager } = makeManager(tui);
-      await manager.sendTextSubmit("s-a", text);
-      expect(tui.state.submitted).toEqual(["mac draft line", spaced(text)]);
+      const discarded: string[] = [];
+      await manager.sendTextSubmit("s-a", text, { onResidueDiscarded: (residue) => discarded.push(residue) });
+      // ホスト側の下書きは送らずに消し、消したことを知らせる（residue-clear）。本文とつながらない。
+      expect(tui.state.submitted).toEqual([spaced(text)]);
+      expect(discarded).toEqual(["mac draft line"]);
     }
   });
 

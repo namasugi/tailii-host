@@ -27,9 +27,9 @@ import { resolveHubSocketPath } from "../shared/socketPath.js";
 import {
   processTmuxCommandRunner,
   JUMP_TO_LATEST_SEQUENCE,
+  jumpToLatestAllowed,
   screenBusyButScrolledAway,
   screenInLoginFlow,
-  screenShouldJumpToLatest,
   screenShowsApprovalDialog,
 } from "../backend/tmux.js";
 import { envWithoutTmux, screenHasSelectionFooter } from "../backend/herdr.js";
@@ -561,7 +561,8 @@ export async function runHubCommand(args: string[]): Promise<number> {
       // （jump-to-latest。hub が前面購読の開始で armJumpToLatest を呼ぶ）。戻らない環境（キー割り当ての
       // 変更等）では上の保持が残る。
       jumpToLatest: (session) => sessionBackend.sendKeys(session, [JUMP_TO_LATEST_SEQUENCE], true),
-      jumpToLatestIf: screenShouldJumpToLatest,
+      // 「一番下へ戻る」の割り当てを利用者が変えていたら送らない（変えた後の ctrl+End が何をするか分からない）。
+      jumpToLatestIf: (text) => jumpToLatestAllowed(text),
     }),
     questionInjector: (answers, session) => injectQuestionAnswers(answers, session, sessionBackend),
     // 回答キーは設問ダイアログが TUI に出ているときだけ打つ（question-stale）。
@@ -586,6 +587,9 @@ export async function runHubCommand(args: string[]): Promise<number> {
             log(`audit chat-choice-dialog-cancelled session=${session}`);
             context.onChoiceCancelled();
           },
+          // 入力欄に残っていた文字を送らずに消した（residue-clear）。hub が会話内に出す。知らせる先が無い
+          // 呼び出しでは渡さない（backend は黙って消さず、従来どおり送り出す）。
+          onResidueDiscarded: context.onResidueDiscarded,
           // 送信確定を確認できないまま配送済みレシートを返す唯一の経路。無言だと
           // 「送ったのに届かない」の再発に誰も気づけないので 1 行残す（事後解析用）。
           onUnconfirmedSubmit: () => log(`audit chat-submit-unconfirmed session=${session}`),

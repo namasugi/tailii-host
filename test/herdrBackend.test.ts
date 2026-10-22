@@ -399,6 +399,16 @@ describe("HerdrSessionManager", () => {
     plainScreen?: string;
     /** 最初の N 回の pane read は起動中の画面（入力欄の罫線なし）を返す（TUI 起動待ちの再現, boot-gate）。 */
     bootReads?: number;
+    /** 最新位置へ戻すキーが届くまで pane read はこの画面を返す（fullscreen で上へスクロールされた再現）。 */
+    scrolledScreen?: string;
+    /** 最新位置へ戻すキーの後は pane read が失敗する（画面を読めない）。 */
+    readFailsAfterJump?: boolean;
+    /** 最新位置へ戻すキーが効かない（隠れたまま）。 */
+    jumpIgnored?: boolean;
+    /** 隠れた画面で Esc を送ると、隠れていたダイアログが閉じて入力欄が下に出る（実測 2.1.306）。 */
+    escapeRevealsInput?: boolean;
+    /** Esc の後、2 回目以降の pane read が失敗する（閉じたのは確かめた直後に画面を読めなくなる）。 */
+    readFailsAfterEscape?: boolean;
   } = {}) {
     const state = {
       input: options.initialInput ?? "",
@@ -409,6 +419,9 @@ describe("HerdrSessionManager", () => {
       statusReads: 0,
       hideInputReads: options.hideInputReads ?? 0,
       bootReads: options.bootReads ?? 0,
+      scrolled: options.scrolledScreen !== undefined,
+      jumped: false,
+      readsAfterEscape: -1,
     };
     // 起動中の画面: 初期シェルのプロンプト + launcher がタイプした exec 行 + 起動バナー
     // （角付き枠。入力欄の罫線 `─…` は無い）。
@@ -442,6 +455,8 @@ describe("HerdrSessionManager", () => {
       }
       if (args[0] === "pane" && args[1] === "send-keys" && args[3] === "Escape") {
         if (options.escapeStuck !== true) state.dialogOpen = false;
+        if (state.scrolled && options.escapeRevealsInput === true) state.scrolled = false;
+        state.readsAfterEscape = 0;
         return herdrOk("");
       }
       if (args[0] === "pane" && args[1] === "send-keys" && args[3] === "Backspace") {
@@ -460,6 +475,12 @@ describe("HerdrSessionManager", () => {
           lines[lines.length - 1] = "";
           state.input = lines.length === 1 ? "" : lines.join("\n");
         }
+        return herdrOk("");
+      }
+      if (args[0] === "pane" && args[1] === "send-text" && args[3] === "\u001b[1;5F") {
+        // 最新位置へ戻すキー（ctrl+end）。入力欄の中身は変えない。
+        if (options.jumpIgnored !== true) state.scrolled = false;
+        state.jumped = true;
         return herdrOk("");
       }
       if (args[0] === "pane" && args[1] === "send-text" && args[3] === "\r") {
@@ -496,6 +517,12 @@ describe("HerdrSessionManager", () => {
           state.bootReads -= 1;
           return herdrOk(bootScreen);
         }
+        if (state.jumped && options.readFailsAfterJump === true) return { exitCode: 1, stdout: "", stderr: "pane read failed" };
+        if (state.readsAfterEscape >= 0) {
+          state.readsAfterEscape += 1;
+          if (options.readFailsAfterEscape === true && state.readsAfterEscape > 1) return { exitCode: 1, stdout: "", stderr: "pane read failed" };
+        }
+        if (state.scrolled && options.scrolledScreen !== undefined) return herdrOk(options.scrolledScreen);
         if (options.plainScreen !== undefined) return herdrOk(options.plainScreen);
         if (state.dialogOpen) return herdrOk(dialogScreen);
         const rule = "─".repeat(40);
@@ -537,23 +564,26 @@ describe("HerdrSessionManager", () => {
   const submitSends = (runner: MockHerdrRunner) =>
     runner.recorded.filter((args) => args[1]?.startsWith("send-"));
 
-  test("sendTextSubmit: 中断で書き戻された残存テキストは先に Enter で独立送信してから注入する", async () => {
+  test("sendTextSubmit: 入力欄に残っていた文字は送らずに消してから注入し、消した内容を知らせる（residue-clear）", async () => {
     const store = makeStore();
     store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
-    const { runner } = makeSubmitHarness({ initialInput: "前回の本文" });
+    // 設問の回答キーの取り残し「1」やホスト側の打ちかけ。以前は Enter で独立送信していた。
+    const { runner, state } = makeSubmitHarness({ initialInput: "前回の本文" });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
-    await manager.sendTextSubmit("s-a", "今回の本文");
-    // 残存 flush（独立メッセージとして送信）→ 本文 → CR。連結（"前回の本文今回の本文"）に
-    // ならないこと（実機FB 2026-07-29: 停止→送信の二重表示）。
+    const discarded: string[] = [];
+    await manager.sendTextSubmit("s-a", "今回の本文", { onResidueDiscarded: (text) => discarded.push(text) });
+    // 残存は C-u で消す → 本文 → CR。残存を Enter で送らない・連結（"前回の本文今回の本文"）にもしない。
     expect(submitSends(runner)).toEqual([
-      ["pane", "send-text", "w4:p2", "\r"],
+      ["pane", "send-text", "w4:p2", "\u0015"],
       ["pane", "send-text", "w4:p2", "今回の本文"],
       ["pane", "send-text", "w4:p2", "\r"],
     ]);
+    expect(discarded).toEqual(["前回の本文"]);
+    expect(state.input).toBe("");
   });
 
   test("sendTextSubmit: 残存が transcript の直近の発話と同文なら Enter で送り直さず C-u で破棄して注入する", async () => {
@@ -580,21 +610,83 @@ describe("HerdrSessionManager", () => {
     ]);
   });
 
-  test("sendTextSubmit: 残存が記録本文と別文なら従来どおり Enter で独立送信してから注入する（照合は遅延評価）", async () => {
+  test("sendTextSubmit: 送信を確かめられなかった自分の本文が中断で書き戻されたら、送り直さずに黙って消す（二重送信の防止）", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    // 1 通目は CR が飲まれて送信を確かめられない（実際には届いていた想定）→ 自分の未確定本文として覚える。
+    const { runner, state } = makeSubmitHarness({ swallowEnters: 1000 });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    let unconfirmed = 0;
+    await manager.sendTextSubmit("s-a", "届いていた本文", { onUnconfirmedSubmit: () => { unconfirmed += 1; } });
+    expect(unconfirmed).toBe(1);
+    expect(state.input).toBe("届いていた本文");
+    // Mac 側で中断 → 書き戻し。transcript の直近の発話と同文なので、自分の本文としては送り出さない。
+    state.swallowEnters = 0;
+    runner.recorded.length = 0;
+    const discarded: string[] = [];
+    await manager.sendTextSubmit("s-a", "次の本文", {
+      recordedPromptText: () => "届いていた本文", onResidueDiscarded: (text) => discarded.push(text),
+    });
+    expect(submitSends(runner)).toEqual([
+      ["pane", "send-text", "w4:p2", "\u0015"],
+      ["pane", "send-text", "w4:p2", "次の本文"],
+      ["pane", "send-text", "w4:p2", "\r"],
+    ]);
+    expect(discarded).toEqual([]);
+  });
+
+  test("sendTextSubmit: 消したことを知らせる手段の無い呼び出し（hub 以外）は、残り物を黙って消さず従来どおり送り出す", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const { runner } = makeSubmitHarness({ initialInput: "Mac 側の下書き" });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    await manager.sendTextSubmit("s-a", "/remote-control");
+    expect(submitSends(runner)).toEqual([
+      ["pane", "send-text", "w4:p2", "\r"],
+      ["pane", "send-text", "w4:p2", "/remote-control"],
+      ["pane", "send-text", "w4:p2", "\r"],
+    ]);
+  });
+
+  test("sendTextSubmit: 残存が記録本文と別文なら消したことを知らせ、同文（中断の書き戻し）なら黙って消す（照合は遅延評価）", async () => {
     const store = makeStore();
     store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
     const { runner } = makeSubmitHarness({ initialInput: "queued だった本文" });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
-    await manager.sendTextSubmit("s-a", "今回の本文", { recordedPromptText: () => "直近の発話" });
+    const discarded: string[] = [];
+    await manager.sendTextSubmit("s-a", "今回の本文", {
+      recordedPromptText: () => "直近の発話", onResidueDiscarded: (text) => discarded.push(text),
+    });
     expect(submitSends(runner)).toEqual([
-      ["pane", "send-text", "w4:p2", "\r"],
+      ["pane", "send-text", "w4:p2", "\u0015"],
       ["pane", "send-text", "w4:p2", "今回の本文"],
       ["pane", "send-text", "w4:p2", "\r"],
     ]);
+    expect(discarded).toEqual(["queued だった本文"]);
+    // 中断で書き戻された直前の発話（transcript の直近と同文）は配送済みなので、知らせずに消す。
+    const restored = makeSubmitHarness({ initialInput: "直近の発話" });
+    const managerR = new HerdrSessionManager({
+      runner: restored.runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    const discardedR: string[] = [];
+    await managerR.sendTextSubmit("s-a", "今回の本文", {
+      recordedPromptText: () => "直近の発話", onResidueDiscarded: (text) => discardedR.push(text),
+    });
+    expect(discardedR).toEqual([]);
     // 残存が無ければ transcript は読まない（chat_send ごとの I/O を増やさない）。
     const empty = makeSubmitHarness();
     const manager2 = new HerdrSessionManager({
@@ -634,9 +726,10 @@ describe("HerdrSessionManager", () => {
       submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
+    // 1 キーも本文を打っていない「打つ前の拒否」（配送不明に積まない）。
     await expect(manager.sendTextSubmit("s-a", "次の本文", {
       recordedPromptText: () => "中周(r≈175)を1枚足す",
-    })).rejects.toThrow(/restored prompt could not be cleared/);
+    })).rejects.toBeInstanceOf(ChatInjectionRejectedError);
     const sends = submitSends(runner);
     expect(sends.every((args) => args[3] === "\u0015")).toBe(true);
   });
@@ -942,11 +1035,10 @@ describe("HerdrSessionManager", () => {
       submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
-    // 残存が居座る画面では、本文を打つ前の残留 flush が成立しない時点で失敗する
-    // （2.1.277+ は不可視文字入りの残存を 1 回の Enter で流せないため、裸の Enter で
-    //  流せたつもりになると今回の本文が残存の後ろへ連結される）。
-    await expect(manager.sendTextSubmit("s-a", "重要なメッセージ")).rejects.toThrow(
-      /送り切れなかった/,
+    // 残存が居座る画面では、本文を打つ前の残存クリアが成立しない時点で失敗する
+    // （消せたつもりで打つと今回の本文が残存の後ろへ連結される）。
+    await expect(manager.sendTextSubmit("s-a", "重要なメッセージ", { onResidueDiscarded: () => {} })).rejects.toThrow(
+      /残っていた文字を消せなかった/,
     );
     // 本文は 1 文字も打っていない（クリアを確信できないまま重ね打ちしない）。
     const bodySends = runner.recorded.filter(
@@ -1035,6 +1127,190 @@ describe("HerdrSessionManager", () => {
       ["pane", "send-text", "w4:p2", "\r"],
     ]);
     expect(state.input).toBe("");
+  });
+
+  test("sendTextSubmit: fullscreen で上へスクロールされ入力欄が画面外なら、最新位置へ戻してから注入する（実機 2026-10-21）", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    // 入力欄もダイアログのフッターも無く、最下行に herdr の案内だけが重なる画面。本文に罫線だけの行
+    // （図・区切り線）があっても入力欄と取り違えない（取り違えると隠れたダイアログへ本文を打つ）。
+    const scrolledScreen = [
+      "⏺ 提出の前に、決めていただきたいことが3つあります。",
+      "",
+      "  " + "─".repeat(60),
+      "  1. 1.1 にする",
+      "  2. 1.0.1 にする",
+      "",
+      "⏺ 本文の続き                         2 new messages (click) ↓                ",
+    ].join("\n");
+    const { runner, state } = makeSubmitHarness({ scrolledScreen });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0, inputBoxReadyTimeoutMs: 5000,
+      jumpSettleMs: 0, scrollBottomKeyAvailable: () => true,
+    });
+    await manager.sendTextSubmit("s-a", "どういう状況？");
+    expect(submitSends(runner)).toEqual([
+      ["pane", "send-text", "w4:p2", "\u001b[1;5F"],
+      ["pane", "send-text", "w4:p2", "どういう状況？"],
+      ["pane", "send-text", "w4:p2", "\r"],
+    ]);
+    expect(state.input).toBe("");
+  });
+
+  test("sendTextSubmit: 戻した後に画面を読めなければ、隠れたダイアログへ打たないよう 1 キーも打たずに拒否する", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const scrolledScreen = "⏺ 本文\n  1. 1.1 にする\n⏺ 続き                    Jump to bottom: fn+↓ to scroll          ";
+    const { runner } = makeSubmitHarness({ scrolledScreen, readFailsAfterJump: true });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0, inputBoxReadyTimeoutMs: 5000,
+      jumpSettleMs: 0, scrollBottomKeyAvailable: () => true,
+    });
+    await expect(manager.sendTextSubmit("s-a", "本文")).rejects.toBeInstanceOf(ChatInjectionRejectedError);
+    expect(submitSends(runner)).toEqual([["pane", "send-text", "w4:p2", "\u001b[1;5F"]]);
+  });
+
+  test("sendTextSubmit: 戻すキーが効かず隠れたままなら、答えずに送る指定の無い送信は 1 キーも打たずに拒否する", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const scrolledScreen = "⏺ 本文                     Jump to bottom: fn+↓ to scroll        ";
+    const { runner } = makeSubmitHarness({ scrolledScreen, jumpIgnored: true, escapeRevealsInput: true });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0, inputBoxReadyTimeoutMs: 20_000,
+      jumpSettleMs: 0, scrollBottomKeyAvailable: () => true,
+    });
+    // 1 キーも打っていない「打つ前の拒否」として返す（配送不明にすると hub が以降の送信を止める）。
+    // 入力欄待ちの上限（20 秒）は待たない（戻すのは 1 回だけ試す）。
+    const startedAt = Date.now();
+    const error = await manager.sendTextSubmit("s-a", "本文").catch((e: unknown) => e);
+    expect(Date.now() - startedAt).toBeLessThan(3_000);
+    expect(error).toBeInstanceOf(ChatInjectionRejectedError);
+    expect(String(error)).toMatch(/上へスクロールされていて入力欄が見えない/);
+    // Esc は送らない（答えずに送る指定が無い送信で、隠れたダイアログを閉じない）。
+    expect(submitSends(runner)).toEqual([["pane", "send-text", "w4:p2", "\u001b[1;5F"]]);
+  });
+
+  test("sendTextSubmit: 「一番下へ戻る」の割り当てが既定でなければ戻すキーを送らない", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const scrolledScreen = "⏺ 本文                     Jump to bottom (meta+g) ↓        ";
+    const { runner } = makeSubmitHarness({ scrolledScreen });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0, inputBoxReadyTimeoutMs: 20_000,
+      jumpSettleMs: 0, scrollBottomKeyAvailable: () => false,
+    });
+    await expect(manager.sendTextSubmit("s-a", "本文")).rejects.toBeInstanceOf(ChatInjectionRejectedError);
+    expect(submitSends(runner)).toEqual([]);
+  });
+
+  test("sendTextSubmit: 戻せないとき、答えずに送る送信は隠れたダイアログを Esc で 1 回だけ閉じて入力欄へ送る", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const scrolledScreen = "⏺ 本文\n  " + "─".repeat(60) + "\n⏺ 続き                    Jump to bottom: fn+↓ to scroll          ";
+    for (const jumpAllowed of [true, false]) {
+      // 戻すキーが効かない環境 / 割り当てが既定でない環境のどちらでも、Esc で閉じれば入力欄が下に出る。
+      const { runner, state } = makeSubmitHarness({ scrolledScreen, jumpIgnored: true, escapeRevealsInput: true });
+      const manager = new HerdrSessionManager({
+        runner: runner.runner, store,
+        submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+        readyTimeoutMs: 5000, readyPollMs: 0, inputBoxReadyTimeoutMs: 5000,
+        jumpSettleMs: 0, scrollBottomKeyAvailable: () => jumpAllowed,
+      });
+      let cancelled = 0;
+      await manager.sendTextSubmit("s-a", "（設問への回答）\n・テスト → B", {
+        cancelChoiceDialog: true, onChoiceDialogCancelled: () => { cancelled += 1; },
+      });
+      const sends = submitSends(runner).map((args) => args.slice(1));
+      expect(sends.filter((args) => args[2] === "Escape")).toHaveLength(1);
+      expect(sends.some((args) => args[2] === "\u001b[1;5F")).toBe(jumpAllowed);
+      // Esc の後に本文と CR。
+      const escAt = sends.findIndex((args) => args[2] === "Escape");
+      expect(sends.slice(escAt + 1).map((args) => args[2])).toEqual(["（設問への回答）\n・テスト → B", "\r"]);
+      expect(cancelled).toBe(1);
+      expect(state.input).toBe("");
+    }
+  });
+
+  test("sendTextSubmit: 隠れた設問を Esc で閉じた直後に画面を読めなくなっても、閉じたことは必ず伝え、本文は打たない", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const scrolledScreen = "⏺ 本文                     Jump to bottom: fn+↓ to scroll        ";
+    const { runner } = makeSubmitHarness({
+      scrolledScreen, jumpIgnored: true, escapeRevealsInput: true, readFailsAfterEscape: true,
+    });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0, inputBoxReadyTimeoutMs: 5000,
+      jumpSettleMs: 0, scrollBottomKeyAvailable: () => false,
+    });
+    let cancelled = 0;
+    const error = await manager.sendTextSubmit("s-a", "本文", {
+      cancelChoiceDialog: true, onChoiceDialogCancelled: () => { cancelled += 1; },
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ChatInjectionRejectedError);
+    // 伝え漏れると hub が閉じた設問を再提示し、答え直した回答が「設問が出ていなかった」で捨てられる。
+    expect(cancelled).toBe(1);
+    expect(String(error)).toMatch(/設問は閉じましたが/);
+    expect(submitSends(runner)).toEqual([["pane", "send-keys", "w4:p2", "Escape"]]);
+  });
+
+  test("sendTextSubmit: 送信を確かめられなかった自分の本文が残っていたら、消さずに送り出してから注入する（知らせない）", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    // 1 通目は CLI が止まっていて CR が効かない → 自分の未確定本文として覚える（アプリでは送信済み）。
+    const { runner, state } = makeSubmitHarness({ swallowEnters: 1000 });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    await manager.sendTextSubmit("s-a", "止まっていた間の本文", { onUnconfirmedSubmit: () => {} });
+    expect(state.input).toBe("止まっていた間の本文");
+    state.swallowEnters = 0;
+    runner.recorded.length = 0;
+    const discarded: string[] = [];
+    await manager.sendTextSubmit("s-a", "次の本文", {
+      recordedPromptText: () => "もっと前の発話", onResidueDiscarded: (text) => discarded.push(text),
+    });
+    // 消すと送ったはずの発話が失われる。送り出してから今回の本文。
+    expect(submitSends(runner)).toEqual([
+      ["pane", "send-text", "w4:p2", "\r"],
+      ["pane", "send-text", "w4:p2", "次の本文"],
+      ["pane", "send-text", "w4:p2", "\r"],
+    ]);
+    expect(discarded).toEqual([]);
+  });
+
+  test("sendTextSubmit: Esc でも入力欄が出なければ、閉じた扱いにして本文は 1 キーも打たずに拒否する", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const scrolledScreen = "⏺ 本文                     Jump to bottom: fn+↓ to scroll        ";
+    const { runner } = makeSubmitHarness({ scrolledScreen, jumpIgnored: true });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0, inputBoxReadyTimeoutMs: 5000,
+      jumpSettleMs: 0, scrollBottomKeyAvailable: () => false,
+    });
+    let cancelled = 0;
+    const error = await manager.sendTextSubmit("s-a", "本文", {
+      cancelChoiceDialog: true, onChoiceDialogCancelled: () => { cancelled += 1; },
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ChatInjectionRejectedError);
+    // Esc は送ったので「閉じた」扱い（設問を再提示して Esc を重ねない）。本文は打たない。
+    expect(String(error)).toMatch(/設問は閉じましたが/);
+    expect(cancelled).toBe(1);
+    // Esc は 1 回だけ（2 回目は巻き戻し画面を開く）。
+    expect(submitSends(runner)).toEqual([["pane", "send-keys", "w4:p2", "Escape"]]);
   });
 
   test("sendTextSubmit: 入力欄が上限まで描画されなければ 1 キーも打たずに throw する（残留→明示再送の二重ターンを作らない）", async () => {

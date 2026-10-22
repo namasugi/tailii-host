@@ -892,6 +892,137 @@ describe("SessionHub actor", () => {
     await vi.waitFor(() => expect(hub.actors.get("work")?.questionAnswerInjections).toBe(0));
   });
 
+  describe("画面外に隠れて戻せない設問へは、回答を文字で送る（scrolled-hiding-bottom）", () => {
+    const HIDDEN_QUESTIONS = [{ header: "版", question: "新しい版はどうしますか？", multiSelect: false,
+      options: [{ label: "1.1", description: "" }, { label: "1.0.1", description: "" }] }];
+    type InjectContext = {
+      cancelChoice: boolean; onChoiceCancelled: () => void; onResidueDiscarded?: (text: string) => void;
+      recordedPromptText: () => string | null;
+    };
+    const setup = (chatInjector: (text: string, session: string, context: InjectContext) => Promise<void>) => {
+      const questionInjector = vi.fn(async () => {});
+      const log: string[] = [];
+      const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-question-hidden"),
+        metadataStore: makeTempStore(), timeoutSeconds: 1800, questionInjector, chatInjector,
+        questionDialogVisible: async () => "hidden", staleQuestionRecheckMs: 10, log: (line) => log.push(line) });
+      hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q1", questions: HIDDEN_QUESTIONS });
+      const client = {}, received: unknown[] = [];
+      hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+      hub.handleClientMessage(client, JSON.stringify({ type: "conversation_subscribe", session: "work" }));
+      hub.handleClientMessage(client, JSON.stringify({ type: "question_answer_submit", id: "answer", session: "work",
+        questionId: "q1", answers: [{ questionIndex: 0, selectedOptionIndexes: [0], multiSelect: false }] }));
+      return { hub, received, questionInjector, log };
+    };
+    const marker = (streamId: string, text?: string) => expect.objectContaining({
+      type: "conversation_event", session: "work",
+      payload: expect.objectContaining({ streamId, role: "system", ...(text === undefined ? {} : { text: expect.stringContaining(text) }) }),
+    });
+
+    test("回答キーは打たず、設問を閉じる指定で「設問への回答」を chat として送り、会話内に知らせる", async () => {
+      const chatInjector = vi.fn(async (_text: string, _session: string, context: InjectContext) => {
+        context.onChoiceCancelled();
+      });
+      const { hub, received, questionInjector, log } = setup(chatInjector);
+      await vi.waitFor(() => expect(received).toContainEqual({ type: "question_answer_result", id: "answer", status: "accepted" }));
+      await vi.waitFor(() => expect(chatInjector).toHaveBeenCalledTimes(1));
+      expect(chatInjector.mock.calls[0]![0]).toBe("（設問への回答）\n・新しい版はどうしますか？ → 1.1");
+      expect(chatInjector.mock.calls[0]![1]).toBe("work");
+      expect(chatInjector.mock.calls[0]![2]).toEqual(expect.objectContaining({ cancelChoice: true }));
+      expect(questionInjector).not.toHaveBeenCalled();
+      await vi.waitFor(() => expect(received).toContainEqual(marker("question-answer-as-text-q1", "回答を文字で送りました")));
+      expect(hub.actors.get("work")?.pendingQuestion).toBeNull();
+      expect(log.some((line) => line.includes("audit question-answer-as-text session=work question=q1"))).toBe(true);
+      await vi.waitFor(() => expect(hub.actors.get("work")?.questionAnswerInjections).toBe(0));
+    });
+
+    test("通常の chat と同じく直前の発話を照合材料に渡し、消した残り物も会話内に出す", async () => {
+      let recorded: string | null | undefined;
+      const chatInjector = vi.fn(async (_text: string, _session: string, context: InjectContext) => {
+        recorded = context.recordedPromptText();
+        context.onChoiceCancelled();
+        context.onResidueDiscarded?.("1");
+      });
+      const { hub, received } = (() => {
+        const made = setup(chatInjector);
+        vi.spyOn(made.hub as unknown as { trailingUserPromptText: (session: string) => string | null },
+          "trailingUserPromptText").mockReturnValue("直前の発話");
+        return made;
+      })();
+      await vi.waitFor(() => expect(chatInjector).toHaveBeenCalledTimes(1));
+      expect(recorded).toBe("直前の発話");
+      await vi.waitFor(() => expect(received).toContainEqual(marker("chat-residue-discarded-question-q1", "「1」は送らずに消しました")));
+      expect(hub.actors.get("work")?.pendingQuestion).toBeNull();
+    });
+
+    test("設問を閉じずに送れた（画面が戻ったら設問がもう無かった）なら、閉じたとは言わない", async () => {
+      const chatInjector = vi.fn(async () => {});
+      const { received } = setup(chatInjector);
+      await vi.waitFor(() => expect(received).toContainEqual(marker("question-answer-as-text-q1", "見つからなかったため")));
+    });
+
+    test("閉じる前に諦めた（打つ前の拒否）なら、設問を戻して再提示し、理由を会話内に出す", async () => {
+      const chatInjector = vi.fn(async () => {
+        throw new ChatInjectionRejectedError("ホスト側の画面が上へスクロールされていて入力欄が見えないため、メッセージを送信しませんでした");
+      });
+      const { hub, received } = setup(chatInjector);
+      await vi.waitFor(() => expect(hub.actors.get("work")?.pendingQuestion?.id).toBe("q1"));
+      expect(received).toContainEqual({ type: "question_event", session: "work", event: "prompt", id: "q1", questions: HIDDEN_QUESTIONS });
+      await vi.waitFor(() => expect(received).toContainEqual(marker("question-answer-rejected-q1", "上へスクロールされていて")));
+    });
+
+    test("設問を閉じた後に本文を送れなかったら、設問は戻さず（TUI にもう無い）メッセージで答え直すよう出す", async () => {
+      const chatInjector = vi.fn(async (_text: string, _session: string, context: InjectContext) => {
+        context.onChoiceCancelled();
+        throw new ChatInjectionRejectedError("typed text did not reach the input box");
+      });
+      const { hub, received } = setup(chatInjector);
+      await vi.waitFor(() => expect(received).toContainEqual(marker("question-answer-as-text-failed-q1", "メッセージで回答を送り直して")));
+      expect(hub.actors.get("work")?.pendingQuestion).toBeNull();
+      // 再提示しない（設問カードを出し直すと、TUI に無い設問へ答えさせることになる）。
+      expect(received.filter((m) => (m as { type?: string; event?: string }).type === "question_event" &&
+        (m as { event?: string }).event === "prompt")).toHaveLength(0);
+    });
+  });
+
+  test("backend が入力欄の残り文字を送らずに消したら、消した内容を会話内に出す（residue-clear）", async () => {
+    const chatInjector = vi.fn(async (_text: string, _session: string, context: { onResidueDiscarded?: (text: string) => void }) => {
+      context.onResidueDiscarded?.("1");
+    });
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-residue-clear"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, chatInjector });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "conversation_subscribe", session: "work" }));
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "one", session: "work",
+      clientMessageId: "client-1", text: "どういう状況？" }));
+    await vi.waitFor(() => expect(received).toContainEqual({ type: "chat_send_result", id: "one", status: "accepted" }));
+    expect(received).toContainEqual(expect.objectContaining({
+      type: "conversation_event", session: "work",
+      payload: expect.objectContaining({
+        streamId: "chat-residue-discarded-one", role: "system",
+        text: "ℹ️ ホスト側の入力欄に残っていた「1」は送らずに消しました。",
+      }),
+    }));
+    // 長い残りは 1 行にして先頭だけ見せる。
+    const longInjector = vi.fn(async (_text: string, _session: string, context: { onResidueDiscarded?: (text: string) => void }) => {
+      context.onResidueDiscarded?.(`${"あ".repeat(70)}\n二行目`);
+    });
+    const hub2 = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-residue-clear-long"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, chatInjector: longInjector });
+    const received2: unknown[] = [];
+    hub2.registerClient(client, (line) => received2.push(decodeHubServerLine(line)));
+    hub2.handleClientMessage(client, JSON.stringify({ type: "conversation_subscribe", session: "work" }));
+    hub2.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "two", session: "work",
+      clientMessageId: "client-2", text: "本文" }));
+    await vi.waitFor(() => expect(received2).toContainEqual(expect.objectContaining({
+      type: "conversation_event",
+      payload: expect.objectContaining({
+        streamId: "chat-residue-discarded-two",
+        text: `ℹ️ ホスト側の入力欄に残っていた「${"あ".repeat(60)}…」は送らずに消しました。`,
+      }),
+    })));
+  });
+
   test("stale で捨てた設問は、少し後にダイアログが出ていたら戻して再提示する（遅い hook で描画前に答えた, question-stale）", async () => {
     const questionInjector = vi.fn(async () => {});
     const visible = [false, true];

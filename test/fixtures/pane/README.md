@@ -67,3 +67,5 @@ tmux `capture-pane -p -e`（ANSI 付き・viewport のみ）でそのまま採�
 | `question-dialog-multiselect-single.ansi` | 2.1.289・AskUserQuestion の 1 問だけの multiSelect（`[ ]` 付き・`Type something` は末尾ドット無し・`Chat about this` は罫線の下） | `Enter to select · ↑/↓ to navigate · Esc to cancel` |
 | `question-dialog-preview.ansi` | 2.1.289・preview 付き単一選択（左に選択肢・右にプレビュー枠。Other 行は無く `Notes: press n to add notes`） | `Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel` |
 | `typed-digit-idle.ansi` | 2.1.289・待機中の入力欄に `1` が残った画面（設問の回答キーが入力欄へ落ちた 2026-10-05 の障害と同じ形） | `⏸ manual mode on` |
+| `question-dialog-fullscreen-diff.ansi` | 2.1.306・`tui: fullscreen`・tmux 240×30・`/diff` の差分パネルあり（中身は `No commits yet`）。AskUserQuestion の 3 問。ダイアログはスクロール領域の中（左の列）に描かれ、罫線は 150 桁目の縦線 `│` で止まる | `Enter to select · Tab/Arrow keys to navigate · Esc to cancel` |
+| `question-dialog-fullscreen-scrolled.ansi` | 上の画面で PgUp を押した形。ダイアログも入力欄も画面外になり、最下行の本文に案内 `Jump to bottom: fn+↓ to scroll` が重なる（実機 2026-10-21 の question-stale 誤判定の形）。ctrl+End で上の画面に戻り、選択肢のカーソルは動かない | （ボトムバー無し） |

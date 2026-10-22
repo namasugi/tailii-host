@@ -1,9 +1,11 @@
 // questionInjection.ts
 // tailii (TS host) — AskUserQuestion の回答を Claude TUI へ注入する。
 
-import type { QuestionAnswer } from "../protocol.js";
+import type { QuestionAnswer, QuestionPromptQuestion } from "../protocol.js";
 import { sleep } from "../shared/sleep.js";
 import type { SessionBackend } from "../backend/sessionBackend.js";
+import { JUMP_TO_LATEST_SEQUENCE, screenScrolledAwayHidingBottom } from "../backend/tmux.js";
+import { scrollBottomKeyIsDefault } from "../shared/claudeKeybindings.js";
 
 const KEY_STEP_MS = 150;
 /** Other 本文 → Enter の猶予（herdr 実測: 300ms 未満だと CR が本文に飲まれる）。 */
@@ -178,22 +180,85 @@ export async function injectQuestionAnswers(
 
 /** 設問ダイアログが描かれ終わるのを待つ猶予（回答前の確認で 1 回だけ読み直す）。 */
 const PRESENCE_RETRY_DELAY_MS = 300;
+/** 最新位置へ戻すキーを送ってから読み直すまでの猶予（fullscreen の再描画待ち）。 */
+const JUMP_SETTLE_DELAY_MS = 600;
+/**
+ * 戻した後もまだ隠れていたときに追加で読み直す回数。回答 RPC の待ち（engine→hub 5 秒）に収めるため 1 回。
+ * それでも隠れていれば "hidden"（呼び出し側は設問を閉じて文字で回答する）。
+ */
+const MAX_EXTRA_READS_AFTER_JUMP = 1;
+
+/**
+ * 回答前の確認結果（question-stale / scrolled-hiding-bottom）。
+ * - true: 設問ダイアログが見えている（回答キーを打ってよい）。
+ * - false: 出ていない（回答済み・取り消し済み等。打たずに `stale`）。
+ * - "hidden": 上へスクロールされて画面外にあり、最新位置へ戻せない（キー割り当てを変えている・戻らない）。
+ *   隠れたダイアログが設問だと画面で確かめられないので回答キーは打たない。呼び出し側は
+ *   「Esc で閉じて、設問と回答を文字で送る」へ切り替える（Esc は承認ダイアログでも「許可しない」側）。
+ * - null: pane を読めず判定できない（従来どおり打つ側へ倒す）。
+ */
+export type QuestionDialogPresence = boolean | "hidden" | null;
 
 /**
  * 回答キーを打つ前に、TUI に AskUserQuestion の設問ダイアログが出ているかを確かめる（question-stale）。
  * 出ていないのに数字キーを打つと入力欄へ落ち、Enter を送らない単一選択では「1」が入ったまま
  * 会話が止まる（実機 2026-10-05）。描画の途中を取り違えないよう、見えなければ 1 回だけ読み直す。
- * @returns true = 出ている / false = 出ていない / null = pane を読めず判定できない。
+ * 端末側で上へスクロールされて隠れているだけなら、「一番下へ戻る」が既定の ctrl+End のままだと
+ * 設定ファイルで確かめられたときだけ戻して読み直す（`jumpAllowed`）。戻せなければ "hidden"。
  */
 export async function questionDialogVisible(
   session: string, sessionManager: SessionBackend,
-): Promise<boolean | null> {
+  options: { jumpAllowed?: () => boolean } = {},
+): Promise<QuestionDialogPresence> {
   const first = await capturedFrame(session, sessionManager);
   if (first !== null && isQuestionDialogFrame(first)) return true;
-  await sleep(PRESENCE_RETRY_DELAY_MS);
-  const second = await capturedFrame(session, sessionManager);
+  // fullscreen 表示で上へスクロールされていると、設問ダイアログはスクロール領域ごと画面外にあり
+  // 読めない（実機 2026-10-21: 回答したのに「設問が画面に出ていなかった」で回答を捨てた）。
+  // 最新位置へ戻してから読み直す。戻すキーは設問の選択肢を動かさない（実測 2.1.306）。
+  const hidden = first !== null && screenScrolledAwayHidingBottom(first);
+  let jumped = false;
+  if (hidden && (options.jumpAllowed ?? (() => scrollBottomKeyIsDefault()))()) {
+    try {
+      await sessionManager.sendKeys(session, [JUMP_TO_LATEST_SEQUENCE], true);
+      jumped = true;
+    } catch {
+      // 送れなければ戻せなかった扱い。
+    }
+  }
+  if (hidden && !jumped) return "hidden";
+  await sleep(jumped ? JUMP_SETTLE_DELAY_MS : PRESENCE_RETRY_DELAY_MS);
+  let second = await capturedFrame(session, sessionManager);
+  // 再描画が遅く、まだ隠れたままなら少しだけ待って読み直す。
+  for (let extra = 0; jumped && extra < MAX_EXTRA_READS_AFTER_JUMP && second !== null && screenScrolledAwayHidingBottom(second); extra += 1) {
+    await sleep(JUMP_SETTLE_DELAY_MS);
+    second = await capturedFrame(session, sessionManager);
+  }
   if (second === null) return first === null ? null : false;
+  if (screenScrolledAwayHidingBottom(second)) return "hidden";
   return isQuestionDialogFrame(second);
+}
+
+/**
+ * 設問と回答を、Claude へ送るメッセージの本文にする（scrolled-hiding-bottom の文字回答）。
+ * 設問ダイアログが画面外に隠れて回答キーを打てないとき、ダイアログを Esc で閉じてからこの本文を
+ * 送る（Claude には「設問に答えなかった」に続いてこの回答が届き、そのまま読み取れる。実測 2.1.306）。
+ * 選択肢は表示名で、「その他」の自由記述はそのまま書く。
+ */
+export function formatQuestionAnswerText(
+  questions: QuestionPromptQuestion[], answers: QuestionAnswer[],
+): string {
+  const lines = ["（設問への回答）"];
+  for (const answer of answers.slice().sort((a, b) => a.questionIndex - b.questionIndex)) {
+    const question = questions[answer.questionIndex];
+    const picked = answer.selectedOptionIndexes
+      .filter((index) => question !== undefined && index >= 0 && index < question.options.length)
+      .map((index) => question!.options[index]!.label);
+    const other = (answer.otherText ?? "").trim();
+    if (other.length > 0) picked.push(`その他「${other}」`);
+    const title = question?.question.trim() || `設問 ${answer.questionIndex + 1}`;
+    lines.push(`・${title} → ${picked.length > 0 ? picked.join(" / ") : "（選択なし）"}`);
+  }
+  return lines.join("\n");
 }
 
 /** pane 読取失敗は「検証不能」= 残存扱いにしない（誤復元でユーザーを二重回答に誘導しない）。 */

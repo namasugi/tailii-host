@@ -3,7 +3,7 @@
 
 import { expect, test } from "vitest";
 import {
-  injectQuestionAnswers, isPreviewQuestionFrame, isQuestionDialogFrame, questionDialogVisible,
+  formatQuestionAnswerText, injectQuestionAnswers, isPreviewQuestionFrame, isQuestionDialogFrame, questionDialogVisible,
 } from "../src/hub/questionInjection.js";
 import type { SessionBackend } from "../src/backend/sessionBackend.js";
 import type { QuestionAnswer } from "../src/protocol.js";
@@ -249,3 +249,72 @@ test("実機 2.1.289 の 1 問 multiSelect / preview の設問は「出ている
   expect(await questionDialogVisible("work", stubBackend([plain("question-dialog-preview")]).backend)).toBe(true);
   expect(await questionDialogVisible("work", stubBackend([plain("typed-digit-idle")]).backend)).toBe(false);
 });
+
+test("questionDialogVisible: 上へスクロールされて設問が画面外なら、最新位置へ戻してから読み直す（実機 2026-10-21）", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const { JUMP_TO_LATEST_SEQUENCE } = await import("../src/backend/tmux.js");
+  const dir = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "pane");
+  const raw = (name: string) => fs.readFileSync(path.join(dir, `${name}.ansi`), "utf8");
+  const jumpAllowed = () => true;
+  // 2.1.306・fullscreen・差分パネルあり: スクロール中はダイアログが読めず、戻すと読める。
+  const scrolled = raw("question-dialog-fullscreen-scrolled");
+  const visible = raw("question-dialog-fullscreen-diff");
+  const recovered = stubBackend([scrolled, visible]);
+  expect(await questionDialogVisible("work", recovered.backend, { jumpAllowed })).toBe(true);
+  expect(recovered.keys).toEqual([[JUMP_TO_LATEST_SEQUENCE]]);
+  // 戻しても設問が無ければ false（キーは戻す 1 回だけで、回答キーは打たない）。
+  const gone = stubBackend([scrolled, plainIdle()]);
+  expect(await questionDialogVisible("work", gone.backend, { jumpAllowed })).toBe(false);
+  expect(gone.keys).toEqual([[JUMP_TO_LATEST_SEQUENCE]]);
+  // 戻した直後の再描画が遅く 1 回目の読み直しでまだ隠れていても、もう 1 回読み直して見つける。
+  const slow = stubBackend([scrolled, scrolled, visible]);
+  expect(await questionDialogVisible("work", slow.backend, { jumpAllowed })).toBe(true);
+  expect(slow.keys).toEqual([[JUMP_TO_LATEST_SEQUENCE]]);
+  // 追加の読み直しは 1 回まで（回答 RPC の待ちに収める）。それでも隠れていれば "hidden"
+  // （設問が無いとは言えない。呼び出し側は Esc で閉じて文字で回答する）。
+  const slower = stubBackend([scrolled, scrolled, scrolled, visible]);
+  expect(await questionDialogVisible("work", slower.backend, { jumpAllowed })).toBe("hidden");
+  // スクロールされていない「設問なし」の画面では何も送らない。
+  const idle = stubBackend([plainIdle()]);
+  expect(await questionDialogVisible("work", idle.backend, { jumpAllowed })).toBe(false);
+  expect(idle.keys).toEqual([]);
+});
+
+test("questionDialogVisible: 「一番下へ戻る」の割り当てが既定でなければ、何も送らず \"hidden\" を返す", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const dir = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "pane");
+  const scrolled = fs.readFileSync(path.join(dir, "question-dialog-fullscreen-scrolled.ansi"), "utf8");
+  const stub = stubBackend([scrolled]);
+  expect(await questionDialogVisible("work", stub.backend, { jumpAllowed: () => false })).toBe("hidden");
+  expect(stub.keys).toEqual([]);
+});
+
+test("formatQuestionAnswerText: 設問ごとに選択肢の表示名と「その他」の自由記述を書く", () => {
+  const questions = [
+    { header: "バージョン", question: "新しいバージョン番号はどうしますか？", multiSelect: false,
+      options: [{ label: "1.1 (Recommended)", description: "" }, { label: "1.0.1", description: "" }] },
+    { header: "公開", question: "いつ公開しますか？", multiSelect: true,
+      options: [{ label: "手動", description: "" }, { label: "自動", description: "" }] },
+    { header: "CloudKit", question: "どうしますか？", multiSelect: false,
+      options: [{ label: "自分でやる", description: "" }, { label: "Chrome で", description: "" }] },
+  ];
+  expect(formatQuestionAnswerText(questions, [
+    // 順不同で届いても設問の順に並べる。Other の synthetic index（= options.count）は表示名に変換しない。
+    { questionIndex: 2, selectedOptionIndexes: [2], otherText: "  あとで決める ", multiSelect: false },
+    { questionIndex: 0, selectedOptionIndexes: [0], multiSelect: false },
+    { questionIndex: 1, selectedOptionIndexes: [0, 1], multiSelect: true },
+  ])).toBe([
+    "（設問への回答）",
+    "・新しいバージョン番号はどうしますか？ → 1.1 (Recommended)",
+    "・いつ公開しますか？ → 手動 / 自動",
+    "・どうしますか？ → その他「あとで決める」",
+  ].join("\n"));
+});
+
+function plainIdle(): string {
+  return IDLE_PROMPT_WITH_NUMBERED_TEXT;
+}

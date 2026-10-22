@@ -34,6 +34,7 @@ import type { ImageService } from "../chat/imageService.js";
 import type { PanePreviewMode } from "./panePreviewPump.js";
 import { sameUsageLimitWait, type UsageLimitWaitState } from "../shared/usageLimitWait.js";
 import type { QuestionAnswer } from "../protocol.js";
+import { formatQuestionAnswerText, type QuestionDialogPresence } from "./questionInjection.js";
 import { PROTOCOL_V1, PROTOCOL_V2 } from "../protocol.js";
 import {
   ChatInjectionRejectedError,
@@ -100,6 +101,8 @@ export interface ChatInjectContext {
   cancelChoice: boolean;
   /** backend が選択ダイアログを実際に閉じたときに呼ぶ（hub は未回答の設問を片付ける）。 */
   onChoiceCancelled: () => void;
+  /** backend が入力欄に残っていた文字を送らずに消したときに呼ぶ（residue-clear。hub は会話内に出す）。 */
+  onResidueDiscarded?: (text: string) => void;
 }
 
 export type HubTailFactory = (
@@ -140,9 +143,10 @@ export type SessionHubOptions = Omit<ReaperTickOptions, "now"> & {
   /**
    * TUI に AskUserQuestion の設問ダイアログが出ているか（回答キーを打つ前の確認, question-stale）。
    * false = 出ていない（キーを打たず `stale` で返す）。null = 判定できない（従来どおり打つ）。
-   * 省略時は確認しない。
+   * "hidden" = 上へスクロールされて画面外にあり戻せない（回答キーは打たず、設問を Esc で閉じて
+   * 回答を文字で送る, scrolled-hiding-bottom）。省略時は確認しない。
    */
-  questionDialogVisible?: (session: string) => Promise<boolean | null>;
+  questionDialogVisible?: (session: string) => Promise<QuestionDialogPresence>;
   /** `stale` の後、設問ダイアログを確かめ直す最初の待ち（ms, 既定 1500。以後 2 倍・4 倍で計 3 回。テスト注入用）。 */
   staleQuestionRecheckMs?: number;
   /**
@@ -369,6 +373,9 @@ function defaultTranscriptPathFor(meta: SessionMeta): string | null {
 }
 
 /** 設問の回答時に TUI へ設問ダイアログが出ていなかった（question-stale）。キーは 1 つも打っていない。 */
+/** 入力欄から消した残り文字を会話内に見せる長さ（文字数。超えたら先頭だけ + …）。 */
+const RESIDUE_EXCERPT_CHARS = 60;
+
 class StaleQuestionError extends Error {
   constructor() {
     super("AskUserQuestion dialog is not on screen");
@@ -778,8 +785,13 @@ export class SessionHub {
           try {
             injection = (async () => {
               if (dialogVisible !== undefined) {
-                if (await dialogVisible(message.session) === false) throw new StaleQuestionError();
+                const presence = await dialogVisible(message.session);
+                if (presence === false) throw new StaleQuestionError();
                 accept();
+                if (presence === "hidden") {
+                  await this.answerHiddenQuestionAsText(message.session, restoreSnapshot, message.answers);
+                  return;
+                }
               }
               await this.options.questionInjector?.(message.answers, message.session);
             })();
@@ -798,6 +810,14 @@ export class SessionHub {
                 return;
               }
               this.options.log?.(`設問回答注入失敗: ${String(error)}`);
+              // 1 キーも打たずに諦めた理由（画面が戻らない等）は利用者向けの文言を持つ。会話内に出す。
+              if (error instanceof ChatInjectionRejectedError) {
+                this.publishCodexMarker(
+                  message.session,
+                  `question-answer-rejected-${restoreSnapshot.id}`,
+                  `⚠️ 設問の回答を送れませんでした: ${error.message}`,
+                );
+              }
               // 自己修復（question-answer-retry）: pendingQuestion を失ったまま TUI ダイアログが
               // 残ると、アプリから再回答する手段が無く会話が詰む。失敗の度に必ず復元し、
               // 「host が設問で止まっている」の権威を保つ（会話を開き直せば emitPendingQuestion が
@@ -2425,6 +2445,7 @@ export class SessionHub {
             cancelChoice: cancelledQuestion !== null,
             // 閉じた時点で片付ける（続く本文の注入が失敗しても、TUI に設問はもう無い）。
             onChoiceCancelled: resolveCancelledQuestion,
+            onResidueDiscarded: (text) => this.publishResidueDiscarded(session, message.id, text),
           }) ?? Promise.resolve());
           // 明示 kill / reaper kill が注入 await 中に actor を廃棄した場合、同名の新 actorへ
           // 古い receipt を復活させない。waiter は retireSession が既に失敗で解放している。
@@ -2674,6 +2695,65 @@ export class SessionHub {
       );
       this.options.log?.(`codex turn 開始失敗 session=${message.session}: ${String(error)}`);
     }
+  }
+
+  /**
+   * 画面外に隠れて戻せない設問へ、回答を文字で送る（scrolled-hiding-bottom）。chat の注入経路を
+   * 「答えずに送る」指定で使う: backend が隠れたダイアログを Esc で 1 回だけ閉じ、入力欄が見えたのを
+   * 確かめてから本文を送る（Esc は承認ダイアログでも「許可しない」側に働くので、誤って許可しない）。
+   * 閉じる前に諦めた失敗は throw（呼び出し側が設問を戻して再提示する）。閉じた後に本文を送れなかった
+   * 失敗は、設問がもう TUI に無いので戻さず、メッセージで答え直すよう会話内に出す。
+   */
+  private async answerHiddenQuestionAsText(
+    session: string, snapshot: PendingQuestion, answers: QuestionAnswer[],
+  ): Promise<void> {
+    const injector = this.options.chatInjector;
+    if (injector === undefined) throw new Error("chat injector unavailable");
+    this.options.log?.(`audit question-answer-as-text session=${auditValue(session)} question=${auditValue(snapshot.id)}`);
+    let dialogClosed = false;
+    try {
+      await injector(formatQuestionAnswerText(snapshot.questions, answers), session, {
+        // 通常の chat と同じく、中断で書き戻された直前の発話を見分ける材料を渡す（送り直して二重に届けない）。
+        recordedPromptText: () => this.trailingUserPromptText(session),
+        cancelChoice: true,
+        onChoiceCancelled: () => { dialogClosed = true; },
+        onResidueDiscarded: (text) => this.publishResidueDiscarded(session, `question-${snapshot.id}`, text),
+      });
+    } catch (error) {
+      if (!dialogClosed) throw error;
+      this.options.log?.(`設問の文字回答の送信失敗（設問は閉じた）session=${session}: ${String(error)}`);
+      this.publishCodexMarker(
+        session,
+        `question-answer-as-text-failed-${snapshot.id}`,
+        "⚠️ 設問はホスト側で閉じましたが、回答の送信に失敗しました。メッセージで回答を送り直してください。",
+      );
+      return;
+    }
+    // 送る直前に画面が戻って設問がもう無かった（Mac 側で片付いていた）場合は、閉じてはいない。
+    this.publishCodexMarker(
+      session,
+      `question-answer-as-text-${snapshot.id}`,
+      dialogClosed
+        ? "ℹ️ 設問がホスト側の画面で隠れていたため、設問を閉じて回答を文字で送りました。"
+        : "ℹ️ 設問がホスト側の画面で見つからなかったため、回答を文字で送りました。",
+    );
+  }
+
+  /**
+   * 入力欄に残っていた文字を送らずに消したことを会話内に出す（residue-clear）。黙って消さない:
+   * ホスト側の打ちかけが消えたことに利用者が気づけるようにする。長い残りは先頭だけ見せる。
+   */
+  private publishResidueDiscarded(session: string, key: string, text: string): void {
+    const oneLine = text.replace(/\s+/g, " ").trim();
+    const excerpt = [...oneLine].length > RESIDUE_EXCERPT_CHARS
+      ? `${[...oneLine].slice(0, RESIDUE_EXCERPT_CHARS).join("")}…`
+      : oneLine;
+    this.options.log?.(`audit chat-residue-discarded session=${auditValue(session)} chars=${[...text].length}`);
+    this.publishCodexMarker(
+      session,
+      `chat-residue-discarded-${key}`,
+      `ℹ️ ホスト側の入力欄に残っていた「${excerpt}」は送らずに消しました。`,
+    );
   }
 
   private publishCodexMarker(session: string, streamId: string, text: string): void {

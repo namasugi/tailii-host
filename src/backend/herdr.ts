@@ -22,6 +22,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { PROTOCOL_V1, type ControlMessage, type SessionInfo } from "../protocol.js";
+import { scrollBottomKeyIsDefault } from "../shared/claudeKeybindings.js";
 import {
   HERDR_PANE_ID_PATTERN,
   SessionMetadataStore,
@@ -33,6 +34,9 @@ import {
   CHAT_BLOCKED_AFTER_CHOICE_CANCELLED,
   CHAT_BLOCKED_BY_STUCK_CHOICE,
   CHAT_BLOCKED_BY_UNREADABLE_CHOICE,
+  CHAT_BLOCKED_BY_SCROLLED_AWAY,
+  CHAT_BLOCKED_BY_UNCLEARABLE_RESIDUE,
+  CHAT_BLOCKED_BY_UNSENT_OWN_TEXT,
   CHOICE_CANCEL_MAX_POLLS,
   CHOICE_CANCEL_POLL_MS,
   claudeComposerBarVisible,
@@ -42,6 +46,11 @@ import {
   inputBoxRealText,
   inputBoxIsShellMode,
   inputBoxTextMatchesRecordedPrompt,
+  JUMP_TO_LATEST_SEQUENCE,
+  JUMP_SETTLE_MS,
+  JUMP_SETTLE_READS,
+  revealHiddenBottom,
+  screenScrolledAwayHidingBottom,
   LoginCodeError,
   paneCommandLooksLikeAgent,
   screenInLoginFlow,
@@ -484,6 +493,10 @@ export class HerdrSessionManager {
   private readonly readyPollMs: number;
   /** 注入前の入力欄描画待ちの上限 ms（起動直後の TUI へ打たない, boot-gate。テスト注入用）。 */
   private readonly inputBoxReadyTimeoutMs: number;
+  private readonly jumpSettleMs: number;
+  private readonly scrollBottomKeyAvailable: () => boolean;
+  /** 会話ごとの、打ったが送信を確かめられていない本文（residue-clear で自分の本文を消さないため）。 */
+  private readonly ownUnsubmittedText = new Map<string, string>();
   /** login-code 送出後にコード欄の消滅を待つポーリング間隔 / 上限 ms（テスト注入用）。 */
   private readonly loginPollMs: number;
   private readonly loginSettleMs: number;
@@ -508,6 +521,10 @@ export class HerdrSessionManager {
     readyTimeoutMs?: number;
     readyPollMs?: number;
     inputBoxReadyTimeoutMs?: number;
+    /** 最新位置へ戻すキー・Esc の後に画面を読み直すまでの猶予（テストで 0 にする）。 */
+    jumpSettleMs?: number;
+    /** 「一番下へ戻る」が既定の ctrl+End のままか（既定は keybindings.json を読む。テストで差し替える）。 */
+    scrollBottomKeyAvailable?: () => boolean;
     loginPollMs?: number;
     loginSettleMs?: number;
     now?: () => number;
@@ -532,6 +549,8 @@ export class HerdrSessionManager {
     // 上限はアプリの chat_send ACK 予算（18s）より長くてよい: 超過分はアプリの明示再送が
     // hub の同一 clientMessageId 待ちへ合流し、二重注入にはならない。
     this.inputBoxReadyTimeoutMs = options.inputBoxReadyTimeoutMs ?? 20_000;
+    this.jumpSettleMs = options.jumpSettleMs ?? JUMP_SETTLE_MS;
+    this.scrollBottomKeyAvailable = options.scrollBottomKeyAvailable ?? (() => scrollBottomKeyIsDefault());
     this.loginPollMs = options.loginPollMs ?? 250;
     this.loginSettleMs = options.loginSettleMs ?? 5_000;
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
@@ -767,7 +786,18 @@ export class HerdrSessionManager {
     // → 本文を再注入、で同一本文が 2 ターン届いていた（2026-09-07 実機: 新規会話の初回送信が
     // 「⚠️ 送信失敗」表示のうえ二重）。上限まで現れなければ何も打たずに throw し、明示再送
     // （=fresh な注入）に倒す。
-    if (!(await this.waitForInputBoxRendered(name))) {
+    const inputBox = await this.waitForInputBoxRendered(name, options.cancelChoiceDialog === true);
+    // 上へスクロールされたまま戻らなかった。本文は 1 キーも打っていないので「打つ前の拒否」として
+    // 返し、後続の送信を止めない（配送不明扱いにすると以降の送信が全部詰まる）。
+    // 隠れたダイアログを Esc で閉じたことは、この後どう失敗しても先に伝える（hub が設問を片付ける。
+    // 伝え漏れると、閉じた設問を再提示して答えさせ、回答が「設問が出ていなかった」で捨てられる）。
+    if (inputBox.hiddenDialogCancelled) {
+      options.onChoiceDialogCancelled?.();
+      // Esc は送ったが、その後の入力欄を確かめられなかった。閉じた扱いにして本文は打たない。
+      if (inputBox.state !== "ready") throw new ChatInjectionRejectedError(CHAT_BLOCKED_AFTER_CHOICE_CANCELLED);
+    }
+    if (inputBox.state === "scrolled") throw new ChatInjectionRejectedError(CHAT_BLOCKED_BY_SCROLLED_AWAY);
+    if (inputBox.state === "timeout") {
       throw new HerdrFailedError(
         ["pane", "send-text", name],
         1,
@@ -793,7 +823,7 @@ export class HerdrSessionManager {
     // ボトムバーが見えているフレームでは撃たない: Esc は処理中の Claude を中断するキーでもあり、
     // 30 行窓は会話本文（閉じたダイアログの転写や引用）を含むため。
     let choiceStuck = false;
-    let choiceCancelled = false;
+    let choiceCancelled = inputBox.hiddenDialogCancelled;
     if (dialogWindow !== null) {
       const outcome = await cancelChoiceDialog({
         screen: dialogWindow,
@@ -806,8 +836,11 @@ export class HerdrSessionManager {
       // 閉じたかどうかの最終判断は下のフレーム判定に任せる（30 行窓は会話本文を含むので、
       // 本文に残った文言で「閉じていない」と見誤っても、ダイアログでなければ従来どおり送る）。
       choiceStuck = outcome === "stuck";
-      choiceCancelled = outcome === "cancelled";
-      if (choiceCancelled) options.onChoiceDialogCancelled?.();
+      // 隠れていたダイアログを先に閉じた事実（inputBox.hiddenDialogCancelled）を上書きしない。
+      if (outcome === "cancelled") {
+        choiceCancelled = true;
+        options.onChoiceDialogCancelled?.();
+      }
     }
     // 中断（停止）直後の入力欄に残存テキストがあるまま注入すると、今回の本文がその後ろへ
     // 連結され 1 メッセージとして送信される（実機FB 2026-07-29: 停止→送信で「前回本文+今回
@@ -816,8 +849,9 @@ export class HerdrSessionManager {
     //   「配送済み・表示済みの発話」（実測 2026-09-08 sandbox: queued 発話がある中断は書き戻さず
     //   自動送信するので、書き戻しは常にこの 1 種）→ 破棄（C-u）。Enter で送り直すと同じ発話が
     //   二重に届く（実機 2026-09-08: 中断→別文を送信で中断前の発話が重複投稿）。
-    // - それ以外（旧版の queued 書き戻し / Mac 側の下書き）→ 従来どおり Enter で独立メッセージ
-    //   として送信し切る（アプリの楽観バブルとも一致する）。空入力への Enter は no-op。
+    // - それ以外（設問の回答キーの取り残し「1」・Mac 側の打ちかけ等）→ 送らずに消し、消した内容を
+    //   `onResidueDiscarded` で知らせる（residue-clear）。以前は Enter で独立送信していたが、取り残しや
+    //   打ちかけが Claude へ勝手に届いていた（2026-10-22 利用者提案で変更）。
     //
     // 残存の有無は **composer フレームでだけ** 意味を持つ。ダイアログ表示中の
     // `inputBoxRealText` はカーソル行（`1. Yes` 等）を返すので、これを残存と信じて Enter を
@@ -849,26 +883,33 @@ export class HerdrSessionManager {
     }
     const pending = injectFrame === "pending" ? await this.inputBoxPendingText(name) : "";
     if (pending.length > 0) {
+      // 判定の順序が肝心: 中断で書き戻された直前の発話（配送済み）は、Tailii が打って送信を確かめられ
+      // なかった本文と同文でもありうる（届いていたが確認できなかった → Mac 側で中断 → 書き戻し）。
+      // 自分の本文として送り出すと同じ発話が二重に届く（2026-09-08 の重複投稿と同型）ので、先に書き戻しを見る。
       const recorded = options.recordedPromptText?.() ?? null;
-      if (recorded !== null && inputBoxTextMatchesRecordedPrompt(pending, recorded)) {
-        // 空にできないまま注入すると連結送信になるので、何も打たずに throw（明示再送へ倒す）。
-        if (!(await this.clearInputBox(name))) {
-          throw new HerdrFailedError(
-            ["pane", "send-text", name],
-            1,
-            "restored prompt could not be cleared from the input box (中断で書き戻された発話が残存)",
-          );
+      const restored = recorded !== null && inputBoxTextMatchesRecordedPrompt(pending, recorded);
+      const own = this.ownUnsubmittedText.get(name);
+      if (restored) {
+        this.ownUnsubmittedText.delete(name);
+        // 空にできないまま本文を打つと、今回の本文が残存の後ろへ連結されて 1 メッセージになる。
+        if (!(await this.clearInputBox(name))) throw new ChatInjectionRejectedError(CHAT_BLOCKED_BY_UNCLEARABLE_RESIDUE);
+      } else if ((own !== undefined && inputBoxTextMatchesRecordedPrompt(pending, own)) || options.onResidueDiscarded === undefined) {
+        // Tailii 自身が前に打って送信を確かめられなかった本文（CLI が止まっていた・貼り付けが後から
+        // 入った等。アプリでは送信済み／配送不明として見えている）は、消すと送ったはずの発話が失われる
+        // ので送り出す。消したことを知らせる手段の無い呼び出し（hub 以外: 公式アプリ連携・kick）も、
+        // 黙って消さないよう従来どおり送り出す。2.1.277+ は不可視文字入りを 1 回の Enter で流さないので、
+        // 送信確定ループで流す。流し切れなければ本文を打たずに失敗させる（連結送信の防止）。
+        if ((await this.submitTypedText(name)) !== "submitted") {
+          throw new ChatInjectionRejectedError(CHAT_BLOCKED_BY_UNSENT_OWN_TEXT);
         }
-      } else if ((await this.submitTypedText(name)) !== "submitted") {
-        // 残存を送信し切れないまま本文を打つと、今回の本文が残存の後ろへ連結されて
-        // 1 メッセージになる（実機FB 2026-07-29）。2.1.277+ は残存に不可視文字があると
-        // 1 回目の Enter で送信せず確認待ちにするため、裸の Enter 1 発では流し切れない。
-        // 流せなかったら何も打たずに失敗させ、明示再送へ倒す（「重複より欠落」）。
-        throw new ChatInjectionRejectedError(
-          "入力欄に残っていた文字を送り切れなかったため、メッセージを送信しませんでした（連結送信の防止）",
-        );
+        this.ownUnsubmittedText.delete(name);
+      } else {
+        // それ以外（設問の回答キーの取り残し「1」・ホスト側の打ちかけ等）は送らずに消し、知らせる。
+        if (!(await this.clearInputBox(name))) throw new ChatInjectionRejectedError(CHAT_BLOCKED_BY_UNCLEARABLE_RESIDUE);
+        options.onResidueDiscarded(pending);
       }
     }
+
     // 前回の注入が途中で終わった等でシェルモード（プロンプト `!`）に入ったままの入力欄へ
     // 注入すると、本文がそのままシェルコマンドとして実行される。空入力の Backspace で
     // モード記号を消して通常入力へ戻してから注入する（`!` 始まりの本文は注入時に自分で
@@ -879,6 +920,9 @@ export class HerdrSessionManager {
     // = 送信成立」と誤判定して配送済みレシートを発行 → silent loss）。本文が入力欄へ
     // 反映されたことを検証し、反映されなければ間隔を置いて再投入、最終的に throw して
     // chat_send を uncertain（アプリの明示再送）へ倒す。
+    // ここから本文を打つ。送信を確かめられるまでは「自分が打った本文」として覚えておく（次の送信で
+    // 入力欄に残っていたら、消さずに送り出す）。
+    this.ownUnsubmittedText.set(name, text);
     const probe = typedTextProbe(text);
     let typed = probe === null;
     if (!typed && typedTextWouldBreak(text) && textIsPasteSafe(text)) {
@@ -912,6 +956,8 @@ export class HerdrSessionManager {
         // 打つ場合の反映検証と同じ扱い: 残骸を best-effort で掃除してから失敗として返す。
         // 貼り直しはしない（CLI が止まっていただけなら、貼り直した分だけ後から重なって入る）。
         await this.clearInputBox(name);
+        // 配送不明で返す。後から入った分を「自分の本文」として送り出すと明示再送と二重に届くので覚えを消す。
+        this.ownUnsubmittedText.delete(name);
         throw new HerdrFailedError(
           ["pane", "send-text", name],
           1,
@@ -949,6 +995,8 @@ export class HerdrSessionManager {
       // Enter flush が残骸を独立メッセージとして送ってしまう（幽霊バブル）。
       // best-effort で掃除してから throw する（掃除できない場合もそのまま throw）。
       await this.clearInputBox(name);
+      // 配送不明で返す。後から入った分を「自分の本文」として送り出すと明示再送と二重に届くので覚えを消す。
+      this.ownUnsubmittedText.delete(name);
       throw new HerdrFailedError(
         ["pane", "send-text", name],
         1,
@@ -956,6 +1004,7 @@ export class HerdrSessionManager {
       );
     }
     if ((await this.submitTypedText(name)) !== "submitted") options.onUnconfirmedSubmit?.();
+    else this.ownUnsubmittedText.delete(name);
   }
 
   /** CLI のキューに溜まっている発話を今すぐ届ける（chat-send-now, SessionBackend 共通面）。 */
@@ -1168,16 +1217,45 @@ export class HerdrSessionManager {
    * 入力欄を描くまでの窓（起動バナー／初期シェルのエコーだけの画面）は通過してしまう。
    * 入力欄の罫線が見えるか、後続の門番が扱う画面（`/login` フロー・選択ダイアログ）に
    * なったら true。capture 不能は fail-open（後続の判定・送出エラーで顕在化させる）。
-   * 上限まで現れなければ false（呼び出し側は 1 キーも打たずに throw する）。
+   * 上限まで現れなければ "timeout"（呼び出し側は 1 キーも打たずに throw する）。
+   * fullscreen 表示で上へスクロールされて入力欄・ダイアログが画面外にあるだけなら、最新位置へ
+   * 戻すキーを送って待ち続ける（実機 2026-10-21: 設問を出したまま上へスクロールされた会話への送信が
+   * 20 秒待って「入力欄不可視」で失敗した）。戻すキーは入力欄の下書きも選択肢も動かさない。
    */
-  private async waitForInputBoxRendered(name: string): Promise<boolean> {
+  private async waitForInputBoxRendered(
+    name: string, cancelHiddenDialog: boolean,
+  ): Promise<{ state: "ready" | "timeout" | "scrolled" | "escaped-unconfirmed"; hiddenDialogCancelled: boolean }> {
     const deadline = Date.now() + this.inputBoxReadyTimeoutMs;
+    let revealTried = false;
+    let hiddenDialogCancelled = false;
     for (;;) {
       const window = await this.captureDialogWindow(name);
-      if (window === null) return true;
-      if (claudeInputBoxRendered(window)) return true;
-      if (screenInLoginFlow(window) || screenHasSelectionFooter(window)) return true;
-      if (Date.now() >= deadline) return false;
+      // 読めなければ従来どおり進める（fail-open）。ただし隠れた画面へキーを送った後は、何が起きたか
+      // 確かめられないので打たない（隠れた設問ダイアログへ本文が入ると選択肢が動く）。
+      if (window === null) return { state: revealTried ? "scrolled" : "ready", hiddenDialogCancelled };
+      // スクロールで隠れた画面は、本文に罫線だけの行（図・区切り線）があると入力欄の罫線と取り違える。
+      // 隠れている間は入力欄が見えたと扱わない。最新位置へ戻すか、答えずに送る送信なら隠れた
+      // ダイアログを Esc で閉じる（1 回だけ試す。どちらもできなければ打たずに失敗）。
+      if (screenScrolledAwayHidingBottom(window)) {
+        if (revealTried) return { state: "scrolled", hiddenDialogCancelled };
+        revealTried = true;
+        const revealed = await revealHiddenBottom({
+          capture: () => this.captureDialogWindow(name),
+          sendJump: () => this.sendKeys(name, [JUMP_TO_LATEST_SEQUENCE], true),
+          sendEscape: () => this.sendKeys(name, ["Escape"]),
+          jumpAllowed: this.scrollBottomKeyAvailable(),
+          cancelHiddenDialog,
+          settleMs: this.jumpSettleMs,
+          maxReads: JUMP_SETTLE_READS,
+        });
+        if (revealed.outcome === "stuck") return { state: "scrolled", hiddenDialogCancelled };
+        if (revealed.outcome === "escaped-unconfirmed") return { state: "escaped-unconfirmed", hiddenDialogCancelled: true };
+        if (revealed.outcome === "dialog-cancelled") hiddenDialogCancelled = true;
+        continue;
+      }
+      if (claudeInputBoxRendered(window)) return { state: "ready", hiddenDialogCancelled };
+      if (screenInLoginFlow(window) || screenHasSelectionFooter(window)) return { state: "ready", hiddenDialogCancelled };
+      if (Date.now() >= deadline) return { state: "timeout", hiddenDialogCancelled };
       await new Promise((resolve) => setTimeout(resolve, this.readyPollMs));
     }
   }

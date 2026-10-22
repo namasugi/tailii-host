@@ -15,6 +15,9 @@ import {
   inputBoxRealText,
   inputBoxResidueText,
   screenBusyButScrolledAway,
+  screenScrolledAwayHidingBottom,
+  revealHiddenBottom,
+  jumpToLatestAllowed,
   screenShouldJumpToLatest,
   screenShowsApprovalDialog,
   screenShowsCancellableChoice,
@@ -291,6 +294,113 @@ describe("screenShouldJumpToLatest（上へスクロールされた画面を最�
     // ダイアログの本文に案内の文言があっても戻さない。
     const quotedInDialog = APPROVAL_DIALOG.replace(/\n/, "\n  3 new messages ↓\n");
     expect(screenShouldJumpToLatest(quotedInDialog)).toBe(false);
+  });
+});
+
+describe("screenScrolledAwayHidingBottom（上へスクロールされて設問・入力欄が画面外, scrolled-hiding-bottom）", () => {
+  /** 2.1.306・fullscreen・差分パネルあり・240×30。設問ダイアログ（3 問）が見えている。 */
+  const DIALOG_FULLSCREEN = frame("question-dialog-fullscreen-diff");
+  /** 同じ画面を PgUp で上へスクロールした形。ダイアログも入力欄も無く、最下行に案内が重なる。 */
+  const DIALOG_SCROLLED = frame("question-dialog-fullscreen-scrolled");
+
+  test("設問を出したまま上へスクロールされた画面だけ真（実機 2026-10-21 の形）", () => {
+    expect(screenScrolledAwayHidingBottom(DIALOG_SCROLLED)).toBe(true);
+    // この画面では設問のフッターも入力欄も読めない（だから回答前の確認が「設問なし」と誤認した）。
+    expect(screenShowsDialogFooter(DIALOG_SCROLLED)).toBe(false);
+    expect(claudeComposerBarVisible(DIALOG_SCROLLED)).toBe(false);
+  });
+
+  test("herdr の案内（`N new messages (click) ↓`）でも真", () => {
+    const herdrPill = DIALOG_SCROLLED.replace("Jump to bottom: fn+↓ to scroll", "2 new messages (click) ↓");
+    expect(herdrPill).not.toBe(DIALOG_SCROLLED);
+    expect(screenScrolledAwayHidingBottom(herdrPill)).toBe(true);
+  });
+
+  test("ダイアログ・入力欄が見えている画面、入力欄の上に案内がある画面（既存の jump-to-latest の担当）では偽", () => {
+    for (const other of [
+      DIALOG_FULLSCREEN, IDLE, TYPED, PROCESSING, QUESTION_DIALOG, APPROVAL_DIALOG,
+      frame("fullscreen-busy"), frame("fullscreen-scrolled-busy"), frame("fullscreen-scrolled-idle"),
+    ]) {
+      expect(screenScrolledAwayHidingBottom(other)).toBe(false);
+    }
+  });
+
+  test("差分パネルの縦線だけの行が案内の下に続いても真（空行と同じく読み飛ばす）", () => {
+    const panelRows = Array.from({ length: 4 }, () => `${" ".repeat(150)}│`);
+    const withPanelRows = [DIALOG_SCROLLED, ...panelRows].join("\n");
+    expect(screenScrolledAwayHidingBottom(withPanelRows)).toBe(true);
+  });
+
+  test("案内が末尾にあってもボトムバーが見えている画面は偽（入力欄が見えているので戻さなくてよい）", () => {
+    // 入力欄の下に案内が来た形（現実には出ないが、バーが見えたら戻さない規則を固定する）。
+    const withBar = [IDLE, "⏺ 続き      Jump to bottom: fn+↓ to scroll      "].join("\n");
+    expect(claudeComposerBarVisible(withBar)).toBe(true);
+    expect(screenScrolledAwayHidingBottom(withBar)).toBe(false);
+  });
+
+  test("案内が末尾にあってもダイアログのフッターが見えている画面は偽（ダイアログは見えているので戻さなくてよい）", () => {
+    const withFooter = [DIALOG_FULLSCREEN, "⏺ 続き      Jump to bottom: fn+↓ to scroll      "].join("\n");
+    expect(screenShowsDialogFooter(withFooter)).toBe(true);
+    expect(claudeComposerBarVisible(withFooter)).toBe(false);
+    expect(screenScrolledAwayHidingBottom(withFooter)).toBe(false);
+  });
+
+  test("案内の文言が末尾から離れた本文にあるだけ・単語の一部なだけでは偽", () => {
+    const lines = DIALOG_SCROLLED.split("\n");
+    const moved = [...lines.slice(0, 3), "  3 new messages ↓", ...lines.slice(3, -1), "⏺ plain line"].join("\n");
+    expect(screenScrolledAwayHidingBottom(moved)).toBe(false);
+    const glued = DIALOG_SCROLLED.replace("Jump to bottom: fn+↓ to scroll", "Jump to bottom: fn+↓ to scrolling");
+    expect(screenScrolledAwayHidingBottom(glued)).toBe(false);
+  });
+});
+
+describe("revealHiddenBottom（隠れた下側を戻す・閉じる, scrolled-hiding-bottom）", () => {
+  const SCROLLED = frame("question-dialog-fullscreen-scrolled");
+  const VISIBLE = frame("question-dialog-fullscreen-diff");
+  const run = async (frames: (string | null)[], options: { jumpAllowed: boolean; cancelHiddenDialog: boolean }) => {
+    const keys: string[] = [];
+    const queue = frames.slice();
+    const result = await revealHiddenBottom({
+      capture: async () => (queue.length > 1 ? queue.shift()! : queue[0] ?? null),
+      sendJump: async () => { keys.push("jump"); },
+      sendEscape: async () => { keys.push("esc"); },
+      settleMs: 0, maxReads: 3, ...options,
+    });
+    return { ...result, keys };
+  };
+
+  test("戻せれば revealed（Esc は送らない）", async () => {
+    const r = await run([VISIBLE], { jumpAllowed: true, cancelHiddenDialog: true });
+    expect(r.outcome).toBe("revealed");
+    expect(r.keys).toEqual(["jump"]);
+  });
+
+  test("戻せず、答えずに送る送信なら Esc 1 回で閉じ、入力欄（ボトムバー）が見えたら dialog-cancelled", async () => {
+    const r = await run([SCROLLED, SCROLLED, SCROLLED, IDLE], { jumpAllowed: true, cancelHiddenDialog: true });
+    expect(r.outcome).toBe("dialog-cancelled");
+    expect(r.keys).toEqual(["jump", "esc"]);
+  });
+
+  test("Esc の後に隠れていなくても、ボトムバーが見えなければ escaped-unconfirmed（Esc は重ねない）", async () => {
+    const r = await run([VISIBLE], { jumpAllowed: false, cancelHiddenDialog: true });
+    expect(r.outcome).toBe("escaped-unconfirmed");
+    expect(r.keys).toEqual(["esc"]);
+  });
+
+  test("答えずに送る送信でなければ Esc は送らず stuck。戻すキーの後に読めなくても stuck", async () => {
+    expect((await run([SCROLLED], { jumpAllowed: true, cancelHiddenDialog: false })).outcome).toBe("stuck");
+    const unreadable = await run([null], { jumpAllowed: true, cancelHiddenDialog: true });
+    expect(unreadable.outcome).toBe("stuck");
+    expect(unreadable.keys).toEqual(["jump"]);
+  });
+});
+
+describe("jumpToLatestAllowed（会話を開いたときに戻すか）", () => {
+  test("割り当てが既定のときだけ戻す", () => {
+    const scrolledIdle = frame("fullscreen-scrolled-idle");
+    expect(jumpToLatestAllowed(scrolledIdle, () => true)).toBe(true);
+    expect(jumpToLatestAllowed(scrolledIdle, () => false)).toBe(false);
+    expect(jumpToLatestAllowed(IDLE, () => true)).toBe(false);
   });
 });
 
