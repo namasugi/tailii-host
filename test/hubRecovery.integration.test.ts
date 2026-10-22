@@ -152,7 +152,7 @@ describe("Session Hub 復旧シナリオ (Unix socket)", () => {
       server = await startHubSocket({ hub, socketPath, version: "test", bootId: "boot-retire" });
       expect(server).not.toBeNull();
       await vi.waitFor(() => expect(reconnected).toHaveBeenCalledWith({
-        bootId: "boot-retire", disconnectedAtMs: null, processingSessions: [],
+        bootId: "boot-retire", disconnectedAtMs: null, processingSessions: [], resumeHint: true,
       }));
       await vi.waitFor(() => expect(hub.actors.has("doomed")).toBe(false));
     } finally {
@@ -197,6 +197,7 @@ describe("Session Hub 復旧シナリオ (Unix socket)", () => {
         bootId: "boot-before-handler",
         disconnectedAtMs: null,
         processingSessions: ["already-running"],
+        resumeHint: true,
       });
 
       // 保持情報は最初の handler へ渡した時点で消費し、再代入では再配送しない。
@@ -339,7 +340,9 @@ describe("Session Hub 復旧シナリオ (Unix socket)", () => {
       socketPath,
       version: "test",
       bootId: "same-boot",
-      writableLengthLimit: 1_024,
+      // 8MiB の行を積んだ時点で上限を超えさせ、切断させる（受信側は速いので socket 側の滞留では
+      // 決定的に切れない。Hub が client を切る経路の一つとして積む時点の上限を使う）。
+      conversationQueueLimit: 1_024,
       log: (message) => audit.push(message),
     });
     expect(server).not.toBeNull();
@@ -365,7 +368,7 @@ describe("Session Hub 復旧シナリオ (Unix socket)", () => {
       publishPayload(output("before-pressure"));
       await vi.waitFor(() => expect(receivedSeqs).toEqual([1]));
 
-      // 1 行目を kernel buffer に滞留させ、次の書込前検査で socket を切断させる。
+      // 巨大な 1 行で client ごとの上限を超えさせ、socket を切断させる。
       publishPayload(output("pressure", "x".repeat(8 * 1024 * 1024)));
       publishPayload(output("missed-3"));
       publishPayload(output("missed-4"));

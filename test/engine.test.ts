@@ -608,7 +608,16 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.lines.nextOfType("chat_output");
 
     sent.length = 0;
-    hubLink.onReconnect?.({ bootId: "boot-a", disconnectedAtMs: 1_000 });
+    // 同じ世代でも Hub の tail は購読者 0 人で止まり頭から再生し直すので、届け済みの範囲を
+    // 取り直さないよう最終転送時刻 − 5 秒の境界も添える（afterSeq は replay buffer 回収用）。
+    hubLink.onReconnect?.({ bootId: "boot-a", disconnectedAtMs: 1_000, resumeHint: true });
+    expect(sent).toContainEqual({
+      type: "conversation_subscribe", session: "work", afterSeq: 7, newerThanMs: 195_000, preview: true,
+    });
+
+    // ヒントを解釈できない旧 Hub（hello に resumeHint なし）には afterSeq だけを送る。
+    sent.length = 0;
+    hubLink.onReconnect?.({ bootId: "boot-a", disconnectedAtMs: 1_500 });
     expect(sent).toContainEqual({
       type: "conversation_subscribe", session: "work", afterSeq: 7, preview: true,
     });
@@ -631,6 +640,56 @@ describe("EngineControl — 横断制御チャネル", () => {
     expect(sent).toEqual([{
       type: "conversation_subscribe", session: "work", preview: true,
     }]);
+    now.mockRestore();
+    await engine.teardown();
+  });
+
+  test("同じ Hub 世代の再接続: 共有 tail の全履歴再生が完走する前に切れたら境界を付けず取り直す", async () => {
+    const store = makeTempStore();
+    store.put({ name: "work", cwd: "/tmp/work", createdAt: 1, agent: "claude",
+      providerSessionId: "provider-1" });
+    const sent: unknown[] = [];
+    const hubLink: HubLink = {
+      onMessage: null, onReconnect: null,
+      send(message) {
+        sent.push(message);
+        if (message.type === "hub_state_request") queueMicrotask(() => hubLink.onMessage?.({
+          type: "hub_state_response", id: message.id, session: message.session,
+          pendingQuestion: null, processing: false,
+        }));
+        return true;
+      },
+      close: vi.fn(),
+    };
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("work\n") : ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner, store), metadataStore: store, hubLink });
+    await engine.lines.nextOfType("channel_hello");
+    hubLink.onReconnect?.({ bootId: "boot-a", disconnectedAtMs: null });
+    engine.writeLine('{"id":"open","name":"work","type":"session_reattach","v":2}');
+    await engine.lines.nextOfType("session_list_response");
+    const now = vi.spyOn(Date, "now").mockReturnValue(300_000);
+    const event = (serverSeq: number, streamId: string): void => {
+      hubLink.onMessage?.({ type: "conversation_event", session: "work", serverSeq,
+        payload: { type: "chat_output", v: 1, streamId, role: "system", text: "", eof: true } });
+    };
+    // 共有 tail の全履歴再生（serverSeq > 0）が始まり、途中で切れた。
+    event(1, "pc:history-begin");
+    event(2, "old-line");
+    await engine.lines.nextOfType("chat_output");
+    sent.length = 0;
+    hubLink.onReconnect?.({ bootId: "boot-a", disconnectedAtMs: 1_000, resumeHint: true });
+    expect(sent).toContainEqual({
+      type: "conversation_subscribe", session: "work", afterSeq: 2, preview: true,
+    });
+
+    // 完走（history-done）後の再接続は、届け済みの範囲を境界で省く。
+    event(3, "pc:history-done");
+    await engine.lines.nextOfType("chat_output");
+    sent.length = 0;
+    hubLink.onReconnect?.({ bootId: "boot-a", disconnectedAtMs: 2_000, resumeHint: true });
+    expect(sent).toContainEqual({
+      type: "conversation_subscribe", session: "work", afterSeq: 3, newerThanMs: 295_000, preview: true,
+    });
     now.mockRestore();
     await engine.teardown();
   });

@@ -80,7 +80,15 @@ export type HubClientMessage =
   | SessionProcessingMessage;
 
 export type HubServerMessage =
-  | { type: "hub_hello_ack"; version: string | null; bootId: string; processingSessions?: string[] }
+  | {
+    type: "hub_hello_ack"; version: string | null; bootId: string; processingSessions?: string[];
+    /**
+     * 再開のヒント（conversation_subscribe の afterSeq + newerThanMs）を、Hub が境界を使ってよいか確かめた上で
+     * 解釈できる。旧 Hub は両方付きを無条件に時刻境界として使い未配送行を落とすので、engine はこれが
+     * true の Hub にだけヒントを送る。
+     */
+    resumeHint?: true;
+  }
   | {
       type: "hub_state_response";
       id: string;
@@ -366,6 +374,7 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
       version,
       bootId,
       ...(processingSessions !== undefined ? { processingSessions } : {}),
+      ...(record["resumeHint"] === true ? { resumeHint: true as const } : {}),
     };
   }
   if (record["type"] === "hub_state_response") {

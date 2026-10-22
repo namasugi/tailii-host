@@ -41,6 +41,8 @@ import {
 export const HISTORY_BEGIN_STREAM_ID = "pc:history-begin";
 /** 履歴再生完了マーカーの streamId（iOS 側 `ChatLogModel` と対で解釈する）。 */
 export const HISTORY_DONE_STREAM_ID = "pc:history-done";
+/** 履歴を読み直せず取り込みを打ち切ったマーカー（Hub が出す。iOS は完了と同じく待ちを解く）。 */
+export const HISTORY_CANCELLED_STREAM_ID = "pc:history-cancelled";
 /** 利用中モデル通知マーカーの streamId（iOS 側 `ChatLogModel` と対で解釈する）。 */
 export const MODEL_STREAM_ID = "pc:model";
 /** 現在コンテキストトークン数通知マーカーの streamId（iOS 側 `ChatLogModel` と対で解釈する）。 */
@@ -54,6 +56,13 @@ export const CONTEXT_STREAM_ID = "pc:context";
 export const EFFORT_STREAM_ID = "pc:effort";
 /** claude の effort 既知値（未知値は通知しない）。 */
 const EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
+
+/** transcript の 1 回の読み取り量。 */
+const TRANSCRIPT_READ_CHUNK_BYTES = 64 * 1024;
+/** 再生中にイベントループへ譲る読み取り量の目安（Codex rollout tail と同じ 1MiB）。 */
+const TRANSCRIPT_YIELD_BYTES = 1024 * 1024;
+/** 再生中にイベントループへ譲る間隔（Hub の送信キュー書き出し間隔 8ms に合わせる）。 */
+const TRANSCRIPT_YIELD_INTERVAL_MS = 8;
 
 /**
  * 利用者の中断確定マーカー（claude が transcript に user 行として記録する
@@ -477,7 +486,20 @@ export class TranscriptTailer {
     }
     try {
       let position = 0;
-      let lineBuf = Buffer.alloc(0);
+      // 改行までの断片。4KB ごとに全体を連結し直すと、数MBの画像行で二乗のコピーになる
+      // （299MB の会話で 1 回の再生に約 25GB の複製・4.6 秒停止を実測）。
+      let lineParts: Buffer[] = [];
+      let lineBytes = 0;
+      const takeLine = (suffix?: Buffer): Buffer => {
+        if (suffix !== undefined) {
+          lineParts.push(suffix);
+          lineBytes += suffix.length;
+        }
+        const line = lineParts.length === 1 ? lineParts[0]! : Buffer.concat(lineParts, lineBytes);
+        lineParts = [];
+        lineBytes = 0;
+        return line;
+      };
       const state: TailState = {
         seq: 0,
         lastModel: null,
@@ -496,7 +518,9 @@ export class TranscriptTailer {
       };
       const start = Date.now();
       let announcedReplayDone = false;
-      const chunk = Buffer.alloc(4096);
+      const chunk = Buffer.alloc(TRANSCRIPT_READ_CHUNK_BYTES);
+      let bytesSinceYield = 0;
+      let lastYieldAtMs = Date.now();
       if (this.emitReplayDoneMarker && newerThanMs === null) {
         yield {
           type: "chat_output", v: PROTOCOL_V1, streamId: HISTORY_BEGIN_STREAM_ID,
@@ -519,9 +543,14 @@ export class TranscriptTailer {
             announcedReplayDone = true;
             // 購読開始が書き込み途中に重なることがある。未完の最終行は後続の追記と結合するため残す。
             // 改行だけが無い完全な JSON は従来どおり履歴に含める。
-            if (lineBuf.length > 0 && isCompleteJsonLine(lineBuf)) {
-              yield* emitLineAfter(lineBuf, state, newerThanMs);
-              lineBuf = Buffer.alloc(0);
+            if (lineBytes > 0) {
+              const pending = takeLine();
+              if (isCompleteJsonLine(pending)) {
+                yield* emitLineAfter(pending, state, newerThanMs);
+              } else {
+                lineParts = [pending];
+                lineBytes = pending.length;
+              }
             }
             yield {
               type: "chat_output",
@@ -536,7 +565,7 @@ export class TranscriptTailer {
           }
           if (!this.tailIndefinitely) {
             if (this.tailDeadlineMs === null || Date.now() - start >= this.tailDeadlineMs) {
-              if (lineBuf.length > 0) yield* emitLineAfter(lineBuf, state, newerThanMs);
+              if (lineBytes > 0) yield* emitLineAfter(takeLine(), state, newerThanMs);
               return;
             }
           }
@@ -545,14 +574,32 @@ export class TranscriptTailer {
         }
 
         position += bytesRead;
-        lineBuf = Buffer.concat([lineBuf, chunk.subarray(0, bytesRead)]);
-        // 改行区切りで完結行を切り出して処理する。
-        let nl = lineBuf.indexOf(0x0a);
+        const data = chunk.subarray(0, bytesRead);
+        // 改行区切りで完結行を切り出して処理する。行は次の readSync より前に処理し終える。
+        let offset = 0;
+        let nl = data.indexOf(0x0a);
         while (nl >= 0) {
-          const line = lineBuf.subarray(0, nl);
-          lineBuf = lineBuf.subarray(nl + 1);
+          const suffix = data.subarray(offset, nl);
+          const line = lineBytes > 0 ? takeLine(suffix) : suffix;
           yield* emitLineAfter(line, state, newerThanMs);
-          nl = lineBuf.indexOf(0x0a);
+          offset = nl + 1;
+          nl = data.indexOf(0x0a, offset);
+        }
+        if (offset < bytesRead) {
+          // 再利用する読み取り buffer からコピーし、改行まで断片を保持する。
+          const rest = Buffer.from(data.subarray(offset));
+          lineParts.push(rest);
+          lineBytes += rest.length;
+        }
+        // 履歴の再生は 1 回の同期処理で終えない。Hub は同じイベントループで送信キューの
+        // 書き出し・切断・他会話の購読を処理するため、巨大な会話の再生中に数秒固まると
+        // 自分のキューに数MBを積み上げて「遅い client」と誤判定して切ってしまう（10-20 実障害）。
+        bytesSinceYield += bytesRead;
+        const now = Date.now();
+        if (bytesSinceYield >= TRANSCRIPT_YIELD_BYTES || now - lastYieldAtMs >= TRANSCRIPT_YIELD_INTERVAL_MS) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          bytesSinceYield = 0;
+          lastYieldAtMs = Date.now();
         }
       }
     } finally {

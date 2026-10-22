@@ -37,6 +37,7 @@ import { readPackageVersion } from "../shared/version.js";
 import { ChatTailController } from "../chat/chatTailController.js";
 import { TranscriptTailer } from "../chat/transcriptTailer.js";
 import { LineWriter } from "../shared/lineWriter.js";
+import { NdjsonLineSplitter } from "../shared/lineSplitter.js";
 import { PanePreviewPump } from "./panePreviewPump.js";
 import { makeUsageLimitPushNotifier } from "../push/approvalPushNotifier.js";
 import { parseUsageLimitWait } from "../shared/usageLimitWait.js";
@@ -170,9 +171,23 @@ export interface HubSocketServer {
   close(): Promise<void>;
 }
 
-export const HUB_SOCKET_WRITABLE_LENGTH_LIMIT = 4 * 1024 * 1024;
+/**
+ * client 側の滞留（socket.writableLength）がこれを超えたら即座に切る上限。読まない client の判定は
+ * 高水位の停滞（HUB_SOCKET_STALL_TIMEOUT_MS）で行い、これは数MBの RPC 応答（サブエージェント全文等）を
+ * 直送した直後に速い client まで切らないためのメモリ上限として大きめに取る。
+ */
+export const HUB_SOCKET_WRITABLE_LENGTH_LIMIT = 32 * 1024 * 1024;
 export const HUB_SOCKET_CONVERSATION_EVENT_BATCH_SIZE = 16;
 export const HUB_SOCKET_CONVERSATION_EVENT_FLUSH_INTERVAL_MS = 8;
+/** 履歴キューの書き出しを待つ socket 側滞留量（client が読むまで次の束を積まない）。 */
+export const HUB_SOCKET_FLUSH_HIGH_WATER = 1024 * 1024;
+/**
+ * Hub 内の履歴キューの安全上限。キューは Hub 自身の再生速度で膨らむもので client の遅さでは
+ * ないため、切断判定（writableLength 上限）には数えない。メモリを無制限に使わないための上限だけ置く。
+ */
+export const HUB_SOCKET_CONVERSATION_QUEUE_LIMIT = 32 * 1024 * 1024;
+/** socket 側の滞留が高水位のまま一度も下がらなかったら、読まない client として切る時間。 */
+export const HUB_SOCKET_STALL_TIMEOUT_MS = 30_000;
 
 interface HubWritableSocket {
   readonly writableLength: number;
@@ -202,23 +217,65 @@ export function writeHubSocketLine(
  * 大量の履歴 conversation_event を同期的に socket へ積むと、後着した pane_preview が
  * history-done の後ろまで待たされる。履歴だけを小分けにし、ライブ状態・RPC応答は
  * 直送して追い越せるようにする。conversation_event 同士の順序は FIFO で維持する。
+ *
+ * 遅延 client の判定は socket 側の滞留（client が読んでいない量）だけで行う。Hub 内の履歴
+ * キューは Hub 自身が巨大な会話を一気に再生したときに膨らむもので、これを数えると client が
+ * 速くても切ってしまい、再接続→全履歴の再購読→また切断…の繰り返しになる（10-20 実障害:
+ * 13 分で 41 回、新規セッションの最初の送信が「Session Hub disconnected during RPC」で失敗）。
  */
 export function createPrioritizedHubSocketWriter(
   socket: HubWritableSocket,
   writableLengthLimit: number,
   log: (message: string) => void,
-  options: { batchSize?: number; flushIntervalMs?: number } = {},
+  options: {
+    batchSize?: number;
+    flushIntervalMs?: number;
+    flushHighWater?: number;
+    queueLimit?: number;
+    stallTimeoutMs?: number;
+    now?: () => number;
+  } = {},
 ): (line: string) => void {
   const batchSize = options.batchSize ?? HUB_SOCKET_CONVERSATION_EVENT_BATCH_SIZE;
   const flushIntervalMs = options.flushIntervalMs ??
     HUB_SOCKET_CONVERSATION_EVENT_FLUSH_INTERVAL_MS;
+  const flushHighWater = Math.min(
+    options.flushHighWater ?? HUB_SOCKET_FLUSH_HIGH_WATER,
+    writableLengthLimit,
+  );
+  const queueLimit = options.queueLimit ?? HUB_SOCKET_CONVERSATION_QUEUE_LIMIT;
+  const stallTimeoutMs = options.stallTimeoutMs ?? HUB_SOCKET_STALL_TIMEOUT_MS;
+  const now = options.now ?? Date.now;
   const conversationEvents: string[] = [];
   let queuedBytes = 0;
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
+  /** socket 側の滞留が高水位以上になり続けている起点（下がったら null）。 */
+  let stalledSinceMs: number | null = null;
 
   const clearQueue = (): void => {
     conversationEvents.length = 0;
     queuedBytes = 0;
+  };
+  const disconnect = (reason: string, backlog: number, threshold: number): void => {
+    log(`audit slow_client_disconnect writableLength=${backlog} threshold=${threshold} reason=${reason}`);
+    clearQueue();
+    socket.destroy();
+  };
+  /**
+   * client 側の滞留が高水位以上か（以上なら停滞の起点を記録し、下回れば解く）。停滞が
+   * stallTimeoutMs 続いたら読まない client として切る。履歴の書き出しと直送の両方で見る。
+   */
+  const backlogged = (): boolean => {
+    if (socket.writableLength < flushHighWater) {
+      stalledSinceMs = null;
+      return false;
+    }
+    const current = now();
+    stalledSinceMs ??= current;
+    if (current - stalledSinceMs >= stallTimeoutMs) {
+      disconnect("stalled", socket.writableLength, flushHighWater);
+    }
+    return true;
   };
   const scheduleFlush = (): void => {
     if (flushTimer !== null || conversationEvents.length === 0 || socket.destroyed) return;
@@ -228,7 +285,19 @@ export function createPrioritizedHubSocketWriter(
         clearQueue();
         return;
       }
+      // client がまだ読んでいない分が高水位以上なら、次の束は積まずに待つ（滞留を client 側の
+      // 遅さとして上限で測れるよう、Hub のキューから socket へは読まれた分だけ流す）。
+      if (socket.writableLength > writableLengthLimit) {
+        disconnect("socket", socket.writableLength, writableLengthLimit);
+        return;
+      }
+      if (backlogged()) {
+        if (!socket.destroyed) scheduleFlush();
+        return;
+      }
       for (let index = 0; index < batchSize; index += 1) {
+        // 束の途中でも client 側の滞留が高水位に達したら残りは次の tick へ回す。
+        if (index > 0 && socket.writableLength >= flushHighWater) break;
         const line = conversationEvents.shift();
         if (line === undefined) break;
         queuedBytes -= Buffer.byteLength(line, "utf8");
@@ -245,14 +314,14 @@ export function createPrioritizedHubSocketWriter(
   return (line: string): void => {
     // 外側 envelope の type だけを照合する。payload 内の同名 type では誤判定しない。
     if (line.startsWith('{"type":"conversation_event"')) {
+      if (socket.destroyed) return;
       const lineBytes = Buffer.byteLength(line, "utf8");
-      if (socket.writableLength + queuedBytes + lineBytes > writableLengthLimit) {
-        log(
-          `audit slow_client_disconnect writableLength=${socket.writableLength + queuedBytes}` +
-            ` threshold=${writableLengthLimit}`,
-        );
-        clearQueue();
-        socket.destroy();
+      if (socket.writableLength > writableLengthLimit) {
+        disconnect("socket", socket.writableLength, writableLengthLimit);
+        return;
+      }
+      if (queuedBytes + lineBytes > queueLimit) {
+        disconnect("queue", queuedBytes, queueLimit);
         return;
       }
       conversationEvents.push(line);
@@ -261,6 +330,9 @@ export function createPrioritizedHubSocketWriter(
       return;
     }
     // pane_preview / processing state / RPC応答は履歴キューを待たせず即時配送する。
+    if (socket.destroyed) return;
+    backlogged();
+    if (socket.destroyed) return;
     writeHubSocketLine(socket, line, writableLengthLimit, log);
   };
 }
@@ -273,6 +345,8 @@ export async function startHubSocket(options: {
   bootId?: string;
   log?: (message: string) => void;
   writableLengthLimit?: number;
+  /** client ごとの履歴キューの安全上限（既定 HUB_SOCKET_CONVERSATION_QUEUE_LIMIT）。 */
+  conversationQueueLimit?: number;
 }): Promise<HubSocketServer | null> {
   const socketPath = options.socketPath ?? resolveHubSocketPath();
   const log = options.log ?? (() => {});
@@ -285,15 +359,13 @@ export async function startHubSocket(options: {
   const server = net.createServer((socket) => {
     clients.add(socket);
     log(`audit client_connect clients=${clients.size}`);
-    const write = createPrioritizedHubSocketWriter(socket, writableLengthLimit, log);
+    const write = createPrioritizedHubSocketWriter(socket, writableLengthLimit, log,
+      options.conversationQueueLimit !== undefined ? { queueLimit: options.conversationQueueLimit } : {});
     options.hub.registerClient(socket, write);
-    let buffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    const splitter = new NdjsonLineSplitter();
     socket.on("data", (chunk: Buffer) => {
-      buffer = buffer.length === 0 ? chunk : Buffer.concat([buffer, chunk]);
-      let newline: number;
-      while ((newline = buffer.indexOf(0x0a)) >= 0) {
-        const line = buffer.subarray(0, newline).toString("utf8");
-        buffer = buffer.subarray(newline + 1);
+      splitter.push(chunk, (lineBuffer) => {
+        const line = lineBuffer.toString("utf8");
         try {
           const message = JSON.parse(line) as { type?: unknown };
           if (message.type === "hub_hello") {
@@ -302,11 +374,12 @@ export async function startHubSocket(options: {
               version: options.version,
               bootId,
               processingSessions: options.hub.processingSessionNames,
+              resumeHint: true,
             }));
           }
         } catch { /* Hub コア側でも不正行を破棄する。 */ }
         options.hub.handleClientMessage(socket, line);
-      }
+      });
     });
     socket.on("error", () => {});
     socket.on("close", () => {

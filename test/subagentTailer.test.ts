@@ -154,6 +154,52 @@ describe("SubagentTailer", () => {
     ac.abort();
   });
 
+  test("巨大な親 transcript も上限ずつ読み切り、途中でイベントループへ譲ってから結果を出す（10-20 実障害）", async () => {
+    const project = makeTempDir("subagent-tailer-large");
+    const sessionId = "11111111-2222-3333-4444-666666666666";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    const subagents = path.join(project, sessionId, "subagents");
+    fs.mkdirSync(subagents, { recursive: true });
+    const padding = (index: number): string => JSON.stringify({
+      message: { role: "assistant", content: [{ type: "text", text: "p".repeat(4_000) }] },
+      timestamp: "2026-07-03T02:00:00.000Z", uuid: `pad-${index}`,
+    });
+    // 約 2.4MB の本文の後に起動、さらに約 2.4MB の後に完了（1 回に読む上限 1MiB を何度もまたぐ）。
+    const lines = [
+      ...Array.from({ length: 600 }, (_, index) => padding(index)),
+      JSON.stringify({
+        message: { role: "assistant", content: [
+          { type: "tool_use", id: "toolu_parent", name: "Agent", input: { description: "Food" } },
+        ] },
+        timestamp: "2026-07-03T02:18:18.000Z",
+      }),
+      ...Array.from({ length: 600 }, (_, index) => padding(600 + index)),
+      JSON.stringify({
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_parent", content: "done" }] },
+        timestamp: "2026-07-03T02:20:00.000Z",
+      }),
+    ];
+    fs.writeFileSync(main, lines.join("\n") + "\n");
+    fs.writeFileSync(path.join(subagents, "agent-child.meta.json"), JSON.stringify({
+      agentType: "general-purpose", description: "Search", toolUseId: "toolu_parent", spawnDepth: 1,
+    }));
+    fs.writeFileSync(path.join(subagents, "agent-child.jsonl"), JSON.stringify({
+      agentId: "child", isSidechain: true, message: { role: "user", content: "start" },
+      timestamp: "2026-07-03T02:18:21.453Z",
+    }) + "\n");
+
+    let immediateRan = false;
+    setImmediate(() => { immediateRan = true; });
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10 });
+    const gen = tailer.streamSession(main, ac.signal);
+    const first = await nextOfType(gen, "subagent_node");
+    // 1 回目の tick で親 transcript を最後まで読んでいる（途中で打ち切って running を出さない）。
+    expect(first).toMatchObject({ node: { nodeId: "child", status: "completed" } });
+    expect(immediateRan).toBe(true);
+    ac.abort();
+  });
+
   test("tail 中に追加された meta/jsonl と追記 tool_result から重複なく completed へ進む", async () => {
     const project = makeTempDir("subagent-tailer-incremental");
     const sessionId = "22222222-3333-4444-5555-666666666666";

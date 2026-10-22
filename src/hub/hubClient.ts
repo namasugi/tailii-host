@@ -5,12 +5,15 @@ import * as net from "node:net";
 import { ensureHubDaemon } from "./hubDaemon.js";
 import { decodeHubServerLine, encodeHubMessage, type HubClientMessage, type HubServerMessage } from "./hubProtocol.js";
 import { resolveHubSocketPath } from "../shared/socketPath.js";
+import { NdjsonLineSplitter } from "../shared/lineSplitter.js";
 import type { SessionHub } from "./sessionHub.js";
 
 export interface HubReconnectInfo {
   bootId: string;
   disconnectedAtMs: number | null;
   processingSessions?: string[];
+  /** Hub が再開のヒント（afterSeq + newerThanMs）を安全に解釈できるか（hub_hello_ack.resumeHint）。 */
+  resumeHint?: boolean;
 }
 
 export interface HubLink {
@@ -105,7 +108,7 @@ export function connectHubSocket(options: {
     let connected = false;
     let helloHandled = false;
     let helloTimer: ReturnType<typeof setTimeout> | null = null;
-    let buffer = Buffer.alloc(0);
+    const splitter = new NdjsonLineSplitter();
     candidate.once("connect", () => {
       connected = true;
       retryMs = 250;
@@ -115,12 +118,9 @@ export function connectHubSocket(options: {
       }, options.helloTimeoutMs ?? 5_000);
       helloTimer.unref();
     });
-    candidate.on("data", (chunk) => {
-      buffer = buffer.length === 0 ? chunk : Buffer.concat([buffer, chunk]);
-      let newline: number;
-      while ((newline = buffer.indexOf(0x0a)) >= 0) {
-        const message = decodeHubServerLine(buffer.subarray(0, newline).toString("utf8"));
-        buffer = buffer.subarray(newline + 1);
+    candidate.on("data", (chunk: Buffer) => {
+      splitter.push(chunk, (lineBuffer) => {
+        const message = decodeHubServerLine(lineBuffer.toString("utf8"));
         if (message !== null) {
           link.onMessage?.(message);
           if (message.type === "hub_hello_ack" && !helloHandled) {
@@ -158,12 +158,13 @@ export function connectHubSocket(options: {
               processingSessions: effectiveProcessingSessions === undefined
                 ? undefined
                 : [...effectiveProcessingSessions],
+              ...(message.resumeHint === true ? { resumeHint: true } : {}),
             };
             if (reconnectHandler === null) pendingReconnect = info;
             else reconnectHandler(info);
           }
         }
-      }
+      });
     });
     candidate.once("error", () => {
       (options.ensureDaemon ?? ensureHubDaemon)();

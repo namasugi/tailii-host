@@ -13,6 +13,9 @@ import { abortableSleep } from "../shared/sleep.js";
 import { isApiRequestBlobLine } from "../shared/transcriptRecord.js";
 import { extractToolActivities, TranscriptTailer } from "./transcriptTailer.js";
 
+/** 1 回に読む transcript の上限。超えたらイベントループへ譲ってから続きを読む。 */
+const SUBAGENT_READ_SLICE_BYTES = 1024 * 1024;
+
 export interface SubagentTailerOptions {
   /** 追記ポーリング間隔（ms）。既定 50ms。 */
   pollIntervalMs?: number;
@@ -275,124 +278,135 @@ export class SubagentTailer {
       }
 
       const transcriptOwners = transcriptFiles(mainTranscript, tracked);
+      let bytesSinceYield = 0;
       for (const transcript of transcriptOwners) {
-        const read = readNewLines(transcript.path, fileStates);
-        const node = transcript.nodeId === null ? null : (tracked.get(transcript.nodeId) ?? null);
-        if (read.reset) {
-          aggregateDirty = true;
-          if (node !== null) {
-            node.currentActivity = null;
-            node.lastJsonlTimestampMs = null;
-            node.finalReportMarker = null;
-            node.finalDefinite = false;
-            node.apiErrorMarker = false;
-            node.handbackToolUseId = null;
-            // model は「一度判明したら消えない」。truncate 直後の再読込で assistant 行が
-            // まだ無い tick に model 無しのノードを配信しないよう、直前値を保持する
-            // （再読込で別の値が出れば最新行が勝つ）。
-          }
-        }
-        if (node !== null) node.firstJsonlTimestampMs = read.state.firstTimestampMs;
-        if (read.lines.length > 0) aggregateDirty = true;
-        for (const line of read.lines) {
-          // 2.1.300+ の `api-request-blob`（API へ送った message の複製。timestamp 無し）は
-          // 行動でも通知でもない。text だけの assistant 複製を最終報告と誤認したり、tool_result /
-          // task-notification の複製を再登録したりしないよう、行ごと読み飛ばす。
-          if (isApiRequestBlobLine(line)) continue;
-          const lineTs = timestampMs(line);
-          if (lineTs !== null && (lastActivityTsMs === null || lineTs > lastActivityTsMs)) {
-            lastActivityTsMs = lineTs;
-          }
-          if (read.state.firstTimestampMs === null && lineTs !== null) {
-            read.state.firstTimestampMs = lineTs;
-          }
-          if (node !== null) {
-            node.firstJsonlTimestampMs = read.state.firstTimestampMs;
-            if (lineTs !== null) node.lastJsonlTimestampMs = lineTs;
-          }
-          for (const id of extractSpawnToolUseIds(line)) read.state.ownerByToolUseId.set(id, transcript.owner);
-          for (const spawn of extractBackgroundSpawns(line)) {
-            read.state.bgSpawnByToolUseId.set(spawn.id, { label: spawn.label, ts: lineTs, background: spawn.background });
-          }
-          for (const hit of extractToolResults(line)) {
-            read.state.resultByToolUseId.set(hit.id, {
-              isError: hit.isError,
-              ts: hit.ts,
-              asyncLaunch: hit.asyncLaunch,
-            });
-            const launch = hit.backgroundLaunch;
-            const spawn = read.state.bgSpawnByToolUseId.get(hit.id);
-            read.state.bgSpawnByToolUseId.delete(hit.id);
-            if (launch !== null && spawn !== undefined && (spawn.background || launch.confirmed)) {
-              read.state.bgCommandByTaskId.set(launch.taskId, {
-                taskId: launch.taskId,
-                toolUseId: hit.id,
-                owner: transcript.owner,
-                label: spawn.label,
-                startTs: spawn.ts ?? hit.ts,
-                outputPath: launch.outputPath,
-              });
-            }
-            // TaskStop で停止されたタスクは task-notification を残さない。
-            // 停止 ack を「静かな完了」として通知と同列に扱う。
-            if (hit.stoppedTaskId !== null) {
-              read.state.notificationByTaskId.set(hit.stoppedTaskId, {
-                status: "completed",
-                exitCode: null,
-                ts: hit.ts ?? lineTs,
-                stopAck: true,
-              });
-            }
-          }
-          for (const notification of extractTaskNotifications(line)) {
-            // 同じ task-id の通知は enqueue ログと配達行（user / attachment / assistant 注入形）の
-            // 複数行に現れ、再開→再停止で複数回起こる。ファイル横断の集約と同じく最新 ts の
-            // 記録を採る（= 最後に起きた完了イベント）。TaskStop の ack は明示停止として常に優先。
-            const existing = read.state.notificationByTaskId.get(notification.taskId);
-            if (existing?.stopAck === true) continue;
-            const ts = notification.ts ?? lineTs;
-            if (existing !== undefined && (existing.ts ?? 0) > (ts ?? 0)) continue;
-            // enqueue（完了時点の正確な ts）を、同じ完了イベントの遅い配達 ts で前進させない。
-            // 配達は停止境界までずれ込むため、その間の再開（自 transcript の追記）を「通知より
-            // 古い」と誤認して running のエージェントを completed に塗ってしまう。再完了は新しい
-            // enqueue が先に書かれるので latest-wins のまま拾える。
-            if (existing !== undefined && existing.enqueue === true && !notification.enqueue
-              && existing.status === notification.status && existing.exitCode === notification.exitCode
-              && (existing.waitingOnBackground === true) === notification.waitingOnBackground) {
-              continue;
-            }
-            if (isLateWaitingDelivery(existing, notification)) continue;
-            read.state.notificationByTaskId.set(notification.taskId, {
-              status: notification.status,
-              exitCode: notification.exitCode,
-              ts,
-              ...(notification.enqueue ? { enqueue: true } : {}),
-              ...(notification.waitingOnBackground ? { waitingOnBackground: true } : {}),
-            });
-          }
-          if (node !== null) {
-            // SubagentHandback（2.1.302+）の tool_result は走行の終わりを告げる行。成功なら最終報告の
-            // 確定形、失敗（届かなかった）なら続きがあるので最終形ではない。他の user 行と違い
-            // 「再開注入」ではないので、ここで最終形を倒さない。
-            const handback = node.handbackToolUseId === null
-              ? null
-              : handbackOutcome(line, node.handbackToolUseId);
-            const shape = handback === null ? messageShape(line) : null;
-            if (handback !== null) {
-              node.finalReportMarker = handback;
-              node.finalDefinite = handback;
+        // 巨大な transcript（本体 299MB + サブエージェント 148MB の会話を実測）を 1 tick で同期に
+        // 読み切ると Hub のイベントループが数秒止まる。上限ずつ読み、間でイベントループへ譲る。
+        for (let more = true; more && !signal?.aborted;) {
+          const read = readNewLines(transcript.path, fileStates, SUBAGENT_READ_SLICE_BYTES);
+          more = read.more;
+          const node = transcript.nodeId === null ? null : (tracked.get(transcript.nodeId) ?? null);
+          if (read.reset) {
+            aggregateDirty = true;
+            if (node !== null) {
+              node.currentActivity = null;
+              node.lastJsonlTimestampMs = null;
+              node.finalReportMarker = null;
+              node.finalDefinite = false;
               node.apiErrorMarker = false;
               node.handbackToolUseId = null;
-            } else if (shape !== null) {
-              node.finalReportMarker = shape.final;
-              node.finalDefinite = shape.definite;
-              node.apiErrorMarker = shape.apiError;
-              node.handbackToolUseId = shape.handbackToolUseId;
-              if (shape.model !== null) node.model = shape.model;
-              if (shape.effort !== null) node.effort = shape.effort;
+              // model は「一度判明したら消えない」。truncate 直後の再読込で assistant 行が
+              // まだ無い tick に model 無しのノードを配信しないよう、直前値を保持する
+              // （再読込で別の値が出れば最新行が勝つ）。
             }
-            const activity = latestActivitySummary(line);
-            if (activity !== null) node.currentActivity = activity;
+          }
+          if (node !== null) node.firstJsonlTimestampMs = read.state.firstTimestampMs;
+          if (read.lines.length > 0) aggregateDirty = true;
+          for (const line of read.lines) {
+            // 2.1.300+ の `api-request-blob`（API へ送った message の複製。timestamp 無し）は
+            // 行動でも通知でもない。text だけの assistant 複製を最終報告と誤認したり、tool_result /
+            // task-notification の複製を再登録したりしないよう、行ごと読み飛ばす。
+            if (isApiRequestBlobLine(line)) continue;
+            const lineTs = timestampMs(line);
+            if (lineTs !== null && (lastActivityTsMs === null || lineTs > lastActivityTsMs)) {
+              lastActivityTsMs = lineTs;
+            }
+            if (read.state.firstTimestampMs === null && lineTs !== null) {
+              read.state.firstTimestampMs = lineTs;
+            }
+            if (node !== null) {
+              node.firstJsonlTimestampMs = read.state.firstTimestampMs;
+              if (lineTs !== null) node.lastJsonlTimestampMs = lineTs;
+            }
+            for (const id of extractSpawnToolUseIds(line)) read.state.ownerByToolUseId.set(id, transcript.owner);
+            for (const spawn of extractBackgroundSpawns(line)) {
+              read.state.bgSpawnByToolUseId.set(spawn.id, { label: spawn.label, ts: lineTs, background: spawn.background });
+            }
+            for (const hit of extractToolResults(line)) {
+              read.state.resultByToolUseId.set(hit.id, {
+                isError: hit.isError,
+                ts: hit.ts,
+                asyncLaunch: hit.asyncLaunch,
+              });
+              const launch = hit.backgroundLaunch;
+              const spawn = read.state.bgSpawnByToolUseId.get(hit.id);
+              read.state.bgSpawnByToolUseId.delete(hit.id);
+              if (launch !== null && spawn !== undefined && (spawn.background || launch.confirmed)) {
+                read.state.bgCommandByTaskId.set(launch.taskId, {
+                  taskId: launch.taskId,
+                  toolUseId: hit.id,
+                  owner: transcript.owner,
+                  label: spawn.label,
+                  startTs: spawn.ts ?? hit.ts,
+                  outputPath: launch.outputPath,
+                });
+              }
+              // TaskStop で停止されたタスクは task-notification を残さない。
+              // 停止 ack を「静かな完了」として通知と同列に扱う。
+              if (hit.stoppedTaskId !== null) {
+                read.state.notificationByTaskId.set(hit.stoppedTaskId, {
+                  status: "completed",
+                  exitCode: null,
+                  ts: hit.ts ?? lineTs,
+                  stopAck: true,
+                });
+              }
+            }
+            for (const notification of extractTaskNotifications(line)) {
+              // 同じ task-id の通知は enqueue ログと配達行（user / attachment / assistant 注入形）の
+              // 複数行に現れ、再開→再停止で複数回起こる。ファイル横断の集約と同じく最新 ts の
+              // 記録を採る（= 最後に起きた完了イベント）。TaskStop の ack は明示停止として常に優先。
+              const existing = read.state.notificationByTaskId.get(notification.taskId);
+              if (existing?.stopAck === true) continue;
+              const ts = notification.ts ?? lineTs;
+              if (existing !== undefined && (existing.ts ?? 0) > (ts ?? 0)) continue;
+              // enqueue（完了時点の正確な ts）を、同じ完了イベントの遅い配達 ts で前進させない。
+              // 配達は停止境界までずれ込むため、その間の再開（自 transcript の追記）を「通知より
+              // 古い」と誤認して running のエージェントを completed に塗ってしまう。再完了は新しい
+              // enqueue が先に書かれるので latest-wins のまま拾える。
+              if (existing !== undefined && existing.enqueue === true && !notification.enqueue
+                && existing.status === notification.status && existing.exitCode === notification.exitCode
+                && (existing.waitingOnBackground === true) === notification.waitingOnBackground) {
+                continue;
+              }
+              if (isLateWaitingDelivery(existing, notification)) continue;
+              read.state.notificationByTaskId.set(notification.taskId, {
+                status: notification.status,
+                exitCode: notification.exitCode,
+                ts,
+                ...(notification.enqueue ? { enqueue: true } : {}),
+                ...(notification.waitingOnBackground ? { waitingOnBackground: true } : {}),
+              });
+            }
+            if (node !== null) {
+              // SubagentHandback（2.1.302+）の tool_result は走行の終わりを告げる行。成功なら最終報告の
+              // 確定形、失敗（届かなかった）なら続きがあるので最終形ではない。他の user 行と違い
+              // 「再開注入」ではないので、ここで最終形を倒さない。
+              const handback = node.handbackToolUseId === null
+                ? null
+                : handbackOutcome(line, node.handbackToolUseId);
+              const shape = handback === null ? messageShape(line) : null;
+              if (handback !== null) {
+                node.finalReportMarker = handback;
+                node.finalDefinite = handback;
+                node.apiErrorMarker = false;
+                node.handbackToolUseId = null;
+              } else if (shape !== null) {
+                node.finalReportMarker = shape.final;
+                node.finalDefinite = shape.definite;
+                node.apiErrorMarker = shape.apiError;
+                node.handbackToolUseId = shape.handbackToolUseId;
+                if (shape.model !== null) node.model = shape.model;
+                if (shape.effort !== null) node.effort = shape.effort;
+              }
+              const activity = latestActivitySummary(line);
+              if (activity !== null) node.currentActivity = activity;
+            }
+          }
+          bytesSinceYield += read.bytesRead;
+          if (more || bytesSinceYield >= SUBAGENT_READ_SLICE_BYTES) {
+            bytesSinceYield = 0;
+            await new Promise<void>((resolve) => setImmediate(resolve));
           }
         }
       }
@@ -814,13 +828,14 @@ function transcriptFiles(
 function readNewLines(
   file: string,
   states: Map<string, FileTailState>,
-): { lines: string[]; reset: boolean; state: FileTailState } {
+  maxBytes = Number.POSITIVE_INFINITY,
+): { lines: string[]; reset: boolean; state: FileTailState; bytesRead: number; more: boolean } {
   let stat: fs.Stats;
   try {
     stat = fs.statSync(file);
   } catch {
     const state = ensureFileState(file, states);
-    return { lines: [], reset: false, state };
+    return { lines: [], reset: false, state, bytesRead: 0, more: false };
   }
 
   const state = ensureFileState(file, states);
@@ -841,28 +856,56 @@ function readNewLines(
   try {
     fd = fs.openSync(file, "r");
   } catch {
-    return { lines: [], reset, state };
+    return { lines: [], reset, state, bytesRead: 0, more: false };
   }
 
   const out: string[] = [];
-  const chunk = Buffer.alloc(4096);
+  const chunk = Buffer.alloc(64 * 1024);
+  // 改行までの断片。読み取りごとに全体を連結し直すと、数MBの画像行で二乗のコピーになる。
+  let pending: Buffer[] = state.lineBuf.length > 0 ? [state.lineBuf] : [];
+  let pendingBytes = state.lineBuf.length;
+  let totalRead = 0;
+  let more = false;
   try {
     for (;;) {
+      // 1 回の呼び出しで読む量に上限を置き、残りは呼び出し側がイベントループへ譲ってから読む。
+      if (totalRead >= maxBytes) {
+        more = true;
+        break;
+      }
       const bytesRead = fs.readSync(fd, chunk, 0, chunk.length, state.position);
       if (bytesRead === 0) break;
       state.position += bytesRead;
-      state.lineBuf = Buffer.concat([state.lineBuf, chunk.subarray(0, bytesRead)]);
-      let nl = state.lineBuf.indexOf(0x0a);
+      totalRead += bytesRead;
+      const data = chunk.subarray(0, bytesRead);
+      let offset = 0;
+      let nl = data.indexOf(0x0a);
       while (nl >= 0) {
-        const line = state.lineBuf.subarray(0, nl).toString("utf8").replaceAll("\r", "");
-        state.lineBuf = state.lineBuf.subarray(nl + 1);
+        const suffix = data.subarray(offset, nl);
+        const lineBuf = pendingBytes > 0
+          ? Buffer.concat([...pending, suffix], pendingBytes + suffix.length)
+          : suffix;
+        pending = [];
+        pendingBytes = 0;
+        const line = lineBuf.toString("utf8").replaceAll("\r", "");
         if (line.length > 0) out.push(line);
-        nl = state.lineBuf.indexOf(0x0a);
+        offset = nl + 1;
+        nl = data.indexOf(0x0a, offset);
+      }
+      if (offset < bytesRead) {
+        // 再利用する読み取り buffer からコピーして残す。
+        const rest = Buffer.from(data.subarray(offset));
+        pending.push(rest);
+        pendingBytes += rest.length;
       }
     }
   } catch {
-    return { lines: out, reset, state };
+    return { lines: out, reset, state, bytesRead: totalRead, more: false };
   } finally {
+    // 途中で読み取りに失敗しても、進めた position と対応する未完の行を残す。
+    state.lineBuf = pendingBytes === 0
+      ? Buffer.alloc(0)
+      : pending.length === 1 ? pending[0]! : Buffer.concat(pending, pendingBytes);
     // Subagent tailing watches a changing set of files, so each tick opens only for
     // the incremental read and closes immediately. Offsets and partial lines stay cached.
     try {
@@ -871,7 +914,7 @@ function readNewLines(
       // 二重 close 等は無視。
     }
   }
-  return { lines: out, reset, state };
+  return { lines: out, reset, state, bytesRead: totalRead, more };
 }
 
 function ensureFileState(file: string, states: Map<string, FileTailState>): FileTailState {

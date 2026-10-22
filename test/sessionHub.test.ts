@@ -2314,6 +2314,87 @@ describe("SessionHub conversation stream", () => {
   const output = (streamId: string): ControlMessage =>
     ({ type: "chat_output", v: 1, streamId, role: "assistant", text: streamId, eof: true });
 
+  describe("再開のヒント（afterSeq + newerThanMs, 10-20 実障害の再接続）", () => {
+    function makeHintHub(replayLimit = 500) {
+      const metadataStore = makeTempStore();
+      metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0, providerSessionId: "provider-1" });
+      const writes: Array<(payload: ControlMessage) => void> = [];
+      const opens: Array<number | null> = [];
+      const hub = new SessionHub({
+        runner: async () => ok(""), heartbeatDir: makeTempDir("session-hub-hint"), metadataStore,
+        timeoutSeconds: 1800, replayLimit,
+        tailFactory: (write) => {
+          writes.push(write);
+          return { open(_cwd: string, _id: string | null, newerThanMs: number | null) { opens.push(newerThanMs); }, stop() {} };
+        },
+      });
+      return { hub, writes, opens };
+    }
+    const done: ControlMessage = { type: "chat_output", v: 1, streamId: HISTORY_DONE_STREAM_ID, role: "system", text: "1", eof: true };
+    const unsubscribe = (hub: SessionHub, client: object): void => {
+      hub.handleClientMessage(client, JSON.stringify({ type: "conversation_unsubscribe", session: "work" }));
+      hub.unregisterClient(client);
+    };
+
+    test("止まった共有 tail が再生を完走し、afterSeq 以降が replay buffer にあれば境界付きで開き直して buffer から補う", () => {
+      const { hub, writes, opens } = makeHintHub();
+      const a = {}, ar: unknown[] = [];
+      subscribe(hub, a, ar);
+      writes[0]!(output("old")); writes[0]!(done); writes[0]!(output("live-1"));
+      writes[0]!(output("live-2")); // seq 4: a には届かなかったとする
+      unsubscribe(hub, a);
+      const b = {}, br: unknown[] = [];
+      subscribe(hub, b, br, { afterSeq: 3, newerThanMs: 5_000 });
+      expect(opens).toEqual([null, 5_000]);
+      expect(br).toMatchObject([{ serverSeq: 4, payload: { streamId: "live-2" } }]);
+    });
+
+    test("再生の途中で止まった共有 tail は境界を信用せず、頭から読み直す", () => {
+      const { hub, writes, opens } = makeHintHub();
+      const a = {}, ar: unknown[] = [];
+      subscribe(hub, a, ar, { newerThanMs: 1_000 }); // 開き直しの差分再生
+      writes[0]!(output("history-1"));
+      unsubscribe(hub, a); // pc:history-done の前に切れた
+      const b = {}, br: unknown[] = [];
+      subscribe(hub, b, br, { afterSeq: 1, newerThanMs: 9_000 });
+      expect(opens).toEqual([1_000, null]);
+    });
+
+    test("afterSeq 以降が replay buffer から溢れていれば、境界を信用せず頭から読み直す", () => {
+      const { hub, writes, opens } = makeHintHub(2);
+      const a = {}, ar: unknown[] = [];
+      subscribe(hub, a, ar);
+      writes[0]!(done); writes[0]!(output("x")); writes[0]!(output("y")); writes[0]!(output("z"));
+      unsubscribe(hub, a);
+      const b = {}, br: unknown[] = [];
+      subscribe(hub, b, br, { afterSeq: 1, newerThanMs: 9_000 });
+      expect(opens).toEqual([null, null]);
+    });
+
+    test("他の購読者が tail を生かしている間は、溢れた未配送を境界付きでなく全履歴の backfill で取り直す", () => {
+      const { hub, writes, opens } = makeHintHub(2);
+      const keeper = {}, kr: unknown[] = [];
+      subscribe(hub, keeper, kr);
+      writes[0]!(done); writes[0]!(output("x")); writes[0]!(output("y")); writes[0]!(output("z"));
+      const b = {}, br: unknown[] = [];
+      subscribe(hub, b, br, { afterSeq: 1, newerThanMs: 9_000 });
+      expect(opens).toEqual([null, null]); // 2 本目は b 専用の backfill
+    });
+
+    test("既存の購読者が再開のヒントを送っても、境界付きの backfill は始めず afterSeq の replay で扱う", () => {
+      const { hub, writes, opens } = makeHintHub();
+      const a = {}, ar: unknown[] = [];
+      subscribe(hub, a, ar);
+      writes[0]!(done); writes[0]!(output("live-1")); writes[0]!(output("live-2"));
+      ar.length = 0;
+      hub.handleClientMessage(a, JSON.stringify({
+        type: "conversation_subscribe", session: "work", afterSeq: 2, newerThanMs: 9_000,
+      }));
+      expect(opens).toEqual([null]);
+      expect(ar).toMatchObject([{ serverSeq: 3, payload: { streamId: "live-2" } }]);
+    });
+  });
+
   test("2 subscriber に同じ serverSeq で fan-out し共有 tail は1つ、最後の離脱で stop", () => {
     const { hub, writes, tails } = makeStreamingHub();
     const a = {}, b = {}, ar: unknown[] = [], br: unknown[] = [];

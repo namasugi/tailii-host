@@ -70,7 +70,9 @@ import { SessionListService } from "../sessions/sessionListService.js";
 import { SessionMetadataStore, type SessionMeta } from "../sessions/sessionMetadataStore.js";
 import { claudeTranscriptPathFor } from "../sessions/transcriptPath.js";
 import { OfficialAppsService } from "../services/officialApps.js";
-import { HISTORY_DONE_STREAM_ID, TranscriptTailer } from "../chat/transcriptTailer.js";
+import {
+  HISTORY_BEGIN_STREAM_ID, HISTORY_CANCELLED_STREAM_ID, HISTORY_DONE_STREAM_ID, TranscriptTailer,
+} from "../chat/transcriptTailer.js";
 import {
   makeSessionBackend,
   resolveSessionBackendKind,
@@ -716,13 +718,18 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
         if (payload === null) return;
         try {
           writer.write(payload);
+          const markerStreamId = payload.type === "chat_output" || payload.type === "session_chat_output"
+            ? payload.streamId : null;
           if (message.serverSeq === 0) {
             historyBackfillSessions.add(message.session);
-            if ((payload.type === "chat_output" || payload.type === "session_chat_output") &&
-              payload.streamId === HISTORY_DONE_STREAM_ID) {
+            if (markerStreamId === HISTORY_DONE_STREAM_ID || markerStreamId === HISTORY_CANCELLED_STREAM_ID) {
               historyBackfillSessions.delete(message.session);
             }
           } else if (message.serverSeq > 0) {
+            // 共有 tail の全履歴再生（history-begin〜history-done）も途中で切れたら全履歴から取り直す。
+            // 完走前に時刻境界で再購読すると、まだ届けていない古い行が境界より前として落ちる。
+            if (markerStreamId === HISTORY_BEGIN_STREAM_ID) historyBackfillSessions.add(message.session);
+            else if (markerStreamId === HISTORY_DONE_STREAM_ID) historyBackfillSessions.delete(message.session);
             lastForwardedAtMs.set(message.session, Date.now());
             if (isActive) {
               lastServerSeq.set(message.session, message.serverSeq);
@@ -844,7 +851,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           reject(new Error("Session Hub link unavailable"));
         }
       });
-    hubLink.onReconnect = ({ bootId, disconnectedAtMs, processingSessions: processingSnapshot }) => {
+    hubLink.onReconnect = ({ bootId, disconnectedAtMs, processingSessions: processingSnapshot, resumeHint }) => {
       if (disconnectedAtMs !== null) {
         const failures = [...rpcDisconnectFailures.values()];
         rpcDisconnectFailures.clear();
@@ -919,8 +926,21 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           hubLink.send({ type: "conversation_subscribe", session,
             ...(backfillBoundary !== undefined ? { newerThanMs: backfillBoundary } : {}), preview });
         } else {
+          // 同じ Hub 世代でも、この接続が唯一の購読者だった会話は切断で Hub の tail が止まり、
+          // afterSeq を渡しても transcript を頭から再生し直す（巨大な会話では数MB）。届け終えた
+          // 範囲を取り直さなくて済むよう、afterSeq に「再開のヒント」として最終転送時刻（− 5 秒）を
+          // 添える。境界を使ってよいか（tail が再生を完走し、afterSeq 以降が replay buffer に揃って
+          // いるか）は Hub だけが判定できるので、Hub が確かめられないときは afterSeq だけで扱われる。
+          // 境界は afterSeq と対でだけ送る（単独の newerThanMs は開き直しの差分取得の意味になる）。
+          // こちらでも全履歴の再生が完走していない会話には添えない。ヒントを解釈できない旧 Hub
+          // （hub_hello_ack.resumeHint なし）は両方付きを無条件に境界として使うので送らない。
+          const afterSeq = lastServerSeq.get(session);
+          const forwardedAtMs = resumeHint !== true || afterSeq === undefined || historyBackfillSessions.has(session)
+            ? undefined : lastForwardedAtMs.get(session);
           hubLink.send({ type: "conversation_subscribe", session,
-            ...(lastServerSeq.has(session) ? { afterSeq: lastServerSeq.get(session)! } : {}), preview });
+            ...(afterSeq !== undefined ? { afterSeq } : {}),
+            ...(forwardedAtMs !== undefined ? { newerThanMs: Math.max(0, forwardedAtMs - 5_000) } : {}),
+            preview });
         }
       }
     };

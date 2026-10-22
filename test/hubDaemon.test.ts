@@ -206,7 +206,7 @@ describe("hub socket", () => {
     expect(log).toHaveBeenCalledWith(
       "audit slow_client_disconnect writableLength=11 threshold=10",
     );
-    expect(HUB_SOCKET_WRITABLE_LENGTH_LIMIT).toBe(4 * 1024 * 1024);
+    expect(HUB_SOCKET_WRITABLE_LENGTH_LIMIT).toBe(32 * 1024 * 1024);
   });
 
   test("pane preview は未送信の履歴 conversation_event を追い越す", async () => {
@@ -235,6 +235,147 @@ describe("hub socket", () => {
     expect(HUB_SOCKET_CONVERSATION_EVENT_FLUSH_INTERVAL_MS).toBe(8);
   });
 
+  test("Hub 自身の履歴キューが上限を超えても、client が読めている限り切断しない（10-20 実障害）", async () => {
+    const written: string[] = [];
+    const destroy = vi.fn();
+    const socket = {
+      writableLength: 0,
+      destroyed: false,
+      write: (line: string) => { written.push(line); },
+      destroy,
+    };
+    const log = vi.fn();
+    // 上限 1KB に対し、巨大な会話の再生で 1 度に 5KB 分の履歴を積む（client は即座に読む）。
+    const write = createPrioritizedHubSocketWriter(socket, 1_024, log, { batchSize: 8, flushIntervalMs: 1 });
+    const lines = Array.from({ length: 50 }, (_, index) =>
+      `{"type":"conversation_event","serverSeq":${index + 1},"pad":"${"x".repeat(60)}"}\n`);
+    for (const line of lines) write(line);
+
+    await vi.waitFor(() => expect(written).toEqual(lines));
+    expect(destroy).not.toHaveBeenCalled();
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  test("client 側の滞留が高水位以上なら履歴の書き出しを待ち、下がれば再開する", async () => {
+    const written: string[] = [];
+    const socket = {
+      writableLength: 100,
+      destroyed: false,
+      write: (line: string) => { written.push(line); },
+      destroy: vi.fn(),
+    };
+    const write = createPrioritizedHubSocketWriter(socket, 1_000, vi.fn(), {
+      batchSize: 4, flushIntervalMs: 1, flushHighWater: 50,
+    });
+    const history = '{"type":"conversation_event","serverSeq":1}\n';
+    const preview = '{"type":"conversation_pane_preview","payload":{}}\n';
+    write(history);
+    write(preview);
+    // ライブ状態は待たずに直送し、履歴は client が読むまで積まない。
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(written).toEqual([preview]);
+
+    socket.writableLength = 0;
+    await vi.waitFor(() => expect(written).toEqual([preview, history]));
+    expect(socket.destroy).not.toHaveBeenCalled();
+  });
+
+  test("client 側の滞留が高水位のまま下がらなければ、停滞として切断する", async () => {
+    let nowMs = 1_000;
+    const socket = {
+      writableLength: 100,
+      destroyed: false,
+      write: vi.fn(),
+      destroy: vi.fn(() => { socket.destroyed = true; }),
+    };
+    const log = vi.fn();
+    const write = createPrioritizedHubSocketWriter(socket, 1_000, log, {
+      batchSize: 4, flushIntervalMs: 1, flushHighWater: 50, stallTimeoutMs: 30_000, now: () => nowMs,
+    });
+    write('{"type":"conversation_event","serverSeq":1}\n');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(socket.destroy).not.toHaveBeenCalled();
+
+    nowMs += 30_000;
+    await vi.waitFor(() => expect(socket.destroy).toHaveBeenCalledOnce());
+    expect(socket.write).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(
+      "audit slow_client_disconnect writableLength=100 threshold=50 reason=stalled",
+    );
+  });
+
+  test("束の途中でも client 側の滞留が高水位に達したら、残りは次の tick へ回す", async () => {
+    const written: string[] = [];
+    const socket = {
+      writableLength: 0,
+      destroyed: false,
+      // client が読まない間は書いた分だけ滞留が増える。
+      write: (line: string) => { written.push(line); socket.writableLength += 30; },
+      destroy: vi.fn(),
+    };
+    const write = createPrioritizedHubSocketWriter(socket, 1_000_000, vi.fn(), {
+      batchSize: 16, flushIntervalMs: 1, flushHighWater: 50,
+    });
+    for (let index = 0; index < 5; index += 1) write(`{"type":"conversation_event","serverSeq":${index}}\n`);
+    await vi.waitFor(() => expect(written).toHaveLength(2));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(written).toHaveLength(2);
+    socket.writableLength = 0; // client が読んだ
+    await vi.waitFor(() => expect(written).toHaveLength(4));
+    socket.writableLength = 0;
+    await vi.waitFor(() => expect(written).toHaveLength(5));
+    expect(socket.destroy).not.toHaveBeenCalled();
+  });
+
+  test("直送でも client 側の滞留が高水位のまま下がらなければ停滞として切断し、下がれば数え直す", () => {
+    let nowMs = 0;
+    const socket = {
+      writableLength: 100,
+      destroyed: false,
+      write: vi.fn(),
+      destroy: vi.fn(() => { socket.destroyed = true; }),
+    };
+    const write = createPrioritizedHubSocketWriter(socket, 1_000_000, vi.fn(), {
+      flushHighWater: 50, stallTimeoutMs: 1_000, now: () => nowMs,
+    });
+    const preview = '{"type":"conversation_pane_preview","payload":{}}\n';
+    write(preview);
+    nowMs = 900;
+    write(preview);
+    socket.writableLength = 0; // 一度読まれた → 停滞の起点を解く
+    nowMs = 950;
+    write(preview);
+    socket.writableLength = 100;
+    nowMs = 1_500;
+    write(preview);
+    expect(socket.destroy).not.toHaveBeenCalled();
+    expect(socket.write).toHaveBeenCalledTimes(4);
+    nowMs = 2_500;
+    write(preview);
+    expect(socket.destroy).toHaveBeenCalledOnce();
+    expect(socket.write).toHaveBeenCalledTimes(4);
+  });
+
+  test("履歴キューの安全上限を超えたら切断する", () => {
+    const socket = {
+      writableLength: 0,
+      destroyed: false,
+      write: vi.fn(),
+      destroy: vi.fn(() => { socket.destroyed = true; }),
+    };
+    const log = vi.fn();
+    const write = createPrioritizedHubSocketWriter(socket, 1_000_000, log, { queueLimit: 200 });
+    const line = `{"type":"conversation_event","pad":"${"x".repeat(40)}"}\n`; // 79 バイト
+    write(line);
+    write(line);
+    expect(socket.destroy).not.toHaveBeenCalled();
+    write(line);
+    expect(socket.destroy).toHaveBeenCalledOnce();
+    expect(log).toHaveBeenCalledWith(
+      `audit slow_client_disconnect writableLength=${line.length * 2} threshold=200 reason=queue`,
+    );
+  });
+
   test("hub_hello に ack を返して clientCount を反映する", async () => {
     if (!(await canListenUnixSocket())) return;
     const socketPath = tempSocketPath(`hub-${Date.now()}`);
@@ -254,7 +395,7 @@ describe("hub socket", () => {
     expect(log).toHaveBeenCalledWith("audit client_connect clients=1");
     writeLine(client, JSON.stringify({ type: "hub_hello" }));
     expect(JSON.parse(await reader.nextLine())).toEqual({
-      type: "hub_hello_ack", version: "1.2.3", bootId: "boot-test", processingSessions: [],
+      type: "hub_hello_ack", version: "1.2.3", bootId: "boot-test", processingSessions: [], resumeHint: true,
     });
 
     client.destroy();

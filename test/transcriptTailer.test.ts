@@ -4,7 +4,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import type { ControlMessage } from "../src/protocol.js";
 import {
   CONTEXT_STREAM_ID,
@@ -697,6 +697,61 @@ describe("TranscriptTailer", () => {
     // 本文は追いついた時点の host 時刻（epoch ms, reattach-since）。
     const doneAt = Number((marker[0] as { text: string }).text);
     expect(Math.abs(doneAt - Date.now())).toBeLessThan(60_000);
+  });
+
+  test("読み取り単位より長い行も前後の行と取り違えずに 1 行として流す", async () => {
+    const long = "長".repeat(120_000); // UTF-8 で約 360KB（読み取り単位 64KB を何度もまたぐ）
+    const p = writeTranscript([
+      '{"type":"user","message":{"role":"user","content":"前"},"uuid":"u1"}',
+      JSON.stringify({ message: { role: "assistant", content: [{ type: "text", text: long }] }, uuid: "a1" }),
+      '{"type":"user","message":{"role":"user","content":"後"},"uuid":"u2"}',
+    ]);
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
+    const chats = (await collect(tailer.streamTranscript(p))).filter((m) => m.type === "chat_output");
+    expect(chats.map((m) => (m.type === "chat_output" ? [m.streamId, m.text.length] : []))).toEqual([
+      ["u1", 1], ["a1", long.length], ["u2", 1],
+    ]);
+  });
+
+  test("巨大な履歴の再生は 1 回の同期処理で終えず、途中でイベントループへ譲る（10-20 実障害）", async () => {
+    // 1 行約 2KB × 1500 行 ≒ 3MB。従来は再生全体が 1 マクロタスクで、Hub が数秒固まり
+    // 自分の送信キューに履歴を積み上げて client を「遅い」と誤判定して切っていた。
+    const lines = Array.from({ length: 1_500 }, (_, index) =>
+      JSON.stringify({ message: { role: "assistant", content: [{ type: "text", text: "x".repeat(2_000) }] },
+        uuid: `a${index}` }));
+    const p = writeTranscript(lines);
+    let immediateRan = false;
+    setImmediate(() => { immediateRan = true; });
+    let ranBeforeLast = false;
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10 });
+    for await (const message of tailer.streamTranscript(p)) {
+      if (message.type === "chat_output" && message.streamId === "a1499") ranBeforeLast = immediateRan;
+    }
+    expect(ranBeforeLast).toBe(true);
+  });
+
+  test("EOF で未完だった長い最終行は、後続の追記と結合して 1 行として流す", async () => {
+    const dir = makeTempDir("tailer-partial");
+    const p = path.join(dir, "t.jsonl");
+    const full = JSON.stringify({ message: { role: "assistant", content: [{ type: "text", text: "y".repeat(200_000) }] },
+      uuid: "a-long" });
+    const cut = 150_000;
+    fs.writeFileSync(p, '{"type":"user","message":{"role":"user","content":"q"},"uuid":"u1"}\n' + full.slice(0, cut));
+    const ac = new AbortController();
+    const tailer = new TranscriptTailer({ pollIntervalMs: 10, tailIndefinitely: true, emitReplayDoneMarker: true });
+    const seen: ControlMessage[] = [];
+    const done = (async () => {
+      for await (const message of tailer.streamTranscript(p, ac.signal)) {
+        seen.push(message);
+        if (message.type === "chat_output" && message.streamId === "a-long") ac.abort();
+      }
+    })();
+    await vi.waitFor(() => expect(seen.some((m) => m.type === "chat_output" && m.streamId === HISTORY_DONE_STREAM_ID))
+      .toBe(true));
+    fs.appendFileSync(p, full.slice(cut) + "\n");
+    await done;
+    const longLine = seen.find((m) => m.type === "chat_output" && m.streamId === "a-long");
+    expect(longLine).toMatchObject({ role: "assistant", text: "y".repeat(200_000) });
   });
 
   test("assistant の message.model が変わるたびにモデルマーカーを流す", async () => {

@@ -21,6 +21,15 @@ describe("hubProtocol hello compatibility", () => {
     });
   });
 
+  test("hello ack の resumeHint は true のときだけ残す（旧 Hub は再開のヒント非対応）", () => {
+    expect(decodeHubServerLine(JSON.stringify({
+      type: "hub_hello_ack", version: "1.3.0", bootId: "hint-hub", resumeHint: true,
+    }))).toEqual({ type: "hub_hello_ack", version: "1.3.0", bootId: "hint-hub", resumeHint: true });
+    expect(decodeHubServerLine(JSON.stringify({
+      type: "hub_hello_ack", version: "1.3.0", bootId: "odd-hub", resumeHint: "yes",
+    }))).toEqual({ type: "hub_hello_ack", version: "1.3.0", bootId: "odd-hub" });
+  });
+
   test("hello ack の processingSessions は不正要素だけを除外してhandshakeを維持する", () => {
     expect(decodeHubServerLine(JSON.stringify({
       type: "hub_hello_ack", version: "1.2.0", bootId: "mixed-hub",

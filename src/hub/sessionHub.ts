@@ -270,6 +270,12 @@ interface SessionActor {
   nextServerSeq: number;
   replayBuffer: ReplayEvent[];
   tail: HubTail | null;
+  /**
+   * 直近の claude 共有 tail が既存内容の再生を完走した（`pc:history-done` を配った）か。購読者 0 人で
+   * tail が止まった後も保持し、再開購読（afterSeq + newerThanMs）の時刻境界を信用してよいかの判定に使う。
+   * 再生の途中で止まった tail は、まだ配っていない古い行を境界より前として落としうるので信用しない。
+   */
+  sharedTailCaughtUp: boolean;
   tailRetryTimer: ReturnType<typeof setTimeout> | null;
   previewPump: HubPreviewPump | null;
   /**
@@ -1232,11 +1238,24 @@ export class SessionHub {
   private subscribe(client: object, session: string, afterSeq: number | undefined,
     newerThanMs: number | undefined, preview: boolean): void {
     const actor = this.actor(session);
+    // afterSeq と newerThanMs の両方付きは engine の再接続の「再開のヒント」（newerThanMs = engine が
+    // 最後に届けた時刻 − 5 秒）。時刻境界で省いてよいのは、Hub 側で欠けなく続きを渡せると確かめられる
+    // ときだけ: この client の新規購読で、止まっている共有 tail が再生を完走しており、afterSeq 以降が
+    // replay buffer に揃っていること。それ以外（再生途中で止まった tail・buffer から溢れた未配送・
+    // 既存購読）で境界を使うと、まだ届けていない古い行が境界より前として落ちるので afterSeq だけで扱う。
+    let resume = "";
+    if (afterSeq !== undefined && newerThanMs !== undefined) {
+      const trusted = !actor.subscribers.has(client) && actor.subscribers.size === 0 &&
+        actor.tail === null && actor.codexLive === null &&
+        actor.sharedTailCaughtUp && this.canReplay(actor, afterSeq);
+      resume = ` resume=${trusted ? "boundary" : "full"}`;
+      if (!trusted) newerThanMs = undefined;
+    }
     // ライブビュー消灯（preview 購読者不在）の事後解析用: 誰がどのフラグで購読したかを残す。
     this.options.log?.(
       `audit subscribe session=${session} preview=${preview}` +
         ` afterSeq=${afterSeq ?? "-"} newerThanMs=${newerThanMs ?? "-"}` +
-        ` existing=${actor.subscribers.has(client)} subscribers=${actor.subscribers.size}`,
+        ` existing=${actor.subscribers.has(client)} subscribers=${actor.subscribers.size}${resume}`,
     );
     const existing = actor.subscribers.get(client);
     if (existing !== undefined) {
@@ -1382,19 +1401,27 @@ export class SessionHub {
     }
     if (actor.tailRetryTimer !== null) clearTimeout(actor.tailRetryTimer);
     actor.tailRetryTimer = null;
+    // 新しい tail は再生を始め直す（Codex は App Server 通知と合流するため完走を信用しない）。
+    actor.sharedTailCaughtUp = false;
     if (meta.agent === "codex" && meta.providerSessionId) {
       this.startCodexSharedStream(session, actor, meta.cwd, meta.providerSessionId, newerThanMs);
       return;
     }
     if (this.options.tailFactory === undefined) return;
+    let current: HubTail | null = null;
     const tail = this.options.tailFactory(
       (payload) => {
         this.publishConversationEvent(session, actor, payload);
+        if (current !== null && actor.tail === current &&
+          payload.type === "chat_output" && payload.streamId === HISTORY_DONE_STREAM_ID) {
+          actor.sharedTailCaughtUp = true;
+        }
       },
       undefined,
       (event) => this.handleClaudeTurnLifecycle(session, actor, event),
     );
     actor.tail = tail;
+    current = tail;
     tail.open(meta.cwd, meta.providerSessionId ?? meta.claudeSessionId ?? null, newerThanMs, meta.agent ?? "claude");
   }
 
@@ -2069,7 +2096,7 @@ export class SessionHub {
       actor = { pendingQuestion: null, processingSince: null, processingSinceMs: null, lastInterruptDoneMs: null,
         lastTurnEndMs: null, turnStartFiredAtMs: null, lastTurnStartMs: null,
         focusedBy: new Set(), subscribers: new Map(),
-        nextServerSeq: 1, replayBuffer: [], tail: null, tailRetryTimer: null,
+        nextServerSeq: 1, replayBuffer: [], tail: null, sharedTailCaughtUp: false, tailRetryTimer: null,
         previewPump: null, usageLimitWatch: null, backfillTails: new Map(),
         seenClientMessageIds: new Set(), deliveredChatMessageIds: new Map(),
         deliveredCodexMessageIds: new Map(),
