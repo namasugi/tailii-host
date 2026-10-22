@@ -217,6 +217,12 @@ interface CodexLiveState {
   publishedContentCounts: Map<string, number>;
   scanContentCounts: Map<string, number>;
   fallbackBaselineCounts: Map<string, number>;
+  /**
+   * 共有 rollout tail を開いた起点（差分購読の newerThanMs。全履歴なら null）。切断後の再走査も同じ起点から
+   * 読む: publishedContentCounts はこの起点より後に配った分しか数えていないので、頭から読み直すと起点より
+   * 前の行（端末のキャッシュに無い注記など）を新着として配ってしまう（2026-10-23 レビューで再現）。
+   */
+  newerThanMs: number | null;
   disconnected: boolean;
   /**
    * この会話へ最後に配信した `pc:model` の値。App Server 通知（onModel）と rollout の
@@ -226,8 +232,8 @@ interface CodexLiveState {
   /** 購読時点の thread のモデル（thread/resume 応答）。初回 backfill 完了後に配信する。 */
   subscribedModel: string | null;
   /**
-   * fallback-scan（切断後の rollout 再走査）で最後に見た `pc:model`。再走査は履歴を頭から
-   * 読み直すため、途中の旧モデルを配信せず走査完了時に最新値だけを配る。
+   * fallback-scan（切断後の rollout 再走査）で最後に見た `pc:model`。再走査は共有 tail と同じ起点から
+   * 履歴を読み直すため、途中の旧モデルを配信せず走査完了時に最新値だけを配る。
    */
   scanLastModel: string | null;
   /**
@@ -1496,6 +1502,7 @@ export class SessionHub {
       publishedContentCounts: new Map(),
       scanContentCounts: new Map(),
       fallbackBaselineCounts: new Map(),
+      newerThanMs,
       disconnected: false,
       lastModel: null,
       subscribedModel: null,
@@ -1751,11 +1758,14 @@ export class SessionHub {
     const meta = this.options.metadataStore.get(session);
     if (meta === null) return;
     this.startCodexFallbackRescan(
-      session, actor, meta.cwd, meta.providerSessionId ?? meta.claudeSessionId ?? null, null,
+      session, actor, meta.cwd, meta.providerSessionId ?? meta.claudeSessionId ?? null, state.newerThanMs,
     );
   }
 
-  /** live 移行後の接続断: rollout を頭から再走査し、配信済み本文を occurrence 照合で除外して継続する。 */
+  /**
+   * live 移行後の接続断: rollout を共有 tail と同じ起点から再走査し、配信済み本文を occurrence 照合で
+   * 除外して継続する（起点より前の行は状態だけ進めて出さない＝基準の数え方と範囲を揃える）。
+   */
   private startCodexFallbackRescan(
     session: string,
     actor: SessionActor,

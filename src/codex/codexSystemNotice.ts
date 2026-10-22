@@ -17,11 +17,16 @@ export interface CodexSystemNotice {
   payload: Extract<ControlMessage, { type: "chat_output" }>;
 }
 
-/** Codex 専用 system 注記だけを rollout/live occurrence 照合の対象にする。 */
+/**
+ * Codex 専用 system 注記だけを rollout/live occurrence 照合の対象にする。
+ * 照合は本文ではなく streamId（出来事ごとの identity から作る）で行う。live と rollout は同じ出来事なら
+ * 同じ streamId になる一方、「⏹️ 中断しました」のように本文が毎回同じ注記を本文で照合すると、履歴にある
+ * 前の中断と新しい中断が同じものとみなされ、新しい方が配信済み扱いで落ちる（2026-10-23 レビューで再現）。
+ */
 export function codexSystemNoticeContentKey(payload: ControlMessage): string | null {
   if (payload.type !== "chat_output" || payload.role !== "system" ||
     !payload.streamId.startsWith(NOTICE_STREAM_PREFIX)) return null;
-  return `system\u0000${payload.text}`;
+  return `system\u0000${payload.streamId}`;
 }
 
 /** App Server item/completed の mcpToolCall 失敗を表示用注記へ変換する。 */
@@ -41,7 +46,7 @@ export function codexMcpItemErrorNotice(
   );
 }
 
-/** rollout event_msg の利用者向け error / warning を表示用注記へ変換する。 */
+/** rollout event_msg の利用者向け error / warning と、失敗・中断で終わった turn を表示用注記へ変換する。 */
 export function codexRolloutSystemNotice(
   payload: Record<string, unknown>,
 ): CodexSystemNotice | null {
@@ -64,6 +69,26 @@ export function codexRolloutSystemNotice(
     );
   }
 
+  // 現行 Codex は error / stream_error / warning を rollout に保存しない（turn の終わりの task_complete /
+  // turn_aborted は必ず保存する）。失敗した turn の理由は task_complete.error にしか残らないので、ここから
+  // live の turn/completed（failed）と同じ注記を作る。開き直した履歴や、iPhone がつながっていない間に
+  // 終わった turn でも理由が出る（実障害 2026-10-23: 自動圧縮が「Selected model is at capacity」で
+  // 失敗して止まった会話に、Tailii では何も出ていなかった）。
+  if (kind === "task_complete") {
+    const error = asRecord(payload["error"]);
+    const turnId = nonEmptyString(payload["turn_id"]);
+    if (error === null || turnId === null) return null;
+    return turnFailedNotice(turnId, turnErrorMessage(error));
+  }
+  if (kind === "turn_aborted") {
+    const turnId = nonEmptyString(payload["turn_id"]);
+    if (turnId === null) return null;
+    // 目標のトークン予算で止まった turn は 🎯 目標注記（トークン予算に到達）が理由を示すので、
+    // 中断の注記は出さない（TUI も中断ではなく予算到達として表示する）。
+    if (payload["reason"] === "budget_limited") return null;
+    return turnInterruptedNotice(turnId);
+  }
+
   if (kind !== "error" && kind !== "stream_error" && kind !== "warning") return null;
   const message = noticeMessage(payload);
   if (message === null) return null;
@@ -78,16 +103,30 @@ export function codexRolloutSystemNotice(
     : retrying
       ? `⚠️ Codex エラー（自動再試行中）: ${detail}`
       : `❌ Codex エラー: ${detail}`;
-  // 同じ stream_error の再試行は 1 件へ畳み、上限到達（retrying=false）だけ別注記にする。
-  // retry attempt を ID に含めると 502 × 10 回のような一時障害で会話が埋まってしまう。
-  const identity = `${String(kind)}:${turnId}:${retrying ? "retrying" : "terminal"}:${detail}`;
+  // live（App Server の error / warning 通知）と同じ出来事は同じ identity にする（Hub と iOS は streamId で
+  // 照合するので、形が違うと会話を開いている間や再走査で同じ注記が 2 行並ぶ）。
+  // - 再試行中: live の error(willRetry) と同じ `turn-retry:<turnId>:<detail>`（回数を外して 1 行に畳む）
+  // - 再試行なしのエラー: live の error / turn/completed failed と同じ `turn-error:<turnId>`
+  // - 警告: live の warning と同じ `warning:<detail>`
+  const identity = kind === "warning"
+    ? `warning:${detail}`
+    : retrying ? `turn-retry:${turnId}:${detail}` : `turn-error:${turnId}`;
   return notice(`rollout:${identity}`, identity, text);
+}
+
+export interface CodexAppServerSystemNoticeOptions {
+  /**
+   * 目標のトークン予算で止まった turn（`thread/goal/updated` の budgetLimited に付く turnId）。
+   * App Server はこの止まり方も `turn/completed` の interrupted で知らせるので、中断の注記を出さない。
+   */
+  budgetLimitedTurnIds?: ReadonlySet<string>;
 }
 
 /** App Server の item 以外の error / warning 通知を表示用注記へ変換する。 */
 export function codexAppServerSystemNotice(
   method: string,
   params: Record<string, unknown> | null,
+  options: CodexAppServerSystemNoticeOptions = {},
 ): CodexSystemNotice | null {
   if (params === null) return null;
 
@@ -114,17 +153,17 @@ export function codexAppServerSystemNotice(
 
   if (method === "turn/completed") {
     const turn = asRecord(params["turn"]);
-    if (turn?.["status"] !== "failed") return null;
-    const turnId = nonEmptyString(turn["id"]) ?? "unknown-turn";
-    const detail = clip(
-      turnErrorMessage(turn["error"]) ?? "ターンを完了できませんでした。",
-      NOTICE_DETAIL_LIMIT,
-    );
-    return notice(
-      `turn-error:${turnId}`,
-      `turn-error:${turnId}`,
-      `❌ Codex エラー: ${detail}`,
-    );
+    const status = turn?.["status"];
+    if (status === "interrupted") {
+      // 利用者の停止（iPhone の停止ボタン・端末の Esc）。App Server は止まった理由を渡さないので、
+      // TUI と同じく予算到達の turn 以外はすべて中断として出す。turn id が無いと別の中断と
+      // streamId が重なって後の中断が表示されなくなるため、その場合は出さない。
+      const turnId = nonEmptyString(turn?.["id"]);
+      if (turnId === null || options.budgetLimitedTurnIds?.has(turnId) === true) return null;
+      return turnInterruptedNotice(turnId);
+    }
+    if (status !== "failed") return null;
+    return turnFailedNotice(nonEmptyString(turn?.["id"]) ?? "unknown-turn", turnErrorMessage(turn?.["error"]));
   }
 
   if (method === "mcpServer/startupStatus/updated") {
@@ -269,6 +308,25 @@ export function codexAsyncAnswerFailedNotice(itemId: string, kind: "expired" | "
   return notice(identity, identity, text);
 }
 
+/**
+ * 失敗で終わった turn の注記。live（App Server の `error` / `turn/completed` failed）と rollout
+ * （task_complete.error）が同じ identity・本文になり、どちらから届いても 1 行にまとまる。
+ */
+function turnFailedNotice(turnId: string, message: string | null): CodexSystemNotice {
+  const identity = `turn-error:${turnId}`;
+  const detail = clip(message ?? "ターンを完了できませんでした。", NOTICE_DETAIL_LIMIT);
+  return notice(identity, identity, `❌ Codex エラー: ${detail}`);
+}
+
+/**
+ * 中断で終わった turn の注記（TUI の「■ Conversation interrupted」にあたる）。live の
+ * `turn/completed` interrupted と rollout の turn_aborted が同じ identity・本文になる。
+ */
+function turnInterruptedNotice(turnId: string): CodexSystemNotice {
+  const identity = `turn-interrupted:${turnId}`;
+  return notice(identity, identity, "⏹️ 中断しました");
+}
+
 function notice(itemId: string, identity: string, text: string): CodexSystemNotice {
   const digest = createHash("sha256").update(identity).digest("hex").slice(0, 24);
   return {
@@ -300,14 +358,35 @@ function noticeMessage(payload: Record<string, unknown>): string | null {
 }
 
 function turnErrorMessage(value: unknown): string | null {
-  if (typeof value === "string") return value.trim().length > 0 ? value : null;
+  if (typeof value === "string") return value.trim().length > 0 ? readableErrorText(value) : null;
   const error = asRecord(value);
   if (error === null) return null;
-  const message = nonEmptyString(error["message"]);
-  const additional = nonEmptyString(error["additionalDetails"]);
+  const rawMessage = nonEmptyString(error["message"]);
+  const message = rawMessage === null ? null : readableErrorText(rawMessage);
+  // live（App Server）は camelCase、rollout（Codex の event）は snake_case。どちらでも同じ本文にする。
+  const additional = nonEmptyString(error["additionalDetails"]) ?? nonEmptyString(error["additional_details"]);
   if (message === null) return additional;
   if (additional === null || message.includes(additional)) return message;
   return `${message} — ${additional}`;
+}
+
+/**
+ * API の 400 などで Codex がレスポンス本文の JSON をそのまま message にしたときは、中の説明文だけにする
+ * （実測 0.163.0: `{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"…"}}`）。
+ * live と rollout はどちらもこの関数を通るので、本文は一致したまま。
+ */
+function readableErrorText(message: string): string {
+  const trimmed = message.trim();
+  if (!trimmed.startsWith("{")) return message;
+  try {
+    const parsed = asRecord(JSON.parse(trimmed));
+    return nonEmptyString(asRecord(parsed?.["error"])?.["message"]) ??
+      nonEmptyString(parsed?.["message"]) ??
+      nonEmptyString(parsed?.["error"]) ??
+      message;
+  } catch {
+    return message;
+  }
 }
 
 function textContent(value: unknown): string | null {

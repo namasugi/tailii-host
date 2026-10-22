@@ -60,6 +60,8 @@ const TITLE_GENERATION_MAX_ATTEMPTS = 3;
 const TITLE_GENERATION_RETRY_BASE_MS = 250;
 /** 記録済み deprecationNotice 文言の保持上限。 */
 const DEPRECATION_NOTICE_LOG_CAP = 64;
+/** 予算到達で止まった turn id の保持上限（通常は直後の turn/completed で消える）。 */
+const BUDGET_LIMITED_TURN_IDS_CAP = 16;
 
 export interface CodexNativeApproval {
   id: string;
@@ -298,6 +300,11 @@ interface OpenThread {
   goal: CodexGoalInfo | null;
   /** 直近に注記した目標の照合キー（状態 / 内容が変わったときだけ 🎯 注記を出す）。null は未確定。 */
   goalNoticeKey: string | null;
+  /**
+   * 目標のトークン予算で止まった turn（`thread/goal/updated` の budgetLimited に付く turnId）。
+   * その turn の `turn/completed`（interrupted）では中断の注記を出さない（理由は 🎯 注記が示す。TUI と同じ）。
+   */
+  budgetLimitedTurnIds: Set<string>;
 }
 
 interface PendingUserInput {
@@ -1027,6 +1034,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       subagentSeq: 0,
       goal: null,
       goalNoticeKey: null,
+      budgetLimitedTurnIds: new Set<string>(),
     };
     this.open.set(session, opened);
     // 開いている間に close が要求されていた（購読者が去った等）なら、開き終わった接続を残さず畳む。
@@ -1126,7 +1134,9 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       typeof notificationThreadId !== "string" || notificationThreadId === threadId;
     const current = this.open.get(session);
     const systemNotice = current?.threadId === threadId && lifecycleMatchesThread
-      ? codexAppServerSystemNotice(notification.method, params)
+      ? codexAppServerSystemNotice(notification.method, params, {
+        budgetLimitedTurnIds: current.budgetLimitedTurnIds,
+      })
       : null;
     if (systemNotice !== null) {
       this.onChatItem({ session, itemId: systemNotice.itemId, payload: systemNotice.payload });
@@ -1220,6 +1230,9 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     if (notification.method === "turn/completed" && lifecycleMatchesThread) {
       const current = this.open.get(session);
       const completedTurn = asRecord(params?.["turn"])?.["id"];
+      if (current?.threadId === threadId && typeof completedTurn === "string") {
+        current.budgetLimitedTurnIds.delete(completedTurn);
+      }
       if (current?.threadId === threadId &&
         (typeof completedTurn !== "string" ||
           current.activeTurnId === null || current.activeTurnId === completedTurn)) {
@@ -1270,6 +1283,15 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     if (notification.method === "thread/goal/updated" && lifecycleMatchesThread) {
       const goal = codexGoalFromWire(params?.["goal"]);
       if (goal !== null && current?.threadId === threadId) {
+        // 予算到達で止める turn を覚える（続く turn/completed の interrupted で中断の注記を出さない）。
+        const goalTurnId = params?.["turnId"];
+        if (goal.status === "budgetLimited" && typeof goalTurnId === "string" && goalTurnId.length > 0) {
+          // turn/completed が届かなかった分で膨らまないよう、上限を超えたら古い記録ごと捨てる。
+          if (current.budgetLimitedTurnIds.size >= BUDGET_LIMITED_TURN_IDS_CAP) {
+            current.budgetLimitedTurnIds.clear();
+          }
+          current.budgetLimitedTurnIds.add(goalTurnId);
+        }
         this.applyGoal(session, current, goal, { publishState: true });
       }
     }

@@ -1555,6 +1555,57 @@ describe("CodexNativeTurnController plan mode / goal（codex-plan-mode / codex-g
     ]);
   });
 
+  test("turn/completed の中断・失敗を注記にし、予算到達で止まった turn と別 thread の中断は出さない", async () => {
+    const thread = new FakeThread();
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const chats: { itemId: string; payload: unknown }[] = [];
+    const processing: string[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return thread; } },
+      onChatItem: (event) => chats.push(event),
+      onProcessing: (_session, state) => processing.push(state),
+    });
+    await controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" });
+    const notify = (method: string, params: Record<string, unknown>): void => {
+      openOptions?.onNotification?.({ method, params });
+    };
+
+    // 利用者の停止。
+    notify("turn/started", { threadId: "thread-1", turn: { id: "turn-1" } });
+    notify("turn/completed", {
+      threadId: "thread-1", turn: { id: "turn-1", status: "interrupted", items: [], error: null },
+    });
+    // 目標のトークン予算に到達: goal の更新（budgetLimited + turnId）に続いて interrupted で終わる。
+    notify("turn/started", { threadId: "thread-1", turn: { id: "turn-2" } });
+    notify("thread/goal/updated", { threadId: "thread-1", turnId: "turn-2", goal: {
+      threadId: "thread-1", objective: "テストを緑にする", status: "budgetLimited", tokenBudget: 1000,
+      tokensUsed: 1000, timeUsedSeconds: 60, createdAt: 1, updatedAt: 2,
+    } });
+    notify("turn/completed", { threadId: "thread-1", turn: { id: "turn-2", status: "interrupted", items: [] } });
+    // サブエージェント（別 thread）の中断はこの会話の注記にしない。
+    notify("turn/completed", { threadId: "thread-child", turn: { id: "turn-child", status: "interrupted" } });
+    // 失敗（自動圧縮が混雑で失敗した実例）。
+    notify("turn/started", { threadId: "thread-1", turn: { id: "turn-3" } });
+    notify("turn/completed", { threadId: "thread-1", turn: {
+      id: "turn-3", status: "failed", items: [],
+      error: {
+        message: "Error running remote compact task: Selected model is at capacity. Please try a different model.",
+        codexErrorInfo: "serverOverloaded", additionalDetails: null,
+      },
+    } });
+
+    const notices = chats
+      .map((event) => event.payload as ControlMessage)
+      .filter((payload): payload is Extract<ControlMessage, { type: "chat_output" }> =>
+        payload.type === "chat_output" && payload.role === "system");
+    expect(notices.map((notice) => notice.text)).toEqual([
+      "⏹️ 中断しました",
+      "🎯 目標（トークン予算に到達）: テストを緑にする",
+      "❌ Codex エラー: Error running remote compact task: Selected model is at capacity. Please try a different model.",
+    ]);
+    expect(processing.filter((state) => state === "done")).toHaveLength(3);
+  });
+
   test("goal() は thread の goalGet / goalSet / goalClear を呼び、結果を onGoal と hasActiveGoal へ反映する", async () => {
     const calls: unknown[] = [];
     const goal = {

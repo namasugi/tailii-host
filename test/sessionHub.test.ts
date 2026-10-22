@@ -10,6 +10,7 @@ import { SessionHub, type HubTail } from "../src/hub/sessionHub.js";
 import { HISTORY_DONE_STREAM_ID } from "../src/chat/transcriptTailer.js";
 import { ImageService } from "../src/chat/imageService.js";
 import { codexCommandActivity, toolActivityMessage } from "../src/codex/codexToolActivity.js";
+import { codexAppServerSystemNotice, codexRolloutSystemNotice } from "../src/codex/codexSystemNotice.js";
 import type { ControlMessage } from "../src/protocol.js";
 import type {
   CodexNativeTurnControllerOptions,
@@ -3179,7 +3180,7 @@ function makeCodexStreamingHub(options: {
     state: "active" | "done";
     turnId: string;
   }) => void) | undefined> = [];
-  const tails: Array<HubTail & { stopped: boolean }> = [];
+  const tails: Array<HubTail & { stopped: boolean; openedNewerThanMs: number | null | undefined }> = [];
   let callbacks!: CodexNativeTurnControllerOptions;
   const reconcileCompletedTurn = vi.fn((session: string, _turnId: string) => {
     callbacks.onProcessing?.(session, "done");
@@ -3207,7 +3208,15 @@ function makeCodexStreamingHub(options: {
     tailFactory: (write, onCodexTurnLifecycle) => {
       writes.push(write);
       lifecycleWrites.push(onCodexTurnLifecycle);
-      const tail = { stopped: false, open() {}, stop() { tail.stopped = true; } };
+      const tail = {
+        stopped: false,
+        // 開いた起点（差分購読の newerThanMs）。open 前は undefined。
+        openedNewerThanMs: undefined as number | null | undefined,
+        open(_cwd: string, _sessionId: string | null, newerThanMs?: number | null) {
+          tail.openedNewerThanMs = newerThanMs ?? null;
+        },
+        stop() { tail.stopped = true; },
+      };
       tails.push(tail);
       return tail;
     },
@@ -3445,6 +3454,113 @@ describe("SessionHub Codex App Server live stream", () => {
     writes[0]!(chat("system", "", HISTORY_DONE_STREAM_ID));
 
     expect(received.filter((message) => message?.payload?.text === "履歴")).toHaveLength(2);
+  });
+
+  // 失敗・中断の注記（codex-turn-end-notice, 2026-10-23）。旧 host は出していなかったので、端末の
+  // キャッシュは起点より前の注記の streamId を知らない。起点より前を新着として配ると、古い中断・失敗が
+  // 末尾にまとめて並ぶ（独立レビューで再現）。
+  describe("失敗・中断の注記（codex-turn-end-notice）", () => {
+    const interruptedFromRollout = (turnId: string) =>
+      codexRolloutSystemNotice({ type: "turn_aborted", turn_id: turnId, reason: "interrupted" })!;
+    const interruptedFromLive = (turnId: string) =>
+      codexAppServerSystemNotice("turn/completed", {
+        threadId: "thread-1", turn: { id: turnId, status: "interrupted" },
+      })!;
+    const noticeStreamIds = (messages: any[]): string[] => messages.flatMap((message) =>
+      message?.type === "conversation_event" && message.payload?.type === "chat_output" &&
+        message.payload.streamId.startsWith("codex-notice-")
+        ? [message.payload.streamId]
+        : []);
+
+    test("差分購読の後に App Server が切断されても、再走査は共有 tail と同じ起点から読む", async () => {
+      const { hub, writes, tails, getCallbacks } = makeCodexStreamingHub();
+      const client = {}, received: any[] = [];
+      subscribe(hub, client, received, { newerThanMs: 5_000 });
+      await vi.waitFor(() => expect(writes).toHaveLength(1));
+      expect(tails[0]!.openedNewerThanMs).toBe(5_000);
+      writes[0]!(chat("assistant", "境界後の応答", "codex-item-new"));
+      writes[0]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+      await vi.waitFor(() => expect(hub.actors.get("work")?.codexLive?.phase).toBe("live"));
+
+      getCallbacks().onDisconnect?.("work", new Error("closed"));
+      expect(writes).toHaveLength(2);
+      expect(tails[0]!.stopped).toBe(true);
+      // 起点より前の行（端末のキャッシュに無い注記を含む）は再走査でも出さない。
+      expect(tails[1]!.openedNewerThanMs).toBe(5_000);
+      // 同じ範囲の配信済み本文は読み飛ばし、切断後に増えた行だけを配る。
+      received.length = 0;
+      writes[1]!(chat("assistant", "境界後の応答", "codex-turn-1"));
+      writes[1]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+      const interrupted = interruptedFromRollout("turn-after-disconnect");
+      writes[1]!(interrupted.payload);
+      expect(received.flatMap((message) =>
+        message?.type === "conversation_event" && message.payload?.type === "chat_output" &&
+          !message.payload.streamId.startsWith("pc:")
+          ? [message.payload.text]
+          : [])).toEqual(["⏹️ 中断しました"]);
+      hub.close();
+    });
+
+    test("履歴に前の中断があっても、backfill 中に届いた新しい中断を配信済み扱いにしない", async () => {
+      const { hub, writes, getCallbacks, releaseSubscribe } = makeCodexStreamingHub({ holdSubscribe: true });
+      const client = {}, received: any[] = [];
+      subscribe(hub, client, received);
+      expect(writes).toHaveLength(1);
+      const previous = interruptedFromRollout("turn-old");
+      writes[0]!(previous.payload);
+      writes[0]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+      // snapshot 待ちの間に新しい turn が中断された（live 通知は buffer される）。本文は前の中断と同じ。
+      const next = interruptedFromLive("turn-new");
+      expect(next.payload.text).toBe(previous.payload.text);
+      getCallbacks().onChatItem?.({ session: "work", itemId: next.itemId, payload: next.payload });
+      releaseSubscribe();
+      await vi.waitFor(() => expect(hub.actors.get("work")?.codexLive?.phase).toBe("live"));
+      // live へ移った後に届いた rollout の同じ中断は読まない（live が一次ソース）。
+      writes[0]!(interruptedFromRollout("turn-new").payload);
+
+      expect(noticeStreamIds(received)).toEqual([previous.payload.streamId, next.payload.streamId]);
+      hub.close();
+    });
+
+    test("backfill 中に rollout と live の両方から届いた同じ中断は 1 回だけ配る", async () => {
+      const { hub, writes, getCallbacks, releaseSubscribe } = makeCodexStreamingHub({ holdSubscribe: true });
+      const client = {}, received: any[] = [];
+      subscribe(hub, client, received);
+      writes[0]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+      const live = interruptedFromLive("turn-1");
+      getCallbacks().onChatItem?.({ session: "work", itemId: live.itemId, payload: live.payload });
+      // EOF の後に rollout へ追記された同じ中断は、snapshot 待ちの backfill 経路で先に配られる。
+      writes[0]!(interruptedFromRollout("turn-1").payload);
+      releaseSubscribe();
+      await vi.waitFor(() => expect(hub.actors.get("work")?.codexLive?.phase).toBe("live"));
+
+      expect(noticeStreamIds(received)).toEqual([live.payload.streamId]);
+      hub.close();
+    });
+
+    test("2 台目の端末の履歴取得中に起きた中断を、履歴にある前の中断と取り違えずに届ける", async () => {
+      const { hub, writes, getCallbacks } = makeCodexStreamingHub();
+      const a = {}, ar: any[] = [];
+      subscribe(hub, a, ar);
+      await vi.waitFor(() => expect(writes).toHaveLength(1));
+      writes[0]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+      await vi.waitFor(() => expect(hub.actors.get("work")?.codexLive?.phase).toBe("live"));
+
+      // 2 台目は buffer 範囲外の afterSeq で履歴（rollout）から読み直す。
+      const b = {}, br: any[] = [];
+      subscribe(hub, b, br, { afterSeq: 999 });
+      await vi.waitFor(() => expect(writes).toHaveLength(2));
+      const previous = interruptedFromRollout("turn-old");
+      writes[1]!(previous.payload);
+      // 2 台目の履歴取得中に新しい turn が中断された（live。2 台目へは取得後の replay で届く）。
+      const next = interruptedFromLive("turn-new");
+      getCallbacks().onChatItem?.({ session: "work", itemId: next.itemId, payload: next.payload });
+      writes[1]!(chat("system", "", HISTORY_DONE_STREAM_ID));
+
+      expect(noticeStreamIds(br)).toEqual([previous.payload.streamId, next.payload.streamId]);
+      expect(noticeStreamIds(ar)).toEqual([next.payload.streamId]);
+      hub.close();
+    });
   });
 
   test("App Server 不達時は rollout を history 後も tail し、model marker は通す", async () => {

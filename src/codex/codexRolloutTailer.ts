@@ -502,6 +502,7 @@ function readRolloutMeta(rolloutPath: string): { id: string | null; cwd: string 
  *     - token_count   → コンテキストトークン数／窓マーカー
  *     - patch_apply_end → ファイル変更カード（tool_activity, codex-tool-cards）
  *     - mcp_tool_call_end / error / warning → system 注記
+ *     - task_complete（error 付き）/ turn_aborted → 失敗・中断の system 注記（live の turn/completed と同じ）
  *   - `response_item`:
  *     - custom_tool_call "exec" / function_call "exec_command" → コマンド実行カード
  *     - function_call "update_plan" → プラン更新カード

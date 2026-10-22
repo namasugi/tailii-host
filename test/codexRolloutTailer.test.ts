@@ -534,6 +534,55 @@ describe("CodexRolloutTailer.streamForCwd（有限 tail）", () => {
     ]);
   });
 
+  test("失敗・中断で終わった turn を終端行（task_complete.error / turn_aborted）から注記にする", async () => {
+    // 実障害 2026-10-23: 現行 Codex は error を rollout に保存しない。自動圧縮の失敗で止まった会話は
+    // task_complete.error にしか理由が残らず、開き直しても Tailii には何も出なかった。中断も同じ。
+    const root = makeTempDir("codex-turn-end-notices");
+    const cwd = makeTempDir("codex-turn-end-notices-cwd");
+    const capacity = "Error running remote compact task: Selected model is at capacity. Please try a different model.";
+    writeRollout(root, "2026/10/22", "r.jsonl", cwd, [
+      taskLifecycle("task_started", "turn-1"),
+      userMsg("歩行アニメを直して"),
+      agentMsg("確認しています。", "commentary"),
+      JSON.stringify({ timestamp: "2026-10-22T15:04:05.253Z", ordinal: 2590, type: "event_msg", payload: {
+        type: "task_complete", root_turn_id: "turn-1", turn_id: "turn-1", last_agent_message: null,
+        error: { message: capacity, codex_error_info: "server_overloaded" },
+        started_at: 1792680032, completed_at: 1792681445, duration_ms: 1412963,
+      } }),
+      taskLifecycle("task_started", "turn-2"),
+      userMsg("原因を調べて"),
+      // モデル向けの中断記録（developer）は本文にしない。
+      JSON.stringify({ type: "response_item", payload: {
+        type: "message", role: "developer",
+        content: [{ type: "input_text", text: "<turn_aborted>\nThe previous turn was interrupted on purpose.\n</turn_aborted>" }],
+      } }),
+      JSON.stringify({ type: "event_msg", payload: {
+        type: "turn_aborted", root_turn_id: "turn-2", turn_id: "turn-2", reason: "interrupted",
+        started_at: 1792685258, completed_at: 1792685337, duration_ms: 78313,
+      } }),
+      taskLifecycle("task_started", "turn-3"),
+      userMsg("もう一度"),
+      agentMsg("完了しました。"),
+      taskLifecycle("task_complete", "turn-3"),
+    ]);
+    const tailer = new CodexRolloutTailer({ sessionsRoot: root, tailDeadlineMs: 0 });
+    const msgs = await collect(tailer, cwd);
+    const rows = msgs.flatMap((message) =>
+      message.type === "chat_output" && !message.streamId.startsWith("pc:")
+        ? [`${message.role}: ${message.text}`]
+        : []);
+
+    expect(rows).toEqual([
+      "user: 歩行アニメを直して",
+      "assistant: 確認しています。",
+      `system: ❌ Codex エラー: ${capacity}`,
+      "user: 原因を調べて",
+      "system: ⏹️ 中断しました",
+      "user: もう一度",
+      "assistant: 完了しました。",
+    ]);
+  });
+
   test("turn_context は利用中モデルマーカーを変化時だけ流す", async () => {
     const root = makeTempDir("codex-model");
     const cwd = makeTempDir("codex-model-cwd");
