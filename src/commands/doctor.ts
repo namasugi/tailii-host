@@ -145,7 +145,8 @@ export const DOCTOR_QUIC_STATUS_TIMEOUT_MS = 2_000;
  */
 /**
  * `herdr status` の出力から「サーバーの再起動が必要か」を読む（`update:` 節の
- * `restart_needed: yes|no`。0.7.5 / 0.9.3 とも同じ書式）。読めなければ null。
+ * `restart_needed: yes|no`。0.7.5 / 0.9.3 / 0.9.5 とも同じ書式。0.9.4+ が併記する
+ * `server_binary_stale` は互換な旧サーバーでも yes になるので見ない）。読めなければ null。
  */
 export function herdrStatusRestartNeeded(output: string): boolean | null {
   const match = /^\s*restart_needed:\s*(yes|no)\s*$/m.exec(output);

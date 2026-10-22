@@ -2,7 +2,7 @@
 // tailii (TS host) — herdr backend のセッション操作（list / reattach / kill / send / read）。
 // TmuxSessionManager と同じ面（SessionBackend）を herdr CLI（socket API のフロント）で実装する。
 //
-// 実測済みの herdr 0.7.5 挙動（0.9.3 でも CLI 面・JSON 形状は同一。設計正本は docs/herdr-backend.md）:
+// 実測済みの herdr 0.7.5 挙動（0.9.3 / 0.9.5 でも CLI 面・JSON 形状は同一。設計正本は docs/herdr-backend.md）:
 // - 全 pane は専用 named session `tailii` に収容（全コマンドに `--session tailii` 前置）。
 //   起動は `tab create --cwd --env --no-focus`（root_pane.pane_id が新 pane）→ `pane rename`
 //   → `pane run <id> "exec env -u HERDR_ENV /bin/zsh -lc '<cmd>'"`（長いときは一時スクリプト経由）。
