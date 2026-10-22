@@ -10,6 +10,10 @@ import * as path from "node:path";
 import WebSocket, { type RawData } from "ws";
 import { ensureDirectory0700 } from "../shared/paths.js";
 import type { CodexCollaborationMode, CodexGoalInfo, CodexModelInfo } from "../protocol.js";
+import {
+  defaultCodexAppServerProcessControl,
+  type CodexAppServerProcessControl,
+} from "./codexAppServerProcess.js";
 
 const THREAD_TITLE_MODEL = "gpt-5.6-luna";
 const THREAD_TITLE_PROMPT_MAX_LENGTH = 2_000;
@@ -54,6 +58,50 @@ const THREAD_TITLE_CONFIG = {
 
 /** `thread/goal/set` / `clear` の `origin`（Codex 0.161+ の `ThreadGoalMutationOrigin`）。 */
 const GOAL_MUTATION_ORIGIN_USER = "user";
+
+/** `codex --version` の結果を使い回す時間。長寿命の hub でも CLI の更新に追従させる。 */
+const DEFAULT_CLI_VERSION_TTL_MS = 60_000;
+/**
+ * 版ずれ daemon の入れ替えを「使用中」で保留した後、再判定するまでの間。最後の購読者が去った thread は
+ * unload されるまで読み込まれたまま（=使用中）に見える。unload までの時間は codex の版で違い、0.153 以前は
+ * 固定 30 分、0.154〜0.162 は既定 60 秒、0.163.0 から既定 1800 秒（`thread_unload_delay_secs`）。共有 daemon の
+ * 全クライアントに効く設定なので Tailii からは変えない（0.163 の 1800 秒は multi-agent v2 の子の idle
+ * cleanup のため。短くすると turn 前の thread が早く消える）。
+ */
+const STALE_SERVER_BUSY_RECHECK_MS = 30_000;
+/** 入れ替えを試した後（成否問わず）・見送った後に、この process が再判定するまでの間。 */
+const STALE_SERVER_RETRY_MS = 10 * 60_000;
+/**
+ * 同じ組み合わせ（旧版→CLI 版）の入れ替えを試した記録があれば、別 process も含めてこの間は繰り返さない
+ * （見送りの記録は STALE_SERVER_RETRY_MS）。外部の監視が旧版を立て直す環境で止め続けないため。
+ */
+const STALE_SERVER_REPEAT_BACKOFF_MS = 6 * 60 * 60_000;
+/** `ensureRunning` を通った呼び出しを「使用中」とみなす時間（thread/resume が終わるまでを覆う）。 */
+const DAEMON_USE_MARKER_TTL_MS = 30_000;
+/** 旧 daemon に SIGTERM を送ってから SIGKILL へ切り替えるまで。 */
+const DEFAULT_STOP_TIMEOUT_MS = 3_000;
+/** SIGKILL 後に終了を待つ時間。 */
+const KILL_WAIT_MS = 1_000;
+/** 入れ替え直前の再確認までの間。開きかけの会話（thread/resume 中）を拾うため。 */
+const DEFAULT_REPLACE_GRACE_MS = 250;
+/**
+ * startup lock がこれより古ければ、持ち主の pid が生きていても放棄済みとみなす
+ * （pid の再利用・刺さった持ち主）。起動待ち 10 秒 + 停止待ち 4 秒より十分長くする。
+ */
+const STARTUP_LOCK_STALE_MS = 60_000;
+/**
+ * 印・記録・lock の経過時間がこれより負なら、時計が戻ったとみなして古いものとして扱う。ファイルの
+ * 時刻はミリ秒未満まで持つので、作った直後は Date.now との差がわずかに負になる。それは新しい扱いにする。
+ */
+const CLOCK_ROLLBACK_TOLERANCE_MS = 5_000;
+
+type ReplaceRecordResult =
+  | "attempted"
+  | "replaced"
+  | "stop-failed"
+  | "start-failed"
+  | "version-mismatch"
+  | "skipped";
 
 export type CodexAppServerSandbox = "read-only" | "workspace-write" | "danger-full-access";
 export type CodexAppServerApprovalPolicy = "untrusted" | "on-request" | "never";
@@ -818,6 +866,14 @@ export interface CodexAppServerManagerOptions {
   log?: (message: string) => void;
   /** `codex --version` の代替（テスト用）。null は不明。 */
   cliVersion?: () => Promise<string | null>;
+  /** `codex --version` の結果を使い回す時間（テスト用）。 */
+  cliVersionTtlMs?: number;
+  /** 版ずれ daemon の入れ替えで使うプロセス操作（テスト用）。 */
+  processControl?: CodexAppServerProcessControl;
+  /** 旧 daemon に SIGTERM を送ってから SIGKILL へ切り替えるまで（テスト用）。 */
+  stopTimeoutMs?: number;
+  /** 入れ替え直前の再確認までの間（テスト用）。 */
+  replaceGraceMs?: number;
 }
 
 /** thread/list の公開スキーマから一覧表示に必要なフィールドだけを保持する。 */
@@ -857,6 +913,10 @@ export class CodexAppServerManager {
   private readonly startupTimeoutMs: number;
   private readonly titleGenerationTimeoutMs: number;
   private readonly startupLockPath: string;
+  /** `ensureRunning` を通った呼び出しが置く使用の印（1 呼び出し 1 ファイル）。 */
+  private readonly useMarkerDir: string;
+  /** 版ずれ daemon の入れ替えを試した記録（process をまたいで繰り返しを防ぐ）。 */
+  private readonly replaceRecordPath: string;
   /** 最初の turn 前（rollout 未作成）の thread を生存させる作成元購読。openThread が引き継ぐ。 */
   private readonly bootstrapConnections = new Map<string, CodexAppServerConnection>();
   /** thread/start 応答の model。bootstrap 接続を引き継ぐ openThread が購読時のモデルとして返す。 */
@@ -865,12 +925,25 @@ export class CodexAppServerManager {
   private readonly bootstrapThreadEfforts = new Map<string, string | null>();
   private readonly log: ((message: string) => void) | null;
   private readonly readCliVersion: () => Promise<string | null>;
-  private cliVersionPromise: Promise<string | null> | null = null;
+  private readonly cliVersionTtlMs: number;
+  private cliVersionCache: { value: Promise<string | null>; readAt: number } | null = null;
   /** 版ずれは同じ組み合わせにつき 1 回だけログする。 */
   private lastVersionMismatch: string | null = null;
+  private readonly processControl: CodexAppServerProcessControl;
+  /** 版ずれ daemon を入れ替えてよいか（テストが開発機の実物の daemon を止めないための切替）。 */
+  private readonly replaceEnabled: boolean;
+  private readonly stopTimeoutMs: number;
+  private readonly replaceGraceMs: number;
+  /**
+   * 版ずれ daemon の入れ替えを次に判定してよい時刻（保留・失敗・入れ替え直後の連打を防ぐ）。
+   * 組み合わせ（旧版→CLI 版）ごと。CLI が更新されて組み合わせが変われば、すぐ判定する。
+   */
+  private replaceGate: { pair: string; notBefore: number } | null = null;
+  /** 入れ替えの保留・見送りは同じ内容につき 1 回だけログする。 */
+  private lastReplaceNote: string | null = null;
 
   constructor(options: CodexAppServerManagerOptions = {}) {
-    this.codexHome = options.codexHome ?? path.join(os.homedir(), ".codex");
+    this.codexHome = options.codexHome ?? defaultAppServerCodexHome();
     this.codexPath = options.codexPath ?? "codex";
     this.socketPath =
       options.socketPath ?? path.join(this.codexHome, "app-server-control", "app-server-control.sock");
@@ -884,37 +957,76 @@ export class CodexAppServerManager {
     this.titleGenerationTimeoutMs =
       options.titleGenerationTimeoutMs ?? DEFAULT_TITLE_GENERATION_TIMEOUT_MS;
     this.startupLockPath = path.join(path.dirname(this.socketPath), "tailii-start.lock");
+    this.useMarkerDir = path.join(path.dirname(this.socketPath), "tailii-daemon-use");
+    this.replaceRecordPath = path.join(path.dirname(this.socketPath), "tailii-replace.json");
     this.log = options.log ?? null;
     this.readCliVersion = options.cliVersion ?? (() => probeCodexCliVersion(this.codexPath));
+    this.cliVersionTtlMs = options.cliVersionTtlMs ?? DEFAULT_CLI_VERSION_TTL_MS;
+    this.processControl = options.processControl ?? defaultCodexAppServerProcessControl;
+    // 実物のプロセス操作での入れ替えは `TAILII_CODEX_APP_SERVER_REPLACE=off` で止められる
+    // （vitest.config.ts が設定する。テスト用の processControl を渡したときは常に有効）。
+    this.replaceEnabled =
+      options.processControl !== undefined || process.env["TAILII_CODEX_APP_SERVER_REPLACE"] !== "off";
+    this.stopTimeoutMs = options.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
+    this.replaceGraceMs = options.replaceGraceMs ?? DEFAULT_REPLACE_GRACE_MS;
   }
 
   /**
    * initialize 応答の `userAgent`（`<client>/<server 版> (...)`）から daemon の版を読み、
    * `codex --version` と食い違えばログに残す。共有 daemon は detached spawn で生き残るため、
-   * codex 更新後も旧バイナリが App Server を提供し続ける（2026-07-23 実障害）。他クライアントも
-   * 使う daemon を勝手には再起動せず、原因究明の手掛かりとして版ずれを可視化する。
+   * codex 更新後も旧バイナリが App Server を提供し続ける（2026-07-23・2026-10-20 実障害）。
+   * 入れ替えは `ensureRunning` が使用中でないときだけ行う（replaceStaleServerIfIdle）。
    */
   private noteServerVersion(initializeResponse: unknown): void {
     if (this.log === null) return;
     const serverVersion = extractServerVersion(initializeResponse);
     if (serverVersion === null) return;
-    this.cliVersionPromise ??= this.readCliVersion().catch(() => null);
-    void this.cliVersionPromise.then((cliVersion) => {
+    void this.currentCliVersion().then((cliVersion) => {
       if (cliVersion === null || cliVersion === serverVersion) return;
       const key = `${serverVersion}->${cliVersion}`;
       if (this.lastVersionMismatch === key) return;
       this.lastVersionMismatch = key;
       this.log?.(
         `Codex App Server daemon の版 ${serverVersion} が codex CLI ${cliVersion} と一致しない` +
-        "（旧 daemon が残っている可能性。App Server 経由の操作が失敗するなら daemon を kill して再 spawn）",
+        (compareVersions(serverVersion, cliVersion) < 0
+          ? "（使用中でなければ、次の起動確認で今の CLI の daemon へ入れ替える）"
+          : "（daemon の方が新しいので入れ替えない）"),
       );
     });
   }
 
-  /** serverを再利用または排他的に起動し、利用可能になるまで待つ。 */
-  async ensureRunning(): Promise<void> {
-    if (await this.probe()) return;
+  /** `codex --version` の数値版。TTL の間は前回の結果を使う。 */
+  private currentCliVersion(): Promise<string | null> {
+    const now = Date.now();
+    if (this.cliVersionCache === null || now - this.cliVersionCache.readAt >= this.cliVersionTtlMs) {
+      this.cliVersionCache = { value: this.readCliVersion().catch(() => null), readAt: now };
+    }
+    return this.cliVersionCache.value;
+  }
 
+  /**
+   * serverを再利用または排他的に起動し、利用可能になるまで待つ。daemon が codex CLI より古く、
+   * 使用中でなければ、今の CLI の daemon へ入れ替えてから返す。
+   */
+  async ensureRunning(): Promise<void> {
+    // 入れ替える側へ「これから使う」と知らせる印は、lock を確かめる前に置く。入れ替える側は lock を
+    // 取った後に印を読むので、lock を見ずに旧 daemon を使い始めた呼び出しは必ず印で見つかる。
+    const useMarker = this.markDaemonUse();
+    // 別の起動・入れ替えの最中なら、終わるまで待ってから確かめる（入れ替え直前の旧 daemon へ
+    // 繋いで、直後に切られるのを避ける）。待っている間に印が古くならないよう、待った後に付け直す。
+    await this.waitWhileStartupLocked();
+    this.touchDaemonUse(useMarker);
+    const serverVersion = await this.probeServerVersion();
+    if (serverVersion !== undefined) {
+      if (!(await this.replaceStaleServerIfIdle(serverVersion, useMarker))) return;
+      // 旧 daemon を止めた・別の入れ替えを待った。起動していなければ下の通常起動に任せる。
+      if (await this.probe()) return;
+    }
+    await this.launchExclusively();
+  }
+
+  /** startup lock を取って server を起動し、利用可能になるまで待つ。 */
+  private async launchExclusively(): Promise<void> {
     ensureDirectory0700(path.dirname(this.startupLockPath));
     let lockFd: number | null = null;
     try {
@@ -926,37 +1038,323 @@ export class CodexAppServerManager {
 
       // lock取得待ちの間に別processが起動済みかもしれないので再確認する。
       if (await this.probe()) return;
-      await this.launch(
-        this.codexPath,
-        ["app-server", "--listen", this.remoteEndpoint],
-        { ...process.env, CODEX_HOME: this.codexHome },
-      );
+      await this.launchServer();
       if (!(await this.waitUntilReady())) {
         throw new Error("Codex App Server failed to become ready");
       }
     } finally {
-      if (lockFd !== null) {
-        try {
-          fs.closeSync(lockFd);
-        } catch {
-          // 無視。
-        }
-        try {
-          fs.unlinkSync(this.startupLockPath);
-        } catch {
-          // 無視。
-        }
+      this.releaseStartupLock(lockFd);
+    }
+  }
+
+  private async launchServer(): Promise<void> {
+    await this.launch(
+      this.codexPath,
+      ["app-server", "--listen", this.remoteEndpoint],
+      { ...process.env, CODEX_HOME: this.codexHome },
+    );
+  }
+
+  /**
+   * daemon が codex CLI より古ければ、使用中でないときだけ旧 daemon を止めて今の CLI で起動し直す。
+   * 旧 daemon が残ると、モデル一覧（OpenAI は client の版ごとに返す）や App Server の機能が古いまま
+   * 固定される（2026-10-20 実障害: 0.153.4 のまま 44 日）。daemon の方が新しい・同じなら触らない
+   * （process ごとに codex の解決先が違っても版を往復させず、新しい方へ寄せるだけにする）。
+   *
+   * 「使用中」は次のどちらか。
+   * - daemon の `thread/loaded/list` が空でない: remote TUI の接続中・hub の購読中・実行中 turn・
+   *   承認待ち・作成直後の thread はどれも読み込まれている。TUI は長く動いた後の切断を再試行しない
+   *   ため、止めると pane ごと消える。最後の購読者が去った thread も unload まで残るので、入れ替えは
+   *   最後の利用から unload までの時間が過ぎた後になる（STALE_SERVER_BUSY_RECHECK_MS の注記）。
+   * - 自分以外の呼び出しが直前（DAEMON_USE_MARKER_TTL_MS 以内）に `ensureRunning` を通った:
+   *   thread を開いている途中（`thread/resume` が終わるまで一覧に出ない）を止めないため。
+   *
+   * 判定の途中で失敗したら（lock が取れない等）、稼働中の daemon をそのまま使う。記録が書けないだけなら
+   * 入れ替えは続ける（繰り返しの抑止が process ごとの 10 分だけになる）。
+   * 戻り値: true = daemon の状態が変わったかもしれない（呼び出し側が起動を確かめる）。false = そのまま使う。
+   */
+  private async replaceStaleServerIfIdle(
+    serverVersion: string | null,
+    useMarker: string | null,
+  ): Promise<boolean> {
+    if (!this.replaceEnabled || serverVersion === null) return false;
+    const cliVersion = await this.currentCliVersion();
+    if (cliVersion === null || compareVersions(serverVersion, cliVersion) >= 0) return false;
+    const pair = `${serverVersion}->${cliVersion}`;
+    if (this.replaceGate !== null && this.replaceGate.pair === pair && Date.now() < this.replaceGate.notBefore) {
+      return false;
+    }
+    let lockFd: number | null = null;
+    try {
+      ensureDirectory0700(path.dirname(this.startupLockPath));
+      lockFd = this.acquireStartupLock();
+      if (lockFd === null) {
+        // 別の起動・入れ替えの最中。終わるのを待ち、起動しているかは呼び出し側で確かめ直す。
+        await this.waitWhileStartupLocked();
+        this.touchDaemonUse(useMarker);
+        return true;
+      }
+      return await this.replaceStaleServerLocked(cliVersion, useMarker);
+    } catch (error) {
+      this.log?.(`Codex App Server daemon ${pair}: 入れ替えの判定に失敗したので、今の daemon を使う（${String(error)}）`);
+      this.setReplaceGate(pair, STALE_SERVER_RETRY_MS);
+      // 止めた後の起動で失敗した可能性もあるので、呼び出し側に起動を確かめさせる。
+      return true;
+    } finally {
+      this.releaseStartupLock(lockFd);
+    }
+  }
+
+  private setReplaceGate(pair: string, delayMs: number): void {
+    this.replaceGate = { pair, notBefore: Date.now() + delayMs };
+  }
+
+  private async replaceStaleServerLocked(cliVersion: string, useMarker: string | null): Promise<boolean> {
+    const before = await this.inspectServer();
+    // lock を待つ間に止まった（呼び出し側が起動する）・入れ替わった。
+    if (before === null) return true;
+    if (before.serverVersion === null || compareVersions(before.serverVersion, cliVersion) >= 0) return false;
+    const pair = `${before.serverVersion}->${cliVersion}`;
+    const label = `Codex App Server daemon ${before.serverVersion} → codex CLI ${cliVersion}`;
+    // 同じ組み合わせを最近試した（別 process を含む）なら繰り返さない。外部の監視が旧版を立て直す・
+    // 起動し直しても版が揃わない環境で、接続ごとに立つ engine が止め続けないため。
+    const record = readReplaceRecord(this.replaceRecordPath);
+    if (record !== null && record.pair === pair) {
+      const backoffMs = record.result === "skipped" ? STALE_SERVER_RETRY_MS : STALE_SERVER_REPEAT_BACKOFF_MS;
+      const age = Date.now() - record.at;
+      if (isWithin(age, backoffMs)) {
+        this.noteReplace(`${label}: 同じ入れ替えを最近試したので見送る（${record.result}）`);
+        // 記録は毎回読み直す（短い間だけ読まない）。組み合わせが変われば記録に関係なく判定する。
+        this.setReplaceGate(pair, Math.min(backoffMs - age, STALE_SERVER_RETRY_MS));
+        return false;
+      }
+    }
+    if (!this.idleForReplacement(before, useMarker, pair, label)) return false;
+
+    const target = await this.findServerPid();
+    if (typeof target === "string") {
+      this.skipReplacement(pair, `${label}: 入れ替えを見送る（${target}）`);
+      return false;
+    }
+    // 開きかけの会話を拾うため少し置いてから、止める直前にもう一度確かめる。
+    if (this.replaceGraceMs > 0) await sleep(this.replaceGraceMs);
+    const recheck = await this.inspectServer();
+    if (recheck === null) return true;
+    if (recheck.serverVersion !== before.serverVersion) return false;
+    if (!this.idleForReplacement(recheck, useMarker, pair, label)) return false;
+
+    // 止める前に記録する（止めた直後にこの process が落ちても、別 process が同じ入れ替えを繰り返さない）。
+    this.writeReplaceRecord(pair, "attempted");
+    this.setReplaceGate(pair, STALE_SERVER_RETRY_MS);
+    if (!(await this.stopProcess(target.pid)) && (await this.probe())) {
+      this.log?.(`${label}: 旧 daemon（pid ${target.pid}）が止まらないので入れ替えをやめた`);
+      this.writeReplaceRecord(pair, "stop-failed");
+      return false;
+    }
+    if (!(await this.probe())) {
+      await this.launchServer();
+      await this.waitUntilReady();
+    }
+    const after = await this.probeServerVersion();
+    if (after === undefined) {
+      this.log?.(`${label}: 旧 daemon（pid ${target.pid}）を止めたが、新しい daemon が起動しない`);
+      this.writeReplaceRecord(pair, "start-failed");
+    } else if (after !== cliVersion) {
+      this.log?.(`${label}: 入れ替えたが daemon の版が ${after ?? "不明"} のまま`);
+      this.writeReplaceRecord(pair, "version-mismatch");
+    } else {
+      this.lastReplaceNote = null;
+      this.log?.(`${label}: 使用中でないので旧 daemon（pid ${target.pid}）を入れ替えた`);
+      this.writeReplaceRecord(pair, "replaced");
+    }
+    return true;
+  }
+
+  /** 使用中でなければ true。保留・判定不能はログして再判定の時刻を決める。 */
+  private idleForReplacement(
+    state: { loadedThreadIds: string[] | null },
+    useMarker: string | null,
+    pair: string,
+    label: string,
+  ): boolean {
+    if (state.loadedThreadIds === null) {
+      this.skipReplacement(pair, `${label}: 読み込み中の会話を確かめられないので入れ替えを見送る`);
+      return false;
+    }
+    const recentUse = this.recentDaemonUseByOthers(useMarker);
+    const reasons = [
+      ...(state.loadedThreadIds.length > 0 ? ["読み込み中の会話がある"] : []),
+      ...(recentUse === true ? ["直前に別の処理が使い始めた"] : []),
+      ...(recentUse === null ? ["使用の印を確かめられない"] : []),
+    ];
+    if (reasons.length === 0) return true;
+    this.noteReplace(`${label}: ${reasons.join("・")}ので入れ替えを保留する`);
+    this.setReplaceGate(pair, STALE_SERVER_BUSY_RECHECK_MS);
+    return false;
+  }
+
+  /** 入れ替えを見送り、別 process も含めてしばらく同じ判定を繰り返さない。 */
+  private skipReplacement(pair: string, message: string): void {
+    this.noteReplace(message);
+    this.writeReplaceRecord(pair, "skipped");
+    this.setReplaceGate(pair, STALE_SERVER_RETRY_MS);
+  }
+
+  private noteReplace(message: string): void {
+    if (this.lastReplaceNote === message) return;
+    this.lastReplaceNote = message;
+    this.log?.(message);
+  }
+
+  /** 入れ替えの記録（startup lock の下で読み書きする）。書けなくても入れ替えは続ける。 */
+  private writeReplaceRecord(pair: string, result: ReplaceRecordResult): void {
+    try {
+      fs.writeFileSync(
+        this.replaceRecordPath,
+        JSON.stringify({ pair, result, at: Date.now(), pid: process.pid }),
+        { mode: 0o600 },
+      );
+    } catch {
+      // 記録が無い間は process ごとの再判定時刻だけが効く。
+    }
+  }
+
+  /** これから daemon を使う印を置き、その名前を返す。古い印は掃除する。置けなくても使用は妨げない。 */
+  private markDaemonUse(): string | null {
+    const name = `${process.pid}-${randomUUID()}`;
+    try {
+      ensureDirectory0700(this.useMarkerDir);
+      fs.writeFileSync(path.join(this.useMarkerDir, name), "", { mode: 0o600 });
+    } catch {
+      return null;
+    }
+    this.recentDaemonUseByOthers(name);
+    return name;
+  }
+
+  /**
+   * 自分以外の新しい使用の印（DAEMON_USE_MARKER_TTL_MS 以内）があれば true。古い印はついでに消す。
+   * 印の置き場を読めなければ null（使用中かもしれない側へ倒す）。
+   */
+  private recentDaemonUseByOthers(ownMarker: string | null): boolean | null {
+    let names: string[];
+    try {
+      names = fs.readdirSync(this.useMarkerDir);
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ENOENT" ? false : null;
+    }
+    const now = Date.now();
+    let recent = false;
+    for (const name of names) {
+      if (name === ownMarker) continue;
+      const markerPath = path.join(this.useMarkerDir, name);
+      try {
+        const age = now - fs.statSync(markerPath).mtimeMs;
+        if (isWithin(age, DAEMON_USE_MARKER_TTL_MS)) recent = true;
+        else fs.unlinkSync(markerPath);
+      } catch {
+        // 別の process が先に消した。
+      }
+    }
+    return recent;
+  }
+
+  /** 使用の印の時刻を今に付け直す（lock を待った後。消えていれば置き直す）。 */
+  private touchDaemonUse(useMarker: string | null): void {
+    if (useMarker === null) return;
+    const markerPath = path.join(this.useMarkerDir, useMarker);
+    try {
+      // 鮮度の判定（recentDaemonUseByOthers）と同じ Date.now の時計で付ける。
+      const now = Date.now() / 1000;
+      fs.utimesSync(markerPath, now, now);
+    } catch {
+      try {
+        fs.writeFileSync(markerPath, "", { mode: 0o600 });
+      } catch {
+        // 置けなくても使用は妨げない。
       }
     }
   }
 
+  /** 稼働中なら版と読み込み中の thread（取れなければ null）。停止中なら null。 */
+  private async inspectServer(): Promise<
+    { serverVersion: string | null; loadedThreadIds: string[] | null } | null
+  > {
+    const connected = await this.connectWithServerVersion();
+    if (connected === null) return null;
+    try {
+      return {
+        serverVersion: connected.serverVersion,
+        loadedThreadIds: await listLoadedThreadIds(connected.connection),
+      };
+    } finally {
+      connected.connection.close();
+    }
+  }
+
+  /**
+   * socket を開いている daemon の pid。Tailii 自身が起動する形（isOwnLaunchCommand）のプロセスが
+   * 1 つだけのとき。codex 自身が管理する daemon（`~/.codex/packages/app-server-daemon/`）には
+   * 触らない。違えば見送りの理由を返す。
+   */
+  private async findServerPid(): Promise<{ pid: number } | string> {
+    const pids = await this.processControl.findSocketPids(this.socketPath);
+    if (pids === null) return "socket を開いているプロセスを調べられない";
+    const servers: number[] = [];
+    for (const pid of pids) {
+      if (pid === process.pid) continue;
+      const command = await this.processControl.readCommand(pid);
+      if (command === null) continue;
+      if (command.includes("/packages/app-server-daemon/")) return "codex が管理する daemon";
+      if (this.isOwnLaunchCommand(command)) servers.push(pid);
+    }
+    const [pid] = servers;
+    if (servers.length !== 1 || pid === undefined) {
+      return servers.length === 0 ? "daemon のプロセスが見つからない" : `daemon の候補が ${servers.length} 件ある`;
+    }
+    return { pid };
+  }
+
+  /** `launchServer` が起動する形のコマンドラインか（実行ファイルは codexPath か名前が codex）。 */
+  private isOwnLaunchCommand(command: string): boolean {
+    const suffix = ` app-server --listen ${this.remoteEndpoint}`;
+    if (!command.endsWith(suffix)) return false;
+    const executable = command.slice(0, -suffix.length);
+    return executable === this.codexPath || path.basename(executable) === "codex";
+  }
+
+  /** SIGTERM → 待つ → まだ居れば SIGKILL → 待つ。止まったら true。 */
+  private async stopProcess(pid: number): Promise<boolean> {
+    if (!this.processControl.signal(pid, "SIGTERM")) return !this.processControl.isAlive(pid);
+    if (await this.waitForExit(pid, this.stopTimeoutMs)) return true;
+    this.processControl.signal(pid, "SIGKILL");
+    return this.waitForExit(pid, KILL_WAIT_MS);
+  }
+
+  private async waitForExit(pid: number, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.processControl.isAlive(pid)) {
+      if (Date.now() > deadline) return false;
+      await sleep(this.pollIntervalMs);
+    }
+    return true;
+  }
+
   /** 稼働中の server にだけ接続する。停止中・不達時は起動せず null を返す。 */
   async connectIfRunning(requestTimeoutMs = 2_000): Promise<CodexAppServerConnection | null> {
+    return (await this.connectWithServerVersion(requestTimeoutMs))?.connection ?? null;
+  }
+
+  /** 稼働中の server に接続して initialize し、server の版（不明は null）と一緒に返す。停止中は null。 */
+  private async connectWithServerVersion(
+    requestTimeoutMs = 2_000,
+  ): Promise<{ connection: CodexAppServerConnection; serverVersion: string | null } | null> {
     let connection: CodexAppServerConnection | null = null;
     try {
       connection = await this.connect(this.socketPath, requestTimeoutMs);
-      this.noteServerVersion(await connection.initialize());
-      return connection;
+      const initializeResponse = await connection.initialize();
+      this.noteServerVersion(initializeResponse);
+      return { connection, serverVersion: extractServerVersion(initializeResponse) };
     } catch {
       connection?.close();
       return null;
@@ -1404,6 +1802,14 @@ export class CodexAppServerManager {
     return true;
   }
 
+  /** 稼働中なら server の版（不明は null）、停止中なら undefined。 */
+  private async probeServerVersion(): Promise<string | null | undefined> {
+    const connected = await this.connectWithServerVersion();
+    if (connected === null) return undefined;
+    connected.connection.close();
+    return connected.serverVersion;
+  }
+
   private async remoteControlRequest<T>(
     method: string,
     params: Record<string, unknown>,
@@ -1432,7 +1838,10 @@ export class CodexAppServerManager {
     return false;
   }
 
-  /** lockが他の生存processに所有されていればnull。死んだownerのlockは1回だけ回収する。 */
+  /**
+   * lockが他の生存processに所有されていればnull。死んだowner・古すぎる（STARTUP_LOCK_STALE_MS 超）
+   * lockは1回だけ回収する。
+   */
   private acquireStartupLock(): number | null {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
@@ -1441,8 +1850,7 @@ export class CodexAppServerManager {
         return fd;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        const ownerPid = readLockPid(this.startupLockPath);
-        if (ownerPid !== null && processIsAlive(ownerPid)) return null;
+        if (startupLockIsHeld(readStartupLock(this.startupLockPath))) return null;
         try {
           fs.unlinkSync(this.startupLockPath);
         } catch {
@@ -1451,6 +1859,35 @@ export class CodexAppServerManager {
       }
     }
     return null;
+  }
+
+  private releaseStartupLock(lockFd: number | null): void {
+    if (lockFd === null) return;
+    try {
+      // 古い lock として別 process に回収された後なら、今のファイルはその持ち主のもの。消さない。
+      const held = fs.fstatSync(lockFd);
+      const current = fs.statSync(this.startupLockPath);
+      if (held.ino === current.ino && held.dev === current.dev) fs.unlinkSync(this.startupLockPath);
+    } catch {
+      // 既に無い・読めない。
+    }
+    try {
+      fs.closeSync(lockFd);
+    } catch {
+      // 無視。
+    }
+  }
+
+  /**
+   * 生きた process が持つ新しい startup lock（起動・入れ替えの最中）が外れるまで待つ。同じ process の
+   * 別の呼び出しが持つ lock も待つ（lock を持つ処理自身は ensureRunning を呼ばないので詰まらない）。
+   */
+  private async waitWhileStartupLocked(): Promise<void> {
+    const deadline = Date.now() + STARTUP_LOCK_STALE_MS;
+    while (startupLockIsHeld(readStartupLock(this.startupLockPath))) {
+      if (Date.now() > deadline) return;
+      await sleep(this.pollIntervalMs);
+    }
   }
 }
 
@@ -2308,12 +2745,123 @@ function codexTimestampMs(value: unknown): number | undefined {
   return Math.floor(value < 10_000_000_000 ? value * 1_000 : value);
 }
 
-function readLockPid(lockPath: string): number | null {
+interface StartupLockInfo {
+  /** 持ち主の pid。書き込み途中・壊れた lock は null。 */
+  pid: number | null;
+  /** lock の作成時刻（記録が無ければファイルの更新時刻）。 */
+  createdAt: number;
+}
+
+/** startup lock の中身。lock が無ければ null。 */
+function readStartupLock(lockPath: string): StartupLockInfo | null {
+  let mtimeMs: number;
+  try {
+    mtimeMs = fs.statSync(lockPath).mtimeMs;
+  } catch {
+    return null;
+  }
   try {
     const parsed = JSON.parse(fs.readFileSync(lockPath, "utf8")) as unknown;
+    const record = typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : {};
+    const pid = record["pid"];
+    const createdAt = record["createdAt"];
+    return {
+      pid: typeof pid === "number" && Number.isSafeInteger(pid) && pid > 0 ? pid : null,
+      createdAt: typeof createdAt === "number" && Number.isFinite(createdAt) ? createdAt : mtimeMs,
+    };
+  } catch {
+    // 作成直後で pid がまだ書かれていない・壊れている。新しい間は持ち主がいるものとして扱う。
+    return { pid: null, createdAt: mtimeMs };
+  }
+}
+
+/**
+ * lock が新しく、持ち主が生きている（pid 未記入の作成直後を含む）なら true。時計が戻って
+ * 未来の時刻になった lock は古い lock として扱う。
+ */
+function startupLockIsHeld(lock: StartupLockInfo | null): boolean {
+  if (lock === null) return false;
+  if (!isWithin(Date.now() - lock.createdAt, STARTUP_LOCK_STALE_MS)) return false;
+  return lock.pid === null || processIsAlive(lock.pid);
+}
+
+/** 経過時間 age が ttl 未満の「新しい」範囲か（時計が戻った分の負は古い扱い。CLOCK_ROLLBACK_TOLERANCE_MS）。 */
+function isWithin(age: number, ttl: number): boolean {
+  return age >= -CLOCK_ROLLBACK_TOLERANCE_MS && age < ttl;
+}
+
+/**
+ * `CodexAppServerManager` の既定の CODEX_HOME。`TAILII_CODEX_APP_SERVER_HOME` で差し替え可
+ * （テストの隔離用。開発機の実物の daemon・~/.codex に触れないため）。
+ */
+function defaultAppServerCodexHome(): string {
+  const override = process.env["TAILII_CODEX_APP_SERVER_HOME"];
+  if (override !== undefined && override.length > 0) return override;
+  return path.join(os.homedir(), ".codex");
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+/** 数値の版（`0.163.0`）を部分ごとに比べる。a が古ければ負、同じなら 0、新しければ正。 */
+export function compareVersions(a: string, b: string): number {
+  const left = a.split(".").map((part) => Number.parseInt(part, 10) || 0);
+  const right = b.split(".").map((part) => Number.parseInt(part, 10) || 0);
+  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+    const difference = (left[index] ?? 0) - (right[index] ?? 0);
+    if (difference !== 0) return difference;
+  }
+  return 0;
+}
+
+interface ReplaceRecord {
+  pair: string;
+  result: string;
+  at: number;
+}
+
+function readReplaceRecord(recordPath: string): ReplaceRecord | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(recordPath, "utf8")) as unknown;
     if (typeof parsed !== "object" || parsed === null) return null;
-    const pid = (parsed as Record<string, unknown>)["pid"];
-    return typeof pid === "number" && Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+    const record = parsed as Record<string, unknown>;
+    const pair = record["pair"];
+    const result = record["result"];
+    const at = record["at"];
+    if (typeof pair !== "string" || typeof result !== "string" || typeof at !== "number" || !Number.isFinite(at)) {
+      return null;
+    }
+    return { pair, result, at };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * daemon がメモリに読み込んでいる thread（購読中・実行中・購読者が去って unload 待ち）。
+ * `thread/loaded/list` は 0.145.0〜0.163.0 のバイナリで確認（サポート下限 0.144.5 は未確認）。
+ * 取れない・形が違うなら null（入れ替えの判定では「使用中かもしれない」側へ倒す）。
+ */
+async function listLoadedThreadIds(connection: CodexAppServerConnection): Promise<string[] | null> {
+  const ids: string[] = [];
+  const seenCursors = new Set<string>();
+  let cursor: string | null = null;
+  try {
+    for (let page = 0; page < 100; page += 1) {
+      const response = objectRecord(
+        await connection.request("thread/loaded/list", cursor !== null ? { cursor } : {}),
+      );
+      const data = response?.["data"];
+      if (!Array.isArray(data) || !data.every((id): id is string => typeof id === "string")) return null;
+      ids.push(...data);
+      const next = response?.["nextCursor"];
+      if (next === null || next === undefined) return ids;
+      if (typeof next !== "string" || seenCursors.has(next)) return null;
+      seenCursors.add(next);
+      cursor = next;
+    }
+    return null;
   } catch {
     return null;
   }
