@@ -11,7 +11,8 @@
 // メッセージ（event_msg/user_message の message）から導出する（codex アプリのスレッドタイトルと
 // 同じ源。session_index は生成が遅延/欠落することがあり、id 先頭 8 字だとアプリと食い違うため）。
 // どちらも取れなければ id 先頭 8 字へフォールバックする。cwd は rollout 側にのみ在る。
-// 更新時刻は session_index の updated_at（無ければ rollout ファイル mtime）を Unix 秒で用いる。
+// 更新時刻は rollout ファイルの mtime（Codex App Server の updatedAt と同じ値。取れなければ session_index の
+// updated_at）を Unix 秒で用いる。
 
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -20,7 +21,6 @@ import type { ClaudeSessionInfo } from "../protocol.js";
 import { isInsideBase } from "../shared/paths.js";
 import { noteReadFailure, readFailureCount } from "../shared/readFailures.js";
 import type { ListMemoFile } from "../sessions/listMemoFile.js";
-import type { CodexAppServerManager, CodexAppServerThreadInfo } from "./codexAppServer.js";
 import { isVisibleCodexMessagePhase } from "./codexMessagePhase.js";
 
 /** session_meta 先頭行を読む最大バイト数（先頭 1 行のみ使用。base_instructions を含み得るため広め）。 */
@@ -60,6 +60,8 @@ interface RolloutMemo {
   meta?: ReturnType<typeof readSessionMeta>;
   firstUserMessage?: string | null;
   lastMessage?: string | null;
+  /** ユーザーの発話行が 1 行でもあるか（無い会話は App Server の一覧にも出ない）。 */
+  hasUserTurn?: boolean;
 }
 
 /** 保存ファイルから読んだ値がメモとして使えるか（壊れた・古い形の値は読み直させる）。 */
@@ -70,6 +72,7 @@ function isRolloutMemo(value: unknown): value is RolloutMemo {
   const isOptionalText = (field: unknown): boolean =>
     field === undefined || field === null || typeof field === "string";
   if (!isOptionalText(memo["firstUserMessage"]) || !isOptionalText(memo["lastMessage"])) return false;
+  if (memo["hasUserTurn"] !== undefined && typeof memo["hasUserTurn"] !== "boolean") return false;
   const meta = memo["meta"];
   if (meta === undefined || meta === null) return true;
   if (typeof meta !== "object") return false;
@@ -78,13 +81,6 @@ function isRolloutMemo(value: unknown): value is RolloutMemo {
     && (fields["cwd"] === null || typeof fields["cwd"] === "string")
     && (fields["timestamp"] === null || typeof fields["timestamp"] === "string")
     && typeof fields["isBackgroundSession"] === "boolean";
-}
-
-interface RolloutEntry {
-  file: RolloutFile;
-  path: string;
-  cwd: string | null;
-  isBackgroundSession: boolean;
 }
 
 /** codex のマシン内会話一覧を導出する値型サービス（agent-tag）。 */
@@ -135,6 +131,9 @@ export class CodexSessionStore {
       if (result.length >= this.maxSessions) break;
       const meta = this.sessionMeta(file);
       if (meta === null || meta.cwd === null || meta.isBackgroundSession) continue;
+      // ユーザーの発話が 1 つも無い会話（開いてすぐ閉じた・起動に失敗した等）は出さない。App Server の
+      // thread/list もこれらを返さない（2026-10-23 実測: 337 件すべてでこの判定と一致）。
+      if (!this.hasUserTurn(file)) continue;
       const sessionId = meta.id ?? path.basename(file.path);
       if (seen.has(sessionId)) continue;
       seen.add(sessionId);
@@ -143,8 +142,11 @@ export class CodexSessionStore {
       // thread_name が無ければ最初の実ユーザー発話からタイトルを作る（codex アプリ準拠）。
       // それも取れなければ id 先頭 8 字。index にある会話は毎回のファイル走査を避けて thread_name を使う。
       const title = idx?.title ?? this.firstUserMessage(file) ?? sessionId.slice(0, 8);
+      // 更新時刻は rollout の mtime（Codex App Server の thread/list が返す updatedAt と同じ値。
+      // 2026-10-23 実測で上位 200 件すべて一致）。session_index の updated_at は名前を付けた時点の
+      // 値で古く、App Server 経由の一覧と並びが食い違っていた（取得のたびに入れ替わって見えた）。
       const updatedAt =
-        idx?.updatedAt ?? (file.mtimeMs > 0 ? Math.floor(file.mtimeMs / 1000) : undefined);
+        file.mtimeMs > 0 ? Math.floor(file.mtimeMs / 1000) : idx?.updatedAt ?? undefined;
 
       const info: ClaudeSessionInfo = {
         sessionId,
@@ -167,75 +169,6 @@ export class CodexSessionStore {
       if (l !== r) return r - l;
       return lhs.sessionId < rhs.sessionId ? -1 : lhs.sessionId > rhs.sessionId ? 1 : 0;
     });
-  }
-
-  /**
-   * 稼働中の App Server を権威に一覧を返す。不達・停止中・不正応答は rollout 一覧へ完全に戻す。
-   * この経路は App Server を起動しない。
-   */
-  async listWithAppServer(
-    appServer: Pick<CodexAppServerManager, "listThreads">,
-    baseDir?: string,
-  ): Promise<ClaudeSessionInfo[]> {
-    try {
-      const threads = await appServer.listThreads(this.maxSessions);
-      if (threads === null) return this.list(baseDir);
-      return this.mapAppServerThreads(threads, baseDir);
-    } catch {
-      return this.list(baseDir);
-    }
-  }
-
-  private mapAppServerThreads(
-    threads: readonly CodexAppServerThreadInfo[],
-    baseDir?: string,
-  ): ClaudeSessionInfo[] {
-    const rollouts = this.rolloutsById();
-    const result: ClaudeSessionInfo[] = [];
-    const seen = new Set<string>();
-    for (const thread of threads) {
-      if (result.length >= this.maxSessions) break;
-      if (seen.has(thread.id) || isBackgroundThread(thread)) continue;
-      seen.add(thread.id);
-
-      const rollout = rollouts.get(thread.id);
-      if (rollout?.isBackgroundSession === true) continue;
-      const cwd = thread.cwd ?? rollout?.cwd ?? null;
-      if (cwd === null || (baseDir !== undefined && !isInsideBase(cwd, baseDir))) continue;
-      const fallbackTitle = rollout === undefined ? null : this.firstUserMessage(rollout.file);
-      const rawTitle = nonEmptyString(thread.name) ?? nonEmptyString(thread.preview);
-      const info: ClaudeSessionInfo = {
-        sessionId: thread.id,
-        cwd,
-        title: rawTitle === null ? (fallbackTitle ?? thread.id.slice(0, 8)) : normalizeTitle(rawTitle),
-        updatedAt: Math.floor(thread.updatedAt),
-        agent: "codex",
-        hasProviderTitle: nonEmptyString(thread.name) !== null,
-      };
-      if (rollout !== undefined) {
-        const lastMessage = this.lastMessage(rollout.file);
-        if (lastMessage !== null) info.lastMessage = lastMessage;
-      }
-      result.push(info);
-    }
-    this.flushMemoFile();
-    return result.sort(compareSessions);
-  }
-
-  private rolloutsById(): Map<string, RolloutEntry> {
-    const result = new Map<string, RolloutEntry>();
-    const files = this.listRollouts().sort((a, b) => b.mtimeMs - a.mtimeMs);
-    for (const file of files) {
-      const meta = this.sessionMeta(file);
-      if (meta?.id === null || meta === null || result.has(meta.id)) continue;
-      result.set(meta.id, {
-        file,
-        path: file.path,
-        cwd: meta.cwd,
-        isBackgroundSession: meta.isBackgroundSession,
-      });
-    }
-    return result;
   }
 
   /** `session_index.jsonl` を id → { title, updatedAt(秒) } に読む（無ければ空マップ）。 */
@@ -334,6 +267,9 @@ export class CodexSessionStore {
     const hit = this.rolloutMemo.get(file.path);
     if (hit !== undefined && hit.mtimeMs === file.mtimeMs && hit.size === file.size) return hit;
     const memo: RolloutMemo = { mtimeMs: file.mtimeMs, size: file.size };
+    // rollout は追記だけなので、伸びただけのファイルで一度見つけた発話は消えない（処理中の会話を
+    // 一覧のたびに頭から読み直さない）。
+    if (hit?.hasUserTurn === true && file.size >= hit.size) memo.hasUserTurn = true;
     if (file.size >= 0) {
       this.rolloutMemo.set(file.path, memo);
       this.memoDirty = true;
@@ -353,6 +289,13 @@ export class CodexSessionStore {
     return this.remember(memo, "firstUserMessage", () => readFirstUserMessage(file.path));
   }
 
+  private hasUserTurn(file: RolloutFile): boolean {
+    const memo = this.memoFor(file);
+    if (memo.hasUserTurn !== undefined) return memo.hasUserTurn;
+    // 読めなかったときは隠さない（remember は失敗結果を覚えない）。
+    return this.remember(memo, "hasUserTurn", () => readHasUserTurn(file.path)) ?? true;
+  }
+
   private lastMessage(file: RolloutFile): string | null {
     const memo = this.memoFor(file);
     if (memo.lastMessage !== undefined) return memo.lastMessage;
@@ -360,7 +303,7 @@ export class CodexSessionStore {
   }
 
   /** 読み取り結果をメモへ入れる。I/O エラーで失敗した劣化結果は覚えない（直ったら次の一覧で読み直す）。 */
-  private remember<K extends "meta" | "firstUserMessage" | "lastMessage">(
+  private remember<K extends "meta" | "firstUserMessage" | "lastMessage" | "hasUserTurn">(
     memo: RolloutMemo,
     key: K,
     read: () => NonNullable<RolloutMemo[K]> | null,
@@ -373,6 +316,70 @@ export class CodexSessionStore {
     }
     return value;
   }
+}
+
+/** ユーザーの発話行を探す範囲の上限（先頭の session_meta は数百 KB になり得る）。 */
+const USER_TURN_SCAN_LIMIT_BYTES = 4 * 1024 * 1024;
+const USER_TURN_SCAN_CHUNK_BYTES = 64 * 1024;
+
+/**
+ * rollout にユーザーの発話行（旧形式 `event_msg/user_message`・`response_item` の user メッセージ・
+ * 新形式 `item_completed` の `UserMessage`）が 1 行でもあるか。題名用の最初の発話（注入行を読み飛ばす）
+ * とは別で、形式を問わず発話の有無だけを見る。上限まで見つからなければ false。読めなければ null。
+ */
+function readHasUserTurn(rolloutPath: string): boolean | null {
+  let fd: number;
+  try {
+    fd = fs.openSync(rolloutPath, "r");
+  } catch (error) {
+    noteReadFailure(error);
+    return null;
+  }
+  try {
+    const chunk = Buffer.alloc(USER_TURN_SCAN_CHUNK_BYTES);
+    let pending = Buffer.alloc(0);
+    let offset = 0;
+    while (offset < USER_TURN_SCAN_LIMIT_BYTES) {
+      const bytesRead = fs.readSync(fd, chunk, 0, chunk.length, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+      pending = Buffer.concat([pending, chunk.subarray(0, bytesRead)]);
+      let nl: number;
+      while ((nl = pending.indexOf(0x0a)) >= 0) {
+        if (isUserTurnLine(pending.subarray(0, nl))) return true;
+        pending = pending.subarray(nl + 1);
+      }
+    }
+    return pending.length > 0 && isUserTurnLine(pending);
+  } catch (error) {
+    noteReadFailure(error);
+    return null;
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      // 閉じられなくても判定結果は使える（一覧全体を例外にしない）。
+    }
+  }
+}
+
+function isUserTurnLine(line: Buffer): boolean {
+  // 安い前判定（"user" を含まない行は JSON を解かない）。
+  if (line.indexOf("user") < 0 && line.indexOf("User") < 0) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line.toString("utf8"));
+  } catch {
+    return false;
+  }
+  const record = asRecord(parsed);
+  const payload = asRecord(record?.["payload"]);
+  if (record === null || payload === null) return false;
+  if (record["type"] === "event_msg") {
+    if (payload["type"] === "user_message") return true;
+    return payload["type"] === "item_completed" && asRecord(payload["item"])?.["type"] === "UserMessage";
+  }
+  return record["type"] === "response_item" && payload["type"] === "message" && payload["role"] === "user";
 }
 
 /** rollout の先頭 `session_meta` 行から会話メタデータを読む。読めなければ null。 */
@@ -489,22 +496,6 @@ function readFirstUserMessage(rolloutPath: string): string | null {
 /** タイトルを 1 行・先頭 ~60 字へ整形する。 */
 function normalizeTitle(raw: string): string {
   return normalizeSnippet(raw, TITLE_MAX_LENGTH);
-}
-
-function nonEmptyString(value: string | null): string | null {
-  return value !== null && value.trim().length > 0 ? value : null;
-}
-
-function isBackgroundThread(thread: CodexAppServerThreadInfo): boolean {
-  if (thread.parentThreadId !== null || thread.source === "exec" || thread.source === "subagent") return true;
-  return typeof thread.source === "object" && thread.source !== null && "subAgent" in thread.source;
-}
-
-function compareSessions(lhs: ClaudeSessionInfo, rhs: ClaudeSessionInfo): number {
-  const l = lhs.updatedAt ?? Number.MIN_SAFE_INTEGER;
-  const r = rhs.updatedAt ?? Number.MIN_SAFE_INTEGER;
-  if (l !== r) return r - l;
-  return lhs.sessionId < rhs.sessionId ? -1 : lhs.sessionId > rhs.sessionId ? 1 : 0;
 }
 
 /** 1 行・先頭 maxLength 字へ整形する。 */

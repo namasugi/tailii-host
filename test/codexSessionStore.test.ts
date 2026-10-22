@@ -26,22 +26,24 @@ function writeRollout(
     payload: { id, cwd, cli_version: "0.142.5", ...(source === undefined ? {} : { source }) },
   });
   let content = meta + "\n";
+  // codex アプリと同じく、注入込みの環境コンテキスト行（user ロール）を先に置く。発話の無い会話は
+  // 一覧に出ないので、どの会話もこの行は持つ（素の user_message は userMessage 指定時だけ。タイトル
+  // 導出が注入行ではなく user_message を拾うことを検証する）。
+  const envUser = JSON.stringify({
+    type: "response_item",
+    payload: {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "<environment_context>...</environment_context>" }],
+    },
+  });
+  content += envUser + "\n";
   if (userMessage !== undefined) {
-    // codex アプリと同じく、注入込みの環境コンテキスト行を先に置いてから素の user_message を続ける
-    // （タイトル導出が注入行ではなく user_message を拾うことを検証する）。
-    const envUser = JSON.stringify({
-      type: "response_item",
-      payload: {
-        type: "message",
-        role: "user",
-        content: [{ type: "input_text", text: "<environment_context>...</environment_context>" }],
-      },
-    });
     const um = JSON.stringify({
       type: "event_msg",
       payload: { type: "user_message", message: userMessage, images: [] },
     });
-    content += envUser + "\n" + um + "\n";
+    content += um + "\n";
   }
   fs.writeFileSync(p, content);
   if (mtime) fs.utimesSync(p, mtime, mtime);
@@ -57,7 +59,8 @@ function writeIndex(home: string, entries: { id: string; thread_name?: string; u
 describe("CodexSessionStore.list", () => {
   test("rollout と session_index を id で結合し agent=codex で返す", () => {
     const home = makeTempDir("codex-store");
-    writeRollout(home, "2026/07/06", "rollout-a.jsonl", "id-aaaaaaaa", "/work/a");
+    const mtime = new Date("2026-07-06T15:00:00.000Z");
+    writeRollout(home, "2026/07/06", "rollout-a.jsonl", "id-aaaaaaaa", "/work/a", mtime);
     writeIndex(home, [
       { id: "id-aaaaaaaa", thread_name: "会話タイトルA", updated_at: "2026-07-06T12:00:00.000Z" },
     ]);
@@ -70,8 +73,8 @@ describe("CodexSessionStore.list", () => {
       title: "会話タイトルA",
       agent: "codex",
     });
-    // updated_at(ISO) → Unix 秒。
-    expect(list[0]?.updatedAt).toBe(Math.floor(Date.parse("2026-07-06T12:00:00.000Z") / 1000));
+    // 更新時刻は rollout の mtime（App Server の updatedAt と同じ）。索引の updated_at（名前を付けた時点）は使わない。
+    expect(list[0]?.updatedAt).toBe(Math.floor(mtime.getTime() / 1000));
   });
 
   test("索引に無い会話はタイトルを id 先頭 8 字・更新時刻をファイル mtime にフォールバックする", () => {
@@ -124,17 +127,60 @@ describe("CodexSessionStore.list", () => {
     expect(list[0]?.title).toBe("索引タイトル");
   });
 
-  test("updatedAt 降順で整列する", () => {
+  test("ユーザーの発話行が 1 行も無い会話は出さない（App Server の一覧と同じ）", () => {
+    const home = makeTempDir("codex-store-no-user-turn");
+    writeRollout(home, "2026/07/08", "rollout-real.jsonl", "id-real", "/work/real", undefined, "依頼");
+    // 開いてすぐ閉じた会話: session_meta と developer の指示・中断だけ（索引に名前があっても出さない）。
+    const dir = path.join(home, "sessions", "2026/07/08");
+    fs.writeFileSync(path.join(dir, "rollout-empty.jsonl"), [
+      { timestamp: "2026-07-08T00:00:00.000Z", type: "session_meta", payload: { id: "id-empty", cwd: "/work/empty", source: "vscode" } },
+      { type: "event_msg", payload: { type: "task_started" } },
+      { type: "response_item", payload: { type: "message", role: "developer", content: [{ type: "input_text", text: "指示" }] } },
+      { type: "event_msg", payload: { type: "turn_aborted" } },
+    ].map((line) => JSON.stringify(line)).join("\n") + "\n");
+    // 新形式（item_completed の UserMessage）だけの会話は出す。
+    fs.writeFileSync(path.join(dir, "rollout-modern.jsonl"), [
+      { timestamp: "2026-07-08T00:00:00.000Z", type: "session_meta", payload: { id: "id-modern", cwd: "/work/modern", source: "vscode" } },
+      { type: "event_msg", payload: { type: "item_completed", item: { type: "UserMessage", content: [{ type: "text", text: "新形式" }] } } },
+    ].map((line) => JSON.stringify(line)).join("\n") + "\n");
+    writeIndex(home, [{ id: "id-empty", thread_name: "差分レビュー", updated_at: "2026-07-08T00:00:00.000Z" }]);
+
+    const ids = new CodexSessionStore(home).list().map((session) => session.sessionId).sort();
+    expect(ids).toEqual(["id-modern", "id-real"]);
+  });
+
+  test("発話行の判定は読み取りの区切りをまたぐ行・巨大な先頭行・末尾の改行なしでも見つける", () => {
+    const home = makeTempDir("codex-store-user-turn-chunks");
+    const dir = path.join(home, "sessions", "2026/07/09");
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, "rollout-big.jsonl");
+    // 300KB の session_meta（base_instructions）の後に発話行。64KB 区切りを何度もまたぐ。
+    fs.writeFileSync(file, [
+      { timestamp: "2026-07-09T00:00:00.000Z", type: "session_meta",
+        payload: { id: "id-big", cwd: "/work/big", source: "vscode", base_instructions: "x".repeat(300 * 1024) } },
+      { type: "event_msg", payload: { type: "user_message", message: "依頼", images: [] } },
+    ].map((line) => JSON.stringify(line)).join("\n"));   // 末尾に改行が無い行も判定する
+    const store = new CodexSessionStore(home);
+    expect(store.list().map((session) => session.sessionId)).toEqual(["id-big"]);
+
+    // 追記で伸びても一覧に残る（一度見つけた発話はメモから引き継ぐ）。
+    fs.appendFileSync(file, "\n" + JSON.stringify({ type: "event_msg", payload: { type: "agent_message", message: "返答" } }) + "\n");
+    expect(store.list().map((session) => session.sessionId)).toEqual(["id-big"]);
+  });
+
+  test("updatedAt（rollout の mtime）降順で整列し、索引の古い updated_at では並べない", () => {
     const home = makeTempDir("codex-store-sort");
-    writeRollout(home, "2026/07/01", "rollout-old.jsonl", "id-old", "/w/old");
-    writeRollout(home, "2026/07/02", "rollout-new.jsonl", "id-new", "/w/new");
+    // 先に名前が付いた会話ほど索引の updated_at は古いが、その後に更新されていれば上に来る
+    // （App Server の thread/list と同じ並び。索引で並べると取得経路ごとに入れ替わっていた）。
+    writeRollout(home, "2026/07/01", "rollout-old.jsonl", "id-old", "/w/old", new Date("2026-07-10T00:00:00.000Z"));
+    writeRollout(home, "2026/07/02", "rollout-new.jsonl", "id-new", "/w/new", new Date("2026-07-05T00:00:00.000Z"));
     writeIndex(home, [
       { id: "id-old", thread_name: "旧", updated_at: "2026-07-01T00:00:00.000Z" },
       { id: "id-new", thread_name: "新", updated_at: "2026-07-09T00:00:00.000Z" },
     ]);
 
     const list = new CodexSessionStore(home).list();
-    expect(list.map((s) => s.sessionId)).toEqual(["id-new", "id-old"]);
+    expect(list.map((s) => s.sessionId)).toEqual(["id-old", "id-new"]);
   });
 
   test("baseDir 指定時は cwd が baseDir 配下の会話のみに絞る", () => {
@@ -263,7 +309,7 @@ describe("CodexSessionStore.list", () => {
         },
       },
     },
-  ])("$label をローカル一覧と App Server 一覧のプレビューへ反映する", async ({ type, payload }) => {
+  ])("$label を一覧のプレビューへ反映する", ({ type, payload }) => {
     const home = makeTempDir("codex-store-modern-preview");
     const p = writeRollout(
       home, "2026/09/08", "rollout-modern.jsonl", "modern-id", "/work/modern",
@@ -272,13 +318,6 @@ describe("CodexSessionStore.list", () => {
     fs.appendFileSync(p, JSON.stringify({ type, payload }) + "\n");
     const store = new CodexSessionStore(home);
     expect(store.list()[0]?.lastMessage).toBe("新形式の本文。 続きです。");
-    const sessions = await store.listWithAppServer({
-      listThreads: async () => [{
-        id: "modern-id", name: "会話名", preview: "最初の発話", updatedAt: 300,
-        cwd: "/work/modern", source: "vscode", parentThreadId: null,
-      }],
-    });
-    expect(sessions[0]?.lastMessage).toBe("新形式の本文。 続きです。");
   });
 
   test("新旧形式の混在時も末尾の実発話を選び、注入・思考・ツール・不正行を表示しない", () => {
@@ -363,96 +402,5 @@ describe("CodexSessionStore.list", () => {
 
     const list = new CodexSessionStore(home, 1).list();
     expect(list.map((session) => session.sessionId)).toEqual(["parent-id"]);
-  });
-
-  test("App Server thread を写像し、cwd 補完・title 整形・非対話除外を行う", async () => {
-    const home = makeTempDir("codex-store-app-server");
-    const complemented = writeRollout(
-      home, "2026/07/12", "rollout-complemented.jsonl", "thread-complemented", "/rollout/cwd",
-      undefined, "rollout のタイトル候補",
-    );
-    fs.appendFileSync(complemented, JSON.stringify({
-      type: "event_msg",
-      payload: { type: "agent_message", message: "最後の応答" },
-    }) + "\n");
-    writeRollout(
-      home, "2026/07/12", "rollout-exec.jsonl", "thread-rollout-exec", "/work/exec",
-      undefined, "除外", "exec",
-    );
-    const longTitle = `  1行目\n${"x".repeat(70)}  `;
-    const store = new CodexSessionStore(home);
-
-    const sessions = await store.listWithAppServer({
-      listThreads: async () => [
-        {
-          id: "thread-named", name: longTitle, preview: "preview", updatedAt: 300,
-          cwd: "/app/cwd", source: "vscode", parentThreadId: null,
-        },
-        {
-          id: "thread-complemented", name: null, preview: "preview title", updatedAt: 200,
-          cwd: null, source: "cli", parentThreadId: null,
-        },
-        {
-          id: "thread-no-cwd", name: null, preview: "hidden", updatedAt: 190,
-          cwd: null, source: "cli", parentThreadId: null,
-        },
-        {
-          id: "thread-exec", name: "exec", preview: "exec", updatedAt: 180,
-          cwd: "/work/exec", source: "exec", parentThreadId: null,
-        },
-        {
-          id: "thread-subagent", name: "child", preview: "child", updatedAt: 170,
-          cwd: "/work/child", source: { subAgent: { threadSpawn: {} } }, parentThreadId: "parent",
-        },
-        {
-          id: "thread-rollout-exec", name: "looks interactive", preview: "preview", updatedAt: 160,
-          cwd: "/work/exec", source: "unknown", parentThreadId: null,
-        },
-      ],
-    });
-
-    expect(sessions).toHaveLength(2);
-    expect(sessions[0]).toMatchObject({
-      sessionId: "thread-named",
-      cwd: "/app/cwd",
-      title: `1行目 ${"x".repeat(56)}`,
-      updatedAt: 300,
-      agent: "codex",
-      hasProviderTitle: true,
-    });
-    expect(sessions[0]?.title).toHaveLength(60);
-    expect(sessions[1]).toMatchObject({
-      sessionId: "thread-complemented",
-      cwd: "/rollout/cwd",
-      title: "preview title",
-      updatedAt: 200,
-      lastMessage: "最後の応答",
-      agent: "codex",
-      hasProviderTitle: false,
-    });
-  });
-
-  test("App Server 接続失敗時は既存 rollout 一覧へフォールバックする", async () => {
-    const home = makeTempDir("codex-store-app-server-fallback");
-    writeRollout(
-      home, "2026/07/12", "rollout-fallback.jsonl", "fallback-id", "/work/fallback",
-      undefined, "rollout fallback",
-    );
-    const store = new CodexSessionStore(home);
-
-    const sessions = await store.listWithAppServer({
-      listThreads: async () => {
-        throw new Error("connection failed");
-      },
-    });
-
-    expect(sessions).toHaveLength(1);
-    expect(sessions[0]).toMatchObject({
-      sessionId: "fallback-id",
-      cwd: "/work/fallback",
-      title: "rollout fallback",
-      agent: "codex",
-      hasProviderTitle: false,
-    });
   });
 });

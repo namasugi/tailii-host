@@ -339,11 +339,12 @@ export const conversationHandlers: HandlerRegistry = {
     // store 未注入時はその分を空一覧扱い（後方互換 — 会話機能なし）。
     engineDiag(`claude_session_list_request id=${message.id}`);
     const claudeSessions = ctx.claudeSessionStore?.list() ?? [];
-    const codexSessions = ctx.codexSessionStore === null
-      ? []
-      : ctx.codexAppServer === null
-        ? ctx.codexSessionStore.list()
-        : await ctx.codexSessionStore.listWithAppServer(ctx.codexAppServer);
+    // Codex は rollout から作る（App Server の thread/list は待たない）。thread/list は 100 件で約 1.7 秒
+    // かかり、2 ページで時間切れ（2 秒）を越えたり越えなかったりして、成功時と rollout 一覧で並び・
+    // 境目の会話が入れ替わっていた（一覧で Codex の会話が出たり消えたりする）。会話一覧は復帰時の
+    // 死活確認にも使うので遅いと接続を張り直させる。rollout 一覧の題名・最終メッセージ・更新時刻は
+    // App Server と一致する（2026-10-23 実測, 上位 200 件）。
+    const codexSessions = ctx.codexSessionStore?.list() ?? [];
     const sessions = [...claudeSessions, ...codexSessions].sort((lhs, rhs) => {
       const l = lhs.updatedAt ?? Number.MIN_SAFE_INTEGER;
       const r = rhs.updatedAt ?? Number.MIN_SAFE_INTEGER;
