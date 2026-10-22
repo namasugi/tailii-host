@@ -3,6 +3,8 @@
 
 import type { EngineRelayMessage, SessionProcessingMessage } from "./engineRelaySocket.js";
 import {
+  isBackgroundCommandStopStatus,
+  type BackgroundCommandStopStatus,
   decodeControlMessage,
   encodeControlMessage,
   type CodexCollaborationMode,
@@ -19,6 +21,8 @@ export type HubClientMessage =
   | { type: "conversation_unsubscribe"; session: string }
   | { type: "session_retire"; session: string }
   | { type: "conversation_subagent_transcript_request"; id: string; session: string; nodeId: string }
+  /** バックグラウンドタスク一覧からの背景コマンドの停止（nodeId = taskId）。 */
+  | { type: "background_command_stop"; id: string; session: string; nodeId: string }
   /** 会話履歴のページ取得（history-page）。before* の行より前の最後の limit 行ぶん。 */
   | {
       type: "conversation_history_page_request";
@@ -143,6 +147,7 @@ export type HubServerMessage =
   | { type: "pending_message_delete_result"; id: string; status: "deleted" | "not_found" | "processing" | "failed"; error?: string }
   | { type: "chat_receipt_query_result"; id: string; status: "delivered" | "deleted" | "uncertain" | "pending" | "unknown" }
   | { type: "chat_send_now_result"; id: string; status: "sent" | "nothing_queued" | "blocked" | "failed"; error?: string }
+  | { type: "background_command_stop_result"; id: string; status: BackgroundCommandStopStatus; error?: string }
   | { type: "runtime_claim_result"; id: string; status: "granted" | "held" }
   | EngineRelayMessage;
 
@@ -313,6 +318,13 @@ export function decodeHubClientLine(line: string): HubClientMessage | null {
       ? { type: "chat_receipt_query", id, session, clientMessageId }
       : null;
   }
+  if (record["type"] === "background_command_stop") {
+    const id = record["id"], session = record["session"], nodeId = record["nodeId"];
+    return typeof id === "string" && id.length > 0 && typeof session === "string" && session.length > 0 &&
+      typeof nodeId === "string" && nodeId.length > 0
+      ? { type: "background_command_stop", id, session, nodeId }
+      : null;
+  }
   if (record["type"] === "chat_send_now") {
     const id = record["id"], session = record["session"];
     return typeof id === "string" && id.length > 0 && typeof session === "string" && session.length > 0
@@ -448,6 +460,12 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
       (status !== "delivered" && status !== "deleted" && status !== "uncertain" &&
         status !== "pending" && status !== "unknown")) return null;
     return { type: "chat_receipt_query_result", id, status };
+  }
+  if (record["type"] === "background_command_stop_result") {
+    const id = record["id"], status = record["status"], error = record["error"];
+    if (typeof id !== "string" || !isBackgroundCommandStopStatus(status) ||
+      (error !== undefined && typeof error !== "string")) return null;
+    return { type: "background_command_stop_result", id, status, ...(typeof error === "string" ? { error } : {}) };
   }
   if (record["type"] === "chat_send_now_result") {
     const id = record["id"], status = record["status"], error = record["error"];

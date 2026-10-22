@@ -11,12 +11,15 @@ import { PROTOCOL_V2, type ControlMessage, type SubagentNode, type SubagentNodeS
 import { injectedReminderBodies } from "../shared/harnessReminder.js";
 import { abortableSleep } from "../shared/sleep.js";
 import { isApiRequestBlobLine } from "../shared/transcriptRecord.js";
+import { processBackgroundStopRecords, type BackgroundStopRecords } from "./backgroundStopRecords.js";
 import { extractToolActivities, TranscriptTailer } from "./transcriptTailer.js";
 
 /** 1 回に読む transcript の上限。超えたらイベントループへ譲ってから続きを読む。 */
 const SUBAGENT_READ_SLICE_BYTES = 1024 * 1024;
 
 export interface SubagentTailerOptions {
+  /** iPhone から止めた背景コマンドの記録。既定はプロセス内で共有する記録（hub はファイルを渡す）。 */
+  stopRecords?: BackgroundStopRecords;
   /** 追記ポーリング間隔（ms）。既定 50ms。 */
   pollIntervalMs?: number;
   /** EOF 後も abort まで無期限に tail するか。既定 true。 */
@@ -193,6 +196,12 @@ export class SubagentTailer {
   private readonly sessionStaleMs: number;
   private readonly jsonlPaths = new Map<string, string>();
   private readonly outputPaths = new Map<string, string>();
+  /**
+   * iPhone から止めた背景コマンド（taskId → 最初の SIGTERM の時刻）。CLI の完了通知は外から
+   * 止められたコマンドを「失敗（exit 143 等）」と書くが、利用者の停止なので TaskStop の ack と
+   * 同じく完了として出す。tail より長く生きる記録（hub はファイル）を使う。
+   */
+  private readonly stopRecords: BackgroundStopRecords;
 
   constructor(options: SubagentTailerOptions = {}) {
     this.pollIntervalMs = options.pollIntervalMs ?? 50;
@@ -203,6 +212,7 @@ export class SubagentTailer {
     this.tentativeFinalGraceMs = Math.max(this.agentOrphanGraceMs, options.tentativeFinalGraceMs ?? 600_000);
     this.probeOutputOpen = options.probeOutputOpen ?? defaultProbeOutputOpen;
     this.sessionStaleMs = options.sessionStaleMs ?? 6 * 60 * 60 * 1000;
+    this.stopRecords = options.stopRecords ?? processBackgroundStopRecords();
     this.probeSessionAlive = options.probeSessionAlive
       ?? ((sessionId, lastActivityMs) => defaultProbeSessionAlive(sessionId, lastActivityMs, this.sessionStaleMs));
   }
@@ -215,6 +225,21 @@ export class SubagentTailer {
   /** バックグラウンドコマンドの nodeId(taskId) から出力ファイルを引く。 */
   outputPath(nodeId: string): string | null {
     return this.outputPaths.get(nodeId) ?? null;
+  }
+
+  /**
+   * iPhone から止めた背景コマンドを記録する（以後その taskId は止めた時刻で完了として出す）。
+   * 既に記録があれば最初の時刻を保つ。新しく記録したときだけ true。
+   */
+  markUserStopped(taskId: string, atMs: number = Date.now()): boolean {
+    if (this.stopRecords.get(taskId) !== null) return false;
+    this.stopRecords.set(taskId, atMs);
+    return true;
+  }
+
+  /** 止められなかったときに、先に入れた記録を外す。 */
+  unmarkUserStopped(taskId: string): void {
+    this.stopRecords.delete(taskId);
   }
 
   async *streamProjectDir(
@@ -692,11 +717,18 @@ export class SubagentTailer {
         const notification = notificationByTaskId.get(command.taskId) ?? null;
         // 遅配された本物の通知が届いたら exit code 込みでそちらを優先する。
         const orphanTs = notification === null ? (bgOrphanTsByTaskId.get(command.taskId) ?? null) : null;
-        const failed = notification !== null
+        // iPhone から止めたコマンドは、止めた時刻で完了（停止による exit 143 等を失敗にしない）。
+        // ただし止める前に通知済みだった終わり方はそのまま使う。
+        const userStoppedTs = this.stopRecords.get(command.taskId);
+        const stoppedByUser = userStoppedTs !== null
+          && (notification === null || notification.ts === null || notification.ts >= userStoppedTs);
+        const failed = !stoppedByUser && notification !== null
           && (notification.status !== "completed" || (notification.exitCode ?? 0) !== 0);
-        const status: SubagentNodeStatus = notification !== null
-          ? (failed ? "error" : "completed")
-          : (orphanTs !== null ? "completed" : "running");
+        const status: SubagentNodeStatus = stoppedByUser
+          ? "completed"
+          : notification !== null
+            ? (failed ? "error" : "completed")
+            : (orphanTs !== null ? "completed" : "running");
         const ownerNode = tracked.get(command.owner) ?? null;
         const messageNode: SubagentNode = {
           nodeId: command.taskId,
@@ -707,7 +739,7 @@ export class SubagentTailer {
           depth: ownerNode === null ? 1 : ownerNode.meta.spawnDepth + 1,
           status,
           currentActivity: null,
-          ts: notification?.ts ?? orphanTs ?? command.startTs ?? 0,
+          ts: stoppedByUser ? userStoppedTs : (notification?.ts ?? orphanTs ?? command.startTs ?? 0),
           kind: "command",
         };
         const key = stableNodeKey(messageNode);

@@ -28,6 +28,7 @@ import {
   type ClaudeTurnLifecycleEvent,
 } from "../chat/transcriptTailer.js";
 import type { ChatAgent } from "../chat/chatTailController.js";
+import type { BackgroundCommandStopResult } from "../chat/backgroundCommandStop.js";
 import { sliceHistoryPage, type HistoryPageAnchor } from "./historyPage.js";
 import type { ImageService } from "../chat/imageService.js";
 import type { PanePreviewMode } from "./panePreviewPump.js";
@@ -67,6 +68,8 @@ export interface HubTail {
     entries: SubagentTranscriptEntry[];
     omitted: number;
   };
+  /** バックグラウンドタスク一覧からの背景コマンドの停止（任意実装）。 */
+  stopBackgroundCommand?(nodeId: string): Promise<BackgroundCommandStopResult>;
 }
 
 export interface HubPreviewPump {
@@ -1057,6 +1060,36 @@ export class SessionHub {
       const actor = this.actor(message.session);
       actor.sendNowWaiters.push({ client, id: message.id, receivedAtMs: this.nowMs() });
       void this.runSendNow(message.session, actor);
+      return;
+    }
+    if (message.type === "background_command_stop") {
+      // 背景コマンドの停止は出力ファイルを持つ tail（この会話の actor）にしかできない。
+      // 会話を tail していなければ not_found（iPhone は一覧を開いている前面会話からしか送らない）。
+      const tail = this.actors.get(message.session)?.tail;
+      if (tail?.stopBackgroundCommand === undefined) {
+        this.sendTo(client, { type: "background_command_stop_result", id: message.id, status: "not_found" });
+        return;
+      }
+      void tail.stopBackgroundCommand(message.nodeId).then(
+        (result) => {
+          this.options.log?.(
+            `audit background_command_stop session=${auditValue(message.session)} status=${result.status}`,
+          );
+          this.sendTo(client, {
+            type: "background_command_stop_result", id: message.id, status: result.status,
+            ...(result.error !== undefined ? { error: result.error } : {}),
+          });
+        },
+        (error: unknown) => {
+          this.options.log?.(
+            `audit background_command_stop session=${auditValue(message.session)} status=failed error=${auditValue(String(error))}`,
+          );
+          this.sendTo(client, {
+            type: "background_command_stop_result", id: message.id, status: "failed",
+            error: "停止の途中でエラーが起きました。一覧で状態を確かめてください。",
+          });
+        },
+      );
       return;
     }
     if (message.type === "chat_receipt_query") {

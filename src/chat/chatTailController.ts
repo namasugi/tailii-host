@@ -13,6 +13,12 @@ import { attachmentImagePaths, type ImageService } from "./imageService.js";
 import { TranscriptTailer, type ClaudeTurnLifecycleEvent } from "./transcriptTailer.js";
 import { SubagentTailer } from "./subagentTailer.js";
 import {
+  stopBackgroundCommandProcess,
+  type BackgroundCommandStopHooks,
+  type BackgroundCommandStopResult,
+} from "./backgroundCommandStop.js";
+import type { BackgroundStopRecords } from "./backgroundStopRecords.js";
+import {
   readBackgroundOutput,
   readCodexSubagentTranscript,
   readSubagentTranscript,
@@ -32,6 +38,10 @@ export class ChatTailController {
   private readonly writer: LineWriter;
   private readonly tailer: TranscriptTailer;
   private readonly subagentTailer: SubagentTailer;
+  /** 背景コマンドの停止（テストで差し替える）。 */
+  private readonly stopProcess: (
+    outputPath: string, hooks: BackgroundCommandStopHooks,
+  ) => Promise<BackgroundCommandStopResult>;
   private readonly projectsRoot: string;
   /** チャット添付（user 発話の `@"path"` / Tailii upload path）のサムネ発行に使う。 */
   private readonly imageService: ImageService | null;
@@ -66,10 +76,18 @@ export class ChatTailController {
     onCodexTurnLifecycle?: (event: CodexTurnLifecycleEvent) => void;
     /** claude の transcript 由来ライフサイクル（中断マーカー）。hub が処理中状態の補完に使う。 */
     onClaudeTurnLifecycle?: (event: ClaudeTurnLifecycleEvent) => void;
+    stopBackgroundCommandProcess?: (
+      outputPath: string, hooks: BackgroundCommandStopHooks,
+    ) => Promise<BackgroundCommandStopResult>;
+    /** iPhone から止めた背景コマンドの記録（hub はファイルを渡す。tail を作り直しても残す）。 */
+    backgroundStopRecords?: BackgroundStopRecords;
   }) {
     this.writer = options.writer;
     this.tailer = options.tailer;
-    this.subagentTailer = options.subagentTailer ?? new SubagentTailer();
+    this.subagentTailer = options.subagentTailer
+      ?? new SubagentTailer(options.backgroundStopRecords !== undefined ? { stopRecords: options.backgroundStopRecords } : {});
+    this.stopProcess = options.stopBackgroundCommandProcess
+      ?? ((outputPath, hooks) => stopBackgroundCommandProcess(outputPath, hooks));
     this.projectsRoot = options.projectsRoot;
     this.imageService = options.imageService ?? null;
     this.protocolVersion = options.protocolVersion ?? (() => 1);
@@ -100,6 +118,29 @@ export class ChatTailController {
     if (jsonl !== null) return readSubagentTranscript(jsonl);
     // バックグラウンドコマンドは jsonl を持たないので、出力ファイルの末尾を返す。
     return readBackgroundOutput(this.subagentTailer.outputPath(nodeId));
+  }
+
+  /**
+   * iPhone のバックグラウンドタスク一覧から背景コマンドを止める。止めたら tailer に記録し、
+   * 以後そのコマンドを（停止による exit 143 等の失敗ではなく）完了として出す。
+   */
+  async stopBackgroundCommand(nodeId: string): Promise<BackgroundCommandStopResult> {
+    if (this.openAgent === "codex") return { status: "not_found" };
+    const outputPath = this.subagentTailer.outputPath(nodeId);
+    // kill の起点になるパスなので、その taskId の出力ファイル（`…/tasks/<taskId>.output`）である
+    // ことを確かめる（transcript 本文から拾ったパスがそれ以外を指していたら止めない）。
+    if (outputPath === null || !isBackgroundOutputPathFor(nodeId, outputPath)) return { status: "not_found" };
+    let marked = false;
+    const result = await this.stopProcess(outputPath, {
+      // CLI の完了通知（exit 143）は終了直後に書かれるので、SIGTERM の前に記録を入れておく
+      // （後から入れると、その間だけ一覧に「失敗」が出る）。
+      onSignal: (atMs) => { marked = this.subagentTailer.markUserStopped(nodeId, atMs); },
+    });
+    if (result.status === "failed" && marked) this.subagentTailer.unmarkUserStopped(nodeId);
+    // もう動いていなかった（通知が来ないまま実行中に見えていた）ものも、利用者が止めた時点で
+    // 片付ける（孤児判定の約 90 秒を待たない）。それより前に自分で失敗していた通知は失敗のまま。
+    if (result.status === "not_running") this.subagentTailer.markUserStopped(nodeId, Date.now());
+    return result;
   }
 
   /**
@@ -417,4 +458,11 @@ export class ChatTailController {
       // 診断ログの失敗は無視。
     }
   }
+}
+
+/** その taskId の背景コマンドの出力ファイル（`…/tasks/<taskId>.output`）か。 */
+export function isBackgroundOutputPathFor(taskId: string, outputPath: string): boolean {
+  return path.isAbsolute(outputPath)
+    && path.basename(outputPath) === `${taskId}.output`
+    && path.basename(path.dirname(outputPath)) === "tasks";
 }

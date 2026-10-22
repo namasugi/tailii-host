@@ -198,6 +198,17 @@ describe("hubProtocol subagent transcript RPC", () => {
   });
 });
 
+describe("hubProtocol background command stop", () => {
+  test("request/result を encode/decode 往復し、空の識別子・未知の status を拒否する", () => {
+    const request: HubClientMessage = { type: "background_command_stop", id: "s1", session: "work", nodeId: "b1" };
+    expect(decodeHubClientLine(encodeHubMessage(request))).toEqual(request);
+    const result: HubServerMessage = { type: "background_command_stop_result", id: "s1", status: "failed", error: "x" };
+    expect(decodeHubServerLine(encodeHubMessage(result))).toEqual(result);
+    expect(decodeHubClientLine(JSON.stringify({ ...request, nodeId: "" }))).toBeNull();
+    expect(decodeHubServerLine(JSON.stringify({ ...result, status: "killed" }))).toBeNull();
+  });
+});
+
 describe("hubProtocol conversation event", () => {
   test("tool_activity payload を flat wire で encode し activity として復元する", () => {
     const message: HubServerMessage = {

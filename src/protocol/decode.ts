@@ -20,6 +20,7 @@ import {
   type HostUpdateStatus,
   type HostVersions,
   isToolDenialKind,
+  isBackgroundCommandStopStatus,
   type OfficialAppProvider,
   type QuestionAnswer,
   type QuestionOption,
@@ -1276,6 +1277,22 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         ok: requireBoolean(raw, "ok"),
         error: optionalNullableString(raw, "error") ?? null,
       };
+
+    case "background_command_stop_request":
+      return { type, v, id: requireString(raw, "id"), nodeId: requireString(raw, "nodeId") };
+
+    case "background_command_stop_response": {
+      const status = requireString(raw, "status");
+      if (!isBackgroundCommandStopStatus(status)) throw new ProtocolDecodeError("missing-field", "status");
+      const error = optionalString(raw, "error");
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        nodeId: requireString(raw, "nodeId"),
+        status,
+        ...(error !== undefined ? { error } : {}),
+      };
+    }
 
     case "backend_get_request":
       return { type, v, id: requireString(raw, "id") };

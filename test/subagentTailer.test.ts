@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { describe, expect, test } from "vitest";
 import type { ControlMessage, SubagentNode } from "../src/protocol.js";
 import { defaultProbeSessionAlive, SubagentTailer, type ProcessProbeExec } from "../src/chat/subagentTailer.js";
+import { memoryBackgroundStopRecords } from "../src/chat/backgroundStopRecords.js";
 import { makeTempDir } from "./helpers.js";
 
 async function nextOfType(
@@ -779,6 +780,104 @@ describe("SubagentTailer", () => {
     ]);
     ac.abort();
     expect(first).toBeNull();
+  });
+
+  test("iPhone から止めた背景コマンドは、停止による失敗通知（exit 143）でも止めた時刻で完了として出す", async () => {
+    const project = makeTempDir("subagent-tailer-bg-user-stop");
+    const sessionId = "55555555-6666-7777-8888-99999999999e";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    fs.mkdirSync(path.join(project, sessionId, "subagents"), { recursive: true });
+    const launch = (id: string, taskId: string, ts: string) => [
+      JSON.stringify({ message: { role: "assistant", content: [{ type: "tool_use", id, name: "Bash",
+        input: { command: "zsh ui.sh", run_in_background: true, description: taskId } }] }, timestamp: ts }),
+      JSON.stringify({ message: { role: "user", content: [{ type: "tool_result", tool_use_id: id,
+        content: `Command running in background with ID: ${taskId}. Output is being written to: /tmp/t/${taskId}.output.` }] },
+        toolUseResult: { backgroundTaskId: taskId }, timestamp: ts }),
+    ];
+    const failed = (taskId: string, ts: string) => JSON.stringify({ type: "user", timestamp: ts, message: { role: "user",
+      content: `<task-notification>\n<task-id>${taskId}</task-id>\n<status>failed</status>\n<summary>Background command "${taskId}" failed with exit code 143</summary>\n</task-notification>` } });
+    fs.writeFileSync(main, [
+      ...launch("toolu_s", "bstop", "2026-01-01T01:00:00.000Z"),
+      ...launch("toolu_n", "bnatural", "2026-01-01T01:00:00.000Z"),
+    ].join("\n") + "\n");
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10, probeOutputOpen: () => Promise.resolve(true) });
+    const gen = tailer.streamSession(main, ac.signal);
+    const latest = new Map<string, SubagentNode>();
+    // 時間切れで抜けても待ち中の next() は持ち越す（捨てると次の更新を飲み込む）。
+    let pending: Promise<IteratorResult<ControlMessage, void>> | null = null;
+    const pump = async (ms: number) => {
+      const end = Date.now() + ms;
+      while (Date.now() < end) {
+        pending ??= gen.next();
+        const n = await Promise.race([pending, new Promise<null>((r) => setTimeout(() => r(null), Math.max(1, end - Date.now())))]);
+        if (n === null) break;
+        pending = null;
+        if (n.done) break;
+        if (n.value.type === "subagent_node") latest.set(n.value.node.nodeId, n.value.node);
+      }
+    };
+    await pump(200);
+    expect(latest.get("bstop")?.status).toBe("running");
+    const stoppedAt = Date.parse("2026-01-01T01:10:00.000Z");
+    tailer.markUserStopped("bstop", stoppedAt);
+    // bnatural は止める前に自分で失敗していた（止めた時刻より前の通知）。止めていない bnatural も失敗のまま。
+    fs.appendFileSync(main, [
+      failed("bstop", "2026-01-01T01:10:00.500Z"),
+      failed("bnatural", "2026-01-01T01:09:00.000Z"),
+    ].join("\n") + "\n");
+    await pump(300);
+    ac.abort();
+    expect(latest.get("bstop")).toMatchObject({ status: "completed", ts: stoppedAt });
+    expect(latest.get("bnatural")).toMatchObject({ status: "error" });
+  });
+
+  test("会話を閉じて開き直す（tailer を作り直す）と、共有の記録から止めたコマンドを完了のまま出す", async () => {
+    const project = makeTempDir("subagent-tailer-bg-user-stop-reopen");
+    const sessionId = "55555555-6666-7777-8888-9999999999a0";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    fs.mkdirSync(path.join(project, sessionId, "subagents"), { recursive: true });
+    fs.writeFileSync(main, [
+      JSON.stringify({ message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_r", name: "Bash",
+        input: { command: "x", run_in_background: true, description: "x" } }] }, timestamp: "2026-01-01T01:00:00.000Z" }),
+      JSON.stringify({ message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_r",
+        content: "Command running in background with ID: breopen. Output is being written to: /tmp/t/breopen.output." }] },
+        toolUseResult: { backgroundTaskId: "breopen" }, timestamp: "2026-01-01T01:00:00.000Z" }),
+      // 止めたことで CLI が書いた失敗通知（exit 143）。
+      JSON.stringify({ type: "user", timestamp: "2026-01-01T01:10:00.200Z", message: { role: "user",
+        content: "<task-notification>\n<task-id>breopen</task-id>\n<status>failed</status>\n<summary>Background command \"x\" failed with exit code 143</summary>\n</task-notification>" } }),
+    ].join("\n") + "\n");
+    const records = memoryBackgroundStopRecords();
+    // 止めたときの tailer（会話を閉じると捨てられる）。
+    new SubagentTailer({ stopRecords: records }).markUserStopped("breopen", Date.parse("2026-01-01T01:10:00.000Z"));
+    // 開き直しで作られる新しい tailer。
+    const reopened = new SubagentTailer({ ...aliveSession, stopRecords: records, pollIntervalMs: 10, probeOutputOpen: () => Promise.resolve(true) });
+    const ac = new AbortController();
+    const node = await nextOfType(reopened.streamSession(main, ac.signal), "subagent_node");
+    ac.abort();
+    expect(node).toMatchObject({ node: { nodeId: "breopen", status: "completed", ts: Date.parse("2026-01-01T01:10:00.000Z") } });
+  });
+
+  test("止める前に自分で失敗していた背景コマンドは、あとから止めた記録があっても失敗のまま", async () => {
+    const project = makeTempDir("subagent-tailer-bg-user-stop-late");
+    const sessionId = "55555555-6666-7777-8888-99999999999f";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    fs.mkdirSync(path.join(project, sessionId, "subagents"), { recursive: true });
+    fs.writeFileSync(main, [
+      JSON.stringify({ message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_e", name: "Bash",
+        input: { command: "x", run_in_background: true, description: "x" } }] }, timestamp: "2026-01-01T01:00:00.000Z" }),
+      JSON.stringify({ message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_e",
+        content: "Command running in background with ID: bearly. Output is being written to: /tmp/t/bearly.output." }] },
+        toolUseResult: { backgroundTaskId: "bearly" }, timestamp: "2026-01-01T01:00:00.000Z" }),
+      JSON.stringify({ type: "user", timestamp: "2026-01-01T01:05:00.000Z", message: { role: "user",
+        content: "<task-notification>\n<task-id>bearly</task-id>\n<status>failed</status>\n<summary>Background command \"x\" failed with exit code 1</summary>\n</task-notification>" } }),
+    ].join("\n") + "\n");
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10, probeOutputOpen: () => Promise.resolve(true) });
+    tailer.markUserStopped("bearly", Date.parse("2026-01-01T01:10:00.000Z"));
+    const ac = new AbortController();
+    const node = await nextOfType(tailer.streamSession(main, ac.signal), "subagent_node");
+    ac.abort();
+    expect(node).toMatchObject({ node: { nodeId: "bearly", status: "error" } });
   });
 
   test("停止境界注入(assistant text 内の system-reminder)の task-notification でも完了する", async () => {

@@ -35,6 +35,7 @@ import {
 import { envWithoutTmux, screenHasSelectionFooter } from "../backend/herdr.js";
 import { readPackageVersion } from "../shared/version.js";
 import { ChatTailController } from "../chat/chatTailController.js";
+import { fileBackgroundStopRecords } from "../chat/backgroundStopRecords.js";
 import { TranscriptTailer } from "../chat/transcriptTailer.js";
 import { LineWriter } from "../shared/lineWriter.js";
 import { NdjsonLineSplitter } from "../shared/lineSplitter.js";
@@ -506,6 +507,8 @@ export async function runHubCommand(args: string[]): Promise<number> {
   // ここで ImageService を渡さないと engine 側のサービスは tail を通らず、
   // user 添付の image_available が消失する。index は engine と共通の既定パスへ書く。
   const imageService = new ImageService();
+  // iPhone から止めた背景コマンドの記録。tail（会話を閉じると捨てる）と hub の再起動より長く残す。
+  const backgroundStopRecords = fileBackgroundStopRecords();
   const hub = new SessionHub({
     runner,
     imageService,
@@ -525,6 +528,7 @@ export async function runHubCommand(args: string[]): Promise<number> {
     chatReceiptsPath: defaultChatReceiptsPath(),
     log,
     tailFactory: (write, onCodexTurnLifecycle, onClaudeTurnLifecycle) => new ChatTailController({
+      backgroundStopRecords,
       writer: controlMessageCallbackWriter(write),
       tailer: new TranscriptTailer({ tailIndefinitely: true, emitReplayDoneMarker: true }),
       projectsRoot: path.join(os.homedir(), ".claude", "projects"),

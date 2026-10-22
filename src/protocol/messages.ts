@@ -365,6 +365,18 @@ export type RemotePendingKind = "approval" | "question";
  *   error       — 起動前検証で拒否(ダウングレード等。詳細は error)
  */
 export type HostUpdateStatus = "started" | "already" | "in_progress" | "unsupported" | "error";
+/**
+ * background_command_stop_response.status（バックグラウンドタスク一覧からの背景コマンドの停止）:
+ *   stopped     — 出力ファイルを書いていたプロセス（グループ）を止めた
+ *   not_running — もう動いていなかった（書き込み元がいない）
+ *   not_found   — その会話の背景コマンドとして見つからない（出力ファイル不明・Codex 会話等）
+ *   failed      — 調べられない／止まらなかった（詳細は error）
+ */
+export type BackgroundCommandStopStatus = "stopped" | "not_running" | "not_found" | "failed";
+
+export function isBackgroundCommandStopStatus(value: unknown): value is BackgroundCommandStopStatus {
+  return value === "stopped" || value === "not_running" || value === "not_found" || value === "failed";
+}
 export type OfficialAppProvider = "claude" | "codex";
 export type OfficialAppAction = "open" | "repair" | "stop";
 export type OfficialAppState = "active" | "inactive" | "unavailable";
@@ -738,6 +750,16 @@ export type ControlMessage =
   | { type: "serve_list_response"; v: number; id: string; servers: ServeProcessInfo[] }
   | { type: "serve_stop_request"; v: number; id: string; pid: number; port: number }
   | { type: "serve_stop_response"; v: number; id: string; ok: boolean; error: string | null }
+  /** バックグラウンドタスク一覧から背景コマンドを止める（前面の会話。nodeId = taskId）。 */
+  | { type: "background_command_stop_request"; v: number; id: string; nodeId: string }
+  | {
+      type: "background_command_stop_response";
+      v: number;
+      id: string;
+      nodeId: string;
+      status: BackgroundCommandStopStatus;
+      error?: string;
+    }
   | { type: "backend_get_request"; v: number; id: string }
   | {
       type: "backend_get_response";

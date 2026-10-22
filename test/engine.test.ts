@@ -579,6 +579,60 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
+  test("背景コマンドの停止要求を現在会話の Hub tail へ中継し、結果を返す", async () => {
+    const store = makeTempStore();
+    store.put({ name: "work", cwd: "/tmp/work", createdAt: 1, agent: "claude", providerSessionId: "provider-1" });
+    const stopBackgroundCommand = vi.fn(async (nodeId: string) =>
+      nodeId === "bstuck" ? { status: "failed" as const, error: "プロセスが終了しませんでした" } : { status: "stopped" as const });
+    const tail: import("../src/hub/sessionHub.js").HubTail = { open: vi.fn(), stop: vi.fn(), stopBackgroundCommand };
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir: makeTempDir("bg-stop-hub"), metadataStore: store,
+      timeoutSeconds: 1_800, tailFactory: () => tail,
+    });
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("work\n") : ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner, store), metadataStore: store, hub });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine('{"id":"open","name":"work","type":"session_reattach","v":2}');
+    await engine.lines.nextOfType("session_list_response");
+
+    engine.writeLine('{"id":"bs1","nodeId":"b1sf98mak","type":"background_command_stop_request","v":2}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("background_command_stop_response"))).toEqual({
+      type: "background_command_stop_response", v: 2, id: "bs1", nodeId: "b1sf98mak", status: "stopped",
+    });
+    expect(stopBackgroundCommand).toHaveBeenCalledWith("b1sf98mak");
+
+    engine.writeLine('{"id":"bs2","nodeId":"bstuck","type":"background_command_stop_request","v":2}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("background_command_stop_response"))).toEqual({
+      type: "background_command_stop_response", v: 2, id: "bs2", nodeId: "bstuck", status: "failed",
+      error: "プロセスが終了しませんでした",
+    });
+    await engine.teardown();
+  });
+
+  test("会話を開いていない（または tail が停止に対応しない）ときの停止要求は not_found を返す", async () => {
+    const store = makeTempStore();
+    store.put({ name: "work", cwd: "/tmp/work", createdAt: 1, agent: "claude", providerSessionId: "provider-1" });
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir: makeTempDir("bg-stop-hub-none"), metadataStore: store,
+      timeoutSeconds: 1_800, tailFactory: () => ({ open: vi.fn(), stop: vi.fn() }),
+    });
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("work\n") : ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner, store), metadataStore: store, hub });
+    await engine.lines.nextOfType("channel_hello");
+    // 会話を開く前（前面の会話なし）。
+    engine.writeLine('{"id":"bs0","nodeId":"b1","type":"background_command_stop_request","v":2}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("background_command_stop_response"))).toMatchObject({
+      id: "bs0", status: "not_found",
+    });
+    engine.writeLine('{"id":"open","name":"work","type":"session_reattach","v":2}');
+    await engine.lines.nextOfType("session_list_response");
+    engine.writeLine('{"id":"bs1","nodeId":"b1","type":"background_command_stop_request","v":2}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("background_command_stop_response"))).toMatchObject({
+      id: "bs1", status: "not_found",
+    });
+    await engine.teardown();
+  });
+
   test("Hub 世代変更時は旧 afterSeq を捨て、切断時刻から再購読する", async () => {
     const store = makeTempStore();
     store.put({ name: "work", cwd: "/tmp/work", createdAt: 1, agent: "claude",

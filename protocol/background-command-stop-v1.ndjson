@@ -1,0 +1,5 @@
+{"id":"bs1","nodeId":"b1sf98mak","type":"background_command_stop_request","v":1}
+{"id":"bs1","nodeId":"b1sf98mak","status":"stopped","type":"background_command_stop_response","v":1}
+{"id":"bs2","nodeId":"bgone1","status":"not_running","type":"background_command_stop_response","v":1}
+{"id":"bs3","nodeId":"bnone1","status":"not_found","type":"background_command_stop_response","v":1}
+{"error":"プロセスが終了しませんでした","id":"bs4","nodeId":"bstuck1","status":"failed","type":"background_command_stop_response","v":1}

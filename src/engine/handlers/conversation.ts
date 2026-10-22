@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { HubServerMessage } from "../../hub/hubProtocol.js";
-import { PROTOCOL_V2, type ControlMessage } from "../../protocol.js";
+import { PROTOCOL_V2, type BackgroundCommandStopStatus, type ControlMessage } from "../../protocol.js";
 import {
   annotateLiveSessions,
   buildLiveSessionIndex,
@@ -288,6 +288,43 @@ export const conversationHandlers: HandlerRegistry = {
     } catch (error) {
       process.stderr.write(`[tailii-host engine] subagent_transcript_response 書込失敗: ${String(error)}\n`);
     }
+  },
+
+  background_command_stop_request: (message, ctx) => {
+    const { writer, state } = ctx;
+    const v = state.negotiatedVersion;
+    const session = ctx.activeChatSession.name;
+    // 停止は SIGTERM → 猶予（約 3 秒）→ SIGKILL → 確認（約 2 秒）まで待つので read loop を塞がない。
+    // lsof（最長 5 秒）を含めても hub 側は 20 秒以内に答える。
+    void (async () => {
+      let status: BackgroundCommandStopStatus = "not_found";
+      let error: string | undefined;
+      if (session !== null) {
+        try {
+          const result = await ctx.hubRpc<Extract<HubServerMessage, { type: "background_command_stop_result" }>>(
+            { type: "background_command_stop", id: message.id, session, nodeId: message.nodeId },
+            message.id,
+            20_000,
+          );
+          status = result.status;
+          error = result.error;
+        } catch (failure) {
+          // hub 不達・時間切れ。止まったかどうか分からないので、そのまま伝える（英語の例外文は出さない）。
+          engineDiag(`background_command_stop hub 失敗 id=${message.id}: ${String(failure)}`);
+          status = "failed";
+          error = "停止の結果を確認できませんでした。しばらくしてから一覧で状態を確かめてください。";
+        }
+      }
+      engineDiag(`background_command_stop id=${message.id} node=${message.nodeId} status=${status}`);
+      try {
+        writer.write({
+          type: "background_command_stop_response", v, id: message.id, nodeId: message.nodeId, status,
+          ...(error !== undefined ? { error } : {}),
+        });
+      } catch (failure) {
+        process.stderr.write(`[tailii-host engine] background_command_stop_response 書込失敗: ${String(failure)}\n`);
+      }
+    })();
   },
 
   claude_session_list_request: async (message, ctx) => {

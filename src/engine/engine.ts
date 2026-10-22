@@ -819,6 +819,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
         message.type === "pending_message_delete_result" ||
         message.type === "chat_receipt_query_result" ||
         message.type === "chat_send_now_result" ||
+        message.type === "background_command_stop_result" ||
         message.type === "presence_response" ||
         message.type === "conversation_subagent_transcript_response" ||
         message.type === "conversation_history_page_response") {
