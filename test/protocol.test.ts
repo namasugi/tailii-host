@@ -148,6 +148,28 @@ describe("golden roundtrip", () => {
     }
   });
 
+  it("background-sync-hints v1 golden 全行が byte-exact でラウンドトリップする", () => {
+    for (const line of goldenLines("background-sync-hints-v1.ndjson")) {
+      const decoded = decodeControlMessage(line);
+      expect(encodeControlMessage(decoded)).toBe(line);
+    }
+  });
+
+  it("background_sync_hints は負・小数の境界や欠けた要素を decode で拒否し、上限を超えた分は捨てる", () => {
+    for (const bad of [
+      '{"sessions":[{"newerThanMs":-1,"session":"a"}],"type":"background_sync_hints","v":1}',
+      '{"sessions":[{"newerThanMs":1.5,"session":"a"}],"type":"background_sync_hints","v":1}',
+      '{"sessions":[{"session":"a"}],"type":"background_sync_hints","v":1}',
+      '{"sessions":["a"],"type":"background_sync_hints","v":1}',
+      '{"type":"background_sync_hints","v":1}',
+    ]) {
+      expect(() => decodeControlMessage(bad), bad).toThrow();
+    }
+    const many = Array.from({ length: 300 }, (_, i) => ({ newerThanMs: i, session: `s-${i}` }));
+    const decoded = decodeControlMessage(JSON.stringify({ sessions: many, type: "background_sync_hints", v: 1 }));
+    expect(decoded.type === "background_sync_hints" && decoded.sessions).toHaveLength(256);
+  });
+
   it("background_command_stop_response は未知の status を decode で拒否する", () => {
     expect(() => decodeControlMessage(
       '{"id":"x","nodeId":"b1","status":"killed","type":"background_command_stop_response","v":1}',

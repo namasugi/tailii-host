@@ -365,6 +365,16 @@ export type RemotePendingKind = "approval" | "question";
  *   error       — 起動前検証で拒否(ダウングレード等。詳細は error)
  */
 export type HostUpdateStatus = "started" | "already" | "in_progress" | "unsupported" | "error";
+
+/** 背景同期の境界ヒント 1 件（`background_sync_hints`）。`newerThanMs` は host 時刻の epoch ms。 */
+export interface BackgroundSyncHint {
+  session: string;
+  newerThanMs: number;
+}
+
+/** `background_sync_hints.sessions` の上限（iOS の上限と同じ）。超えた分は decode で捨てる。 */
+export const BACKGROUND_SYNC_HINTS_MAX = 256;
+
 /**
  * background_command_stop_response.status（バックグラウンドタスク一覧からの背景コマンドの停止）:
  *   stopped     — 出力ファイルを書いていたプロセス（グループ）を止めた
@@ -750,6 +760,11 @@ export type ControlMessage =
   | { type: "serve_list_response"; v: number; id: string; servers: ServeProcessInfo[] }
   | { type: "serve_stop_request"; v: number; id: string; pid: number; port: number }
   | { type: "serve_stop_response"; v: number; id: string; ok: boolean; error: string | null }
+  /**
+   * 背景同期の境界ヒント（iOS→Mac, background-sync-hints）。engine を張り直した直後に iOS が
+   * 手元の会話ログごとに「この時刻以降だけ送ればよい」を伝える。応答は無い。
+   */
+  | { type: "background_sync_hints"; v: number; sessions: BackgroundSyncHint[] }
   /** バックグラウンドタスク一覧から背景コマンドを止める（前面の会話。nodeId = taskId）。 */
   | { type: "background_command_stop_request"; v: number; id: string; nodeId: string }
   | {

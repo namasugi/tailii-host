@@ -250,6 +250,7 @@ export async function runEngineCommand(args: string[]): Promise<number> {
     await runEngine({
       input: process.stdin,
       output: process.stdout,
+      backgroundSyncHintsWaitMs: BACKGROUND_SYNC_HINTS_WAIT_MS,
       sessionManager,
       imageService,
       transcriptTailer,
@@ -373,7 +374,19 @@ export interface RunEngineOptions {
   hubLink?: HubLink;
   /** Codex Hub start ACK の待機時間（テスト注入用、既定15秒）。 */
   codexHubRpcTimeoutMs?: number;
+  /**
+   * 境界の無い背景購読（新しい engine の初回）を、iOS の背景同期ヒント（`background_sync_hints`）が
+   * 届くまで保留する上限（ms, background-sync-hints）。0 は待たない（ヒントは届いた後の購読から使う）。
+   * CLI の engine は {@link BACKGROUND_SYNC_HINTS_WAIT_MS}。
+   */
+  backgroundSyncHintsWaitMs?: number;
 }
+
+/**
+ * iOS の背景同期ヒントを待つ既定の上限（ms）。iOS は engine チャネルを開いた直後の名乗りに続けて送るので
+ * ふつうは往復 1 回で届く。ヒントを送らない旧アプリでも、この時間だけ背景購読が遅れるだけで済む。
+ */
+export const BACKGROUND_SYNC_HINTS_WAIT_MS = 2_000;
 
 /**
  * EngineControl の本体。`input` から NDJSON 行を読み、session_* を `sessionManager` に
@@ -416,6 +429,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     hubLink: injectedHubLink = undefined,
     codexHubRpcTimeoutMs = 15_000,
     heartbeatDir = defaultHeartbeatDir(),
+    backgroundSyncHintsWaitMs = 0,
   } = options;
   // 既定の Codex 使用量フェッチャは共有 App Server 経由（未接続・停止中は null を返す）。
   // 分割代入の中では codexAppServer をまだ参照できないため、確定後にここで束ねる。
@@ -465,14 +479,91 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
   /** retire された前面会話。次の処理中通知（claude が実際に動いた証拠）で 1 回だけ前面購読を張り直す。 */
   const pendingForegroundResubscribe = new Set<string>();
   const backgroundUnwatchTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  // ---- 背景同期ヒント（background-sync-hints）----
+  // 新しい engine（= 新しい接続）は処理中会話を背景購読するとき、iOS へどこまで届いているかを知らない。
+  // 境界なしで購読すると Hub は全履歴を送り直し、巨大な会話では数千件・数 MB を iOS が取り込み直して
+  // メインスレッドが秒単位で止まる（2026-10-22 実機: 再接続のたびに 2,600 件超・約 1.5MB）。iOS が
+  // 接続直後に送る会話ごとの境界を待ち、届いたらそれ以降だけを購読する。
+  const backgroundSyncHints = new Map<string, number>();
+  let backgroundSyncHintsSettled = backgroundSyncHintsWaitMs <= 0;
+  /** ヒント待ちで送らずにいる背景購読（台帳 backgroundChatSessions には載っている）。 */
+  const deferredBackgroundSubscribes = new Set<string>();
+  /** Hub が「再開のヒント」（afterSeq と対の newerThanMs）を解釈できるか（hub_hello_ack.resumeHint）。 */
+  let hubAcceptsResumeHint = false;
   const unwatchBackgroundSession = (session: string): void => {
     const timer = backgroundUnwatchTimers.get(session);
     if (timer !== undefined) clearTimeout(timer);
     backgroundUnwatchTimers.delete(session);
     if (!backgroundChatSessions.delete(session)) return;
+    // まだ購読を送っていない（ヒント待ち）なら Hub に解除するものは無い。
+    if (deferredBackgroundSubscribes.delete(session)) return;
     if (activeChatSession.name !== session) {
       hubLink.send({ type: "conversation_unsubscribe", session });
     }
+  };
+  /**
+   * 背景購読（preview=false）を送る。この engine の転送記録から境界が作れないとき（新しい engine の
+   * 初回など）は iOS のヒントを境界にし、ヒントがまだ届いていなければ届くまで保留する。ヒントも無い
+   * 会話（iOS が手元にログを持たない）は従来どおり全履歴を受け取る。
+   */
+  const sendBackgroundSubscribe = (
+    session: string,
+    boundary: { afterSeq?: number; newerThanMs?: number },
+  ): void => {
+    if (boundary.afterSeq === undefined && boundary.newerThanMs === undefined) {
+      if (!backgroundSyncHintsSettled) {
+        deferredBackgroundSubscribes.add(session);
+        return;
+      }
+      const hint = backgroundSyncHints.get(session);
+      if (hint !== undefined) boundary = { newerThanMs: hint };
+    }
+    // ヒントは「この engine がまだその会話を購読していない」ときの境界。一度購読したら以後は自分の
+    // 転送記録で続ける（古いヒントを既存購読へ付けると Hub が古い時刻から backfill をやり直す）。
+    backgroundSyncHints.delete(session);
+    deferredBackgroundSubscribes.delete(session);
+    hubLink.send({ type: "conversation_subscribe", session, ...boundary, preview: false });
+  };
+  /** この engine の転送記録から背景購読の境界を作る（無ければ空 = ヒントか全履歴）。 */
+  const backgroundSubscribeBoundary = (session: string): { afterSeq?: number; newerThanMs?: number } => {
+    const afterSeq = lastServerSeq.get(session);
+    const forwardedAtMs = lastForwardedAtMs.get(session);
+    if (afterSeq !== undefined) {
+      // 同じ Hub 世代の続き。Hub の共有 tail が止まっていると afterSeq だけでは頭から再生し直すので、
+      // 解釈できる Hub には最終転送時刻（− 5 秒）を「再開のヒント」として添える（使ってよいかは Hub が
+      // 判定する。onReconnect と同じ規則。全履歴の再生が完走していない会話には添えない）。
+      const resume = hubAcceptsResumeHint && forwardedAtMs !== undefined &&
+        !historyBackfillSessions.has(session);
+      return { afterSeq, ...(resume ? { newerThanMs: Math.max(0, forwardedAtMs - 5_000) } : {}) };
+    }
+    return forwardedAtMs !== undefined ? { newerThanMs: Math.max(0, forwardedAtMs - 5_000) } : {};
+  };
+  /** ヒント待ちを終え、保留していた背景購読を送る。 */
+  const settleBackgroundSyncHints = (): void => {
+    if (backgroundSyncHintsSettled) return;
+    backgroundSyncHintsSettled = true;
+    if (backgroundSyncHintsTimer !== null) clearTimeout(backgroundSyncHintsTimer);
+    backgroundSyncHintsTimer = null;
+    for (const session of [...deferredBackgroundSubscribes]) {
+      deferredBackgroundSubscribes.delete(session);
+      if (activeChatSession.name === session || !backgroundChatSessions.has(session)) continue;
+      sendBackgroundSubscribe(session, backgroundSubscribeBoundary(session));
+    }
+  };
+  let backgroundSyncHintsTimer: ReturnType<typeof setTimeout> | null = backgroundSyncHintsSettled
+    ? null
+    : setTimeout(settleBackgroundSyncHints, backgroundSyncHintsWaitMs);
+  backgroundSyncHintsTimer?.unref();
+  /** 前面購読を送った会話のヒントを捨てる（以後は前面購読の続きとして扱う）。 */
+  const consumeBackgroundSyncHint = (session: string): void => {
+    backgroundSyncHints.delete(session);
+  };
+  const applyBackgroundSyncHints = (hints: readonly { session: string; newerThanMs: number }[]): void => {
+    // 前面の開き直し（subscribeConversation）と同じく host の現在時刻で頭打ちにする（端末の時計が
+    // 進んでいると、共有 tail が新着まで境界より前として捨て続けるため）。
+    const now = Date.now();
+    for (const hint of hints) backgroundSyncHints.set(hint.session, Math.min(hint.newerThanMs, now));
+    settleBackgroundSyncHints();
   };
   const watchBackgroundSession = (session: string, newerThanMs?: number, subscribe = true): void => {
     const timer = backgroundUnwatchTimers.get(session);
@@ -493,18 +584,11 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     // （実測 2026-09-07: 1 会話で毎分 70 回超の tail 再起動、249 行 × 回数の再送）。
     if (alreadyWatching) return;
     // Hub 世代内の seq が無い（retire 後の再購読等）場合は、最終転送時刻を境界にして全履歴再生を避ける
-    // （再接続の backfill と同じ規則: 転送遅延ぶん 5 秒重ねる）。
-    const forwardedAtMs = lastForwardedAtMs.get(session);
-    hubLink.send({
-      type: "conversation_subscribe",
+    // （再接続の backfill と同じ規則: 転送遅延ぶん 5 秒重ねる）。どちらも無ければ iOS のヒント。
+    sendBackgroundSubscribe(
       session,
-      ...(newerThanMs !== undefined
-        ? { newerThanMs }
-        : lastServerSeq.has(session)
-          ? { afterSeq: lastServerSeq.get(session)! }
-          : forwardedAtMs !== undefined ? { newerThanMs: Math.max(0, forwardedAtMs - 5_000) } : {}),
-      preview: false,
-    });
+      newerThanMs !== undefined ? { newerThanMs } : backgroundSubscribeBoundary(session),
+    );
   };
   const finishWatchingBackgroundSession = (session: string): void => {
     if (activeChatSession.name === session || !backgroundChatSessions.has(session)) return;
@@ -609,6 +693,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           // 再接続の requiresFullBackfill と同じ規則）。
           const forwardedAtMs = historyBackfillSessions.has(message.session)
             ? undefined : lastForwardedAtMs.get(message.session);
+          consumeBackgroundSyncHint(message.session);
           hubLink.send({
             type: "conversation_subscribe", session: message.session,
             ...(forwardedAtMs !== undefined ? { newerThanMs: Math.max(0, forwardedAtMs - 5_000) } : {}),
@@ -869,6 +954,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
       }
       const restarted = hubBootId !== null && hubBootId !== bootId;
       hubBootId = bootId;
+      hubAcceptsResumeHint = resumeHint === true;
       const requiresFullBackfill = restarted ? new Set(historyBackfillSessions) : new Set<string>();
       if (restarted) {
         // serverSeq は Hub 世代ローカル。現在未購読の会話も含め旧 checkpoint を全破棄し、
@@ -921,6 +1007,9 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
       if (activeChatSession.name !== null) sessions.add(activeChatSession.name);
       for (const session of sessions) {
         const preview = session === activeChatSession.name;
+        // ヒント待ちで保留中の背景購読はまだ Hub へ送っていない（転送もしていない）。世代が変わっても
+        // 切断時刻の巻き戻しで購読せず、ヒントが届いてから（無ければ全履歴で）1 回だけ購読する。
+        if (!preview && deferredBackgroundSubscribes.has(session)) continue;
         if (restarted) {
           // serverSeq は Hub プロセス内の採番なので世代を越えて比較できない。切断時刻以降だけを
           // transcript から backfill し、既表示本文の全履歴再送と停止中の追記欠落をともに避ける。
@@ -947,10 +1036,13 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           const afterSeq = lastServerSeq.get(session);
           const forwardedAtMs = resumeHint !== true || afterSeq === undefined || historyBackfillSessions.has(session)
             ? undefined : lastForwardedAtMs.get(session);
-          hubLink.send({ type: "conversation_subscribe", session,
+          const boundary = {
             ...(afterSeq !== undefined ? { afterSeq } : {}),
             ...(forwardedAtMs !== undefined ? { newerThanMs: Math.max(0, forwardedAtMs - 5_000) } : {}),
-            preview });
+          };
+          // 背景購読で境界が何も無い（新しい engine の初回）ときは iOS のヒントを待って使う。
+          if (!preview) sendBackgroundSubscribe(session, boundary);
+          else hubLink.send({ type: "conversation_subscribe", session, ...boundary, preview });
         }
       }
     };
@@ -1056,6 +1148,8 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           processingSessions,
           backgroundChatSessions,
           watchBackgroundSession,
+          applyBackgroundSyncHints,
+          consumeBackgroundSyncHint,
           lastServerSeq,
           codexAppServer,
           codexTurnController,
@@ -1086,6 +1180,8 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     lifecycleAbort.abort();
     for (const timer of backgroundUnwatchTimers.values()) clearTimeout(timer);
     backgroundUnwatchTimers.clear();
+    if (backgroundSyncHintsTimer !== null) clearTimeout(backgroundSyncHintsTimer);
+    backgroundSyncHintsTimer = null;
     // 切り離した処理（conversation-delete の kill→削除）は Hub へ session_retire 等を送るので、
     // Hub 接続を閉じる前に終わらせる（閉じた後の送信は届かず、Hub に旧 actor / queue が残る）。
     await Promise.allSettled(background);

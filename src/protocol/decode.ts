@@ -3,6 +3,7 @@
 // ProtocolDecodeError（呼び出し元は安全側 = 破棄/deny に倒す）。
 
 import {
+  BACKGROUND_SYNC_HINTS_MAX,
   PROTOCOL_LEGACY,
   PROTOCOL_MAX_SUPPORTED,
   type ClaudeAccountUsage,
@@ -1277,6 +1278,18 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         ok: requireBoolean(raw, "ok"),
         error: optionalNullableString(raw, "error") ?? null,
       };
+
+    case "background_sync_hints": {
+      const sessions = requireArray(raw, "sessions").slice(0, BACKGROUND_SYNC_HINTS_MAX).map((element) => {
+        const hint = requireObject(element, "sessions");
+        const newerThanMs = requireNumber(hint, "newerThanMs");
+        if (!Number.isInteger(newerThanMs) || newerThanMs < 0) {
+          throw new ProtocolDecodeError("missing-field", "newerThanMs");
+        }
+        return { session: requireString(hint, "session"), newerThanMs };
+      });
+      return { type, v, sessions };
+    }
 
     case "background_command_stop_request":
       return { type, v, id: requireString(raw, "id"), nodeId: requireString(raw, "nodeId") };

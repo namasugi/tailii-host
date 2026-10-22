@@ -859,6 +859,176 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
+  test("新しい engine の背景購読は iOS の背景同期ヒントを待ち、届いた境界以降だけを購読する", async () => {
+    const send = vi.fn();
+    const hubLink: HubLink = { onMessage: null, onReconnect: null, send, close: vi.fn() };
+    const engine = startEngine({
+      sessionManager: makeManager(new MockTmuxRunner(() => ok(""))),
+      hubLink,
+      backgroundSyncHintsWaitMs: 60_000,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    hubLink.onReconnect?.({
+      bootId: "boot-a", disconnectedAtMs: null, processingSessions: ["big", "unknown"], resumeHint: true,
+    });
+    await engine.lines.nextOfType("session_processing_state");
+    // ヒントが届くまでは境界の無い背景購読を送らない（全履歴の再送を始めない）。
+    expect(send).not.toHaveBeenCalledWith(expect.objectContaining({ type: "conversation_subscribe" }));
+
+    engine.writeLine(
+      '{"sessions":[{"newerThanMs":1700000000000,"session":"big"}],"type":"background_sync_hints","v":1}',
+    );
+    await vi.waitFor(() => {
+      expect(send).toHaveBeenCalledWith({
+        type: "conversation_subscribe", session: "big", newerThanMs: 1_700_000_000_000, preview: false,
+      });
+    });
+    // iOS が手元にログを持たない会話は従来どおり全履歴を受け取る。
+    expect(send).toHaveBeenCalledWith({ type: "conversation_subscribe", session: "unknown", preview: false });
+    expect(send.mock.calls.filter(([m]) => m.type === "conversation_subscribe")).toHaveLength(2);
+
+    // ヒントを受け取った後の処理中通知（live）でも、転送記録が無ければヒントを境界にする。
+    engine.writeLine(
+      '{"sessions":[{"newerThanMs":42,"session":"later"}],"type":"background_sync_hints","v":1}',
+    );
+    await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(2));
+    hubLink.onMessage?.({ type: "session_processing", session: "later", state: "active" });
+    await vi.waitFor(() => {
+      expect(send).toHaveBeenCalledWith({
+        type: "conversation_subscribe", session: "later", newerThanMs: 42, preview: false,
+      });
+    });
+    await engine.teardown();
+  });
+
+  test("背景同期ヒントが届かなければ待ちの上限の後に従来どおり購読する", async () => {
+    const send = vi.fn();
+    const hubLink: HubLink = { onMessage: null, onReconnect: null, send, close: vi.fn() };
+    const engine = startEngine({
+      sessionManager: makeManager(new MockTmuxRunner(() => ok(""))),
+      hubLink,
+      backgroundSyncHintsWaitMs: 30,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    hubLink.onReconnect?.({ bootId: "boot-a", disconnectedAtMs: null, processingSessions: ["work"] });
+    await engine.lines.nextOfType("session_processing_state");
+    expect(send).not.toHaveBeenCalled();
+    await vi.waitFor(() => {
+      expect(send).toHaveBeenCalledWith({ type: "conversation_subscribe", session: "work", preview: false });
+    });
+    await engine.teardown();
+  });
+
+  test("ヒント待ちの間に retire / 前面化した会話は保留していた背景購読を送らない", async () => {
+    const send = vi.fn((message: { type: string; id?: string; session?: string }) => {
+      if (message.type === "hub_state_request") queueMicrotask(() => hubLink.onMessage?.({
+        type: "hub_state_response", id: message.id!, session: message.session!,
+        pendingQuestion: null, processing: true,
+      }));
+      return true;
+    });
+    const hubLink: HubLink = { onMessage: null, onReconnect: null, send, close: vi.fn() };
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("front\n") : ok(""));
+    const store = makeTempStore();
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store), metadataStore: store, hubLink,
+      backgroundSyncHintsWaitMs: 60_000,
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    hubLink.onReconnect?.({
+      bootId: "boot-a", disconnectedAtMs: null, processingSessions: ["gone", "front"],
+    });
+    await engine.lines.nextOfType("session_processing_state");
+    hubLink.onMessage?.({ type: "conversation_retired", session: "gone" });
+    engine.writeLine('{"id":"open-front","name":"front","type":"session_reattach","v":2,"newerThanMs":5}');
+    await engine.lines.nextOfType("session_list_response");
+    engine.writeLine('{"sessions":[],"type":"background_sync_hints","v":1}');
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    const subscribes = send.mock.calls.map(([m]) => m).filter((m) => m.type === "conversation_subscribe");
+    expect(subscribes).not.toContainEqual(expect.objectContaining({ session: "gone" }));
+    expect(subscribes).not.toContainEqual(expect.objectContaining({ session: "front", preview: false }));
+    expect(subscribes).toContainEqual(expect.objectContaining({ session: "front", preview: true }));
+    await engine.teardown();
+  });
+
+  test("ヒント待ちの間に Hub が再起動しても保留中の会話を切断時刻で購読せず、ヒントで 1 回だけ購読する", async () => {
+    const send = vi.fn();
+    const hubLink: HubLink = { onMessage: null, onReconnect: null, send, close: vi.fn() };
+    const engine = startEngine({
+      sessionManager: makeManager(new MockTmuxRunner(() => ok(""))),
+      hubLink,
+      backgroundSyncHintsWaitMs: 60_000,
+    });
+    await engine.lines.nextOfType("channel_hello");
+    hubLink.onReconnect?.({ bootId: "A", disconnectedAtMs: null, processingSessions: ["x"], resumeHint: true });
+    await engine.lines.nextOfType("session_processing_state");
+    hubLink.onReconnect?.({ bootId: "B", disconnectedAtMs: Date.now(), processingSessions: ["x"], resumeHint: true });
+    expect(send).not.toHaveBeenCalledWith(expect.objectContaining({ type: "conversation_subscribe" }));
+
+    engine.writeLine('{"sessions":[{"newerThanMs":1000,"session":"x"}],"type":"background_sync_hints","v":1}');
+    await vi.waitFor(() => {
+      expect(send).toHaveBeenCalledWith({
+        type: "conversation_subscribe", session: "x", newerThanMs: 1000, preview: false,
+      });
+    });
+    expect(send.mock.calls.filter(([m]) => m.type === "conversation_subscribe")).toHaveLength(1);
+    await engine.teardown();
+  });
+
+  test("使った背景同期ヒントは捨て、前面から降格するときに古い境界を付けない", async () => {
+    const send = vi.fn((message: { type: string; id?: string; session?: string }) => {
+      if (message.type === "hub_state_request") queueMicrotask(() => hubLink.onMessage?.({
+        type: "hub_state_response", id: message.id!, session: message.session!,
+        pendingQuestion: null, processing: true,
+      }));
+      return true;
+    });
+    const hubLink: HubLink = { onMessage: null, onReconnect: null, send, close: vi.fn() };
+    const store = makeTempStore();
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("front\nback\n") : ok(""));
+    const engine = startEngine({
+      sessionManager: makeManager(runner, store), metadataStore: store, hubLink,
+      backgroundSyncHintsWaitMs: 60_000,
+    });
+    await engine.lines.nextOfType("channel_hello");
+    hubLink.onReconnect?.({
+      bootId: "A", disconnectedAtMs: null, processingSessions: ["front", "back"], resumeHint: true,
+    });
+    await engine.lines.nextOfType("session_processing_state");
+    engine.writeLine(
+      '{"sessions":[{"newerThanMs":1000,"session":"front"},{"newerThanMs":2000,"session":"back"}],' +
+        '"type":"background_sync_hints","v":1}',
+    );
+    await vi.waitFor(() => expect(send).toHaveBeenCalledWith({
+      type: "conversation_subscribe", session: "back", newerThanMs: 2000, preview: false,
+    }));
+
+    engine.writeLine('{"id":"open-front","name":"front","type":"session_reattach","v":2,"newerThanMs":5000}');
+    await engine.lines.nextOfType("session_list_response");
+    send.mockClear();
+    engine.writeLine('{"id":"idle-1","name":"front","type":"session_idle_hint","v":1}');
+    await vi.waitFor(() => expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "conversation_subscribe", session: "front", preview: false }),
+    ));
+    expect(send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: "conversation_subscribe", session: "front", newerThanMs: 1000,
+    }));
+
+    // 一度使ったヒントは、処理中の再通知（retire 後の再購読など）でも使い回さない。
+    hubLink.onMessage?.({ type: "conversation_retired", session: "back" });
+    send.mockClear();
+    hubLink.onMessage?.({ type: "session_processing", session: "back", state: "active" });
+    await vi.waitFor(() => expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "conversation_subscribe", session: "back", preview: false }),
+    ));
+    expect(send).not.toHaveBeenCalledWith(expect.objectContaining({ session: "back", newerThanMs: 2000 }));
+    await engine.teardown();
+  });
+
   test("旧 Hub の hello に snapshot が無い場合は既知の背景処理状態を維持する", async () => {
     const send = vi.fn();
     const hubLink: HubLink = {

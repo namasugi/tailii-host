@@ -327,6 +327,11 @@ export const conversationHandlers: HandlerRegistry = {
     })();
   },
 
+  background_sync_hints: (message, ctx) => {
+    // iOS が engine 張り直しの直後に送る、会話ごとの背景同期の境界（background-sync-hints）。
+    ctx.applyBackgroundSyncHints(message.sessions);
+  },
+
   claude_session_list_request: async (message, ctx) => {
     const { writer, state } = ctx;
     const v = state.negotiatedVersion;

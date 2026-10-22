@@ -139,6 +139,13 @@ export interface HandlerContext {
    * 残すと、上限や冪等性の規則がここと食い違うため、降格はすべてこの閉包を通す。
    */
   watchBackgroundSession: (session: string) => void;
+  /**
+   * iOS の背景同期ヒント（`background_sync_hints`）を取り込み、ヒント待ちで保留していた背景購読を送る
+   * （background-sync-hints）。
+   */
+  applyBackgroundSyncHints: (hints: readonly { session: string; newerThanMs: number }[]) => void;
+  /** 前面購読を送った会話の背景同期ヒントを捨てる（前面から降格したときに古いヒントを付けない）。 */
+  consumeBackgroundSyncHint: (session: string) => void;
   /** Hub 世代内で iOS へ連続配送済みの最後の conversation seq。 */
   lastServerSeq: Map<string, number>;
   /** Codex モデル一覧を取得する共有 App Server。 */
@@ -202,6 +209,7 @@ export function subscribeConversation(ctx: HandlerContext, session: string, newe
     }
   }
   ctx.backgroundChatSessions.delete(session);
+  ctx.consumeBackgroundSyncHint(session);
   ctx.hubLink.send({ type: "conversation_subscribe", session,
     ...(newerThanMs !== undefined
       ? { newerThanMs }
