@@ -72,7 +72,7 @@ export function codexRolloutSystemNotice(
   const maxRetries = nonNegativeInteger(payload["max_retries"]);
   const retrying = kind === "stream_error" &&
     (maxRetries === null || attempt === null || attempt < maxRetries);
-  const detail = clip(message, NOTICE_DETAIL_LIMIT);
+  const detail = clip(kind === "stream_error" ? withoutRetryCounter(message) : message, NOTICE_DETAIL_LIMIT);
   const text = kind === "warning"
     ? `⚠️ Codex 警告: ${detail}`
     : retrying
@@ -95,7 +95,10 @@ export function codexAppServerSystemNotice(
     const turnId = nonEmptyString(params["turnId"]) ?? "unknown-turn";
     const message = turnErrorMessage(params["error"]);
     const willRetry = params["willRetry"] === true;
-    const detail = clip(message ?? "Codex でエラーが発生しました。", NOTICE_DETAIL_LIMIT);
+    // 再試行中の本文は「Reconnecting... 2/5 — 原因」のように回数を含む。回数ごとに別注記に
+    // なると 1 回の切断で 4〜5 行並ぶ（実障害 2026-10-21）ため、回数を外して turn × 原因で 1 行に畳む。
+    const raw = message ?? "Codex でエラーが発生しました。";
+    const detail = clip(willRetry ? withoutRetryCounter(raw) : raw, NOTICE_DETAIL_LIMIT);
     return willRetry
       ? notice(
         `turn-retry:${turnId}:${detail}`,
@@ -279,6 +282,15 @@ function notice(itemId: string, identity: string, text: string): CodexSystemNoti
       eof: true,
     },
   };
+}
+
+/**
+ * Codex の再試行本文の先頭にある回数表記（`Reconnecting... 2/5`）を外す。
+ * 回数しか無い本文は回数抜きの「Reconnecting...」を残す（空にしない）。
+ */
+function withoutRetryCounter(text: string): string {
+  const stripped = text.replace(/^\s*Reconnecting\.\.\.\s*\d+\s*\/\s*\d+\s*(?:[—–-]\s*)?/u, "").trim();
+  return stripped.length > 0 ? stripped : "Reconnecting...";
 }
 
 function noticeMessage(payload: Record<string, unknown>): string | null {

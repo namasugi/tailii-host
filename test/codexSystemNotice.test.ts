@@ -134,6 +134,43 @@ describe("codexSystemNotice", () => {
     expect(terminal?.payload.text).toBe("❌ Codex エラー: gateway timeout");
   });
 
+  test("App Server の再試行は回数表記（Reconnecting... n/m）を外して turn × 原因で 1 行に畳む", () => {
+    // 実障害 2026-10-21: websocket 切断の再試行 2/5〜5/5 が 4 行並んだ。
+    const cause = "stream disconnected before completion: websocket closed by server before response.completed";
+    const retries = [2, 3, 4, 5].map((n) => codexAppServerSystemNotice("error", {
+      threadId: "thread-1", turnId: "turn-1", willRetry: true,
+      error: { message: `Reconnecting... ${n}/5`, additionalDetails: cause },
+    }));
+    expect(new Set(retries.map((notice) => notice?.itemId)).size).toBe(1);
+    expect(new Set(retries.map((notice) => notice?.payload.streamId)).size).toBe(1);
+    expect(retries[0]?.payload.text).toBe(`⚠️ Codex エラー（自動再試行中）: ${cause}`);
+    // 別 turn・別原因は別注記のまま。
+    const otherTurn = codexAppServerSystemNotice("error", {
+      threadId: "thread-1", turnId: "turn-2", willRetry: true,
+      error: { message: "Reconnecting... 2/5", additionalDetails: cause },
+    });
+    expect(otherTurn?.payload.streamId).not.toBe(retries[0]?.payload.streamId);
+    // 回数しか無い本文も空にはしない。
+    expect(codexAppServerSystemNotice("error", {
+      turnId: "turn-3", willRetry: true, error: { message: "Reconnecting... 1/5" },
+    })?.payload.text).toBe("⚠️ Codex エラー（自動再試行中）: Reconnecting...");
+    // 再試行でないエラー本文は手を加えない。
+    expect(codexAppServerSystemNotice("error", {
+      turnId: "turn-4", willRetry: false, error: { message: "Reconnecting... 5/5" },
+    })?.payload.text).toBe("❌ Codex エラー: Reconnecting... 5/5");
+    // rollout の stream_error も同じく回数を外して畳む。
+    const r2 = codexRolloutSystemNotice({
+      type: "stream_error", turn_id: "turn-1", message: `Reconnecting... 2/5 — ${cause}`,
+      retry_attempt: 2, max_retries: 5,
+    });
+    const r3 = codexRolloutSystemNotice({
+      type: "stream_error", turn_id: "turn-1", message: `Reconnecting... 3/5 — ${cause}`,
+      retry_attempt: 3, max_retries: 5,
+    });
+    expect(r2?.payload.streamId).toBe(r3?.payload.streamId);
+    expect(r2?.payload.text).toBe(`⚠️ Codex エラー（自動再試行中）: ${cause}`);
+  });
+
   test("長い詳細は改行を畳んで上限で切る", () => {
     const notice = codexAppServerSystemNotice("warning", {
       message: "first\n" + "x".repeat(500),
