@@ -40,6 +40,7 @@ import {
   CHOICE_CANCEL_MAX_POLLS,
   CHOICE_CANCEL_POLL_MS,
   claudeComposerBarVisible,
+  deferIfStopping,
   claudeInputBoxRendered,
   extractClaudeInputBox,
   inputBoxHasRealPendingText,
@@ -68,6 +69,7 @@ import {
   PASTED_TEXT_POLL_MS,
   PASTED_TEXT_TIMEOUT_MS,
   TYPED_TEXT_CLEAR_SETTLE_MS,
+  ChatInjectionDeferredError,
   ChatInjectionRejectedError,
   classifySubmitFrame,
   SEND_NOW_MAX_POLLS,
@@ -777,17 +779,19 @@ export class HerdrSessionManager {
    */
   async sendTextSubmit(name: string, text: string, options: SendTextSubmitOptions = {}): Promise<void> {
     const startedAtMs = Date.now();
+    // hub が終了の準備に入っていたら、打ち始める前に見送る（起動待ち・描画待ちの間も確かめる）。
+    deferIfStopping(options);
     // ブート直後の注入は本文ごと TUI 初期化に破棄され得る（実測: 入力欄にも jsonl にも
     // 残らない）。herdr の claude 検出（agent_status が unknown を抜けるまで）を注入の
     // 準備完了ゲートにする。working（処理中の queue 入力）も注入可。判定不能は fail-open。
-    await this.waitForAgentReady(name);
+    await this.waitForAgentReady(name, options);
     // 入力欄が描画されるまで 1 キーも打たない（boot-gate）。起動中の TUI に打った本文は
     // 反映検証では見えない（偽陰性）のに TUI 側には保持され、入力欄が現れた時点で残留する。
     // 旧実装はここで throw → アプリの明示再送 → 冒頭の残留 flush（Enter）が残留分を独立送信
     // → 本文を再注入、で同一本文が 2 ターン届いていた（2026-09-07 実機: 新規会話の初回送信が
     // 「⚠️ 送信失敗」表示のうえ二重）。上限まで現れなければ何も打たずに throw し、明示再送
     // （=fresh な注入）に倒す。
-    const inputBox = await this.waitForInputBoxRendered(name, options.cancelChoiceDialog === true);
+    const inputBox = await this.waitForInputBoxRendered(name, options.cancelChoiceDialog === true, options);
     // 上へスクロールされたまま戻らなかった。本文は 1 キーも打っていないので「打つ前の拒否」として
     // 返し、後続の送信を止めない（配送不明扱いにすると以降の送信が全部詰まる）。
     // 隠れたダイアログを Esc で閉じたことは、この後どう失敗しても先に伝える（hub が設問を片付ける。
@@ -884,6 +888,9 @@ export class HerdrSessionManager {
         "ダイアログの表示中はメッセージを送信できません（アプリで選択肢に答えてから送り直してください）",
       );
     }
+    // ここから入力欄を触る（残り物を消す / 送り出す・シェルモードを抜ける・本文を打つ）。hub が終了の準備に
+    // 入っていたら、1 キーも打たずに見送る（次の hub が届ける）。ダイアログを閉じた事実は上で伝え済み。
+    deferIfStopping(options);
     const pending = injectFrame === "pending" ? await this.inputBoxPendingText(name) : "";
     if (pending.length > 0) {
       // 判定の順序が肝心: 中断で書き戻された直前の発話（配送済み）は、Tailii が打って送信を確かめられ
@@ -1211,9 +1218,11 @@ export class HerdrSessionManager {
    * `pane get` の agent_status を読む。pane 不在は即 fail-open（後続 sendKeys が
    * pane not found で正しく失敗する）。
    */
-  private async waitForAgentReady(name: string): Promise<void> {
+  private async waitForAgentReady(name: string, options: SendTextSubmitOptions = {}): Promise<void> {
     const deadline = Date.now() + this.readyTimeoutMs;
     for (;;) {
+      // 待っている間に hub が終了の準備に入ったら、1 キーも打たずに見送る（最大 10 秒待たない）。
+      deferIfStopping(options);
       try {
         const target = await this.paneTarget(name);
         if (target === null) return;
@@ -1242,12 +1251,18 @@ export class HerdrSessionManager {
    * 20 秒待って「入力欄不可視」で失敗した）。戻すキーは入力欄の下書きも選択肢も動かさない。
    */
   private async waitForInputBoxRendered(
-    name: string, cancelHiddenDialog: boolean,
+    name: string, cancelHiddenDialog: boolean, options: SendTextSubmitOptions = {},
   ): Promise<{ state: "ready" | "timeout" | "scrolled" | "escaped-unconfirmed"; hiddenDialogCancelled: boolean }> {
     const deadline = Date.now() + this.inputBoxReadyTimeoutMs;
     let revealTried = false;
     let hiddenDialogCancelled = false;
     for (;;) {
+      // 待っている間に hub が終了の準備に入ったら見送る（最大 20 秒待たない）。隠れたダイアログを閉じた
+      // 後なら、その事実を先に伝える（伝え漏れると hub が閉じた設問を再提示する）。
+      if (options.mayStartTyping?.() === false) {
+        if (hiddenDialogCancelled) options.onChoiceDialogCancelled?.();
+        throw new ChatInjectionDeferredError();
+      }
       const window = await this.captureDialogWindow(name);
       // 読めなければ従来どおり進める（fail-open）。ただし隠れた画面へキーを送った後は、何が起きたか
       // 確かめられないので打たない（隠れた設問ダイアログへ本文が入ると選択肢が動く）。

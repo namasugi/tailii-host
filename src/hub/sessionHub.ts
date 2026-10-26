@@ -37,9 +37,11 @@ import type { QuestionAnswer } from "../protocol.js";
 import { formatQuestionAnswerText, type QuestionDialogPresence } from "./questionInjection.js";
 import { PROTOCOL_V1, PROTOCOL_V2 } from "../protocol.js";
 import {
+  ChatInjectionDeferredError,
   ChatInjectionRejectedError,
   LoginCodeError,
   SEND_NOW_BLOCKED_BY_DIALOG,
+  SEND_NOW_BLOCKED_BY_SHUTDOWN,
   SEND_NOW_EXPIRED_IN_QUEUE,
   type SendQueuedNowOutcome,
 } from "../backend/tmux.js";
@@ -103,6 +105,11 @@ export interface ChatInjectContext {
   onChoiceCancelled: () => void;
   /** backend が入力欄に残っていた文字を送らずに消したときに呼ぶ（residue-clear。hub は会話内に出す）。 */
   onResidueDiscarded?: (text: string) => void;
+  /**
+   * 本文を打ち始めてよいか（graceful shutdown）。hub が終了の準備に入ると false になり、backend は打ち始める
+   * 前に `ChatInjectionDeferredError` で抜ける（hub は発話を queued へ戻し、次の hub が届ける）。
+   */
+  mayStartTyping?: () => boolean;
 }
 
 export type HubTailFactory = (
@@ -382,6 +389,10 @@ function defaultTranscriptPathFor(meta: SessionMeta): string | null {
 /** 入力欄から消した残り文字を会話内に見せる長さ（文字数。超えたら先頭だけ + …）。 */
 const RESIDUE_EXCERPT_CHARS = 60;
 
+/** hub の終了の準備中（graceful shutdown）に届いた、外部の操作を伴う要求への答え（もう一度試せる）。 */
+const STOP_BLOCKED_BY_SHUTDOWN = "ホスト側の再起動中のため止められませんでした。少し待ってもう一度試してください。";
+const GOAL_BLOCKED_BY_SHUTDOWN = "ホスト側の再起動中のため目標を変更できませんでした。少し待ってもう一度試してください。";
+
 class StaleQuestionError extends Error {
   constructor() {
     super("AskUserQuestion dialog is not on screen");
@@ -401,6 +412,10 @@ export class SessionHub {
   private readonly replayLimit: number;
   private injectionsInFlight = 0;
   private codexStartsInFlight = 0;
+  /** 終了の準備中（`drainForShutdown`）。新しい注入（chat・今すぐ送信・Codex の turn 開始）を始めない。 */
+  private shuttingDown = false;
+  /** 注入以外で外部の操作を伴う要求（背景コマンドの停止・Codex の目標）の実行中の件数。終了の前に待つ。 */
+  private opsInFlight = 0;
   private modePushSeq = 0;
   private chatReceiptsDirty = false;
   /**
@@ -426,6 +441,39 @@ export class SessionHub {
   get hasInjectionsInFlight(): boolean { return this.injectionsInFlight > 0; }
   get hasCodexTurnsInFlight(): boolean {
     return this.codexStartsInFlight > 0 || this.activeCodexTurns.size > 0;
+  }
+
+  /**
+   * 終了の前に、実行中の注入が終わるのを待つ（graceful shutdown, 2026-10-26）。呼んだ後は新しい注入を
+   * 始めない（queue に残った発話は queued のまま受理記録に残り、次の hub が復元して届ける）。
+   *
+   * 注入の途中（本文を打った後・Enter の後、配送済みの保存の前）で終わると、その発話は再起動後に配送不明
+   * （uncertain）になり、アプリが同じ ID で明示再送する。Enter が効いていれば二重に届き、打っただけなら
+   * 入力欄に本文が残る。完了まで待てば配送済みが保存され、明示再送は `duplicate` で片付く。
+   * 待つのは chat / 今すぐ送信 / 設問の回答キーの注入、Codex の turn 開始の要求、背景コマンドの停止と Codex の
+   * 目標の操作まで（始まった Codex の turn そのものは App Server 側で続くので待たない）。打ち始める前の注入は
+   * `mayStartTyping` が false になって backend が見送り、queued へ戻る（待たずに終わる）。
+   * 待つ間も client の接続は開いたまま（終わった発話の ACK がそのまま届く）。届いた要求は、chat / Codex の
+   * turn は queued のまま次の hub へ、今すぐ送信・背景コマンドの停止・Codex の目標は断り、TUI の設問への回答は
+   * unknown（アプリが自動再送）で返す。上限を過ぎたら待つのをやめる（従来どおり配送不明として残る）。
+   */
+  async drainForShutdown(timeoutMs: number, pollMs = 50): Promise<{ inFlight: number; drained: boolean; waitedMs: number }> {
+    this.shuttingDown = true;
+    const startedAt = Date.now();
+    const pending = (): number => this.injectionsInFlight + this.codexStartsInFlight + this.opsInFlight;
+    const inFlight = pending();
+    while (pending() > 0 && Date.now() - startedAt < timeoutMs) {
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
+    }
+    // 注入の完了で書けなかった受理記録（ふだんは tick が書き直す）を、終わる前に書き直す。
+    if (this.chatReceiptsDirty) this.persistChatReceipts();
+    return { inFlight, drained: pending() === 0, waitedMs: Date.now() - startedAt };
+  }
+
+  /** 外部の操作を伴う要求の実行中を数える（終了の前に待つ, `drainForShutdown`）。 */
+  private trackOp<T>(work: Promise<T>): Promise<T> {
+    this.opsInFlight += 1;
+    return work.finally(() => { this.opsInFlight -= 1; });
   }
   /** 新しく接続した engine が処理中会話を直ちに購読するための軽量スナップショット。 */
   get processingSessionNames(): string[] {
@@ -519,8 +567,12 @@ export class SessionHub {
     if (changed) this.persistPendingQuestions();
   }
 
-  /** daemon 再起動前に durable enqueue 済みだった chat_send と receipt を復元する。 */
-  restoreChatReceipts(): void {
+  /**
+   * daemon 再起動前に durable enqueue 済みだった chat_send と receipt を復元する。
+   * `startDrains: false` は復元だけして、queue の注入はまだ始めない（daemon は socket を勝ち取ってから
+   * `startRestoredDrains` を呼ぶ。起動競合で負けた hub が、勝った hub と同じ発話を注入しないように）。
+   */
+  restoreChatReceipts(options: { startDrains?: boolean } = {}): void {
     const persisted = this.readChatReceipts();
     const restoredLedgerAt = Date.now();
     for (const [clientMessageId, deliveredAt] of Object.entries(this.readRetiredChatDeliveries())) {
@@ -619,10 +671,20 @@ export class SessionHub {
       );
       actor.codexQueue.sort((left, right) => actor.codexOrder.indexOf(left.message.clientUserMessageId) -
         actor.codexOrder.indexOf(right.message.clientUserMessageId));
+      if (options.startDrains !== false) {
+        void this.drainChatQueue(session, actor);
+        void this.drainCodexQueue(session, actor);
+      }
+    }
+    if (discardedStaleSession) this.persistChatReceipts();
+  }
+
+  /** 復元した queue の注入を始める（`restoreChatReceipts({ startDrains: false })` の続き）。 */
+  startRestoredDrains(): void {
+    for (const [session, actor] of this.actors) {
       void this.drainChatQueue(session, actor);
       void this.drainCodexQueue(session, actor);
     }
-    if (discardedStaleSession) this.persistChatReceipts();
   }
 
   registerClient(client: object, write: (line: string) => void): void { this.clients.set(client, write); }
@@ -756,6 +818,11 @@ export class SessionHub {
         // まま残るのに、アプリは回答を捨ててしまう（設問シートも再表示ピルも無く、答える手段が消える）。
         // 再試行できる失敗で返す（`unknown` → engine が `question_answer_failed` → アプリが 1s / 3s で
         // 自動再送）。再送が届く頃には決着している: 閉じていれば `already_resolved`、諦めていれば受理。
+        this.sendTo(client, { type: "question_answer_result", id: message.id, status: "unknown" });
+      } else if (this.shuttingDown && actor.pendingQuestion?.answerRoute === "tui") {
+        // hub の終了の準備中（graceful shutdown）。回答キーの注入を新しく始めない。設問は残したまま、再試行
+        // できる失敗で返す（アプリが 1s / 3s で自動再送し、設問を復元した次の hub が受ける）。Codex の設問は
+        // App Server の要求が再起動を越せないので、下の分岐で今すぐ答える。
         this.sendTo(client, { type: "question_answer_result", id: message.id, status: "unknown" });
       } else {
         // first-wins の判定と clear は await を挟まず同期的に行い、勝者だけが注入する。
@@ -940,6 +1007,11 @@ export class SessionHub {
       return;
     }
     if (message.type === "codex_goal_submit") {
+      // 終了の準備中は始めない（App Server の接続を新しく開いても、閉じる hub が RPC の途中で畳む）。
+      if (this.shuttingDown) {
+        this.sendTo(client, { type: "codex_goal_result", id: message.id, status: "failed", error: GOAL_BLOCKED_BY_SHUTDOWN });
+        return;
+      }
       // 目標操作（codex-goal）。turn と同じ hub 所有の thread 接続で実行し、結果と通知を会話 stream へ返す。
       const controller = this.ensureCodexTurnController();
       const goal = controller.goal;
@@ -950,12 +1022,12 @@ export class SessionHub {
         });
         return;
       }
-      void goal.call(controller, {
+      void this.trackOp(goal.call(controller, {
         session: message.session, threadId: message.threadId, cwd: message.cwd, action: message.action,
         ...(message.objective !== undefined ? { objective: message.objective } : {}),
         ...(message.status !== undefined ? { status: message.status } : {}),
         ...(message.tokenBudget !== undefined ? { tokenBudget: message.tokenBudget } : {}),
-      }).then(
+      })).then(
         (result) => {
           this.sendTo(client, {
             type: "codex_goal_result", id: message.id, status: "ok",
@@ -1096,7 +1168,15 @@ export class SessionHub {
         this.sendTo(client, { type: "background_command_stop_result", id: message.id, status: "not_found" });
         return;
       }
-      void tail.stopBackgroundCommand(message.nodeId).then(
+      // 終了の準備中は始めない（TERM → 待ち → KILL の途中で終わると、KILL を送れず結果も届かない）。
+      // 始まっていた停止は、終了の前に最後まで待つ（`trackOp`）。
+      if (this.shuttingDown) {
+        this.sendTo(client, {
+          type: "background_command_stop_result", id: message.id, status: "failed", error: STOP_BLOCKED_BY_SHUTDOWN,
+        });
+        return;
+      }
+      void this.trackOp(tail.stopBackgroundCommand(message.nodeId)).then(
         (result) => {
           this.options.log?.(
             `audit background_command_stop session=${auditValue(message.session)} status=${result.status}`,
@@ -2361,6 +2441,16 @@ export class SessionHub {
    * ダイアログでは効かず、キーだけが選択肢へ落ちる）。
    */
   private async runSendNow(session: string, actor: SessionActor): Promise<void> {
+    if (this.shuttingDown) {
+      // 終了の準備中（graceful shutdown）は chord を送らない。1 キーも送らずに断る（待たせたまま接続を閉じると、
+      // engine が再接続まで答えを返せない）。
+      for (const waiter of actor.sendNowWaiters.splice(0)) {
+        this.sendTo(waiter.client, {
+          type: "chat_send_now_result", id: waiter.id, status: "blocked", error: SEND_NOW_BLOCKED_BY_SHUTDOWN,
+        });
+      }
+      return;
+    }
     if (actor.sendNowRunning || actor.chatDrainRunning || actor.sendNowWaiters.length === 0) return;
     // 待ちすぎた要求には chord を送らない（1 キーも送らずに失敗で返す）。
     const expired = actor.sendNowWaiters.filter(
@@ -2409,11 +2499,12 @@ export class SessionHub {
   }
 
   private async drainChatQueue(session: string, actor: SessionActor): Promise<void> {
-    if (actor.chatDrainRunning || actor.chatDrainBlocked || actor.sendNowRunning ||
+    if (this.shuttingDown || actor.chatDrainRunning || actor.chatDrainBlocked || actor.sendNowRunning ||
       this.chatDrainHeldByQuestion(actor)) return;
     actor.chatDrainRunning = true;
     try {
-      while (!this.chatDrainHeldByQuestion(actor)) {
+      // 終了の準備に入ったら次の発話へ進まない（queued のまま残し、次の hub に届けさせる）。
+      while (!this.shuttingDown && !this.chatDrainHeldByQuestion(actor)) {
         const entry = actor.chatQueue[0];
         if (entry === undefined) break;
         const { message } = entry;
@@ -2456,6 +2547,8 @@ export class SessionHub {
             // 閉じた時点で片付ける（続く本文の注入が失敗しても、TUI に設問はもう無い）。
             onChoiceCancelled: resolveCancelledQuestion,
             onResidueDiscarded: (text) => this.publishResidueDiscarded(session, message.id, text),
+            // 終了の準備に入ったら、打ち始める前の発話は見送らせる（起動待ちの間まで終了を待たせない）。
+            mayStartTyping: () => !this.shuttingDown,
           }) ?? Promise.resolve());
           // 明示 kill / reaper kill が注入 await 中に actor を廃棄した場合、同名の新 actorへ
           // 古い receipt を復活させない。waiter は retireSession が既に失敗で解放している。
@@ -2483,6 +2576,15 @@ export class SessionHub {
           // 古い会話のエラーマーカーを復活させない。
           if (this.actors.get(session) !== actor) continue;
           actor.injectingChatMessageIds.delete(message.clientMessageId);
+          if (error instanceof ChatInjectionDeferredError) {
+            // 終了の準備中に、打ち始める前に見送った（1 キーも打っていない）。queue の先頭へ戻して queued の
+            // まま残し、次の hub が復元して届ける。waiter には答えない（接続を閉じると engine が配送不明にし、
+            // アプリの明示再送が次の hub の queued へ合流する）。
+            actor.chatQueue.unshift(entry);
+            this.persistChatReceipts();
+            this.options.log?.(`audit chat-inject-deferred session=${auditValue(session)}`);
+            continue;
+          }
           actor.pendingChatMessages.delete(message.clientMessageId);
           // `/login` 中の門番（LoginCodeError）は 1 キーも送る前の確定拒否 = 非配達が確定している。
           // uncertain（配送不明）に積むと削除不能・後続ブロックのゾンビになるので、失敗として
@@ -2616,10 +2718,11 @@ export class SessionHub {
   }
 
   private async drainCodexQueue(session: string, actor: SessionActor): Promise<void> {
-    if (actor.codexDrainRunning || actor.codexDrainBlocked) return;
+    if (this.shuttingDown || actor.codexDrainRunning || actor.codexDrainBlocked) return;
     actor.codexDrainRunning = true;
     try {
-      while (true) {
+      // 終了の準備に入ったら次の turn を始めない（queued のまま残し、次の hub に始めさせる）。
+      while (!this.shuttingDown) {
         const entry = actor.codexQueue[0];
         if (entry === undefined) break;
         const id = entry.message.clientUserMessageId;

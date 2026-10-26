@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { connectHubSocket, type HubLink } from "../src/hub/hubClient.js";
 import type { HubServerMessage } from "../src/hub/hubProtocol.js";
-import { startHubSocket, type HubSocketServer } from "../src/hub/hubDaemon.js";
+import { shutdownHub, startHubSocket, type HubSocketServer } from "../src/hub/hubDaemon.js";
 import { readHeartbeat, writeHeartbeat } from "../src/sessions/heartbeat.js";
 import type { ControlMessage } from "../src/protocol.js";
 import { SessionHub, type HubTail } from "../src/hub/sessionHub.js";
@@ -438,6 +438,75 @@ describe("Session Hub 復旧シナリオ (Unix socket)", () => {
       });
     } finally {
       await closeRecoveryFixture(link, server, hub);
+    }
+  });
+
+  test("注入の途中で終了しても完了を待って配送済みを残し、作り直した hub への明示再送は duplicate で片付く", async () => {
+    // 2026-10-26: hub の再起動（デプロイ・自動更新）が注入の途中に重なると、送れた発話が配送不明のまま残り、
+    // アプリの明示再送で同じ発話が 2 回届きうる（Enter の後に切れた場合）。終了の前に注入を終わらせる。
+    if (!(await canListenUnixSocket())) return;
+    const socketPath = tempSocketPath(`hub-shutdown-drain-${Date.now()}`);
+    const receiptsPath = path.join(makeTempDir("hub-shutdown-drain-receipts"), "receipts.json");
+    const metadataStore = makeTempStore();
+    metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 1, agent: "claude" });
+    let release: (() => void) | null = null;
+    const firstInjector = vi.fn(async () => {
+      await new Promise<void>((resolve) => { release = resolve; });
+    });
+    const secondInjector = vi.fn(async () => {});
+    const makeHub = (chatInjector: () => Promise<void>) => new SessionHub({
+      runner: new MockTmuxRunner(() => ok("")).runner,
+      heartbeatDir: makeTempDir("hub-shutdown-drain-heartbeat"),
+      metadataStore,
+      timeoutSeconds: 1_800,
+      chatReceiptsPath: receiptsPath,
+      chatInjector,
+    });
+    const first = makeHub(firstInjector);
+    let second: SessionHub | null = null;
+    let server = await startHubSocket({ hub: first, socketPath, version: "test", bootId: "boot-a" });
+    expect(server).not.toBeNull();
+    const link = connectHubSocket({ socketPath, ensureDaemon: () => {} });
+    const received: HubServerMessage[] = [];
+    let currentBootId: string | null = null;
+    link.onMessage = (message) => { received.push(message); };
+    link.onReconnect = ({ bootId }) => { currentBootId = bootId; };
+    try {
+      await vi.waitFor(() => expect(currentBootId).toBe("boot-a"));
+      link.send({ type: "chat_send", id: "send-1", session: "work",
+        clientMessageId: "client-drain", text: "槍は顔の後ろにした方がいいかも" });
+      await vi.waitFor(() => expect(firstInjector).toHaveBeenCalledOnce());
+      // 終了の合図。接続は開いたまま注入を最後まで続け、配送済みを保存して ACK を返してから閉じる。
+      let lockReleasedAfterAck = false;
+      const shutdown = shutdownHub({ hub: first, relayServer: null, socketServer: server, log: () => {},
+        drainTimeoutMs: 5_000,
+        finalize: () => {
+          lockReleasedAfterAck = received.some((message) =>
+            message.type === "chat_send_result" && message.id === "send-1" && message.status === "accepted");
+        } });
+      server = null;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(release).not.toBeNull();
+      (release as unknown as () => void)();
+      await shutdown;
+      // 送っていた発話の ACK は、待っている間に同じ接続で届いた（明示再送を待たずに片付く）。
+      expect(received).toContainEqual({ type: "chat_send_result", id: "send-1", status: "accepted" });
+      expect(lockReleasedAfterAck).toBe(true);
+
+      second = makeHub(secondInjector);
+      second.restoreChatReceipts();
+      server = await startHubSocket({ hub: second, socketPath, version: "test", bootId: "boot-b" });
+      expect(server).not.toBeNull();
+      await vi.waitFor(() => expect(currentBootId).toBe("boot-b"), { timeout: 3_000 });
+      // 応答を受け取れなかったアプリは、同じ ID で明示再送する。打ち直さずに duplicate で片付く。
+      link.send({ type: "chat_send", id: "retry-1", session: "work", clientMessageId: "client-drain",
+        text: "槍は顔の後ろにした方がいいかも", explicitRetry: true });
+      await vi.waitFor(() => expect(received).toContainEqual(
+        { type: "chat_send_result", id: "retry-1", status: "duplicate" }));
+      expect(secondInjector).not.toHaveBeenCalled();
+      expect(firstInjector).toHaveBeenCalledOnce();
+    } finally {
+      await closeRecoveryFixture(link, server, first, ...(second === null ? [] : [second]));
     }
   });
 });

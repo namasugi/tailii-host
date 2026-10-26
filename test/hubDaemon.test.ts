@@ -13,6 +13,8 @@ import {
   HUB_SOCKET_WRITABLE_LENGTH_LIMIT,
   pidAlive,
   readHubLock,
+  releaseOwnHubLock,
+  shutdownHub,
   startHubSocket,
   writeHubSocketLine,
 } from "../src/hub/hubDaemon.js";
@@ -40,6 +42,83 @@ function spawnRecorder(): { args: string[][]; spawnImpl: typeof import("node:chi
   }) as unknown as typeof import("node:child_process").spawn;
   return { args, spawnImpl };
 }
+
+describe("hub shutdown", () => {
+  test("shutdownHub は接続を開いたまま注入と後処理の完了を待ち、その後で接続を閉じ、最後に lock を外す", async () => {
+    // 2026-10-26: 注入の途中で切ると、送れた発話が配送不明のまま残り、アプリの明示再送で 2 回届きうる。
+    // 接続を先に閉じると engine の再接続の間隔が伸び、hub の居ない時間が待ちの長さ以上に延びる（独立検証）。
+    const order: string[] = [];
+    const logs: string[] = [];
+    let releaseFollowup: (() => void) | undefined;
+    const followup = new Promise<void>((resolve) => { releaseFollowup = resolve; });
+    setTimeout(() => { order.push("followup done"); releaseFollowup?.(); }, 15);
+    await shutdownHub({
+      relayServer: { close: async () => { order.push("relay.close"); } },
+      socketServer: { close: async () => { order.push("socket.close"); } },
+      hub: {
+        drainForShutdown: async (timeoutMs) => {
+          order.push(`drain:${timeoutMs}`);
+          await new Promise<void>((resolve) => setTimeout(resolve, 5));
+          order.push("drained");
+          return { inFlight: 1, drained: true, waitedMs: 5 };
+        },
+        close: () => { order.push("hub.close"); },
+      },
+      pendingWork: () => [followup],
+      finalize: () => { order.push("finalize"); },
+      log: (message) => logs.push(message),
+      drainTimeoutMs: 1234,
+    });
+    expect(order).toEqual([
+      "drain:1234", "drained", "followup done", "relay.close", "socket.close", "hub.close", "finalize",
+    ]);
+    expect(logs).toEqual([
+      "audit hub_shutdown_drain inflight=1 drained=true waitedMs=5 followups=1 followupsSettled=true",
+    ]);
+  });
+
+  test("shutdownHub は後処理を上限までしか待たず、閉じる・内部を閉じるのに失敗しても lock は外す", async () => {
+    const order: string[] = [];
+    const logs: string[] = [];
+    await expect(shutdownHub({
+      relayServer: { close: async () => { order.push("relay.close"); throw new Error("relay close failed"); } },
+      socketServer: { close: async () => { order.push("socket.close"); } },
+      hub: {
+        drainForShutdown: async () => { order.push("drain"); return { inFlight: 0, drained: true, waitedMs: 0 }; },
+        close: () => { order.push("hub.close"); throw new Error("hub close failed"); },
+      },
+      pendingWork: () => [new Promise<void>(() => {})],
+      finalize: () => { order.push("finalize"); },
+      log: (message) => logs.push(message),
+      drainTimeoutMs: 20,
+    })).rejects.toThrow("hub close failed");
+    expect(order).toEqual(["drain", "relay.close", "socket.close", "hub.close", "finalize"]);
+    expect(logs).toEqual([
+      "audit hub_shutdown_drain inflight=0 drained=true waitedMs=0 followups=1 followupsSettled=false",
+      "終了処理: relay を閉じられなかった（続行）: Error: relay close failed",
+    ]);
+    // 注入も後処理も無ければ監査行を出さない。
+    const quiet: string[] = [];
+    await shutdownHub({
+      relayServer: null, socketServer: null,
+      hub: { drainForShutdown: async () => ({ inFlight: 0, drained: true, waitedMs: 0 }), close: () => {} },
+      log: (message) => quiet.push(message),
+    });
+    expect(quiet).toEqual([]);
+  });
+
+  test("releaseOwnHubLock は自分の lock だけを消す（後継 daemon の lock は残す）", () => {
+    const dir = makeTempDir("hub-release-lock");
+    const lockPath = path.join(dir, "hub.lock");
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: 4242, version: "1.0.0" }));
+    releaseOwnHubLock(lockPath, 1111);
+    expect(readHubLock(lockPath)).toEqual({ pid: 4242, version: "1.0.0" });
+    releaseOwnHubLock(lockPath, 4242);
+    expect(fs.existsSync(lockPath)).toBe(false);
+    // 無い lock でも投げない。
+    releaseOwnHubLock(lockPath, 4242);
+  });
+});
 
 describe("hub lock / ensure", () => {
   test("hub は TMUX / TMUX_PANE を外した環境で起動する（herdr 配下の Claude の tmux 欄誤記を防ぐ）", () => {

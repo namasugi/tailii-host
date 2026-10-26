@@ -112,6 +112,16 @@ export function readHubLock(lockPath: string): HubLock | null {
   }
 }
 
+/** 自分（ownerPid）の lock だけを消す。後継 daemon の lock は壊さない。残っても pid の生存判定があるので無害。 */
+export function releaseOwnHubLock(lockPath: string, ownerPid: number = process.pid): void {
+  if (readHubLock(lockPath)?.pid !== ownerPid) return;
+  try {
+    fs.unlinkSync(lockPath);
+  } catch {
+    // 消せなくても次の daemon が死んだ所有者の lock として奪取できる。
+  }
+}
+
 /** 生存中の別 pid が所有していなければ lock を取得する。 */
 export function acquireHubLock(
   lockPath: string,
@@ -417,6 +427,76 @@ export async function startHubSocket(options: {
   };
 }
 
+/**
+ * 終了の合図の後、実行中の注入の完了を待つ上限（ms）。ふだんの注入は 2 秒前後、遅いものでも 6 秒ほど
+ * （hub.log の `chat-inject` / `chat-inject-slow`）。打ち始める前の待ち（claude の起動待ち・入力欄の描画待ち。
+ * herdr では合わせて最大 30 秒）は見送らせる（`mayStartTyping`）ので、待つのは打ち始めた注入だけ。その上限
+ * （貼り付けの確認は注入の開始から `INJECT_VERIFY_BUDGET_MS`、送信の確認は最大 4 回）を少し超えるところに取る。
+ * 待っている間は新しい hub が起動を見送る（lock を持ったまま待つ）ので、これより長くは取らない。
+ */
+export const HUB_SHUTDOWN_DRAIN_MS = 20_000;
+
+/**
+ * hub を閉じる（graceful shutdown, 2026-10-26）。SIGTERM（デプロイ・自動更新・版違いの engine による入れ替え）・
+ * stale dist・自然終了・起動競合の早期終了の全部がここを通る。
+ *
+ * 1. 新しい注入を止め、実行中の注入（打鍵 → Enter → 送信の確認 → 配送済みの保存）が終わるのを待つ。途中で切ると、
+ *    送れた発話が配送不明のまま残り、アプリの明示再送で同じ発話が 2 回届く（Enter の後に切れた場合）。打っただけ
+ *    なら入力欄に本文が残る（実機 2026-10-26）。打ち始める前の注入は見送らせて queued へ戻す
+ * 2. 注入に続けて走らせている後処理（`/model`・`/effort` の確認ダイアログの承認）も、残りの時間で待つ
+ * 3. hook の中継と engine の接続を閉じる。待っている間は開いたままにする: 終わった発話の ACK がそのまま届き、
+ *    設問の通知も受け取れる。先に閉じると engine の再接続の間隔が伸び（250ms → 最大 5 秒）、hub の居ない時間が
+ *    待ちの長さ以上に延びる（独立検証 2026-10-26: 2 秒の待ちで約 8 秒）
+ * 4. hub の内部（タイマー・Codex App Server の接続）を閉じる
+ * 5. `finalize`（signal の解除・自分の lock の削除）。最後に呼ぶ: 待っている間に次の hub が起動して受理記録を
+ *    読むと、まだ注入中の発話を配送不明として扱う
+ */
+export async function shutdownHub(options: {
+  hub: Pick<SessionHub, "drainForShutdown" | "close">;
+  relayServer: Pick<EngineRelayServer, "close"> | null;
+  socketServer: Pick<HubSocketServer, "close"> | null;
+  log: (message: string) => void;
+  /** 注入に続けて hub の外で走らせている後処理（確認ダイアログの承認）。待つ対象に含める。 */
+  pendingWork?: () => Promise<unknown>[];
+  /** 最後に呼ぶ（signal の解除・自分の lock の削除）。 */
+  finalize?: () => void;
+  drainTimeoutMs?: number;
+}): Promise<void> {
+  const startedAt = Date.now();
+  const timeoutMs = options.drainTimeoutMs ?? HUB_SHUTDOWN_DRAIN_MS;
+  const { inFlight, drained, waitedMs } = await options.hub.drainForShutdown(timeoutMs);
+  const work = options.pendingWork?.() ?? [];
+  let workSettled = true;
+  if (work.length > 0) {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const remaining = Math.max(0, timeoutMs - (Date.now() - startedAt));
+    workSettled = await Promise.race([
+      Promise.allSettled(work).then(() => true),
+      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), remaining); }),
+    ]);
+    if (timer !== null) clearTimeout(timer);
+  }
+  if (inFlight > 0 || work.length > 0) {
+    options.log(
+      `audit hub_shutdown_drain inflight=${inFlight} drained=${drained} waitedMs=${waitedMs}` +
+        (work.length > 0 ? ` followups=${work.length} followupsSettled=${workSettled}` : ""),
+    );
+  }
+  // 閉じるのに失敗しても先へ進む（投げ直すと、lock を外す前に抜ける）。
+  for (const [name, server] of [["relay", options.relayServer], ["socket", options.socketServer]] as const) {
+    try {
+      await server?.close();
+    } catch (error) {
+      options.log(`終了処理: ${name} を閉じられなかった（続行）: ${String(error)}`);
+    }
+  }
+  try {
+    options.hub.close();
+  } finally {
+    options.finalize?.();
+  }
+}
+
 export interface EnsureHubDaemonOptions {
   lockPath?: string;
   cliPath?: string;
@@ -509,6 +589,13 @@ export async function runHubCommand(args: string[]): Promise<number> {
   const imageService = new ImageService();
   // iPhone から止めた背景コマンドの記録。tail（会話を閉じると捨てる）と hub の再起動より長く残す。
   const backgroundStopRecords = fileBackgroundStopRecords();
+  // 注入に続けて待たずに走らせる後処理（`/model`・`/effort` の確認ダイアログの承認）。終了の前に待つ
+  // （graceful shutdown。途中で終わると確認ダイアログが未承認のまま残り、次の発話が送れない）。
+  const followupWork = new Set<Promise<unknown>>();
+  const trackFollowup = (work: Promise<unknown>): void => {
+    followupWork.add(work);
+    void work.finally(() => followupWork.delete(work));
+  };
   const hub = new SessionHub({
     runner,
     imageService,
@@ -598,6 +685,8 @@ export async function runHubCommand(args: string[]): Promise<number> {
           // 送信確定を確認できないまま配送済みレシートを返す唯一の経路。無言だと
           // 「送ったのに届かない」の再発に誰も気づけないので 1 行残す（事後解析用）。
           onUnconfirmedSubmit: () => log(`audit chat-submit-unconfirmed session=${session}`),
+          // 終了の準備に入ったら、打ち始める前の発話は見送る（graceful shutdown）。
+          mayStartTyping: context.mayStartTyping,
         });
       } finally {
         const elapsedMs = Date.now() - startedAt;
@@ -607,23 +696,25 @@ export async function runHubCommand(args: string[]): Promise<number> {
       // 明示操作なので出現したら Enter で承認し、切替を完了させる。
       // ack（chat_send_result）を遅らせないよう待たずに流す（ダイアログ未出現時は 4s で諦める）。
       if (EFFORT_COMMAND_PATTERN.test(text)) {
-        void confirmEffortChangeDialog(sessionBackend, session, { log }).catch((error: unknown) => {
+        trackFollowup(confirmEffortChangeDialog(sessionBackend, session, { log }).catch((error: unknown) => {
           log(`effort dialog 承認失敗 session=${session} error=${String(error)}`);
-        });
+        }));
       }
       // `/model <slug>` も同型の確認ダイアログ（`Switch model?`）が挟まる。herdr backend では
       // iOS の pane_preview 自動 Yes（入力 PTY）が claude へ届かないため host が承認する
       // （model-switch-dialog, 2026-09-06 実障害: 開き直した会話でモデル変更が未反映）。
       if (MODEL_COMMAND_PATTERN.test(text)) {
-        void confirmModelSwitchDialog(sessionBackend, session, { log }).catch((error: unknown) => {
+        trackFollowup(confirmModelSwitchDialog(sessionBackend, session, { log }).catch((error: unknown) => {
           log(`model dialog 承認失敗 session=${session} error=${String(error)}`);
-        });
+        }));
       }
     },
   });
   hub.restoreFromHeartbeats();
   hub.restorePendingQuestions();
-  hub.restoreChatReceipts();
+  // 受理記録は socket を開く前に戻す（つないできた engine の明示再送を、配送済みとして見分けるため）。queue の
+  // 注入は socket を勝ち取ってから始める（起動競合で負けた hub が、勝った hub と同じ発話を注入しないように）。
+  hub.restoreChatReceipts({ startDrains: false });
   let socketServer: HubSocketServer | null = null;
   let relayServer: EngineRelayServer | null = null;
 
@@ -645,6 +736,7 @@ export async function runHubCommand(args: string[]): Promise<number> {
     // socket を勝ち取った時点で lock の権威は自分。起動競合の名残(敗者の lock や
     // own-pid ガード付き削除)があっても、ここで上書きすれば最終状態は必ず整合する。
     fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, version: startupVersion }));
+    hub.startRestoredDrains();
     relayServer = await startEngineRelaySocket({ onMessage: (message) => hub.handleRelayMessage(message), log });
     while (!abort.signal.aborted) {
       let result: ReaperTickResult;
@@ -669,19 +761,17 @@ export async function runHubCommand(args: string[]): Promise<number> {
       await abortableSleep(intervalSeconds * 1000, abort.signal);
     }
   } finally {
-    hub.close();
-    process.off("SIGTERM", onSignal);
-    process.off("SIGINT", onSignal);
-    await relayServer?.close();
-    await socketServer?.close();
-    // 後継 daemon の lock を壊さず、自分の lock だけを消す。
-    if (readHubLock(lockPath)?.pid === process.pid) {
-      try {
-        fs.unlinkSync(lockPath);
-      } catch {
-        // pid 生存判定があるため残っても無害。
-      }
-    }
+    // 実行中の注入を終わらせてから接続を閉じ、最後に lock を外す（graceful shutdown）。待っている間に重ねて届く
+    // SIGTERM（版違いの engine が ensure のたびに送る）は abort を繰り返すだけで、待ちを打ち切らない。
+    await shutdownHub({
+      hub, relayServer, socketServer, log,
+      pendingWork: () => [...followupWork],
+      finalize: () => {
+        process.off("SIGTERM", onSignal);
+        process.off("SIGINT", onSignal);
+        releaseOwnHubLock(lockPath);
+      },
+    });
   }
   return 0;
 

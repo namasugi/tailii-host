@@ -48,6 +48,7 @@ import {
 import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
 import { resolveDefaultAgent } from "../src/engine/engine.js";
 import {
+  ChatInjectionDeferredError,
   ChatInjectionRejectedError,
   tmuxServerAbsent,
   classifySubmitFrame,
@@ -1175,6 +1176,21 @@ describe("TmuxSessionManager", () => {
     const mgrRemote = new TmuxSessionManager({ runner: remote.runner.runner, store: makeTempStore(), clearKeyDelayMs: 0, submitDelayMs: 0, submitVerifyDelayMs: 0 });
     await mgrRemote.sendTextSubmit("s", "/remote-control");
     expect(remote.sends()).toEqual([["C-u"], ["-l", "--", "/remote-control"], ["Enter"]]);
+  });
+
+  test("sendTextSubmit: hub が終了の準備に入ったら、打ち始める前に 1 キーも打たずに見送る（tmux）", async () => {
+    for (const stopAt of [1, 2]) {
+      // 1 = 入口で / 2 = 入力欄の残り物を扱う直前で、終了の準備に入った。
+      const h = makeTmuxSubmitHarness("Mac 側の下書き");
+      const mgr = new TmuxSessionManager({ runner: h.runner.runner, store: makeTempStore(), clearKeyDelayMs: 0, submitDelayMs: 0, submitVerifyDelayMs: 0 });
+      let checks = 0;
+      await expect(mgr.sendTextSubmit("s", "本文", {
+        mayStartTyping: () => (checks += 1) < stopAt, onResidueDiscarded: () => {},
+      })).rejects.toBeInstanceOf(ChatInjectionDeferredError);
+      expect(checks).toBe(stopAt);
+      expect(h.sends()).toEqual([]);
+      expect(h.state.input).toBe("Mac 側の下書き");
+    }
   });
 
   test("sendTextSubmit: Enter の送出が失敗で返った（配送不明）発話の明示再送は、残りを送り出さずに消して 1 回だけ送る（tmux）", async () => {

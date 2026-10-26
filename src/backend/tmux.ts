@@ -332,6 +332,13 @@ export interface SendTextSubmitOptions {
    * 会話内には出さない。hub は監査ログへ残す（事後解析用）。
    */
   onSameTextResidueCleared?: (text: string) => void;
+  /**
+   * 本文を打ち始めてよいか（graceful shutdown）。false なら、打ち始める前（claude の起動待ち・入力欄の
+   * 描画待ちの間と、入力欄の残り物を扱う直前）に `ChatInjectionDeferredError` で抜ける。打ち始めた後は
+   * 最後まで送る。hub が終了の準備に入ったときに false を返す（待っても守るもの = 打った本文が無いので、
+   * 終了を遅らせない）。
+   */
+  mayStartTyping?: () => boolean;
 }
 
 /**
@@ -1257,6 +1264,18 @@ export class ChatInjectionRejectedError extends Error {
 }
 
 /**
+ * 本文を打ち始める前に注入を見送った（hub が終了の準備に入った, graceful shutdown）。1 キーも打っていない
+ * ので、hub は発話を queue へ戻して queued のまま残し、次の hub が届ける。配送不明（uncertain）にも、
+ * 非配達の確定（`ChatInjectionRejectedError`）にもしない。
+ */
+export class ChatInjectionDeferredError extends Error {
+  constructor() {
+    super("hub の終了の準備中のため、本文を打ち始める前に見送った（次の hub が届ける）");
+    this.name = "ChatInjectionDeferredError";
+  }
+}
+
+/**
  * `tmux ls` の失敗が「tmux サーバが無い」ことを表すか（空集合として扱ってよいか, TESTABLE）。
  * - `no server running on …`: socket ファイルはあるが、誰も listen していない
  * - `no sessions`
@@ -1271,6 +1290,11 @@ export class ChatInjectionRejectedError extends Error {
 export function tmuxServerAbsent(output: string): boolean {
   const text = output.toLowerCase();
   return text.includes("no server running") || text.includes("no sessions");
+}
+
+/** `mayStartTyping` が false（hub の終了の準備中）なら、打ち始める前に `ChatInjectionDeferredError` で抜ける。 */
+export function deferIfStopping(options: Pick<SendTextSubmitOptions, "mayStartTyping">): void {
+  if (options.mayStartTyping?.() === false) throw new ChatInjectionDeferredError();
 }
 
 export class LoginCodeError extends Error {
@@ -1982,6 +2006,8 @@ export const SEND_NOW_UNCONFIRMED =
   "「今すぐ送信」を送りましたが、届いたことを確認できませんでした";
 export const SEND_NOW_EXPIRED_IN_QUEUE =
   "先に送ったメッセージの処理に時間がかかったため「今すぐ送信」しませんでした（もう一度試してください）";
+export const SEND_NOW_BLOCKED_BY_SHUTDOWN =
+  "ホスト側の再起動中のため「今すぐ送信」しませんでした（少し待ってもう一度試してください）";
 
 /**
  * chord 後にヒント行の消滅を確かめる間隔と回数の既定（合計 約 6s）。短い発話は 0.7s 以内に消えるが、
@@ -2300,6 +2326,7 @@ export class TmuxSessionManager {
    */
   async sendTextSubmit(name: string, text: string, options: SendTextSubmitOptions = {}): Promise<void> {
     const startedAtMs = Date.now();
+    deferIfStopping(options);
     // 1 回の capture で「/login フロー中か」と「残存テキスト」を判定する（chat 毎の capture を増やさない）。
     let screen = await this.captureVisibleScreenOrNull(name);
     let hiddenDialogCancelled = false;
@@ -2401,6 +2428,9 @@ export class TmuxSessionManager {
         "ダイアログの表示中はメッセージを送信できません（アプリで選択肢に答えてから送り直してください）",
       );
     }
+    // ここから入力欄を触る（残り物を消す / 送り出す・本文を打つ）。hub が終了の準備に入っていたら、
+    // 1 キーも打たずに見送る（次の hub が届ける）。ダイアログを閉じた事実は上で伝え済み。
+    deferIfStopping(options);
     const pending = frame === "pending" ? (inputBoxRealText(ansiScreen ?? "") ?? "") : "";
     if (pending.length > 0) {
       // 判定の順序が肝心: 中断で書き戻された直前の発話（配送済み）は、Tailii が打って送信を確かめられ

@@ -29,6 +29,7 @@ import {
 } from "../src/backend/sessionBackend.js";
 import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
 import {
+  ChatInjectionDeferredError,
   ChatInjectionRejectedError,
   extractClaudeInputBox,
   extractInputBoxSuggestion,
@@ -630,6 +631,36 @@ describe("HerdrSessionManager", () => {
     expect(discarded).toEqual([]);
     expect(sameText).toEqual([text]);
     expect(state.input).toBe("");
+  });
+
+  test("sendTextSubmit: hub が終了の準備に入ったら、打ち始める前（起動待ち・描画待ちの間も）に 1 キーも打たずに見送る", async () => {
+    // 独立検証 2026-10-26: 起動待ち（最大 10 秒）・描画待ち（最大 20 秒）の注入まで hub の終了が待たされていた。
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    // [ハーネス, 何回目の確認で終了の準備に入るか]: 入口 / claude の起動待ち / 入力欄の描画待ち / 残り物の直前
+    const cases: Array<[Parameters<typeof makeSubmitHarness>[0], number]> = [
+      [{}, 1],
+      [{ agentStatuses: ["unknown"] }, 3],
+      [{ bootReads: 1000 }, 4],
+      [{ initialInput: "Mac 側の下書き" }, 4],
+    ];
+    for (const [harnessOptions, stopAt] of cases) {
+      const { runner, state } = makeSubmitHarness(harnessOptions);
+      const manager = new HerdrSessionManager({
+        runner: runner.runner, store,
+        submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+        readyTimeoutMs: 5000, readyPollMs: 1, inputBoxReadyTimeoutMs: 5000,
+      });
+      let checks = 0;
+      const startedAt = Date.now();
+      await expect(manager.sendTextSubmit("s-a", "本文", {
+        mayStartTyping: () => (checks += 1) < stopAt, onResidueDiscarded: () => {},
+      })).rejects.toBeInstanceOf(ChatInjectionDeferredError);
+      expect(checks).toBe(stopAt);
+      expect(Date.now() - startedAt).toBeLessThan(2_000);
+      expect(submitSends(runner)).toEqual([]);
+      expect(state.input).toBe(harnessOptions?.initialInput ?? "");
+    }
   });
 
   test("sendTextSubmit: 本文を打った後に失敗で返した（配送不明）発話の明示再送は、残りを送り出さずに消して 1 回だけ送る", async () => {

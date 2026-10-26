@@ -5,7 +5,11 @@ import { decodeHubServerLine } from "../src/hub/hubProtocol.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { bumpHeartbeat, readHeartbeat, writeHeartbeat } from "../src/sessions/heartbeat.js";
-import { ChatInjectionRejectedError } from "../src/backend/tmux.js";
+import {
+  ChatInjectionDeferredError,
+  ChatInjectionRejectedError,
+  SEND_NOW_BLOCKED_BY_SHUTDOWN,
+} from "../src/backend/tmux.js";
 import { SessionHub, type HubTail } from "../src/hub/sessionHub.js";
 import { HISTORY_DONE_STREAM_ID } from "../src/chat/transcriptTailer.js";
 import { ImageService } from "../src/chat/imageService.js";
@@ -142,6 +146,230 @@ describe("SessionHub actor", () => {
     await vi.waitFor(() => expect(order).toEqual([
       "start:first", "done:first", "start:second", "done:second",
     ]));
+  });
+
+  test("drainForShutdown は実行中の注入の完了を待ち、配送済みを保存する。次の発話は注入せず queued のまま残す", async () => {
+    // 2026-10-26: hub の再起動が注入の途中（Enter の後・配送済みの保存の前）に重なると、再起動後に配送不明に
+    // なり、アプリの明示再送で同じ発話が 2 回届きうる。終了の前に実行中の注入を終わらせる（graceful shutdown）。
+    const receiptsPath = path.join(makeTempDir("hub-shutdown-drain"), "receipts.json");
+    const releases: Array<() => void> = [];
+    const injected: string[] = [];
+    const chatInjector = vi.fn(async (text: string) => {
+      injected.push(text);
+      await new Promise<void>((resolve) => releases.push(resolve));
+    });
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-shutdown-drain-hb"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, chatInjector, chatReceiptsPath: receiptsPath });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    for (const [id, text] of [["one", "first"], ["two", "second"]]) {
+      hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id, session: "work",
+        clientMessageId: `client-${id}`, text }));
+    }
+    await vi.waitFor(() => expect(injected).toEqual(["first"]));
+    // 終了の合図。接続は開いたまま、注入が終わるまで待つ。
+    let settled = false;
+    const drain = hub.drainForShutdown(5_000, 5).then((result) => { settled = true; return result; });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(settled).toBe(false);
+    releases.shift()?.();
+    const result = await drain;
+    expect(result).toMatchObject({ inFlight: 1, drained: true });
+    // 終わった発話の ACK はそのまま届く（接続を閉じるのは待った後）。
+    expect(received).toContainEqual({ type: "chat_send_result", id: "one", status: "accepted" });
+    // 2 通目は注入しない（次の hub が復元して届ける）。答えもしない（接続を閉じると engine が配送不明にする）。
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(injected).toEqual(["first"]);
+    expect(received).not.toContainEqual(expect.objectContaining({ type: "chat_send_result", id: "two" }));
+    expect(JSON.parse(fs.readFileSync(receiptsPath, "utf8"))).toMatchObject({
+      sessions: {
+        work: {
+          delivered: ["client-one"],
+          queued: [expect.objectContaining({ clientMessageId: "client-two", text: "second" })],
+          injecting: [],
+        },
+      },
+    });
+
+    // 次の hub: 1 通目の明示再送は duplicate（打ち直さない）。2 通目は queued から届ける。
+    const restoredInjected: string[] = [];
+    const restored = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-shutdown-drain-hb2"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, chatReceiptsPath: receiptsPath,
+      chatInjector: async (text) => { restoredInjected.push(text); } });
+    restored.restoreChatReceipts();
+    const retryClient = {}, retryReceived: unknown[] = [];
+    restored.registerClient(retryClient, (line) => retryReceived.push(decodeHubServerLine(line)));
+    restored.handleClientMessage(retryClient, JSON.stringify({ type: "chat_send", id: "retry-one", session: "work",
+      clientMessageId: "client-one", text: "first", explicitRetry: true }));
+    restored.handleClientMessage(retryClient, JSON.stringify({ type: "chat_send", id: "retry-two", session: "work",
+      clientMessageId: "client-two", text: "second", explicitRetry: true }));
+    expect(retryReceived).toContainEqual({ type: "chat_send_result", id: "retry-one", status: "duplicate" });
+    // 2 通目は復元の直後から注入が始まる。再送が注入中に届けば合流して accepted、終わった後なら duplicate。
+    await vi.waitFor(() => expect(retryReceived).toContainEqual(expect.objectContaining(
+      { type: "chat_send_result", id: "retry-two" })));
+    const second = retryReceived.find((message) =>
+      (message as { id?: string }).id === "retry-two") as { status: string };
+    expect(["accepted", "duplicate"]).toContain(second.status);
+    expect(restoredInjected).toEqual(["second"]);
+  });
+
+  test("終了の準備に入ると、打ち始める前の注入は見送られて queued へ戻り、待ちはすぐ終わる", async () => {
+    // 独立検証 2026-10-26: claude の起動待ち（herdr で最大 30 秒）の注入まで待つと、守るもの（打った本文）が
+    // 無いのに終了が 20 秒遅れ、受理記録は injecting のまま残っていた。
+    const receiptsPath = path.join(makeTempDir("hub-shutdown-defer"), "receipts.json");
+    let releaseWait: (() => void) | undefined;
+    const injected: string[] = [];
+    const log: string[] = [];
+    const chatInjector = vi.fn(async (text: string, _session: string, context: { mayStartTyping?: () => boolean }) => {
+      // backend の起動待ちの模型: 待っている間に終了の準備に入ったら、打ち始める前に見送る。
+      await new Promise<void>((resolve) => { releaseWait = resolve; });
+      if (context.mayStartTyping?.() === false) throw new ChatInjectionDeferredError();
+      injected.push(text);
+    });
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-shutdown-defer-hb"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, chatInjector, chatReceiptsPath: receiptsPath,
+      log: (line) => log.push(line) });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "one", session: "work",
+      clientMessageId: "client-booting", text: "起動中の会話へ" }));
+    await vi.waitFor(() => expect(chatInjector).toHaveBeenCalledOnce());
+    const drain = hub.drainForShutdown(5_000, 5);
+    releaseWait?.();
+    expect(await drain).toMatchObject({ inFlight: 1, drained: true });
+    expect(injected).toEqual([]);
+    expect(log).toContain("audit chat-inject-deferred session=work");
+    expect(received).not.toContainEqual(expect.objectContaining({ type: "chat_send_result", id: "one" }));
+    // 配送不明（uncertain）にしない。queued のまま残り、次の hub が明示再送を待たずに届ける。
+    expect(JSON.parse(fs.readFileSync(receiptsPath, "utf8"))).toMatchObject({
+      sessions: { work: { queued: [expect.objectContaining({ clientMessageId: "client-booting" })], injecting: [] } },
+    });
+    const restoredInjected: string[] = [];
+    const restored = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-shutdown-defer-hb2"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, chatReceiptsPath: receiptsPath,
+      chatInjector: async (text) => { restoredInjected.push(text); } });
+    restored.restoreChatReceipts();
+    await vi.waitFor(() => expect(restoredInjected).toEqual(["起動中の会話へ"]));
+  });
+
+  test("終了の準備中は、今すぐ送信を 1 キーも送らずに断り、TUI の設問への回答キーも打たずに unknown で返す", async () => {
+    const sendNowInjector = vi.fn(async () => ({ status: "sent" as const }));
+    const questionInjector = vi.fn(async () => {});
+    const questions = [{ header: "h", question: "q", options: [], multiSelect: false }];
+    const answers = [{ questionIndex: 0, selectedOptionIndexes: [0], multiSelect: false }];
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-shutdown-guards-hb"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, sendNowInjector, questionInjector });
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q1", questions });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    expect(await hub.drainForShutdown(1_000, 5)).toMatchObject({ inFlight: 0, drained: true });
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send_now", id: "now", session: "other" }));
+    await vi.waitFor(() => expect(received).toContainEqual({
+      type: "chat_send_now_result", id: "now", status: "blocked", error: SEND_NOW_BLOCKED_BY_SHUTDOWN,
+    }));
+    expect(sendNowInjector).not.toHaveBeenCalled();
+    hub.handleClientMessage(client, JSON.stringify({ type: "question_answer_submit", id: "answer", session: "work",
+      questionId: "q1", answers }));
+    expect(received).toContainEqual({ type: "question_answer_result", id: "answer", status: "unknown" });
+    // 設問は残す（アプリの自動再送を、設問を復元した次の hub が受ける）。
+    expect(hub.actors.get("work")?.pendingQuestion?.id).toBe("q1");
+    expect(received).not.toContainEqual(expect.objectContaining({ type: "question_event", event: "dismiss" }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(questionInjector).not.toHaveBeenCalled();
+  });
+
+  test("終了の準備中は次の Codex の turn を始めず、queued のまま残す", async () => {
+    const startTurn = vi.fn(async () => "turn-1");
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-shutdown-codex-hb"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800,
+      codexAppServerFactory: () => ({ openThread: async () => { throw new Error("unused"); } }),
+      codexTurnControllerFactory: () => ({ startTurn, closeSession: vi.fn(), close: vi.fn() }) });
+    const client = {};
+    hub.registerClient(client, () => {});
+    await hub.drainForShutdown(1_000, 5);
+    hub.handleClientMessage(client, JSON.stringify({ type: "codex_turn_submit", id: "one", session: "work",
+      text: "run", clientUserMessageId: "codex-during-shutdown", effort: null, sandbox: null,
+      threadId: "thread-1", cwd: "/tmp/work" }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(startTurn).not.toHaveBeenCalled();
+    expect(hub.actors.get("work")?.codexQueue.map((entry) => entry.message.clientUserMessageId))
+      .toEqual(["codex-during-shutdown"]);
+  });
+
+  test("終了の準備中は背景コマンドの停止と Codex の目標を断り、始まっていた停止は最後まで待つ", async () => {
+    // 独立検証 2026-10-26: 背景コマンドの停止（TERM → 約 3 秒 → KILL）は待つ対象に入っておらず、途中で終わると
+    // KILL を送れず結果も届かなかった。Codex の目標は閉じる hub が App Server の接続を RPC の途中で畳みえた。
+    const metadataStore = makeTempStore();
+    metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0, providerSessionId: "provider-1" });
+    let finishStop: (() => void) | undefined;
+    const stopBackgroundCommand = vi.fn(async () => {
+      await new Promise<void>((resolve) => { finishStop = resolve; });
+      return { status: "stopped" as const };
+    });
+    const goal = vi.fn(async () => ({ goal: null, cleared: true }));
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir: makeTempDir("hub-shutdown-ops-hb"), metadataStore, timeoutSeconds: 1800,
+      tailFactory: () => ({ open() {}, stop() {}, stopBackgroundCommand }),
+      codexAppServerFactory: () => ({ openThread: async () => { throw new Error("unused"); } }),
+      codexTurnControllerFactory: () => ({ startTurn: vi.fn(async () => "turn-1"), goal, closeSession: vi.fn(), close: vi.fn() }),
+    });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "conversation_subscribe", session: "work" }));
+    hub.handleClientMessage(client, JSON.stringify({ type: "background_command_stop", id: "stop-1", session: "work",
+      nodeId: "b1" }));
+    await vi.waitFor(() => expect(stopBackgroundCommand).toHaveBeenCalledOnce());
+    let settled = false;
+    const drain = hub.drainForShutdown(5_000, 5).then((result) => { settled = true; return result; });
+    // 待っている間に届いた停止・目標は断る（もう一度試せる）。
+    hub.handleClientMessage(client, JSON.stringify({ type: "background_command_stop", id: "stop-2", session: "work",
+      nodeId: "b2" }));
+    hub.handleClientMessage(client, JSON.stringify({ type: "codex_goal_submit", id: "g1", session: "work",
+      threadId: "thread-1", cwd: "/tmp/work", action: "clear" }));
+    expect(received).toContainEqual(expect.objectContaining({ type: "background_command_stop_result", id: "stop-2", status: "failed" }));
+    expect(received).toContainEqual(expect.objectContaining({ type: "codex_goal_result", id: "g1", status: "failed" }));
+    expect(stopBackgroundCommand).toHaveBeenCalledOnce();
+    expect(goal).not.toHaveBeenCalled();
+    // 始まっていた停止は最後まで待ち、結果も届ける。
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(settled).toBe(false);
+    finishStop?.();
+    expect(await drain).toMatchObject({ inFlight: 1, drained: true });
+    expect(received).toContainEqual({ type: "background_command_stop_result", id: "stop-1", status: "stopped" });
+  });
+
+  test("restoreChatReceipts({ startDrains: false }) は注入を始めず、startRestoredDrains で始める（起動競合で負けた hub は打たない）", async () => {
+    const receiptsPath = path.join(makeTempDir("hub-restore-nodrain"), "receipts.json");
+    fs.writeFileSync(receiptsPath, JSON.stringify({ version: 1, sessions: { work: {
+      delivered: [], queued: [{ type: "chat_send", id: "q", session: "work", clientMessageId: "client-q", text: "queued" }],
+      injecting: [], chatOrder: ["client-q"], deliveredCodex: [], queuedCodex: [], startingCodex: [], codexOrder: [],
+    } } }));
+    const injected: string[] = [];
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-restore-nodrain-hb"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, chatReceiptsPath: receiptsPath,
+      chatInjector: async (text) => { injected.push(text); } });
+    hub.restoreChatReceipts({ startDrains: false });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(injected).toEqual([]);
+    hub.startRestoredDrains();
+    await vi.waitFor(() => expect(injected).toEqual(["queued"]));
+  });
+
+  test("drainForShutdown は上限を過ぎたら待つのをやめる（従来どおり配送不明として残る）", async () => {
+    const chatInjector = vi.fn(async () => new Promise<void>(() => {}));
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-shutdown-timeout-hb"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, chatInjector });
+    const client = {};
+    hub.registerClient(client, () => {});
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "one", session: "work",
+      clientMessageId: "client-one", text: "stuck" }));
+    await vi.waitFor(() => expect(chatInjector).toHaveBeenCalledOnce());
+    const result = await hub.drainForShutdown(40, 5);
+    expect(result).toMatchObject({ inFlight: 1, drained: false });
+    expect(result.waitedMs).toBeGreaterThanOrEqual(40);
+    // 注入が無ければ待たない。
+    const idle = makeHub().hub;
+    expect(await idle.drainForShutdown(5_000, 5)).toMatchObject({ inFlight: 0, drained: true });
   });
 
   test("pending message delete は durable queued chat を host から先に削除する", async () => {
