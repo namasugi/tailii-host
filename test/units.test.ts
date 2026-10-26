@@ -5,6 +5,7 @@
 
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, test } from "vitest";
 import { ChatTailController } from "../src/chat/chatTailController.js";
@@ -2804,8 +2805,12 @@ describe("login-code 画面判定 / submitLoginCode（仮想時計）", () => {
     // 番犬が吠えない（2026-09-24 のセルフレビュー指摘）。claude が無い環境（CI）は skip。
     let installed: string | null = null;
     try {
-      installed = execFileSync("/bin/zsh", ["-lc", "claude --version"], { encoding: "utf8" })
-        .trim().split(" ")[0] ?? null;
+      // テストの HOME は空の一時ディレクトリ（vitest.config.ts）。実物の claude を別の HOME で起動すると、
+      // 認証の取り方が変わって `~/.claude/.credentials.json` を壊した事例がある（2026-10-22）。
+      // 版を見るだけなので、利用者の本当の HOME で起動する。
+      installed = execFileSync("/bin/zsh", ["-lc", "claude --version"], {
+        encoding: "utf8", env: { ...process.env, HOME: os.userInfo().homedir },
+      }).trim().split(" ")[0] ?? null;
     } catch {
       installed = null;
     }

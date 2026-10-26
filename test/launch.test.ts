@@ -528,8 +528,10 @@ describe("shellSingleQuote", () => {
 });
 
 describe("makeSessionLauncher: claude --session-id / --name の合成（lazy-session）", () => {
-  // makeSessionLauncher → launchCore は preTrustFolder で実 ~/.claude.json を触るため、
-  // スナップショット＆復元で密閉性を保つ（本テストスイートは singleFork 直列実行）。
+  // makeSessionLauncher → launchCore は preTrustFolder で ~/.claude.json を触る。テストの HOME は空の一時
+  // ディレクトリ（vitest.config.ts）なので、ここで触るのはテスト用のファイル。以前は開発機の実物を控えて
+  // 書き戻しており、テストの最中に Claude Code が書いた更新を古い内容で消しえた（2026-10-26 に HOME ごと
+  // 隔離）。念のためスナップショット＆復元は残す（本テストスイートは直列実行）。
   async function withClaudeJsonRestored<T>(fn: () => Promise<T>): Promise<T> {
     const claudeJson = path.join(os.homedir(), ".claude.json");
     let backup: string | null = null;
