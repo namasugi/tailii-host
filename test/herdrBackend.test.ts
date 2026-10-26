@@ -34,6 +34,7 @@ import {
   extractInputBoxSuggestion,
   inputBoxHasRealPendingText,
   inputBoxRealText,
+  inputBoxShowsTextBeingSent,
   inputBoxTextMatchesRecordedPrompt,
   screenHasLoginCodePrompt,
   TmuxSessionManager,
@@ -375,6 +376,10 @@ describe("HerdrSessionManager", () => {
     swallowTextInputs?: number;
     /** 最初の CR を飲む回数（実測: 300ms 未満で CR が飲まれる挙動）。 */
     swallowEnters?: number;
+    /** CR の send-text を失敗で返す回数（入力欄は変えない。herdr CLI のタイムアウト等）。 */
+    failEnters?: number;
+    /** 本文の send-text を、入力欄へ反映したうえで失敗で返す回数。 */
+    failTextAfterApply?: number;
     /** CR の結果ダイアログを開く（RC active 中の /remote-control）。 */
     openDialogOnEnter?: boolean;
     /** 初期状態でダイアログが開いている。 */
@@ -416,6 +421,8 @@ describe("HerdrSessionManager", () => {
       dialogOpen: options.dialogInitiallyOpen ?? false,
       swallowTextInputs: options.swallowTextInputs ?? 0,
       swallowEnters: options.swallowEnters ?? 0,
+      failEnters: options.failEnters ?? 0,
+      failTextAfterApply: options.failTextAfterApply ?? 0,
       statusReads: 0,
       hideInputReads: options.hideInputReads ?? 0,
       bootReads: options.bootReads ?? 0,
@@ -484,6 +491,10 @@ describe("HerdrSessionManager", () => {
         return herdrOk("");
       }
       if (args[0] === "pane" && args[1] === "send-text" && args[3] === "\r") {
+        if (state.failEnters > 0) {
+          state.failEnters -= 1;
+          return { exitCode: 1, stdout: "", stderr: "herdr: request timed out" };
+        }
         if (state.swallowEnters > 0) {
           state.swallowEnters -= 1;
         } else if (options.openDialogOnEnter) {
@@ -509,6 +520,10 @@ describe("HerdrSessionManager", () => {
           }
           state.input += typed;
           if (options.openDialogOnText === true) state.dialogOpen = true;
+          if (state.failTextAfterApply > 0) {
+            state.failTextAfterApply -= 1;
+            return { exitCode: 1, stdout: "", stderr: "herdr: request timed out" };
+          }
         }
         return herdrOk("");
       }
@@ -584,6 +599,101 @@ describe("HerdrSessionManager", () => {
     ]);
     expect(discarded).toEqual(["前回の本文"]);
     expect(state.input).toBe("");
+  });
+
+  test("sendTextSubmit: 残っていたのが今回の本文そのもの（hub の再起動で途切れた前の試行）なら、知らせずに消して打ち直す", async () => {
+    // 実機 2026-10-26: 処理中に送った発話を打った直後に hub が再起動し、Enter の前に途切れた。アプリが
+    // 同じ発話を明示再送し、自分の本文の覚えを持たない新しい hub が「ホスト側の入力欄に残っていた
+    // 「…」は送らずに消しました」と知らせていた（実際には打ち直して 1 回だけ届いていた）。
+    const text = "縦に槍を持った時にもっと身体に寄せた方がいい 槍は顔の後ろにした方がいいかも";
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const { runner, state } = makeSubmitHarness({ initialInput: text });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    const discarded: string[] = [];
+    const sameText: string[] = [];
+    await manager.sendTextSubmit("s-a", text, {
+      recordedPromptText: () => "足パーツを作り直した方がいい 足首はない方がいい",
+      onResidueDiscarded: (residue) => discarded.push(residue),
+      onSameTextResidueCleared: (residue) => sameText.push(residue),
+    });
+    // 残りは Enter で送り出さずに消し（二重に届かない）、本文を打ち直して 1 回だけ送る。
+    expect(submitSends(runner)).toEqual([
+      ["pane", "send-text", "w4:p2", "\u0015"],
+      ["pane", "send-text", "w4:p2", text],
+      ["pane", "send-text", "w4:p2", "\r"],
+    ]);
+    expect(discarded).toEqual([]);
+    expect(sameText).toEqual([text]);
+    expect(state.input).toBe("");
+  });
+
+  test("sendTextSubmit: 本文を打った後に失敗で返した（配送不明）発話の明示再送は、残りを送り出さずに消して 1 回だけ送る", async () => {
+    // 独立検証 2026-10-26: 例外で抜けても自分の本文の覚えが残り、明示再送で残りを「自分の本文」として
+    // 送り出してから打ち直し、同じ発話が 2 回届いていた（Enter の送出の失敗 / 本文は入ったのに失敗で返る）。
+    const text = "槍は顔の後ろにした方がいいかも";
+    for (const failure of [{ failEnters: 1 }, { failTextAfterApply: 1 }]) {
+      const store = makeStore();
+      store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+      const { runner, state } = makeSubmitHarness(failure);
+      const manager = new HerdrSessionManager({
+        runner: runner.runner, store,
+        submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+        readyTimeoutMs: 5000, readyPollMs: 0,
+      });
+      await expect(manager.sendTextSubmit("s-a", text, { onResidueDiscarded: () => {} }))
+        .rejects.toBeInstanceOf(HerdrFailedError);
+      expect(state.input).toBe(text);
+      runner.recorded.length = 0;
+      const discarded: string[] = [];
+      const sameText: string[] = [];
+      await manager.sendTextSubmit("s-a", text, {
+        onResidueDiscarded: (residue) => discarded.push(residue),
+        onSameTextResidueCleared: (residue) => sameText.push(residue),
+      });
+      expect(submitSends(runner)).toEqual([
+        ["pane", "send-text", "w4:p2", "\u0015"],
+        ["pane", "send-text", "w4:p2", text],
+        ["pane", "send-text", "w4:p2", "\r"],
+      ]);
+      expect(discarded).toEqual([]);
+      expect(sameText).toEqual([text]);
+      expect(state.input).toBe("");
+    }
+  });
+
+  test("sendTextSubmit: 同じ本文を別の発話として 2 回送ったとき、送信を確かめられなかった 1 通目は送り出す（2 回届ける）", async () => {
+    // 今回の本文と同文でも、自分の本文の覚えにあるなら「前の別の発話」なので消さない（消すと 1 通目が失われる）。
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const { runner, state } = makeSubmitHarness({ swallowEnters: 1000 });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      readyTimeoutMs: 5000, readyPollMs: 0,
+    });
+    await manager.sendTextSubmit("s-a", "はい", { onUnconfirmedSubmit: () => {} });
+    expect(state.input).toBe("はい");
+    state.swallowEnters = 0;
+    runner.recorded.length = 0;
+    const discarded: string[] = [];
+    const sameText: string[] = [];
+    await manager.sendTextSubmit("s-a", "はい", {
+      recordedPromptText: () => "もっと前の発話",
+      onResidueDiscarded: (residue) => discarded.push(residue),
+      onSameTextResidueCleared: (residue) => sameText.push(residue),
+    });
+    expect(submitSends(runner)).toEqual([
+      ["pane", "send-text", "w4:p2", "\r"],
+      ["pane", "send-text", "w4:p2", "はい"],
+      ["pane", "send-text", "w4:p2", "\r"],
+    ]);
+    expect(discarded).toEqual([]);
+    expect(sameText).toEqual([]);
   });
 
   test("sendTextSubmit: 残存が transcript の直近の発話と同文なら Enter で送り直さず C-u で破棄して注入する", async () => {
@@ -750,6 +860,29 @@ describe("HerdrSessionManager", () => {
     expect(inputBoxTextMatchesRecordedPrompt(`中周を${zwsp}1枚足す`, "中周を1枚足す")).toBe(true);
     // 短い断片の末尾一致は偶然（Mac 側の下書き）とみなして不一致。
     expect(inputBoxTextMatchesRecordedPrompt("い".repeat(10), long)).toBe(false);
+  });
+
+  test("inputBoxShowsTextBeingSent: 今回の本文そのもの（同文・見えている末尾・途中まで入った一部）だけを真にする", () => {
+    const text = "縦に槍を持った時にもっと身体に寄せた方がいい\n槍は顔の後ろにした方がいいかも";
+    // 前の試行が打ったまま途切れた本文（折り返し・改行の違いは無視する）。
+    expect(inputBoxShowsTextBeingSent(text, text)).toBe(true);
+    expect(inputBoxShowsTextBeingSent("縦に槍を持った時にもっと身体に寄せた方がい\nい 槍は顔の後ろにした方がいいかも", text)).toBe(true);
+    expect(inputBoxShowsTextBeingSent("1", "1")).toBe(true);
+    // 長い本文は、入力欄が末尾側だけを映す。
+    const long = "あ".repeat(40) + "い".repeat(40);
+    expect(inputBoxShowsTextBeingSent("い".repeat(30), long)).toBe(true);
+    // 小分けの貼り付けが途中まで入った形（本文の連続した一部で 24 字以上）。
+    expect(inputBoxShowsTextBeingSent("あ".repeat(30), long)).toBe(true);
+    // 中ほどが置き換えの表示になった長い本文。
+    const huge = "x".repeat(600) + "middle".repeat(2000) + "y".repeat(100);
+    expect(inputBoxShowsTextBeingSent(`${"x".repeat(500)}[...Truncated text #1 +0 lines...]${"y".repeat(100)}`, huge)).toBe(true);
+    // 24 字に満たない断片は同文に限る（取り残しの「1」が本文に現れても、消したことは知らせる）。
+    expect(inputBoxShowsTextBeingSent("1", "1つ目の案で進めて")).toBe(false);
+    expect(inputBoxShowsTextBeingSent("あ".repeat(10), long)).toBe(false);
+    // 本文に無い文字を含む残り（Mac 側で書き足した・別の下書き）は今回の本文ではない。
+    expect(inputBoxShowsTextBeingSent(`${text} それと`, text)).toBe(false);
+    expect(inputBoxShowsTextBeingSent("別の下書き", text)).toBe(false);
+    expect(inputBoxShowsTextBeingSent("", text)).toBe(false);
   });
 
   /** 実測 claude 2.1.241 の `/login` コード入力待ち画面（URL は Ink がハード改行する）。 */

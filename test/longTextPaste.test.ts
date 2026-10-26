@@ -1145,6 +1145,27 @@ describe("pasteTextInline", () => {
   });
 });
 
+/**
+ * 同じ発話の前の試行が、本文を入力欄へ入れたまま Enter の前に途切れた形（hub の再起動, 実機 2026-10-26）。
+ * `typed` = 打った本文 / `pasted` = 小分けの貼り付けの全部 / `first-piece` = 先頭の 1 つだけ入った。
+ */
+const EARLIER_ATTEMPT_CASES: Array<[string, "typed" | "pasted" | "first-piece"]> = [
+  ["縦に槍を持った時にもっと身体に寄せた方がいい\n槍は顔の後ろにした方がいいかも", "typed"],
+  [LONG_ASCII, "pasted"], [LONG_MULTILINE, "pasted"], [TAB_CODE, "pasted"],
+  [LONG_ASCII, "first-piece"], [LONG_MULTILINE, "first-piece"],
+];
+
+function leaveEarlierAttempt(tui: Tui, text: string, mode: "typed" | "pasted" | "first-piece"): void {
+  if (mode === "typed") {
+    tui.write(text);
+    return;
+  }
+  const pieces = splitForInlinePaste(normalizeTextForPaste(text));
+  for (const piece of mode === "first-piece" ? pieces.slice(0, 1) : pieces) {
+    tui.write(`${BRACKETED_PASTE_START}${piece}${BRACKETED_PASTE_END}`);
+  }
+}
+
 describe("tmux: 長い本文の注入", () => {
   /** tmux の模型。引数の末尾の `;` は区切りとして落ち、`-r` の無い貼り付けは LF を CR に替える。 */
   function makeManager(tui: Tui, options: { failPasteAt?: number } = {}) {
@@ -1425,6 +1446,27 @@ describe("tmux: 長い本文の注入", () => {
     expect(discarded).toEqual(["[Pasted text #1]"]);
   });
 
+  test("前の試行が入れたまま途切れた今回の本文（hub の再起動）は、知らせずに消して 1 回だけ届ける", async () => {
+    // 実機 2026-10-26: 処理中に送った発話を打った直後に hub が再起動し、Enter の前に途切れた。アプリの
+    // 明示再送を受けた新しい hub（自分の本文の覚えを持たない）が、届く発話を「送らずに消しました」と知らせていた。
+    for (const [text, mode] of EARLIER_ATTEMPT_CASES) {
+      const tui = makeTui();
+      leaveEarlierAttempt(tui, text, mode);
+      expect(tui.state.input.length).toBeGreaterThan(0);
+      const { manager } = makeManager(tui);
+      const discarded: string[] = [];
+      const sameText: string[] = [];
+      await manager.sendTextSubmit("s", text, {
+        recordedPromptText: () => "足パーツを作り直した方がいい\n足首はない方がいい",
+        onResidueDiscarded: (residue) => discarded.push(residue),
+        onSameTextResidueCleared: (residue) => sameText.push(residue),
+      });
+      expect(tui.state.submitted).toEqual([spaced(text)]);
+      expect(discarded).toEqual([]);
+      expect(sameText).toHaveLength(1);
+    }
+  });
+
   test("中断で書き戻された長い発話は、送り直さずに消す（30 行でも消し切る）", async () => {
     for (const text of [LONG_ASCII, LONG_MULTILINE, TAB_CODE]) {
       const tui = makeTui();
@@ -1451,11 +1493,13 @@ describe("tmux: 長い本文の注入", () => {
 });
 
 describe("herdr: 長い本文の注入", () => {
-  function makeManager(tui: Tui) {
+  /** `failPasteAt`: その回の括弧付き貼り付けの send-text を、入力欄へ入れずに失敗で返す。 */
+  function makeManager(tui: Tui, options: { failPasteAt?: number } = {}) {
     const store = new SessionMetadataStore(makeTempDir("long-text-paste-herdr"));
     store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
     const herdrOk = (stdout: string): HerdrCommandResult => ({ exitCode: 0, stdout, stderr: "" });
     const recorded: string[][] = [];
+    let pastes = 0;
     const runner: HerdrCommandRunner = async (args) => {
       recorded.push(args);
       if (args[0] === "pane" && args[1] === "list") {
@@ -1470,6 +1514,10 @@ describe("herdr: 長い本文の注入", () => {
       if (args[0] === "pane" && args[1] === "read") return herdrOk(tui.screen());
       if (args[0] === "pane" && args[1] === "send-text") {
         const text = args[3] ?? "";
+        if (text.startsWith(BRACKETED_PASTE_START)) {
+          pastes += 1;
+          if (options.failPasteAt === pastes) return { exitCode: 1, stdout: "", stderr: "herdr: request timed out" };
+        }
         if (text === "\r") tui.enter();
         else if (/^\u0015+$/.test(text)) tui.kill(text.length);
         else if (/^\u007f+$/.test(text)) tui.backspace(text.length);
@@ -1628,6 +1676,43 @@ describe("herdr: 長い本文の注入", () => {
     tui.state.stalled = true;
     await expect(manager.sendTextSubmit("s-a", "短い本文です。届きますか")).rejects.toThrow(/typed text did not reach/);
     expect(recorded.filter((args) => args[1] === "send-text" && args[3] === "短い本文です。届きますか")).toHaveLength(3);
+  });
+
+  test("貼り付けが途中で失敗して送らなかった本文の断片が後から入っても、次の別の発話の前に送らずに消して知らせる", async () => {
+    // 独立検証 2026-10-26: 例外で抜けても自分の本文の覚えが残り、後から入った断片を「自分の本文」として
+    // 独立した発話で送り出していた（アプリには「送信しませんでした」と出ている本文の一部）。
+    const tui = makeTui();
+    const { manager } = makeManager(tui, { failPasteAt: 2 });
+    await expect(manager.sendTextSubmit("s-a", LONG_MULTILINE)).rejects.toThrow(/送信しませんでした/);
+    expect(tui.state.submitted).toEqual([]);
+    // 止まっていた CLI が、失敗した片より後ろの分を後から読んだ形（末尾 3 行）。
+    tui.state.input = LONG_MULTILINE.split("\n").slice(-3).join("\n");
+    const discarded: string[] = [];
+    await manager.sendTextSubmit("s-a", "次の別の発話です", {
+      recordedPromptText: () => "前の発話", onResidueDiscarded: (residue) => discarded.push(residue),
+    });
+    expect(tui.state.submitted).toEqual(["次の別の発話です"]);
+    expect(discarded).toHaveLength(1);
+  });
+
+  test("前の試行が入れたまま途切れた今回の本文（hub の再起動）は、知らせずに消して 1 回だけ届ける", async () => {
+    // 実機 2026-10-26 の再現（herdr の会話で発生）。
+    for (const [text, mode] of EARLIER_ATTEMPT_CASES) {
+      const tui = makeTui();
+      leaveEarlierAttempt(tui, text, mode);
+      expect(tui.state.input.length).toBeGreaterThan(0);
+      const { manager } = makeManager(tui);
+      const discarded: string[] = [];
+      const sameText: string[] = [];
+      await manager.sendTextSubmit("s-a", text, {
+        recordedPromptText: () => "足パーツを作り直した方がいい\n足首はない方がいい",
+        onResidueDiscarded: (residue) => discarded.push(residue),
+        onSameTextResidueCleared: (residue) => sameText.push(residue),
+      });
+      expect(tui.state.submitted).toEqual([spaced(text)]);
+      expect(discarded).toEqual([]);
+      expect(sameText).toHaveLength(1);
+    }
   });
 
   test("中断で書き戻された長い発話は、送り直さずに消す（30 行でも消し切る）", async () => {

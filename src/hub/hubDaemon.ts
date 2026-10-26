@@ -588,8 +588,13 @@ export async function runHubCommand(args: string[]): Promise<number> {
             context.onChoiceCancelled();
           },
           // 入力欄に残っていた文字を送らずに消した（residue-clear）。hub が会話内に出す。知らせる先が無い
-          // 呼び出しでは渡さない（backend は黙って消さず、従来どおり送り出す）。
+          // 呼び出しでは渡さない（backend は黙って消さず、従来どおり送り出す。今回の本文そのものの残りだけは、
+          // 送り出すと 2 回届くので消して打ち直す）。
           onResidueDiscarded: context.onResidueDiscarded,
+          // 残っていたのが今回の本文そのもの（同じ発話の前の試行が途切れた分）で、知らせずに消して打ち直した。
+          // 会話内には出さないので、ここで 1 行残す（事後解析用）。
+          onSameTextResidueCleared: (residue) =>
+            log(`audit chat-residue-same-text session=${session} chars=${[...residue].length}`),
           // 送信確定を確認できないまま配送済みレシートを返す唯一の経路。無言だと
           // 「送ったのに届かない」の再発に誰も気づけないので 1 行残す（事後解析用）。
           onUnconfirmedSubmit: () => log(`audit chat-submit-unconfirmed session=${session}`),

@@ -45,6 +45,7 @@ import {
   inputBoxHasRealPendingText,
   inputBoxRealText,
   inputBoxIsShellMode,
+  inputBoxShowsTextBeingSent,
   inputBoxTextMatchesRecordedPrompt,
   JUMP_TO_LATEST_SEQUENCE,
   JUMP_SETTLE_MS,
@@ -849,6 +850,8 @@ export class HerdrSessionManager {
     //   「配送済み・表示済みの発話」（実測 2026-09-08 sandbox: queued 発話がある中断は書き戻さず
     //   自動送信するので、書き戻しは常にこの 1 種）→ 破棄（C-u）。Enter で送り直すと同じ発話が
     //   二重に届く（実機 2026-09-08: 中断→別文を送信で中断前の発話が重複投稿）。
+    // - いまから打つ本文そのもの（同じ発話の前の試行が打ったまま途切れた分。hub の再起動が注入の途中に
+    //   重なった等）→ 知らせずに消して打ち直す（届くのはこの 1 通だけ。`inputBoxShowsTextBeingSent`）。
     // - それ以外（設問の回答キーの取り残し「1」・Mac 側の打ちかけ等）→ 送らずに消し、消した内容を
     //   `onResidueDiscarded` で知らせる（residue-clear）。以前は Enter で独立送信していたが、取り残しや
     //   打ちかけが Claude へ勝手に届いていた（2026-10-22 利用者提案で変更）。
@@ -889,11 +892,19 @@ export class HerdrSessionManager {
       const recorded = options.recordedPromptText?.() ?? null;
       const restored = recorded !== null && inputBoxTextMatchesRecordedPrompt(pending, recorded);
       const own = this.ownUnsubmittedText.get(name);
+      const ownText = own !== undefined && inputBoxTextMatchesRecordedPrompt(pending, own);
       if (restored) {
         this.ownUnsubmittedText.delete(name);
         // 空にできないまま本文を打つと、今回の本文が残存の後ろへ連結されて 1 メッセージになる。
         if (!(await this.clearInputBox(name))) throw new ChatInjectionRejectedError(CHAT_BLOCKED_BY_UNCLEARABLE_RESIDUE);
-      } else if ((own !== undefined && inputBoxTextMatchesRecordedPrompt(pending, own)) || options.onResidueDiscarded === undefined) {
+      } else if (!ownText && inputBoxShowsTextBeingSent(pending, text)) {
+        // いまから打つ本文そのもの（同じ発話の前の試行が打ったまま途切れた分）。送り出すと、続けて打つ
+        // 本文と二重に届く。消したことを知らせると、届く発話を消したと読める（実機 2026-10-26）ので、
+        // 黙って消して打ち直す。自分の本文の覚えと同文のときは下の「送り出す」を優先する（別の発話として
+        // 同じ本文を 2 回送った = 2 回届けるのが正しい）。
+        if (!(await this.clearInputBox(name))) throw new ChatInjectionRejectedError(CHAT_BLOCKED_BY_UNCLEARABLE_RESIDUE);
+        options.onSameTextResidueCleared?.(pending);
+      } else if (ownText || options.onResidueDiscarded === undefined) {
         // Tailii 自身が前に打って送信を確かめられなかった本文（CLI が止まっていた・貼り付けが後から
         // 入った等。アプリでは送信済み／配送不明として見えている）は、消すと送ったはずの発話が失われる
         // ので送り出す。消したことを知らせる手段の無い呼び出し（hub 以外: 公式アプリ連携・kick）も、
@@ -920,91 +931,99 @@ export class HerdrSessionManager {
     // = 送信成立」と誤判定して配送済みレシートを発行 → silent loss）。本文が入力欄へ
     // 反映されたことを検証し、反映されなければ間隔を置いて再投入、最終的に throw して
     // chat_send を uncertain（アプリの明示再送）へ倒す。
-    // ここから本文を打つ。送信を確かめられるまでは「自分が打った本文」として覚えておく（次の送信で
-    // 入力欄に残っていたら、消さずに送り出す）。
+    // ここから本文を打つ。送信を確かめられるまでは「自分が打った本文」として覚えておく（確かめられないまま
+    // 戻ったら、次の送信で入力欄に残っていても消さずに送り出す。例外で抜けたら覚えを消す）。
     this.ownUnsubmittedText.set(name, text);
-    const probe = typedTextProbe(text);
-    let typed = probe === null;
-    if (!typed && typedTextWouldBreak(text) && textIsPasteSafe(text)) {
-      // 1 回で打つと壊れる本文は、小分けの括弧付き貼り付けで渡す（long-text-paste）。1 回で打つと
-      // CLI が読み取りの境界ごとに貼り付けとして取り込み、入力欄が `[Pasted text #N]` になって
-      // 下の反映検証が必ず失敗する（実測 2.1.283: 983 字の送信が 3 回打ち直した末に失敗）。
-      const target = await this.paneTarget(name);
-      if (target === null) {
-        throw await this.missingPaneError(["pane", "send-text", name]);
+    try {
+      const probe = typedTextProbe(text);
+      let typed = probe === null;
+      if (!typed && typedTextWouldBreak(text) && textIsPasteSafe(text)) {
+        // 1 回で打つと壊れる本文は、小分けの括弧付き貼り付けで渡す（long-text-paste）。1 回で打つと
+        // CLI が読み取りの境界ごとに貼り付けとして取り込み、入力欄が `[Pasted text #N]` になって
+        // 下の反映検証が必ず失敗する（実測 2.1.283: 983 字の送信が 3 回打ち直した末に失敗）。
+        const target = await this.paneTarget(name);
+        if (target === null) {
+          throw await this.missingPaneError(["pane", "send-text", name]);
+        }
+        const sendRaw = async (payload: string): Promise<void> => {
+          const args = ["pane", "send-text", target, payload];
+          const result = await this.runner(args);
+          if (result.exitCode !== 0) throw new HerdrFailedError(args, result.exitCode, result.stderr);
+        };
+        const outcome = await pasteTextInline(text, {
+          // 1 つずつ書き込む。まとめて書き込むと、CLI が読み進めるのを待たされる（実測: 8KB を
+          // 1 回で書くと入り切るまで 4〜7 秒、20KB は 10 秒でも入り切らない。1 つずつなら 1 秒）。
+          paste: async (pieces) => {
+            for (const piece of pieces) await sendRaw(`${BRACKETED_PASTE_START}${piece}${BRACKETED_PASTE_END}`);
+          },
+          capture: () => this.captureVisibleScreenAnsiOrNull(name),
+          sendKills: (count) => sendRaw(KILL_LINE_SEQUENCE.repeat(count)),
+          pollMs: this.pastedTextPollMs,
+          timeoutMs: this.pastedTextTimeoutMs,
+          clearDelayMs: this.clearKeyDelayMs,
+          clearSettleMs: this.clearSettleMs,
+          verifyDeadlineMs: startedAtMs + INJECT_VERIFY_BUDGET_MS,
+        });
+        if (outcome !== "arrived") {
+          // 打つ場合の反映検証と同じ扱い: 残骸を best-effort で掃除してから失敗として返す。
+          // 貼り直しはしない（CLI が止まっていただけなら、貼り直した分だけ後から重なって入る）。
+          await this.clearInputBox(name);
+          // 配送不明で返す。後から入った分を「自分の本文」として送り出すと明示再送と二重に届くので覚えを消す。
+          this.ownUnsubmittedText.delete(name);
+          throw new HerdrFailedError(
+            ["pane", "send-text", name],
+            1,
+            "pasted text did not reach the input box (RC limbo / ダイアログ表示中 / 入力欄不可視 / CLI の停止のいずれか)",
+          );
+        }
+        typed = true;
       }
-      const sendRaw = async (payload: string): Promise<void> => {
-        const args = ["pane", "send-text", target, payload];
-        const result = await this.runner(args);
-        if (result.exitCode !== 0) throw new HerdrFailedError(args, result.exitCode, result.stderr);
-      };
-      const outcome = await pasteTextInline(text, {
-        // 1 つずつ書き込む。まとめて書き込むと、CLI が読み進めるのを待たされる（実測: 8KB を
-        // 1 回で書くと入り切るまで 4〜7 秒、20KB は 10 秒でも入り切らない。1 つずつなら 1 秒）。
-        paste: async (pieces) => {
-          for (const piece of pieces) await sendRaw(`${BRACKETED_PASTE_START}${piece}${BRACKETED_PASTE_END}`);
-        },
-        capture: () => this.captureVisibleScreenAnsiOrNull(name),
-        sendKills: (count) => sendRaw(KILL_LINE_SEQUENCE.repeat(count)),
-        pollMs: this.pastedTextPollMs,
-        timeoutMs: this.pastedTextTimeoutMs,
-        clearDelayMs: this.clearKeyDelayMs,
-        clearSettleMs: this.clearSettleMs,
-        verifyDeadlineMs: startedAtMs + INJECT_VERIFY_BUDGET_MS,
-      });
-      if (outcome !== "arrived") {
-        // 打つ場合の反映検証と同じ扱い: 残骸を best-effort で掃除してから失敗として返す。
-        // 貼り直しはしない（CLI が止まっていただけなら、貼り直した分だけ後から重なって入る）。
+      for (let attempt = 0; attempt < 3 && !typed; attempt += 1) {
+        if (attempt > 0) {
+          await new Promise((resolve) => setTimeout(resolve, this.inputRetryDelayMs));
+          // 反映検証の偽陰性時にクリアせず再投入すると、前回分と連結され 1 メッセージの
+          // 本文が二重になる（初回送信の本文二重化・実機5件）。再投入前に必ず入力欄を
+          // 空にし、空にできたと確信できなければ再投入を諦めて throw（明示再送）へ倒す。
+          if (!(await this.clearInputBox(name))) break;
+          // クリアがシェルモード記号だけを残すことがある（実測: `!echo ...` へ C-u 1回で
+          // `!` プロンプトの空入力になる）。常に通常モードから再投入する既存方針に合わせる。
+          await this.exitShellMode(name);
+        }
+        await this.sendKeys(name, [text], true);
+        await new Promise((resolve) => setTimeout(resolve, this.submitDelayMs));
+        if (await this.inputBoxContainsText(name, probe as string)) {
+          typed = true;
+          break;
+        }
+        // 描画遅延での誤判定 → 再投入で本文が二重になるのを避けるため、少し待って再確認。
+        await new Promise((resolve) => setTimeout(resolve, this.submitVerifyDelayMs));
+        if (await this.inputBoxContainsText(name, probe as string)) {
+          typed = true;
+          break;
+        }
+      }
+      if (!typed) {
+        // 残骸（自分の投入分）を残したまま throw すると、アプリの明示再送時に冒頭の
+        // Enter flush が残骸を独立メッセージとして送ってしまう（幽霊バブル）。
+        // best-effort で掃除してから throw する（掃除できない場合もそのまま throw）。
         await this.clearInputBox(name);
         // 配送不明で返す。後から入った分を「自分の本文」として送り出すと明示再送と二重に届くので覚えを消す。
         this.ownUnsubmittedText.delete(name);
         throw new HerdrFailedError(
           ["pane", "send-text", name],
           1,
-          "pasted text did not reach the input box (RC limbo / ダイアログ表示中 / 入力欄不可視 / CLI の停止のいずれか)",
+          "typed text did not reach the input box (RC limbo / ダイアログ表示中 / 入力欄不可視のいずれか)",
         );
       }
-      typed = true;
-    }
-    for (let attempt = 0; attempt < 3 && !typed; attempt += 1) {
-      if (attempt > 0) {
-        await new Promise((resolve) => setTimeout(resolve, this.inputRetryDelayMs));
-        // 反映検証の偽陰性時にクリアせず再投入すると、前回分と連結され 1 メッセージの
-        // 本文が二重になる（初回送信の本文二重化・実機5件）。再投入前に必ず入力欄を
-        // 空にし、空にできたと確信できなければ再投入を諦めて throw（明示再送）へ倒す。
-        if (!(await this.clearInputBox(name))) break;
-        // クリアがシェルモード記号だけを残すことがある（実測: `!echo ...` へ C-u 1回で
-        // `!` プロンプトの空入力になる）。常に通常モードから再投入する既存方針に合わせる。
-        await this.exitShellMode(name);
-      }
-      await this.sendKeys(name, [text], true);
-      await new Promise((resolve) => setTimeout(resolve, this.submitDelayMs));
-      if (await this.inputBoxContainsText(name, probe as string)) {
-        typed = true;
-        break;
-      }
-      // 描画遅延での誤判定 → 再投入で本文が二重になるのを避けるため、少し待って再確認。
-      await new Promise((resolve) => setTimeout(resolve, this.submitVerifyDelayMs));
-      if (await this.inputBoxContainsText(name, probe as string)) {
-        typed = true;
-        break;
-      }
-    }
-    if (!typed) {
-      // 残骸（自分の投入分）を残したまま throw すると、アプリの明示再送時に冒頭の
-      // Enter flush が残骸を独立メッセージとして送ってしまう（幽霊バブル）。
-      // best-effort で掃除してから throw する（掃除できない場合もそのまま throw）。
-      await this.clearInputBox(name);
-      // 配送不明で返す。後から入った分を「自分の本文」として送り出すと明示再送と二重に届くので覚えを消す。
+      if ((await this.submitTypedText(name)) !== "submitted") options.onUnconfirmedSubmit?.();
+      else this.ownUnsubmittedText.delete(name);
+    } catch (error) {
+      // 本文を打った後に例外で抜けた（配送不明。herdr CLI の失敗・タイムアウト等）。覚えを残すと、アプリの
+      // 明示再送で残りを「自分の本文」として送り出し、続けて打ち直す本文と同じ発話が 2 回届く。覚えを消し、
+      // 残りは「今回の本文そのもの」（明示再送）か「それ以外」（別の発話）として扱わせる。
       this.ownUnsubmittedText.delete(name);
-      throw new HerdrFailedError(
-        ["pane", "send-text", name],
-        1,
-        "typed text did not reach the input box (RC limbo / ダイアログ表示中 / 入力欄不可視のいずれか)",
-      );
+      throw error;
     }
-    if ((await this.submitTypedText(name)) !== "submitted") options.onUnconfirmedSubmit?.();
-    else this.ownUnsubmittedText.delete(name);
   }
 
   /** CLI のキューに溜まっている発話を今すぐ届ける（chat-send-now, SessionBackend 共通面）。 */

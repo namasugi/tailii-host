@@ -326,6 +326,12 @@ export interface SendTextSubmitOptions {
    * 1 回だけ呼ばれる（residue-clear）。hub は消した内容を会話内に出す（黙って消さない）。
    */
   onResidueDiscarded?: (text: string) => void;
+  /**
+   * 入力欄に残っていたのが、いまから打つ本文そのもの（同じ発話の前の試行が打ったまま途切れた分）
+   * だったので、知らせずに消して打ち直すときに 1 回だけ呼ばれる（`inputBoxShowsTextBeingSent`）。
+   * 会話内には出さない。hub は監査ログへ残す（事後解析用）。
+   */
+  onSameTextResidueCleared?: (text: string) => void;
 }
 
 /**
@@ -834,6 +840,25 @@ export function inputBoxTextMatchesRecordedPrompt(boxText: string, recordedPromp
   if (pending.length === 0 || recorded.length === 0) return false;
   if (pending === recorded) return true;
   return pending.length >= 24 && recorded.endsWith(pending);
+}
+
+/**
+ * 入力欄の残存テキストが、いまから打つ本文そのもの（またはその途中まで）か（residue-clear, TESTABLE）。
+ *
+ * 同じ発話の前の試行が本文を打ったまま、送信の前に途切れた形に当たる。hub の再起動（自動更新・
+ * デプロイ）が注入の途中に重なると、アプリは配送不明になった同じ発話を明示再送する（実機 2026-10-26:
+ * 処理中に送った発話に「ホスト側の入力欄に残っていた「…」は送らずに消しました」と出た。実際には
+ * 消した直後に同じ本文を打ち直し、1 回だけ届いていた）。自分の本文の覚え（`ownUnsubmittedText`）は
+ * メモリにしか無く hub の再起動で消えるので、いまから打つ本文と照らす。消して打ち直しても届くのは
+ * この 1 通だけで何も失われないので、消したことを知らせない（知らせると、届いた発話を消したと読める）。
+ *
+ * 照合は `inputBoxTextMatchesRecordedPrompt` と同じ（同文 / 長い本文は見えている末尾 24 字以上 /
+ * 置き換えの表示）に、小分けの貼り付けが途中まで入った形（本文の連続した一部で 24 字以上）を足す。
+ * 24 字に満たない残りは同文に限る（取り残しの「1」が本文のどこかに現れるだけで、消したことを
+ * 知らせなくならないように）。
+ */
+export function inputBoxShowsTextBeingSent(boxText: string, text: string): boolean {
+  return inputBoxTextMatchesRecordedPrompt(boxText, text) || matchInputBoxAgainstText(boxText, text, false) >= 24;
 }
 
 /**
@@ -2313,6 +2338,8 @@ export class TmuxSessionManager {
     //   → 黙って破棄。Enter で送り直すと同じ発話が二重に届く（実機 2026-09-08）。
     // - Tailii 自身が前に打って送信を確かめられなかった本文（CLI が止まっていた等。アプリでは
     //   送信済みとして見えている）→ 従来どおり Enter で独立送信し切る（消すと送ったはずの発話が失われる）。
+    // - いまから打つ本文そのもの（同じ発話の前の試行が打ったまま途切れた分。hub の再起動が注入の途中に
+    //   重なった等）→ 知らせずに消して打ち直す（届くのはこの 1 通だけ。`inputBoxShowsTextBeingSent`）。
     // - それ以外（設問の回答キーの取り残し「1」・Mac 側の打ちかけ等）→ 破棄し、消した内容を
     //   `onResidueDiscarded` で知らせる。以前は Enter で独立送信していたが、取り残しの「1」や
     //   打ちかけが Claude へ勝手に届いていた（2026-10-22 利用者提案で変更）。
@@ -2382,11 +2409,19 @@ export class TmuxSessionManager {
       const recorded = options.recordedPromptText?.() ?? null;
       const restored = recorded !== null && inputBoxTextMatchesRecordedPrompt(pending, recorded);
       const own = this.ownUnsubmittedText.get(name);
+      const ownText = own !== undefined && inputBoxTextMatchesRecordedPrompt(pending, own);
       if (restored) {
         this.ownUnsubmittedText.delete(name);
         // 空にできないまま本文を打つと、今回の本文が残存の後ろへ連結されて 1 メッセージになる。
         if (!(await this.clearInputBox(name))) throw new ChatInjectionRejectedError(CHAT_BLOCKED_BY_UNCLEARABLE_RESIDUE);
-      } else if ((own !== undefined && inputBoxTextMatchesRecordedPrompt(pending, own)) || options.onResidueDiscarded === undefined) {
+      } else if (!ownText && inputBoxShowsTextBeingSent(pending, text)) {
+        // いまから打つ本文そのもの（同じ発話の前の試行が打ったまま途切れた分）。送り出すと、続けて打つ
+        // 本文と二重に届く。消したことを知らせると、届く発話を消したと読める（実機 2026-10-26）ので、
+        // 黙って消して打ち直す。自分の本文の覚えと同文のときは下の「送り出す」を優先する（別の発話として
+        // 同じ本文を 2 回送った = 2 回届けるのが正しい）。
+        if (!(await this.clearInputBox(name))) throw new ChatInjectionRejectedError(CHAT_BLOCKED_BY_UNCLEARABLE_RESIDUE);
+        options.onSameTextResidueCleared?.(pending);
+      } else if (ownText || options.onResidueDiscarded === undefined) {
         // Tailii 自身が前に打って送信を確かめられなかった本文（CLI が止まっていた・貼り付けが後から
         // 入った等。アプリでは送信済み／配送不明として見えている）は、消すと送ったはずの発話が失われる
         // ので送り出す。消したことを知らせる手段の無い呼び出し（hub 以外: 公式アプリ連携・kick）も、
@@ -2408,10 +2443,11 @@ export class TmuxSessionManager {
     // 記号を消して通常入力へ戻す。`!` 始まりの本文は注入時に自分でシェルモードへ入るので、
     // 常に通常モードから始めるのが決定的で安全（herdr 側 exitShellMode と同じ防御）。
     await this.exitShellMode(name);
-    // ここから本文を打つ。送信を確かめられるまでは「自分が打った本文」として覚えておく（次の送信で
-    // 入力欄に残っていたら、消さずに送り出す）。
+    // ここから本文を打つ。送信を確かめられるまでは「自分が打った本文」として覚えておく（確かめられないまま
+    // 戻ったら、次の送信で入力欄に残っていても消さずに送り出す。例外で抜けたら覚えを消す）。
     this.ownUnsubmittedText.set(name, text);
     let pasted: PasteOutcome = "arrived";
+    let outcome: SubmitOutcome;
     try {
       if (tmuxTypedTextWouldBreak(text) && textIsPasteSafe(text) && typedTextProbe(text) !== null) {
         // 1 回で打つと壊れる本文は、小分けの括弧付き貼り付けで渡す（long-text-paste）。
@@ -2430,13 +2466,14 @@ export class TmuxSessionManager {
       } else {
         await this.sendKeys(name, [text], true);
       }
+      outcome = await this.submitTypedText(name);
     } catch (error) {
-      // 打つ途中で失敗した（配送不明）。後から入った分を「自分の本文」として送り出すと、利用者の
-      // 明示再送と二重に届く。覚えを消し、後から入った分は「消して知らせる」側に倒す。
+      // 打った後に例外で抜けた（配送不明。打つ途中・Enter の送出の失敗）。覚えを残すと、アプリの明示再送で
+      // 残りを「自分の本文」として送り出し、続けて打ち直す本文と同じ発話が 2 回届く。覚えを消し、残りは
+      // 「今回の本文そのもの」（明示再送）か「それ以外」（別の発話）として扱わせる。
       this.ownUnsubmittedText.delete(name);
       throw error;
     }
-    const outcome = await this.submitTypedText(name);
     // 入ったのを確かめられなかった貼り付けは、送信確定が成立に見えても未確認として残す
     // （止まっている CLI の画面は、空の入力欄のまま変わらない）。
     if (outcome !== "submitted" || pasted === "unverified") options.onUnconfirmedSubmit?.();

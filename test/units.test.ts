@@ -1020,7 +1020,10 @@ describe("TmuxSessionManager", () => {
     unknownAfterEscapeReads?: number;
     /** 上の描画途中の画面が続く回数（既定は以後ずっと）。 */
     unknownFrames?: number;
+    /** Enter の send-keys を失敗で返す回数（入力欄は変えない。tmux サーバの一時エラー等）。 */
+    failEnters?: number;
   } = {}) {
+    let enterFailures = options.failEnters ?? 0;
     const state = {
       input: initialInput,
       dialog: options.dialogFromStart === "selection",
@@ -1087,6 +1090,10 @@ describe("TmuxSessionManager", () => {
         return ok("");
       }
       if (args[0] === "send-keys" && args[3] === "Enter") {
+        if (enterFailures > 0) {
+          enterFailures -= 1;
+          return { exitCode: 1, stdout: "", stderr: "server exited unexpectedly" };
+        }
         submits += 1;
         if ((options.dialogOnFirstSubmit ?? false) && submits === 1) { state.dialog = true; return ok(""); }
         if ((options.approvalOnFirstSubmit ?? false) && submits === 1) { state.approval = true; return ok(""); }
@@ -1137,6 +1144,78 @@ describe("TmuxSessionManager", () => {
     await mgrB.sendTextSubmit("s", "今回の本文", { onResidueDiscarded: (text) => discardedB.push(text) });
     expect(b.sends()).toEqual([["C-u"], ["-l", "--", "今回の本文"], ["Enter"]]);
     expect(discardedB).toEqual(["1"]);
+  });
+
+  test("sendTextSubmit: 残っていたのが今回の本文そのもの（hub の再起動で途切れた前の試行）なら、知らせずに消して打ち直す（tmux）", async () => {
+    // 実機 2026-10-26（herdr で発生。tmux も同じ規則）: 打った直後に hub が再起動して Enter の前に途切れ、
+    // アプリの明示再送を受けた新しい hub が、届く発話を「送らずに消しました」と知らせていた。
+    const text = "縦に槍を持った時にもっと身体に寄せた方がいい 槍は顔の後ろにした方がいいかも";
+    const h = makeTmuxSubmitHarness(text);
+    const mgr = new TmuxSessionManager({ runner: h.runner.runner, store: makeTempStore(), clearKeyDelayMs: 0, submitDelayMs: 0, submitVerifyDelayMs: 0 });
+    const discarded: string[] = [];
+    const sameText: string[] = [];
+    await mgr.sendTextSubmit("s", text, {
+      recordedPromptText: () => "足パーツを作り直した方がいい 足首はない方がいい",
+      onResidueDiscarded: (residue) => discarded.push(residue),
+      onSameTextResidueCleared: (residue) => sameText.push(residue),
+    });
+    expect(h.sends()).toEqual([["C-u"], ["-l", "--", text], ["Enter"]]);
+    expect(discarded).toEqual([]);
+    expect(sameText).toEqual([text]);
+    // 取り残しの「1」は、本文が「1」で始まっても今回の本文ではない（消したことを知らせる）。
+    const one = makeTmuxSubmitHarness("1");
+    const mgrOne = new TmuxSessionManager({ runner: one.runner.runner, store: makeTempStore(), clearKeyDelayMs: 0, submitDelayMs: 0, submitVerifyDelayMs: 0 });
+    const discardedOne: string[] = [];
+    await mgrOne.sendTextSubmit("s", "1つ目の案で進めて", { onResidueDiscarded: (residue) => discardedOne.push(residue) });
+    expect(one.sends()).toEqual([["C-u"], ["-l", "--", "1つ目の案で進めて"], ["Enter"]]);
+    expect(discardedOne).toEqual(["1"]);
+    // 知らせる手段の無い呼び出し（公式アプリ連携・kick）でも、今回の本文そのものは送り出さずに打ち直す
+    // （送り出すと、続けて打つ本文と 2 回届く）。
+    const remote = makeTmuxSubmitHarness("/remote-control");
+    const mgrRemote = new TmuxSessionManager({ runner: remote.runner.runner, store: makeTempStore(), clearKeyDelayMs: 0, submitDelayMs: 0, submitVerifyDelayMs: 0 });
+    await mgrRemote.sendTextSubmit("s", "/remote-control");
+    expect(remote.sends()).toEqual([["C-u"], ["-l", "--", "/remote-control"], ["Enter"]]);
+  });
+
+  test("sendTextSubmit: Enter の送出が失敗で返った（配送不明）発話の明示再送は、残りを送り出さずに消して 1 回だけ送る（tmux）", async () => {
+    // 独立検証 2026-10-26: 覚えを消す catch が打鍵だけを覆い、Enter の失敗では覚えが残っていた。明示再送で
+    // 残りを「自分の本文」として送り出してから打ち直し、同じ発話が 2 回届いていた。
+    const text = "槍は顔の後ろにした方がいいかも";
+    const h = makeTmuxSubmitHarness("", { failEnters: 1 });
+    const mgr = new TmuxSessionManager({ runner: h.runner.runner, store: makeTempStore(), clearKeyDelayMs: 0, submitDelayMs: 0, submitVerifyDelayMs: 0 });
+    await expect(mgr.sendTextSubmit("s", text, { onResidueDiscarded: () => {} })).rejects.toThrow(/Enter/);
+    expect(h.state.input).toBe(text);
+    h.runner.recorded.length = 0;
+    const discarded: string[] = [];
+    const sameText: string[] = [];
+    await mgr.sendTextSubmit("s", text, {
+      onResidueDiscarded: (residue) => discarded.push(residue),
+      onSameTextResidueCleared: (residue) => sameText.push(residue),
+    });
+    expect(h.sends()).toEqual([["C-u"], ["-l", "--", text], ["Enter"]]);
+    expect(discarded).toEqual([]);
+    expect(sameText).toEqual([text]);
+    expect(h.state.input).toBe("");
+  });
+
+  test("sendTextSubmit: 同じ本文を別の発話として 2 回送ったとき、送信を確かめられなかった 1 通目は送り出す（tmux）", async () => {
+    const harnessOptions = { neverSubmits: true };
+    const h = makeTmuxSubmitHarness("", harnessOptions);
+    const mgr = new TmuxSessionManager({ runner: h.runner.runner, store: makeTempStore(), clearKeyDelayMs: 0, submitDelayMs: 0, submitVerifyDelayMs: 0 });
+    await mgr.sendTextSubmit("s", "はい", { onUnconfirmedSubmit: () => {} });
+    expect(h.state.input).toBe("はい");
+    harnessOptions.neverSubmits = false;
+    h.runner.recorded.length = 0;
+    const discarded: string[] = [];
+    const sameText: string[] = [];
+    await mgr.sendTextSubmit("s", "はい", {
+      recordedPromptText: () => "もっと前の発話",
+      onResidueDiscarded: (residue) => discarded.push(residue),
+      onSameTextResidueCleared: (residue) => sameText.push(residue),
+    });
+    expect(h.sends()).toEqual([["Enter"], ["-l", "--", "はい"], ["Enter"]]);
+    expect(discarded).toEqual([]);
+    expect(sameText).toEqual([]);
   });
 
   test("sendTextSubmit: 送信が成立したら Enter は 1 回だけで終える（tmux）", async () => {
