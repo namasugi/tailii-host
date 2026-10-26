@@ -88,10 +88,14 @@ import { resolveHostDisplayName } from "../shared/hostDisplayName.js";
 import {
   DEFAULT_MODE_TIMING,
   engineDiag,
+  writeError,
   type EngineState,
   type HandlerContext,
   type ModeTiming,
 } from "./context.js";
+
+/** 順番に処理する要求の処理が投げたときの、アプリへの答え（理由はホストのログへ）。 */
+const HANDLER_FAILED_MESSAGE = "ホスト側で要求を処理できませんでした。少し待ってもう一度試してください。";
 import { ENGINE_HANDLERS } from "./handlers/index.js";
 import { isNonBlockingQuestionId } from "../codex/codexAsyncQuestion.js";
 
@@ -1259,6 +1263,15 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
     ctx.trackBackground(task);
     return true;
   }
-  await handler(message, ctx);
+  try {
+    await handler(message, ctx);
+  } catch (error) {
+    // 1 件の要求の失敗で engine（= アプリとの接続）を落とさない。以前は順番に処理する要求（会話の開始など）が
+    // 投げると読み取りループごと終わり、接続が切れていた（独立検証 2026-10-26: tmux の socket ファイルが無いときの
+    // 会話の開き直し）。id のある要求にはエラーで答える（アプリは待ちを失敗として終え、理由を出す）。
+    process.stderr.write(`[tailii-host engine] ${message.type} 処理失敗: ${String(error)}\n`);
+    const id = "id" in message && typeof message.id === "string" ? message.id : undefined;
+    writeError(ctx.writer, ctx.state.negotiatedVersion, id, "internal_error", HANDLER_FAILED_MESSAGE);
+  }
   return true;
 }

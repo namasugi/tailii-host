@@ -268,6 +268,49 @@ describe("reaperTick", () => {
     expect(result.killed).toEqual([]);
   });
 
+  test("tmux が答えられない tick（socket ファイルが無い・権限）は tmux の会話を回収せず、herdr の巡回は続ける", async () => {
+    // socket ファイルが無い（`No such file or directory`）のは、tmux 以外が消したとき。サーバは動いていることがある
+    // （`kill -USR1` で作り直すと会話が出てくる）。サーバ不在と読むと、生きている会話を回収して送信待ちを捨て、
+    // 開き直しで claude を二重に起動する（独立検証 2026-10-26）。以前は tick ごと投げて herdr の巡回まで止まっていた
+    // （実ログ 2026-08-05）。
+    for (const stderr of [
+      "error connecting to /private/tmp/tmux-502/default (No such file or directory)",
+      "error connecting to /private/tmp/tmux-502/default (Permission denied)",
+    ]) {
+      const dir = makeTempDir("reaper-tmux-unavailable");
+      const store = makeTempStore();
+      store.put({ name: "s-live0001", cwd: "/w", createdAt: 1, backend: "tmux" });
+      store.put({ name: "s-herdr", cwd: "/h", createdAt: 1, backend: "herdr" });
+      writeHeartbeat(dir, "s-live0001", { ts: NOW - 10, state: "active" });
+      writeHeartbeat(dir, "s-legacy", { ts: NOW - 10, state: "idle" });
+      writeHeartbeat(dir, "s-herdr-gone", { ts: NOW - 10, state: "idle" });
+      store.put({ name: "s-herdr-gone", cwd: "/h", createdAt: 1, backend: "herdr" });
+      const runner = new MockTmuxRunner(() => ({ exitCode: 1, stdout: "", stderr }));
+      let stopServerCalls = 0;
+      const logs: string[] = [];
+      const result = await reaperTick({
+        runner: runner.runner, heartbeatDir: dir, metadataStore: store, timeoutSeconds: TIMEOUT, now: NOW,
+        log: (line) => logs.push(line),
+        herdrOps: {
+          list: async () => [],
+          listLive: async () => [],
+          agentProcessAlive: async () => true,
+          kill: async () => {},
+          stopServerIfEmpty: async () => { stopServerCalls += 1; },
+        },
+      });
+      // tmux の会話・素性の分からない残骸は回収しない（herdr と分かっている会話は herdr の判定で回収する）。
+      expect(result.reclaimed).toEqual(["s-herdr-gone"]);
+      expect(readHeartbeat(dir, "s-live0001")).not.toBeNull();
+      expect(readHeartbeat(dir, "s-legacy")).not.toBeNull();
+      // herdr の巡回は続く（空 server の停止まで進む）。
+      expect(stopServerCalls).toBe(1);
+      // 「生存 0」とは言わない（hub の自然終了の条件）。
+      expect(result.liveCount).toBeGreaterThanOrEqual(1);
+      expect(logs.some((line) => line.startsWith("tmux 生存判定に失敗"))).toBe(true);
+    }
+  });
+
   test("kill 失敗（既に不在等）でも heartbeat を掃除して継続する", async () => {
     const dir = makeTempDir("reaper");
     const runner = new MockTmuxRunner((args) => {

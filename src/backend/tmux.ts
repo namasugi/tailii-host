@@ -1231,6 +1231,23 @@ export class ChatInjectionRejectedError extends Error {
   }
 }
 
+/**
+ * `tmux ls` の失敗が「tmux サーバが無い」ことを表すか（空集合として扱ってよいか, TESTABLE）。
+ * - `no server running on …`: socket ファイルはあるが、誰も listen していない
+ * - `no sessions`
+ *
+ * socket ファイルそのものが無い形（`error connecting to … (No such file or directory)`）は**サーバ不在と読まない**。
+ * tmux は自分では socket ファイルを消さない（`kill-server` でも自然終了でも残る。tmux 3.7 実測）ので、これが出るのは
+ * tmux 以外（/tmp の掃除等）が消したときで、そのときサーバが動いていることがある（`kill -USR1` で socket を作り直すと
+ * 会話が出てくる。このマシンでも再起動なしで起きた: 2026-09-13・09-26）。サーバ不在と読むと、reaper が生きている
+ * 会話を回収して送信待ちの発話を捨て、開き直しで同じ会話の claude を二重に起動する（独立検証 2026-10-26 で再現）。
+ * 判定できない失敗として投げる（reaper は tmux の会話の回収だけを見送る）。
+ */
+export function tmuxServerAbsent(output: string): boolean {
+  const text = output.toLowerCase();
+  return text.includes("no server running") || text.includes("no sessions");
+}
+
 export class LoginCodeError extends Error {
   constructor(message: string) {
     super(message);
@@ -2710,10 +2727,7 @@ export class TmuxSessionManager {
     const args = ["ls", "-F", "#{session_name}"];
     const result = await this.runner(args);
     if (result.exitCode !== 0) {
-      const combined = (result.stdout + result.stderr).toLowerCase();
-      if (combined.includes("no server running") || combined.includes("no sessions")) {
-        return new Set();
-      }
+      if (tmuxServerAbsent(result.stdout + result.stderr)) return new Set();
       throw new TmuxFailedError(args, result.exitCode, result.stderr);
     }
     const out = new Set<string>();

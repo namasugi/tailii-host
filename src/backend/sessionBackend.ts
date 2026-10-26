@@ -30,6 +30,13 @@ export type SessionBackendKind = TerminalBackendKind;
 export interface SessionBackend {
   readonly store: SessionMetadataStore;
   list(): Promise<SessionInfo[]>;
+  /**
+   * list の、片方の backend が答えられなくても答えた方の分を返す形（任意実装。Composite だけが持つ）。
+   * 答えられなかった backend を `unavailable` に入れる。そこで会話が動いているかは分からない（tmux は socket
+   * ファイルだけが消えてサーバが動いていることがある）ので、呼び出し側はその backend の会話を「止まっている」と
+   * 決めつけない（開き直しで二重に起動しない）。
+   */
+  listAvailable?(): Promise<{ sessions: SessionInfo[]; unavailable: SessionBackendKind[] }>;
   reattach(name: string): Promise<ReattachResult>;
   kill(name: string): Promise<void>;
   sendKeys(name: string, keys: string[], literal?: boolean): Promise<void>;
@@ -108,6 +115,13 @@ export function writeSessionBackendKind(
   fs.renameSync(tmp, backendFilePath);
 }
 
+/** tmux と herdr の一覧を名前順にまとめる。名前空間はメタの backend 欄で分割済み。万一の重複は tmux 優先。 */
+function mergeSessionInfos(tmuxInfos: SessionInfo[], herdrInfos: SessionInfo[]): SessionInfo[] {
+  const seen = new Set(tmuxInfos.map((info) => info.name));
+  const merged = [...tmuxInfos, ...herdrInfos.filter((info) => !seen.has(info.name))];
+  return merged.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
 /**
  * メタデータの backend 欄で tmux / herdr へ per-session ルーティングする合成バックエンド。
  * list は両方の和（各バックエンドが自分の担当メタだけを列挙するので重複しない）。
@@ -134,11 +148,19 @@ export class CompositeSessionBackend implements SessionBackend {
 
   async list(): Promise<SessionInfo[]> {
     const [tmuxInfos, herdrInfos] = await Promise.all([this.tmux.list(), this.herdr.list()]);
-    // 名前空間はメタの backend 欄で分割済み（tmux 側は herdr メタを列挙しない）。
-    // 万一の重複（メタ無し同名 pane 等）は tmux 優先で除く。
-    const seen = new Set(tmuxInfos.map((info) => info.name));
-    const merged = [...tmuxInfos, ...herdrInfos.filter((info) => !seen.has(info.name))];
-    return merged.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    return mergeSessionInfos(tmuxInfos, herdrInfos);
+  }
+
+  async listAvailable(): Promise<{ sessions: SessionInfo[]; unavailable: SessionBackendKind[] }> {
+    const [tmux, herdr] = await Promise.allSettled([this.tmux.list(), this.herdr.list()]);
+    const unavailable: SessionBackendKind[] = [];
+    if (tmux.status === "rejected") unavailable.push("tmux");
+    if (herdr.status === "rejected") unavailable.push("herdr");
+    return {
+      sessions: mergeSessionInfos(
+        tmux.status === "fulfilled" ? tmux.value : [], herdr.status === "fulfilled" ? herdr.value : []),
+      unavailable,
+    };
   }
 
   reattach(name: string): Promise<ReattachResult> {

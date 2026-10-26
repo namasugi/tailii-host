@@ -268,7 +268,11 @@ export async function waitForLiveSession(
 ): Promise<SessionInfo | null> {
   const deadline = Date.now() + 8_000;
   while (Date.now() < deadline) {
-    const found = (await sessionManager.list()).find((info) => info.alive && predicate(info));
+    // 片方の backend が答えられなくても、答えた方で探す（一覧ごと投げると、待っている要求ごと失敗する）。
+    const sessions = sessionManager.listAvailable !== undefined
+      ? (await sessionManager.listAvailable()).sessions
+      : await sessionManager.list();
+    const found = sessions.find((info) => info.alive && predicate(info));
     if (found !== undefined) return found;
     await sleep(500);
   }

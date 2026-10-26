@@ -3,6 +3,7 @@
 // 新規/再開起動（session_start）・離脱（session_idle_hint）。
 
 import { randomUUID } from "node:crypto";
+import * as os from "node:os";
 import type { ChatAgent } from "../../chat/chatTailController.js";
 import {
   gitWorktreeIsClean,
@@ -28,6 +29,33 @@ import {
   type WorktreeResponseFields,
 } from "../context.js";
 import { isNonBlockingQuestionId } from "../../codex/codexAsyncQuestion.js";
+import type { SessionBackendKind } from "../../backend/sessionBackend.js";
+import type { SessionMeta } from "../../sessions/sessionMetadataStore.js";
+
+/** 会話を開き直せなかった（答えられない backend で動いている可能性がある）ときの文言。backend 名は出さない。 */
+export const RESUME_BLOCKED_BY_UNAVAILABLE_BACKEND =
+  "ホスト側の端末が応答しないため、この会話を開けませんでした（ホストで動いている可能性があり、二重に起動しないよう止めました）。";
+
+/**
+ * 答えられなかった backend で、この会話（同じエージェント・同じ provider の会話 id）が動いている可能性があるか。
+ * その backend の Tailii セッションの記録のうち、この起動の後に作られたもの（`createdAt`）があれば「ある」。見えない
+ * だけで動いていることがある（tmux の socket ファイルだけが消えた等）。起動より前の記録は、そのプロセスごと止まって
+ * いる（tmux サーバも herdr の pane も再起動を越えない。tmux は起動のたびに createdAt を書き直し、herdr は pane を
+ * 作った時刻を保つ）ので数えない（独立検証 2026-10-26: 起動前の古い tmux の記録が残っているだけで、その会話を開け
+ * なくなっていた）。heartbeat では判定しない: hub が処理中・設問を戻した会話の heartbeat を毎分書き直すので、
+ * 再起動で止まった会話まで「起動後に動いている」に見える（同 6 周目）。メタの backend 欄が無い記録は tmux 扱い
+ * （CompositeSessionBackend と同じ後方互換）。
+ */
+export function conversationMayRunOn(
+  metas: SessionMeta[], unavailable: SessionBackendKind[], agent: ChatAgent, providerSessionId: string,
+  bootedAtSeconds: number,
+): boolean {
+  return metas.some((meta) =>
+    unavailable.includes(meta.backend ?? "tmux") &&
+    (meta.agent ?? "claude") === agent &&
+    (meta.providerSessionId ?? meta.claudeSessionId) === providerSessionId &&
+    meta.createdAt >= bootedAtSeconds);
+}
 
 export const sessionHandlers: HandlerRegistry = {
   session_list_request: async (message, ctx) => {
@@ -232,7 +260,12 @@ export const sessionHandlers: HandlerRegistry = {
     const resumeSessionId = message.resumeSessionId ?? null;
     const shouldSubscribe = message.deferSubscribe !== true;
     if (resumeSessionId !== null && metadataStore !== null) {
-      const aliases = await sessionManager.list();
+      // 片方の backend が答えられなくても（tmux の socket ファイルが無い等）、答えた方で同じ会話を探す。以前は一覧ごと
+      // 投げ、engine の読み取りループまで落ちて接続が切れていた（独立検証 2026-10-26）。
+      const listed = sessionManager.listAvailable !== undefined
+        ? await sessionManager.listAvailable()
+        : { sessions: await sessionManager.list(), unavailable: [] };
+      const aliases = listed.sessions;
       const liveAliases = aliases.filter((info) => {
         if (!info.alive || info.name === message.name) return false;
         const aliasAgent = info.agent ?? "claude";
@@ -258,6 +291,17 @@ export const sessionHandlers: HandlerRegistry = {
         writeSessionListResponse(
           writer, v, message.id, shouldSubscribe ? aliases : [liveAlias], null, liveAlias.name,
         );
+        return;
+      }
+      // 答えた backend に動いている同じ会話が無い。答えられなかった backend に、この起動の後に動いていた記録があれば、
+      // 見えないだけで動いている可能性がある（socket ファイルだけが消えた tmux 等）ので起動しない（二重になる）。
+      if (listed.unavailable.length > 0 && conversationMayRunOn(
+        metadataStore.all(), listed.unavailable, sessionAgent, resumeSessionId, Date.now() / 1_000 - os.uptime(),
+      )) {
+        engineDiag(
+          `session_start resume 見送り（backend 応答なし: ${listed.unavailable.join(",")}） providerSessionId=${resumeSessionId}`,
+        );
+        writeError(writer, v, message.id, "tmux_error", RESUME_BLOCKED_BY_UNAVAILABLE_BACKEND);
         return;
       }
     }

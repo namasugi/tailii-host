@@ -33,7 +33,7 @@ describe("backend ランナーのタイムアウト", () => {
     expect(elapsed).toBeLessThan(5_000);
     // 起動自体は成功しているので throw ではなく「非 0 終了」として返る。
     // liveTailiiSessions はこれを "no server running" 以外の失敗として throw し、
-    // hub の tick が catch して liveCount=1 で継続する（セッションを誤って回収しない）。
+    // reaperTick が受けて tmux の会話の回収だけを見送る（生存 0 とは言わない。herdr の巡回は続ける）。
     expect(result.exitCode).not.toBe(0);
   });
 

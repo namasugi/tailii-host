@@ -46,7 +46,7 @@ import { CodexAppServerManager } from "../codex/codexAppServer.js";
 import type { SessionInfo } from "../protocol.js";
 import { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
 import { ClaudeSessionStore, transcriptTitle } from "../sessions/claudeSessionStore.js";
-import { paneCommandLooksLikeAgent, type TmuxCommandRunner } from "../backend/tmux.js";
+import { paneCommandLooksLikeAgent, tmuxServerAbsent, type TmuxCommandRunner } from "../backend/tmux.js";
 import {
   type ClaudeLiveRecord,
   claudeProcessAlive,
@@ -186,8 +186,7 @@ export function serverCwdBelongsToSession(sessionCwd: string, serverCwd: string)
 export async function liveTailiiSessions(runner: TmuxCommandRunner): Promise<string[]> {
   const result = await runner(["ls", "-F", "#{session_name}"]);
   if (result.exitCode !== 0) {
-    const combined = (result.stdout + result.stderr).toLowerCase();
-    if (combined.includes("no server running") || combined.includes("no sessions")) return [];
+    if (tmuxServerAbsent(result.stdout + result.stderr)) return [];
     throw new Error(`tmux ls failed (exit ${result.exitCode}): ${result.stderr}`);
   }
   return result.stdout
@@ -262,7 +261,20 @@ async function loadCodexThreadTitles(): Promise<ReadonlyMap<string, string>> {
 export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTickResult> {
   const { runner, heartbeatDir, metadataStore, timeoutSeconds, now } = options;
   const log = options.log ?? (() => {});
-  const live = await liveTailiiSessions(runner);
+  // 「tmux が答えられなかった」tick（サーバ不在以外の失敗: socket ファイルが無い・権限・タイムアウト等）では、
+  // tmux の会話の回収だけを見送り、herdr の巡回は続ける（herdrUnavailable と対称）。以前は tick ごと投げて、
+  // herdr の回収・空 server の停止・タブ名の同期まで止まっていた（実ログ 2026-08-05 に約 8 分）。
+  let live: string[] = [];
+  let tmuxUnavailable = false;
+  try {
+    live = await liveTailiiSessions(runner);
+  } catch (error) {
+    tmuxUnavailable = true;
+    const hint = String(error).includes("No such file or directory")
+      ? "（tmux の socket ファイルが見つからない。tmux サーバが動いていれば、サーバのプロセスへ SIGUSR1 を送ると作り直せる）"
+      : "";
+    log(`tmux 生存判定に失敗(tmux セッションの回収を延期): ${String(error)}${hint}`);
+  }
   const attached = live.length > 0 ? await attachedSessions(runner) : new Set<string>();
   const killed: string[] = [];
   const demoted: string[] = [];
@@ -572,10 +584,14 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
       // 一時的な CLI 失敗を「消滅」と誤判定すると、実行中の会話が retire され（queue 破棄・
       // 「Session disappeared」通知）、アプリ上は会話が消えたように見える。
       if (herdrUnavailable && metadataStore.get(name)?.backend === "herdr") continue;
+      // tmux の生存判定ができなかった tick では、herdr と分かっている会話以外（tmux・backend 不明）を回収しない。
+      // socket ファイルだけが消えてサーバは動いている場合に、生きている会話を retire して送信待ちを捨てない。
+      if (tmuxUnavailable && metadataStore.get(name)?.backend !== "herdr") continue;
       removeHeartbeat(heartbeatDir, name);
       reclaimed.push(name);
     }
   }
 
-  return { liveCount: live.length + herdrLive.length, killed, demoted, reclaimed };
+  // tmux が答えられなかった tick は「生存 0」ではない（hub の自然終了の条件に使われる）。
+  return { liveCount: live.length + herdrLive.length + (tmuxUnavailable ? 1 : 0), killed, demoted, reclaimed };
 }

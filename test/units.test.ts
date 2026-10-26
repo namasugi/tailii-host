@@ -48,6 +48,7 @@ import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
 import { resolveDefaultAgent } from "../src/engine/engine.js";
 import {
   ChatInjectionRejectedError,
+  tmuxServerAbsent,
   classifySubmitFrame,
   loginCodeScreenState,
   loginStorageFailure,
@@ -919,6 +920,23 @@ describe("TmuxSessionManager", () => {
     );
     const mgr = new TmuxSessionManager({ runner: runner.runner, store: makeTempStore() });
     expect(await mgr.list()).toEqual([]);
+  });
+
+  test("tmux の socket ファイルが無い（ENOENT）はサーバ不在と読まず投げる（開き直しで claude を二重に起動しない）", async () => {
+    // socket ファイルだけが消えてサーバは動いていることがある。空集合にすると reattach が「会話が無い」として
+    // `claude --resume` で起こし直し、行き場を失った元のサーバの claude と二重になる（独立検証 2026-10-26）。
+    const enoent = new MockTmuxRunner((args) =>
+      args[0] === "ls"
+        ? { exitCode: 1, stdout: "", stderr: "error connecting to /private/tmp/tmux-502/default (No such file or directory)" }
+        : ok(""),
+    );
+    await expect(new TmuxSessionManager({ runner: enoent.runner, store: makeTempStore() }).list())
+      .rejects.toBeInstanceOf(TmuxFailedError);
+    expect(tmuxServerAbsent("no server running on /tmp/tmux-501/default")).toBe(true);
+    expect(tmuxServerAbsent("no sessions")).toBe(true);
+    expect(tmuxServerAbsent("error connecting to /tmp/tmux-501/default (No such file or directory)")).toBe(false);
+    expect(tmuxServerAbsent("error connecting to /tmp/tmux-501/default (Permission denied)")).toBe(false);
+    expect(tmuxServerAbsent("")).toBe(false);
   });
 
   test("kill の非0終了は TmuxFailedError", async () => {
