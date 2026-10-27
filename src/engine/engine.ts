@@ -98,6 +98,7 @@ import {
 const HANDLER_FAILED_MESSAGE = "ホスト側で要求を処理できませんでした。少し待ってもう一度試してください。";
 import { ENGINE_HANDLERS } from "./handlers/index.js";
 import { isNonBlockingQuestionId } from "../codex/codexAsyncQuestion.js";
+import { questionPendingSummary, remotePendingQuestionSnapshot } from "./remotePendingQuestions.js";
 
 // MARK: - エントリポイント（cli から呼ばれる）
 
@@ -661,7 +662,6 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
         return;
       }
       const questions = message.questions ?? [];
-      const first = questions[0];
       // Codex の非同期質問（id 接頭辞 `codex-async:`）は turn を止めない。別会話の一覧バッジ
       // （remote_pending kind=question = 「あなたの番」）にすると作業中表示が消えるので出さない。
       // 会話を開けば hub_state の再配信で設問が届く。
@@ -675,7 +675,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
               id: message.id,
               session: message.session,
               kind: "question",
-              summary: first?.question || first?.header || "Question prompt",
+              summary: questionPendingSummary(questions),
             };
       try {
         writer.write(wire);
@@ -950,11 +950,24 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           reject(new Error("Session Hub link unavailable"));
         }
       });
-    hubLink.onReconnect = ({ bootId, disconnectedAtMs, processingSessions: processingSnapshot, resumeHint }) => {
+    hubLink.onReconnect = ({
+      bootId, disconnectedAtMs, processingSessions: processingSnapshot, pendingQuestions, resumeHint,
+    }) => {
       if (disconnectedAtMs !== null) {
         const failures = [...rpcDisconnectFailures.values()];
         rpcDisconnectFailures.clear();
         for (const fail of failures) fail();
+      }
+      // 一覧の「回答待ち」ピルを Hub の設問で揃え直す（pending-question-snapshot）。設問の片付けは接続中の
+      // engine にしか流れないので、アプリの切断中（この engine の起動前）や Hub との切断中に片付いた設問の
+      // ピルは、ここで送り直さないと残り続ける。hello と同じ流れの中で書くので、以後の設問イベントと
+      // 順序が入れ替わらない。旧 Hub（snapshot 無し）には何も送らない（アプリは従来どおりの扱い）。
+      if (pendingQuestions !== undefined) {
+        try {
+          writer.write(remotePendingQuestionSnapshot(pendingQuestions, state.negotiatedVersion));
+        } catch (error) {
+          process.stderr.write(`[tailii-host engine] remote_pending_snapshot 書込失敗: ${String(error)}\n`);
+        }
       }
       const restarted = hubBootId !== null && hubBootId !== bootId;
       hubBootId = bootId;

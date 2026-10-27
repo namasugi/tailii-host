@@ -385,6 +385,7 @@ export async function startHubSocket(options: {
               version: options.version,
               bootId,
               processingSessions: options.hub.processingSessionNames,
+              pendingQuestions: options.hub.pendingQuestionSnapshot,
               resumeHint: true,
             }));
           }

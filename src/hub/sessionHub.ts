@@ -15,6 +15,7 @@ import {
   encodeHubMessage,
   type HubClientMessage,
   type HubServerMessage,
+  type PendingQuestionSnapshotEntry,
 } from "./hubProtocol.js";
 import type {
   ControlMessage,
@@ -480,6 +481,20 @@ export class SessionHub {
     return [...this.actors]
       .filter(([, actor]) => actor.processingSince !== null)
       .map(([session]) => session);
+  }
+
+  /**
+   * 新しく接続した engine へ渡す、会話ごとの未回答の設問（pending-question-snapshot）。engine はこれで
+   * iOS の一覧の「回答待ち」ピルを揃え直す。設問の解決は接続中の engine へ流すだけなので、iOS が
+   * 切断している間に片付いた設問のピルは、この snapshot が無いと永久に残る（実機 2026-10-27）。
+   */
+  get pendingQuestionSnapshot(): PendingQuestionSnapshotEntry[] {
+    const entries: PendingQuestionSnapshotEntry[] = [];
+    for (const [session, actor] of this.actors) {
+      if (actor.pendingQuestion === null) continue;
+      entries.push({ session, id: actor.pendingQuestion.id, questions: actor.pendingQuestion.questions });
+    }
+    return entries;
   }
 
   /** Hub 再起動前から active の heartbeat を actor の処理中状態へ戻す。 */

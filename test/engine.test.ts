@@ -859,6 +859,46 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
+  test("Hub hello の設問 snapshot を remote_pending_snapshot で送り、以後の設問イベントより先に届ける（pending-question-snapshot）", async () => {
+    const hubLink: HubLink = { onMessage: null, onReconnect: null, send: vi.fn(), close: vi.fn() };
+    const engine = startEngine({ sessionManager: makeManager(new MockTmuxRunner(() => ok(""))), hubLink });
+    await engine.lines.nextOfType("channel_hello");
+    const questions = [{ header: "選択", question: "どっち?", multiSelect: false, options: [{ label: "A", description: "" }] }];
+
+    hubLink.onReconnect?.({
+      bootId: "boot-a", disconnectedAtMs: null, processingSessions: [],
+      pendingQuestions: [
+        { session: "waiting", id: "toolu_wait", questions },
+        { session: "headed", id: "toolu_head", questions: [{ ...questions[0]!, question: "" }] },
+        // turn を止めない Codex の非同期質問は「回答待ち」にしない（remote_pending と同じ規則）。
+        { session: "codex", id: "codex-async:turn-1:item-1", questions },
+      ],
+    });
+    hubLink.onMessage?.({ type: "question_event", session: "later", event: "prompt", id: "toolu_later", questions });
+
+    expect(decodeControlMessage(await engine.lines.nextOfType("remote_pending_snapshot"))).toEqual({
+      type: "remote_pending_snapshot", v: 2, kind: "question",
+      items: [
+        { id: "toolu_wait", session: "waiting", summary: "どっち?" },
+        { id: "toolu_head", session: "headed", summary: "選択" },
+      ],
+    });
+    // snapshot の後に届く（先に届くと、アプリが snapshot で新しい設問のピルを消してしまう）。
+    expect(decodeControlMessage(await engine.lines.nextOfType("remote_pending"))).toMatchObject({
+      type: "remote_pending", session: "later", id: "toolu_later", kind: "question",
+    });
+
+    // 旧 Hub（snapshot 欄なし）からは何も送らない: 次に届くのは後続の設問イベントだけ。
+    hubLink.onReconnect?.({ bootId: "boot-a", disconnectedAtMs: null, processingSessions: [] });
+    hubLink.onMessage?.({ type: "question_event", session: "later2", event: "prompt", id: "toolu_later2", questions });
+    for (;;) {
+      const line = await engine.lines.next();
+      expect(line).not.toContain('"type":"remote_pending_snapshot"');
+      if (line.includes('"type":"remote_pending"')) break;
+    }
+    await engine.teardown();
+  });
+
   test("新しい engine の背景購読は iOS の背景同期ヒントを待ち、届いた境界以降だけを購読する", async () => {
     const send = vi.fn();
     const hubLink: HubLink = { onMessage: null, onReconnect: null, send, close: vi.fn() };

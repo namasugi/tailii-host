@@ -29,6 +29,7 @@ import {
   type WorktreeResponseFields,
 } from "../context.js";
 import { isNonBlockingQuestionId } from "../../codex/codexAsyncQuestion.js";
+import { questionPendingSummary } from "../remotePendingQuestions.js";
 import type { SessionBackendKind } from "../../backend/sessionBackend.js";
 import type { SessionMeta } from "../../sessions/sessionMetadataStore.js";
 
@@ -190,14 +191,13 @@ export const sessionHandlers: HandlerRegistry = {
       const pending = await ctx.requestHubState(message.name);
       // turn を止めない設問（Codex の非同期質問）は「あなたの番」のバッジにしない（作業中表示が消える）。
       if (pending !== null && !isNonBlockingQuestionId(pending.id)) {
-        const first = pending.questions[0];
         writer.write({
           type: "remote_pending",
           v,
           id: pending.id,
           session: message.name,
           kind: "question",
-          summary: first?.question || first?.header || "Question prompt",
+          summary: questionPendingSummary(pending.questions),
         });
       }
     }

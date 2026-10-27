@@ -786,6 +786,14 @@ describe("SessionHub actor", () => {
 
     hub.handleClientMessage(client, JSON.stringify({ type: "session_retire", session: "work" }));
     expect(hub.actors.has("work")).toBe(false);
+    // 会話ごと消えた設問も片付けを 1 回だけ流し（一覧の「回答待ち」と設問シートを残さない）、
+    // 次に接続する engine への設問 snapshot にも載せない（pending-question-snapshot）。
+    expect(received.filter((m) => {
+      const event = m as { type?: string; session?: string; event?: string; id?: string };
+      return event.type === "question_event" && event.session === "work" && event.event === "dismiss" &&
+        event.id === "q-retire";
+    })).toHaveLength(1);
+    expect(hub.pendingQuestionSnapshot).toEqual([]);
     expect(JSON.parse(fs.readFileSync(receiptsPath, "utf8"))).toEqual({ version: 1, sessions: {} });
     expect(received).toContainEqual(expect.objectContaining({
       type: "chat_send_result", id: "old", status: "failed",

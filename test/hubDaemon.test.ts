@@ -474,7 +474,8 @@ describe("hub socket", () => {
     expect(log).toHaveBeenCalledWith("audit client_connect clients=1");
     writeLine(client, JSON.stringify({ type: "hub_hello" }));
     expect(JSON.parse(await reader.nextLine())).toEqual({
-      type: "hub_hello_ack", version: "1.2.3", bootId: "boot-test", processingSessions: [], resumeHint: true,
+      type: "hub_hello_ack", version: "1.2.3", bootId: "boot-test", processingSessions: [], pendingQuestions: [],
+      resumeHint: true,
     });
 
     client.destroy();
@@ -482,6 +483,32 @@ describe("hub socket", () => {
     expect(hub.clientCount).toBe(0);
     // client_disconnect 監査行は socket の close イベント（非同期）で出る。
     await vi.waitFor(() => expect(log).toHaveBeenCalledWith("audit client_disconnect clients=0"));
+  });
+
+  test("hub_hello の ack に未回答の設問の snapshot を載せる（pending-question-snapshot）", async () => {
+    if (!(await canListenUnixSocket())) return;
+    const socketPath = tempSocketPath(`hub-q-${Date.now()}`);
+    const hub = new SessionHub({
+      runner: new MockTmuxRunner(() => ok("")).runner,
+      heartbeatDir: makeTempDir("hub-q-heartbeat"),
+      metadataStore: makeTempStore(),
+      timeoutSeconds: 1800,
+    });
+    const questions = [{ header: "選択", question: "どっち?", multiSelect: false, options: [{ label: "A", description: "" }] }];
+    hub.handleRelayMessage({ type: "question_event", session: "waiting", event: "prompt", id: "toolu_wait", questions });
+    hub.handleRelayMessage({ type: "question_event", session: "answered", event: "prompt", id: "toolu_done", questions });
+    hub.handleRelayMessage({ type: "question_event", session: "answered", event: "dismiss", id: "toolu_done" });
+    const server = await startHubSocket({ hub, socketPath, version: "1.2.3", bootId: "boot-q" });
+    expect(server).not.toBeNull();
+    const client = await connectUnixClient(socketPath);
+    const reader = new SocketLineReader(client);
+    writeLine(client, JSON.stringify({ type: "hub_hello" }));
+    expect(JSON.parse(await reader.nextLine())).toMatchObject({
+      type: "hub_hello_ack",
+      pendingQuestions: [{ session: "waiting", id: "toolu_wait", questions }],
+    });
+    client.destroy();
+    await server?.close();
   });
 
   test("生存中の Hub socket への二重 listen を拒否する", async () => {

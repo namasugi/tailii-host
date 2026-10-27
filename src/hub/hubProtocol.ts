@@ -83,9 +83,22 @@ export type HubClientMessage =
   | { type: "session_preview_watch"; enabled: boolean }
   | SessionProcessingMessage;
 
+/**
+ * hub_hello_ack に載せる未回答の設問 1 件（pending-question-snapshot）。hub が今どの会話で設問を
+ * 保持しているかの snapshot で、engine はこれで iOS の一覧の「回答待ち」ピルを揃え直す
+ * （切断中に片付いた設問の解除通知は誰にも届かないため）。
+ */
+export interface PendingQuestionSnapshotEntry {
+  session: string;
+  id: string;
+  questions: QuestionPromptQuestion[];
+}
+
 export type HubServerMessage =
   | {
     type: "hub_hello_ack"; version: string | null; bootId: string; processingSessions?: string[];
+    /** 未回答の設問の snapshot。旧 Hub は送らない（「設問なし」とは区別する）。 */
+    pendingQuestions?: PendingQuestionSnapshotEntry[];
     /**
      * 再開のヒント（conversation_subscribe の afterSeq + newerThanMs）を、Hub が境界を使ってよいか確かめた上で
      * 解釈できる。旧 Hub は両方付きを無条件に時刻境界として使い未配送行を落とすので、engine はこれが
@@ -381,11 +394,17 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
       : rawProcessingSessions.filter(
         (session): session is string => typeof session === "string" && session.length > 0,
       );
+    // 設問の snapshot も同じ方針: 旧 Hub（欄なし）は「snapshot 未提供」、不正な要素だけ捨てる。
+    const rawPendingQuestions = record["pendingQuestions"];
+    const pendingQuestions = rawPendingQuestions === undefined || !Array.isArray(rawPendingQuestions)
+      ? undefined
+      : rawPendingQuestions.filter(isPendingQuestionSnapshotEntry);
     return {
       type: "hub_hello_ack",
       version,
       bootId,
       ...(processingSessions !== undefined ? { processingSessions } : {}),
+      ...(pendingQuestions !== undefined ? { pendingQuestions } : {}),
       ...(record["resumeHint"] === true ? { resumeHint: true as const } : {}),
     };
   }
@@ -641,6 +660,12 @@ function isPendingQuestion(value: unknown): value is { id: string; questions: Qu
   if (typeof value !== "object" || value === null) return false;
   const record = value as Record<string, unknown>;
   return typeof record["id"] === "string" && Array.isArray(record["questions"]);
+}
+
+function isPendingQuestionSnapshotEntry(value: unknown): value is PendingQuestionSnapshotEntry {
+  if (!isPendingQuestion(value) || value.id.length === 0) return false;
+  const session = (value as unknown as Record<string, unknown>)["session"];
+  return typeof session === "string" && session.length > 0;
 }
 
 function numberOrOne(value: unknown): number {

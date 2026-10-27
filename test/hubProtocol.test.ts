@@ -30,6 +30,34 @@ describe("hubProtocol hello compatibility", () => {
     }))).toEqual({ type: "hub_hello_ack", version: "1.3.0", bootId: "odd-hub" });
   });
 
+  test("hello ack の pendingQuestions は旧 Hub（欄なし）と区別し、不正要素だけを除外する", () => {
+    const questions = [{ header: "選択", question: "どっち?", multiSelect: false, options: [{ label: "A", description: "" }] }];
+    expect(decodeHubServerLine(JSON.stringify({
+      type: "hub_hello_ack", version: "1.4.0", bootId: "q-hub",
+      pendingQuestions: [
+        { session: "work", id: "toolu_1", questions },
+        { session: "", id: "toolu_2", questions },
+        { session: "other", id: "", questions },
+        { session: "other", id: "toolu_3" },
+        "broken",
+        { session: "other", id: "toolu_4", questions: [] },
+      ],
+    }))).toEqual({
+      type: "hub_hello_ack", version: "1.4.0", bootId: "q-hub",
+      pendingQuestions: [
+        { session: "work", id: "toolu_1", questions },
+        { session: "other", id: "toolu_4", questions: [] },
+      ],
+    });
+    expect(decodeHubServerLine(JSON.stringify({
+      type: "hub_hello_ack", version: "1.4.0", bootId: "empty-hub", pendingQuestions: [],
+    }))).toEqual({ type: "hub_hello_ack", version: "1.4.0", bootId: "empty-hub", pendingQuestions: [] });
+    // 配列でない値は snapshot 未提供（旧 Hub 相当）として扱い、hello 自体は捨てない。
+    expect(decodeHubServerLine(JSON.stringify({
+      type: "hub_hello_ack", version: "1.4.0", bootId: "odd-hub", pendingQuestions: "none",
+    }))).toEqual({ type: "hub_hello_ack", version: "1.4.0", bootId: "odd-hub" });
+  });
+
   test("hello ack の processingSessions は不正要素だけを除外してhandshakeを維持する", () => {
     expect(decodeHubServerLine(JSON.stringify({
       type: "hub_hello_ack", version: "1.2.0", bootId: "mixed-hub",

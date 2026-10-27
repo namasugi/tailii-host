@@ -142,6 +142,11 @@ describe("Session Hub 復旧シナリオ (Unix socket)", () => {
       timeoutSeconds: 1_800,
     });
     hub.handleRelayMessage({ type: "session_processing", session: "doomed", state: "active" });
+    // 確定 kill で hub が手放す会話の設問も、hello の設問 snapshot から外す（pending-question-snapshot）。
+    hub.handleRelayMessage({
+      type: "question_event", session: "doomed", event: "prompt", id: "toolu_doomed",
+      questions: [{ header: "選択", question: "どっち?", multiSelect: false, options: [{ label: "A", description: "" }] }],
+    });
     const link = connectHubSocket({ socketPath, ensureDaemon: () => {} });
     link.send({ type: "session_retire", session: "doomed" });
 
@@ -152,7 +157,7 @@ describe("Session Hub 復旧シナリオ (Unix socket)", () => {
       server = await startHubSocket({ hub, socketPath, version: "test", bootId: "boot-retire" });
       expect(server).not.toBeNull();
       await vi.waitFor(() => expect(reconnected).toHaveBeenCalledWith({
-        bootId: "boot-retire", disconnectedAtMs: null, processingSessions: [], resumeHint: true,
+        bootId: "boot-retire", disconnectedAtMs: null, processingSessions: [], pendingQuestions: [], resumeHint: true,
       }));
       await vi.waitFor(() => expect(hub.actors.has("doomed")).toBe(false));
     } finally {
@@ -197,6 +202,7 @@ describe("Session Hub 復旧シナリオ (Unix socket)", () => {
         bootId: "boot-before-handler",
         disconnectedAtMs: null,
         processingSessions: ["already-running"],
+        pendingQuestions: [],
         resumeHint: true,
       });
 
@@ -206,6 +212,82 @@ describe("Session Hub 復旧シナリオ (Unix socket)", () => {
       expect(replacementHandler).not.toHaveBeenCalled();
     } finally {
       await closeRecoveryFixture(link, server, hub);
+    }
+  });
+
+  test("hello 後・onReconnect 登録前に届いた行は保留し、snapshot の後に元の順で渡す（pending-question-snapshot）", async () => {
+    if (!(await canListenUnixSocket())) return;
+    const socketPath = tempSocketPath(`hub-held-after-hello-${Date.now()}`);
+    const hub = new SessionHub({
+      runner: new MockTmuxRunner(() => ok("")).runner,
+      heartbeatDir: makeTempDir("hub-held-after-hello-heartbeat"),
+      timeoutSeconds: 1_800,
+    });
+    const questions = [{ header: "選択", question: "どっち?", multiSelect: false, options: [{ label: "A", description: "" }] }];
+    hub.handleRelayMessage({ type: "question_event", session: "s", event: "prompt", id: "toolu_Q", questions });
+    const server = await startHubSocket({ hub, socketPath, version: "test", bootId: "boot-held" });
+    expect(server).not.toBeNull();
+    const link = connectHubSocket({ socketPath, ensureDaemon: () => {} });
+    const order: string[] = [];
+    link.onMessage = (message) => {
+      if (message.type === "hub_hello_ack") order.push("hello");
+      else if (message.type === "question_event") order.push(`${message.event}:${message.id}`);
+    };
+    try {
+      await vi.waitFor(() => expect(order).toEqual(["hello"]));
+      // engine の初期化中（onReconnect 未登録）に設問が片付く。snapshot（hello 時点）より先に渡すと、
+      // 後から渡る snapshot が片付いた設問の「回答待ち」を復活させる。
+      hub.handleRelayMessage({ type: "question_event", session: "s", event: "dismiss", id: "toolu_Q" });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(order).toEqual(["hello"]);
+      link.onReconnect = (info) => {
+        order.push(`snapshot:${(info.pendingQuestions ?? []).map((entry) => entry.id).join(",")}`);
+      };
+      expect(order).toEqual(["hello", "snapshot:toolu_Q", "dismiss:toolu_Q"]);
+    } finally {
+      await closeRecoveryFixture(link, server, hub);
+    }
+  });
+
+  test("onReconnect 登録前に Hub と繋ぎ直したら、前の接続で保留した行は新しい hello の snapshot の後に渡さない", async () => {
+    if (!(await canListenUnixSocket())) return;
+    const socketPath = tempSocketPath(`hub-held-rehello-${Date.now()}`);
+    const questions = [{ header: "選択", question: "どっち?", multiSelect: false, options: [{ label: "A", description: "" }] }];
+    const first = new SessionHub({
+      runner: new MockTmuxRunner(() => ok("")).runner,
+      heartbeatDir: makeTempDir("hub-held-rehello-first"),
+      timeoutSeconds: 1_800,
+    });
+    first.handleRelayMessage({ type: "question_event", session: "s", event: "prompt", id: "toolu_old", questions });
+    const second = new SessionHub({
+      runner: new MockTmuxRunner(() => ok("")).runner,
+      heartbeatDir: makeTempDir("hub-held-rehello-second"),
+      timeoutSeconds: 1_800,
+    });
+    second.handleRelayMessage({ type: "question_event", session: "s2", event: "prompt", id: "toolu_new", questions });
+    let server: HubSocketServer | null = await startHubSocket({ hub: first, socketPath, version: "test", bootId: "boot-1" });
+    expect(server).not.toBeNull();
+    const link = connectHubSocket({ socketPath, ensureDaemon: () => {} });
+    const order: string[] = [];
+    link.onMessage = (message) => {
+      if (message.type === "hub_hello_ack") order.push(`hello:${message.bootId}`);
+      else if (message.type === "question_event") order.push(`${message.event}:${message.id}`);
+    };
+    try {
+      await vi.waitFor(() => expect(order).toEqual(["hello:boot-1"]));
+      // 前の Hub の行（保留される）→ Hub が入れ替わる → 新しい hello。
+      first.handleRelayMessage({ type: "question_event", session: "s", event: "dismiss", id: "toolu_old" });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await server?.close();
+      server = await startHubSocket({ hub: second, socketPath, version: "test", bootId: "boot-2" });
+      expect(server).not.toBeNull();
+      await vi.waitFor(() => expect(order).toEqual(["hello:boot-1", "hello:boot-2"]));
+      link.onReconnect = (info) => {
+        order.push(`snapshot:${info.bootId}:${(info.pendingQuestions ?? []).map((entry) => entry.id).join(",")}`);
+      };
+      expect(order).toEqual(["hello:boot-1", "hello:boot-2", "snapshot:boot-2:toolu_new"]);
+    } finally {
+      await closeRecoveryFixture(link, server, first, second);
     }
   });
 

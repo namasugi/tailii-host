@@ -3,7 +3,13 @@
 
 import * as net from "node:net";
 import { ensureHubDaemon } from "./hubDaemon.js";
-import { decodeHubServerLine, encodeHubMessage, type HubClientMessage, type HubServerMessage } from "./hubProtocol.js";
+import {
+  decodeHubServerLine,
+  encodeHubMessage,
+  type HubClientMessage,
+  type HubServerMessage,
+  type PendingQuestionSnapshotEntry,
+} from "./hubProtocol.js";
 import { resolveHubSocketPath } from "../shared/socketPath.js";
 import { NdjsonLineSplitter } from "../shared/lineSplitter.js";
 import type { SessionHub } from "./sessionHub.js";
@@ -12,10 +18,18 @@ export interface HubReconnectInfo {
   bootId: string;
   disconnectedAtMs: number | null;
   processingSessions?: string[];
+  /** 未回答の設問の snapshot（pending-question-snapshot）。旧 Hub は undefined（「設問なし」とは別）。 */
+  pendingQuestions?: PendingQuestionSnapshotEntry[];
   /** Hub が再開のヒント（afterSeq + newerThanMs）を安全に解釈できるか（hub_hello_ack.resumeHint）。 */
   resumeHint?: boolean;
 }
 
+/**
+ * engine から Hub への link。利用者は `onMessage` → `onReconnect` の順で両方を（間に await を挟まず）
+ * 登録すること: hello の後に `onReconnect` が無い間に届いた行は保留し、`onReconnect` の登録時に
+ * 「hello の snapshot → 保留した行」の順で `onMessage` へ渡す（`onReconnect` を登録しなければ hello 以降の
+ * 行は届かず、`onMessage` が未登録のまま flush すれば捨てられる）。
+ */
 export interface HubLink {
   onMessage: ((message: HubServerMessage) => void) | null;
   /** hello 完了時に購読を再送する。切断時刻は Hub 世代変更時の差分 backfill 境界。 */
@@ -43,6 +57,12 @@ export function connectHubSocket(options: {
   let disconnectedAtMs: number | null = null;
   let reconnectHandler: HubLink["onReconnect"] = null;
   let pendingReconnect: HubReconnectInfo | null = null;
+  // hello を受けたのに onReconnect がまだ無い間（engine の初期化 await 中）に届いた行。onReconnect の登録時に
+  // 「hello の snapshot → これらの行」の順で渡す。先に渡す（または onMessage 未登録で捨てる）と、後から渡る
+  // hello 時点の snapshot が新しい状態を古い状態へ巻き戻す（片付いた設問の「回答待ち」が復活する等,
+  // pending-question-snapshot）。上限は保持し続けた場合のメモリの保険（engine は直後に登録する）。
+  const heldUntilReconnectHandler: HubServerMessage[] = [];
+  const HELD_UNTIL_RECONNECT_HANDLER_MAX = 10_000;
   const helloCompletedSockets = new WeakSet<net.Socket>();
   const queued: HubClientMessage[] = [];
   const isReplayableState = (message: HubClientMessage): boolean =>
@@ -76,6 +96,7 @@ export function connectHubSocket(options: {
       const info = pendingReconnect;
       pendingReconnect = null;
       handler(info);
+      for (const message of heldUntilReconnectHandler.splice(0)) link.onMessage?.(message);
     },
     send(message) {
       // net.Socket は connect 中でも writable=true になり、接続失敗した候補へ write すると
@@ -96,6 +117,7 @@ export function connectHubSocket(options: {
     close() {
       closed = true;
       pendingReconnect = null;
+      heldUntilReconnectHandler.length = 0;
       socket?.destroy();
       socket = null;
     },
@@ -122,6 +144,11 @@ export function connectHubSocket(options: {
       splitter.push(chunk, (lineBuffer) => {
         const message = decodeHubServerLine(lineBuffer.toString("utf8"));
         if (message !== null) {
+          if (pendingReconnect !== null && message.type !== "hub_hello_ack") {
+            heldUntilReconnectHandler.push(message);
+            if (heldUntilReconnectHandler.length > HELD_UNTIL_RECONNECT_HANDLER_MAX) heldUntilReconnectHandler.shift();
+            return;
+          }
           link.onMessage?.(message);
           if (message.type === "hub_hello_ack" && !helloHandled) {
             helloHandled = true;
@@ -147,6 +174,12 @@ export function connectHubSocket(options: {
                 }
               }
             }
+            // 設問の snapshot も同じ: 直後に送る確定 kill で hub が手放す会話の設問は含めない。
+            const retiredByReplay = new Set(replay.flatMap((queuedMessage) =>
+              queuedMessage.type === "session_retire" ? [queuedMessage.session] : []));
+            const effectivePendingQuestions = message.pendingQuestions?.filter(
+              (entry) => !retiredByReplay.has(entry.session),
+            );
             for (const queuedMessage of replay) {
               candidate.write(encodeHubMessage(queuedMessage));
             }
@@ -158,10 +191,16 @@ export function connectHubSocket(options: {
               processingSessions: effectiveProcessingSessions === undefined
                 ? undefined
                 : [...effectiveProcessingSessions],
+              ...(effectivePendingQuestions !== undefined ? { pendingQuestions: effectivePendingQuestions } : {}),
               ...(message.resumeHint === true ? { resumeHint: true } : {}),
             };
-            if (reconnectHandler === null) pendingReconnect = info;
-            else reconnectHandler(info);
+            if (reconnectHandler === null) {
+              // 前の hello の後に保留した行は、この hello の snapshot より古いので捨てる。
+              heldUntilReconnectHandler.length = 0;
+              pendingReconnect = info;
+            } else {
+              reconnectHandler(info);
+            }
           }
         }
       });
