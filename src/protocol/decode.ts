@@ -4,6 +4,7 @@
 
 import {
   BACKGROUND_SYNC_HINTS_MAX,
+  REMOTE_PENDING_SNAPSHOT_MAX,
   PROTOCOL_LEGACY,
   PROTOCOL_MAX_SUPPORTED,
   type ClaudeAccountUsage,
@@ -157,6 +158,21 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         session: requireString(raw, "session"),
         kind: requireRemotePendingKind(raw),
       };
+
+    case "remote_pending_snapshot": {
+      const kind = requireRemotePendingKind(raw);
+      const items = requireArray(raw, "items").slice(0, REMOTE_PENDING_SNAPSHOT_MAX).map((element) => {
+        const item = requireObject(element, "items");
+        const tool = optionalString(item, "tool");
+        return {
+          id: requireString(item, "id"),
+          session: requireString(item, "session"),
+          ...(tool !== undefined ? { tool } : {}),
+          summary: requireString(item, "summary"),
+        };
+      });
+      return { type, v, kind, items };
+    }
 
     case "session_list_request":
       return compact({

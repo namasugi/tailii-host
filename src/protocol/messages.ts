@@ -375,6 +375,17 @@ export interface BackgroundSyncHint {
 /** `background_sync_hints.sessions` の上限（iOS の上限と同じ）。超えた分は decode で捨てる。 */
 export const BACKGROUND_SYNC_HINTS_MAX = 256;
 
+/** 一覧の「待ち」ピルの snapshot 1 件（`remote_pending_snapshot.items`）。`remote_pending` の kind 以外の中身。 */
+export interface RemotePendingSnapshotItem {
+  id: string;
+  session: string;
+  tool?: string;
+  summary: string;
+}
+
+/** `remote_pending_snapshot.items` の上限（iOS の上限と同じ）。超えた分は decode で捨てる。 */
+export const REMOTE_PENDING_SNAPSHOT_MAX = 256;
+
 /**
  * background_command_stop_response.status（バックグラウンドタスク一覧からの背景コマンドの停止）:
  *   stopped     — 出力ファイルを書いていたプロセス（グループ）を止めた
@@ -498,6 +509,13 @@ export type ControlMessage =
   | { type: "approval_decision"; v: number; id: string; decision: Decision; reason?: string }
   | { type: "remote_pending"; v: number; id: string; session: string; kind: RemotePendingKind; tool?: string; summary: string }
   | { type: "remote_pending_cleared"; v: number; id: string; session: string; kind: RemotePendingKind }
+  /**
+   * 一覧の「待ち」ピルの snapshot（Mac→iOS, pending-question-snapshot）。engine が接続・Hub への再接続の
+   * たびに、その kind で今待っている会話を全部送る。iOS はその kind のピルを丸ごと置き換える（載っていない
+   * 会話のピルは消す）。待ちの解除（`remote_pending_cleared` / `question_dismiss`）は接続中にしか届かず、
+   * 切断中に片付いた分のピルが残り続けるため、これで揃え直す。旧アプリは未知 type として捨てる。
+   */
+  | { type: "remote_pending_snapshot"; v: number; kind: RemotePendingKind; items: RemotePendingSnapshotItem[] }
   | { type: "session_list_request"; v: number; id: string; limit?: number; cursor?: string }
   | { type: "session_list_response"; v: number; id: string; sessions: SessionInfo[]; nextCursor?: string; adoptedName?: string; worktreePath?: string; worktreeRemoved?: boolean; worktreeDirty?: boolean }
   | { type: "session_start"; v: number; id: string; cwd: string; name: string; baseDir?: string; resumeSessionId?: string; title?: string; agentType?: "claude" | "codex"; model?: string; permissionMode?: "default" | "acceptEdits" | "plan" | "auto"; effort?: "low" | "medium" | "high" | "xhigh" | "max"; codexModel?: string; codexSandbox?: "read-only" | "workspace-write" | "danger-full-access"; deferSubscribe?: boolean; outputStyle?: string; worktree?: string; todoTools?: boolean }

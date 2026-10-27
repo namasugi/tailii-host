@@ -155,6 +155,39 @@ describe("golden roundtrip", () => {
     }
   });
 
+  it("remote-pending-snapshot v1 golden 全行が byte-exact でラウンドトリップする", () => {
+    const lines = goldenLines("remote-pending-snapshot-v1.ndjson");
+    expect(lines.length).toBeGreaterThan(0);
+    for (const line of lines) {
+      const decoded = decodeControlMessage(line);
+      expect(encodeControlMessage(decoded)).toBe(line);
+    }
+    expect(decodeControlMessage(lines[0]!)).toEqual({
+      type: "remote_pending_snapshot", v: 1, kind: "question",
+      items: [
+        { id: "toolu_01RpSnapshotQuestion00000001", session: "s-d35e0729", summary: "どの方針で進めますか？" },
+        { id: "toolu_01RpSnapshotQuestion00000002", session: "cs-01a15afa", summary: "選択" },
+      ],
+    });
+  });
+
+  it("remote_pending_snapshot は未知の kind・欠けた要素を decode で拒否し、上限を超えた分は捨てる", () => {
+    for (const bad of [
+      '{"items":[],"kind":"other","type":"remote_pending_snapshot","v":1}',
+      '{"items":[],"type":"remote_pending_snapshot","v":1}',
+      '{"kind":"question","type":"remote_pending_snapshot","v":1}',
+      '{"items":[{"session":"s","summary":"x"}],"kind":"question","type":"remote_pending_snapshot","v":1}',
+      '{"items":[{"id":"q","summary":"x"}],"kind":"question","type":"remote_pending_snapshot","v":1}',
+      '{"items":[{"id":"q","session":"s"}],"kind":"question","type":"remote_pending_snapshot","v":1}',
+      '{"items":["q"],"kind":"question","type":"remote_pending_snapshot","v":1}',
+    ]) {
+      expect(() => decodeControlMessage(bad), bad).toThrow();
+    }
+    const many = Array.from({ length: 300 }, (_, i) => ({ id: `q-${i}`, session: `s-${i}`, summary: "x" }));
+    const decoded = decodeControlMessage(JSON.stringify({ items: many, kind: "question", type: "remote_pending_snapshot", v: 1 }));
+    expect(decoded.type === "remote_pending_snapshot" && decoded.items).toHaveLength(256);
+  });
+
   it("background_sync_hints は負・小数の境界や欠けた要素を decode で拒否し、上限を超えた分は捨てる", () => {
     for (const bad of [
       '{"sessions":[{"newerThanMs":-1,"session":"a"}],"type":"background_sync_hints","v":1}',

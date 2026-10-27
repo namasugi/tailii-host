@@ -1,0 +1,3 @@
+{"items":[{"id":"toolu_01RpSnapshotQuestion00000001","session":"s-d35e0729","summary":"どの方針で進めますか？"},{"id":"toolu_01RpSnapshotQuestion00000002","session":"cs-01a15afa","summary":"選択"}],"kind":"question","type":"remote_pending_snapshot","v":1}
+{"items":[],"kind":"question","type":"remote_pending_snapshot","v":1}
+{"items":[{"id":"9b1c2d3e-0000-0000-0000-00000000a001","session":"s-511d99f5","summary":"rm -rf build","tool":"Bash"}],"kind":"approval","type":"remote_pending_snapshot","v":2}
