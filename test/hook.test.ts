@@ -14,6 +14,7 @@ import type * as net from "node:net";
 import {
   HOOK_INTERNAL_DEADLINE_SECONDS,
   autoAllowReasonForMode,
+  isInternalForkHook,
   runHookCore,
   type ApprovalPushRequest,
 } from "../src/approval/hook.js";
@@ -112,6 +113,11 @@ function postToolUse(toolName: string, toolUseId: string, decision: string): Buf
       tool_response: { permissionDecision: decision },
     }),
   );
+}
+
+/** フック入力へ `agent_id` / `agent_type` を足す（サブエージェント / CLI 内部の複製の再現）。 */
+function withAgent(input: Buffer, fields: { agent_id?: string; agent_type?: string }): Buffer {
+  return Buffer.from(JSON.stringify({ ...JSON.parse(input.toString("utf8")), ...fields }));
 }
 
 // MARK: - 出力パース
@@ -849,6 +855,33 @@ describe("Hook — permission mode 自動許可（mode-picker 連動）", () => 
     expect(parseDecision(stdout).decision).toBe("allow");
   });
 
+  it("AskUserQuestion: 本物のサブエージェント（agent_id + agent_type）は従来どおり question_event(prompt) を送る", async () => {
+    if (!(await canListenUnixSocket())) return;
+    const relayPath = tempSocketPath("q-relay-subagent");
+    fs.rmSync(relayPath, { force: true });
+    const received: EngineRelayMessage[] = [];
+    const relay = await startEngineRelaySocket({ socketPath: relayPath, onMessage: (m) => received.push(m) });
+    expect(relay).not.toBeNull();
+    try {
+      const { stdout } = await runHookCore({
+        stdinData: withAgent(askUserQuestionPreToolUse("toolu_qsub"), {
+          agent_id: "a09595cadd6fc3e34", agent_type: "general-purpose",
+        }),
+        socketPath: null,
+        deadlineSeconds: 5,
+        session: "sess-q",
+        engineRelaySocketPath: relayPath,
+      });
+      expect(parseDecision(stdout).decision).toBe("allow");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const events = received.filter((m) => m.type === "question_event");
+      expect(events).toHaveLength(1);
+      expect(events[0]?.type === "question_event" && events[0].event).toBe("prompt");
+    } finally {
+      await relay?.close();
+    }
+  });
+
   it("autoAllowReasonForMode 純ロジック", () => {
     expect(autoAllowReasonForMode("auto", "Bash")).toContain("auto mode on");
     expect(autoAllowReasonForMode("auto", "Read")).toContain("auto mode on");
@@ -860,6 +893,95 @@ describe("Hook — permission mode 自動許可（mode-picker 連動）", () => 
     expect(autoAllowReasonForMode("plan", "Bash")).toBeNull();
     expect(autoAllowReasonForMode("default", "Edit")).toBeNull();
     expect(autoAllowReasonForMode(null, "Bash")).toBeNull();
+  });
+});
+
+describe("Hook — CLI 内部の複製（返答案など, internal-fork-hook）", () => {
+  // 返答案の複製の実例: agent_id だけが付き agent_type が無い（2.1.309 / 2.1.311 実測）。
+  const FORK = { agent_id: "a7c1f0e2b3d4a5968" };
+
+  async function withRelay(
+    name: string,
+    body: (relayPath: string, received: EngineRelayMessage[]) => Promise<void>,
+  ): Promise<void> {
+    if (!(await canListenUnixSocket())) return;
+    const relayPath = tempSocketPath(name);
+    fs.rmSync(relayPath, { force: true });
+    const received: EngineRelayMessage[] = [];
+    const relay = await startEngineRelaySocket({ socketPath: relayPath, onMessage: (m) => received.push(m) });
+    expect(relay).not.toBeNull();
+    try {
+      await body(relayPath, received);
+    } finally {
+      await relay?.close();
+    }
+  }
+
+  it("AskUserQuestion PreToolUse → 設問も処理中も知らせず、判定を返さない（CLI 自身の拒否に任せる）", async () => {
+    await withRelay("fork-q-prompt", async (relayPath, received) => {
+      const heartbeatDir = tempDir("fork-hb");
+      const { exitCode, stdout } = await runHookCore({
+        stdinData: withAgent(askUserQuestionPreToolUse("toolu_fork1"), FORK),
+        socketPath: null,
+        deadlineSeconds: 5,
+        session: "sess-q",
+        engineRelaySocketPath: relayPath,
+        heartbeatDir,
+      });
+      expect(exitCode).toBe(0);
+      expect(stdout).toBe("");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(received).toEqual([]);
+      // ターン終了後の複製で「処理中」を再点灯させない（reaper の heartbeat も触らない）。
+      expect(readHeartbeat(heartbeatDir, "sess-q")).toBeNull();
+    });
+  });
+
+  it("Bash PreToolUse（default モード）→ iPhone へ承認を求めず（接続しない）、判定を返さない", async () => {
+    const socketPath = tempSocketPath("fork-approval");
+    const listener = await startListener(socketPath);
+    let connected = false;
+    void listener.nextConnection().then(() => { connected = true; }).catch(() => {});
+    try {
+      const { stdout } = await runHookCore({
+        stdinData: withAgent(bashPreToolUse("echo x", "/w", "default"), FORK),
+        socketPath,
+        deadlineSeconds: 5,
+        engineRelaySocketPath: null,
+      });
+      expect(stdout).toBe("");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(connected).toBe(false);
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("PostToolUse → 設問の片付け・処理中を知らせず、監査だけ残す", async () => {
+    await withRelay("fork-q-post", async (relayPath, received) => {
+      const observationBase = tempDir("fork-audit");
+      const { exitCode } = await runHookCore({
+        stdinData: withAgent(postToolUse("AskUserQuestion", "toolu_fork2", "allow"), FORK),
+        socketPath: null,
+        deadlineSeconds: 5,
+        session: "sess-q",
+        engineRelaySocketPath: relayPath,
+        observationBase,
+      });
+      expect(exitCode).toBe(0);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(received).toEqual([]);
+      const audit = fs.readFileSync(path.join(observationBase, "sess-q.ndjson"), "utf8");
+      expect(audit).toContain("toolu_fork2");
+    });
+  });
+
+  it("isInternalForkHook: agent_id だけ = 複製 / 両方 = サブエージェント / 無し・agent_type だけ = メイン", () => {
+    expect(isInternalForkHook({ agentId: "a1" })).toBe(true);
+    expect(isInternalForkHook({ agentId: "a1", agentType: "general-purpose" })).toBe(false);
+    expect(isInternalForkHook({})).toBe(false);
+    // `--agent` で起動したメインスレッドは agent_type だけが付く。
+    expect(isInternalForkHook({ agentType: "reviewer" })).toBe(false);
   });
 });
 

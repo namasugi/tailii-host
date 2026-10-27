@@ -24,6 +24,9 @@
 //
 // PostToolUse（別呼び出し、ゲートしない）: ObservationLog に監査追記して exit 0（5.8）。
 //
+// CLI 内部の複製（返答案など。`agent_id` だけ付き `agent_type` が無い）の Pre/PostToolUse は、
+// 処理中の通知・設問・承認のどれにも使わない（`isInternalForkHook`）。
+//
 // 既定は常に deny（安全側）。connect 失敗・stdin 解析不能・id 不一致・非対応 v・
 // undecodable 行・EOF・デッドラインのいずれでも deny を出力する。
 
@@ -196,6 +199,14 @@ export async function runHookCore(options: RunHookOptions): Promise<HookRunResul
       : undefined;
     await notifySessionProcessing(
       options, session, parsed.eventName === "Stop" ? "done" : "active", parsed.eventName, scheduled);
+    return { exitCode: 0, stdout: "" };
+  }
+
+  // --- 0.1 CLI 内部の複製（返答案など）のツール呼び出し（internal-fork-hook） ---
+  // 処理中の通知・設問・承認のどれにも使わない。PreToolUse は判定を返さず（CLI 自身の判定に任せる。
+  // 返答案の複製はツールを必ず拒否される）、PostToolUse は実行された記録として監査だけ残す。
+  if (isInternalForkHook(parsed)) {
+    if (parsed.eventName === "PostToolUse") return runPostToolUse(parsed, session, options.observationBase);
     return { exitCode: 0, stdout: "" };
   }
 
@@ -930,6 +941,27 @@ interface ParsedPreToolUse {
   sessionCrons?: unknown;
   /** Claude の session id（`session_id`）。 */
   sessionId?: string;
+  /** サブエージェント / CLI 内部の複製の id（`agent_id`）。メインスレッドでは無い。 */
+  agentId?: string;
+  /** サブエージェントの種類（`agent_type`）。CLI 内部の複製には付かない。 */
+  agentType?: string;
+}
+
+/**
+ * CLI 内部の複製（返答案・記憶の抽出・要約・圧縮・/btw など）が出した hook か（internal-fork-hook）。
+ *
+ * Claude Code はこれらを会話の複製（runForkedAgent）で動かし、ツール一覧も親から引き継ぐ。複製が
+ * ツールを呼ぶと PreToolUse hook が先に発火するが、CLI 自身の判定（返答案なら必ず拒否）で実行は
+ * されず、transcript にも画面にも何も残らない。これを本物として扱うと、iPhone に存在しない設問が
+ * 出て一覧が「回答待ち」になり、ターン終了後に処理中表示が再点灯する（実機 2026-10-23 / 10-27）。
+ *
+ * 見分け方（2.1.311 で実測・コードで確認）: メインスレッドは `agent_id` も `agent_type` も無い。
+ * 本物のサブエージェント（Agent ツール・背景実行・fork 型を含む）は両方付く。内部の複製は
+ * `agent_id`（毎回新しい id）だけが付き `agent_type` が無い。`--agent` で起動した会話の複製は
+ * メインの種類が `agent_type` に入るため見分けられず、従来どおりサブエージェントとして扱う。
+ */
+export function isInternalForkHook(input: { agentId?: string; agentType?: string }): boolean {
+  return input.agentId !== undefined && input.agentType === undefined;
 }
 
 /** フック JSON を寛容にパースする。欠落フィールドは安全な既定値で補う。 */
@@ -967,6 +999,8 @@ function parsePreToolUse(data: Buffer): ParsedPreToolUse {
   }
   if ("session_crons" in raw) parsed.sessionCrons = raw["session_crons"];
   if (typeof raw["session_id"] === "string" && raw["session_id"].length > 0) parsed.sessionId = raw["session_id"];
+  if (typeof raw["agent_id"] === "string" && raw["agent_id"].length > 0) parsed.agentId = raw["agent_id"];
+  if (typeof raw["agent_type"] === "string" && raw["agent_type"].length > 0) parsed.agentType = raw["agent_type"];
   const response = raw["tool_response"];
   if (typeof response === "object" && response !== null && !Array.isArray(response)) {
     const decision = (response as Record<string, unknown>)["permissionDecision"];
