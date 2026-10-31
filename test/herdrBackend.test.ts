@@ -1793,6 +1793,30 @@ describe("HerdrSessionManager", () => {
     expect(await make(herdrOk(JSON.stringify({ result: { process_info: {} } }))).agentProcessIds("s-a")).toBeNull();
   });
 
+  test("paneProcessId: 前面グループでなく shell_pid を使い、不在・失敗・不正値は null", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const make = (result: HerdrCommandResult | Error, panes = [{ pane_id: "w4:p2" }]): HerdrSessionManager =>
+      new HerdrSessionManager({
+        runner: new MockHerdrRunner((args) => {
+          if (args[1] === "list") return herdrOk(paneListJson(panes));
+          if (result instanceof Error) throw result;
+          return result;
+        }).runner,
+        store,
+      });
+    const info = (shell_pid: unknown): HerdrCommandResult => herdrOk(JSON.stringify({
+      result: { process_info: { shell_pid, foreground_process_group_id: 300, foreground_processes: [{ pid: 310 }] } },
+    }));
+    expect(await make(info(100)).paneProcessId("s-a")).toBe(100);
+    expect(await make(info(100), []).paneProcessId("s-a")).toBeNull();
+    expect(await make({ exitCode: 1, stdout: "", stderr: "error" }).paneProcessId("s-a")).toBeNull();
+    expect(await make(new Error("unavailable")).paneProcessId("s-a")).toBeNull();
+    for (const invalid of [undefined, "100", 0, -1, 1.5]) {
+      expect(await make(info(invalid)).paneProcessId("s-a")).toBeNull();
+    }
+  });
+
   test("agentProcessAlive: launch 直後の猶予窓ではシェル前面を起動中として生存扱い", async () => {
     // pane 作成 → 初期シェル → `exec zsh -lc` → claude exec の間は前面がシェルに見える。
     // 窓内（createdAt が HERDR_LAUNCH_GRACE_SECONDS 未満前）は true、窓外は従来どおり false。

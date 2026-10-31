@@ -57,7 +57,7 @@ import {
   confirmModelSwitchDialog,
 } from "./effortDialog.js";
 import { ImageService } from "../chat/imageService.js";
-import { listServeProcessesWithStatus } from "../services/serveService.js";
+import { listLocalServerProcesses } from "./localServerProcesses.js";
 
 export interface HubLock {
   pid: number;
@@ -603,15 +603,8 @@ export async function runHubCommand(args: string[]): Promise<number> {
     heartbeatDir: defaultHeartbeatDir(),
     metadataStore,
     timeoutSeconds,
-    // ローカル開発サーバー稼働中の cwd は activity とみなし、pane close / kill-session に
-    // よる巻き添え終了を防ぐ。reaper は timeout 候補がある tick でのみこの検出を呼ぶ。
-    listLocalServerCwds: async () => {
-      const result = await listServeProcessesWithStatus({ excludePids: [process.pid] });
-      if (!result.ok) return null;
-      return new Set(
-        result.servers.flatMap((server) => server.cwd === undefined ? [] : [server.cwd]),
-      );
-    },
+    // サーバーを持つ pane だけ保護する。同じ cwd の無関係な会話や CLI 自身の待受では延命しない。
+    listLocalServers: () => listLocalServerProcesses([process.pid]),
     pendingQuestionsPath: defaultPendingQuestionsPath(),
     chatReceiptsPath: defaultChatReceiptsPath(),
     log,

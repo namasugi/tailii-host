@@ -574,7 +574,7 @@ export class HerdrSessionManager {
    * reaper 用の列挙。pane 一覧を**取得できなかった**場合は null を返し、「herdr セッション
    * 0 件」と区別する。両者を混同すると、CLI の一時的な失敗（タイムアウト・server 再起動中）
    * で生存中のセッションを「消滅」と誤判定し、heartbeat を回収して会話を retire してしまう
-   * （`ReaperTickOptions.listLocalServerCwds` の「null=検出不能」と同じ規約）。
+   * （`ReaperTickOptions.listLocalServers` の「null=検出不能」と同じ規約）。
    */
   async listLive(): Promise<SessionInfo[] | null> {
     if (!this.store.all().some((meta) => meta.backend === "herdr")) return [];
@@ -713,6 +713,23 @@ export class HerdrSessionManager {
       // 空は「前面プロセスが無い」ではなく形式変更・一時失敗の疑い → 取得不能として扱う。
       const pids = parseHerdrForegroundPids(result.stdout);
       return pids.length > 0 ? pids : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** pane の起動プロセス。背景サーバーも含む親子関係の根として使う。 */
+  async paneProcessId(name: string): Promise<number | null> {
+    validateSessionName(name);
+    const target = await this.paneTarget(name);
+    if (target === null) return null;
+    try {
+      const result = await this.runner(["pane", "process-info", "--pane", target]);
+      if (result.exitCode !== 0) return null;
+      const info = parseHerdrResult(result.stdout)?.["process_info"];
+      if (typeof info !== "object" || info === null) return null;
+      const pid = (info as Record<string, unknown>)["shell_pid"];
+      return typeof pid === "number" && Number.isInteger(pid) && pid > 0 ? pid : null;
     } catch {
       return null;
     }

@@ -21,9 +21,9 @@ import {
   SCHEDULED_UNPARSED_MAX_SECONDS,
   reaperTick,
   scheduledPending,
-  serverCwdBelongsToSession,
 } from "../src/hub/reaper.js";
 import { MockTmuxRunner, makeTempDir, makeTempStore, ok } from "./helpers.js";
+import type { LocalServerProcesses } from "../src/hub/localServerProcesses.js";
 
 const TIMEOUT = REAPER_IDLE_TIMEOUT_SECONDS;
 const NOW = 1_000_000;
@@ -48,21 +48,6 @@ function killed(runner: MockTmuxRunner): string[] {
 }
 
 describe("reaperTick", () => {
-  test("server cwd はセッション cwd 自身・子孫・symlink 実体を含み prefix sibling を除外する", () => {
-    const root = makeTempDir("reaper-cwd-match");
-    const project = path.join(root, "site");
-    const frontend = path.join(project, "packages", "frontend");
-    const alias = path.join(root, "site-alias");
-    fs.mkdirSync(frontend, { recursive: true });
-    fs.symlinkSync(project, alias, "dir");
-
-    expect(serverCwdBelongsToSession(project, project)).toBe(true);
-    expect(serverCwdBelongsToSession(project, frontend)).toBe(true);
-    expect(serverCwdBelongsToSession(alias, frontend)).toBe(true);
-    expect(serverCwdBelongsToSession(project, path.join(root, "site-other"))).toBe(false);
-    expect(serverCwdBelongsToSession(frontend, project)).toBe(false);
-  });
-
   test("idle かつ timeout 超過のセッションだけ kill し heartbeat も掃除する（旧 4.3）", async () => {
     const dir = makeTempDir("reaper");
     const runner = runnerWithSessions(["cs-old", "cs-fresh"]);
@@ -81,6 +66,75 @@ describe("reaperTick", () => {
     expect(killed(runner)).toEqual(["cs-old"]);
     expect(readHeartbeat(dir, "cs-old")).toBeNull();
     expect(readHeartbeat(dir, "cs-fresh")).not.toBeNull();
+  });
+
+  test("tmux は全 pane の親子関係を見てサーバー所有会話だけ保護し、同じ cwd の別会話は回収する", async () => {
+    const dir = makeTempDir("reaper-tmux-server-owner");
+    const store = makeTempStore();
+    for (const name of ["s-owner", "s-other"]) {
+      store.put({ name, cwd: "/work/site", createdAt: 1 });
+      writeHeartbeat(dir, name, { ts: NOW - TIMEOUT, state: "idle" });
+    }
+    const runner = new MockTmuxRunner((args) => {
+      if (args[0] === "ls") return ok("s-owner\ns-other\n");
+      if (args[0] === "list-panes") return ok(args[3] === "s-owner" ? "100\n110\n" : "200\n");
+      return ok("");
+    });
+    const result = await reaperTick({
+      runner: runner.runner, heartbeatDir: dir, metadataStore: store, timeoutSeconds: TIMEOUT, now: NOW,
+      listLocalServers: async () => ({
+        servers: [{ pid: 120, command: "node", cwd: "/work/site/frontend" }],
+        parents: new Map([[120, 115], [115, 110], [110, 1], [100, 1], [200, 1]]),
+      }),
+    });
+    expect(result.killed).toEqual(["s-other"]);
+    expect(killed(runner)).toEqual(["s-other"]);
+    expect(readHeartbeat(dir, "s-owner")?.event).toBe("daemon-local-server");
+  });
+
+  test("会話の作業ディレクトリの外で起動したサーバーも、所有 pane を保護する", async () => {
+    const dir = makeTempDir("reaper-server-outside-cwd");
+    const store = makeTempStore();
+    store.put({ name: "s-owner", cwd: "/work/site", createdAt: 1 });
+    writeHeartbeat(dir, "s-owner", { ts: NOW - TIMEOUT, state: "idle" });
+    const runner = new MockTmuxRunner((args) => {
+      if (args[0] === "ls") return ok("s-owner\n");
+      if (args[0] === "list-panes") return ok("100\n");
+      return ok("");
+    });
+    const result = await reaperTick({
+      runner: runner.runner, heartbeatDir: dir, metadataStore: store, timeoutSeconds: TIMEOUT, now: NOW,
+      listLocalServers: async () => ({
+        servers: [{ pid: 120, command: "node", cwd: "/work/another-project" }],
+        parents: new Map([[120, 100], [100, 1]]),
+      }),
+    });
+    expect(result.killed).toEqual([]);
+    expect(readHeartbeat(dir, "s-owner")?.event).toBe("daemon-local-server");
+  });
+
+  test("親を失っても同じ制御端末に残るサーバーの pane は保護する（別 pane は回収）", async () => {
+    const dir = makeTempDir("reaper-orphan-server-tty");
+    const store = makeTempStore();
+    for (const name of ["s-owner", "s-other"]) {
+      store.put({ name, cwd: "/work/site", createdAt: 1 });
+      writeHeartbeat(dir, name, { ts: NOW - TIMEOUT, state: "idle" });
+    }
+    const runner = new MockTmuxRunner((args) => {
+      if (args[0] === "ls") return ok("s-owner\ns-other\n");
+      if (args[0] === "list-panes") return ok(args[3] === "s-owner" ? "100\n" : "200\n");
+      return ok("");
+    });
+    const result = await reaperTick({
+      runner: runner.runner, heartbeatDir: dir, metadataStore: store, timeoutSeconds: TIMEOUT, now: NOW,
+      listLocalServers: async () => ({
+        servers: [{ pid: 120, command: "node" }],
+        parents: new Map([[120, 1], [100, 1], [200, 1]]),
+        terminals: new Map([[120, "ttys006"], [100, "ttys006"], [200, "ttys007"]]),
+      }),
+    });
+    expect(result.killed).toEqual(["s-other"]);
+    expect(readHeartbeat(dir, "s-owner")?.event).toBe("daemon-local-server");
   });
 
   test("未採番の生存セッションは「今を idle」で採番し kill しない（過去の残骸の回収）", async () => {
@@ -338,6 +392,7 @@ describe("reaperTick herdr backend", () => {
   function herdrOpsWith(options: {
     names: string[];
     agentAlive?: boolean;
+    panePids?: Record<string, number | null>;
   }): { ops: import("../src/hub/reaper.js").HerdrReaperOps; killedNames: string[] } {
     const killedNames: string[] = [];
     return {
@@ -346,6 +401,7 @@ describe("reaperTick herdr backend", () => {
         list: async () =>
           options.names.map((name) => ({ name, cwd: "/w", alive: true, backend: "herdr" as const })),
         agentProcessAlive: async () => options.agentAlive ?? true,
+        paneProcessId: async (name) => options.panePids?.[name] ?? null,
         kill: async (name) => {
           killedNames.push(name);
         },
@@ -509,13 +565,18 @@ describe("reaperTick herdr backend", () => {
     expect(result.liveCount).toBe(2);
   });
 
-  test("同じプロジェクト配下のローカルサーバーが LISTEN 中なら herdr pane を回収しない", async () => {
+  test("herdr はサーバー所有会話だけを保護し、同じ cwd の別会話は回収する。停止後は通常の猶予で回収", async () => {
     const dir = makeTempDir("reaper-herdr-server-protect");
     const tmux = runnerWithSessions([]);
     const store = makeTempStore();
     store.put({ name: "s-preview", cwd: "/work/site", createdAt: 1, backend: "herdr" });
-    const { ops, killedNames } = herdrOpsWith({ names: ["s-preview"] });
-    writeHeartbeat(dir, "s-preview", { ts: NOW - TIMEOUT, state: "idle" });
+    store.put({ name: "s-other", cwd: "/work/site", createdAt: 1, backend: "herdr" });
+    const { ops, killedNames } = herdrOpsWith({
+      names: ["s-preview", "s-other"], panePids: { "s-preview": 100, "s-other": 200 },
+    });
+    for (const name of ["s-preview", "s-other"]) {
+      writeHeartbeat(dir, name, { ts: NOW - TIMEOUT, state: "idle" });
+    }
     let detections = 0;
 
     const result = await reaperTick({
@@ -525,20 +586,90 @@ describe("reaperTick herdr backend", () => {
       timeoutSeconds: TIMEOUT,
       now: NOW,
       herdrOps: ops,
-      listLocalServerCwds: async () => {
+      listLocalServers: async () => {
         detections += 1;
-        return new Set(["/work/site/frontend"]);
+        return {
+          servers: [{ pid: 120, command: "node", cwd: "/work/site/frontend" }],
+          parents: new Map([[120, 110], [110, 100], [100, 1], [200, 1]]),
+        };
       },
     });
 
-    expect(result.killed).toEqual([]);
-    expect(killedNames).toEqual([]);
+    expect(result.killed).toEqual(["s-other"]);
+    expect(killedNames).toEqual(["s-other"]);
     expect(detections).toBe(1);
     expect(readHeartbeat(dir, "s-preview")).toEqual({
       ts: NOW,
       state: "idle",
       event: "daemon-local-server",
     });
+
+    ops.list = async () => [{ name: "s-preview", cwd: "/work/site", alive: true, backend: "herdr" }];
+    const afterStop = await reaperTick({
+      runner: tmux.runner, heartbeatDir: dir, metadataStore: store, timeoutSeconds: TIMEOUT,
+      now: NOW + TIMEOUT, herdrOps: ops,
+      listLocalServers: async () => ({ servers: [], parents: new Map() }),
+    });
+    expect(afterStop.killed).toEqual(["s-preview"]);
+  });
+
+  test.each(["codex", "claude", "/usr/local/bin/codex"])(
+    "%s 自身の待受だけでは延命しない（親子関係の検出不能でも影響しない）", async (command) => {
+      const dir = makeTempDir("reaper-agent-listener");
+      const store = makeTempStore();
+      store.put({ name: "s-idle", cwd: "/work/site", createdAt: 1, backend: "herdr", agent: "codex" });
+      const { ops } = herdrOpsWith({ names: ["s-idle"], panePids: { "s-idle": 100 } });
+      ops.paneProcessId = async () => { throw new Error("不要な所有判定"); };
+      writeHeartbeat(dir, "s-idle", { ts: NOW - TIMEOUT, state: "idle" });
+      const result = await reaperTick({
+        runner: runnerWithSessions([]).runner, heartbeatDir: dir, metadataStore: store,
+        timeoutSeconds: TIMEOUT, now: NOW, herdrOps: ops,
+        listLocalServers: async () => ({ servers: [{ pid: 100, command, cwd: "/work/site" }], parents: null }),
+      });
+      expect(result.killed).toEqual(["s-idle"]);
+    },
+  );
+
+  test("同じ cwd でも pane から切り離されたサーバーでは延命しない", async () => {
+    const dir = makeTempDir("reaper-detached-server");
+    const store = makeTempStore();
+    store.put({ name: "s-idle", cwd: "/work/site", createdAt: 1, backend: "herdr" });
+    const { ops } = herdrOpsWith({ names: ["s-idle"], panePids: { "s-idle": 100 } });
+    writeHeartbeat(dir, "s-idle", { ts: NOW - TIMEOUT, state: "idle" });
+    const result = await reaperTick({
+      runner: runnerWithSessions([]).runner, heartbeatDir: dir, metadataStore: store,
+      timeoutSeconds: TIMEOUT, now: NOW, herdrOps: ops,
+      listLocalServers: async () => ({
+        servers: [{ pid: 120, command: "node", cwd: "/work/site" }],
+        parents: new Map([[120, 1], [100, 1]]),
+      }),
+    });
+    expect(result.killed).toEqual(["s-idle"]);
+  });
+
+  test.each(["parents", "pane", "ancestor"])("%s の取得不能は heartbeat を進めず延期し、次 tick で再試行する", async (missing) => {
+    const dir = makeTempDir("reaper-server-owner-unavailable");
+    const store = makeTempStore();
+    store.put({ name: "s-idle", cwd: "/work/site", createdAt: 1, backend: "herdr" });
+    const { ops } = herdrOpsWith({ names: ["s-idle"], panePids: { "s-idle": missing === "pane" ? null : 100 } });
+    const stale = { ts: NOW - TIMEOUT, state: "idle" as const };
+    writeHeartbeat(dir, "s-idle", stale);
+    const options = {
+      runner: runnerWithSessions([]).runner, heartbeatDir: dir, metadataStore: store,
+      timeoutSeconds: TIMEOUT, now: NOW, herdrOps: ops,
+      listLocalServers: async (): Promise<LocalServerProcesses> => ({
+        servers: [{ pid: 120, command: "node", cwd: "/work/site" }],
+        parents: missing === "parents" ? null : missing === "ancestor"
+          ? new Map([[120, 110], [100, 1]]) : new Map([[120, 1], [100, 1]]),
+      }),
+    };
+    expect((await reaperTick(options)).killed).toEqual([]);
+    expect(readHeartbeat(dir, "s-idle")).toEqual(stale);
+    ops.paneProcessId = async () => 100;
+    options.listLocalServers = async () => ({
+      servers: [{ pid: 120, command: "node", cwd: "/work/site" }], parents: new Map([[120, 1], [100, 1]]),
+    });
+    expect((await reaperTick({ ...options, now: NOW + 60 })).killed).toEqual(["s-idle"]);
   });
 
   test("fresh セッションだけならローカルサーバー検出を呼ばない", async () => {
@@ -555,9 +686,9 @@ describe("reaperTick herdr backend", () => {
       timeoutSeconds: TIMEOUT,
       now: NOW,
       herdrOps: ops,
-      listLocalServerCwds: async () => {
+      listLocalServers: async () => {
         detections += 1;
-        return new Set();
+        return { servers: [], parents: new Map() };
       },
     });
 
@@ -574,9 +705,9 @@ describe("reaperTick herdr backend", () => {
     writeHeartbeat(dir, "s-preview", stale);
     let detectionAvailable = false;
     let detections = 0;
-    const listLocalServerCwds = async (): Promise<ReadonlySet<string> | null> => {
+    const listLocalServers = async (): Promise<LocalServerProcesses | null> => {
       detections += 1;
-      return detectionAvailable ? new Set() : null;
+      return detectionAvailable ? { servers: [], parents: new Map() } : null;
     };
 
     const deferred = await reaperTick({
@@ -586,7 +717,7 @@ describe("reaperTick herdr backend", () => {
       timeoutSeconds: TIMEOUT,
       now: NOW,
       herdrOps: ops,
-      listLocalServerCwds,
+      listLocalServers,
     });
 
     expect(deferred.killed).toEqual([]);
@@ -601,7 +732,7 @@ describe("reaperTick herdr backend", () => {
       timeoutSeconds: TIMEOUT,
       now: NOW + 60,
       herdrOps: ops,
-      listLocalServerCwds,
+      listLocalServers,
     });
 
     expect(retried.killed).toEqual(["s-preview"]);
