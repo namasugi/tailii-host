@@ -129,7 +129,7 @@ describe("CodexNativeTurnController", () => {
     ]);
   });
 
-  test("MCP item と App Server の error / warning 通知を system 注記として流す", async () => {
+  test("MCP は操作カード、App Server の error / warning は system 注記として流す", async () => {
     const thread = new FakeThread();
     let openOptions: CodexAppServerThreadOptions | null = null;
     const chats: { session: string; itemId: string; payload: unknown }[] = [];
@@ -144,6 +144,13 @@ describe("CodexNativeTurnController", () => {
       item: {
         id: "mcp-1", type: "mcpToolCall", server: "drive", tool: "search",
         status: "failed", error: { message: "permission denied" },
+      },
+    } });
+    openOptions?.onNotification?.({ method: "item/completed", params: {
+      threadId: "thread-1", item: {
+        id: "mcp-unverified", type: "mcpToolCall", server: "logic_pro", tool: "logic_transport",
+        status: "failed", error: null,
+        result: { structuredContent: { success: true, verified: false, reason: "readback_unavailable" } },
       },
     } });
     openOptions?.onNotification?.({ method: "mcpServer/startupStatus/updated", params: {
@@ -168,12 +175,16 @@ describe("CodexNativeTurnController", () => {
         : [];
     });
     expect(texts).toEqual([
-      "❌ MCP「drive / search」エラー: permission denied",
       "❌ MCP サーバー「notion」の起動に失敗しました: handshake failed",
       "⚠️ Codex エラー（自動再試行中）: connection lost",
       "⚠️ Codex 警告: context is nearly full",
     ]);
-    expect(chats[0]?.itemId).toBe("mcp-1");
+    expect(chats[0]).toMatchObject({ itemId: "mcp-1#tool-0", payload: {
+      type: "tool_activity", activity: { id: "mcp-mcp-1", name: "MCP", outcome: "connection_failed", description: "permission denied" },
+    } });
+    expect(chats[1]).toMatchObject({ payload: {
+      type: "tool_activity", activity: { outcome: "unverified", description: "readback_unavailable" },
+    } });
   });
 
   test("deprecationNotice は chat へ流さず、同文はログへ 1 回だけ記録する", async () => {

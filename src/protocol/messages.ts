@@ -72,6 +72,8 @@ export interface ToolActivity {
   url?: string;
   /** 実行されなかった / 中断された理由（tool_result から後付け, additive, tool-denial）。成功時は省略。 */
   denial?: ToolDenialKind;
+  /** MCP 操作の結果（additive）。接続失敗と操作失敗・結果未確認を区別する。 */
+  outcome?: "completed" | "unverified" | "failed" | "connection_failed";
 }
 
 export type SubagentNodeStatus = "running" | "completed" | "error";

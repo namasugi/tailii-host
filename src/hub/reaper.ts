@@ -40,7 +40,7 @@ import {
   writeHeartbeat,
 } from "../sessions/heartbeat.js";
 import { HerdrSessionManager, isDefaultHerdrTabLabel } from "../backend/herdr.js";
-import { CodexAppServerManager } from "../codex/codexAppServer.js";
+import { CodexSessionStore } from "../codex/codexSessionStore.js";
 import type { SessionInfo } from "../protocol.js";
 import { isAgentListener, processBelongsToPane, type LocalServerProcesses } from "./localServerProcesses.js";
 import { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
@@ -143,7 +143,7 @@ export interface ReaperTickOptions {
   deriveClaudeTitle?: (claudeSessionId: string) => string | null;
   /**
    * Codex の正式な会話名（thread.name）の導出（session-title 自動タイトル同期用）。
-   * 省略時は稼働中の共有 App Server の thread/list を巡回ごとに一度だけ読む。
+   * 省略時はローカルの session_index.jsonl を巡回ごとに一度だけ読む。
    */
   deriveCodexTitle?: (threadId: string) => string | null | Promise<string | null>;
   /**
@@ -228,16 +228,6 @@ function defaultDeriveClaudeTitle(claudeSessionId: string): string | null {
   const transcript = new ClaudeSessionStore().transcriptPath(claudeSessionId);
   if (transcript === null) return null;
   return transcriptTitle(transcript);
-}
-
-/** 稼働中の共有 App Server から正式名つき Codex thread を一括取得する（server は起動しない）。 */
-async function loadCodexThreadTitles(): Promise<ReadonlyMap<string, string>> {
-  const threads = await new CodexAppServerManager().listThreads();
-  if (threads === null) return new Map();
-  return new Map(
-    threads.flatMap((thread) =>
-      thread.name === null ? [] : [[thread.id, thread.name] as const]),
-  );
 }
 
 /** 巡回 1 回分。判定表は docs/architecture.md「セッション自動掃除」を参照。 */
@@ -517,15 +507,17 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
     // --- 未命名タブへ会話タイトルを自動反映（session-title）---
     // タブラベルが未命名（null / 空 / セッション名 / 0.7.5 tab create の既定連番 "1"…）の
     // 生存セッションだけを対象に、Claude は transcript の会話タイトル（明示タイトル
-    // custom-title/ai-title 優先）、Codex は App Server の正式名 thread.name をタブへ書く。
+    // custom-title/ai-title 優先）、Codex は session_index の正式名 thread_name をタブへ書く。
     // 命名済み（それ以外のラベル）は手動を優先して触らない。
     if (herdrLive.length > 0 &&
         herdrOps.tabInfoByName !== undefined && herdrOps.setDisplayTitle !== undefined) {
       const deriveClaudeTitle = options.deriveClaudeTitle ?? defaultDeriveClaudeTitle;
-      let codexTitlesPromise: Promise<ReadonlyMap<string, string>> | null = null;
-      const deriveCodexTitle = options.deriveCodexTitle ?? (async (threadId: string) => {
-        codexTitlesPromise ??= loadCodexThreadTitles();
-        return (await codexTitlesPromise).get(threadId) ?? null;
+      let codexTitles: ReadonlyMap<string, string> | null = null;
+      const deriveCodexTitle = options.deriveCodexTitle ?? ((threadId: string) => {
+        // thread/list は会話が増えると 2 秒の時間制限を超えて全タブの同期が止まる。
+        // 一覧と同じローカル索引から正式名だけ読み、古い生存会話も件数制限なく対象にする。
+        codexTitles ??= new CodexSessionStore().providerTitles();
+        return codexTitles.get(threadId) ?? null;
       });
       try {
         const tabInfo = await herdrOps.tabInfoByName();

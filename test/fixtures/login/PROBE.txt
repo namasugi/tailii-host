@@ -1,1 +1,1 @@
-claude 2.1.281 / backend=herdr / 2026-09-24T00:49:05.714Z
+claude 2.1.316 / backend=tmux / 2026-11-02T02:00:26.942Z

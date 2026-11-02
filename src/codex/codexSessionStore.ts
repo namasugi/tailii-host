@@ -42,6 +42,7 @@ export function defaultCodexHome(): string {
 }
 
 interface IndexEntry {
+  /** 索引の正式名（一覧表示用の短縮は読み出し側で行う）。 */
   title: string | null;
   updatedAt: number | null;
 }
@@ -141,7 +142,10 @@ export class CodexSessionStore {
       const idx = meta.id !== null ? index.get(meta.id) : undefined;
       // thread_name が無ければ最初の実ユーザー発話からタイトルを作る（codex アプリ準拠）。
       // それも取れなければ id 先頭 8 字。index にある会話は毎回のファイル走査を避けて thread_name を使う。
-      const title = idx?.title ?? this.firstUserMessage(file) ?? sessionId.slice(0, 8);
+      const indexedTitle = idx?.title;
+      const title = indexedTitle !== undefined && indexedTitle !== null
+        ? normalizeTitle(indexedTitle)
+        : this.firstUserMessage(file) ?? sessionId.slice(0, 8);
       // 更新時刻は rollout の mtime（Codex App Server の thread/list が返す updatedAt と同じ値。
       // 2026-10-23 実測で上位 200 件すべて一致）。session_index の updated_at は名前を付けた時点の
       // 値で古く、App Server 経由の一覧と並びが食い違っていた（取得のたびに入れ替わって見えた）。
@@ -171,6 +175,20 @@ export class CodexSessionStore {
     });
   }
 
+  /**
+   * 保存済みの正式タイトルだけを返す（herdr タブ名同期用）。rollout の列挙・App Server の
+   * 問い合わせ・一覧件数の制限を使わず、未命名の会話には発話や ID の代替タイトルを付けない。
+   * 一覧用の 60 文字への短縮はせず、herdr と同じ前後空白除去だけを行う。
+   */
+  providerTitles(): ReadonlyMap<string, string> {
+    const titles = new Map<string, string>();
+    for (const [id, entry] of this.readIndex()) {
+      const title = entry.title?.trim();
+      if (title !== undefined && title.length > 0) titles.set(id, title);
+    }
+    return titles;
+  }
+
   /** `session_index.jsonl` を id → { title, updatedAt(秒) } に読む（無ければ空マップ）。 */
   private readIndex(): Map<string, IndexEntry> {
     const map = new Map<string, IndexEntry>();
@@ -194,7 +212,7 @@ export class CodexSessionStore {
       if (typeof id !== "string" || id.length === 0) continue;
       let title: string | null = null;
       if (typeof rec["thread_name"] === "string" && rec["thread_name"].length > 0) {
-        title = normalizeTitle(rec["thread_name"]);
+        title = rec["thread_name"];
       }
       let updatedAt: number | null = null;
       if (typeof rec["updated_at"] === "string") {

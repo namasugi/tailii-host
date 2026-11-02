@@ -468,17 +468,10 @@ async function refreshQuicGateway(packageDir: string, io: SelfUpdateIO): Promise
     return;
   }
   fs.chmodSync(prebuilt, 0o755);
-  // installQuicGatewayBinary の「サイズ一致なら据え置き」最適化は npm tarball の
-  // 正規化 mtime(過去日付)と噛み合い偽陰性になり得るため、更新時は必ずコピーする。
+  // setup と同じ署名検証 / atomic install を通す。内容比較は mtime に依存しないため、
+  // npm tarball の正規化 mtime でも新版を検出できる。
   const installed = await installQuicLaunchAgent({
     gatewayPath: prebuilt,
-    installBinary: (source) => {
-      const dest = path.join(os.homedir(), ".tailii", "bin", "tailii-quic-gw");
-      fs.mkdirSync(path.dirname(dest), { recursive: true });
-      fs.copyFileSync(source, dest);
-      fs.chmodSync(dest, 0o755);
-      return dest;
-    },
   });
   io.log(
     installed.running

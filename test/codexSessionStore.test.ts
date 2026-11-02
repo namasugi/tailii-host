@@ -56,6 +56,52 @@ function writeIndex(home: string, entries: { id: string; thread_name?: string; u
   fs.writeFileSync(path.join(home, "session_index.jsonl"), lines + "\n");
 }
 
+describe("CodexSessionStore.providerTitles", () => {
+  test("rollout・App Server が無くても全件の正式名を読み、破損行と未命名を除く", () => {
+    const home = makeTempDir("codex-provider-titles");
+    const store = new CodexSessionStore(home, 1);
+    expect([...store.providerTitles()]).toEqual([]);
+    const entries = Array.from({ length: 205 }, (_, i) => ({
+      id: `thread-${i}`, thread_name: `正式名${i}`,
+    }));
+    writeIndex(home, [
+      ...entries,
+      { id: "unnamed" },
+      { id: "empty", thread_name: "" },
+      { id: "whitespace", thread_name: " \n " },
+      { id: "", thread_name: "IDなし" },
+    ]);
+    fs.appendFileSync(path.join(home, "session_index.jsonl"), 'broken\nnull\n{"id":');
+
+    expect(store.providerTitles()).toEqual(new Map(entries.map((entry) => [entry.id, entry.thread_name])));
+  });
+
+  test("同じ会話の末尾の名前を採用し、次の読み取りでリネームへ追随する", () => {
+    const home = makeTempDir("codex-provider-title-rename");
+    const store = new CodexSessionStore(home);
+    writeIndex(home, [
+      { id: "thread-1", thread_name: "最初の名前" },
+      { id: "thread-1", thread_name: "新しい名前" },
+    ]);
+    expect(store.providerTitles().get("thread-1")).toBe("新しい名前");
+
+    fs.appendFileSync(path.join(home, "session_index.jsonl"),
+      JSON.stringify({ id: "thread-1", thread_name: "さらに変更" }) + "\n");
+    expect(store.providerTitles().get("thread-1")).toBe("さらに変更");
+  });
+
+  test("正式名は60文字で切らずherdrと同じ前後空白除去だけを行い、一覧は従来どおり短縮する", () => {
+    const home = makeTempDir("codex-provider-title-full");
+    const title = "あ".repeat(59) + " 正式名の末尾\n続き";
+    writeIndex(home, [{ id: "thread-long", thread_name: `  ${title}  ` }]);
+    writeRollout(home, "2026/07/06", "rollout-long.jsonl", "thread-long", "/w", undefined, "依頼");
+    const store = new CodexSessionStore(home);
+
+    expect(store.providerTitles().get("thread-long")).toBe(title);
+    expect(store.list()[0]?.title).toBe("あ".repeat(59) + " ");
+  });
+});
+
 describe("CodexSessionStore.list", () => {
   test("rollout と session_index を id で結合し agent=codex で返す", () => {
     const home = makeTempDir("codex-store");

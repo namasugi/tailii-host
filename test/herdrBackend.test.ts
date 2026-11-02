@@ -2375,6 +2375,27 @@ describe("launchCore herdr backend", () => {
     expect(store.get("s-h")?.herdrPaneId).toBe("w9:p7");
   });
 
+  test.each([
+    { label: "Codexの同じ会話・paneでは保持", agent: "codex" as const, reuse: true, sameThread: true, preserve: true },
+    { label: "Claudeの同じ会話・paneでは保持", agent: "claude" as const, reuse: true, sameThread: true, preserve: true },
+    { label: "paneを作り直したら解除", agent: "codex" as const, reuse: false, sameThread: true, preserve: false },
+    { label: "別会話に変わったら解除", agent: "codex" as const, reuse: true, sameThread: false, preserve: false },
+  ])("タブ自動命名の記録: $label", async ({ agent, reuse, sameThread, preserve }) => {
+    const dir = makeTempDir("herdr-launch-auto-title");
+    const store = makeStore();
+    store.put({
+      name: "s-h", cwd: dir, createdAt: 1, backend: "herdr", herdrPaneId: "w9:p7",
+      agent, providerSessionId: "thread-1", autoTabTitle: "自動タイトル",
+    });
+    const { runner } = herdrProcessRunner({ panes: reuse ? [{ pane_id: "w9:p7", label: "s-h" }] : [] });
+
+    expect(await launchCore({
+      ...launchOptions(dir, store, runner), agent,
+      providerSessionId: sameThread ? "thread-1" : "thread-2",
+    })).toBe(0);
+    expect(store.get("s-h")?.autoTabTitle).toBe(preserve ? "自動タイトル" : undefined);
+  });
+
   test("利用者が pane 名を変えた生存 pane は作り直さない（同じ会話の二重起動を防ぐ）", async () => {
     const dir = makeTempDir("herdr-launch-renamed");
     const store = makeStore();

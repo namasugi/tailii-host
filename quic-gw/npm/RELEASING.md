@@ -54,3 +54,17 @@ node scripts/stage-prebuilt.mjs        # bin/ へ配置し version 同期
 `bin/tailii-quic-gw` と各 package へコピーされた `THIRD-PARTY-LICENSES.yml` はビルド成果物の
 ため git 管理しない（`.gitignore`。ライセンスの正本は `quic-gw/` 直下のみコミット）。
 npm publish は `files: ["bin", "THIRD-PARTY-LICENSES.yml"]` によりディスク上の成果物を同梱する。
+
+## macOS のコード署名とアクセス許可
+
+現行 CI の Rust 成果物は ad-hoc 署名で、ビルドごとに DR の cdhash が変わる。
+この状態の配布物を入れ替えるだけではフルディスクアクセスを継承できない。
+
+Apple コード署名証明書を持つ開発機では、`~/.tailii/quic-signing-identity` に証明書の
+SHA-1 セレクタまたは名前を保存する。setup / self-update の設置時に Keychain の秘密鍵で
+固定 identifier `com.tailii.quic-gw` を付け、既設版と同じ DR に適合することを検証してから
+旧ファイルを置き換える。初回の ad-hoc → 証明書署名ではアクセス許可を登録し直す。
+
+固定署名へ移行済みのホストは、条件の合わない配布物による上書きを拒否する。
+一般利用者向けにも許可を継承させるには、配布 CI で同じ identifier と安定した Apple の
+証明書条件による署名を付ける必要がある（現在の CI にはその証明書を導入していない）。

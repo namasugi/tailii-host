@@ -2,7 +2,7 @@
 // 判定表: idle かつ timeout 超過 → kill / claude active はプロセス生存で bump 代行 /
 // codex active は bump 停止(ts stale)= 死んだターンとして kill / 未採番は adopt。
 
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
@@ -540,6 +540,72 @@ describe("reaperTick herdr backend", () => {
     expect(store.get("s-unnamed")?.autoTabTitle).toBe("最初の発話タイトル");
     expect(store.get("s-stale")?.autoTabTitle).toBe("新AIタイトル");
     expect(store.get("s-named")?.autoTabTitle).toBeUndefined();
+  });
+
+  test("Codexのタブ名はApp Server不在でもローカル索引から同期し、200件外・名前の更新にも追随する", async () => {
+    const home = makeTempDir("reaper-codex-local-titles");
+    const codexHome = path.join(home, ".codex");
+    fs.mkdirSync(codexHome);
+    const indexPath = path.join(codexHome, "session_index.jsonl");
+    const longTitle = "あ".repeat(59) + " 正式名の末尾";
+    const renamedLongTitle = "あ".repeat(59) + " 変更した末尾";
+    // 古い生存会話が thread/list の上位 200 件の外にあっても、タイトルを失わない。
+    const index = [
+      { id: "th-old", thread_name: "古い生存会話" },
+      ...Array.from({ length: 205 }, (_, i) => ({ id: `other-${i}`, thread_name: `他の会話${i}` })),
+      { id: "th-new", thread_name: `  ${longTitle}  ` },
+      { id: "th-manual", thread_name: "自動タイトル" },
+    ];
+    fs.writeFileSync(indexPath, index.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+    const store = makeTempStore();
+    const tabs = new Map([
+      ["s-old", { tabId: "w1:t1", label: "1" }],
+      ["s-new", { tabId: "w1:t2", label: "前の正式名" }],
+      ["s-manual", { tabId: "w1:t3", label: "手動のタブ名" }],
+      ["s-unnamed", { tabId: "w1:t4", label: "4" }],
+    ]);
+    for (const [name, threadId] of [
+      ["s-old", "th-old"], ["s-new", "th-new"],
+      ["s-manual", "th-manual"], ["s-unnamed", "th-unnamed"],
+    ] as const) {
+      store.put({
+        name, cwd: "/w", createdAt: 1, backend: "herdr", agent: "codex", providerSessionId: threadId,
+        ...(name === "s-new" ? { autoTabTitle: "前の正式名" } : {}),
+      });
+    }
+    const renamed: [string, string | null][] = [];
+    const ops: HerdrReaperOps = {
+      list: async () => [...tabs.keys()].map((name) => ({ name, cwd: "/w", alive: true, backend: "herdr" })),
+      agentProcessAlive: async () => true,
+      kill: async () => {},
+      tabInfoByName: async () => tabs,
+      setDisplayTitle: async (name, title) => {
+        renamed.push([name, title]);
+        tabs.get(name)!.label = title!;
+      },
+    };
+    const options = {
+      runner: runnerWithSessions([]).runner, heartbeatDir: makeTempDir("reaper-codex-heartbeat"),
+      metadataStore: store, timeoutSeconds: TIMEOUT, now: NOW, herdrOps: ops,
+    };
+    vi.stubEnv("HOME", home);
+    try {
+      // deriveCodexTitle は注入せず、製品と同じ導出を使う。App Server はテスト隔離先で停止中。
+      await reaperTick(options);
+      expect(renamed).toEqual([["s-new", longTitle], ["s-old", "古い生存会話"]]);
+      expect(store.get("s-new")?.autoTabTitle).toBe(longTitle);
+      expect(store.get("s-manual")?.autoTabTitle).toBeUndefined();
+      expect(tabs.get("s-unnamed")?.label).toBe("4");
+
+      fs.appendFileSync(indexPath, JSON.stringify({ id: "th-new", thread_name: renamedLongTitle }) + "\n");
+      await reaperTick(options);
+      expect(renamed).toEqual([
+        ["s-new", longTitle], ["s-old", "古い生存会話"], ["s-new", renamedLongTitle],
+      ]);
+      expect(store.get("s-new")?.autoTabTitle).toBe(renamedLongTitle);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   test("herdr セッションも idle timeout 超過で pane close(kill) される", async () => {

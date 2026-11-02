@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { findCommand } from "../commands/doctor.js";
 import { defaultInjectedPath } from "../commands/launch.js";
+import { prepareQuicGatewaySignature, type QuicGatewaySigningOptions } from "./quicGatewaySigning.js";
 
 /** launchd ジョブのラベル（plist ファイル名と対）。 */
 export const QUIC_GW_LAUNCHD_LABEL = "com.tailii.quic-gw";
@@ -63,22 +64,35 @@ export function quicGatewayInstalledBinaryPath(): string {
 
 /**
  * gateway バイナリを非 TCC 保護の `~/.tailii/bin` へコピーして、その設置先パスを返す。
- * 内容が同一なら再コピーしない（mtime/サイズで判定）。常に実行ビットを立てる。
+ * 署名を整えた候補が同一なら置き換えない（サイズ / SHA-256 で判定）。常に実行ビットを立てる。
+ * macOS は同じディレクトリの一時ファイルで署名を整え、既設版の署名条件を検証してから
+ * atomic rename する。署名失敗・不一致なら稼働中のバイナリを保持する。
  */
-export function installQuicGatewayBinary(sourcePath: string): string {
+export function installQuicGatewayBinary(
+  sourcePath: string,
+  signing: QuicGatewaySigningOptions = {},
+): string {
   const dest = quicGatewayInstalledBinaryPath();
   fs.mkdirSync(path.dirname(dest), { recursive: true });
-  const sourceStat = fs.statSync(sourcePath);
-  let needCopy = true;
+  const stagingDir = fs.mkdtempSync(path.join(path.dirname(dest), ".quic-gw-install-"));
   try {
-    const destStat = fs.statSync(dest);
-    // サイズ一致 かつ コピー先が新しければ据え置き（cargo 再ビルドは mtime が進む）。
-    needCopy = !(destStat.size === sourceStat.size && destStat.mtimeMs >= sourceStat.mtimeMs);
-  } catch {
-    needCopy = true;
-  }
-  if (needCopy) {
-    fs.copyFileSync(sourcePath, dest);
+    const candidate = path.join(stagingDir, "tailii-quic-gw");
+    fs.copyFileSync(sourcePath, candidate);
+    fs.chmodSync(candidate, 0o755);
+    // 同じビルドの再設置でも ad-hoc → 証明書署名の移行を省略しない。
+    prepareQuicGatewaySignature(candidate, dest, signing);
+    let unchanged = false;
+    try {
+      // npm tarball の mtime は過去に正規化されるため、署名後の内容で比較する。
+      unchanged = fs.statSync(dest).size === fs.statSync(candidate).size &&
+        createHash("sha256").update(fs.readFileSync(dest)).digest("hex") ===
+          createHash("sha256").update(fs.readFileSync(candidate)).digest("hex");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (!unchanged) fs.renameSync(candidate, dest);
+  } finally {
+    fs.rmSync(stagingDir, { recursive: true, force: true });
   }
   fs.chmodSync(dest, 0o755);
   return dest;

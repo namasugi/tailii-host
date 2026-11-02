@@ -43,7 +43,6 @@ import {
   codexGoalNotice,
   codexGoalNoticeKey,
   codexAsyncAnswerFailedNotice,
-  codexMcpItemErrorNotice,
   codexSystemNoticeContentKey,
 } from "./codexSystemNotice.js";
 import {
@@ -431,7 +430,8 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     for (const item of opened.thread.initialItems ?? []) {
       const id = item["id"];
       if (typeof id === "string" && id.length > 0) itemIds.add(id);
-      const payloads = [codexItemToChatOutput(item), codexMcpItemErrorNotice(item)?.payload];
+      const payloads = [codexItemToChatOutput(item),
+        ...codexItemToolActivities(item).filter((activity) => activity.name === "MCP").map(toolActivityMessage)];
       for (const payload of payloads) {
         const key = payload === null || payload === undefined ? null : chatContentKey(payload);
         if (key !== null) contentCounts.set(key, (contentCounts.get(key) ?? 0) + 1);
@@ -1192,13 +1192,11 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
           this.ingestAsyncQuestions(session, current, item);
           this.resolveAsyncAnswersFromInput(session, current, item);
         }
-        const mcpNotice = current?.threadId === threadId ? codexMcpItemErrorNotice(item) : null;
-        if (mcpNotice !== null) {
-          this.onChatItem({ session, itemId: mcpNotice.itemId, payload: mcpNotice.payload });
-        }
-        // コマンド実行 / ファイル変更は tool_activity カードとして別 itemId で流す
+        // コマンド実行 / ファイル変更 / MCP 操作は tool_activity カードとして別 itemId で流す
         // （同一 item から chat 本文と tool カードの両方が出ることは無いが、dedup 集合を分ける）。
-        codexItemToolActivities(item).forEach((activity, index) => {
+        const activities = item["type"] === "mcpToolCall" && current?.threadId !== threadId
+          ? [] : codexItemToolActivities(item);
+        activities.forEach((activity, index) => {
           this.onChatItem({
             session,
             itemId: `${id}#tool-${index}`,

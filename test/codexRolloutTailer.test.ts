@@ -494,7 +494,7 @@ describe("CodexRolloutTailer.streamForCwd（有限 tail）", () => {
     ]);
   });
 
-  test("MCP / Codex の失敗と警告を system 注記へ写像し、MCP 成功は流さない", async () => {
+  test("MCP の成否は操作カード、Codex の失敗と警告は system 注記へ写像する", async () => {
     const root = makeTempDir("codex-stream-notices");
     const cwd = makeTempDir("codex-stream-notices-cwd");
     writeRollout(root, "2026/09/06", "r.jsonl", cwd, [
@@ -527,11 +527,15 @@ describe("CodexRolloutTailer.streamForCwd（有限 tail）", () => {
       message.type === "chat_output" && message.role === "system" ? [message.text] : []);
 
     expect(notices).toEqual([
-      "❌ MCP「drive / search」エラー: permission denied",
-      "❌ MCP「calendar / create」エラー: invalid date",
       "⚠️ Codex エラー（自動再試行中）: connection lost",
       "⚠️ Codex 警告: context is nearly full",
     ]);
+    expect(msgs.flatMap((message) => message.type === "tool_activity" ? [message.activity] : []))
+      .toMatchObject([
+        { id: "mcp-mcp-failed", name: "MCP", outcome: "connection_failed", description: "permission denied" },
+        { id: "mcp-mcp-tool-error", name: "MCP", outcome: "failed", description: "invalid date" },
+        { id: "mcp-mcp-ok", name: "MCP", outcome: "completed" },
+      ]);
   });
 
   test("失敗・中断で終わった turn を終端行（task_complete.error / turn_aborted）から注記にする", async () => {

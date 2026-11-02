@@ -19,6 +19,7 @@
 //   - plan status は live "inProgress"（camel）/ rollout "in_progress"（snake）
 
 import * as path from "node:path";
+import { codexMcpItemActivity } from "./codexMcpActivity.js";
 import {
   PROTOCOL_V1,
   type ControlMessage,
@@ -157,6 +158,9 @@ export function codexPlanActivity(id: string, steps: CodexPlanStep[]): ToolActiv
  * 行数サマリで代表させて、キャップ切り詰めの影響を受けないようにする。
  */
 export function toolActivityContentKey(activity: ToolActivity): string {
+  // MCP は両系統とも同じ call_id（旧 system 注記と同じ出来事の identity）。
+  // 引数 JSON のキー順や本文の表記差で同じ操作を二重表示しない。
+  if (activity.name === "MCP") return ["tool", "MCP", activity.id, activity.outcome ?? ""].join("\u0000");
   const todos = (activity.todos ?? []).map((todo) => `${todo.content}=${todo.status}`).join("");
   return [
     "tool",
@@ -181,6 +185,10 @@ export function codexItemToolActivities(item: Record<string, unknown>): ToolActi
   const id = item["id"];
   const type = item["type"];
   if (typeof id !== "string" || id.length === 0) return [];
+  if (type === "mcpToolCall") {
+    const activity = codexMcpItemActivity(item);
+    return activity === null ? [] : [activity];
+  }
   if (type === "commandExecution") {
     const command = item["command"];
     const status = item["status"];

@@ -30,6 +30,7 @@ import {
 } from "./codexSystemNotice.js";
 import { codexAsyncQuestionItem, codexAsyncQuestionReplyDisplayText } from "./codexAsyncQuestion.js";
 import { codexGoalFromWire } from "./codexAppServer.js";
+import { codexRolloutMcpActivity } from "./codexMcpActivity.js";
 import { isVisibleCodexMessagePhase } from "./codexMessagePhase.js";
 import {
   codexPlanChatOutput,
@@ -501,7 +502,7 @@ function readRolloutMeta(rolloutPath: string): { id: string | null; cwd: string 
  *     - agent_message（commentary / final_answer）→ assistant ロールの chat_output
  *     - token_count   → コンテキストトークン数／窓マーカー
  *     - patch_apply_end → ファイル変更カード（tool_activity, codex-tool-cards）
- *     - mcp_tool_call_end / error / warning → system 注記
+ *     - mcp_tool_call_end → MCP 操作カード、error / warning → system 注記
  *     - task_complete（error 付き）/ turn_aborted → 失敗・中断の system 注記（live の turn/completed と同じ）
  *   - `response_item`:
  *     - custom_tool_call "exec" / function_call "exec_command" → コマンド実行カード
@@ -677,6 +678,12 @@ export function* emitLine(line: Buffer, state: TailState): Generator<ControlMess
       streamId,
       role: "user", text, eof: true,
     };
+    return;
+  }
+
+  const mcpActivity = codexRolloutMcpActivity(payload as Record<string, unknown>);
+  if (mcpActivity !== null) {
+    yield toolActivityMessage(mcpActivity);
     return;
   }
 

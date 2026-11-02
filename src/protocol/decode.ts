@@ -1502,6 +1502,9 @@ function decodeToolActivity(raw: Raw): ToolActivity {
     url: optionalString(raw, "url"),
     // 未知の値は捨てる（将来の区分が増えてもカード自体は落とさない）。
     denial: isToolDenialKind(raw["denial"]) ? raw["denial"] : undefined,
+    outcome: typeof raw["outcome"] === "string" &&
+      ["completed", "unverified", "failed", "connection_failed"].includes(raw["outcome"])
+      ? raw["outcome"] as ToolActivity["outcome"] : undefined,
   });
 }
 

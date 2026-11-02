@@ -965,11 +965,23 @@ async function launchHerdrPane(options: {
   // 自己修復（stale 掃除→再起動）が永遠に走らない）。同名重複の新旧判定（liveSessionJoin）
   // にとっても「同じ pane は同じ時刻」が正しい。
   try {
+    // 同じ pane・会話を開き直すときは、自動命名と人為リネームを区別する記録も保つ。
+    // 起動準備中に hub が命名した可能性があるので、保存の直前に読み直す。
+    const currentMeta = store.get(session);
+    const currentSessionId = currentMeta?.providerSessionId ??
+      (agent === "claude" ? currentMeta?.claudeSessionId : undefined);
+    const nextSessionId = options.providerSessionId ??
+      (agent === "claude" ? options.claudeSessionId ?? undefined : undefined);
+    const autoTabTitle = existing !== null && currentMeta !== null &&
+      currentMeta.backend === "herdr" && currentMeta.herdrPaneId === herdrPaneId &&
+      (currentMeta.agent ?? "claude") === agent && currentSessionId === nextSessionId
+      ? currentMeta.autoTabTitle : undefined;
     store.put({
       name: session,
       cwd: options.recordCwd ?? dir,
       createdAt: existing !== null && recordedMeta !== null ? recordedMeta.createdAt : now(),
       backend: "herdr",
+      ...(autoTabTitle !== undefined ? { autoTabTitle } : {}),
       ...(agent === "codex" ? { agent } : {}),
       ...(agent === "claude" && options.claudeSessionId
         ? { claudeSessionId: options.claudeSessionId }

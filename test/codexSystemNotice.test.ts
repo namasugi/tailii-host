@@ -8,65 +8,11 @@ import {
   codexGoalNotice,
   codexGoalNoticeKey,
   codexGoalStatusLabel,
-  codexMcpItemErrorNotice,
   codexRolloutSystemNotice,
   codexSystemNoticeContentKey,
 } from "../src/codex/codexSystemNotice.js";
 
 describe("codexSystemNotice", () => {
-  test("live / rollout の同じ MCP 失敗を同じ streamId と本文へ正規化する", () => {
-    const live = codexMcpItemErrorNotice({
-      type: "mcpToolCall",
-      id: "call-1",
-      server: "drive",
-      tool: "search",
-      status: "failed",
-      error: { message: "permission denied" },
-    });
-    const rollout = codexRolloutSystemNotice({
-      type: "mcp_tool_call_end",
-      call_id: "call-1",
-      invocation: { server: "drive", tool: "search", arguments: {} },
-      result: { Err: "permission denied" },
-    });
-
-    expect(live).not.toBeNull();
-    expect(rollout).not.toBeNull();
-    expect(live?.itemId).toBe("call-1");
-    expect(rollout?.itemId).toBe("call-1");
-    expect(live?.payload).toEqual(rollout?.payload);
-    expect(live?.payload).toMatchObject({
-      role: "system",
-      text: "❌ MCP「drive / search」エラー: permission denied",
-      eof: true,
-    });
-    // 照合キーは streamId（出来事ごと）。live と rollout の同じ出来事は同じキーになる。
-    expect(codexSystemNoticeContentKey(live!.payload)).toBe(`system\u0000${live!.payload.streamId}`);
-    expect(codexSystemNoticeContentKey(rollout!.payload)).toBe(codexSystemNoticeContentKey(live!.payload));
-  });
-
-  test("MCP の isError content を表示し、成功は表示しない", () => {
-    const failed = codexRolloutSystemNotice({
-      type: "mcp_tool_call_end",
-      call_id: "call-2",
-      invocation: { server: "calendar", tool: "create" },
-      result: { Ok: { isError: true, content: [{ type: "text", text: "invalid date" }] } },
-    });
-    const succeeded = codexRolloutSystemNotice({
-      type: "mcp_tool_call_end",
-      call_id: "call-3",
-      invocation: { server: "calendar", tool: "list" },
-      result: { Ok: { isError: false, content: [{ type: "text", text: "ok" }] } },
-    });
-
-    expect(failed?.payload.text).toBe("❌ MCP「calendar / create」エラー: invalid date");
-    expect(succeeded).toBeNull();
-    expect(codexMcpItemErrorNotice({
-      type: "mcpToolCall", id: "call-4", server: "x", tool: "y", status: "completed",
-      error: null,
-    })).toBeNull();
-  });
-
   test("App Server のターンエラー、警告、MCP 起動失敗を注記にする", () => {
     expect(codexAppServerSystemNotice("error", {
       threadId: "thread-1",

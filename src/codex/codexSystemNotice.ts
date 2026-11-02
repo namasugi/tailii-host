@@ -29,46 +29,11 @@ export function codexSystemNoticeContentKey(payload: ControlMessage): string | n
   return `system\u0000${payload.streamId}`;
 }
 
-/** App Server item/completed の mcpToolCall 失敗を表示用注記へ変換する。 */
-export function codexMcpItemErrorNotice(
-  item: Record<string, unknown>,
-): CodexSystemNotice | null {
-  if (item["type"] !== "mcpToolCall") return null;
-  const id = nonEmptyString(item["id"]);
-  if (id === null) return null;
-  const error = asRecord(item["error"]);
-  const errorMessage = nonEmptyString(error?.["message"]);
-  if (item["status"] !== "failed" && errorMessage === null) return null;
-  return notice(
-    id,
-    `mcp:${id}`,
-    mcpErrorText(item["server"], item["tool"], errorMessage),
-  );
-}
-
 /** rollout event_msg の利用者向け error / warning と、失敗・中断で終わった turn を表示用注記へ変換する。 */
 export function codexRolloutSystemNotice(
   payload: Record<string, unknown>,
 ): CodexSystemNotice | null {
   const kind = payload["type"];
-  if (kind === "mcp_tool_call_end") {
-    const id = nonEmptyString(payload["call_id"]);
-    if (id === null) return null;
-    const result = asRecord(payload["result"]);
-    if (result === null) return null;
-    const transportError = nonEmptyString(result["Err"]);
-    const toolResult = asRecord(result["Ok"]);
-    const toolReportedError = toolResult?.["isError"] === true || toolResult?.["is_error"] === true;
-    if (transportError === null && !toolReportedError) return null;
-    const invocation = asRecord(payload["invocation"]);
-    const detail = transportError ?? textContent(toolResult?.["content"]);
-    return notice(
-      id,
-      `mcp:${id}`,
-      mcpErrorText(invocation?.["server"], invocation?.["tool"], detail),
-    );
-  }
-
   // 現行 Codex は error / stream_error / warning を rollout に保存しない（turn の終わりの task_complete /
   // turn_aborted は必ず保存する）。失敗した turn の理由は task_complete.error にしか残らないので、ここから
   // live の turn/completed（failed）と同じ注記を作る。開き直した履歴や、iPhone がつながっていない間に
@@ -287,13 +252,6 @@ export function codexDeprecationNoticeLogLine(
   return `Codex App Server 非推奨通知（利用者には表示しない）: ${body}`;
 }
 
-function mcpErrorText(serverValue: unknown, toolValue: unknown, detailValue: string | null): string {
-  const server = clip(nonEmptyString(serverValue) ?? "不明", NOTICE_NAME_LIMIT);
-  const tool = clip(nonEmptyString(toolValue) ?? "不明", NOTICE_NAME_LIMIT);
-  const detail = clip(detailValue ?? "ツールがエラーを返しました。", NOTICE_DETAIL_LIMIT);
-  return `❌ MCP「${server} / ${tool}」エラー: ${detail}`;
-}
-
 /**
  * 非同期質問（codex-async-question）への回答を Codex へ届けられなかったときの注記（live 専用）。
  * - `expired`: 質問した turn が終わっていた（TUI と同じく締め切り。新しい turn は始めない）
@@ -387,17 +345,6 @@ function readableErrorText(message: string): string {
   } catch {
     return message;
   }
-}
-
-function textContent(value: unknown): string | null {
-  if (!Array.isArray(value)) return null;
-  const parts = value.flatMap((entry): string[] => {
-    if (typeof entry === "string" && entry.trim().length > 0) return [entry];
-    const record = asRecord(entry);
-    const text = nonEmptyString(record?.["text"]);
-    return text === null ? [] : [text];
-  });
-  return parts.length > 0 ? parts.join("\n") : null;
 }
 
 /** 改行を 1 段落へ畳み、Unicode scalar 単位で切り詰める。 */
