@@ -613,10 +613,14 @@ export class CodexAppServerThread {
           continue;
         }
         // 新規 thread の最初の turn 記録がまだ無い間は、idle とは断定できない。
-        // controller は手元の ID を維持するか、初回 turn/start へ進む。判定は既知文言に加えて
-        // thread メタデータの可読性（文言非依存）で行う。判定文言の網羅漏れで新規会話が
+        // controller は手元の ID を維持するか、初回 turn/start へ進む。判定は既知文言に依存せず
+        // thread メタデータの runtime status で行う。判定文言の網羅漏れで新規会話が
         // 全滅した実障害（2026-09-06）の再発防止。
-        if (await confirmThreadHistoryUnavailable(this.connection, this.threadId, error)) {
+        // このインスタンスは start / resume 成功、または loaded status の確認後にだけ返される。
+        // status を省略する旧版の応答も、open 時と同じ条件で扱う。
+        if (await confirmThreadHistoryUnavailable(this.connection, this.threadId, error, {
+          requireLoaded: true, loadedPreviously: true,
+        })) {
           return undefined;
         }
         throw error;
@@ -1742,14 +1746,27 @@ export class CodexAppServerManager {
             }));
           }
         } catch (error) {
+          // 公式アプリなど別 App Server の writer が thread を保持している場合は再開不能。
+          // 保存済みメタデータは thread/read で読めても、この接続からは turn/start できない。
+          // 接続を破棄して失敗を返すことで、利用者の再送時には resume をやり直せる。
+          if (error instanceof Error && error.message.includes("already has an active writer")) {
+            this.log?.(`Codex thread ${options.threadId} の再開が writer 競合で拒否された: ${String(error)}`);
+            throw new Error(
+              "この会話は別の Codex アプリまたは CLI が使用中です。" +
+              "そちらで会話の使用を終え（必要ならアプリを終了）、Tailii で「再送」してください。",
+              { cause: error },
+            );
+          }
           // thread/start から最初の user turn まで turn 履歴は未作成で、別接続からの
           // 履歴読み取りは "no rollout found" / "list_turns is not supported yet" になる。
           // ただし共有 App Server 内の live thread 自体は存在し、この接続から turn/start を
           // 直接送れば materialize できる。engine と Session Hub は別プロセスなので、
           // この場合だけ履歴ゼロとして接続を維持し、最初の turn/start へ進ませる
           // （resume 自体が成立していても live 権威にはせず、従来どおり rollout fallback）。
-          // 判定は文言一致に加えてメタデータ読み取りの可否（文言非依存）で行う。
-          if (!(await confirmThreadHistoryUnavailable(connection, options.threadId, error))) {
+          // 判定は文言一致に加えて runtime のロード状態（文言非依存）で行う。
+          if (!(await confirmThreadHistoryUnavailable(connection, options.threadId, error, {
+            requireLoaded: true, loadedPreviously: resumedSuccessfully,
+          }))) {
             throw error;
           }
           liveSubscriptionError = String(error);
@@ -2193,12 +2210,14 @@ const THREAD_METADATA_PROBE_TIMEOUT_MS = 2_000;
  * turn 履歴の読み取り（thread/turns/list。旧: thread/resume / thread/read includeTurns:true）の
  * 失敗が「turn 履歴が未生成・未対応」なのかを、エラー文言に依存せず判定する。
  *
- * 1. 既知の文言（isUnmaterializedThreadError）なら即 true。
+ * 1. 履歴表示だけなら既知の文言（isUnmaterializedThreadError）で即 true。
+ *    送信経路は既知文言でも runtime の確認を省略しない。
  * 2. timeout は接続が刺さっている可能性があるため false（呼び出し側の有界リトライに委ねる）。
  * 3. それ以外は、メタデータだけの `thread/read includeTurns:false` を短い期限で試す。
- *    live thread は最初の turn 前でも（rollout 未作成でも）これに応答する一方、存在しない
- *    thread は `thread not loaded` 等で失敗する。応答があれば thread は App Server から
- *    見えており、履歴 hydration だけが不可＝turn/start へ進んでよい状態と判断する。
+ *    命名用の履歴読み取りなら id の一致で十分。送信経路（requireLoaded）は保存済み thread の
+ *    可読性と区別し、idle / active を必要とする。status を省略する旧版だけは、この接続の
+ *    start / resume 成功か過去の loaded status 確認で補える。notLoaded / 未知の status は
+ *    過去の確認より優先して拒否する。
  *
  * App Server の文言は版ごとに変わる（no rollout found → not materialized yet →
  * list_turns is not supported yet）。文言の網羅漏れで新規会話が全滅しないための安全側判定。
@@ -2207,8 +2226,9 @@ async function confirmThreadHistoryUnavailable(
   connection: CodexAppServerConnection,
   threadId: string,
   error: unknown,
+  options: { requireLoaded?: boolean; loadedPreviously?: boolean } = {},
 ): Promise<boolean> {
-  if (isUnmaterializedThreadError(error, threadId)) return true;
+  if (!options.requireLoaded && isUnmaterializedThreadError(error, threadId)) return true;
   if (!(error instanceof Error)) return false;
   if (error.message.startsWith("Codex App Server request timed out")) return false;
   try {
@@ -2218,7 +2238,11 @@ async function confirmThreadHistoryUnavailable(
       THREAD_METADATA_PROBE_TIMEOUT_MS,
     ));
     const thread = objectRecord(response?.["thread"]);
-    return thread !== null && thread["id"] === threadId;
+    if (thread === null || thread["id"] !== threadId) return false;
+    if (!options.requireLoaded) return true;
+    const status = objectRecord(thread["status"])?.["type"];
+    return status === "idle" || status === "active" ||
+      (options.loadedPreviously === true && thread["status"] === undefined);
   } catch {
     return false;
   }

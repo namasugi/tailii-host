@@ -1030,6 +1030,7 @@ describe("CodexAppServerManager", () => {
       if (method === "thread/turns/list") {
         throw new Error("no rollout found for thread id thread-fresh");
       }
+      if (method === "thread/read") return { thread: { id: "thread-fresh", status: { type: "idle" } } };
       if (method === "turn/start") return { turn: { id: "turn-first" } };
       return {};
     };
@@ -1047,7 +1048,9 @@ describe("CodexAppServerManager", () => {
     await expect(thread.startTurn("first", "client-first")).resolves.toBe("turn-first");
     expect(connection.requests.map((request) => request.method)).toEqual([
       "thread/resume",
-      "thread/turns/list", // readActiveTurnId（既知文言なので thread/read の確認は不要）
+      "thread/read", // 既知文言でも runtime のロードを確認する。
+      "thread/turns/list", // readActiveTurnId
+      "thread/read",
       "turn/start",
     ]);
     expect(connection.closed).toBe(0);
@@ -1070,6 +1073,7 @@ describe("CodexAppServerManager", () => {
       if (method === "thread/turns/list") {
         throw new Error("list_turns is not supported yet");
       }
+      if (method === "thread/read") return { thread: { id: "thread-paginated", status: { type: "idle" } } };
       if (method === "turn/start") return { turn: { id: "turn-first" } };
       return {};
     };
@@ -1089,8 +1093,10 @@ describe("CodexAppServerManager", () => {
     await expect(thread.startTurn("first", "client-first")).resolves.toBe("turn-first");
     expect(connection.requests.map((request) => request.method)).toEqual([
       "thread/resume",
-      "thread/turns/list", // openThread の履歴読み取り（既知文言なので thread/read の確認は不要）
+      "thread/turns/list", // openThread の履歴読み取り
+      "thread/read",
       "thread/turns/list", // readActiveTurnId
+      "thread/read",
       "turn/start",
     ]);
     expect(connection.closed).toBe(0);
@@ -1104,6 +1110,7 @@ describe("CodexAppServerManager", () => {
       if (method === "thread/resume") {
         throw new Error("no rollout found for thread id thread-variant");
       }
+      if (method === "thread/read") return { thread: { id: "thread-variant", status: { type: "idle" } } };
       if (method === "thread/turns/list") {
         throw new Error(
           "thread thread-variant is not materialized yet; " +
@@ -1194,6 +1201,150 @@ describe("CodexAppServerManager", () => {
     expect(connection.closed).toBe(0);
   });
 
+  test.each([{ type: "notLoaded" }, undefined, { type: "futureStatus" }])(
+    "保存済みメタデータだけ読めても resume 失敗を未materializeとみなさない（status=%j）",
+    async (status) => {
+      const probe = new FakeConnection();
+      const connection = new FakeConnection("thread-stored");
+      connection.request = async (method, params) => {
+        connection.requests.push({ method, params });
+        if (method === "thread/resume") throw new Error("cannot resume stored thread");
+        if (method === "thread/read") return { thread: { id: "thread-stored", status, turns: [] } };
+        throw new Error(`unexpected request: ${method}`);
+      };
+      const manager = new CodexAppServerManager({
+        codexHome: makeTempDir("codex-app-server-stored"),
+        connect: async () => probe.closed === 0 ? probe : connection,
+        launch: () => {},
+      });
+
+      await expect(manager.openThread({ threadId: "thread-stored" }))
+        .rejects.toThrow("cannot resume stored thread");
+      expect(connection.closed).toBe(1);
+      expect(connection.notificationHandler).toBeNull();
+      expect(connection.serverRequestHandler).toBeNull();
+      expect(connection.requests.map((request) => request.method)).toEqual(["thread/resume", "thread/read"]);
+    },
+  );
+
+  test.each([
+    "no rollout found for thread id thread-stored",
+    "list_turns is not supported yet",
+    "thread thread-stored is not materialized yet; thread/turns/list is unavailable before first user message",
+  ])("既知の履歴エラーでも未ロードの会話を送信可能にしない: %s", async (message) => {
+    const probe = new FakeConnection();
+    const connection = new FakeConnection("thread-stored");
+    connection.request = async (method, params) => {
+      connection.requests.push({ method, params });
+      if (method === "thread/resume") throw new Error(message);
+      if (method === "thread/read") return { thread: { id: "thread-stored", status: { type: "notLoaded" } } };
+      throw new Error(`unexpected request: ${method}`);
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-known-unloaded"),
+      connect: async () => probe.closed === 0 ? probe : connection,
+      launch: () => {},
+    });
+    await expect(manager.openThread({ threadId: "thread-stored" })).rejects.toThrow(message);
+    expect(connection.closed).toBe(1);
+    expect(connection.requests.map((request) => request.method)).toEqual(["thread/resume", "thread/read"]);
+  });
+
+  test("resume 済みで status を省略する応答でも送信前の状態確認を続け、明示的な notLoaded は拒否する", async () => {
+    const probe = new FakeConnection();
+    const connection = new FakeConnection("thread-legacy-status");
+    let status: { type: string } | undefined;
+    let historyError = "history unavailable (future wording)";
+    connection.request = async (method, params) => {
+      connection.requests.push({ method, params });
+      if (method === "thread/resume") return { thread: { id: "thread-legacy-status", historyMode: "paginated" } };
+      if (method === "thread/turns/list") throw new Error(historyError);
+      if (method === "thread/read") return { thread: { id: "thread-legacy-status", status } };
+      throw new Error(`unexpected request: ${method}`);
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-legacy-status"),
+      connect: async () => probe.closed === 0 ? probe : connection,
+      launch: () => {},
+    });
+    const thread = await manager.openThread({ threadId: "thread-legacy-status" });
+    try {
+      expect(thread.liveSubscriptionReady).toBe(false);
+      await expect(thread.readActiveTurnId()).resolves.toBeUndefined();
+      // 開いた後に unload された場合は、過去の resume 成功より現在の状態を優先する。
+      status = { type: "notLoaded" };
+      await expect(thread.readActiveTurnId()).rejects.toThrow(historyError);
+      historyError = "list_turns is not supported yet";
+      await expect(thread.readActiveTurnId()).rejects.toThrow(historyError);
+    } finally {
+      thread.close();
+    }
+  });
+
+  test("公式アプリの writer 競合では送信せず接続を破棄し、解放後の同じ入力を再開して一度だけ送る", async () => {
+    const threadId = "thread-desktop";
+    let writerBusy = true;
+    const connections: FakeConnection[] = [];
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-active-writer"),
+      cliVersion: async () => null,
+      connect: async () => {
+        const connection = new FakeConnection(threadId);
+        connections.push(connection);
+        connection.request = async (method, params) => {
+          connection.requests.push({ method, params });
+          if (method === "thread/resume") {
+            if (writerBusy) throw new Error(`thread ${threadId} already has an active writer`);
+            return { thread: { id: threadId, historyMode: "paginated", status: { type: "idle" } } };
+          }
+          // ディスクの会話は read できる。これを turn/start 可能の証拠にしてはいけない。
+          if (method === "thread/read") return { thread: { id: threadId, status: { type: "notLoaded" }, turns: [] } };
+          if (method === "thread/turns/list" || method === "thread/items/list") return { data: [], nextCursor: null };
+          if (method === "turn/start") {
+            if (writerBusy) throw new Error(`thread not found: ${threadId}`);
+            return { turn: { id: "turn-retried" } };
+          }
+          return {};
+        };
+        return connection;
+      },
+      launch: () => {},
+    });
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: (options) => manager.openThread(options) },
+      onProcessing: () => {},
+      onQuestion: () => {},
+      onQuestionDismiss: () => {},
+      onChatItem: () => {},
+    });
+    const options = {
+      session: "cs-desktop", threadId, cwd: "/tmp/project", text: "続けて", clientUserMessageId: "client-retry",
+    };
+    try {
+      await expect(controller.subscribeSession(options)).rejects.toThrow("別の Codex アプリ");
+      await expect(controller.startTurn(options)).rejects.toThrow("再送");
+      const rejected = connections.filter((connection) => connection.requests.some((request) => request.method === "thread/resume"));
+      expect(rejected).toHaveLength(2);
+      for (const connection of rejected) {
+        expect(connection.closed).toBe(1);
+        expect(connection.notificationHandler).toBeNull();
+        expect(connection.serverRequestHandler).toBeNull();
+      }
+      expect(connections.flatMap((connection) => connection.requests).filter((request) => request.method === "turn/start"))
+        .toEqual([]);
+
+      writerBusy = false;
+      await expect(controller.startTurn(options)).resolves.toBe("turn-retried");
+      const starts = connections.flatMap((connection) => connection.requests).filter((request) => request.method === "turn/start");
+      expect(starts).toHaveLength(1);
+      expect(starts[0]?.params).toMatchObject({
+        threadId, clientUserMessageId: "client-retry", input: [{ type: "text", text: "続けて" }],
+      });
+    } finally {
+      controller.closeSession(options.session);
+    }
+  });
+
   test("thread メタデータも読めない失敗は未materializeとみなさず伝播する", async () => {
     const probe = new FakeConnection();
     const connection = new FakeConnection("thread-gone");
@@ -1220,6 +1371,7 @@ describe("CodexAppServerManager", () => {
     connection.request = async (method, params) => {
       connection.requests.push({ method, params });
       if (method === "thread/resume") throw new Error("no rollout found for thread id thread-timeout-probe");
+      if (method === "thread/read") return { thread: { id: "thread-timeout-probe", status: { type: "idle" } } };
       if (method === "thread/turns/list") {
         throw new Error("Codex App Server request timed out: thread/turns/list");
       }
@@ -1234,7 +1386,8 @@ describe("CodexAppServerManager", () => {
     await expect(thread.readActiveTurnId()).rejects.toThrow("timed out: thread/turns/list");
     expect(connection.requests.filter((request) => request.method === "thread/turns/list"))
       .toHaveLength(2);
-    expect(connection.requests.filter((request) => request.method === "thread/read")).toEqual([]);
+    // open 時の resume 失敗は確認するが、状態読み取りの timeout では追加 probe しない。
+    expect(connection.requests.filter((request) => request.method === "thread/read")).toHaveLength(1);
   });
 
   test("fallback 接続の実行中 turn 読み直しは thread/turns/list の最新 1 件だけを読む", async () => {
@@ -1244,6 +1397,7 @@ describe("CodexAppServerManager", () => {
     connection.request = async (method, params) => {
       connection.requests.push({ method, params });
       if (method === "thread/resume") throw new Error("list_turns is not supported yet");
+      if (method === "thread/read") return { thread: { id: "thread-paged", status: { type: "idle" } } };
       if (method === "thread/turns/list") {
         expect(params).toEqual({ threadId: "thread-paged", limit: 1, sortDirection: "desc", itemsView: "notLoaded" });
         return { data: [{ id: "turn-live", status: latestStatus, items: [], itemsView: "notLoaded" }] };
@@ -1304,6 +1458,7 @@ describe("CodexAppServerManager", () => {
       if (method === "thread/resume") {
         throw new Error("no rollout found for thread id thread-read-retry");
       }
+      if (method === "thread/read") return { thread: { id: "thread-read-retry", status: { type: "idle" } } };
       if (method === "thread/turns/list") {
         readAttempts += 1;
         readTimeouts.push(timeoutMs);
@@ -1378,6 +1533,7 @@ describe("CodexAppServerManager", () => {
       if (method === "thread/resume") {
         throw new Error("no rollout found for thread id thread-read-timeout");
       }
+      if (method === "thread/read") return { thread: { id: "thread-read-timeout", status: { type: "idle" } } };
       if (method === "thread/turns/list") {
         throw new Error("Codex App Server request timed out: thread/turns/list");
       }
@@ -1407,6 +1563,7 @@ describe("CodexAppServerManager", () => {
           "/tmp/rollout-thread-empty.jsonl: rollout at /tmp/rollout-thread-empty.jsonl is empty",
         );
       }
+      if (method === "thread/read") return { thread: { id: "thread-empty", status: { type: "idle" } } };
       if (method === "turn/start") return { turn: { id: "turn-first" } };
       return {};
     };
