@@ -123,11 +123,12 @@ describe("CodexNativeTurnController: 非同期質問", () => {
       initialActiveTurnId: options.initialActiveTurnId ?? null,
     });
     let openOptions: CodexAppServerThreadOptions | null = null;
+    const connections: CodexAppServerThreadOptions[] = [];
     const prompts: { session: string; id: string; questions: unknown[] }[] = [];
     const dismissed: string[] = [];
     const chats: { itemId: string; payload: unknown }[] = [];
     const controller = new CodexNativeTurnController({
-      appServer: { openThread: async (opts) => { openOptions = opts; return thread; } },
+      appServer: { openThread: async (opts) => { openOptions = opts; connections.push(opts); return thread; } },
       onQuestion: (event) => prompts.push(event),
       onQuestionDismiss: (_session, id) => dismissed.push(id),
       onChatItem: (event) => chats.push(event),
@@ -144,7 +145,8 @@ describe("CodexNativeTurnController: 非同期質問", () => {
     }
     const notify = (method: string, params: Record<string, unknown>) =>
       openOptions!.onNotification?.({ method, params: { threadId: "thread-1", ...params } });
-    return { thread, controller, prompts, dismissed, chats, notify, request: () => openOptions!.onServerRequest! };
+    return { thread, controller, prompts, dismissed, chats, notify, connections,
+      request: () => openOptions!.onServerRequest! };
   }
   const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
   const PROMPT_1 = "codex-async:thread-1:call_1#0:n-1";
@@ -272,6 +274,98 @@ describe("CodexNativeTurnController: 非同期質問", () => {
     expect(controller.answerQuestion(PROMPT_1, [])).toBe(false);
   });
 
+  test("設問に答えず通常のメッセージを送ったら設問を閉じ、同じ入力の再通知では後から来た設問を消さない", async () => {
+    const { controller, prompts, dismissed, notify } = await setup();
+    const question = asyncItem("call_1", [{ title: "Q1", options: ["A"] }]);
+    notify("item/completed", { item: question });
+    const input = { id: "u1", type: "userMessage", content: [{ type: "text", text: "その前に相談です" }] };
+    notify("item/completed", { turnId: "turn-1", item: input });
+    expect(dismissed).toEqual([PROMPT_1]);
+    expect(controller.answerQuestion(PROMPT_1, [])).toBe(false);
+    // 古い設問の再通知でも復活させない。
+    notify("item/completed", { item: question });
+    expect(prompts).toHaveLength(1);
+    notify("item/completed", { item: asyncItem("call_2", [{ title: "Q2", options: ["B"] }]) });
+    const next = prompts.at(-1)!;
+    expect(next.questions).toHaveLength(1);
+    notify("item/completed", { turnId: "turn-1", item: input });
+    expect(dismissed).toEqual([PROMPT_1]);
+    expect(controller.answerQuestion(next.id, [])).toBe(true);
+  });
+
+  test("別 thread / 古い turn のユーザー入力や空の記録では、現在の設問を閉じない", async () => {
+    const { dismissed, notify } = await setup();
+    notify("item/completed", { item: asyncItem("call_1", [{ title: "Q", options: ["A"] }]) });
+    const input = { id: "u1", type: "userMessage", content: [{ type: "text", text: "別の入力" }] };
+    notify("item/completed", { threadId: "child", turnId: "turn-1", item: input });
+    notify("item/completed", { turnId: "turn-old", item: input });
+    for (const [index, content] of [
+      [], [{}], [{ type: "text", text: "" }], [{ type: "text", text: " \n" }],
+      [{ type: "image" }], [{ type: "localImage", path: "" }],
+    ].entries()) {
+      notify("item/completed", { item: { id: `empty-${index}`, type: "userMessage", content } });
+    }
+    expect(dismissed).toEqual([]);
+  });
+
+  test.each([
+    { type: "image", url: "data:image/png;base64,AAAA" },
+    { type: "image", fileId: "file-1" },
+    { type: "localImage", path: "/tmp/image.png" },
+    { type: "audio", url: "data:audio/wav;base64,AAAA" },
+    { type: "localAudio", path: "/tmp/audio.wav" },
+    { type: "skill", name: "review", path: "/tmp/SKILL.md" },
+    { type: "mention", name: "file", path: "/tmp/file.ts" },
+  ])("本文がなくても有効な入力（%j）を受理したら設問を閉じる", async (part) => {
+    const { dismissed, notify } = await setup();
+    notify("item/completed", { item: asyncItem("call_1", [{ title: "Q", options: ["A"] }]) });
+    notify("item/completed", { item: { id: "u1", type: "userMessage", content: [part] } });
+    expect(dismissed).toEqual([PROMPT_1]);
+  });
+
+  test("切断後は履歴から最新の未回答設問を復元し、通常メッセージより前の設問は戻さない", async () => {
+    const { thread, controller, prompts, dismissed, notify, connections } = await setup();
+    const tagged = (item: Record<string, unknown>) => {
+      tagCodexItemTurn(item, "turn-1");
+      return item;
+    };
+    const oldQuestion = tagged(asyncItem("call_1", [{ title: "前の質問", options: ["A"] }]));
+    const input = tagged({ id: "u1", type: "userMessage", content: [{ type: "text", text: "先にこちらを進めて" }] });
+    const newQuestion = tagged(asyncItem("call_2", [{ title: "最新の質問", options: ["B"] }]));
+    for (const item of [oldQuestion, input, newQuestion]) notify("item/completed", { item });
+    const previousID = prompts.at(-1)!.id;
+    connections[0]!.onDisconnect?.(new Error("connection closed"));
+    expect(dismissed).toEqual([PROMPT_1, previousID]);
+    thread.initialActiveTurnId = "turn-1";
+    thread.initialItems = [oldQuestion, input, newQuestion];
+    await controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" });
+    expect(prompts).toHaveLength(3);
+    expect(prompts.at(-1)!.id).not.toBe(previousID);
+    expect(prompts.at(-1)!.questions).toEqual([{
+      header: "Codex の質問", question: "最新の質問", multiSelect: false,
+      options: [{ label: "B", description: "" }],
+    }]);
+    notify("item/completed", { item: input });
+    expect(dismissed).toEqual([PROMPT_1, previousID]);
+  });
+
+  test("再接続後は古い接続から遅れて届いた入力・切断通知で新しい設問を消さない", async () => {
+    const { thread, controller, prompts, dismissed, notify, connections } = await setup();
+    const oldConnection = connections[0]!;
+    controller.closeSession("work");
+    thread.initialActiveTurnId = "turn-1";
+    await controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" });
+    notify("item/completed", { item: asyncItem("call_1", [{ title: "現在の質問", options: ["A"] }]) });
+    const promptID = prompts.at(-1)!.id;
+    oldConnection.onNotification?.({ method: "item/completed", params: {
+      threadId: "thread-1", turnId: "turn-1",
+      item: { id: "late-user", type: "userMessage", content: [{ type: "text", text: "古い接続の入力" }] },
+    } });
+    oldConnection.onDisconnect?.(new Error("late disconnect"));
+    expect(dismissed).toEqual([]);
+    expect(controller.answerQuestion(promptID, [])).toBe(true);
+  });
+
   test("接続を畳むと締め切り、状態も残さない", async () => {
     const { dismissed, notify, controller } = await setup();
     notify("item/completed", { item: asyncItem("call_1", [{ title: "Q", options: ["A"] }]) });
@@ -339,6 +433,31 @@ describe("CodexNativeTurnController: 非同期質問", () => {
       questions: [{ header: "Codex の質問", question: "B?", multiSelect: false,
         options: [{ label: "1", description: "" }, { label: "2", description: "" }] }],
     }]);
+  });
+
+  test("通常メッセージより前の設問は開き直しても復元せず、後から来た設問だけを残す", async () => {
+    const tagged = (item: Record<string, unknown>) => {
+      tagCodexItemTurn(item, "turn-9");
+      return item;
+    };
+    const input = tagged({ id: "u1", type: "userMessage", content: [{ type: "text", text: "先にこちらを進めて" }] });
+    const { prompts, dismissed, notify } = await setup({
+      startTurn: false,
+      initialActiveTurnId: "turn-9",
+      initialItems: [
+        tagged(asyncItem("call_a", [{ title: "前の質問", options: null }])),
+        input,
+        tagged(asyncItem("call_b", [{ title: "新しい質問", options: ["1", "2"] }])),
+      ],
+    });
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]!.questions).toEqual([{
+      header: "Codex の質問", question: "新しい質問", multiSelect: false,
+      options: [{ label: "1", description: "" }, { label: "2", description: "" }],
+    }]);
+    // snapshot と live の重複入力で、snapshot の後続設問を消さない。
+    notify("item/completed", { turnId: "turn-9", item: input });
+    expect(dismissed).toEqual([]);
   });
 
   test("stdin 承認は新しいコマンドの実行と見分けられる見出しと要約で出す", async () => {

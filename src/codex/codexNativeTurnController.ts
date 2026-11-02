@@ -334,6 +334,8 @@ interface PendingAsyncQuestions {
   seenItemIds: Set<string>;
   /** 回答の封筒で回答済みと分かった質問（`itemId#index`、旧形式は item id だけ）。 */
   answeredKeys: Set<string>;
+  /** 処理済みの入力。snapshot と live の重複で、入力より後に届いた質問を消さない。 */
+  seenUserMessageIds: Set<string>;
 }
 
 /** 非同期質問 1 件の照合キー（`itemId#index`）。 */
@@ -832,11 +834,11 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
   }
 
   /**
-   * ユーザー入力が回答の封筒なら、指された質問を未回答から外す（他クライアント = TUI / デスクトップの
-   * 回答で Tailii の設問を閉じ、二重回答を防ぐ。TUI の `resolve_answers` と同じ照合。自分の回答の
-   * こだまは既に片付け済みなので何も起きない）。
+   * 回答の封筒なら指された質問を外し、通常のメッセージならその時点の未回答の質問を閉じる。
+   * Tailii / TUI / デスクトップのいずれからの入力も、Codex が受理した記録を根拠にする。
+   * snapshot の再生でも同じ順序で処理し、答えずに進めた古い設問を復活させない。
    */
-  private resolveAsyncAnswersFromInput(
+  private resolveAsyncQuestionsFromInput(
     session: string,
     opened: OpenThread,
     item: Record<string, unknown>,
@@ -844,14 +846,38 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
   ): void {
     if (item["type"] !== "userMessage") return;
     const content = item["content"];
-    if (!Array.isArray(content)) return;
+    if (!Array.isArray(content) || content.length === 0) return;
     const text = content.flatMap((part) => {
       const record = asRecord(part);
       return record?.["type"] === "text" && typeof record["text"] === "string" ? [record["text"] as string] : [];
     }).join("\n");
-    const targets = codexAsyncQuestionReplyTargets(text);
-    if (targets === null) return;
+    // 空の本文や形のない履歴記録だけでは「答えずに送った」と判定しない。添付だけの入力も受ける。
+    const hasValue = (value: unknown): boolean => typeof value === "string" && value.trim().length > 0;
+    const hasAttachment = content.some((part) => {
+      const record = asRecord(part);
+      switch (record?.["type"]) {
+        case "image": return hasValue(record["url"]) || hasValue(record["fileId"]);
+        case "audio": return hasValue(record["url"]);
+        case "localImage":
+        case "localAudio":
+        case "skill":
+        case "mention": return hasValue(record["path"]);
+        default: return false;
+      }
+    });
+    if (text.trim().length === 0 && !hasAttachment) return;
     const pending = this.asyncQuestionsFor(session, opened);
+    const id = item["id"];
+    if (typeof id === "string") {
+      if (pending.seenUserMessageIds.has(id)) return;
+      pending.seenUserMessageIds.add(id);
+    }
+    const targets = codexAsyncQuestionReplyTargets(text);
+    if (targets === null) {
+      pending.entries = [];
+      if (present) this.presentAsyncQuestions(session);
+      return;
+    }
     for (const target of targets) {
       // 開き直しの再生で、後から出る質問を回答済みとして覚えておく（item id 全体の旧形式も）。
       pending.answeredKeys.add(target.index === null ? target.itemId : `${target.itemId}#${target.index}`);
@@ -869,7 +895,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       if (pending?.promptId != null) this.onQuestionDismiss(session, pending.promptId);
       pending = {
         threadId: opened.threadId, entries: [], promptId: null, presentedEntries: [], presentedKey: null,
-        seenItemIds: new Set(), answeredKeys: new Set(),
+        seenItemIds: new Set(), answeredKeys: new Set(), seenUserMessageIds: new Set(),
       };
       this.pendingAsyncQuestions.set(session, pending);
     }
@@ -939,7 +965,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     for (const item of items) {
       if (codexItemTurnId(item) !== turnId) continue;
       this.ingestAsyncQuestions(session, opened, item, false);
-      this.resolveAsyncAnswersFromInput(session, opened, item, false);
+      this.resolveAsyncQuestionsFromInput(session, opened, item, false);
     }
     this.presentAsyncQuestions(session);
   }
@@ -1007,10 +1033,12 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       onServerRequest: (request) => this.handleServerRequest(session, cwd, items, request),
       onDisconnect: (error) => {
         const current = this.open.get(session);
-        if (current?.threadId !== threadId) return;
+        if (current?.threadId !== threadId || current.items !== items) return;
         this.rememberPlanRestoreSnapshot(session, threadId, current.thread);
         this.open.delete(session);
         this.resolvePendingQuestionsForSession(session);
+        // 重複判定は接続ごとのもの。再接続時には履歴を最初から再生して未回答分を作り直す。
+        this.pendingAsyncQuestions.delete(session);
         this.onProcessing(session, "done");
         this.onDisconnect(session, error);
       },
@@ -1112,6 +1140,8 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     items: Map<string, Record<string, unknown>>,
     notification: CodexAppServerNotification,
   ): void {
+    // 同じ thread を開き直した後、旧接続から遅れて来た通知で現在の状態を変えない。
+    if (this.open.get(session)?.items !== items) return;
     const params = asRecord(notification.params);
     if (notification.method === "deprecationNotice") {
       // 開発者向け通知（API の非推奨・config の旧機能）は chat へ流さず、同文は 1 回だけログする。
@@ -1188,9 +1218,11 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
         if (payload !== null) this.onChatItem({ session, itemId: id, payload });
         // 非同期質問（codex-async-question）は本文を最終回答と同じ吹き出しで残しつつ、回答できる設問として出す。
         // 子 thread（サブエージェント）は質問しない（ツールが root thread だけに登録される）。
-        if (current?.threadId === threadId && current.activeTurnId !== null) {
+        const itemTurnId = codexItemTurnId(item) ?? params?.["turnId"];
+        if (current?.threadId === threadId && lifecycleMatchesThread && current.activeTurnId !== null &&
+          (typeof itemTurnId !== "string" || itemTurnId === current.activeTurnId)) {
           this.ingestAsyncQuestions(session, current, item);
-          this.resolveAsyncAnswersFromInput(session, current, item);
+          this.resolveAsyncQuestionsFromInput(session, current, item);
         }
         // コマンド実行 / ファイル変更 / MCP 操作は tool_activity カードとして別 itemId で流す
         // （同一 item から chat 本文と tool カードの両方が出ることは無いが、dedup 集合を分ける）。
