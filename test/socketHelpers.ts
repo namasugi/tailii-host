@@ -118,7 +118,7 @@ export interface BrokerHarness {
 
 export function startBroker(
   suffix: string,
-  options: Pick<Parameters<typeof runBroker>[0], "sendHello" | "staleDistGuard" | "onStaleDist"> = {},
+  options: Pick<Parameters<typeof runBroker>[0], "sendHello" | "staleDistGuard" | "onStaleDist" | "clientId"> = {},
 ): BrokerHarness {
   const socketPath = tempSocketPath(suffix);
   const input = new PassThrough();

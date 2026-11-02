@@ -9,7 +9,7 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 import * as fs from "node:fs";
-import type * as net from "node:net";
+import * as net from "node:net";
 import { PassThrough } from "node:stream";
 import { runBroker } from "../src/approval/broker.js";
 import {
@@ -87,6 +87,24 @@ describe("Broker — 双方向中継", () => {
     // stdin を閉じて EOF を送る (SSH チャネルが閉じた状況を模擬)
     harness.input.end();
     await reader.waitForEOF();
+  });
+
+  it("通常の EOF では hook 側が FIN を返さなくても終了する", async () => {
+    harness = startBroker("half-open");
+    (await connectUnixClient(harness.socketPath)).destroy();
+    const socket = net.connect({ path: harness.socketPath, allowHalfOpen: true });
+    clients.push(socket);
+    socket.on("error", () => {});
+    await new Promise<void>((resolve) => socket.once("connect", resolve));
+    await ensureRegistered(socket, harness.outputLines, "half-open");
+    harness.input.end();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        harness.done,
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("EOF shutdown blocked")), 500); }),
+      ]);
+    } finally { clearTimeout(timer); socket.destroy(); }
   });
 
   it("SSH 側決定行が接続中の全クライアントへブロードキャストされる (Req 5.4)", async () => {
@@ -255,6 +273,143 @@ describe("Broker — 双方向中継", () => {
     inputA.end();
     await doneA;
     expect(fs.existsSync(socketPath)).toBe(false);
+  });
+
+  it("同じ端末の再接続は、旧接続の stdin が残っていても listener を引き継ぎ、承認の再送と決定を中継する", async () => {
+    const clientId = "11111111-1111-4111-8111-111111111111";
+    const old = startBroker("same-client", { clientId });
+    try {
+      const hook = await connect(old);
+      await ensureRegistered(hook.socket, old.outputLines, "before-handoff");
+      const request = '{"id":"pending-1","type":"approval_request"}';
+      writeLine(hook.socket, request);
+      expect(await old.outputLines.next()).toBe(request);
+
+      harness = startBroker("same-client", { clientId, sendHello: true });
+      expect(JSON.parse(await harness.outputLines.next()).type).toBe("channel_hello");
+      await old.done;
+      expect(old.input.writableEnded).toBe(false); // 旧 QUIC の idle timeout を待たない。
+      await hook.reader.waitForEOF();
+      expect(fs.existsSync(harness.socketPath)).toBe(true);
+
+      // hook は切断後に同じ承認 id で送り直す。新しい接続からの決定が届くことまで検証する。
+      const retried = await connect(harness);
+      writeLine(retried.socket, request);
+      expect(await harness.outputLines.next()).toBe(request);
+      const decision = '{"id":"pending-1","decision":"deny","type":"approval_decision"}';
+      harness.input.write(decision + "\n");
+      expect(await retried.reader.nextLine()).toBe(decision);
+      // 旧 input の遅れた終了でも、新 listener の socket は消さない。
+      old.input.end();
+      expect(fs.existsSync(harness.socketPath)).toBe(true);
+    } finally {
+      await old.teardown();
+    }
+  });
+
+  it("別端末の clientId では生きた listener を奪わず、引き継ぎ制御行もアプリへ転送しない", async () => {
+    harness = startBroker("other-client", { clientId: "11111111-1111-4111-8111-111111111111" });
+    const hook = await connect(harness);
+    await ensureRegistered(hook.socket, harness.outputLines, "before-denied-handoff");
+    const input = new PassThrough();
+    try {
+      await expect(runBroker({
+        socketPath: harness.socketPath, input, output: new PassThrough(),
+        clientId: "22222222-2222-4222-8222-222222222222",
+        socketWaitGraceMs: 100, socketWaitIntervalMs: 10,
+      })).rejects.toThrow(/already in use/);
+      await ensureRegistered(hook.socket, harness.outputLines, "after-denied-handoff");
+      expect(fs.existsSync(harness.socketPath)).toBe(true);
+    } finally { input.destroy(); }
+  });
+
+  it("不正な clientId は listener を触る前に拒否する", async () => {
+    await expect(runBroker({
+      socketPath: tempSocketPath("invalid-client"), input: new PassThrough(), output: new PassThrough(),
+      clientId: "not-a-uuid",
+    })).rejects.toThrow("invalid serve client id");
+  });
+
+  it("接続が既に閉じていたら、空のパスにも listener を残さない", async () => {
+    const socketPath = tempSocketPath("cancelled-before-start");
+    const input = new PassThrough(); input.destroy();
+    let finished = false;
+    const done = runBroker({ socketPath, input, output: new PassThrough() }).finally(() => { finished = true; });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      expect(fs.existsSync(socketPath)).toBe(false);
+      expect(finished).toBe(true);
+    } finally { input.emit("end"); await done; }
+  });
+
+  it("起動前の EOF で取り消された後発は、同じ端末の既存 listener を終了させない", async () => {
+    const clientId = "11111111-1111-4111-8111-111111111111";
+    harness = startBroker("cancelled-handoff", { clientId });
+    const hook = await connect(harness);
+    await ensureRegistered(hook.socket, harness.outputLines, "before-cancelled-handoff");
+    let oldFinished = false;
+    void harness.done.then(() => { oldFinished = true; });
+    const input = new PassThrough(); input.end();
+    const done = runBroker({ socketPath: harness.socketPath, input, output: new PassThrough(), clientId });
+    try {
+      await done;
+      expect(oldFinished).toBe(false);
+      await ensureRegistered(hook.socket, harness.outputLines, "after-cancelled-handoff");
+    } finally { input.destroy(); }
+  });
+
+  it("listener 解放待ち中の取り消しは待機を打ち切り、他端末の listener を維持する", async () => {
+    harness = startBroker("cancelled-during-wait", { clientId: "11111111-1111-4111-8111-111111111111" });
+    const hook = await connect(harness);
+    await ensureRegistered(hook.socket, harness.outputLines, "before-wait");
+    const input = new PassThrough();
+    const done = runBroker({
+      socketPath: harness.socketPath, input, output: new PassThrough(),
+      clientId: "22222222-2222-4222-8222-222222222222", socketWaitIntervalMs: 10,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    input.destroy();
+    await done;
+    await ensureRegistered(hook.socket, harness.outputLines, "after-wait-cancelled");
+  });
+
+  it("起動中の stdin EOF でも改行なしの最後の決定を落とさない", async () => {
+    harness = startBroker("partial-eof");
+    const hook = await connect(harness);
+    await ensureRegistered(hook.socket, harness.outputLines, "before-partial-eof");
+    const bytes = new Promise<string>((resolve) => hook.socket.once("data", (chunk) => resolve(chunk.toString())));
+    const decision = '{"type":"approval_decision","id":"last","decision":"deny"}';
+    harness.input.end(decision);
+    expect(await bytes).toBe(decision);
+    await hook.reader.waitForEOF();
+    await harness.done;
+  });
+
+  it("空の socket パスへの同時起動でも、後発が先発の新しい listener を unlink しない", async () => {
+    const socketPath = tempSocketPath("simultaneous-start");
+    const inputA = new PassThrough(); const inputB = new PassThrough();
+    const outputA = new PassThrough(); const outputB = new PassThrough();
+    const doneA = runBroker({ socketPath, input: inputA, output: outputA, sendHello: true });
+    const doneB = runBroker({ socketPath, input: inputB, output: outputB, sendHello: true });
+    const outcomes = [doneA, doneB].map((done) => done.then(() => "closed", () => "occupied"));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      expect(await Promise.race([
+        ...outcomes,
+        new Promise<string>((resolve) => { timer = setTimeout(() => resolve("both-listening"), 1000); }),
+      ])).toBe("occupied");
+      const ownerOutput = outputA.readableLength > 0 ? outputA : outputB;
+      expect(ownerOutput.read().toString()).toContain("channel_hello");
+      const client = await connectUnixClient(socketPath);
+      clients.push(client);
+      const forwarded = new Promise<string>((resolve) => ownerOutput.once("data", (line) => resolve(line.toString())));
+      writeLine(client, '{"type":"probe","id":"still-owned"}');
+      expect(await forwarded).toContain("still-owned");
+    } finally {
+      clearTimeout(timer); inputA.end(); inputB.end();
+      for (const client of clients) client.destroy();
+      await Promise.allSettled([doneA, doneB]);
+    }
   });
 
   it("先発が解放待ち猶予内に閉じれば、後発が同一 socket パスを引き継いで listen できる", async () => {

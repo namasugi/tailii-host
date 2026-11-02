@@ -17,7 +17,7 @@
 
 import * as fs from "node:fs";
 import * as net from "node:net";
-import type { Readable, Writable } from "node:stream";
+import { PassThrough, type Readable, type Writable } from "node:stream";
 import { resolveSocketPath } from "../shared/socketPath.js";
 import { sleep } from "../shared/sleep.js";
 import { encodeControlMessage, PROTOCOL_MAX_SUPPORTED, PROTOCOL_V1 } from "../protocol.js";
@@ -69,6 +69,34 @@ export interface RunBrokerOptions {
   socketWaitGraceMs?: number;
   /** 解放待ちの再確認間隔（ms）。 */
   socketWaitIntervalMs?: number;
+  /** 同じアプリの再接続だけが旧 listener を解放できる、インストール単位の UUID。 */
+  clientId?: string;
+}
+
+const HANDOFF_TYPE = "tailii_serve_handoff_v1";
+const CLIENT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** 同じ端末の旧 serve に正常終了を頼む。PID kill や生きた socket の unlink はしない。 */
+async function requestHandoff(socketPath: string, clientId: string, signal: AbortSignal): Promise<void> {
+  await new Promise<void>((resolve) => {
+    const socket = net.connect(socketPath);
+    const timer = setTimeout(finish, 250);
+    function finish(): void {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", finish);
+      socket.destroy();
+      resolve();
+    }
+    socket.once("connect", () => {
+      if (signal.aborted) { finish(); return; }
+      socket.write(JSON.stringify({ type: HANDOFF_TYPE, clientId }) + "\n");
+    });
+    socket.once("error", finish);
+    socket.once("end", finish);
+    signal.addEventListener("abort", finish, { once: true });
+    if (signal.aborted) finish();
+    socket.resume();
+  });
 }
 
 /**
@@ -84,21 +112,63 @@ export interface RunBrokerOptions {
  * ソケットファイルまで消える（以後の hook connect が全て ECONNREFUSED になり、承認が
  * 「考え中」のまま永久にハングする不具合の実根因）。奪う前に生存確認する。
  */
-function isSocketAlive(socketPath: string): Promise<boolean> {
-  return new Promise((resolve) => {
+function isSocketAlive(socketPath: string, signal: AbortSignal): Promise<boolean> {
+  return new Promise((resolve, reject) => {
     const probe = net.connect(socketPath);
-    probe.once("connect", () => {
+    const timer = setTimeout(() => finish(false, new Error("serve socket probe timed out")), 500);
+    const abort = (): void => finish(false);
+    function finish(alive: boolean, error?: Error): void {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
       probe.destroy();
-      resolve(true);
+      if (error) reject(error); else resolve(alive);
+    }
+    probe.once("connect", () => finish(true));
+    probe.once("error", (error: NodeJS.ErrnoException) => {
+      // 権限・資源不足・応答遅延を「死んだ socket」と誤認して unlink しない。
+      finish(false, error.code === "ENOENT" || error.code === "ECONNREFUSED" ? undefined : error);
     });
-    probe.once("error", () => resolve(false));
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
   });
 }
 
+function socketStat(socketPath: string): fs.Stats | undefined {
+  try { return fs.lstatSync(socketPath); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
 export async function runBroker(options: RunBrokerOptions): Promise<void> {
+  if (options.input.destroyed || options.input.readableEnded) return;
+  // 起動待ちの間も元 stdin を読み、EOF/キャンセルを観測する。決定行は中間 stream に保持し、
+  // listen 後に従来どおり中継する（end を観測するためにデータを捨てない）。
+  const buffered = new PassThrough();
+  const controller = new AbortController();
+  const abort = (): void => { controller.abort(); buffered.destroy(); };
+  options.input.once("end", abort);
+  options.input.once("close", abort);
+  options.input.once("error", abort);
+  options.input.pipe(buffered);
+  try {
+    await runActiveBroker({ ...options, input: buffered }, controller.signal);
+  } finally {
+    options.input.unpipe(buffered);
+    options.input.removeListener("end", abort);
+    options.input.removeListener("close", abort);
+    options.input.removeListener("error", abort);
+    buffered.destroy();
+  }
+}
+
+async function runActiveBroker(options: RunBrokerOptions, signal: AbortSignal): Promise<void> {
   const { socketPath, input, output } = options;
   const log = options.log ?? (() => {});
   const staleDistGuard = options.staleDistGuard ?? createStaleDistGuard();
+  const clientId = options.clientId;
+  if (clientId !== undefined && !CLIENT_ID.test(clientId)) throw new Error("invalid serve client id");
 
   // 既存 socket ファイルが生きていれば奪わず、まず解放を短時間待つ（chat 離脱→開き直しで
   // 旧 serve の終了と競走するケースの吸収）。猶予内に解放されなければ従来どおり諦める
@@ -108,13 +178,31 @@ export async function runBroker(options: RunBrokerOptions): Promise<void> {
   const graceMs = options.socketWaitGraceMs ?? 4000;
   const intervalMs = options.socketWaitIntervalMs ?? 200;
   const waitDeadline = Date.now() + graceMs;
-  while (await isSocketAlive(socketPath)) {
+  let handoffRequested = false;
+  while (true) {
+    if (signal.aborted) return;
+    // probe 中に別の後発が listen し始めても、その新しい socket を unlink しない。
+    const observed = socketStat(socketPath);
+    const alive = await isSocketAlive(socketPath, signal);
+    if (signal.aborted) return;
+    if (!alive) {
+      const current = socketStat(socketPath);
+      if (observed?.isSocket() && current?.ino === observed.ino && current.dev === observed.dev) {
+        fs.rmSync(socketPath, { force: true });
+      }
+      break;
+    }
+    if (input.destroyed || input.readableEnded) return;
+    if (clientId !== undefined && !handoffRequested) {
+      handoffRequested = true;
+      await requestHandoff(socketPath, clientId, signal);
+      continue;
+    }
     if (Date.now() >= waitDeadline) {
       throw new Error(`socket already in use by a live listener: ${socketPath}`);
     }
     await sleep(intervalMs);
   }
-  fs.rmSync(socketPath, { force: true });
 
   const clients = new Set<net.Socket>();
   let registryClosed = false;
@@ -122,15 +210,20 @@ export async function runBroker(options: RunBrokerOptions): Promise<void> {
   let resolveBroker: (() => void) | null = null;
   let server: net.Server;
 
-  const finishBroker = (): void => {
+  const finishBroker = (handoff = false): void => {
     if (registryClosed) return;
     registryClosed = true;
-    for (const client of clients) client.end();
+    for (const client of clients) {
+      if (handoff) client.destroy();
+      else client.end();
+    }
     // `net.Server.close()` は bind したパスの socket ファイルを自前で unlink するため
     // （Node 内部仕様）、ここで追加の fs.rmSync は不要（かつ、上の isSocketAlive ガードにより
     // このプロセスは常にこのパスの正当な唯一の所有者として起動しているため安全）。
-    server.close(() => {});
-    resolveBroker?.();
+    // handoff は全 client を destroy 済みなので、解放完了後に終了する。
+    // 通常の EOF では従来どおり hook 側の FIN を待たず終了し、半開き client で固着させない。
+    server.close(() => { if (handoff) resolveBroker?.(); });
+    if (!handoff) resolveBroker?.();
   };
 
   /** 1 完全行を SSH (output) へ書き込む（失敗は無視 — Swift 版 try? と同一）。 */
@@ -166,7 +259,25 @@ export async function runBroker(options: RunBrokerOptions): Promise<void> {
       options.onStaleDist?.();
     }
 
-    const feeder = makeLineFeeder(writeLineToSSH);
+    let firstLine = true;
+    const feeder = makeLineFeeder((line) => {
+      if (firstLine) {
+        firstLine = false;
+        // handoff はローカル socket 内だけの制御行。承認やアプリ側へは中継しない。
+        let request: { type?: unknown; clientId?: unknown } | null = null;
+        try { request = JSON.parse(line.toString("utf8")); } catch { /* 通常の中継へ。 */ }
+        if (request?.type === HANDOFF_TYPE) {
+          if (clientId !== undefined && request.clientId === clientId) {
+            log("[tailii-host serve] 同じクライアントの再接続へ listener を引き継ぐ\n");
+            finishBroker(true);
+          } else {
+            client.end();
+          }
+          return;
+        }
+      }
+      writeLineToSSH(line);
+    });
     client.on("data", (chunk) => feeder.push(chunk));
     // クライアント切断: 残余バッファをフラッシュして登録簿から除去する。
     client.on("end", () => feeder.flush());
@@ -187,6 +298,7 @@ export async function runBroker(options: RunBrokerOptions): Promise<void> {
     });
   });
   log(`[tailii-host serve] listening on ${socketPath}\n`);
+  if (signal.aborted) { finishBroker(); return; }
   if (options.sendHello === true) {
     const helloVersion = staleDistGuard?.startupVersion ?? readPackageVersion() ?? undefined;
     writeLineToSSH(Buffer.from(encodeControlMessage({
@@ -219,14 +331,21 @@ export async function runBroker(options: RunBrokerOptions): Promise<void> {
     input.on("data", (chunk: Buffer) => feeder.push(chunk));
     input.once("end", finish);
     input.once("error", finish);
+    input.once("close", finish);
   });
 }
 
 /** serve サブコマンドのエントリポイント（`--session <name>` | `--socket <path>`）。 */
 export async function runServeCommand(args: string[]): Promise<number> {
   let socketPath: string | null = null;
+  let clientId: string | undefined;
   try {
     socketPath = parseServeArgs(args);
+    const clientIndex = args.indexOf("--client-id");
+    if (clientIndex !== -1) {
+      clientId = args[clientIndex + 1];
+      if (clientId === undefined || !CLIENT_ID.test(clientId)) throw new Error("invalid serve client id");
+    }
   } catch (error) {
     process.stderr.write(`[tailii-host serve] エラー: ${String(error)}\n`);
     process.stderr.write("使い方: tailii serve --session <name> | --socket <path>\n");
@@ -241,6 +360,7 @@ export async function runServeCommand(args: string[]): Promise<number> {
       output: process.stdout,
       log: (message) => process.stderr.write(message),
       sendHello: true,
+      ...(clientId === undefined ? {} : { clientId }),
     });
   } catch (error) {
     process.stderr.write(`[tailii-host serve] 異常終了: ${String(error)}\n`);
