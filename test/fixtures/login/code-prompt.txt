@@ -1,5 +1,5 @@
 
- ▐▛███▛█   Claude Code v2.1.316
+ ▐▛███▛█   Claude Code v2.1.317
 ▝▜██████▀  Opus 5.5 with high effort · Claude Ultra
  ▝▝   ▝▝   ~/.tailii/tui-probe/cwd
 
@@ -12,13 +12,13 @@ https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88
 ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.co
 m%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainf
 erence+user%3Asessions%3Aclaude_code+user%3Amcp_servers+user%3Afile_upload+user%
-3Aplugins&code_challenge=COS_9OeSmKN5MhXtmImfcBC0myeiB22mNIC50seeEHw&code_challe
-nge_method=S256&state=aw81SpFeMSGHv69HZmzEDAvORW-8y8J7P9tFo0oCJ8E      
+3Aplugins&code_challenge=Wl9qtk5VOTVPaxRA40ddS171v7vQpy0QYOtv391T19c&code_challe
+nge_method=S256&state=MIttDeat6yFXGMiQKneShLTkAQWCYq1R88FhNVH5-Mw      
                                                                       
    Hold Shift (Option in iTerm2, Fn in Terminal.app) while selecting to use 
    your terminal's native copy                                                  
                                                                                 
                                                                                 
-   Paste code here if prompted >
+   Paste code here if prompted > 
 
    Esc to cancel                                     
