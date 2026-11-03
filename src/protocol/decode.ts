@@ -225,19 +225,10 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
           : undefined;
       // permissionMode は既知 4 値のみ採用（claude 新規起動の --permission-mode）。未知/未指定は
       // undefined（フラグ無し＝claude 既定）。
-      const rawMode = optionalString(raw, "permissionMode");
-      const permissionMode =
-        rawMode === "default" || rawMode === "acceptEdits" || rawMode === "plan" || rawMode === "auto"
-          ? rawMode
-          : undefined;
+      const permissionMode = decodePermissionMode(optionalString(raw, "permissionMode"));
       // effort は既知 5 値のみ採用（claude 新規起動の --effort。起動前の工数選択）。未知/未指定は
       // undefined（フラグ無し＝claude 既定）。
-      const rawEffort = optionalString(raw, "effort");
-      const effort =
-        rawEffort === "low" || rawEffort === "medium" || rawEffort === "high" ||
-        rawEffort === "xhigh" || rawEffort === "max"
-          ? rawEffort
-          : undefined;
+      const effort = decodeEffort(optionalString(raw, "effort"));
       return compact({
         type, v,
         id: requireString(raw, "id"),
@@ -262,6 +253,24 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         todoTools: optionalBoolean(raw, "todoTools"),
       });
     }
+
+    case "session_prewarm":
+      return compact({
+        type, v,
+        id: requireString(raw, "id"),
+        cwd: requireString(raw, "cwd"),
+        name: requireString(raw, "name"),
+        baseDir: optionalString(raw, "baseDir"),
+        title: optionalString(raw, "title"),
+        model: optionalString(raw, "model"),
+        permissionMode: decodePermissionMode(optionalString(raw, "permissionMode")),
+        effort: decodeEffort(optionalString(raw, "effort")),
+        outputStyle: decodeOutputStyle(optionalString(raw, "outputStyle")),
+        todoTools: optionalBoolean(raw, "todoTools"),
+      });
+
+    case "session_prewarm_cancel":
+      return { type, v, id: requireString(raw, "id"), name: requireString(raw, "name") };
 
     case "session_reattach": {
       // 範囲外・非整数は指定なし扱い（全履歴の再送へ倒す。開き直し自体は拒否しない）。
@@ -1356,6 +1365,16 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
 }
 
 /** `account_usage_response.claude` を読む（欠落は undefined = 「Claude 側は載っていない」）。 */
+/** claude 新規起動の permission mode（既知 4 値のみ。未知/未指定は undefined = フラグ無し）。 */
+function decodePermissionMode(raw: string | undefined): "default" | "acceptEdits" | "plan" | "auto" | undefined {
+  return raw === "default" || raw === "acceptEdits" || raw === "plan" || raw === "auto" ? raw : undefined;
+}
+
+/** claude 新規起動の effort（既知 5 値のみ。未知/未指定は undefined = フラグ無し）。 */
+function decodeEffort(raw: string | undefined): "low" | "medium" | "high" | "xhigh" | "max" | undefined {
+  return raw === "low" || raw === "medium" || raw === "high" || raw === "xhigh" || raw === "max" ? raw : undefined;
+}
+
 function decodeClaudeAccountUsage(value: unknown): ClaudeAccountUsage | undefined {
   if (value === undefined || value === null) return undefined;
   const obj = requireObject(value, "claude");

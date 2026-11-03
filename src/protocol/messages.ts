@@ -527,6 +527,14 @@ export type ControlMessage =
    */
   | { type: "session_reattach"; v: number; id: string; name: string; newerThanMs?: number }
   | { type: "session_kill"; v: number; id: string; name: string }
+  /**
+   * 新規会話（Claude）の先行起動（session-prewarm）。ドラフトで打ち始めた時点で、送信時の session_start と
+   * 同じ起動パラメータで Claude を裏で起動しておく。後の session_start が同じパラメータなら起動済みの
+   * Claude をそのまま採用する。応答は無い（旧 host は未知 type を捨てる）。
+   */
+  | { type: "session_prewarm"; v: number; id: string; cwd: string; name: string; baseDir?: string; title?: string; model?: string; permissionMode?: "default" | "acceptEdits" | "plan" | "auto"; effort?: "low" | "medium" | "high" | "xhigh" | "max"; outputStyle?: string; todoTools?: boolean }
+  /** 先行起動の取り消し（送らずにドラフトを離れた）。先行起動のまま使われていないものだけ閉じる。応答は無い。 */
+  | { type: "session_prewarm_cancel"; v: number; id: string; name: string }
   | { type: "session_idle_hint"; v: number; id: string; name: string }
   | { type: "codex_model_list_request"; v: number; id: string }
   | { type: "codex_model_list_response"; v: number; id: string; models: CodexModelInfo[] }

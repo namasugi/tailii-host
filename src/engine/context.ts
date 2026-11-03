@@ -30,6 +30,7 @@ import {
 } from "../protocol.js";
 import type { SessionListService } from "../sessions/sessionListService.js";
 import type { SessionMeta, SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
+import { PrewarmStore as PrewarmStoreImpl, type PrewarmStore } from "../sessions/prewarmStore.js";
 import type {
   OfficialAppProvider,
   OfficialAppRuntimeContext,
@@ -89,6 +90,8 @@ export interface HandlerContext {
   codexLauncher: EngineLauncher | null;
   sessionListService: SessionListService | null;
   metadataStore: SessionMetadataStore | null;
+  /** 新規会話の先行起動の記録（session-prewarm）。null は先行起動を扱わない（テスト構成等）。 */
+  prewarmStore: PrewarmStore | null;
   hubLink: HubLink;
   requestHubState: (session: string) => Promise<{ id: string; questions: QuestionPromptQuestion[] } | null>;
   hubRpc: <T extends HubServerMessage>(request: HubClientMessage, id: string, timeoutMs: number) => Promise<T>;
@@ -398,15 +401,33 @@ export function writeSessionListResponse(
   adoptedName: string | null = null,
   worktree: WorktreeResponseFields | null = null,
 ): void {
+  // 先行起動のまま使われていない会話（session-prewarm）はアプリの一覧に出さない（送信前の下書きが
+  // 「動いている会話」として現れる）。採用を伝える応答（adoptedName）の当の会話は出す。
+  const hidden = prewarmNamesToHide();
+  const visible = hidden.size === 0
+    ? sessions
+    : sessions.filter((info) => info.name === adoptedName || !hidden.has(info.name));
   writer.write({
     type: "session_list_response",
     v,
     id,
-    sessions,
+    sessions: visible,
     ...(nextCursor !== null && { nextCursor }),
     ...(adoptedName !== null && { adoptedName }),
     ...(worktree !== null && worktree),
   });
+}
+
+/** 一覧から隠す先行起動中の会話名（session-prewarm）。差し替えはテスト用。 */
+let prewarmNamesToHide: () => Set<string> = () => defaultPrewarmStore().names();
+let sharedPrewarmStore: PrewarmStore | null = null;
+function defaultPrewarmStore(): PrewarmStore {
+  sharedPrewarmStore ??= new PrewarmStoreImpl();
+  return sharedPrewarmStore;
+}
+/** テスト用: 一覧から隠す先行起動名の供給元を差し替える（null で既定へ戻す）。 */
+export function setPrewarmNamesProviderForTesting(provider: (() => Set<string>) | null): void {
+  prewarmNamesToHide = provider ?? (() => defaultPrewarmStore().names());
 }
 
 /** error 封筒を書き出す小ヘルパー。 */

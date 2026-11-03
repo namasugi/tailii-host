@@ -1,0 +1,3 @@
+{"cwd":"/Users/me/work","id":"pw1","model":"opus","name":"s-1a2b3c4d","permissionMode":"default","title":"新しい会話","todoTools":true,"type":"session_prewarm","v":1}
+{"cwd":"/Users/me/work","id":"pw2","name":"s-1a2b3c4d","type":"session_prewarm","v":1}
+{"id":"pw3","name":"s-1a2b3c4d","type":"session_prewarm_cancel","v":1}

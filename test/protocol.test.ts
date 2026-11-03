@@ -141,6 +141,13 @@ describe("golden roundtrip", () => {
     }
   });
 
+  it("session-prewarm v1 golden 全行が byte-exact でラウンドトリップする", () => {
+    for (const line of goldenLines("session-prewarm-v1.ndjson")) {
+      const decoded = decodeControlMessage(line);
+      expect(encodeControlMessage(decoded)).toBe(line);
+    }
+  });
+
   it("background-command-stop v1 golden 全行が byte-exact でラウンドトリップする", () => {
     for (const line of goldenLines("background-command-stop-v1.ndjson")) {
       const decoded = decodeControlMessage(line);

@@ -2121,6 +2121,72 @@ export function classifySubmitFrame(ansiScreen: string | null): SubmitFrameVerdi
   return inputBoxHasRealPendingText(ansiScreen) ? "pending" : "submitted";
 }
 
+/** 送信確定・打鍵の反映確認で画面を読み直す間隔 ms（submit-fast-verify）。 */
+export const SUBMIT_VERIFY_POLL_MS = 100;
+/** 最初に画面を読むまでの待ち ms（submit-fast-verify。待ち全体がこれより短ければそちらに合わせる）。 */
+export const SUBMIT_VERIFY_FIRST_MS = 150;
+
+/**
+ * Enter の後、送信が成立したかを決める（submit-fast-verify, TESTABLE）。
+ *
+ * 以前は `windowMs`（700ms）待ってから 1 回だけ読んでいた。成立は多くの場合 100〜200ms で画面に出るので、
+ * 毎回の送信に約 0.5 秒の空き待ちが乗っていた。短い間隔で読み直すが、**期限前に抜けるのは
+ * `submitted` が 2 回続けて見えたときだけ**にする。描画途中のフレームはボトムバーが欠けて `dialog` /
+ * `unknown` に見えたり、入力欄が一瞬空に見えたりする（短周期で読むと撃ち直すべき場面で打ち切る、が
+ * 以前この方式を避けた理由）。続けて 2 回の一致を求めれば一瞬の描画は通らず、それ以外の判定は
+ * 従来どおり期限の時点のフレームで下す。待ち全体が 0（テスト）なら 1 回読むだけで、従来と同じ回数になる。
+ */
+export async function settleSubmitVerdict(io: {
+  capture: () => Promise<string | null>;
+  windowMs: number;
+  firstDelayMs?: number;
+  pollMs?: number;
+}): Promise<SubmitFrameVerdict> {
+  const deadline = Date.now() + io.windowMs;
+  const pollMs = io.pollMs ?? SUBMIT_VERIFY_POLL_MS;
+  await sleepMs(Math.min(io.firstDelayMs ?? SUBMIT_VERIFY_FIRST_MS, io.windowMs));
+  let submittedOnce = false;
+  for (;;) {
+    const verdict = classifySubmitFrame(await io.capture());
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return verdict;
+    if (verdict === "submitted") {
+      if (submittedOnce) return verdict;
+      submittedOnce = true;
+    } else {
+      submittedOnce = false;
+    }
+    await sleepMs(Math.min(pollMs, remaining));
+  }
+}
+
+/**
+ * 条件が満たされるまで短い間隔で確かめる（submit-fast-verify, TESTABLE）。満たされたら true、
+ * `windowMs` を過ぎても満たされなければ false。期限ちょうどにもう 1 回確かめる（以前の
+ * 「待つ → 確かめる → 少し待つ → もう一度確かめる」の 2 回目に当たる）。待ち全体が 0（テスト）なら
+ * 2 回確かめるだけで、以前と同じ回数になる。陽性の判定（入力欄に本文が見えた）だけで抜けるので、
+ * 描画途中のフレームで早まることは無い。
+ */
+export async function pollUntilTrue(
+  check: () => Promise<boolean>,
+  io: { windowMs: number; firstDelayMs?: number; pollMs?: number },
+): Promise<boolean> {
+  const deadline = Date.now() + io.windowMs;
+  const pollMs = io.pollMs ?? SUBMIT_VERIFY_POLL_MS;
+  await sleepMs(Math.min(io.firstDelayMs ?? SUBMIT_VERIFY_FIRST_MS, io.windowMs));
+  if (await check()) return true;
+  for (;;) {
+    const remaining = deadline - Date.now();
+    if (remaining > 0) await sleepMs(Math.min(pollMs, remaining));
+    if (await check()) return true;
+    if (Date.now() >= deadline) return false;
+  }
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
 /** 送信確定ループの結果。`blocked` は本文を 1 キーも打てずに諦めた（非配達が確定）。 */
 export type SubmitOutcome = "submitted" | "blocked" | "unconfirmed";
 
@@ -2562,10 +2628,10 @@ export class TmuxSessionManager {
    * 打ち切り判定は `submitSettledFromScreen`（同一フレームから「ダイアログでない」＋
    * 「実テキストが無い」を導く fail-closed 判定）に委ね、herdr 側と同じ規則を共有する。
    *
-   * 待ち時間は固定 700ms（`submitVerifyDelayMs`）で、短周期ポーリングにはしない:
-   * 描画途中のフレームを捕まえるとボトムバーが欠けて「ダイアログ」と誤判定し、
-   * 撃ち直すべき場面で黙って打ち切ってしまう（＝この修正が潰した不具合の再発）。
-   * 1 通あたり約 +850ms のコストは iOS の ACK 予算 18s の内側に収まる。
+   * 成立の確認は `settleSubmitVerdict`（submit-fast-verify）: 最長 700ms（`submitVerifyDelayMs`）待つが、
+   * `submitted` が 2 回続けて見えたら早めに抜ける。描画途中のフレームを捕まえるとボトムバーが欠けて
+   * 「ダイアログ」と誤判定し、撃ち直すべき場面で黙って打ち切ってしまう（＝この修正が潰した不具合の
+   * 再発）ので、`submitted` 以外の判定は従来どおり期限の時点のフレームで下す。
    *
    * 割り切り: ループ中（約 0.85〜3.4s）に Mac 側で打ち始めた下書きは「未送信テキスト」に
    * 見えるため Enter で送られ得る（herdr では既存の挙動）。冒頭の残存判定が先に効くので窓は狭い。
@@ -2585,8 +2651,10 @@ export class TmuxSessionManager {
       // （空 composer への Enter は no-op。薄字の提案は実テキストに数えないので送らない）。
       await new Promise((resolve) => setTimeout(resolve, this.submitDelayMs));
       await this.sendKeys(name, ["Enter"]);
-      await new Promise((resolve) => setTimeout(resolve, this.submitVerifyDelayMs));
-      const after = classifySubmitFrame(await this.captureVisibleScreenAnsiOrNull(name));
+      const after = await settleSubmitVerdict({
+        capture: () => this.captureVisibleScreenAnsiOrNull(name),
+        windowMs: this.submitVerifyDelayMs,
+      });
       if (after === "submitted") return "submitted";
       // 撃った**後**にダイアログが出たのは、本文が送られてそれが開いた場合
       // （`/remote-control` など）。送信は成立しているので打ち切る。

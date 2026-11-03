@@ -44,6 +44,8 @@ import { CodexSessionStore } from "../codex/codexSessionStore.js";
 import type { SessionInfo } from "../protocol.js";
 import { isAgentListener, processBelongsToPane, type LocalServerProcesses } from "./localServerProcesses.js";
 import { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
+import { PrewarmStore, prewarmExpired } from "../sessions/prewarmStore.js";
+import { claudeTranscriptExists } from "../sessions/claudeTranscriptExists.js";
 import { ClaudeSessionStore, transcriptTitle } from "../sessions/claudeSessionStore.js";
 import { paneCommandLooksLikeAgent, tmuxServerAbsent, type TmuxCommandRunner } from "../backend/tmux.js";
 import {
@@ -123,6 +125,11 @@ export interface ReaperTickOptions {
   runner: TmuxCommandRunner;
   heartbeatDir: string;
   metadataStore: SessionMetadataStore;
+  /**
+   * 新規会話の先行起動の記録（session-prewarm）。使われないまま期限を過ぎた先行起動を閉じる。
+   * 省略時は既定の場所（`~/.tailii/sessions/prewarm`）。null は扱わない。
+   */
+  prewarmStore?: PrewarmStore | null;
   timeoutSeconds: number;
   now: number;
   log?: (message: string) => void;
@@ -233,6 +240,7 @@ function defaultDeriveClaudeTitle(claudeSessionId: string): string | null {
 /** 巡回 1 回分。判定表は docs/architecture.md「セッション自動掃除」を参照。 */
 export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTickResult> {
   const { runner, heartbeatDir, metadataStore, timeoutSeconds, now } = options;
+  const prewarmStore = options.prewarmStore === undefined ? new PrewarmStore() : options.prewarmStore;
   const log = options.log ?? (() => {});
   // 「tmux が答えられなかった」tick（サーバ不在以外の失敗: socket ファイルが無い・権限・タイムアウト等）では、
   // tmux の会話の回収だけを見送り、herdr の巡回は続ける（herdrUnavailable と対称）。以前は tick ごと投げて、
@@ -340,6 +348,33 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
     paneProcessIds: () => Promise<number[] | null>,
     claudeMatch: { paneProcessIds?: () => Promise<number[] | null>; useSessionId: boolean },
   ): Promise<void> => {
+    // 先行起動（session-prewarm）のまま使われていない Claude は通常の計時に載せない。最後の
+    // `session_prewarm` から期限を過ぎたら閉じる（送らずに離れた・アプリが落ちた等の取り残し）。
+    // transcript があれば会話が始まっている（印の消し忘れ）ので、印だけ外して通常の規則へ戻す。
+    // ターミナルから attach 中（人が見ている）なら閉じない（下の attach 保護と同じ扱い）。
+    const prewarm = prewarmStore?.get(name) ?? null;
+    if (prewarm !== null && prewarmStore != null) {
+      const meta = metadataStore.get(name);
+      if (meta !== null && claudeTranscriptExists(meta.cwd, prewarm.claudeSessionId)) {
+        prewarmStore.remove(name);
+      } else {
+        if (isAttached || !prewarmExpired(prewarm, now)) return;
+        // 閉じる直前に読み直す: その間に送信で採用された（記録が消えた）・再送で延びた会話は閉じない。
+        // engine は期限の 2 分前から採用しないので、ここで期限切れのままなら採用とはすれ違わない。
+        // 同じ先行起動（会話 id）のままのときだけ閉じる（読み直しの直後に engine がパラメータ変更で起動し直した
+        // 新しい先行起動を閉じない）。
+        const recheck = prewarmStore.get(name);
+        if (recheck === null || recheck.claudeSessionId !== prewarm.claudeSessionId || !prewarmExpired(recheck, now)) {
+          return;
+        }
+        await kill();
+        prewarmStore.remove(name);
+        removeHeartbeat(heartbeatDir, name);
+        killed.push(name);
+        log(`kill ${name} (prewarm unused ${now - prewarm.touchedAt}s)`);
+        return;
+      }
+    }
     const heartbeat = readHeartbeat(heartbeatDir, name);
     if (heartbeat === null) {
       // 未採番(engine 再起動をまたいだ残骸等)。今を idle 起点として採番し次周期から計時。
@@ -594,5 +629,15 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
   }
 
   // tmux が答えられなかった tick は「生存 0」ではない（hub の自然終了の条件に使われる）。
+  // 期限を過ぎた先行起動の記録のうち、生きた会話が無いもの（起動に失敗した・利用者が閉じた）を消す。
+  // 生きているものは上の巡回で閉じている。どちらかの backend が答えられなかった tick では見送る。
+  if (prewarmStore != null && !tmuxUnavailable && !herdrUnavailable) {
+    const liveNames = new Set([...live, ...herdrLive]);
+    for (const name of prewarmStore.names()) {
+      if (liveNames.has(name)) continue;
+      const record = prewarmStore.get(name);
+      if (record === null || prewarmExpired(record, now)) prewarmStore.remove(name);
+    }
+  }
   return { liveCount: live.length + herdrLive.length + (tmuxUnavailable ? 1 : 0), killed, demoted, reclaimed };
 }

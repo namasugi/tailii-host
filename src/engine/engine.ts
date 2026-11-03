@@ -68,6 +68,7 @@ import {
 import { ownTranscriptActivityProvider } from "../sessions/sessionActivityProvider.js";
 import { SessionListService } from "../sessions/sessionListService.js";
 import { SessionMetadataStore, type SessionMeta } from "../sessions/sessionMetadataStore.js";
+import { PrewarmStore } from "../sessions/prewarmStore.js";
 import { claudeTranscriptPathFor } from "../sessions/transcriptPath.js";
 import { OfficialAppsService } from "../services/officialApps.js";
 import {
@@ -317,6 +318,8 @@ export interface RunEngineOptions {
   codexLauncher?: EngineLauncher | null;
   sessionListService?: SessionListService | null;
   metadataStore?: SessionMetadataStore | null;
+  /** 新規会話の先行起動の記録（session-prewarm）。省略時は metadataStore があれば既定の場所を使う。 */
+  prewarmStore?: PrewarmStore | null;
   /** @deprecated heartbeat 書き込みは Hub が所有する。 */
   heartbeatDir?: string | null;
   /** @deprecated heartbeat tick は Hub が所有する。 */
@@ -410,6 +413,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     codexLauncher = null,
     sessionListService = null,
     metadataStore = null,
+    prewarmStore = metadataStore !== null ? new PrewarmStore() : null,
     resumeLauncher = null,
     codexResumeLauncher = null,
     claudeSessionStore = null,
@@ -1141,6 +1145,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           codexLauncher,
           sessionListService,
           metadataStore,
+          prewarmStore,
           hubLink,
           requestHubState,
           hubRpc,
@@ -1238,6 +1243,12 @@ export const CONCURRENT_MESSAGE_TYPES: ReadonlySet<ControlMessage["type"]> = new
   "subagent_transcript_request",
   // 履歴ページは transcript 全体を読むことがあり時間がかかる。読み取り専用で応答は id 相関。
   "history_page_request",
+  // 新規会話の先行起動と取り消し（session-prewarm）は応答を返さず、同じ会話名どうしは handler 内の
+  // `withLaunchLock` で直列化する。並べると Claude の起動（pane 作成・数百 ms）の間、別の会話への送信が
+  // read loop で待たされる。続く session_start は、先行起動が先にロックを取ってから並ぶ（handler は
+  // 次の行を読むより前のマイクロタスクで始まり、ロック登録までは同期で進む）。
+  "session_prewarm",
+  "session_prewarm_cancel",
 ]);
 
 /** 1行（改行なし）をデコードし、type に対応するドメインハンドラへ dispatch する。decode 失敗は破棄。 */

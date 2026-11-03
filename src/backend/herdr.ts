@@ -72,6 +72,8 @@ import {
   ChatInjectionDeferredError,
   ChatInjectionRejectedError,
   classifySubmitFrame,
+  pollUntilTrue,
+  settleSubmitVerdict,
   SEND_NOW_MAX_POLLS,
   SEND_NOW_POLL_MS,
   sendQueuedNow,
@@ -131,6 +133,13 @@ const HERDR_TIMEOUT_MS = 15_000;
  * （2026-09-06 実機で発症）。窓内のシェル前面は「起動中」として生存扱いにする。
  */
 export const HERDR_LAUNCH_GRACE_SECONDS = 20;
+
+/**
+ * 入力欄が既に描かれていた（起動直後でない）TUI で、本文を打ち終えてから Enter を撃つまでの間隔 ms
+ * （submit-fast-verify）。実測（2026-07-22）でアイドル時は 300ms 以上空ければ CR が成立する。
+ * 起動直後（入力欄の描画を待った）は従来どおり submitDelayMs（600ms）空ける。
+ */
+const IDLE_SUBMIT_GAP_MS = 300;
 
 /**
  * TMUX / TMUX_PANE を除いた環境。herdr server は最初に `herdr` を叩いたプロセスの環境を引き継ぎ、
@@ -961,6 +970,8 @@ export class HerdrSessionManager {
     try {
       const probe = typedTextProbe(text);
       let typed = probe === null;
+      // 本文を打ち終えた時刻（Enter を撃つまでの間隔の起点, submit-fast-verify）。
+      let typedAtMs = Date.now();
       if (!typed && typedTextWouldBreak(text) && textIsPasteSafe(text)) {
         // 1 回で打つと壊れる本文は、小分けの括弧付き貼り付けで渡す（long-text-paste）。1 回で打つと
         // CLI が読み取りの境界ごとに貼り付けとして取り込み、入力欄が `[Pasted text #N]` になって
@@ -1001,6 +1012,7 @@ export class HerdrSessionManager {
           );
         }
         typed = true;
+        typedAtMs = Date.now();
       }
       for (let attempt = 0; attempt < 3 && !typed; attempt += 1) {
         if (attempt > 0) {
@@ -1014,14 +1026,13 @@ export class HerdrSessionManager {
           await this.exitShellMode(name);
         }
         await this.sendKeys(name, [text], true);
-        await new Promise((resolve) => setTimeout(resolve, this.submitDelayMs));
-        if (await this.inputBoxContainsText(name, probe as string)) {
-          typed = true;
-          break;
-        }
-        // 描画遅延での誤判定 → 再投入で本文が二重になるのを避けるため、少し待って再確認。
-        await new Promise((resolve) => setTimeout(resolve, this.submitVerifyDelayMs));
-        if (await this.inputBoxContainsText(name, probe as string)) {
+        typedAtMs = Date.now();
+        // 入力欄に本文が見えるまで短い間隔で確かめる（submit-fast-verify）。見えた時点で進む。
+        // 描画遅延での誤判定 → 再投入で本文が二重になるのを避けるため、見えないと決めるまでの
+        // 待ちは従来と同じ長さ（submitDelayMs + submitVerifyDelayMs）を保つ。
+        if (await pollUntilTrue(() => this.inputBoxContainsText(name, probe as string), {
+          windowMs: this.submitDelayMs + this.submitVerifyDelayMs,
+        })) {
           typed = true;
           break;
         }
@@ -1039,7 +1050,13 @@ export class HerdrSessionManager {
           "typed text did not reach the input box (RC limbo / ダイアログ表示中 / 入力欄不可視のいずれか)",
         );
       }
-      if ((await this.submitTypedText(name)) !== "submitted") options.onUnconfirmedSubmit?.();
+      // 起動直後の TUI は CR を飲みやすいので従来どおり長めに空ける。入力欄の描画を待った場合のほか、
+      // 起動から間もない pane（先行起動 session-prewarm した Claude は、入力欄が出た直後に打たれうる）も含める。
+      const firstEnterGapMs = inputBox.waited || this.launchedRecently(name)
+        ? this.submitDelayMs
+        : Math.min(this.submitDelayMs, IDLE_SUBMIT_GAP_MS);
+      const submitted = await this.submitTypedText(name, { typedAtMs, firstEnterGapMs });
+      if (submitted !== "submitted") options.onUnconfirmedSubmit?.();
       else this.ownUnsubmittedText.delete(name);
     } catch (error) {
       // 本文を打った後に例外で抜けた（配送不明。herdr CLI の失敗・タイムアウト等）。覚えを残すと、アプリの
@@ -1048,6 +1065,14 @@ export class HerdrSessionManager {
       this.ownUnsubmittedText.delete(name);
       throw error;
     }
+  }
+
+  /** pane を起動してから猶予窓（HERDR_LAUNCH_GRACE_SECONDS）の内か（メタの createdAt 起点。不明は false）。 */
+  private launchedRecently(name: string): boolean {
+    const createdAt = this.store.get(name)?.createdAt;
+    if (createdAt === undefined) return false;
+    const elapsed = this.now() - createdAt;
+    return elapsed >= 0 && elapsed < HERDR_LAUNCH_GRACE_SECONDS;
   }
 
   /** CLI のキューに溜まっている発話を今すぐ届ける（chat-send-now, SessionBackend 共通面）。 */
@@ -1071,7 +1096,10 @@ export class HerdrSessionManager {
    *
    * @returns 送信成立を確認できたら true。上限まで撃っても確認できなければ false。
    */
-  private async submitTypedText(name: string): Promise<SubmitOutcome> {
+  private async submitTypedText(
+    name: string,
+    timing: { typedAtMs?: number; firstEnterGapMs?: number } = {},
+  ): Promise<SubmitOutcome> {
     for (let attempt = 0; attempt < SUBMIT_ATTEMPT_LIMIT; attempt += 1) {
       // **撃つ前に必ずフレームを見る**。ダイアログ表示中・判定不能のまま Enter を撃つと
       // 選択肢を誤操作する（承認ダイアログならファイル書き込みを勝手に承認する）。
@@ -1080,10 +1108,17 @@ export class HerdrSessionManager {
       // 「撃つ前に入力欄が空」は送信成立の証拠にならない（本文を打った直後にこれなら、
       // 打鍵が入力欄へ届いていない＝ RC limbo 等）。打ち切らずに Enter は必ず 1 回撃つ
       // （空 composer への Enter は no-op。薄字の提案は実テキストに数えないので送らない）。
-      await new Promise((resolve) => setTimeout(resolve, this.submitDelayMs));
+      // 最初の Enter は「打ち終えてから」の間隔で待つ（反映の確認に使った時間を二重に待たない,
+      // submit-fast-verify）。撃ち直しは従来どおり submitDelayMs 空ける。
+      const gapMs = attempt === 0 && timing.typedAtMs !== undefined
+        ? Math.max(0, timing.typedAtMs + (timing.firstEnterGapMs ?? this.submitDelayMs) - Date.now())
+        : this.submitDelayMs;
+      await new Promise((resolve) => setTimeout(resolve, gapMs));
       await this.sendKeys(name, ["Enter"]);
-      await new Promise((resolve) => setTimeout(resolve, this.submitVerifyDelayMs));
-      const after = classifySubmitFrame(await this.captureVisibleScreenAnsiOrNull(name));
+      const after = await settleSubmitVerdict({
+        capture: () => this.captureVisibleScreenAnsiOrNull(name),
+        windowMs: this.submitVerifyDelayMs,
+      });
       if (after === "submitted") return "submitted";
       // 撃った**後**にバーが消えたのは、本文が送られてダイアログが開いた場合
       // （RC active 中の `/remote-control` など。実障害 2026-07-28 の誤 Continue はここ）。
@@ -1269,10 +1304,16 @@ export class HerdrSessionManager {
    */
   private async waitForInputBoxRendered(
     name: string, cancelHiddenDialog: boolean, options: SendTextSubmitOptions = {},
-  ): Promise<{ state: "ready" | "timeout" | "scrolled" | "escaped-unconfirmed"; hiddenDialogCancelled: boolean }> {
+  ): Promise<{
+    state: "ready" | "timeout" | "scrolled" | "escaped-unconfirmed";
+    hiddenDialogCancelled: boolean;
+    /** 入力欄が現れるのを待った（=起動直後の TUI。Enter を撃つ間隔を長めに取る, submit-fast-verify）。 */
+    waited: boolean;
+  }> {
     const deadline = Date.now() + this.inputBoxReadyTimeoutMs;
     let revealTried = false;
     let hiddenDialogCancelled = false;
+    let waited = false;
     for (;;) {
       // 待っている間に hub が終了の準備に入ったら見送る（最大 20 秒待たない）。隠れたダイアログを閉じた
       // 後なら、その事実を先に伝える（伝え漏れると hub が閉じた設問を再提示する）。
@@ -1283,12 +1324,12 @@ export class HerdrSessionManager {
       const window = await this.captureDialogWindow(name);
       // 読めなければ従来どおり進める（fail-open）。ただし隠れた画面へキーを送った後は、何が起きたか
       // 確かめられないので打たない（隠れた設問ダイアログへ本文が入ると選択肢が動く）。
-      if (window === null) return { state: revealTried ? "scrolled" : "ready", hiddenDialogCancelled };
+      if (window === null) return { state: revealTried ? "scrolled" : "ready", hiddenDialogCancelled, waited };
       // スクロールで隠れた画面は、本文に罫線だけの行（図・区切り線）があると入力欄の罫線と取り違える。
       // 隠れている間は入力欄が見えたと扱わない。最新位置へ戻すか、答えずに送る送信なら隠れた
       // ダイアログを Esc で閉じる（1 回だけ試す。どちらもできなければ打たずに失敗）。
       if (screenScrolledAwayHidingBottom(window)) {
-        if (revealTried) return { state: "scrolled", hiddenDialogCancelled };
+        if (revealTried) return { state: "scrolled", hiddenDialogCancelled, waited };
         revealTried = true;
         const revealed = await revealHiddenBottom({
           capture: () => this.captureDialogWindow(name),
@@ -1299,14 +1340,15 @@ export class HerdrSessionManager {
           settleMs: this.jumpSettleMs,
           maxReads: JUMP_SETTLE_READS,
         });
-        if (revealed.outcome === "stuck") return { state: "scrolled", hiddenDialogCancelled };
-        if (revealed.outcome === "escaped-unconfirmed") return { state: "escaped-unconfirmed", hiddenDialogCancelled: true };
+        if (revealed.outcome === "stuck") return { state: "scrolled", hiddenDialogCancelled, waited };
+        if (revealed.outcome === "escaped-unconfirmed") return { state: "escaped-unconfirmed", hiddenDialogCancelled: true, waited };
         if (revealed.outcome === "dialog-cancelled") hiddenDialogCancelled = true;
         continue;
       }
-      if (claudeInputBoxRendered(window)) return { state: "ready", hiddenDialogCancelled };
-      if (screenInLoginFlow(window) || screenHasSelectionFooter(window)) return { state: "ready", hiddenDialogCancelled };
-      if (Date.now() >= deadline) return { state: "timeout", hiddenDialogCancelled };
+      if (claudeInputBoxRendered(window)) return { state: "ready", hiddenDialogCancelled, waited };
+      if (screenInLoginFlow(window) || screenHasSelectionFooter(window)) return { state: "ready", hiddenDialogCancelled, waited };
+      if (Date.now() >= deadline) return { state: "timeout", hiddenDialogCancelled, waited };
+      waited = true;
       await new Promise((resolve) => setTimeout(resolve, this.readyPollMs));
     }
   }
