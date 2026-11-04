@@ -286,6 +286,19 @@ export function screenHasSelectionFooter(screen: string): boolean {
     .some((line) => stripAnsiForMatch(line).trim().startsWith("Enter to select"));
 }
 
+/**
+ * 画面に確認系ダイアログのフッター行（Dialog 部品の既定 `Enter to confirm · Esc to cancel`）があるか。
+ * Computer Use の権限案内・対象アプリの許可・フォルダ信頼確認・`/model` 等がこの形で、hook の
+ * 承認モーダルを通らないため iOS が ❯ メニューとして転写する。**開き直しで転写カードを出す
+ * （hub の初回フレーム送出）判定専用**: `screenHasSelectionFooter` と違い、送信前に Esc で閉じる
+ * 判定には使わない（フォルダ信頼確認の Esc は Claude を終了させる）。
+ */
+export function screenHasConfirmFooter(screen: string): boolean {
+  return screen
+    .split("\n")
+    .some((line) => stripAnsiForMatch(line).trim().startsWith("Enter to confirm"));
+}
+
 /** 行頭一致の前に CSI エスケープを落とす（backend/tmux.ts の stripSgr と同値）。 */
 function stripAnsiForMatch(line: string): string {
   // eslint-disable-next-line no-control-regex

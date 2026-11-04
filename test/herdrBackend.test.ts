@@ -15,6 +15,7 @@ import {
   parseHerdrForegroundCommand,
   parseHerdrPaneList,
   parseHerdrStartedPaneId,
+  screenHasConfirmFooter,
   screenHasSelectionFooter,
   typedTextProbe,
   type HerdrCommandResult,
@@ -1507,6 +1508,16 @@ describe("HerdrSessionManager", () => {
       ["pane", "send-text", "w4:p2", "/remote-control"],
       ["pane", "send-text", "w4:p2", "\r"],
     ]);
+  });
+
+  test("screenHasConfirmFooter: 確認系ダイアログのフッターを行頭照合で拾い、送信前 Esc の判定には混ぜない", () => {
+    // 実測 2.1.318: Computer Use の権限案内（番号なし ❯ メニュー + `Enter to confirm · Esc to cancel`）。
+    const screen = "   ❯ Open System Settings → Screen Recording\n     Try again\n\n\n  Enter to confirm · Esc to cancel";
+    expect(screenHasConfirmFooter(screen)).toBe(true);
+    expect(screenHasConfirmFooter("\u001b[2m  Enter to confirm · Esc to cancel\u001b[0m")).toBe(true);
+    expect(screenHasConfirmFooter("フッターに「Enter to confirm」が出ます")).toBe(false);
+    // フォルダ信頼確認の Esc は Claude を終了させるので、送信前に閉じる判定（選択フッター）には入れない。
+    expect(screenHasSelectionFooter(screen)).toBe(false);
   });
 
   test("selectionDialogVisible: 本文が「Enter to select」を引用しても偽陽性にしない（行頭照合）", () => {

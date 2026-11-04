@@ -432,7 +432,7 @@ export class PanePreviewPump {
     this.active = true;
     this.inactiveSent = false;
     // 選択ダイアログ（転写カード対象）のフレームが実際に流れたかを追える遷移ログ。
-    const dialogFrame = text.includes("Enter to select");
+    const dialogFrame = text.includes("Enter to select") || text.includes("Enter to confirm");
     if (dialogFrame !== this.lastEmittedDialog) {
       this.lastEmittedDialog = dialogFrame;
       this.log?.(
