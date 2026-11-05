@@ -1,5 +1,5 @@
 
- ▐▛███▛█   Claude Code v2.1.317
+ ▐▛███▛█   Claude Code v2.1.318
 ▝▜██████▀  Opus 5.5 with high effort · Claude Ultra
  ▝▝   ▝▝   ~/.tailii/tui-probe/cwd
 
@@ -19,6 +19,6 @@
    ❯ 1. Claude account with subscription · Individual, Team, or Enterprise 
      2. Anthropic Console account · API usage billing                         
      3. 3rd-party platform · Amazon Bedrock, Microsoft Foundry, Google Vertex   
-        AI                       
+        AI                 
 
    Esc to cancel                                     
