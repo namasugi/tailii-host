@@ -357,6 +357,9 @@ export function fetchMimeForPath(filePath: string): string {
 /**
  * ファイル原本を `file_fetch_response` のチャンク列として順に yield する（file-download）。
  *
+ * - `offset` を渡すと原本のその位置から末尾までを配り、各チャンクに `offset` を付ける
+ *   （受信しながらの再生で、末尾の索引を先に取り寄せる。`size` は原本全体の大きさのまま）。
+ *   原本の大きさ以上の位置は `error` 付き単一チャンク。
  * - 不正パス・非ファイル・上限超過・読取失敗は `error` 付き単一チャンク（eof:true）。
  * - 空ファイルでも 1 チャンク（data 空・eof:true）を返す。
  * - 読み取り中に `isCancelled()` が true になったら以降を打ち切る（呼び出し側の中止要求）。
@@ -364,7 +367,7 @@ export function fetchMimeForPath(filePath: string): string {
  */
 export async function* fileFetch(
   filePath: string,
-  options: { chunkSize?: number; sizeLimit?: number; isCancelled?: () => boolean } = {},
+  options: { chunkSize?: number; sizeLimit?: number; isCancelled?: () => boolean; offset?: number } = {},
 ): AsyncGenerator<FileFetchChunk> {
   const chunkSize = options.chunkSize ?? FILE_FETCH_CHUNK_SIZE;
   const sizeLimit = options.sizeLimit ?? FILE_FETCH_SIZE_LIMIT;
@@ -390,7 +393,15 @@ export async function* fileFetch(
     return;
   }
 
-  const common = { mime: fetchMimeForPath(filePath), name: path.basename(filePath), size: stat.size };
+  const start = options.offset;
+  if (start !== undefined && start >= stat.size) {
+    yield fetchError("指定位置がファイルの大きさを超えています。");
+    return;
+  }
+  const common = {
+    mime: fetchMimeForPath(filePath), name: path.basename(filePath), size: stat.size,
+    ...(start !== undefined ? { offset: start } : {}),
+  };
   if (stat.size === 0) {
     yield { ...common, seq: 0, data: "", eof: true };
     return;
@@ -405,7 +416,7 @@ export async function* fileFetch(
   }
   try {
     const buffer = Buffer.alloc(chunkSize);
-    let offset = 0;
+    let offset = start ?? 0;
     let seq = 0;
     while (offset < stat.size) {
       if (isCancelled()) return;

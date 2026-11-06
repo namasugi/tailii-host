@@ -131,7 +131,7 @@ export const workspaceHandlers: HandlerRegistry = {
   file_fetch_request: (message, ctx) => {
     const { writer, state } = ctx;
     const v = state.negotiatedVersion;
-    engineDiag(`file_fetch_request id=${message.id} path=${message.path}`);
+    engineDiag(`file_fetch_request id=${message.id} path=${message.path}${message.offset !== undefined ? ` offset=${message.offset}` : ""}`);
     // 同一 id の再要求は前回を打ち切ってから始める（重複配信で seq が混ざるのを防ぐ）。
     const previous = activeFileFetches.get(message.id);
     if (previous !== undefined) previous.cancelled = true;
@@ -141,7 +141,7 @@ export const workspaceHandlers: HandlerRegistry = {
     // 待たずに走らせる。中止要求（file_fetch_cancel）は並行して届く。
     void (async () => {
       try {
-        for await (const chunk of fileFetch(message.path, { isCancelled: () => control.cancelled })) {
+        for await (const chunk of fileFetch(message.path, { isCancelled: () => control.cancelled, offset: message.offset })) {
           if (control.cancelled) break;
           await writer.writeWithBackpressure({ type: "file_fetch_response", v, id: message.id, ...chunk });
         }

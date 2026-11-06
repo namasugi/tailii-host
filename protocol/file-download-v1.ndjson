@@ -5,3 +5,5 @@
 {"id":"ff2","path":"/Users/alice/project/missing.zip","type":"file_fetch_request","v":1}
 {"data":"","eof":true,"error":"Error: ENOENT: no such file or directory, stat '/Users/alice/project/missing.zip'","id":"ff2","seq":0,"type":"file_fetch_response","v":1}
 {"description":"A4 の報告書と元データ","descriptionTruncated":false,"file":"/Users/alice/tmp/報告書.pdf","files":["/Users/alice/tmp/報告書.pdf","/Users/alice/tmp/data.csv"],"id":"toolu_send","label":"ファイルを送信 報告書.pdf ほか1件","name":"SendUserFile","type":"tool_activity","v":1}
+{"id":"ff3","offset":16,"path":"/Users/alice/music/song.wav","type":"file_fetch_request","v":1}
+{"data":"AAAA","eof":true,"id":"ff3","mime":"audio/wav","name":"song.wav","offset":16,"seq":0,"size":19,"type":"file_fetch_response","v":1}

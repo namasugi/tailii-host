@@ -997,7 +997,13 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
 
     case "file_list_request":
     case "file_read_request":
-    case "file_fetch_request":
+    case "file_fetch_request": {
+      const offset = optionalNumber(raw, "offset");
+      if (offset !== undefined && (!Number.isSafeInteger(offset) || offset < 0)) {
+        throw new ProtocolDecodeError("missing-field", "offset");
+      }
+      return compact({ type, v, id: requireString(raw, "id"), path: requireString(raw, "path"), offset });
+    }
     case "git_status_request":
     case "git_branch_list_request":
     case "git_init_request":
@@ -1067,6 +1073,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         name: optionalString(raw, "name"),
         size: optionalNumber(raw, "size"),
         error: optionalString(raw, "error"),
+        offset: optionalNumber(raw, "offset"),
       });
 
     case "git_status_response":

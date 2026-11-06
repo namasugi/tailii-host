@@ -209,6 +209,13 @@ describe("EngineControl — file_fetch (file-download)", () => {
       error: expect.stringContaining("ENOENT"),
     });
 
+    // offset 付きはその位置から末尾までを配り、各チャンクに offset を付ける（size は原本全体）。
+    engine.writeLine(JSON.stringify({ type: "file_fetch_request", v: 1, id: "ffr", path: path.join(root, "doc.pdf"), offset: 6 }));
+    const ranged = decodeControlMessage(await engine.lines.nextOfType("file_fetch_response"));
+    expect(ranged).toMatchObject({ type: "file_fetch_response", id: "ffr", seq: 0, eof: true, offset: 6, size: body.length });
+    if (ranged.type !== "file_fetch_response") throw new Error("unreachable");
+    expect(Buffer.from(ranged.data, "base64").equals(body.subarray(6))).toBe(true);
+
     // 中止は無害（未知 id も含めて例外にしない）。
     engine.writeLine(JSON.stringify({ type: "file_fetch_cancel", v: 1, id: "ff" }));
     await engine.teardown();

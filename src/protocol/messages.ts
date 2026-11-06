@@ -234,6 +234,11 @@ export interface FileFetchChunk {
   size?: number;
   /** 取得失敗の理由。付くときは eof:true・data 空。 */
   error?: string;
+  /**
+   * 途中から読む取り出し（`file_fetch_request.offset`）の開始位置。各チャンクに付ける。
+   * iPhone はこれが無いと「古い host が頭から送っている」とみなして中止する。
+   */
+  offset?: number;
 }
 
 /** git_status_response の変更ファイル 1 件。 */
@@ -742,7 +747,8 @@ export type ControlMessage =
   /** 名前検索応答（Mac→iOS）。`entries[].name` は `path` からの相対パス。 */
   | { type: "file_search_response"; v: number; id: string; path: string; query: string; entries: FileEntry[]; truncated: boolean }
   /** ファイル原本のダウンロード要求（iOS→Mac, file-download）。`path` は絶対パス。 */
-  | { type: "file_fetch_request"; v: number; id: string; path: string }
+  /** `offset` を付けると原本のその位置から末尾までを配る（受信しながらの再生で末尾の索引を先に取り寄せる）。 */
+  | { type: "file_fetch_request"; v: number; id: string; path: string; offset?: number }
   /** ダウンロードの中止（iOS→Mac）。以降のチャンク配信を打ち切る。 */
   | { type: "file_fetch_cancel"; v: number; id: string }
   /** 原本の分割配信（Mac→iOS）。`seq` 昇順・最終チャンクで `eof:true`。失敗は `error` 付き単一チャンク。 */

@@ -193,6 +193,31 @@ describe("fileFetch (file-download)", () => {
     expect(joined.equals(body)).toBe(true);
   });
 
+  test("offset を渡すとその位置から末尾までを配り、各チャンクに offset を付ける", async () => {
+    const root = makeTempDir("file-fetch-offset");
+    const filePath = path.join(root, "song.wav");
+    const body = Buffer.from("0123456789abcdefXYZ");
+    fs.writeFileSync(filePath, body);
+
+    const chunks = await collect(fileFetch(filePath, { chunkSize: 4, offset: 10 }));
+    expect(chunks.map((chunk) => [chunk.seq, chunk.eof])).toEqual([[0, false], [1, false], [2, true]]);
+    expect(chunks.every((chunk) => (chunk as { offset?: number }).offset === 10 && chunk.size === body.length)).toBe(true);
+    const joined = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk.data, "base64")));
+    expect(joined.equals(body.subarray(10))).toBe(true);
+
+    const beyond = await collect(fileFetch(filePath, { offset: body.length }));
+    expect(beyond).toHaveLength(1);
+    expect(beyond[0]?.error).toBeTruthy();
+  });
+
+  test("offset なしのチャンクには offset を付けない（古い iPhone との互換）", async () => {
+    const root = makeTempDir("file-fetch-no-offset");
+    const filePath = path.join(root, "a.bin");
+    fs.writeFileSync(filePath, Buffer.from("abc"));
+    const chunks = await collect(fileFetch(filePath));
+    expect("offset" in (chunks[0] ?? {})).toBe(false);
+  });
+
   test("空ファイルは data 空の 1 チャンク（eof）", async () => {
     const root = makeTempDir("file-fetch-empty");
     const filePath = path.join(root, "empty.bin");
