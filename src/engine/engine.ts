@@ -60,6 +60,7 @@ import {
 import { PreviewServer } from "../services/previewServer.js";
 import {
   decodeControlMessage,
+  ProtocolDecodeError,
   PROTOCOL_MAX_SUPPORTED,
   PROTOCOL_V1,
   type ControlMessage,
@@ -1262,10 +1263,9 @@ async function handleLine(rawLine: string, ctx: HandlerContext): Promise<boolean
     message = decodeControlMessage(trimmed);
   } catch (error) {
     // 破棄（不正 JSON / 未知 type / 非対応版 / 必須欠落）。承認文脈でないので無視。
-    engineDiag(
-      `engine decode 失敗（行破棄）: ${String(error)} 生=${trimmed.slice(0, 120)}`,
-    );
-    process.stderr.write(`[tailii-host engine] decode 失敗、行破棄: ${String(error)}\n`);
+    const category = error instanceof ProtocolDecodeError ? error.reason : "invalid-message";
+    engineDiag(`engine decode 失敗（行破棄）: ${category} bytes=${Buffer.byteLength(trimmed)}`);
+    process.stderr.write(`[tailii-host engine] decode 失敗、行破棄: ${category}\n`);
     return false;
   }
   engineDiag(`engine 受信 type=${message.type}`);

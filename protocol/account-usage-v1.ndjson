@@ -7,3 +7,5 @@
 {"codex":{"fiveHourPercent":25,"monthlyCreditsError":"unavailable"},"id":"au-6","type":"account_usage_response","v":1}
 {"claude":{"extraUsage":{"currency":"USD","decimalPlaces":2,"isEnabled":true,"monthlyLimit":"5000","usedCredits":"1234.5"},"plan":"ultra"},"id":"au-7","type":"account_usage_response","v":1}
 {"claude":{"extraUsage":{"currency":"USD","decimalPlaces":2,"isEnabled":false},"plan":"max"},"id":"au-8","type":"account_usage_response","v":1}
+{"id":"au-9","openaiApi":{"cost":"0.3","currency":"USD","fetchedAt":"2026-11-09T00:00:00.000Z","month":"2026-11"},"type":"account_usage_response","v":1}
+{"id":"au-10","openaiApiError":"admin_key_required","type":"account_usage_response","v":1}

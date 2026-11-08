@@ -69,14 +69,14 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
   try {
     parsed = JSON.parse(text);
   } catch {
-    throw new ProtocolDecodeError("invalid-json", text.slice(0, 80));
+    throw new ProtocolDecodeError("invalid-json", "cannot parse control message");
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     throw new ProtocolDecodeError("invalid-json", "not an object");
   }
   const raw = parsed as Raw;
   const type = raw["type"];
-  if (typeof type !== "string") throw new ProtocolDecodeError("missing-type", text.slice(0, 80));
+  if (typeof type !== "string") throw new ProtocolDecodeError("missing-type", "type");
 
   // v 欠落 = v0 レガシー（承認 2 型のみ復元。他は破棄 = throw）。
   const rawV = raw["v"];
@@ -620,8 +620,13 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
       });
     }
 
-    case "file_fetch_cancel":
     case "account_usage_request":
+      return compact({ type, v, id: requireString(raw, "id"), apiCredentials: decodeApiUsageCredentials(raw["apiCredentials"]) });
+    case "api_usage_options_request":
+      return { type, v, id: requireString(raw, "id") };
+    case "api_usage_options_response":
+      return { type, v, id: requireString(raw, "id"), supported: requireBoolean(raw, "supported") };
+    case "file_fetch_cancel":
     case "question_dismiss":
     case "claude_session_list_request":
       return { type, v, id: requireString(raw, "id") };
@@ -919,6 +924,10 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         codex: decodeCodexAccountUsage(raw["codex"]),
         claudeError: optionalString(raw, "claudeError"),
         codexError: optionalString(raw, "codexError"),
+        openaiApi: decodeOpenAIApiUsage(raw["openaiApi"]),
+        openaiApiError: optionalString(raw, "openaiApiError"),
+        claudeApi: decodeOpenAIApiUsage(raw["claudeApi"]),
+        claudeApiError: optionalString(raw, "claudeApiError"),
         host: decodeHostVersions(raw["host"]),
         fetchedAt: optionalString(raw, "fetchedAt"),
       });
@@ -1382,6 +1391,30 @@ function decodePermissionMode(raw: string | undefined): "default" | "acceptEdits
 /** claude 新規起動の effort（既知 5 値のみ。未知/未指定は undefined = フラグ無し）。 */
 function decodeEffort(raw: string | undefined): "low" | "medium" | "high" | "xhigh" | "max" | undefined {
   return raw === "low" || raw === "medium" || raw === "high" || raw === "xhigh" || raw === "max" ? raw : undefined;
+}
+
+function decodeApiUsageCredentials(value: unknown): import("./messages.js").ApiUsageCredentials | undefined {
+  if (value == null) return undefined;
+  const obj = requireObject(value, "apiCredentials");
+  const credential = (value: unknown): import("./messages.js").ApiUsageCredential | undefined => {
+    if (value == null) return undefined;
+    const record = requireObject(value, "apiCredentials.provider");
+    const mode = requireString(record, "mode");
+    if (mode !== "automatic" && mode !== "custom" && mode !== "disabled") throw new ProtocolDecodeError("missing-field", "apiCredentials.mode");
+    const apiKey = optionalString(record, "apiKey");
+    if (apiKey !== undefined && (apiKey.length > 4096 || /[\r\n]/.test(apiKey))) throw new ProtocolDecodeError("missing-field", "apiCredentials.apiKey");
+    return compact<import("./messages.js").ApiUsageCredential>({ mode, ...(mode === "custom" ? { apiKey } : {}) });
+  };
+  return compact({ openai: credential(obj["openai"]), claude: credential(obj["claude"]) });
+}
+
+function decodeOpenAIApiUsage(value: unknown): import("./messages.js").OpenAIApiUsage | undefined {
+  if (value == null) return undefined;
+  const obj = requireObject(value, "openaiApi");
+  return {
+    month: requireString(obj, "month"), cost: requireString(obj, "cost"),
+    currency: requireString(obj, "currency"), fetchedAt: requireString(obj, "fetchedAt"),
+  };
 }
 
 function decodeClaudeAccountUsage(value: unknown): ClaudeAccountUsage | undefined {

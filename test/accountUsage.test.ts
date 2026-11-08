@@ -33,6 +33,7 @@ import type {
   HostVersions,
 } from "../src/protocol.js";
 import type { PlanUsage, PlanUsageFailureResult } from "../src/services/planUsageFetcher.js";
+import type { OpenAIApiUsageProvider } from "../src/services/openaiApiUsage.js";
 
 /**
  * テスト基準時刻。フィクスチャの resetsAt は**すべてこれより未来**にしてある
@@ -70,6 +71,8 @@ const CODEX: CodexAccountUsage = {
 
 /** account_usage_request を 1 回処理し、書き出された応答と各 provider の呼び出し回数を返す。 */
 function makeHarness(options: {
+  api?: OpenAIApiUsageProvider;
+  claudeApi?: OpenAIApiUsageProvider;
   now: () => number;
   plan: () => Promise<PlanUsage | PlanUsageFailureResult | null>;
   codex: () => Promise<CodexAccountUsage | null>;
@@ -88,6 +91,8 @@ function makeHarness(options: {
   const host = options.host ?? (async (): Promise<HostVersions | null> => HOST);
   const accounts = options.accounts ?? (async (): Promise<AccountIdentities> => ACCOUNTS);
   const handlers = createAccountUsageHandlers({
+    openaiApiUsage: options.api ?? (async () => null),
+    claudeApiUsage: options.claudeApi ?? (async () => null),
     now: options.now,
     ...(options.claudeTtlMs !== undefined && { claudeTtlMs: options.claudeTtlMs }),
     ...(options.codexTtlMs !== undefined && { codexTtlMs: options.codexTtlMs }),
@@ -119,6 +124,18 @@ function makeHarness(options: {
 }
 
 describe("account_usage_request ハンドラ", () => {
+  it("API 利用額は Codex 未起動でも返し、失敗時も使用枠を残す", async () => {
+    const value = { month: "2026-11", cost: "12.34", currency: "USD", fetchedAt: "2026-11-09T00:00:00Z" };
+    const harness = makeHarness({ now: () => NOW_MS, plan: async () => PLAN, codex: async () => null,
+      api: async () => ({ value }) });
+    expect(await harness.request("api")).toMatchObject({ openaiApi: value, codexError: CODEX_ACCOUNT_USAGE_ERROR });
+    const failed = makeHarness({ now: () => NOW_MS, plan: async () => PLAN, codex: async () => CODEX,
+      api: async () => { throw new Error("private"); } });
+    const result = await failed.request("failed-api");
+    expect(result).toMatchObject({ openaiApiError: "unavailable", codex: CODEX });
+    expect(result).not.toHaveProperty("openaiApi");
+  });
+
   it("月替わりは TTL 内でも月間額を取り直す", async () => {
     let clock = Date.parse("2026-10-31T23:59:59Z");
     const harness = makeHarness({

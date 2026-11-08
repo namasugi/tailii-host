@@ -6,6 +6,9 @@ import * as path from "node:path";
 
 // 実物の tmux / herdr を指す環境変数を外す（tmux の中で走らせると `$TMUX` が開発者のサーバを指す。herdr の中なら
 // HERDR_* が実物の herdr を指す）。テストが起こす子プロセスにも引き継がせない。
+// 登録済みの実 API キーをテストや子プロセスへ引き継がない（Costs API の実照会も防ぐ）。
+for (const key of ["OPENAI_ADMIN_KEY", "OPENAI_ADMIN_API_KEY", "OPENAI_API_KEY", "OPENAI_ORG_ID",
+  "ANTHROPIC_ADMIN_KEY", "ANTHROPIC_ADMIN_API_KEY", "ANTHROPIC_API_KEY"]) delete process.env[key];
 for (const key of Object.keys(process.env)) {
   if (key === "TMUX" || key === "TMUX_PANE" || key.startsWith("HERDR_")) delete process.env[key];
 }

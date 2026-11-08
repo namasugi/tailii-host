@@ -20,6 +20,8 @@ import type {
 import type { AccountIdentities } from "../../services/accountIdentity.js";
 import { isPlanUsageFailure, type PlanUsageFailure } from "../../services/planUsageFetcher.js";
 import type { HandlerContext, HandlerRegistry } from "../context.js";
+import { createOpenAIApiUsageProvider, type OpenAIApiUsageProvider } from "../../services/openaiApiUsage.js";
+import { createClaudeApiUsageProvider } from "../../services/claudeApiUsage.js";
 
 /** Claude 側 TTL（ms）。使用量 API は分解能が粗く、2 分で十分新しい。 */
 export const CLAUDE_ACCOUNT_USAGE_TTL_MS = 120_000;
@@ -51,6 +53,8 @@ export const CODEX_ACCOUNT_USAGE_ERROR =
   "Codex の使用量を取得できませんでした（Codex App Server に接続できません）。";
 
 export interface AccountUsageHandlerOptions {
+  openaiApiUsage?: OpenAIApiUsageProvider;
+  claudeApiUsage?: OpenAIApiUsageProvider;
   /** 現在時刻（ms）。テストは固定値/進行を注入して TTL を決定化する。 */
   now?: () => number;
   claudeTtlMs?: number;
@@ -100,6 +104,8 @@ export function createAccountUsageHandlers(
   options: AccountUsageHandlerOptions = {},
 ): HandlerRegistry {
   const now = options.now ?? (() => Date.now());
+  const openaiApiUsage = options.openaiApiUsage ?? createOpenAIApiUsageProvider({ now: () => new Date(now()) });
+  const claudeApiUsage = options.claudeApiUsage ?? createClaudeApiUsageProvider({ now: () => new Date(now()) });
   const claudeTtlMs = options.claudeTtlMs ?? CLAUDE_ACCOUNT_USAGE_TTL_MS;
   const codexTtlMs = options.codexTtlMs ?? CODEX_ACCOUNT_USAGE_TTL_MS;
   const failureTtlMs = options.failureTtlMs ?? ACCOUNT_USAGE_FAILURE_TTL_MS;
@@ -166,15 +172,20 @@ export function createAccountUsageHandlers(
   }
 
   return {
+    api_usage_options_request: (message, ctx) => {
+      ctx.writer.write({ type: "api_usage_options_response", v: ctx.state.negotiatedVersion, id: message.id, supported: true });
+    },
     account_usage_request: async (message, ctx) => {
       const { writer, state } = ctx;
       const v = state.negotiatedVersion;
-      // 4 系統は独立。片方の失敗・遅延がもう片方を巻き込まないよう並行に取る。
-      const [claude, codex, host, accounts] = await Promise.all([
+      // 各系統は独立。登録済み管理キーの API 利用額はサブスクと混ぜない。
+      const [claude, codex, host, accounts, api, claudeApi] = await Promise.all([
         loadClaude(ctx),
         loadCodex(ctx),
         loadHost(ctx),
         loadAccounts(ctx),
+        openaiApiUsage(message.apiCredentials?.openai).catch(() => ({ error: "unavailable" as const })),
+        claudeApiUsage(message.apiCredentials?.claude).catch(() => ({ error: "unavailable" as const })),
       ]);
       // TTL メモの値は共有物。加工は必ずコピーの上で行う（キャッシュを汚さない）。
       const nowMs = now();
@@ -202,7 +213,13 @@ export function createAccountUsageHandlers(
             ? { codex: codexValue }
             : { codexError: CODEX_ACCOUNT_USAGE_ERROR }),
           ...(host !== null ? { host } : {}),
-          fetchedAt: new Date(Math.min(claude.atMs, codex.atMs)).toISOString(),
+          ...(api !== null ? ("value" in api ? { openaiApi: api.value } : { openaiApiError: api.error }) : {}),
+          ...(claudeApi !== null ? ("value" in claudeApi ? { claudeApi: claudeApi.value } : { claudeApiError: claudeApi.error }) : {}),
+          fetchedAt: new Date(Math.min(claude.atMs, codex.atMs,
+            ...(api && "value" in api && Number.isFinite(Date.parse(api.value.fetchedAt))
+              ? [Date.parse(api.value.fetchedAt)] : []),
+            ...(claudeApi && "value" in claudeApi && Number.isFinite(Date.parse(claudeApi.value.fetchedAt))
+              ? [Date.parse(claudeApi.value.fetchedAt)] : []))).toISOString(),
         });
       } catch {
         // 書込失敗（チャネル断）は握り潰す。

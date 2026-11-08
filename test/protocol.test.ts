@@ -24,6 +24,11 @@ function goldenLines(name: string): string[] {
 }
 
 describe("golden roundtrip", () => {
+  it("API 利用額の取得方法 v1 golden 全行が byte-exact でラウンドトリップする", () => {
+    for (const line of goldenLines("api-usage-options-v1.ndjson")) {
+      expect(encodeControlMessage(decodeControlMessage(line))).toBe(line);
+    }
+  });
   it("v1 golden 全行が byte-exact でラウンドトリップする", () => {
     for (const line of goldenLines("approval-protocol-v1.ndjson")) {
       const decoded = decodeControlMessage(line);

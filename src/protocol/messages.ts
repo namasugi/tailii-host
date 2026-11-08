@@ -472,6 +472,24 @@ export interface CodexCredits {
   balance?: string;
 }
 
+/** 登録済み管理キーの組織全体の API 利用額。無料枠の消費内訳・残高とは別。 */
+export interface OpenAIApiUsage {
+  month: string;
+  cost: string;
+  currency: string;
+  fetchedAt: string;
+}
+
+/** キーは端末の Keychain から暗号化チャネルで渡し、応答・ログ・host の設定へ保存しない。 */
+export interface ApiUsageCredential {
+  mode: "automatic" | "custom" | "disabled";
+  apiKey?: string;
+}
+export interface ApiUsageCredentials {
+  openai?: ApiUsageCredential;
+  claude?: ApiUsageCredential;
+}
+
 /** 月内の Codex 追加クレジット消費（符号付き調整を含む）。UTC の暦月。 */
 export interface CodexMonthlyCredits {
   month: string;
@@ -737,7 +755,9 @@ export type ControlMessage =
       sevenDayFableUtilization?: number; sevenDayFableResetsAt?: string;
     }
   /** アカウント使用量の要求（iOS→Mac, account-usage）。session 非依存 — 一覧からも呼べる。 */
-  | { type: "account_usage_request"; v: number; id: string }
+  | { type: "api_usage_options_request"; v: number; id: string }
+  | { type: "api_usage_options_response"; v: number; id: string; supported: boolean }
+  | { type: "account_usage_request"; v: number; id: string; apiCredentials?: ApiUsageCredentials }
   /**
    * アカウント使用量の応答（Mac→iOS, account-usage）。
    *
@@ -750,6 +770,8 @@ export type ControlMessage =
       type: "account_usage_response"; v: number; id: string;
       claude?: ClaudeAccountUsage; codex?: CodexAccountUsage;
       claudeError?: string; codexError?: string;
+      openaiApi?: OpenAIApiUsage; openaiApiError?: string;
+      claudeApi?: OpenAIApiUsage; claudeApiError?: string;
       host?: HostVersions;
       fetchedAt?: string;
     }
