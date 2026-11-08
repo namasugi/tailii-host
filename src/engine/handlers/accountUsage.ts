@@ -13,6 +13,7 @@
 
 import type {
   ClaudeAccountUsage,
+  ClaudeExtraUsage,
   CodexAccountUsage,
   HostVersions,
 } from "../../protocol/messages.js";
@@ -127,7 +128,12 @@ export function createAccountUsageHandlers(
 
   async function loadCodex(ctx: HandlerContext): Promise<CacheEntry<CodexAccountUsage>> {
     const at = now();
-    if (cacheFresh(codexCache, at, codexTtlMs, failureTtlMs)) return codexCache;
+    const ttl = codexCache?.value?.monthlyCreditsError === undefined
+      ? codexTtlMs : Math.min(codexTtlMs, failureTtlMs);
+    if (cacheFresh(codexCache, at, ttl, failureTtlMs)
+      && new Date(codexCache.atMs).toISOString().slice(0, 7) === new Date(at).toISOString().slice(0, 7)) {
+      return codexCache;
+    }
     let value: CodexAccountUsage | null = null;
     try {
       value = await ctx.codexAccountUsage();
@@ -228,7 +234,10 @@ export function withAccount<T extends ClaudeAccountUsage | CodexAccountUsage>(
   const sameTokenResolved = (
     usage as ClaudeAccountUsage & { [CLAUDE_ACCOUNT_FROM_USAGE_TOKEN]?: true }
   )[CLAUDE_ACCOUNT_FROM_USAGE_TOKEN] === true;
-  return account === undefined || usage.account !== undefined || sameTokenResolved
+  // Codex は月間取得の失敗時も同じ App Server の account/read に表示元を固定する。
+  const codexAccountResolved = ("monthlyCredits" in usage && usage.monthlyCredits !== undefined)
+    || ("monthlyCreditsError" in usage && usage.monthlyCreditsError !== undefined);
+  return account === undefined || usage.account !== undefined || sameTokenResolved || codexAccountResolved
     ? usage
     : { ...usage, account };
 }
@@ -281,6 +290,7 @@ export function toClaudeAccountUsage(
     rateLimitTier?: string | null;
     /** 使用量取得に成功した同じ OAuth token のマスク済みアカウント。 */
     account?: string | null;
+    extraUsage?: ClaudeExtraUsage;
   } | null,
 ): ClaudeAccountUsage | null {
   if (plan === null) return null;
@@ -292,6 +302,7 @@ export function toClaudeAccountUsage(
     // premium = 上位モデルの週次枠（PlanUsage の sevenDayFable*）。
     ...(plan.sevenDayFableUtilization !== null && { premiumPercent: plan.sevenDayFableUtilization }),
     ...(plan.sevenDayFableResetsAt !== null && { premiumResetsAt: plan.sevenDayFableResetsAt }),
+    ...(plan.extraUsage !== undefined ? { extraUsage: plan.extraUsage } : {}),
     // プランバッジ用の生値（credentials 由来。アクセストークンは決して載せない）。
     ...(plan.subscriptionType ? { plan: plan.subscriptionType } : {}),
     ...(plan.rateLimitTier ? { rateLimitTier: plan.rateLimitTier } : {}),
@@ -305,7 +316,7 @@ export function toClaudeAccountUsage(
   if (
     usage.fiveHourPercent === undefined &&
     usage.sevenDayPercent === undefined &&
-    usage.premiumPercent === undefined
+    usage.premiumPercent === undefined && usage.extraUsage === undefined
   ) {
     return null;
   }

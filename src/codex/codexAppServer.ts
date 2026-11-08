@@ -909,7 +909,7 @@ export class CodexAppServerManager {
   readonly socketPath: string;
   readonly remoteEndpoint: string;
 
-  private readonly codexHome: string;
+  readonly codexHome: string;
   private readonly codexPath: string;
   private readonly connect: CodexAppServerConnect;
   private readonly launch: CodexAppServerLaunch;

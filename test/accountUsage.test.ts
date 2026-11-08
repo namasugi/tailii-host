@@ -119,6 +119,45 @@ function makeHarness(options: {
 }
 
 describe("account_usage_request ハンドラ", () => {
+  it("月替わりは TTL 内でも月間額を取り直す", async () => {
+    let clock = Date.parse("2026-10-31T23:59:59Z");
+    const harness = makeHarness({
+      now: () => clock, plan: async () => null,
+      codex: async () => ({ monthlyCredits: {
+        month: new Date(clock).toISOString().slice(0, 7), credits: "1", fetchedAt: new Date(clock).toISOString(),
+      } }),
+    });
+    await harness.request("before");
+    clock += 1000;
+    expect((await harness.request("after")).codex?.monthlyCredits?.month).toBe("2026-11");
+    expect(harness.calls.codex).toBe(2);
+  });
+
+  it("月間額だけの失敗は使用枠を残し、短い TTL で再試行できる", async () => {
+    let clock = NOW_MS;
+    const harness = makeHarness({ now: () => clock, plan: async () => null,
+      codex: async () => ({ fiveHourPercent: 25, monthlyCreditsError: "unavailable" }) });
+    expect((await harness.request("first")).codex?.fiveHourPercent).toBe(25);
+    clock += 15_001;
+    await harness.request("retry");
+    expect(harness.calls.codex).toBe(2);
+  });
+
+  it("月間消費のアカウントを別取得のログイン情報で上書きしない", async () => {
+    for (const account of ["c***@example.com", undefined]) {
+      const harness = makeHarness({ now: () => NOW_MS, plan: async () => null,
+        codex: async () => ({ account, monthlyCredits: { month: "2026-07", credits: "1", fetchedAt: new Date(NOW_MS).toISOString() } }),
+      });
+      expect((await harness.request("same-owner")).codex?.account).toBe(account);
+    }
+  });
+
+  it("月間取得に失敗しても、別のログイン情報で残高のアカウントを埋めない", async () => {
+    const harness = makeHarness({ now: () => NOW_MS, plan: async () => null,
+      codex: async () => ({ credits: { balance: "12" }, monthlyCreditsError: "account_mismatch" }) });
+    expect((await harness.request("unknown-owner")).codex?.account).toBeUndefined();
+  });
+
   it("両方取得できたら claude/codex を載せ error を出さない", async () => {
     const harness = makeHarness({
       now: () => NOW_MS,
@@ -505,6 +544,61 @@ describe("toClaudeAccountUsage", () => {
 });
 
 describe("parseCodexAccountUsage", () => {
+  it("異常なリセット時刻でも枠と残高を失わず、巨大な使用率を wire へ流さない", () => {
+    expect(parseCodexAccountUsage({ rateLimits: {
+      primary: { usedPercent: Number.MAX_VALUE, resetsAt: Number.MAX_VALUE },
+      credits: { balance: "12.5" },
+    } })).toEqual({ fiveHourPercent: 100, credits: { balance: "12.5" } });
+    expect(parseCodexAccountUsage({ primary: { usedPercent: -Number.MAX_VALUE } }))
+      .toEqual({ fiveHourPercent: 0 });
+  });
+  it("追加クレジットの小数残高とリセット残り回数を保つ（詳細行の長さは使わない）", () => {
+    expect(parseCodexAccountUsage({
+      rateLimits: {
+        planType: "plus",
+        credits: { hasCredits: true, unlimited: false, balance: "9007199254740993.125" },
+      },
+      rateLimitResetCredits: { availableCount: 2, credits: [] },
+    })).toEqual({
+      planType: "plus",
+      credits: { hasCredits: true, unlimited: false, balance: "9007199254740993.125" },
+      rateLimitResetCreditsAvailable: 2,
+    });
+  });
+
+  it("残高 0 と残り 0 回を欠落と区別し、使用枠がなくても返す", () => {
+    expect(parseCodexAccountUsage({
+      rateLimits: { credits: { hasCredits: false, unlimited: false, balance: "0" } },
+      rateLimitResetCredits: { availableCount: 0 },
+    })).toEqual({
+      credits: { hasCredits: false, unlimited: false, balance: "0" },
+      rateLimitResetCreditsAvailable: 0,
+    });
+    expect(parseCodexAccountUsage({ rateLimits: { primary: { usedPercent: 10 } } }))
+      .toEqual({ fiveHourPercent: 10 });
+  });
+
+  it("無制限・残高不明と、新形式の Codex バケットも読める", () => {
+    expect(parseCodexAccountUsage({
+      rateLimits: null,
+      rateLimitsByLimitId: { codex: { credits: { unlimited: true, balance: null } } },
+    })).toEqual({ credits: { unlimited: true } });
+    expect(parseCodexAccountUsage({ credits: { has_credits: true } }))
+      .toEqual({ credits: { hasCredits: true } });
+  });
+
+  it("壊れた残高や回数から 0 を捏造せず、読めた使用枠は残す", () => {
+    for (const balance of ["NaN", "Infinity", "$20", "1e3", "", "1\n2", "1".repeat(65), 20]) {
+      expect(parseCodexAccountUsage({
+        primary: { usedPercent: 10 }, credits: { balance },
+        rateLimitResetCredits: { availableCount: -1, credits: [{ id: "unused" }] },
+      })).toEqual({ fiveHourPercent: 10 });
+    }
+    for (const availableCount of [null, "2", 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(parseCodexAccountUsage({ rateLimitResetCredits: { availableCount } })).toBeNull();
+    }
+  });
+
   it("v2 camelCase 応答を 5時間枠 / 週次枠へ写す（resetsAt は Unix 秒 → ISO）", () => {
     expect(
       parseCodexAccountUsage({

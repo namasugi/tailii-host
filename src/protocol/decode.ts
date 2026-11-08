@@ -1392,9 +1392,21 @@ function decodeClaudeAccountUsage(value: unknown): ClaudeAccountUsage | undefine
     sevenDayResetsAt: optionalString(obj, "sevenDayResetsAt"),
     premiumPercent: optionalNumber(obj, "premiumPercent"),
     premiumResetsAt: optionalString(obj, "premiumResetsAt"),
+    extraUsage: obj["extraUsage"] == null ? undefined : decodeClaudeExtraUsage(obj["extraUsage"]),
     plan: optionalString(obj, "plan"),
     rateLimitTier: optionalString(obj, "rateLimitTier"),
     account: optionalString(obj, "account"),
+  });
+}
+
+function decodeClaudeExtraUsage(value: unknown): NonNullable<ClaudeAccountUsage["extraUsage"]> {
+  const obj = requireObject(value, "claude.extraUsage");
+  return compact({
+    isEnabled: optionalBoolean(obj, "isEnabled"),
+    usedCredits: optionalString(obj, "usedCredits"),
+    monthlyLimit: optionalString(obj, "monthlyLimit"),
+    currency: optionalString(obj, "currency"),
+    decimalPlaces: optionalNumber(obj, "decimalPlaces"),
   });
 }
 
@@ -1432,8 +1444,30 @@ function decodeCodexAccountUsage(value: unknown): CodexAccountUsage | undefined 
     fiveHourResetsAt: optionalString(obj, "fiveHourResetsAt"),
     weeklyPercent: optionalNumber(obj, "weeklyPercent"),
     weeklyResetsAt: optionalString(obj, "weeklyResetsAt"),
+    credits: obj["credits"] == null ? undefined : decodeCodexCredits(obj["credits"]),
+    monthlyCredits: obj["monthlyCredits"] == null ? undefined : decodeCodexMonthlyCredits(obj["monthlyCredits"]),
+    monthlyCreditsError: optionalString(obj, "monthlyCreditsError"),
+    rateLimitResetCreditsAvailable: optionalNumber(obj, "rateLimitResetCreditsAvailable"),
     account: optionalString(obj, "account"),
   });
+}
+
+function decodeCodexCredits(value: unknown): NonNullable<CodexAccountUsage["credits"]> {
+  const obj = requireObject(value, "codex.credits");
+  return compact({
+    hasCredits: optionalBoolean(obj, "hasCredits"),
+    unlimited: optionalBoolean(obj, "unlimited"),
+    balance: optionalString(obj, "balance"),
+  });
+}
+
+function decodeCodexMonthlyCredits(value: unknown): NonNullable<CodexAccountUsage["monthlyCredits"]> {
+  const obj = requireObject(value, "codex.monthlyCredits");
+  return {
+    month: requireString(obj, "month"),
+    credits: requireString(obj, "credits"),
+    fetchedAt: requireString(obj, "fetchedAt"),
+  };
 }
 
 function requireHostUpdateStatus(raw: Raw): HostUpdateStatus {

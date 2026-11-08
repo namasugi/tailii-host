@@ -17,7 +17,9 @@
 // （呼び出し側が codexError 文字列へ落とす）。
 
 import type { CodexAppServerManager } from "./codexAppServer.js";
-import type { CodexAccountUsage } from "../protocol/messages.js";
+import type { CodexAccountUsage, CodexCredits } from "../protocol/messages.js";
+import { fetchCodexMonthlyCredits, type MonthlyCreditsOptions, type MonthlyCreditsResult } from "./codexMonthlyCredits.js";
+import { maskEmail } from "../services/accountIdentity.js";
 
 /** engine へ注入するフェッチャの型（テストは固定値/null を注入する）。 */
 export type CodexAccountUsageProvider = () => Promise<CodexAccountUsage | null>;
@@ -36,6 +38,7 @@ export const CODEX_ACCOUNT_USAGE_TIMEOUT_MS = 5_000;
 export async function fetchCodexAccountUsage(
   manager: CodexAppServerManager | null,
   timeoutMs: number = CODEX_ACCOUNT_USAGE_TIMEOUT_MS,
+  monthlyCredits: (options: MonthlyCreditsOptions) => Promise<MonthlyCreditsResult> = fetchCodexMonthlyCredits,
 ): Promise<CodexAccountUsage | null> {
   if (manager === null) return null;
   try {
@@ -43,7 +46,31 @@ export async function fetchCodexAccountUsage(
     const connection = await manager.connectIfRunning(timeoutMs);
     if (connection === null) return null;
     try {
-      return parseCodexAccountUsage(await connection.request("account/rateLimits/read", undefined));
+      const [raw, accountRaw] = await Promise.all([
+        connection.request("account/rateLimits/read", undefined),
+        connection.request("account/read", { refreshToken: false }).catch(() => null),
+      ]);
+      const usage = parseCodexAccountUsage(raw);
+      const accountId = objectRecord(raw)?.["accountId"];
+      const account = objectRecord(objectRecord(accountRaw)?.["account"]);
+      const accountEmail = account?.["type"] === "chatgpt" && typeof account["email"] === "string"
+        ? account["email"] : undefined;
+      const displayAccount = maskEmail(accountEmail);
+      let monthly: MonthlyCreditsResult;
+      try {
+        monthly = await monthlyCredits({
+          codexHome: manager.codexHome,
+          accountId: typeof accountId === "string" ? accountId : undefined,
+          accountEmail,
+          timeoutMs: Math.min(timeoutMs, 3_000),
+        });
+      } catch {
+        monthly = { error: "unavailable" };
+      }
+      if ("value" in monthly) {
+        return { ...usage, monthlyCredits: monthly.value, account: displayAccount };
+      }
+      return usage === null ? null : { ...usage, monthlyCreditsError: monthly.error, account: displayAccount };
     } finally {
       connection.close();
     }
@@ -56,16 +83,27 @@ export async function fetchCodexAccountUsage(
  * `account/rateLimits/read` 応答を `CodexAccountUsage` へ落とす（純ロジック, TESTABLE）。
  *
  * 形式は寛容に読む: `rateLimits` 包みでも素の `{primary,secondary}` でも、キーが
- * camelCase（v2）でも snake_case（旧 rollout 互換）でも拾う。1 枠も読めなければ null。
+ * camelCase（v2）でも snake_case（旧 rollout 互換）でも拾う。
+ * クレジットだけ読める場合も返す。未知の残高を 0 にせず、数値文字列の精度を保つ。
  */
 export function parseCodexAccountUsage(raw: unknown): CodexAccountUsage | null {
   const root = objectRecord(raw);
   if (root === null) return null;
-  const limits = objectRecord(root["rateLimits"]) ?? objectRecord(root["rate_limits"]) ?? root;
+  const buckets = objectRecord(root["rateLimitsByLimitId"]);
+  const limits = objectRecord(root["rateLimits"]) ?? objectRecord(root["rate_limits"])
+    ?? objectRecord(buckets?.["codex"]) ?? root;
 
   const result: CodexAccountUsage = {};
   const planType = firstString(limits["planType"], limits["plan_type"], root["planType"], root["plan_type"]);
   if (planType !== undefined) result.planType = planType;
+  const credits = parseCredits(limits["credits"]);
+  if (credits !== undefined) result.credits = credits;
+  const resetCredits = objectRecord(root["rateLimitResetCredits"]);
+  const resetCount = resetCredits?.["availableCount"];
+  // 詳細行は件数が省略・制限されるため、その長さから残り回数を推定しない。
+  if (typeof resetCount === "number" && Number.isSafeInteger(resetCount) && resetCount >= 0) {
+    result.rateLimitResetCreditsAvailable = resetCount;
+  }
 
   // 枠は duration で分類する（位置は保証されない — ファイル冒頭コメント参照）。
   // 同じ枠へ 2 つ写ろうとしたら先勝ち（primary が主バケット）。
@@ -90,9 +128,24 @@ export function parseCodexAccountUsage(raw: unknown): CodexAccountUsage | null {
     }
   }
 
-  // planType だけでは「使用量」を語れない。1 枠も読めなければ未取得として扱う。
-  if (result.fiveHourPercent === undefined && result.weeklyPercent === undefined) return null;
+  // プラン名だけでは成功にしない。使用枠が欠けても、読めた残高・リセット回数は残す。
+  if (result.fiveHourPercent === undefined && result.weeklyPercent === undefined
+    && result.credits === undefined && result.rateLimitResetCreditsAvailable === undefined) return null;
   return result;
+}
+
+function parseCredits(raw: unknown): CodexCredits | undefined {
+  const credits = objectRecord(raw);
+  if (credits === null) return undefined;
+  const result: CodexCredits = {};
+  const hasCredits = credits["hasCredits"] ?? credits["has_credits"];
+  if (typeof hasCredits === "boolean") result.hasCredits = hasCredits;
+  if (typeof credits["unlimited"] === "boolean") result.unlimited = credits["unlimited"];
+  const balance = typeof credits["balance"] === "string" ? credits["balance"].trim() : undefined;
+  if (balance !== undefined && balance.length <= 64 && /^-?[0-9]+(?:\.[0-9]+)?$/.test(balance)) {
+    result.balance = balance;
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
 }
 
 /** 「5時間枠」とみなす window 長の上限（分）。それ超（週次=10080 等）は週次枠。 */
@@ -110,10 +163,12 @@ function parseWindow(raw: unknown): { percent?: number; resetsAt?: string; durat
     window["window_duration_mins"],
     window["window_minutes"],
   );
+  const resetDate = resets === undefined ? undefined : new Date(Math.floor(resets) * 1_000);
+  const validReset = resetDate !== undefined && Number.isFinite(resetDate.getTime());
   return {
-    ...(used !== undefined ? { percent: Math.round(used) } : {}),
+    ...(used !== undefined ? { percent: Math.min(100, Math.max(0, Math.round(used))) } : {}),
     // resets_at は Unix 秒。ワイヤーは ISO 文字列で運ぶ。
-    ...(resets !== undefined ? { resetsAt: new Date(Math.floor(resets) * 1_000).toISOString() } : {}),
+    ...(validReset ? { resetsAt: resetDate.toISOString() } : {}),
     ...(duration !== undefined ? { durationMins: duration } : {}),
   };
 }

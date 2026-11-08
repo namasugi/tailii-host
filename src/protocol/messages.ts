@@ -429,14 +429,19 @@ export interface OfficialAppActionResult {
   unavailableReason?: string;
 }
 
+/** Claude が返す請求期間の追加利用額。金額は通貨の最小単位のまま運ぶ。 */
+export interface ClaudeExtraUsage {
+  isEnabled?: boolean;
+  usedCredits?: string;
+  monthlyLimit?: string;
+  currency?: string;
+  decimalPlaces?: number;
+}
+
 /**
- * アカウント全体の使用量（`account_usage_response`）の Claude 側（account-usage）。
- *
- * 全フィールド optional（取得できた枠だけ載せ、欠落は「その枠は不明」を意味する）。
- * `premium*` は上位モデルの週次枠（`PlanUsage.sevenDayFable*` 相当）。percent は 0..100 の丸め済み、
- * `*ResetsAt` は ISO 8601 文字列。
- *
- * `plan` / `rateLimitTier` は credentials JSON 由来の**生値**（表示整形は iOS 側の責務）。
+ * アカウント全体の使用枠・追加利用額の Claude 側。欠落は不明、0 ではない。
+ * `premium*` は上位モデルの週次枠、`*ResetsAt` は ISO 8601。
+ * `plan` / `rateLimitTier` は認証情報の生値で、現行名への写像は表示側が持つ。
  */
 export interface ClaudeAccountUsage {
   fiveHourPercent?: number;
@@ -445,9 +450,10 @@ export interface ClaudeAccountUsage {
   sevenDayResetsAt?: string;
   premiumPercent?: number;
   premiumResetsAt?: string;
+  extraUsage?: ClaudeExtraUsage;
   /** 契約種別の生値（"max" / "pro" 等。credentials の `subscriptionType`）。 */
   plan?: string;
-  /** レート制限ティアの生値（"default_claude_max_20x" 等）。`plan` の細分（Max 20x/5x）に使う。 */
+  /** レート制限ティアの生値（"default_claude_max_20x" 等）。旧識別子から現行名を導く。 */
   rateLimitTier?: string;
   /**
    * ログイン中アカウントの**マスク済み**表示（"a***@example.com"）。
@@ -456,11 +462,24 @@ export interface ClaudeAccountUsage {
   account?: string;
 }
 
+/** Codex の追加クレジット。API Platform の無料・購入済み API 残高とは別枠。 */
+export interface CodexCredits {
+  hasCredits?: boolean;
+  unlimited?: boolean;
+  /** 単位はクレジット。小数精度を保持し、USD と解釈しない。 */
+  balance?: string;
+}
+
+/** 月内の Codex 追加クレジット消費（符号付き調整を含む）。UTC の暦月。 */
+export interface CodexMonthlyCredits {
+  month: string;
+  credits: string;
+  fetchedAt: string;
+}
+
 /**
- * アカウント全体の使用量（`account_usage_response`）の Codex 側（account-usage）。
- *
- * App Server `account/rateLimits/read` の `primary`（5時間枠）/`secondary`（週次枠）に対応する。
- * `planType` はプラン識別子（"plus" 等の生値。表示整形は iOS 側の責務）。
+ * アカウント全体の使用枠・残高（`account_usage_response`）の Codex 側。
+ * App Server `account/rateLimits/read` 由来。`planType` は生値のまま運ぶ。
  */
 export interface CodexAccountUsage {
   planType?: string;
@@ -468,6 +487,11 @@ export interface CodexAccountUsage {
   fiveHourResetsAt?: string;
   weeklyPercent?: number;
   weeklyResetsAt?: string;
+  credits?: CodexCredits;
+  monthlyCredits?: CodexMonthlyCredits;
+  monthlyCreditsError?: string;
+  /** 獲得した利用枠リセットの残り回数。金額や無料 API クレジットではない。 */
+  rateLimitResetCreditsAvailable?: number;
   /** ログイン中アカウントの**マスク済み**表示（`ClaudeAccountUsage.account` と同じ規約）。 */
   account?: string;
 }

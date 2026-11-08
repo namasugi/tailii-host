@@ -19,6 +19,7 @@ import {
   type RefreshedClaudeCredential,
 } from "./claudeCredentialRefresh.js";
 import { readKeychainMirror, writeKeychainMirror } from "./keychainMirror.js";
+import type { ClaudeExtraUsage } from "../protocol/messages.js";
 
 /**
  * プラン使用状況（5時間枠/7日枠/上位モデル週間枠の使用率とリセット時刻）。
@@ -34,6 +35,7 @@ export interface PlanUsage {
   sevenDayResetsAt: string | null;
   sevenDayFableUtilization: number | null;
   sevenDayFableResetsAt: string | null;
+  extraUsage?: ClaudeExtraUsage;
   /** 契約種別の生値（"max" / "pro" 等）。credentials に無ければ null。 */
   subscriptionType: string | null;
   /** レート制限ティアの生値（"default_claude_max_20x" 等）。credentials に無ければ null。 */
@@ -267,7 +269,8 @@ export function parsePlanUsage(raw: unknown): PlanUsage | null {
     }
   }
 
-  if (five[0] === null && seven[0] === null && fable[0] === null) return null;
+  const extraUsage = parseClaudeExtraUsage(obj["extra_usage"]);
+  if (five[0] === null && seven[0] === null && fable[0] === null && extraUsage === undefined) return null;
   return {
     fiveHourUtilization: five[0],
     fiveHourResetsAt: five[1],
@@ -275,14 +278,42 @@ export function parsePlanUsage(raw: unknown): PlanUsage | null {
     sevenDayResetsAt: seven[1],
     sevenDayFableUtilization: fable[0],
     sevenDayFableResetsAt: fable[1],
+    ...(extraUsage !== undefined ? { extraUsage } : {}),
     // プラン情報は使用量 API 応答には無い（credentials 由来。fetchPlanUsage が後付けする）。
     subscriptionType: null,
     rateLimitTier: null,
   };
 }
 
+/** null の上限は無制限と解釈しない。通貨なしの旧応答は公式 CLI と同じく USD。 */
+export function parseClaudeExtraUsage(raw: unknown): ClaudeExtraUsage | undefined {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
+  const obj = raw as Record<string, unknown>;
+  const result: ClaudeExtraUsage = {};
+  if (typeof obj["is_enabled"] === "boolean") result.isEnabled = obj["is_enabled"];
+  const amount = (value: unknown, nonnegative = false): string | undefined =>
+    typeof value === "number" && Number.isFinite(value) && Math.abs(value) <= Number.MAX_SAFE_INTEGER
+      && (!nonnegative || value >= 0) ? String(value) : undefined;
+  const used = amount(obj["used_credits"]);
+  const limit = amount(obj["monthly_limit"], true);
+  if (used !== undefined) result.usedCredits = used;
+  if (limit !== undefined) result.monthlyLimit = limit;
+  const rawCurrency = obj["currency"];
+  const currency = rawCurrency == null ? "USD"
+    : typeof rawCurrency === "string" ? rawCurrency.trim().toUpperCase() : undefined;
+  if (currency !== undefined && Intl.supportedValuesOf("currency").includes(currency)) {
+    result.currency = currency;
+    // SDK の契約は通貨の最小単位。仕様外の decimal_places を換算率に使わない。
+    result.decimalPlaces = new Intl.NumberFormat("en-US", { style: "currency", currency })
+      .resolvedOptions().maximumFractionDigits;
+  }
+  // 通貨だけが分かっても「追加利用を取得できた」とは扱わない。
+  return result.isEnabled !== undefined || used !== undefined || limit !== undefined ? result : undefined;
+}
+
 function roundedPercent(raw: unknown): number | null {
-  return typeof raw === "number" && Number.isFinite(raw) ? Math.round(raw) : null;
+  return typeof raw === "number" && Number.isFinite(raw)
+    ? Math.min(100, Math.max(0, Math.round(raw))) : null;
 }
 
 /**
