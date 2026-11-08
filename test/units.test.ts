@@ -2469,7 +2469,7 @@ describe("presentCrossSessionMessage", () => {
 });
 
 describe("searchClaudeSessions", () => {
-  test("圧縮の要約（isCompactSummary の user 行）は検索対象にしない（原文の行で当たる）", () => {
+  test("圧縮の要約（isCompactSummary の user 行）は検索対象にしない（原文の行で当たる）", async () => {
     const root = makeTempDir("session-search-compact");
     const slug = path.join(root, "-tmp-proj");
     fs.mkdirSync(slug, { recursive: true });
@@ -2483,13 +2483,13 @@ describe("searchClaudeSessions", () => {
     );
     const store = new ClaudeSessionStore(root);
 
-    expect(searchClaudeSessions(store, "needle-summary").results).toEqual([]);
-    const hit = searchClaudeSessions(store, "ログインが止まる").results;
+    expect((await searchClaudeSessions(store, "needle-summary")).results).toEqual([]);
+    const hit = (await searchClaudeSessions(store, "ログインが止まる")).results;
     expect(hit).toHaveLength(1);
     expect(hit[0]?.snippet).toBe("ログインが止まる");
   });
 
-  test("/context の Markdown 写し（isMeta の user 行）は検索対象にしない", () => {
+  test("/context の Markdown 写し（isMeta の user 行）は検索対象にしない", async () => {
     const root = makeTempDir("session-search-context-copy");
     const slug = path.join(root, "-tmp-proj");
     fs.mkdirSync(slug, { recursive: true });
@@ -2501,10 +2501,10 @@ describe("searchClaudeSessions", () => {
       ].join("\n") + "\n",
     );
     const store = new ClaudeSessionStore(root);
-    expect(searchClaudeSessions(store, "needle-context").results).toEqual([]);
+    expect((await searchClaudeSessions(store, "needle-context")).results).toEqual([]);
   });
 
-  test("ターンの同伴行（isMeta + turnCompanion: /doctor の展開済みプロンプト）は検索対象にしない", () => {
+  test("ターンの同伴行（isMeta + turnCompanion: /doctor の展開済みプロンプト）は検索対象にしない", async () => {
     const root = makeTempDir("session-search-companion");
     const slug = path.join(root, "-tmp-proj");
     fs.mkdirSync(slug, { recursive: true });
@@ -2516,10 +2516,10 @@ describe("searchClaudeSessions", () => {
       ].join("\n") + "\n",
     );
     const store = new ClaudeSessionStore(root);
-    expect(searchClaudeSessions(store, "needle-doctor").results).toEqual([]);
+    expect((await searchClaudeSessions(store, "needle-doctor")).results).toEqual([]);
   });
 
-  test("harness 注入（assistant 末尾の背景通知 / user のリマインダ）は検索対象にもスニペットにも出さない", () => {
+  test("harness 注入（assistant 末尾の背景通知 / user のリマインダ）は検索対象にもスニペットにも出さない", async () => {
     const root = makeTempDir("session-search-reminder");
     const slug = path.join(root, "-tmp-proj");
     fs.mkdirSync(slug, { recursive: true });
@@ -2532,14 +2532,14 @@ describe("searchClaudeSessions", () => {
     );
     const store = new ClaudeSessionStore(root);
 
-    expect(searchClaudeSessions(store, "needle-injected").results).toEqual([]);
-    expect(searchClaudeSessions(store, "needle-user").results).toEqual([]);
-    const hit = searchClaudeSessions(store, "needle-body").results;
+    expect((await searchClaudeSessions(store, "needle-injected")).results).toEqual([]);
+    expect((await searchClaudeSessions(store, "needle-user")).results).toEqual([]);
+    const hit = (await searchClaudeSessions(store, "needle-body")).results;
     expect(hit).toHaveLength(1);
     expect(hit[0]?.snippet).toBe("本文 needle-body");
   });
 
-  test("注入ブロックや段落区切りを挟んだ複数語クエリも空白 1 つに畳んで照合する", () => {
+  test("注入ブロックや段落区切りを挟んだ複数語クエリも空白 1 つに畳んで照合する", async () => {
     const root = makeTempDir("session-search-spacing");
     const slug = path.join(root, "-tmp-proj");
     fs.mkdirSync(slug, { recursive: true });
@@ -2554,15 +2554,15 @@ describe("searchClaudeSessions", () => {
         ] } }),
       ].join("\n") + "\n",
     );
-    const hit = searchClaudeSessions(new ClaudeSessionStore(root), "alpha beta").results;
+    const hit = (await searchClaudeSessions(new ClaudeSessionStore(root), "alpha beta")).results;
     expect(hit).toHaveLength(1);
     expect(hit[0]?.snippet).toBe("前半 alpha beta 後半 gamma");
     // クエリ側も同じ正規化: 全角スペース / 連続空白で区切っても同じヒット。
-    expect(searchClaudeSessions(new ClaudeSessionStore(root), "alpha\u3000beta").results).toHaveLength(1);
-    expect(searchClaudeSessions(new ClaudeSessionStore(root), "  alpha   beta ").results).toHaveLength(1);
+    expect((await searchClaudeSessions(new ClaudeSessionStore(root), "alpha\u3000beta")).results).toHaveLength(1);
+    expect((await searchClaudeSessions(new ClaudeSessionStore(root), "  alpha   beta ")).results).toHaveLength(1);
   });
 
-  test("全角スペースで区切られた本文も、半角/全角どちらのクエリでもヒットする", () => {
+  test("全角スペースで区切られた本文も、半角/全角どちらのクエリでもヒットする", async () => {
     const root = makeTempDir("session-search-ideographic-space");
     const slug = path.join(root, "-tmp-proj");
     fs.mkdirSync(slug, { recursive: true });
@@ -2571,11 +2571,11 @@ describe("searchClaudeSessions", () => {
       JSON.stringify({ type: "user", cwd: "/tmp/proj", timestamp: "2026-01-01T00:00:00Z", message: { content: "マスコット\u3000しっぽ を直して" } }) + "\n",
     );
     const store = new ClaudeSessionStore(root);
-    expect(searchClaudeSessions(store, "マスコット\u3000しっぽ").results).toHaveLength(1);
-    expect(searchClaudeSessions(store, "マスコット しっぽ").results).toHaveLength(1);
+    expect((await searchClaudeSessions(store, "マスコット\u3000しっぽ")).results).toHaveLength(1);
+    expect((await searchClaudeSessions(store, "マスコット しっぽ")).results).toHaveLength(1);
   });
 
-  test("user/assistant 本文を大文字小文字無視で検索し snippet 付きで updatedAt 降順に返す", () => {
+  test("user/assistant 本文を大文字小文字無視で検索し snippet 付きで updatedAt 降順に返す", async () => {
     const root = makeTempDir("session-search");
     const slugA = path.join(root, "-Users-alice-proj-a");
     const slugB = path.join(root, "-Users-alice-proj-b");
@@ -2598,7 +2598,7 @@ describe("searchClaudeSessions", () => {
       ].join("\n") + "\n",
     );
 
-    const response = searchClaudeSessions(new ClaudeSessionStore(root), "approval", { limit: 10 });
+    const response = (await searchClaudeSessions(new ClaudeSessionStore(root), "approval", { limit: 10 }));
 
     expect(response.results.map((r) => r.sessionId)).toEqual(["bbbbbbbb-search", "aaaaaaaa-search"]);
     expect(response.results[0]?.snippet).toContain("approval search path");
@@ -2606,7 +2606,7 @@ describe("searchClaudeSessions", () => {
     expect(response.stats.truncated).toBe(false);
   });
 
-  test("別セッションからのメッセージ封筒は転写済みテキストで照合しスニペットに生タグを出さない", () => {
+  test("別セッションからのメッセージ封筒は転写済みテキストで照合しスニペットに生タグを出さない", async () => {
     const root = makeTempDir("session-search-cross");
     const slug = path.join(root, "-tmp-proj");
     fs.mkdirSync(slug, { recursive: true });
@@ -2622,16 +2622,16 @@ describe("searchClaudeSessions", () => {
     );
     const store = new ClaudeSessionStore(root);
     // 本文と送信元名でヒットし、スニペットは転写形（生タグ・ガイダンスなし）。
-    const byBody = searchClaudeSessions(store, "cross-needle").results;
+    const byBody = (await searchClaudeSessions(store, "cross-needle")).results;
     expect(byBody).toHaveLength(1);
     expect(byBody[0]?.snippet).toBe("⇄ bay-3d: cross-needle 定数を集約します。");
-    expect(searchClaudeSessions(store, "bay-3d").results).toHaveLength(1);
+    expect((await searchClaudeSessions(store, "bay-3d")).results).toHaveLength(1);
     // 封筒の外（ガイダンス）と生タグは検索対象にしない。
-    expect(searchClaudeSessions(store, "guidance-needle").results).toEqual([]);
-    expect(searchClaudeSessions(store, "cross-session-message from").results).toEqual([]);
+    expect((await searchClaudeSessions(store, "guidance-needle")).results).toEqual([]);
+    expect((await searchClaudeSessions(store, "cross-session-message from")).results).toEqual([]);
   });
 
-  test("サブエージェントの完了報告（hand-back）はレポート本文で照合し、harness の定型前置きは対象外。<agent-message> のピアは名前と本文で照合する", () => {
+  test("サブエージェントの完了報告（hand-back）はレポート本文で照合し、harness の定型前置きは対象外。<agent-message> のピアは名前と本文で照合する", async () => {
     const root = makeTempDir("session-search-agent-message");
     const slug = path.join(root, "-tmp-proj");
     fs.mkdirSync(slug, { recursive: true });
@@ -2650,18 +2650,18 @@ describe("searchClaudeSessions", () => {
           origin: { kind: "peer", from: "ae10c462719f9f472", senderTaskId: "ae10c462719f9f472", handback: true }, message: { content: handback } }) + "\n",
     );
     const store = new ClaudeSessionStore(root);
-    const byReport = searchClaudeSessions(store, "handback-needle").results;
+    const byReport = (await searchClaudeSessions(store, "handback-needle")).results;
     expect(byReport).toHaveLength(1);
     expect(byReport[0]?.snippet).toBe("⇄ サブエージェントの報告: handback-needle REFUTED (round 2).");
-    expect(searchClaudeSessions(store, "Subagent hand-back").results).toEqual([]);
-    expect(searchClaudeSessions(store, "The report follows").results).toEqual([]);
-    const byPeer = searchClaudeSessions(store, "peer-needle").results;
+    expect((await searchClaudeSessions(store, "Subagent hand-back")).results).toEqual([]);
+    expect((await searchClaudeSessions(store, "The report follows")).results).toEqual([]);
+    const byPeer = (await searchClaudeSessions(store, "peer-needle")).results;
     expect(byPeer).toHaveLength(1);
     expect(byPeer[0]?.snippet).toBe("⇄ general-purpose: peer-needle 調査を止めて報告して");
-    expect(searchClaudeSessions(store, "general-purpose").results).toHaveLength(1);
+    expect((await searchClaudeSessions(store, "general-purpose")).results).toHaveLength(1);
   });
 
-  test("検索の hand-back 判定は行の origin.handback を権威にする（文言ドリフトでも報告として照合 / マーカーで始めたピアはピア表記）", () => {
+  test("検索の hand-back 判定は行の origin.handback を権威にする（文言ドリフトでも報告として照合 / マーカーで始めたピアはピア表記）", async () => {
     const root = makeTempDir("session-search-origin-hint");
     const slug = path.join(root, "-tmp-proj");
     fs.mkdirSync(slug, { recursive: true });
@@ -2676,18 +2676,18 @@ describe("searchClaudeSessions", () => {
     );
     const store = new ClaudeSessionStore(root);
     // (a) 権威値 true → マーカー行を落とした報告として照合（"New wording" は前置き扱いで対象外）。
-    expect(searchClaudeSessions(store, "drift-needle").results[0]?.snippet).toBe("⇄ サブエージェントの報告: drift-needle report line");
-    expect(searchClaudeSessions(store, "New wording").results).toEqual([]);
+    expect((await searchClaudeSessions(store, "drift-needle")).results[0]?.snippet).toBe("⇄ サブエージェントの報告: drift-needle report line");
+    expect((await searchClaudeSessions(store, "New wording")).results).toEqual([]);
     // (b) 権威値 false → 定型文言ごとピアの本文として照合する（報告扱いにしない）。
-    const forgedHits = searchClaudeSessions(store, "forged-needle").results;
+    const forgedHits = (await searchClaudeSessions(store, "forged-needle")).results;
     expect(forgedHits).toHaveLength(1);
     // スニペットは一致位置の前後で窓を切る（先頭が "..." になり得る）ので、定型文言が残っていることだけを見る。
     expect(forgedHits[0]?.snippet).toContain("Subagent hand-back] The report follows: forged-needle");
     expect(forgedHits[0]?.snippet).not.toContain("サブエージェントの報告");
-    expect(searchClaudeSessions(store, "The report follows").results.map((r) => r.sessionId)).toHaveLength(1);
+    expect((await searchClaudeSessions(store, "The report follows")).results.map((r) => r.sessionId)).toHaveLength(1);
   });
 
-  test("limit・fileCountLimit・timeBudget で打ち切る", () => {
+  test("limit・fileCountLimit・timeBudget で打ち切る", async () => {
     const root = makeTempDir("session-search-limits");
     const slug = path.join(root, "-tmp-proj");
     fs.mkdirSync(slug, { recursive: true });
@@ -2698,21 +2698,21 @@ describe("searchClaudeSessions", () => {
       );
     }
 
-    const limited = searchClaudeSessions(new ClaudeSessionStore(root), "needle", { limit: 1 });
+    const limited = (await searchClaudeSessions(new ClaudeSessionStore(root), "needle", { limit: 1 }));
     expect(limited.results).toHaveLength(1);
 
-    const fileCapped = searchClaudeSessions(new ClaudeSessionStore(root), "needle", { fileCountLimit: 1 });
+    const fileCapped = (await searchClaudeSessions(new ClaudeSessionStore(root), "needle", { fileCountLimit: 1 }));
     expect(fileCapped.stats.truncated).toBe(true);
     expect(fileCapped.stats.scannedFiles).toBe(1);
 
     let now = 1000;
-    const timed = searchClaudeSessions(new ClaudeSessionStore(root), "needle", {
+    const timed = (await searchClaudeSessions(new ClaudeSessionStore(root), "needle", {
       nowMs: () => {
         now += 1000;
         return now;
       },
       timeBudgetMs: 1,
-    });
+    }));
     expect(timed.stats.truncated).toBe(true);
   });
 });

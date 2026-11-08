@@ -318,14 +318,14 @@ describe("narration — 一覧プレビュー / 検索 / サブエージェン�
     expect(scanTranscriptTail(transcript).lastMessage).toBe("needle-narration を確認します。");
   });
 
-  test("検索は narration に当たり、通常の thinking には当たらない", () => {
+  test("検索は narration に当たり、通常の thinking には当たらない", async () => {
     const root = makeTempDir("narration-search");
     const slug = path.join(root, "-tmp-proj");
     fs.mkdirSync(slug, { recursive: true });
     fs.writeFileSync(path.join(slug, "nnnnnnnn-search.jsonl"), lines.join("\n") + "\n");
     const store = new ClaudeSessionStore(root);
-    expect(searchClaudeSessions(store, "needle-hidden").results).toEqual([]);
-    const hit = searchClaudeSessions(store, "needle-narration").results;
+    expect((await searchClaudeSessions(store, "needle-hidden")).results).toEqual([]);
+    const hit = (await searchClaudeSessions(store, "needle-narration")).results;
     expect(hit).toHaveLength(1);
     expect(hit[0]?.snippet).toBe("needle-narration を確認します。");
   });
@@ -337,7 +337,7 @@ describe("narration — 一覧プレビュー / 検索 / サブエージェン�
     expect(texts.some((text) => text.includes("needle-hidden"))).toBe(false);
   });
 
-  test("narration に追記された通知は、プレビュー・検索・サブエージェントでも通常本文と同じく除く", () => {
+  test("narration に追記された通知は、プレビュー・検索・サブエージェントでも通常本文と同じく除く", async () => {
     const line = assistantLine("notice", [thinkingBlock("narration",
       "確認を続けます。\n\n<system-reminder>\nneedle-injected\n</system-reminder>\n")]);
     const root = makeTempDir("narration-reminder");
@@ -347,8 +347,8 @@ describe("narration — 一覧プレビュー / 検索 / サブエージェン�
     fs.writeFileSync(transcript, lines[0] + "\n" + line + "\n");
     expect(scanTranscriptTail(transcript).lastMessage).toBe("確認を続けます。");
     const store = new ClaudeSessionStore(root);
-    expect(searchClaudeSessions(store, "needle-injected").results).toEqual([]);
-    expect(searchClaudeSessions(store, "確認を続けます").results[0]?.snippet).toBe("確認を続けます。");
+    expect((await searchClaudeSessions(store, "needle-injected")).results).toEqual([]);
+    expect((await searchClaudeSessions(store, "確認を続けます")).results[0]?.snippet).toBe("確認を続けます。");
     expect(parseSubagentTranscript(line + "\n").entries.map((item) => item.text)).toEqual(["確認を続けます。"]);
     const noticeOnly = assistantLine("notice-only", [thinkingBlock("narration",
       "<system-reminder>\nneedle-injected\n</system-reminder>")]);

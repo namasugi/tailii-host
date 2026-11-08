@@ -89,6 +89,7 @@ export class CodexSessionStore {
   private readonly sessionsRoot: string;
   private readonly indexPath: string;
   private readonly maxSessions: number;
+  private readonly transcriptPaths = new Map<string, string>();
   /**
    * rollout 1 本分の読み取り結果（key = パス, 照合 = mtimeMs + size, session-list-memo）。
    * 一覧のたびに数百本の先頭・最初の発話・末尾を同期で読み直すと engine のイベントループを
@@ -118,18 +119,29 @@ export class CodexSessionStore {
     this.memoFile = options.memoFile ?? null;
   }
 
+  /** 本文検索では通常の一覧上限（200 件）より古い対話も列挙する。 */
+  listForSearch(): ClaudeSessionInfo[] {
+    return this.list(undefined, Number.POSITIVE_INFINITY);
+  }
+
+  /** 直前の列挙で解決したパス（検索側は非同期読取の前にパスを取得する）。 */
+  transcriptPath(sessionId: string): string | null {
+    return this.transcriptPaths.get(sessionId) ?? null;
+  }
+
   /**
    * codex 会話一覧を updatedAt 降順で返す（同値は sessionId 昇順で安定化）。
    * `baseDir` 指定時は cwd が baseDir 自身/配下の会話のみに絞る（engine は無指定で呼ぶ）。
    */
-  list(baseDir?: string): ClaudeSessionInfo[] {
+  list(baseDir?: string, limit: number = this.maxSessions): ClaudeSessionInfo[] {
+    this.transcriptPaths.clear();
     const index = this.readIndex();
     const files = this.listRollouts().sort((a, b) => b.mtimeMs - a.mtimeMs);
 
     let result: ClaudeSessionInfo[] = [];
     const seen = new Set<string>();
     for (const file of files) {
-      if (result.length >= this.maxSessions) break;
+      if (result.length >= limit) break;
       const meta = this.sessionMeta(file);
       if (meta === null || meta.cwd === null || meta.isBackgroundSession) continue;
       // ユーザーの発話が 1 つも無い会話（開いてすぐ閉じた・起動に失敗した等）は出さない。App Server の
@@ -138,6 +150,7 @@ export class CodexSessionStore {
       const sessionId = meta.id ?? path.basename(file.path);
       if (seen.has(sessionId)) continue;
       seen.add(sessionId);
+      this.transcriptPaths.set(sessionId, file.path);
 
       const idx = meta.id !== null ? index.get(meta.id) : undefined;
       // thread_name が無ければ最初の実ユーザー発話からタイトルを作る（codex アプリ準拠）。
@@ -581,7 +594,7 @@ function readLastRolloutMessage(rolloutPath: string): string | null {
 }
 
 /** 新旧 rollout の表示用本文だけを取り出す。思考・ツール・注入された指示は採用しない。 */
-function rolloutMessageText(value: unknown): string | null {
+export function rolloutMessageText(value: unknown): string | null {
   const record = asRecord(value);
   const payload = asRecord(record?.["payload"]);
   if (payload === null) return null;

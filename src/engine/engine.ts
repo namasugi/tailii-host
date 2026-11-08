@@ -1200,6 +1200,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
   } finally {
     // ---- 3. チャネル断で chat_output tail / reaper を確実に停止する（全経路） ----
     lifecycleAbort.abort();
+    state.sessionSearchAbort?.abort();
     for (const timer of backgroundUnwatchTimers.values()) clearTimeout(timer);
     backgroundUnwatchTimers.clear();
     if (backgroundSyncHintsTimer !== null) clearTimeout(backgroundSyncHintsTimer);

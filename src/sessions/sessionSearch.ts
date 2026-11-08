@@ -1,7 +1,12 @@
 // sessionSearch.ts
-// tailii (TS host) — Claude Code 会話本文の横断検索（session_search）
+// tailii (TS host) — Claude Code / Codex 会話本文の横断検索（session_search）
 
 import * as fs from "node:fs";
+import { createInterface } from "node:readline";
+import { setImmediate as yieldToEngine } from "node:timers/promises";
+import { rolloutMessageText } from "../codex/codexSessionStore.js";
+import { codexAsyncQuestionReplyDisplayText } from "../codex/codexAsyncQuestion.js";
+import { codexPlanChatOutput } from "../codex/codexPlanItem.js";
 import type { ClaudeSessionInfo, SessionSearchResult } from "../protocol.js";
 import { isCompactSummaryRecord } from "../shared/compactSummary.js";
 import { isLocalCommandModelCopyRecord } from "../shared/localCommandModelCopy.js";
@@ -12,6 +17,7 @@ import { crossSessionOriginHint, crossSessionPreviewLine, presentCrossSessionMes
 
 export interface SessionSearchSource {
   list(): ClaudeSessionInfo[];
+  listForSearch?(): ClaudeSessionInfo[];
   transcriptPath(sessionId: string): string | null;
 }
 
@@ -22,6 +28,8 @@ export interface SessionSearchOptions {
   perFileBytes?: number;
   fileCountLimit?: number;
   snippetContextChars?: number;
+  signal?: AbortSignal;
+  onProgress?: (results: SessionSearchResult[]) => void;
 }
 
 export interface SessionSearchStats {
@@ -36,17 +44,26 @@ export interface SessionSearchResponse {
 
 export const SESSION_SEARCH_DEFAULT_LIMIT = 20;
 export const SESSION_SEARCH_MAX_LIMIT = 100;
-export const SESSION_SEARCH_TIME_BUDGET_MS = 120;
-export const SESSION_SEARCH_PER_FILE_BYTES = 1024 * 1024;
-export const SESSION_SEARCH_FILE_COUNT_LIMIT = 1000;
+export const SESSION_SEARCH_TIME_BUDGET_MS = Number.POSITIVE_INFINITY;
+export const SESSION_SEARCH_PER_FILE_BYTES = Number.POSITIVE_INFINITY;
+export const SESSION_SEARCH_FILE_COUNT_LIMIT = Number.POSITIVE_INFINITY;
 export const SESSION_SEARCH_SNIPPET_CONTEXT_CHARS = 40;
 
-/** Claude 会話 jsonl の user/assistant テキストだけを対象に、大文字小文字を無視して部分一致検索する。 */
-export function searchClaudeSessions(
+/** 既存の Claude 単独呼び出しも同じ非同期の全文検索を使う。 */
+export async function searchClaudeSessions(
   store: SessionSearchSource,
   query: string,
   options: SessionSearchOptions = {},
-): SessionSearchResponse {
+): Promise<SessionSearchResponse> {
+  return searchSessions([store], query, options);
+}
+
+/** ホストの全会話を新しい順に検索する。読取量・時間で黙って本文を捨てず、ストリームで読む。 */
+export async function searchSessions(
+  stores: SessionSearchSource[],
+  query: string,
+  options: SessionSearchOptions = {},
+): Promise<SessionSearchResponse> {
   // 本文側（extractMessageText）と同じ空白正規化を掛ける。全角スペース（iOS 日本語キーボードの
   // 既定）や連続空白で区切った複数語クエリも、本文の空白 1 つに畳んだ形へ揃えて照合する。
   const normalizedQuery = query.trim().replaceAll(/\s+/gu, " ").toLocaleLowerCase();
@@ -62,12 +79,16 @@ export function searchClaudeSessions(
   const fileCountLimit = options.fileCountLimit ?? SESSION_SEARCH_FILE_COUNT_LIMIT;
   const snippetContext = options.snippetContextChars ?? SESSION_SEARCH_SNIPPET_CONTEXT_CHARS;
 
-  const sessions = store.list();
+  options.signal?.throwIfAborted();
+  const sessions = stores.flatMap((store) =>
+    (store.listForSearch?.() ?? store.list()).map((info) => ({ info, filePath: store.transcriptPath(info.sessionId) })),
+  ).sort((a, b) => (b.info.updatedAt ?? 0) - (a.info.updatedAt ?? 0) || a.info.sessionId.localeCompare(b.info.sessionId));
   const results: SessionSearchResult[] = [];
   let scannedFiles = 0;
   let truncated = false;
 
-  for (const info of sessions) {
+  for (const { info, filePath } of sessions) {
+    options.signal?.throwIfAborted();
     if (results.length >= limit) break;
     if (scannedFiles >= fileCountLimit) {
       truncated = true;
@@ -77,10 +98,9 @@ export function searchClaudeSessions(
       truncated = true;
       break;
     }
-    const filePath = store.transcriptPath(info.sessionId);
     if (filePath === null) continue;
     scannedFiles += 1;
-    const match = searchTranscriptFile(filePath, normalizedQuery, perFileBytes, snippetContext);
+    const match = await searchTranscriptFile(filePath, normalizedQuery, perFileBytes, snippetContext, info.agent, options.signal);
     if (match === null) continue;
     const result: SessionSearchResult = {
       sessionId: info.sessionId,
@@ -89,7 +109,9 @@ export function searchClaudeSessions(
       snippet: match,
     };
     if (info.updatedAt !== undefined) result.updatedAt = info.updatedAt;
+    if (info.agent !== undefined) result.agent = info.agent;
     results.push(result);
+    options.onProgress?.([...results]);
   }
 
   return { results, stats: { scannedFiles, truncated } };
@@ -100,54 +122,80 @@ function clampLimit(value: number): number {
   return Math.max(1, Math.min(SESSION_SEARCH_MAX_LIMIT, Math.floor(value)));
 }
 
-function searchTranscriptFile(
+async function searchTranscriptFile(
   filePath: string,
   normalizedQuery: string,
   byteLimit: number,
   snippetContext: number,
-): string | null {
-  let content: string;
+  agent: string | undefined,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  if (byteLimit <= 0) return null;
+  const input = fs.createReadStream(filePath, {
+    encoding: "utf8",
+    ...(Number.isFinite(byteLimit) ? { end: byteLimit - 1 } : {}),
+    signal,
+  });
+  const lines = createInterface({ input, crlfDelay: Infinity });
+  let lastYield = Date.now();
   try {
-    const fd = fs.openSync(filePath, "r");
-    try {
-      const size = Math.max(0, Math.min(byteLimit, fs.fstatSync(fd).size));
-      const buf = Buffer.alloc(size);
-      const bytesRead = fs.readSync(fd, buf, 0, size, 0);
-      content = buf.subarray(0, bytesRead).toString("utf8");
-    } finally {
-      fs.closeSync(fd);
+    for await (const line of lines) {
+      signal?.throwIfAborted();
+      // まとめて届いた行の JSON 解析でも engine の制御ループへ定期的に実行権を戻す。
+      if (Date.now() - lastYield >= 8) {
+        await yieldToEngine();
+        signal?.throwIfAborted();
+        lastYield = Date.now();
+      }
+      if (!line) continue;
+      let parsed: unknown;
+      try { parsed = JSON.parse(line); } catch { continue; }
+      if (typeof parsed !== "object" || parsed === null) continue;
+      const obj = parsed as Record<string, unknown>;
+      let text: string | null;
+      if (agent === "codex") {
+        text = extractCodexMessageText(obj);
+      } else {
+        if (obj["type"] !== "user" && obj["type"] !== "assistant") continue;
+        // 画面に出ない要約・ローカルコマンドの写し・ターンの内部コンテキストは除外する。
+        if (isCompactSummaryRecord(obj) || isLocalCommandModelCopyRecord(obj) || isTurnCompanionRecord(obj)) continue;
+        text = extractMessageText(obj);
+      }
+      if (text === null) continue;
+      text = text.replaceAll(/\s+/gu, " ").trim();
+      const index = text.toLocaleLowerCase().indexOf(normalizedQuery);
+      if (index < 0) continue;
+      return makeSnippet(text, index, normalizedQuery.length, snippetContext);
     }
-  } catch {
-    return null;
-  }
-
-  for (const line of content.split("\n")) {
-    if (!line) continue;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (typeof parsed !== "object" || parsed === null) continue;
-    const obj = parsed as Record<string, unknown>;
-    if (obj["type"] !== "user" && obj["type"] !== "assistant") continue;
-    // 圧縮の要約は過去の発話の言い換えで、ヒットしても英文の要約がスニペットに出るだけ（原文は
-    // 圧縮前の行として同じ transcript に残るのでそちらで当たる）。
-    if (isCompactSummaryRecord(obj)) continue;
-    // ローカルコマンド出力のモデル向けの写し（`/context` の表）も発話ではないので当てない。
-    if (isLocalCommandModelCopyRecord(obj)) continue;
-    // ターンの同伴行（isMeta + turnCompanion: `/doctor` 等の展開済みプロンプト・スキル本文の注入・
-    // 画像の寸法注記）は会話画面に出ない内部コンテキストなので当てない（command-expansion）。
-    if (isTurnCompanionRecord(obj)) continue;
-    const text = extractMessageText(obj);
-    if (text === null) continue;
-    const normalizedText = text.toLocaleLowerCase();
-    const index = normalizedText.indexOf(normalizedQuery);
-    if (index < 0) continue;
-    return makeSnippet(text, index, normalizedQuery.length, snippetContext);
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    // 削除・移動・読取不能になった履歴だけを飛ばし、他の会話の検索を続ける。
+  } finally {
+    lines.close();
+    input.destroy();
   }
   return null;
+}
+
+/** 一覧プレビューに加え、会話に表示する提案プランと質問回答の本文も検索する。 */
+function extractCodexMessageText(obj: Record<string, unknown>): string | null {
+  const payload = asRecord(obj["payload"]);
+  const item = asRecord(payload?.["item"]);
+  if (obj["type"] === "event_msg" && payload?.["type"] === "item_completed" && item?.["type"] === "Plan") {
+    if (typeof item["id"] !== "string" || typeof item["text"] !== "string") return null;
+    const plan = codexPlanChatOutput(item["id"], item["text"]);
+    return plan?.type === "chat_output" ? plan.text : null;
+  }
+  const text = rolloutMessageText(obj);
+  if (text === null) return null;
+  const isUser = obj["type"] === "event_msg" && (payload?.["type"] === "user_message"
+    || (payload?.["type"] === "item_completed" && item?.["type"] === "UserMessage"));
+  return isUser ? codexAsyncQuestionReplyDisplayText(text) ?? text : text;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown> : null;
 }
 
 function extractMessageText(obj: Record<string, unknown>): string | null {

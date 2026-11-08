@@ -48,6 +48,7 @@ export interface EngineState {
   negotiatedVersion: number;
   ownMaxVersion: number;
   modeSetInFlight: Set<string>;
+  sessionSearchAbort?: AbortController;
 }
 
 export interface ModeTiming {

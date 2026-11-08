@@ -19,6 +19,7 @@ import {
 import type { EngineLauncher } from "../src/commands/launch.js";
 import type { CodexTurnControllerRuntime } from "../src/codex/codexNativeTurnController.js";
 import type { HubLink } from "../src/hub/hubClient.js";
+import { CodexSessionStore } from "../src/codex/codexSessionStore.js";
 import { ClaudeSessionStore } from "../src/sessions/claudeSessionStore.js";
 import { decodeControlMessage } from "../src/protocol.js";
 import { readHeartbeat } from "../src/sessions/heartbeat.js";
@@ -3316,6 +3317,10 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.lines.nextOfType("channel_hello");
     engine.writeLine('{"id":"SS1","query":"approval","type":"session_search_request","v":2}');
 
+    const accepted = decodeControlMessage(await engine.lines.nextOfType("session_search_response"));
+    expect(accepted).toMatchObject({ id: "SS1", results: [], complete: false });
+    const progress = decodeControlMessage(await engine.lines.nextOfType("session_search_response"));
+    expect(progress).toMatchObject({ id: "SS1", complete: false });
     const resp = await engine.lines.nextOfType("session_search_response");
     expect(resp).toContain('"id":"SS1"');
     expect(resp).toContain('"sessionId":"99999999-8888-7777-6666-555555555555"');
@@ -3323,6 +3328,72 @@ describe("EngineControl — 横断制御チャネル", () => {
     expect(resp).toContain('"title":"検索タイトル"');
 
     await engine.teardown();
+  });
+
+  test("Codex の本文検索結果に agent を付け、途中応答の後に完了する", async () => {
+    const home = makeTempDir("search-codex-engine");
+    fs.mkdirSync(path.join(home, "sessions"));
+    fs.writeFileSync(path.join(home, "sessions", "rollout-test.jsonl"), [
+      { type: "session_meta", payload: { id: "codex-search", cwd: "/tmp/proj", source: "cli" } },
+      { type: "event_msg", payload: { type: "user_message", message: "タイトル" } },
+      { type: "event_msg", payload: { type: "agent_message", message: "本文の Needle" } },
+    ].map((record) => JSON.stringify(record)).join("\n") + "\n");
+    const engine = startEngine({
+      sessionManager: makeManager(new MockTmuxRunner(() => ok(""))),
+      codexSessionStore: new CodexSessionStore(home),
+    });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine('{"id":"CS1","query":"needle","type":"session_search_request","v":2}');
+    let response;
+    do {
+      response = decodeControlMessage(await engine.lines.nextOfType("session_search_response"));
+    } while (response.type === "session_search_response" && response.complete === false);
+    expect(response).toMatchObject({ results: [{ sessionId: "codex-search", agent: "codex", snippet: "本文の Needle" }] });
+    await engine.teardown();
+  });
+
+  test("検索語の変更は前の全文走査を止め、制御要求を待たせない", async () => {
+    const projects = makeTempDir("search-cancel-engine");
+    const slug = path.join(projects, "-tmp-proj");
+    fs.mkdirSync(slug);
+    fs.writeFileSync(path.join(slug, "long.jsonl"),
+      JSON.stringify({ type: "user", cwd: "/tmp/proj", message: { content: "タイトル" } }) + "\n" +
+      (JSON.stringify({ type: "progress", data: "x".repeat(1000) }) + "\n").repeat(10_000));
+    const engine = startEngine({
+      sessionManager: makeManager(new MockTmuxRunner(() => ok(""))),
+      claudeSessionStore: new ClaudeSessionStore(projects),
+    });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine('{"id":"old","query":"absent","type":"session_search_request","v":2}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("session_search_response")))
+      .toMatchObject({ id: "old", complete: false });
+    engine.writeLine('{"id":"clear","query":"","type":"session_search_request","v":2}');
+    let response;
+    do {
+      response = decodeControlMessage(await engine.lines.nextOfType("session_search_response"));
+      expect(response).toMatchObject({ id: "clear" });
+    } while (response.type === "session_search_response" && response.complete === false);
+    engine.writeLine('{"id":"probe","type":"image_fetch_request","v":2}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("error"))).toMatchObject({ id: "probe" });
+    await engine.teardown();
+  });
+
+  test("受理後に検索が失敗しても、要求 ID 付きのエラーで待機を終える", async () => {
+    const store = new ClaudeSessionStore(makeTempDir("search-failure"));
+    vi.spyOn(store, "list").mockImplementation(() => { throw new Error("read failure"); });
+    const engine = startEngine({
+      sessionManager: makeManager(new MockTmuxRunner(() => ok(""))), claudeSessionStore: store,
+    });
+    try {
+      await engine.lines.nextOfType("channel_hello");
+      engine.writeLine('{"id":"failed-search","query":"本文","type":"session_search_request","v":2}');
+      expect(decodeControlMessage(await engine.lines.nextOfType("session_search_response")))
+        .toMatchObject({ id: "failed-search", complete: false });
+      expect(decodeControlMessage(await engine.lines.nextOfType("error", 1000)))
+        .toMatchObject({ id: "failed-search", code: "session_search_failed" });
+    } finally {
+      await engine.teardown();
+    }
   });
 
   // MARK: dir-create: dir_create_request → dir_create_response

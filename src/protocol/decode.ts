@@ -1233,9 +1233,10 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
       });
 
     case "session_search_response":
-      return {
+      return compact({
         type, v,
         id: requireString(raw, "id"),
+        complete: optionalBoolean(raw, "complete"),
         results: requireArray(raw, "results").map((element) => {
           const obj = requireObject(element, "results");
           return compact<SessionSearchResult>({
@@ -1243,10 +1244,11 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
             title: requireString(obj, "title"),
             cwd: requireString(obj, "cwd"),
             snippet: requireString(obj, "snippet"),
+            agent: optionalString(obj, "agent"),
             updatedAt: optionalNumber(obj, "updatedAt"),
           });
         }),
-      };
+      });
 
     case "preview_open":
       return {

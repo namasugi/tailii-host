@@ -159,6 +159,8 @@ export interface ClaudeSessionInfo {
 
 /** session_search_response の 1 検索結果。 */
 export interface SessionSearchResult {
+  /** 一覧に未取得の会話を正しい CLI で開くための種別（旧 host は省略）。 */
+  agent?: string;
   sessionId: string;
   title: string;
   cwd: string;
@@ -809,7 +811,8 @@ export type ControlMessage =
   | { type: "dir_create_request"; v: number; id: string; baseDir: string; relative: string }
   | { type: "dir_create_response"; v: number; id: string; path: string; ok: boolean; error?: string }
   | { type: "session_search_request"; v: number; id: string; query: string; limit?: number }
-  | { type: "session_search_response"; v: number; id: string; results: SessionSearchResult[] }
+  /** complete:false は累積の途中結果。省略/true は完了（旧 host 互換）。 */
+  | { type: "session_search_response"; v: number; id: string; results: SessionSearchResult[]; complete?: boolean }
   | { type: "preview_open"; v: number; id: string; target: string }
   | { type: "preview_ready"; v: number; id: string; url: string }
   | { type: "preview_error"; v: number; id: string; message: string }

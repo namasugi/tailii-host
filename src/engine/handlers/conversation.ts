@@ -15,7 +15,7 @@ import {
 import { annotatePeerSessions, listPeerSessions } from "../../services/peerSessions.js";
 import { defaultClaudeSessionsDir } from "../../sessions/claudeLiveStatus.js";
 import { CONVERSATION_DELETE_MESSAGES, deleteConversation } from "../../sessions/conversationDelete.js";
-import { searchClaudeSessions } from "../../sessions/sessionSearch.js";
+import { searchSessions } from "../../sessions/sessionSearch.js";
 import {
   engineDiag,
   subscribeConversation,
@@ -488,24 +488,34 @@ export const conversationHandlers: HandlerRegistry = {
     })());
   },
 
-  session_search_request: (message, ctx) => {
+  session_search_request: async (message, ctx) => {
     const { writer, state } = ctx;
     const v = state.negotiatedVersion;
-    // Claude 会話本文検索。長時間 read loop を塞がないよう検索関数側で件数/時間/読取量を制限する。
-    engineDiag(`session_search_request id=${message.id} query=${message.query}`);
-    const response =
-      ctx.claudeSessionStore !== null
-        ? searchClaudeSessions(ctx.claudeSessionStore, message.query, { limit: message.limit })
-        : { results: [], stats: { scannedFiles: 0, truncated: false } };
-    engineDiag(
-      `session_search_response id=${message.id} count=${response.results.length} scanned=${response.stats.scannedFiles} truncated=${response.stats.truncated}`,
-    );
+    state.sessionSearchAbort?.abort();
+    const controller = new AbortController();
+    state.sessionSearchAbort = controller;
+    engineDiag(`session_search_request id=${message.id}`);
     try {
+      // 全文走査の前に受理を知らせる。旧 host の無応答タイムアウトと長い検索を区別する。
+      writer.write({ type: "session_search_response", v, id: message.id, results: [], complete: false });
+      const stores = [ctx.claudeSessionStore, ctx.codexSessionStore].filter((store) => store !== null);
+      const response = await searchSessions(stores, message.query, {
+        limit: message.limit,
+        signal: controller.signal,
+        onProgress: (results) => {
+          writer.write({ type: "session_search_response", v, id: message.id, results, complete: false });
+        },
+      });
+      if (controller.signal.aborted) return;
+      engineDiag(`session_search_response id=${message.id} count=${response.results.length} scanned=${response.stats.scannedFiles}`);
       writer.write({ type: "session_search_response", v, id: message.id, results: response.results });
     } catch (error) {
-      process.stderr.write(
-        `[tailii-host engine] session_search_response 書込失敗: ${String(error)}\n`,
-      );
+      if (!controller.signal.aborted) {
+        process.stderr.write(`[tailii-host engine] session_search 失敗: ${String(error)}\n`);
+        writeError(writer, v, message.id, "session_search_failed", "本文を検索できませんでした。もう一度お試しください。");
+      }
+    } finally {
+      if (state.sessionSearchAbort === controller) delete state.sessionSearchAbort;
     }
   },
 
