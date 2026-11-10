@@ -4,6 +4,7 @@
 import type { ClaudeApiDelegateRequest, ClaudeApiDelegateResult } from "../services/claudeApiDelegate.js";
 import type { ApiFederationSelection, ApiFederationOptions, ApiFederationStatus, ApiFederationConfiguration, ApiFederationProfile } from "../services/claudeApiFederation.js";
 import type { ApiDelegateHostKeys } from "../services/apiDelegateHostKeys.js";
+import type { ApiClaudeModelsSelection, ApiClaudeModelsResult } from "../services/claudeApiModels.js";
 
 export const PROTOCOL_LEGACY = 0;
 export const PROTOCOL_V1 = 1;
@@ -828,10 +829,10 @@ export type ControlMessage =
   /** アカウント使用量の要求（iOS→Mac, account-usage）。session 非依存 — 一覧からも呼べる。 */
   | { type: "api_usage_options_request"; v: number; id: string }
   | { type: "api_usage_options_response"; v: number; id: string; supported: boolean }
-  | { type: "api_delegate_options_request"; v: number; id: string; keySources?: ApiUsageCredentials }
+  | { type: "api_delegate_options_request"; v: number; id: string; keySources?: ApiUsageCredentials; claudeModels?: ApiClaudeModelsSelection }
   | { type: "api_delegate_key_register_request"; v: number; id: string; provider: "claude" | "openai"; apiKey: string }
   | { type: "api_delegate_key_register_response"; v: number; id: string; success: boolean; error?: string }
-  | { type: "api_delegate_options_response"; v: number; id: string; supported: boolean; supportsAttachments?: boolean; supportsHistory?: boolean; supportsOpenAI?: boolean; federation?: ApiFederationOptions; hostApiKeys?: ApiDelegateHostKeys }
+  | { type: "api_delegate_options_response"; v: number; id: string; supported: boolean; supportsAttachments?: boolean; supportsHistory?: boolean; supportsOpenAI?: boolean; federation?: ApiFederationOptions; hostApiKeys?: ApiDelegateHostKeys; claudeModels?: ApiClaudeModelsResult }
   | { type: "api_federation_check_request"; v: number; id: string; selection: ApiFederationSelection }
   | { type: "api_federation_check_response"; v: number; id: string; status: ApiFederationStatus }
   | { type: "api_federation_create_request"; v: number; id: string; configuration: ApiFederationConfiguration }

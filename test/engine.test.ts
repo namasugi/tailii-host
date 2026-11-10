@@ -10,6 +10,8 @@ import {
 } from "../src/codex/codexAppServer.js";
 import { ImageService } from "../src/chat/imageService.js";
 import { CONCURRENT_MESSAGE_TYPES } from "../src/engine/engine.js";
+import { ENGINE_HANDLERS } from "../src/engine/handlers/index.js";
+import { createApiDelegateHandlers } from "../src/engine/handlers/apiDelegate.js";
 import { CLIENT_BUILD_PIN } from "../src/shared/clientBuild.js";
 import {
   sendQuestionEventToEngine,
@@ -2981,7 +2983,7 @@ describe("EngineControl — 横断制御チャネル", () => {
   });
 
   test("並行にしてよい要求は読み取り専用の RPC だけ（順序が意味を持つ要求は含めない）", () => {
-    for (const type of ["claude_session_list_request", "git_status_request", "file_list_request"] as const) {
+    for (const type of ["api_delegate_options_request", "claude_session_list_request", "git_status_request", "file_list_request"] as const) {
       expect(CONCURRENT_MESSAGE_TYPES.has(type)).toBe(true);
     }
     for (const type of [
@@ -2991,6 +2993,37 @@ describe("EngineControl — 横断制御チャネル", () => {
       "conversation_delete", "git_checkout_request", "serve_stop_request", "question_answer",
     ] as const) {
       expect(CONCURRENT_MESSAGE_TYPES.has(type)).toBe(false);
+    }
+  });
+
+  test("APIモデルGETが期限まで応答しない間も、後続の画像取得を先に処理する", async () => {
+    const img = makeImageRoot();
+    writeIndexedBlob("behind-models", 100, "png", img.index);
+    const imageService = new ImageService({ pendingBase: img.pending, indexBase: img.index });
+    let release: () => void = () => {}, started: () => void = () => {};
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const entered = new Promise<void>((resolve) => { started = resolve; });
+    // 実際のhandlerを通し、Models APIだけを未完了にする（12秒の実時間待ちは不要）。
+    const models = vi.fn(async () => { started(); await gate; return { models: [], error: "timeout" }; });
+    const handler = createApiDelegateHandlers(undefined, models).api_delegate_options_request!;
+    const spy = vi.spyOn(ENGINE_HANDLERS, "api_delegate_options_request").mockImplementation(handler);
+    const runner = new MockTmuxRunner(() => ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner), imageService });
+    try {
+      await engine.lines.nextOfType("channel_hello");
+      engine.writeLine('{"id":"slow-models","type":"api_delegate_options_request","v":1,"claudeModels":{"useHostApiKey":true}}');
+      await entered;
+      engine.writeLine('{"id":"behind-models","type":"image_fetch_request","v":1}');
+      expect(await engine.lines.nextOfType("image_fetch_response")).toContain('"id":"behind-models"');
+      expect(models).toHaveBeenCalledOnce();
+      release();
+      expect(decodeControlMessage(await engine.lines.nextOfType("api_delegate_options_response"))).toMatchObject({
+        id: "slow-models", claudeModels: { models: [], error: "timeout" },
+      });
+    } finally {
+      release();
+      await engine.teardown();
+      spy.mockRestore();
     }
   });
 

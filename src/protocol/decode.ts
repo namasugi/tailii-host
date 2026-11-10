@@ -63,6 +63,22 @@ function decodeFederationProfile(raw: Raw): import("../services/claudeApiFederat
   return compact({ ...decodeFederationSelection(raw), organizationId: requireString(raw, "organizationId"),
     federationRuleId: requireString(raw, "federationRuleId"), serviceAccountId: optionalString(raw, "serviceAccountId"), workspaceId: optionalString(raw, "workspaceId") });
 }
+function decodeApiClaudeModelsSelection(value: unknown): import("../services/claudeApiModels.js").ApiClaudeModelsSelection | undefined {
+  if (value === undefined) return undefined;
+  const raw = requireObject(value, "claudeModels");
+  return compact({ useHostApiKey: optionalBoolean(raw, "useHostApiKey"),
+    keySource: raw["keySource"] === undefined ? undefined : decodeApiUsageCredentials({ claude: raw["keySource"] })!.claude,
+    federation: raw["federation"] === undefined ? undefined : decodeFederationSelection(requireObject(raw["federation"], "federation")) });
+}
+function decodeApiClaudeModelsResult(value: unknown): import("../services/claudeApiModels.js").ApiClaudeModelsResult | undefined {
+  if (value === undefined) return undefined;
+  const raw = requireObject(value, "claudeModels"), models = requireArray(raw, "models");
+  if (models.length > 1000) throw new ProtocolDecodeError("missing-field", "claudeModels.models");
+  return compact({ models: models.map((value) => {
+    const model = requireObject(value, "claudeModels.models[]");
+    return { id: requireString(model, "id"), name: requireString(model, "name"), priceKnown: requireBoolean(model, "priceKnown") };
+  }), error: optionalString(raw, "error") });
+}
 function decodeApiImageOptions(raw: Raw): import("../services/claudeApiDelegate.js").ApiImageOptions {
   return compact({ quality: requireString(raw, "quality") as "low" | "medium" | "high" | "xhigh" | "max",
     size: requireString(raw, "size"), format: requireString(raw, "format") as "png" | "jpeg" | "webp",
@@ -644,7 +660,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
     case "api_delegate_cancel":
       return { type, v, id: requireString(raw, "id") };
     case "api_delegate_options_request":
-      return compact({ type, v, id: requireString(raw, "id"), keySources: decodeApiUsageCredentials(raw["keySources"]) });
+      return compact({ type, v, id: requireString(raw, "id"), keySources: decodeApiUsageCredentials(raw["keySources"]), claudeModels: decodeApiClaudeModelsSelection(raw["claudeModels"]) });
     case "api_usage_options_response":
       return { type, v, id: requireString(raw, "id"), supported: requireBoolean(raw, "supported") };
     case "api_federation_check_request":
@@ -672,7 +688,8 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         supportsAttachments: optionalBoolean(raw, "supportsAttachments"), supportsHistory: optionalBoolean(raw, "supportsHistory"), supportsOpenAI: optionalBoolean(raw, "supportsOpenAI"),
         federation: raw["federation"] === undefined ? undefined : (() => { const value = requireObject(raw["federation"], "federation");
           return compact({ profiles: requireArray(value, "profiles").slice(0, 32).map((item) => decodeFederationProfile(requireObject(item, "profiles"))), error: optionalString(value, "error") }); })(),
-        hostApiKeys: raw["hostApiKeys"] === undefined ? undefined : (() => { const keys = requireObject(raw["hostApiKeys"], "hostApiKeys"); return compact({ claude: requireBoolean(keys, "claude"), openai: requireBoolean(keys, "openai"), supportsRegistration: optionalBoolean(keys, "supportsRegistration"), supportsKeySources: optionalBoolean(keys, "supportsKeySources") }); })() });
+        hostApiKeys: raw["hostApiKeys"] === undefined ? undefined : (() => { const keys = requireObject(raw["hostApiKeys"], "hostApiKeys"); return compact({ claude: requireBoolean(keys, "claude"), openai: requireBoolean(keys, "openai"), supportsRegistration: optionalBoolean(keys, "supportsRegistration"), supportsKeySources: optionalBoolean(keys, "supportsKeySources") }); })(),
+        claudeModels: decodeApiClaudeModelsResult(raw["claudeModels"]) });
     case "api_delegate_request": {
       const request = requireObject(raw["request"], "request");
       return { type, v, id: requireString(raw, "id"), request: {

@@ -71,7 +71,7 @@ export function validateImageOptions(options: ApiImageOptions | undefined, model
 export async function runOpenAIApiDelegate(request: ClaudeApiDelegateRequest, signal: AbortSignal,
   fetcher: typeof fetch = fetch, outputDirectory = join(homedir(), ".tailii", "uploads"),
 ): Promise<ClaudeApiDelegateResult> {
-  const resolved = resolvedHostApiRequest(request, "openai");
+  const resolved = await resolvedHostApiRequest(request, "openai");
   if (!resolved) throw new DelegateError("host_key_unavailable");
   request = resolved;
   const image = validate(request);

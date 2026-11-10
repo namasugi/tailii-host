@@ -4,6 +4,7 @@ import type { ApiUsageCredential } from "../protocol/messages.js";
 import type { OpenAIApiUsageProvider, OpenAIApiUsageResult } from "./openaiApiUsage.js";
 import { apiRecord as record, readApiJson, sumApiAmounts } from "./apiUsageSupport.js";
 import { resolveApiKeySource } from "./apiKeySource.js";
+import { hostApiKeyEnvironment } from "./hostApiKeyEnvironment.js";
 
 interface Options {
   env?: NodeJS.ProcessEnv;
@@ -17,7 +18,10 @@ export function createClaudeApiUsageProvider(options: Options = {}): OpenAIApiUs
   let pending: { identity: string; value: Promise<OpenAIApiUsageResult> } | undefined;
   return async (credential?: ApiUsageCredential) => {
     if (credential?.mode === "disabled") { cache = undefined; return null; }
-    const env = options.env ?? process.env;
+    const names = credential && credential.mode !== "automatic"
+      ? credential.mode === "environment" && credential.environmentVariable ? [credential.environmentVariable] : []
+      : ["ANTHROPIC_ADMIN_KEY", "ANTHROPIC_ADMIN_API_KEY", "ANTHROPIC_API_KEY"];
+    const env = options.env ?? await hostApiKeyEnvironment(names);
     const custom = credential !== undefined && credential.mode !== "automatic";
     const explicit = custom ? resolveApiKeySource(credential, env) : env["ANTHROPIC_ADMIN_KEY"]?.trim() || env["ANTHROPIC_ADMIN_API_KEY"]?.trim();
     const key = custom ? explicit : explicit || env["ANTHROPIC_API_KEY"]?.trim();

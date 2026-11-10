@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { apiDelegateKeyStore, validDelegateApiKey } from "./apiDelegateKeyStore.js";
 import { resolveApiKeySource } from "./apiKeySource.js";
 import type { ApiUsageCredential, ApiUsageCredentials } from "../protocol/messages.js";
+import { hostApiKeyEnvironment } from "./hostApiKeyEnvironment.js";
 
 export interface ApiDelegateHostKeys { claude: boolean; openai: boolean; supportsRegistration?: boolean; supportsKeySources?: boolean }
 function configuredKey(provider: "claude" | "openai", env: NodeJS.ProcessEnv): string | undefined {
@@ -34,9 +35,19 @@ export function hostApiKey(provider: "claude" | "openai", env: NodeJS.ProcessEnv
 export function apiDelegateHostKeys(env: NodeJS.ProcessEnv = process.env, sources?: ApiUsageCredentials): ApiDelegateHostKeys {
   return { claude: hostApiKey("claude", env, sources?.claudeExecution) !== undefined, openai: hostApiKey("openai", env, sources?.openaiExecution) !== undefined };
 }
-export function resolvedHostApiRequest(request: ClaudeApiDelegateRequest, provider: "claude" | "openai"): ClaudeApiDelegateRequest | undefined {
+function executionEnvironmentNames(provider: "claude" | "openai", source?: ApiUsageCredential): string[] {
+  if (source && source.mode !== "automatic") return source.mode === "environment" && source.environmentVariable ? [source.environmentVariable] : [];
+  return [provider === "claude" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY"];
+}
+export function apiExecutionEnvironment(provider: "claude" | "openai", source?: ApiUsageCredential): Promise<NodeJS.ProcessEnv> {
+  return hostApiKeyEnvironment(executionEnvironmentNames(provider, source));
+}
+export function apiExecutionKeysEnvironment(sources?: ApiUsageCredentials): Promise<NodeJS.ProcessEnv> {
+  return hostApiKeyEnvironment([...executionEnvironmentNames("claude", sources?.claudeExecution), ...executionEnvironmentNames("openai", sources?.openaiExecution)]);
+}
+export async function resolvedHostApiRequest(request: ClaudeApiDelegateRequest, provider: "claude" | "openai"): Promise<ClaudeApiDelegateRequest | undefined> {
   if (!request.useHostApiKey) return request;
   if (request.apiKey !== "" || request.federation) return undefined;
-  const key = hostApiKey(provider, process.env, request.keySource);
+  const key = hostApiKey(provider, await apiExecutionEnvironment(provider, request.keySource), request.keySource);
   return key ? { ...request, apiKey: key, useHostApiKey: false } : undefined;
 }

@@ -1248,6 +1248,8 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
 export const CONCURRENT_MESSAGE_TYPES: ReadonlySet<ControlMessage["type"]> = new Set<ControlMessage["type"]>([
   // API 委譲中も通常会話・キャンセルを受理する。要求の重複と同時実行は handler が抑止する。
   "api_delegate_request",
+  // 環境キーの確認・Models APIのGET（最大12秒）が画像取得や会話操作を待たせない。
+  "api_delegate_options_request",
   "api_federation_check_request",
   "claude_session_list_request",
   // session_list_request は載せない: iOS は応答を届いた順に一覧へ反映し、終了済みの印（tombstone）も

@@ -2,20 +2,26 @@ import type { HandlerRegistry } from "../context.js";
 import { DelegateError, runClaudeApiDelegate } from "../../services/claudeApiDelegate.js";
 import { runOpenAIApiDelegate } from "../../services/openaiApiDelegate.js";
 import { claudeApiFederation, FederationError } from "../../services/claudeApiFederation.js";
-import { apiDelegateHostKeys, hostApiKey } from "../../services/apiDelegateHostKeys.js";
+import { apiDelegateHostKeys, apiExecutionEnvironment, apiExecutionKeysEnvironment, hostApiKey } from "../../services/apiDelegateHostKeys.js";
 import { apiDelegateKeyStore, validDelegateApiKey } from "../../services/apiDelegateKeyStore.js";
+import { fetchClaudeApiModels } from "../../services/claudeApiModels.js";
 
 export function createApiDelegateHandlers(run: typeof runClaudeApiDelegate = (request, signal) =>
-  request.provider === "openai" ? runOpenAIApiDelegate(request, signal) : runClaudeApiDelegate(request, signal)): HandlerRegistry { return {
+  request.provider === "openai" ? runOpenAIApiDelegate(request, signal) : runClaudeApiDelegate(request, signal),
+  models: typeof fetchClaudeApiModels = fetchClaudeApiModels): HandlerRegistry { return {
   api_delegate_options_request: async (message, ctx) => {
+    const [federation, environment, claudeModels] = await Promise.all([
+      claudeApiFederation.list(), apiExecutionKeysEnvironment(message.keySources),
+      message.claudeModels === undefined ? undefined : models(message.claudeModels),
+    ]);
     ctx.writer.write({ type: "api_delegate_options_response", v: ctx.state.negotiatedVersion, id: message.id, supported: true, supportsAttachments: true, supportsHistory: true, supportsOpenAI: true,
-      federation: await claudeApiFederation.list(), hostApiKeys: { ...apiDelegateHostKeys(process.env, message.keySources), supportsRegistration: true, supportsKeySources: true } });
+      federation, hostApiKeys: { ...apiDelegateHostKeys(environment, message.keySources), supportsRegistration: true, supportsKeySources: true }, claudeModels });
   },
-  api_delegate_key_register_request: (message, ctx) => {
+  api_delegate_key_register_request: async (message, ctx) => {
     let error: string | undefined;
     try {
       if (!validDelegateApiKey(message.provider, message.apiKey)) error = "invalid_key";
-      else if (hostApiKey(message.provider)) error = "host_key_exists";
+      else if (hostApiKey(message.provider, await apiExecutionEnvironment(message.provider))) error = "host_key_exists";
       else apiDelegateKeyStore.create(message.provider, message.apiKey);
     } catch (failure) { error = (failure as NodeJS.ErrnoException).code === "EEXIST" ? "host_key_exists" : "host_key_store_unavailable"; }
     ctx.writer.write({ type: "api_delegate_key_register_response", v: ctx.state.negotiatedVersion, id: message.id, success: error === undefined, error });

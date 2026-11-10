@@ -3,12 +3,22 @@ import { claudeApiFederation, FederationError, validFederationSelection,
 import { resolvedHostApiRequest } from "./apiDelegateHostKeys.js";
 import { validClaudeApiKey } from "./claudeApiKey.js";
 // Claude API 会話の1ターン。Subscriptionの認証・CLI の設定は触らず、明示選択したAPI認証を使う。
-// 料金表: https://platform.claude.com/docs/en/about-claude/pricing （2026-11-09）。表示・予算は概算。
+// 各モデルの公式 overview の標準料金（2026-11-10）。表示・予算は概算。
+// Haiku は入力100k以下の料金。delegateOutputLimit の入力上限も100kに保つ。
 export const DELEGATE_MODELS = {
-  "claude-sonnet-5-5": { input: 2, output: 10 },
-  "claude-opus-5-5": { input: 4, output: 20 },
-  "claude-haiku-5-5": { input: 0.1, output: 0.5 },
+  "claude-fable-5-2": { input: 8, output: 40, cacheRead: 0.2 },
+  "claude-sonnet-5-5": { input: 2, output: 10, cacheRead: 0.1 },
+  "claude-opus-5-5": { input: 4, output: 20, cacheRead: 0.2 },
+  "claude-haiku-5-5": { input: 0.1, output: 0.5, cacheRead: 0.01 },
 } as const;
+
+/** 既知モデルとその日付付きsnapshotだけを同じ料金へ解決する。要求のID自体は書き換えない。 */
+export function claudeApiModelPrice(model: string): (typeof DELEGATE_MODELS)[keyof typeof DELEGATE_MODELS] | undefined {
+  const canonical = (Object.keys(DELEGATE_MODELS) as (keyof typeof DELEGATE_MODELS)[])
+    .find((id) => model === id || (model.length === id.length + 9 && model.startsWith(id + "-")
+      && /^[0-9]{8}$/.test(model.slice(id.length + 1))));
+  return canonical === undefined ? undefined : DELEGATE_MODELS[canonical];
+}
 
 export interface ClaudeApiDelegateAttachment { path: string; name: string }
 export interface ClaudeApiDelegateHistoryTurn {
@@ -78,7 +88,7 @@ export function validateDelegateRequest(request: ClaudeApiDelegateRequest): void
   if (request.federation) {
     if (request.apiKey !== "" || !validFederationSelection(request.federation)) throw new DelegateError("federation_invalid_config");
   } else if (!validClaudeApiKey(request.apiKey)) throw new DelegateError("invalid_key");
-  if (!Object.hasOwn(DELEGATE_MODELS, request.model)) throw new DelegateError("unsupported_model");
+  if (!claudeApiModelPrice(request.model)) throw new DelegateError("unsupported_model");
   if (!request.prompt.trim() || !Number.isInteger(request.budgetCents)
       || request.budgetCents < 1 || request.budgetCents > 500) throw new DelegateError("invalid_request");
   const history = request.history ?? [];
@@ -102,9 +112,10 @@ function validateAttachments(value: ClaudeApiDelegateAttachment[] | undefined): 
 }
 
 /** 応答の長さも予算内に収める。count_tokens は概算なので入力に余裕を持たせる。 */
-export function delegateOutputLimit(model: keyof typeof DELEGATE_MODELS, input: number, budgetCents: number): number {
+export function delegateOutputLimit(model: string, input: number, budgetCents: number): number {
   if (input > 100_000) throw new DelegateError("request_too_large");
-  const price = DELEGATE_MODELS[model];
+  const price = claudeApiModelPrice(model);
+  if (!price) throw new DelegateError("unsupported_model");
   const reservedInput = Math.ceil(input * 1.1) + 256;
   const remaining = budgetCents / 100 - reservedInput * price.input / 1_000_000;
   const limit = Math.min(8192, Math.floor(remaining * 1_000_000 / price.output));
@@ -118,11 +129,11 @@ export async function runClaudeApiDelegate(
   fetcher: typeof fetch = fetch,
   federation = claudeApiFederation,
 ): Promise<ClaudeApiDelegateResult> {
-  const resolved = resolvedHostApiRequest(request, "claude");
+  const resolved = await resolvedHostApiRequest(request, "claude");
   if (!resolved) throw new DelegateError("host_key_unavailable");
   request = resolved;
   validateDelegateRequest(request);
-  const model = request.model as keyof typeof DELEGATE_MODELS;
+  const model = request.model;
   const timeout = AbortSignal.timeout(120_000);
   const combined = AbortSignal.any([signal, timeout]);
   async function post(endpoint: string, body: object): Promise<Record<string, unknown>> {
@@ -188,10 +199,9 @@ export async function runClaudeApiDelegate(
       return block["type"] === "text" && typeof block["text"] === "string" ? [block["text"]] : [];
     }).join("\n");
     if (!text.trim()) throw new DelegateError("invalid_response");
-    const price = DELEGATE_MODELS[model];
-    const cacheRate = model === "claude-haiku-5-5" ? 0.1 : 0.05;
+    const price = claudeApiModelPrice(model)!;
     return { text, model, inputTokens: input + cacheRead + cacheWrite, outputTokens: output,
-      estimatedCostUsd: (input * price.input + output * price.output + cacheRead * price.input * cacheRate
+      estimatedCostUsd: (input * price.input + output * price.output + cacheRead * price.cacheRead
         + cacheWrite * price.input * 1.25) / 1_000_000,
       stopReason: typeof response["stop_reason"] === "string" ? response["stop_reason"] : "unknown" };
   } catch (error) {

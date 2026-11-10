@@ -12,6 +12,9 @@ for (const key of ["OPENAI_ADMIN_KEY", "OPENAI_ADMIN_API_KEY", "OPENAI_API_KEY",
 for (const key of Object.keys(process.env)) {
   if (key === "TMUX" || key === "TMUX_PANE" || key.startsWith("HERDR_")) delete process.env[key];
 }
+// API の環境補完が開発者の別ディレクトリのシェル設定を読まないよう、シェルも隔離する。
+for (const key of ["ZDOTDIR", "ENV", "BASH_ENV"]) delete process.env[key];
+process.env.SHELL = "/bin/sh";
 
 // HOME の隔離が効いているかを確かめる（効いていなければ、実物の hub の中継・lock・ログへ書きにいく）。
 // vitest の pool が threads 系だと、worker の process.env.HOME は替わっても os.homedir() は実物を返す。
