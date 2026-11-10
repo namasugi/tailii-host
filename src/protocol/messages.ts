@@ -1,6 +1,7 @@
 // protocol/messages.ts
 // ワイヤー仕様の型定義: プロトコル版数・支援型・ControlMessage（タグ付き union）。
 // 正本は root protocol/control-channel.md + golden フィクスチャ（goldenSync で同期検知）。
+import type { ClaudeApiDelegateRequest, ClaudeApiDelegateResult } from "../services/claudeApiDelegate.js";
 
 export const PROTOCOL_LEGACY = 0;
 export const PROTOCOL_V1 = 1;
@@ -787,6 +788,11 @@ export type ControlMessage =
   /** アカウント使用量の要求（iOS→Mac, account-usage）。session 非依存 — 一覧からも呼べる。 */
   | { type: "api_usage_options_request"; v: number; id: string }
   | { type: "api_usage_options_response"; v: number; id: string; supported: boolean }
+  | { type: "api_delegate_options_request"; v: number; id: string }
+  | { type: "api_delegate_options_response"; v: number; id: string; supported: boolean; supportsAttachments?: boolean; supportsHistory?: boolean; supportsOpenAI?: boolean }
+  | { type: "api_delegate_request"; v: number; id: string; request: ClaudeApiDelegateRequest }
+  | { type: "api_delegate_response"; v: number; id: string; result?: ClaudeApiDelegateResult; error?: string }
+  | { type: "api_delegate_cancel"; v: number; id: string }
   | { type: "account_usage_request"; v: number; id: string; apiCredentials?: ApiUsageCredentials }
   /**
    * アカウント使用量の応答（Mac→iOS, account-usage）。

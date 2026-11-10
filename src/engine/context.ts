@@ -49,6 +49,10 @@ export interface EngineState {
   ownMaxVersion: number;
   modeSetInFlight: Set<string>;
   sessionSearchAbort?: AbortController;
+  apiDelegates?: Map<string, AbortController>;
+  apiDelegateResponses?: Map<string, Extract<ControlMessage, { type: "api_delegate_response" }>>;
+  apiDelegateCancelled?: Set<string>;
+  apiDelegateAttempted?: Set<string>;
 }
 
 export interface ModeTiming {

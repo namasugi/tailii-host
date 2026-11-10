@@ -1202,6 +1202,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     // ---- 3. チャネル断で chat_output tail / reaper を確実に停止する（全経路） ----
     lifecycleAbort.abort();
     state.sessionSearchAbort?.abort();
+    for (const abort of state.apiDelegates?.values() ?? []) abort.abort();
     for (const timer of backgroundUnwatchTimers.values()) clearTimeout(timer);
     backgroundUnwatchTimers.clear();
     if (backgroundSyncHintsTimer !== null) clearTimeout(backgroundSyncHintsTimer);
@@ -1225,6 +1226,8 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
  * 状態を変える要求・開いている会話や一覧の状態に順序で効く要求は載せない（従来どおり直列）。
  */
 export const CONCURRENT_MESSAGE_TYPES: ReadonlySet<ControlMessage["type"]> = new Set<ControlMessage["type"]>([
+  // API 委譲中も通常会話・キャンセルを受理する。要求の重複と同時実行は handler が抑止する。
+  "api_delegate_request",
   "claude_session_list_request",
   // session_list_request は載せない: iOS は応答を届いた順に一覧へ反映し、終了済みの印（tombstone）も
   // 外す。並行にすると、終了より前に要求した古い一覧が後から届いて終了した会話を生き返らせる。

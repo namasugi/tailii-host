@@ -54,6 +54,13 @@ import {
   type Raw,
 } from "./common.js";
 
+function decodeApiImageOptions(raw: Raw): import("../services/claudeApiDelegate.js").ApiImageOptions {
+  return compact({ quality: requireString(raw, "quality") as "low" | "medium" | "high" | "xhigh" | "max",
+    size: requireString(raw, "size"), format: requireString(raw, "format") as "png" | "jpeg" | "webp",
+    background: requireString(raw, "background") as "opaque" | "transparent", count: requireNumber(raw, "count"),
+    complexity: optionalString(raw, "complexity") as "low" | "medium" | "high" | undefined });
+}
+
 /** `history_page_request.limit` の上限（1 回の応答を際限なく大きくしない, history-page）。 */
 export const HISTORY_PAGE_MAX_LIMIT = 200;
 
@@ -623,9 +630,52 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
     case "account_usage_request":
       return compact({ type, v, id: requireString(raw, "id"), apiCredentials: decodeApiUsageCredentials(raw["apiCredentials"]) });
     case "api_usage_options_request":
+    case "api_delegate_options_request":
+    case "api_delegate_cancel":
       return { type, v, id: requireString(raw, "id") };
     case "api_usage_options_response":
       return { type, v, id: requireString(raw, "id"), supported: requireBoolean(raw, "supported") };
+    case "api_delegate_options_response":
+      return compact({ type, v, id: requireString(raw, "id"), supported: requireBoolean(raw, "supported"),
+        supportsAttachments: optionalBoolean(raw, "supportsAttachments"), supportsHistory: optionalBoolean(raw, "supportsHistory"), supportsOpenAI: optionalBoolean(raw, "supportsOpenAI") });
+    case "api_delegate_request": {
+      const request = requireObject(raw["request"], "request");
+      return { type, v, id: requireString(raw, "id"), request: {
+        apiKey: requireString(request, "apiKey"), model: requireString(request, "model"),
+        prompt: requireString(request, "prompt"), context: requireString(request, "context"),
+        budgetCents: requireNumber(request, "budgetCents"),
+        ...(request["provider"] === undefined ? {} : { provider: requireString(request, "provider") as "claude" | "openai" }),
+        ...(request["imageOptions"] === undefined ? {} : { imageOptions: decodeApiImageOptions(requireObject(request["imageOptions"], "imageOptions")) }),
+        ...(request["attachments"] === undefined ? {} : { attachments: requireArray(request, "attachments").map((value) => {
+          const attachment = requireObject(value, "attachments");
+          return { path: requireString(attachment, "path"), name: requireString(attachment, "name") };
+        }) }),
+        ...(request["history"] === undefined ? {} : { history: requireArray(request, "history").map((value) => {
+          const turn = requireObject(value, "history");
+          return { prompt: requireString(turn, "prompt"), context: requireString(turn, "context"), response: requireString(turn, "response"),
+            ...(turn["attachments"] === undefined ? {} : { attachments: requireArray(turn, "attachments").map((item) => {
+              const attachment = requireObject(item, "attachments");
+              return { path: requireString(attachment, "path"), name: requireString(attachment, "name") };
+            }) }) };
+        }) }),
+      } };
+    }
+    case "api_delegate_response": {
+      const value = raw["result"];
+      if (value === undefined) return compact({ type, v, id: requireString(raw, "id"), error: optionalString(raw, "error") });
+      const result = requireObject(value, "result");
+      return { type, v, id: requireString(raw, "id"), result: {
+        text: requireString(result, "text"), model: requireString(result, "model"),
+        inputTokens: requireNumber(result, "inputTokens"), outputTokens: requireNumber(result, "outputTokens"),
+        estimatedCostUsd: requireNumber(result, "estimatedCostUsd"), stopReason: requireString(result, "stopReason"),
+        ...(result["usageUnavailable"] === undefined ? {} : { usageUnavailable: requireBoolean(result, "usageUnavailable") }),
+        ...(result["images"] === undefined ? {} : { images: requireArray(result, "images").map((value) => {
+          const image = requireObject(value, "images");
+          return { id: requireString(image, "id"), path: requireString(image, "path"), mime: requireString(image, "mime"),
+            thumbnail: requireString(image, "thumbnail"), width: requireNumber(image, "width"), height: requireNumber(image, "height") };
+        }) }),
+      } };
+    }
     case "file_fetch_cancel":
     case "question_dismiss":
     case "claude_session_list_request":
