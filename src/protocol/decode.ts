@@ -23,6 +23,8 @@ import {
   type HostVersions,
   isToolDenialKind,
   isBackgroundCommandStopStatus,
+  isSubagentControlAction,
+  isSubagentControlStatus,
   type OfficialAppProvider,
   type QuestionAnswer,
   type QuestionOption,
@@ -138,6 +140,8 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         summary: requireString(raw, "summary"),
         cwd: requireString(raw, "cwd"),
         diff: decodeToolDiff(raw["diff"]),
+        agentId: optionalString(raw, "agentId"),
+        agentType: optionalString(raw, "agentType"),
       });
 
     case "approval_decision": {
@@ -725,8 +729,13 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         mime: requireString(raw, "mime"),
       };
 
-    case "subagent_transcript_request":
-      return { type, v, id: requireString(raw, "id"), nodeId: requireString(raw, "nodeId") };
+    case "subagent_transcript_request": {
+      const before = optionalNumber(raw, "before");
+      if (before !== undefined && (!Number.isInteger(before) || before < 0)) {
+        throw new ProtocolDecodeError("missing-field", "before");
+      }
+      return compact({ type, v, id: requireString(raw, "id"), nodeId: requireString(raw, "nodeId"), before });
+    }
 
     case "history_page_request": {
       const limit = requireNumber(raw, "limit");
@@ -1418,6 +1427,31 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
       return { type, v, sessions };
     }
 
+    case "session_agent_counts": {
+      const items = requireArray(raw, "items").map((element) => {
+        const entry = requireObject(element, "items");
+        const running = requireNumber(entry, "running");
+        if (!Number.isInteger(running) || running < 0) throw new ProtocolDecodeError("missing-field", "items.running");
+        return { session: requireString(entry, "session"), running };
+      });
+      return { type, v, items, ...(raw["replace"] === true ? { replace: true } : {}) };
+    }
+
+    case "subagent_control_request": {
+      const action = requireString(raw, "action");
+      if (!isSubagentControlAction(action)) throw new ProtocolDecodeError("missing-field", "action");
+      return compact({
+        type, v, id: requireString(raw, "id"), action,
+        nodeId: optionalString(raw, "nodeId"), text: optionalString(raw, "text"),
+      });
+    }
+
+    case "subagent_control_response": {
+      const status = requireString(raw, "status");
+      if (!isSubagentControlStatus(status)) throw new ProtocolDecodeError("missing-field", "status");
+      return compact({ type, v, id: requireString(raw, "id"), status, error: optionalString(raw, "error") });
+    }
+
     case "background_command_stop_request":
       return { type, v, id: requireString(raw, "id"), nodeId: requireString(raw, "nodeId") };
 
@@ -1754,6 +1788,9 @@ function decodeSubagentNode(raw: Raw): SubagentNode {
     kind,
     model: optionalNullableString(raw, "model"),
     effort: optionalNullableString(raw, "effort"),
+    command: optionalString(raw, "command"),
+    exitCode: optionalNumber(raw, "exitCode"),
+    startTs: optionalNumber(raw, "startTs"),
   });
 }
 

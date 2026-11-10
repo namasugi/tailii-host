@@ -38,3 +38,26 @@ export function keybindingsTouchScrollBottom(raw: string): boolean {
   if (text.includes("scroll:bottom")) return true;
   return /(?:ctrl|control)\+end(?![a-z])|(?<![a-z])end\+(?:ctrl|control)/.test(text);
 }
+
+/**
+ * 背景エージェントの全停止（`chat:killAgents`、既定 ctrl+x ctrl+k を 2 回, 実測 2.1.321）の割り当てが既定のままか
+ * （subagent-control）。keybindings.json が無ければ既定。読めない・触れていれば送らない（変えた後のキーが何をするか分からない）。
+ */
+export function killAgentsKeyIsDefault(configDir: string = claudeConfigDir()): boolean {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(path.join(configDir, "keybindings.json"), "utf8");
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT";
+  }
+  return !keybindingsTouchKillAgents(raw);
+}
+
+/** keybindings.json の本文が `chat:killAgents` か ctrl+x ctrl+k の割り当てに触れているか（TESTABLE）。 */
+export function keybindingsTouchKillAgents(raw: string): boolean {
+  const text = raw.toLowerCase().replace(/\s+/g, " ");
+  if (text.includes("chat:killagents")) return true;
+  if (/(?:ctrl|control)\+x\s+(?:ctrl|control)\+k(?![a-z])/.test(text)) return true;
+  // 前置キー ctrl+x / ctrl+k 単独の割り当て変更も、2 打の解釈が変わりうるので送らない。
+  return /"(?:ctrl|control)\+[xk]"\s*:/.test(text);
+}

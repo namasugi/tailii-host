@@ -3035,6 +3035,39 @@ describe("SessionHub conversation stream", () => {
     expect(br.at(-1)).toMatchObject({ serverSeq: 4 });
   });
 
+  test("後から開いた client にもサブエージェントの最新状態を購読開始時と backfill 完了時に届ける", () => {
+    // 共有 tail は状態が変わったときしか subagent_node を配らない。backfill tail は本文の history-done で
+    // 止まるので、そこで捨てられると次の状態変化までピルが出なかった。
+    const { hub, writes } = makeStreamingHub(1);
+    const a = {}, b = {}, ar: unknown[] = [], br: unknown[] = [];
+    const node = (nodeId: string, status: "running" | "completed"): ControlMessage => ({
+      type: "subagent_node", v: 2,
+      node: { nodeId, toolUseId: `t-${nodeId}`, parentNodeId: "root", agentType: "Explore", label: nodeId, depth: 1, status, ts: 1 },
+    });
+    subscribe(hub, a, ar);
+    writes[0]!(node("agent-1", "running"));
+    writes[0]!(output("one"));
+    const brAll: unknown[] = [];
+    subscribe(hub, b, brAll, { afterSeq: 0, newerThanMs: 123 });
+    // 会話の流れ（conversation_event）だけを見る（エージェント数の配信 session_agents は別の話）。
+    const conversationEvents = () => brAll.filter((event) => (event as { type?: string }).type === "conversation_event");
+    const syncBr = () => { br.length = 0; br.push(...conversationEvents()); };
+    syncBr();
+    // 購読開始の時点で今の状態が届く（本文の読み直しを待たない）。
+    expect(br).toEqual([expect.objectContaining({ serverSeq: 0, payload: node("agent-1", "running") })]);
+    // 読み直し中に変わった状態は backfilling の client へ流れない → 完了時に最新状態で補う。
+    writes[0]!(node("agent-1", "completed"));
+    writes[0]!(node("agent-2", "running"));
+    syncBr();
+    expect(br).toHaveLength(1);
+    writes[1]!(output(HISTORY_DONE_STREAM_ID));
+    syncBr();
+    // 最新状態は履歴の完了印より前（後に送ると engine が「読み直し途中」と取り違えて再接続ごとに全履歴を取り直す）。
+    const payloads = br.map((event) => (event as { payload: ControlMessage }).payload);
+    expect(payloads.slice(1, 3)).toEqual([node("agent-1", "completed"), node("agent-2", "running")]);
+    expect(payloads.at(-1)).toMatchObject({ type: "chat_output", streamId: HISTORY_DONE_STREAM_ID });
+  });
+
   test("背景購読中の開き直し（newerThanMs, reattach-since）はその時刻以降を読み直し履歴完了まで届ける", () => {
     const metadataStore = makeTempStore();
     metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0, providerSessionId: "provider-1" });

@@ -73,6 +73,9 @@ export function claudeHookLaunchSettings(options: {
       PostToolUse: entry(),
       UserPromptSubmit: lifecycleEntry(),
       Stop: lifecycleEntry(),
+      // サブエージェントの開始 / 終了（会話一覧の「エージェント N」, session-agent-count）。
+      SubagentStart: lifecycleEntry(),
+      SubagentStop: lifecycleEntry(),
     },
   });
 }

@@ -1,0 +1,5 @@
+{"action":"stop_all","id":"control-1","type":"subagent_control_request","v":2}
+{"action":"message","id":"control-2","nodeId":"019a-child-thread","text":"テストも足してください","type":"subagent_control_request","v":2}
+{"id":"control-1","status":"ok","type":"subagent_control_response","v":2}
+{"error":"Claude Code のキー設定で「エージェントをすべて停止」（chat:killAgents）の割り当てが変えられているため送れません。","id":"control-3","status":"failed","type":"subagent_control_response","v":2}
+{"agentId":"a72ad3470729c9d04","agentType":"Explore","cwd":"/Users/me/app","id":"approval-agent-1","summary":"npm test","tool":"Bash","type":"approval_request","v":1}

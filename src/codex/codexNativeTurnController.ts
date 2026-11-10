@@ -68,6 +68,10 @@ export interface CodexNativeApproval {
   tool: string;
   summary: string;
   cwd: string;
+  /** サブエージェント（子 thread）が求めた承認なら、その thread id（= subagent_node の nodeId）。 */
+  agentId?: string;
+  /** 子 thread の種類（agentRole / nickname）。分からなければ省略。 */
+  agentType?: string;
 }
 
 export type CodexApprovalBroker = (approval: CodexNativeApproval) => Promise<Decision>;
@@ -131,6 +135,11 @@ export interface CodexTurnControllerRuntime {
     collaborationMode?: CodexCollaborationMode | null;
   }): Promise<string>;
   interruptTurn?(session: string): Promise<void>;
+  /** 子 thread（サブエージェント）の操作（subagent-control）。 */
+  interruptSubagent?(session: string, threadId: string): Promise<boolean>;
+  /** この会話の thread を開いているか（子の操作は開いている接続からしか送れない）。 */
+  hasOpenSession?(session: string): boolean;
+  sendToSubagent?(session: string, threadId: string, text: string): Promise<void>;
   /** 目標の読み取り / 設定 / 解除（codex-goal）。thread を開いていなければ開いてから実行する。 */
   goal?(options: CodexGoalOperation): Promise<CodexGoalOperationResult>;
   /** 目標が active な会話か（Hub が購読者ゼロでも thread 購読を保持する判定）。 */
@@ -180,6 +189,10 @@ export interface CodexThreadClient {
     clientUserMessageId?: string | null,
   ): Promise<void>;
   interruptTurn(turnId: string): Promise<void>;
+  /** 子 thread（サブエージェント）の実行中 turn を止める。止めたら true、実行中でなければ false（subagent-control）。 */
+  interruptOtherThread?(threadId: string): Promise<boolean>;
+  /** 子 thread へ追加の指示を送る（実行中なら steer、待機中なら新しい turn, subagent-control）。 */
+  sendToOtherThread?(threadId: string, text: string): Promise<void>;
   /** `thread/settings/updated` の取り込み（モデル / effort / collaboration mode の追従, codex-plan-mode）。 */
   noteThreadSettings?(settings: Record<string, unknown>): void;
   /** この接続で最後に観測 / 送信した collaboration mode（server の thread 設定に残る値）。不明は null。 */
@@ -666,6 +679,26 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     throw new Error(
       `Codex title generation failed after ${TITLE_GENERATION_MAX_ATTEMPTS} attempts: ${String(lastError)}`,
     );
+  }
+
+  hasOpenSession(session: string): boolean {
+    return this.open.has(session);
+  }
+
+  /** 子 thread（サブエージェント）の実行中 turn を止める（subagent-control）。会話を開いていなければ false。 */
+  async interruptSubagent(session: string, threadId: string): Promise<boolean> {
+    const opened = this.open.get(session);
+    if (opened === undefined || threadId === opened.threadId) return false;
+    return (await opened.thread.interruptOtherThread?.(threadId)) ?? false;
+  }
+
+  /** 子 thread（サブエージェント）へ追加の指示を送る（subagent-control）。 */
+  async sendToSubagent(session: string, threadId: string, text: string): Promise<void> {
+    const opened = this.open.get(session);
+    if (opened === undefined) throw new Error("Codex conversation is not open");
+    if (threadId === opened.threadId) throw new Error("not a subagent thread");
+    if (opened.thread.sendToOtherThread === undefined) throw new Error("App Server does not support subagent messages");
+    await opened.thread.sendToOtherThread(threadId, text);
   }
 
   async interruptTurn(session: string): Promise<void> {
@@ -1399,12 +1432,17 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
         : isCommand
           ? (command ?? reason ?? "コマンドの実行を許可しますか？")
           : fileChangeSummary(item, reason);
+      // 子 thread（サブエージェント）からの承認なら、どのエージェントかを添える（subagent-control）。
+      const requestThreadId = typeof params["threadId"] === "string" ? params["threadId"] : null;
+      const rootThreadId = this.open.get(session)?.threadId ?? null;
+      const fromSubagent = requestThreadId !== null && rootThreadId !== null && requestThreadId !== rootThreadId;
       const decision = await this.approvalBroker({
         id: `codex:${String(params["threadId"] ?? "thread")}:${String(request.id)}`,
         session,
         tool: writesStdin ? CODEX_WRITE_STDIN_TOOL_LABEL : isCommand ? "Bash" : "Edit",
         summary,
         cwd,
+        ...(fromSubagent ? { agentId: requestThreadId } : {}),
       });
       return { decision: decision === "allow" ? "accept" : "decline" };
     }
@@ -1656,6 +1694,8 @@ export async function requestCodexApprovalViaBroker(
     tool: approval.tool,
     summary: approval.summary,
     cwd: approval.cwd,
+    ...(approval.agentId !== undefined ? { agentId: approval.agentId } : {}),
+    ...(approval.agentType !== undefined ? { agentType: approval.agentType } : {}),
   });
   return new Promise<Decision>((resolve) => {
     let settled = false;

@@ -1205,6 +1205,44 @@ describe("Hook — 待機延長・retry-connect（Req 8.1/8.2/8.3）", () => {
     }
   });
 
+  it("SubagentStart / SubagentStop は subagent_lifecycle を relay へ送り無出力で終了する（内部の複製は送らない）", async () => {
+    if (!(await canListenUnixSocket())) return;
+    const relayPath = tempSocketPath(`relay-agent-${randomUUID().slice(0, 8)}`);
+    fs.rmSync(relayPath, { force: true });
+    const relay = await startListener(relayPath);
+    try {
+      for (const [event, expected] of [["SubagentStart", "start"], ["SubagentStop", "stop"]] as const) {
+        const run = runHookCore({
+          stdinData: Buffer.from(JSON.stringify({ hook_event_name: event, session_id: "s1", agent_id: "a1", agent_type: "Explore" })),
+          socketPath: null, deadlineSeconds: 1, session: "sess-agents", engineRelaySocketPath: relayPath,
+        });
+        const socket = await relay.nextConnection();
+        const line = await new SocketLineReader(socket).nextLine();
+        const { exitCode, stdout } = await run;
+        expect(JSON.parse(line)).toEqual({ type: "subagent_lifecycle", session: "sess-agents", event: expected, agentId: "a1" });
+        expect(exitCode).toBe(0);
+        expect(stdout).toBe("");
+      }
+      // 終了は agent_type が空でも id だけで送る（CLI 実装: `agent_type ?? ""`）。
+      const stopRun = runHookCore({
+        stdinData: Buffer.from(JSON.stringify({ hook_event_name: "SubagentStop", session_id: "s1", agent_id: "a2" })),
+        socketPath: null, deadlineSeconds: 1, session: "sess-agents", engineRelaySocketPath: relayPath,
+      });
+      const stopLine = await new SocketLineReader(await relay.nextConnection()).nextLine();
+      await stopRun;
+      expect(JSON.parse(stopLine)).toEqual({ type: "subagent_lifecycle", session: "sess-agents", event: "stop", agentId: "a2" });
+      // agent_type の無い CLI 内部の複製は数えない（relay へ何も送らず終了する）。
+      const internal = await runHookCore({
+        stdinData: Buffer.from(JSON.stringify({ hook_event_name: "SubagentStart", session_id: "s1", agent_id: "x1" })),
+        socketPath: null, deadlineSeconds: 1, session: "sess-agents", engineRelaySocketPath: relayPath,
+      });
+      expect(internal).toEqual({ exitCode: 0, stdout: "" });
+    } finally {
+      await relay.close();
+      fs.rmSync(relayPath, { force: true });
+    }
+  });
+
   it("Stop は session_processing(done) を relay へ送り無出力で終了する", async () => {
     if (!(await canListenUnixSocket())) return;
     const relayPath = tempSocketPath(`relay-life-b-${randomUUID().slice(0, 8)}`);

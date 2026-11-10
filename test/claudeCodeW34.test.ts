@@ -105,6 +105,20 @@ describe("fork-subagent: transcript の定型指示と spawn 写し", () => {
     ] } }),
   ].join("\n");
 
+  it("2.1.321 の形: 起動の写しとその結果「Fork started — that fork is you.」を落とす", () => {
+    const jsonl = [
+      JSON.stringify({ type: "fork-context-ref", agentId: "a1" }),
+      JSON.stringify({ type: "assistant", message: { role: "assistant", content: [
+        { type: "tool_use", id: "toolu_1", name: "Agent", input: { description: "probe", subagent_type: "fork" } },
+      ] } }),
+      JSON.stringify({ type: "user", message: { role: "user", content: [
+        { type: "tool_result", tool_use_id: "toolu_1", content: [{ type: "text", text: "Fork started — that fork is you." }] },
+      ] } }),
+      JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "始めます。" }] } }),
+    ].join("\n");
+    expect(parseSubagentTranscript(jsonl).entries.map((e) => e.text)).toEqual(["始めます。"]);
+  });
+
   it("先頭の Agent 写しを落とし、boilerplate を外した指示本文だけを user 行にする", () => {
     const { entries } = parseSubagentTranscript(forkJsonl);
     expect(entries.map((e) => e.role)).toEqual(["user", "assistant"]);

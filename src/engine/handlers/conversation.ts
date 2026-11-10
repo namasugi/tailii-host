@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { HubServerMessage } from "../../hub/hubProtocol.js";
-import { PROTOCOL_V2, type BackgroundCommandStopStatus, type ControlMessage } from "../../protocol.js";
+import { PROTOCOL_V2, type BackgroundCommandStopStatus, type ControlMessage, type SubagentControlStatus } from "../../protocol.js";
 import {
   annotateLiveSessions,
   buildLiveSessionIndex,
@@ -274,6 +274,7 @@ export const conversationHandlers: HandlerRegistry = {
             id: message.id,
             session,
             nodeId: message.nodeId,
+            ...(message.before !== undefined ? { before: message.before } : {}),
           },
           message.id,
           1_500,
@@ -323,6 +324,43 @@ export const conversationHandlers: HandlerRegistry = {
         });
       } catch (failure) {
         process.stderr.write(`[tailii-host engine] background_command_stop_response 書込失敗: ${String(failure)}\n`);
+      }
+    })();
+  },
+
+  subagent_control_request: (message, ctx) => {
+    // バックグラウンドタスクからのエージェント操作（subagent-control）。キー送信（Claude の全停止は 2 回押しの間を
+    // 空ける）と Codex の RPC を待つので read loop を塞がない。hub は 15 秒以内に答える。
+    const { writer, state } = ctx;
+    const v = state.negotiatedVersion;
+    const session = ctx.activeChatSession.name;
+    void (async () => {
+      let status: SubagentControlStatus = "failed";
+      let error: string | undefined = "会話を開き直してから、もう一度お試しください。";
+      if (session !== null) {
+        try {
+          const result = await ctx.hubRpc<Extract<HubServerMessage, { type: "subagent_control_result" }>>(
+            {
+              type: "subagent_control", id: message.id, session, action: message.action,
+              ...(message.nodeId !== undefined ? { nodeId: message.nodeId } : {}),
+              ...(message.text !== undefined ? { text: message.text } : {}),
+            },
+            message.id,
+            15_000,
+          );
+          status = result.status;
+          error = result.error;
+        } catch (failure) {
+          engineDiag(`subagent_control hub 失敗 id=${message.id}: ${String(failure)}`);
+          status = "failed";
+          error = "結果を確認できませんでした。しばらくしてから一覧で状態を確かめてください。";
+        }
+      }
+      engineDiag(`subagent_control id=${message.id} action=${message.action} status=${status}`);
+      try {
+        writer.write({ type: "subagent_control_response", v, id: message.id, status, ...(error !== undefined ? { error } : {}) });
+      } catch (failure) {
+        process.stderr.write(`[tailii-host engine] subagent_control_response 書込失敗: ${String(failure)}\n`);
       }
     })();
   },

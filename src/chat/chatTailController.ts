@@ -109,13 +109,13 @@ export class ChatTailController {
   }
 
   /** Hub からのオンデマンド要求に、現在 tail 中のノード全文を返す。 */
-  subagentTranscript(nodeId: string): SubagentTranscriptResult {
+  subagentTranscript(nodeId: string, before?: number): SubagentTranscriptResult {
     if (this.openAgent === "codex" && this.currentDir !== null) {
       const rollout = this.codexTailer.resolve(this.currentDir, null, nodeId);
-      return readCodexSubagentTranscript(rollout);
+      return readCodexSubagentTranscript(rollout, before);
     }
     const jsonl = this.subagentTranscriptPath(nodeId);
-    if (jsonl !== null) return readSubagentTranscript(jsonl);
+    if (jsonl !== null) return readSubagentTranscript(jsonl, before);
     // バックグラウンドコマンドは jsonl を持たないので、出力ファイルの末尾を返す。
     return readBackgroundOutput(this.subagentTailer.outputPath(nodeId));
   }

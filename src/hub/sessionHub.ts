@@ -20,6 +20,7 @@ import {
 import type {
   ControlMessage,
   QuestionPromptQuestion,
+  SubagentControlStatus,
   SubagentTranscriptEntry,
 } from "../protocol.js";
 import {
@@ -68,7 +69,7 @@ import { isNonBlockingQuestionId } from "../codex/codexAsyncQuestion.js";
 export interface HubTail {
   open(cwd: string, preferredSessionId: string | null, newerThanMs?: number | null, agent?: ChatAgent): void;
   stop(): void;
-  subagentTranscript?(nodeId: string): {
+  subagentTranscript?(nodeId: string, before?: number): {
     entries: SubagentTranscriptEntry[];
     omitted: number;
   };
@@ -169,6 +170,11 @@ export type SessionHubOptions = Omit<ReaperTickOptions, "now"> & {
    * hub は chat の注入・設問の回答キーと重ならないように直列化してから呼ぶ。
    */
   sendNowInjector?: (session: string) => Promise<SendQueuedNowOutcome>;
+  /**
+   * Claude の背景エージェントを全部止めるキー（`chat:killAgents` = ctrl+x ctrl+k を 2 回, subagent-control）を送る。
+   * 割り当てが既定から変えられていて送れないときは false。未設定（テスト等）は unsupported として答える。
+   */
+  killAllAgents?: (session: string) => Promise<boolean>;
   codexAppServerFactory?: () => CodexAppServerThreadRuntime;
   codexTurnControllerFactory?: (options: CodexNativeTurnControllerOptions) => CodexTurnControllerRuntime;
   /** 未回答設問の永続化先。省略時は永続化しない（daemon は既定パスを明示する）。 */
@@ -290,6 +296,20 @@ interface SessionActor {
   subscribers: Map<object, SubscriberState>;
   nextServerSeq: number;
   replayBuffer: ReplayEvent[];
+  /**
+   * 共有 tail が配ったサブエージェント / 背景コマンドの最新状態（nodeId → subagent_node）。
+   * tail は状態が変わったときしか配らないので、後から会話を開いた client には履歴の読み直し
+   * （backfill）で届くはずだが、backfill tail は本文の `pc:history-done` で止まり、その時点で
+   * まだ流していないノードは捨てられる（読み直し中の共有配信も backfilling の client へは送らない）。
+   * そのまま次の状態変化までピルが出なかった（「会話を開いてからピルが出るまでとても時間がかかる」）ので、
+   * 購読の開始時と backfill の終わりにこの最新状態を添える。
+   */
+  latestSubagentNodes: Map<string, ControlMessage>;
+  /**
+   * 動いているサブエージェント（agentId → 最後に開始 / 実行中を見た時刻 ms, session-agent-count）。hook の
+   * SubagentStart / SubagentStop と、tail している会話では subagent_node で揃える。会話一覧の「エージェント N」。
+   */
+  runningAgents: Map<string, RunningAgent>;
   tail: HubTail | null;
   /**
    * 直近の claude 共有 tail が既存内容の再生を完走した（`pc:history-done` を配った）か。購読者 0 人で
@@ -391,6 +411,17 @@ function defaultTranscriptPathFor(meta: SessionMeta): string | null {
 const RESIDUE_EXCERPT_CHARS = 60;
 
 /** hub の終了の準備中（graceful shutdown）に届いた、外部の操作を伴う要求への答え（もう一度試せる）。 */
+/** 動いているエージェント 1 体（session-agent-count）。 */
+interface RunningAgent {
+  /** 最後に開始 / 実行中を見た時刻（ms）。 */
+  seenAt: number;
+  /** hook（購読に関係なく終わりが届く）で知ったか。false = tail でしか知らない。 */
+  fromHook: boolean;
+}
+
+/** SubagentStop を取りこぼしたエージェントを数えなくなるまでの時間（session-agent-count）。 */
+const RUNNING_AGENT_STALE_MS = 6 * 60 * 60 * 1000;
+
 const STOP_BLOCKED_BY_SHUTDOWN = "ホスト側の再起動中のため止められませんでした。少し待ってもう一度試してください。";
 const GOAL_BLOCKED_BY_SHUTDOWN = "ホスト側の再起動中のため目標を変更できませんでした。少し待ってもう一度試してください。";
 
@@ -727,7 +758,68 @@ export class SessionHub {
     try { this.clients.get(client)?.(encodeHubMessage(message)); } catch { /* 同上。 */ }
   }
 
+  /** 会話ごとの動いているエージェント数（0 は載せない, session-agent-count）。 */
+  get runningAgentCounts(): { session: string; running: number }[] {
+    const items: { session: string; running: number }[] = [];
+    const now = Date.now();
+    for (const [session, actor] of this.actors) {
+      this.pruneStaleAgents(actor, now);
+      if (actor.runningAgents.size > 0) items.push({ session, running: actor.runningAgents.size });
+    }
+    return items;
+  }
+
+  /**
+   * 1 体の実行中 / 終了を反映し、数が変わったら全 engine へ配る。`source` は知った経路: hook（SubagentStart /
+   * SubagentStop。購読に関係なく届く）か tail（購読している間だけ届く subagent_node）。
+   */
+  private setAgentRunning(
+    session: string, actor: SessionActor, agentId: string, running: boolean, source: "hook" | "tail",
+  ): void {
+    const before = actor.runningAgents.size;
+    if (running) {
+      const existing = actor.runningAgents.get(agentId);
+      actor.runningAgents.set(agentId, { seenAt: Date.now(), fromHook: source === "hook" || existing?.fromHook === true });
+    } else {
+      actor.runningAgents.delete(agentId);
+    }
+    this.broadcastAgentCountIfChanged(session, actor, before);
+  }
+
+  private broadcastAgentCountIfChanged(session: string, actor: SessionActor, before: number): void {
+    if (actor.runningAgents.size !== before) {
+      this.broadcast({ type: "session_agents", items: [{ session, running: actor.runningAgents.size }] });
+    }
+  }
+
+  /**
+   * 購読が切れたら、tail でしか知らない（hook の届かない Codex・hook 導入前から動いている Claude の）エージェントを
+   * 外す。購読していない間は終わりを知る手段が無く、残すと一覧に長く「エージェント N」が残る。
+   */
+  private dropTailOnlyAgents(session: string, actor: SessionActor): void {
+    const before = actor.runningAgents.size;
+    for (const [agentId, agent] of actor.runningAgents) {
+      if (!agent.fromHook) actor.runningAgents.delete(agentId);
+    }
+    this.broadcastAgentCountIfChanged(session, actor, before);
+  }
+
+  /**
+   * SubagentStop を取りこぼした（CLI が落ちた・止められた等）エージェントがいつまでも数えられないよう、
+   * 最後に見てから長く経ったものは外す（背景エージェントは長く走りうるので余裕を持たせる）。
+   */
+  private pruneStaleAgents(actor: SessionActor, now: number): void {
+    for (const [agentId, agent] of actor.runningAgents) {
+      if (now - agent.seenAt > RUNNING_AGENT_STALE_MS) actor.runningAgents.delete(agentId);
+    }
+  }
+
   handleRelayMessage(message: EngineRelayMessage): void {
+    if (message.type === "subagent_lifecycle") {
+      const actor = this.actor(message.session);
+      this.setAgentRunning(message.session, actor, message.agentId, message.event === "start", "hook");
+      return;
+    }
     if (message.type === "question_event") {
       // 新しい設問が来た / CLI 側でその設問が片付いた（PostToolUse）なら、捨てた設問の再確認は要らない。
       if (message.event === "prompt" || this.staleQuestionRechecks.get(message.session)?.id === message.id) {
@@ -738,6 +830,11 @@ export class SessionHub {
         ? { id: message.id, questions: message.questions ?? [], answerRoute: "tui" } : null);
       if (message.event === "dismiss") void this.drainChatQueue(message.session, actor);
     } else if (message.type === "session_processing") {
+      // サブエージェントのツール呼び出し: 数えているエージェントの「最後に見た時刻」を更新する（数は変えない）。
+      if (message.agentId !== undefined) {
+        const agent = this.actors.get(message.session)?.runningAgents.get(message.agentId);
+        if (agent !== undefined) agent.seenAt = Date.now();
+      }
       if (!this.applyProcessing(message.session, message.state, message.event, message.atMs)) return;
     }
     this.broadcast(message);
@@ -745,7 +842,12 @@ export class SessionHub {
 
   handleClientMessage(client: object, line: string): void {
     const message = decodeHubClientLine(line);
-    if (message === null || message.type === "hub_hello") return;
+    if (message === null) return;
+    if (message.type === "hub_hello") {
+      // 接続した engine へ、会話ごとの動いているエージェント数を全件で送る（載っていない会話は 0）。
+      this.sendTo(client, { type: "session_agents", items: this.runningAgentCounts, replace: true });
+      return;
+    }
     if (message.type === "conversation_subscribe") {
       // preview は後から加わった内部フラグ。省略する旧 engine は従来どおり前面購読として扱う。
       this.subscribe(client, message.session, message.afterSeq, message.newerThanMs, message.preview ?? true);
@@ -784,7 +886,7 @@ export class SessionHub {
     }
     if (message.type === "conversation_subagent_transcript_request") {
       const actor = this.actors.get(message.session);
-      const transcript = actor?.tail?.subagentTranscript?.(message.nodeId) ?? {
+      const transcript = actor?.tail?.subagentTranscript?.(message.nodeId, message.before) ?? {
         entries: [],
         omitted: 0,
       };
@@ -1175,6 +1277,26 @@ export class SessionHub {
       void this.runSendNow(message.session, actor);
       return;
     }
+    if (message.type === "subagent_control") {
+      void this.trackOp(this.controlSubagents(message)).then(
+        (result) => {
+          this.options.log?.(
+            `audit subagent_control session=${auditValue(message.session)} action=${message.action} status=${result.status}`,
+          );
+          this.sendTo(client, { type: "subagent_control_result", id: message.id, ...result });
+        },
+        (error: unknown) => {
+          this.options.log?.(
+            `audit subagent_control session=${auditValue(message.session)} action=${message.action} status=failed error=${auditValue(String(error))}`,
+          );
+          this.sendTo(client, {
+            type: "subagent_control_result", id: message.id, status: "failed",
+            error: "操作の途中でエラーが起きました。一覧で状態を確かめてください。",
+          });
+        },
+      );
+      return;
+    }
     if (message.type === "background_command_stop") {
       // 背景コマンドの停止は出力ファイルを持つ tail（この会話の actor）にしかできない。
       // 会話を tail していなければ not_found（iPhone は一覧を開いている前面会話からしか送らない）。
@@ -1259,6 +1381,13 @@ export class SessionHub {
   }
 
   async tick(): Promise<ReaperTickResult> {
+    // 取りこぼしたエージェントの間引き（session-agent-count）。外したら一覧へ配り直す。
+    const pruneNow = Date.now();
+    for (const [session, actor] of this.actors) {
+      const before = actor.runningAgents.size;
+      this.pruneStaleAgents(actor, pruneNow);
+      this.broadcastAgentCountIfChanged(session, actor, before);
+    }
     for (const [session, actor] of this.actors) {
       if (actor.focusedBy.size > 0) this.bumpSafe(session, "hub-tick");
       if (actor.processingSince !== null) this.bumpSafe(session, "hub-processing", "active");
@@ -1316,6 +1445,11 @@ export class SessionHub {
     }
     const actor = this.actors.get(session);
     if (actor === undefined) return;
+    // 会話が終わったら、そこで動いていたエージェントも数えない。
+    if (actor.runningAgents.size > 0) {
+      actor.runningAgents.clear();
+      this.broadcast({ type: "session_agents", items: [{ session, running: 0 }] });
+    }
 
     if (actor.tailRetryTimer !== null) clearTimeout(actor.tailRetryTimer);
     actor.tailRetryTimer = null;
@@ -1522,6 +1656,7 @@ export class SessionHub {
       actor.tail = null;
       actor.codexLive = null;
       this.maybeCloseIdleCodexSession(session);
+      this.dropTailOnlyAgents(session, actor);
     }
   }
 
@@ -1562,6 +1697,8 @@ export class SessionHub {
       return;
     }
     if (this.options.tailFactory === undefined) return;
+    // 新しい共有 tail は既存ノードを頭から配り直す（別の transcript へ切り替わった場合の古い状態も捨てる）。
+    actor.latestSubagentNodes.clear();
     let current: HubTail | null = null;
     const tail = this.options.tailFactory(
       (payload) => {
@@ -1903,6 +2040,13 @@ export class SessionHub {
   }
 
   private publishConversationEvent(session: string, actor: SessionActor, payload: ControlMessage): void {
+    if (payload.type === "subagent_node") {
+      actor.latestSubagentNodes.set(payload.node.nodeId, payload);
+      // tail している会話は transcript が権威（hook の取りこぼし・遅着を揃える）。コマンドは数えない。
+      if (payload.node.kind === undefined) {
+        this.setAgentRunning(session, actor, payload.node.nodeId, payload.node.status === "running", "tail");
+      }
+    }
     const event = { serverSeq: actor.nextServerSeq++, payload };
     actor.replayBuffer.push(event);
     if (actor.replayBuffer.length > this.replayLimit) {
@@ -1915,6 +2059,72 @@ export class SessionHub {
     }
   }
 
+  /**
+   * バックグラウンドタスクからのエージェント操作（subagent-control）。
+   * - Claude: 全停止だけを扱う（TUI の `chat:killAgents`）。個別の停止・メッセージは iOS が会話本体へ定型文で頼む。
+   * - Codex: 子 thread（= nodeId）の turn を App Server で直接 interrupt / 追加の指示。全停止は実行中の子を全部止める。
+   */
+  private async controlSubagents(
+    message: Extract<HubClientMessage, { type: "subagent_control" }>,
+  ): Promise<{ status: SubagentControlStatus; error?: string }> {
+    if (this.shuttingDown) return { status: "failed", error: STOP_BLOCKED_BY_SHUTDOWN };
+    const meta = this.options.metadataStore.get(message.session);
+    if (meta === null) return { status: "failed", error: "会話が見つかりませんでした。開き直してからお試しください。" };
+    if (meta.agent === "codex") {
+      const controller = this.codexTurnController;
+      if (controller === null) {
+        return { status: "failed", error: "会話を開き直してから、もう一度お試しください。" };
+      }
+      if (controller.interruptSubagent === undefined || controller.sendToSubagent === undefined) {
+        return { status: "unsupported" };
+      }
+      if (message.action === "message") {
+        const text = message.text?.trim() ?? "";
+        if (message.nodeId === undefined || text.length === 0) return { status: "failed", error: "送る内容がありません。" };
+        await controller.sendToSubagent(message.session, message.nodeId, text);
+        return { status: "ok" };
+      }
+      const targets = message.action === "stop"
+        ? (message.nodeId === undefined ? [] : [message.nodeId])
+        : this.runningSubagentIds(message.session);
+      if (!(controller.hasOpenSession?.(message.session) ?? true)) {
+        return { status: "failed", error: "この会話を開いてから、もう一度お試しください。" };
+      }
+      let stopped = 0;
+      for (const threadId of targets) {
+        if (await controller.interruptSubagent(message.session, threadId)) stopped += 1;
+      }
+      return { status: stopped > 0 ? "ok" : "not_running" };
+    }
+    if (message.action !== "stop_all") return { status: "unsupported" };
+    if (this.options.killAllAgents === undefined) return { status: "unsupported" };
+    const sent = await this.options.killAllAgents(message.session);
+    return sent
+      ? { status: "ok" }
+      : {
+        status: "failed",
+        error: "Claude Code のキー設定で「エージェントをすべて停止」（chat:killAgents）の割り当てが変えられているため送れません。",
+      };
+  }
+
+  /** 共有 tail が把握している、実行中のサブエージェント（コマンドを除く）の id。 */
+  private runningSubagentIds(session: string): string[] {
+    const ids: string[] = [];
+    for (const payload of this.actors.get(session)?.latestSubagentNodes.values() ?? []) {
+      if (payload.type === "subagent_node" && payload.node.kind === undefined && payload.node.status === "running") {
+        ids.push(payload.node.nodeId);
+      }
+    }
+    return ids;
+  }
+
+  /** 共有 tail が把握しているサブエージェントの最新状態をこの client へ送る（latestSubagentNodes 参照）。 */
+  private sendSubagentSnapshot(client: object, session: string, actor: SessionActor): void {
+    for (const payload of actor.latestSubagentNodes.values()) {
+      this.sendTo(client, { type: "conversation_event", session, serverSeq: 0, payload });
+    }
+  }
+
   private startBackfill(client: object, session: string, actor: SessionActor, newerThanMs: number | null): void {
     if (this.options.tailFactory === undefined) return;
     const meta = this.options.metadataStore.get(session);
@@ -1923,6 +2133,8 @@ export class SessionHub {
     // backfill の後始末が新しい購読を壊さないよう、自分が始めた分だけを識別して触る。
     const ownState = actor.subscribers.get(client)!;
     ownState.backfilling = true;
+    // 本文の読み直しを待たずにピルを出す（今わかっている最新状態を先に送る）。
+    this.sendSubagentSnapshot(client, session, actor);
     const boundarySeq = actor.nextServerSeq - 1;
     const liveCountsAtStart = new Map(actor.codexLive?.publishedContentCounts ?? []);
     const backfillCounts = new Map<string, number>();
@@ -1952,6 +2164,8 @@ export class SessionHub {
       ownState.backfilling = false;
       if (reason !== "history-done") {
         this.options.log?.(`audit backfill-force-finish session=${session} reason=${reason}`);
+        // 完了印（history-done）の前に送れなかった強制完了も、中止の印より前に最新状態で補う。
+        this.sendSubagentSnapshot(client, session, actor);
         // Claude も全履歴を begin/done で囲む。不完全な履歴を採用せず、iOS のバッファを解除する。
         this.sendTo(client, {
           type: "conversation_event", session, serverSeq: 0,
@@ -2022,11 +2236,16 @@ export class SessionHub {
       stallTimer.unref();
     };
     tail = this.options.tailFactory((payload) => {
+      const historyDone = payload.type === "chat_output" && payload.streamId === HISTORY_DONE_STREAM_ID;
+      // 読み直し中に変わった状態（backfilling の間は共有配信を送らない）と、ここで止める backfill tail が
+      // まだ流していなかったノードを、最新状態で補う。履歴の完了印より**前**に送る（後に送ると engine が
+      // 「読み直し途中」と取り違える）。
+      if (historyDone) this.sendSubagentSnapshot(client, session, actor);
       this.sendTo(client, { type: "conversation_event", session, serverSeq: 0, payload });
       lastProgressAt = Date.now();
       const key = chatContentKey(payload);
       if (key !== null) incrementCount(backfillCounts, key);
-      if (payload.type === "chat_output" && payload.streamId === HISTORY_DONE_STREAM_ID) finish("history-done");
+      if (historyDone) finish("history-done");
     });
     if (!completedSynchronously) actor.backfillTails.set(client, tail);
     try {
@@ -2254,7 +2473,9 @@ export class SessionHub {
       actor = { pendingQuestion: null, processingSince: null, processingSinceMs: null, lastInterruptDoneMs: null,
         lastTurnEndMs: null, turnStartFiredAtMs: null, lastTurnStartMs: null,
         focusedBy: new Set(), subscribers: new Map(),
-        nextServerSeq: 1, replayBuffer: [], tail: null, sharedTailCaughtUp: false, tailRetryTimer: null,
+        nextServerSeq: 1, replayBuffer: [], latestSubagentNodes: new Map(), runningAgents: new Map(), tail: null,
+        sharedTailCaughtUp: false,
+        tailRetryTimer: null,
         previewPump: null, usageLimitWatch: null, backfillTails: new Map(),
         seenClientMessageIds: new Set(), deliveredChatMessageIds: new Map(),
         deliveredCodexMessageIds: new Map(),

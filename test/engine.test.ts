@@ -576,7 +576,14 @@ describe("EngineControl — 横断制御チャネル", () => {
       ],
       omitted: 3,
     });
-    expect(transcript).toHaveBeenCalledWith("agent-a");
+    expect(transcript).toHaveBeenCalledWith("agent-a", undefined);
+
+    // さかのぼり読み（agent-conversation-paging）: before が hub の tail まで届く。
+    engine.writeLine(
+      '{"before":120,"id":"transcript-2","nodeId":"agent-a","type":"subagent_transcript_request","v":2}',
+    );
+    await engine.lines.nextOfType("subagent_transcript_response");
+    expect(transcript).toHaveBeenLastCalledWith("agent-a", 120);
     await engine.teardown();
   });
 
@@ -744,6 +751,54 @@ describe("EngineControl — 横断制御チャネル", () => {
     hubLink.onReconnect?.({ bootId: "boot-a", disconnectedAtMs: 2_000, resumeHint: true });
     expect(sent).toContainEqual({
       type: "conversation_subscribe", session: "work", afterSeq: 3, newerThanMs: 295_000, preview: true,
+    });
+    now.mockRestore();
+    await engine.teardown();
+  });
+
+  test("履歴完了の後に届くサブエージェントの最新状態（serverSeq 0）で読み直し途中と取り違えない", async () => {
+    // hub は会話を開いた client へ backfill の前後でサブエージェントの最新状態を serverSeq 0 で送る。
+    // これを読み直しと数えると「読み直し途中」の印が外れず、再接続ごとに全履歴を取り直していた。
+    const store = makeTempStore();
+    store.put({ name: "work", cwd: "/tmp/work", createdAt: 1, agent: "claude",
+      providerSessionId: "provider-1" });
+    const sent: unknown[] = [];
+    const hubLink: HubLink = {
+      onMessage: null, onReconnect: null,
+      send(message) {
+        sent.push(message);
+        if (message.type === "hub_state_request") queueMicrotask(() => hubLink.onMessage?.({
+          type: "hub_state_response", id: message.id, session: message.session,
+          pendingQuestion: null, processing: false,
+        }));
+        return true;
+      },
+      close: vi.fn(),
+    };
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("work\n") : ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner, store), metadataStore: store, hubLink });
+    await engine.lines.nextOfType("channel_hello");
+    hubLink.onReconnect?.({ bootId: "boot-a", disconnectedAtMs: null });
+    engine.writeLine('{"id":"open","name":"work","type":"session_reattach","v":2}');
+    await engine.lines.nextOfType("session_list_response");
+    const now = vi.spyOn(Date, "now").mockReturnValue(400_000);
+    const node = {
+      type: "subagent_node" as const, v: 2,
+      node: { nodeId: "agent-1", toolUseId: "t", parentNodeId: "root", agentType: "Explore", label: "x",
+        depth: 1, status: "running" as const, ts: 1 },
+    };
+    hubLink.onMessage?.({ type: "conversation_event", session: "work", serverSeq: 0, payload: node });
+    hubLink.onMessage?.({ type: "conversation_event", session: "work", serverSeq: 0,
+      payload: { type: "chat_output", v: 1, streamId: "pc:history-done", role: "system", text: "", eof: true } });
+    // 古い hub の順序（完了印の後に最新状態）でも取り違えない。
+    hubLink.onMessage?.({ type: "conversation_event", session: "work", serverSeq: 0, payload: node });
+    hubLink.onMessage?.({ type: "conversation_event", session: "work", serverSeq: 5,
+      payload: { type: "chat_output", v: 1, streamId: "live", role: "assistant", text: "live", eof: true } });
+    await engine.lines.nextOfType("subagent_node");
+    sent.length = 0;
+    hubLink.onReconnect?.({ bootId: "boot-a", disconnectedAtMs: 1_000, resumeHint: true });
+    expect(sent).toContainEqual({
+      type: "conversation_subscribe", session: "work", afterSeq: 5, newerThanMs: 395_000, preview: true,
     });
     now.mockRestore();
     await engine.teardown();

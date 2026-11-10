@@ -14,6 +14,16 @@ import { stripInjectedReminderBlocks, stripReminderTagBlocks } from "../shared/h
 import { crossSessionOriginHint, crossSessionSenderLabel, presentCrossSessionMessage } from "../shared/crossSession.js";
 
 const MAX_ENTRIES = 200;
+
+/**
+ * 全件のうち `before`（通し番号, 省略時は末尾）より前の最大 MAX_ENTRIES 件を返す（agent-conversation-paging）。
+ * `omitted` は返した先頭の通し番号（= それより前の件数）。transcript は追記のみなので通し番号は安定する。
+ */
+export function transcriptPage(all: SubagentTranscriptEntry[], before?: number): SubagentTranscriptResult {
+  const end = before === undefined ? all.length : Math.max(0, Math.min(before, all.length));
+  const start = Math.max(0, end - MAX_ENTRIES);
+  return { entries: all.slice(start, end), omitted: start };
+}
 const MAX_TOOL_TEXT = 1_000;
 const MAX_TOOL_INPUT = 300;
 /** サブエージェント自身の最終レポート送信（SubagentHandback ツール）を全文で載せるときの見出し。 */
@@ -25,20 +35,20 @@ export interface SubagentTranscriptResult {
 }
 
 /** 読めないファイルは空応答にする（要求元を待たせない）。 */
-export function readSubagentTranscript(file: string | null): SubagentTranscriptResult {
+export function readSubagentTranscript(file: string | null, before?: number): SubagentTranscriptResult {
   if (file === null) return { entries: [], omitted: 0 };
   try {
-    return parseSubagentTranscript(fs.readFileSync(file, "utf8"));
+    return parseSubagentTranscript(fs.readFileSync(file, "utf8"), before);
   } catch {
     return { entries: [], omitted: 0 };
   }
 }
 
 /** Codex sub-agent の rollout を全文表示向けの軽量な行へ変換する。 */
-export function readCodexSubagentTranscript(file: string | null): SubagentTranscriptResult {
+export function readCodexSubagentTranscript(file: string | null, before?: number): SubagentTranscriptResult {
   if (file === null) return { entries: [], omitted: 0 };
   try {
-    return parseCodexSubagentTranscript(fs.readFileSync(file, "utf8"));
+    return parseCodexSubagentTranscript(fs.readFileSync(file, "utf8"), before);
   } catch {
     return { entries: [], omitted: 0 };
   }
@@ -62,7 +72,13 @@ export function readBackgroundOutput(file: string | null): SubagentTranscriptRes
     return { entries: [], omitted: 0 };
   }
   const clamped = text.length > MAX_OUTPUT_TAIL;
-  const tail = clamped ? text.slice(text.length - MAX_OUTPUT_TAIL) : text;
+  // 切り出しの先頭がサロゲートペアの後半なら 1 つ後ろから（孤立サロゲートで iOS が応答ごと復号に失敗しないように）。
+  let start = clamped ? text.length - MAX_OUTPUT_TAIL : 0;
+  if (start > 0) {
+    const first = text.charCodeAt(start);
+    if (first >= 0xdc00 && first <= 0xdfff) start += 1;
+  }
+  const tail = text.slice(start);
   if (tail.length === 0) return { entries: [], omitted: 0 };
   return {
     entries: [{
@@ -91,12 +107,14 @@ export function presentForkDirective(raw: string): string | null {
   return directive.length > 0 ? `⑂ 分岐（fork）への指示\n\n${directive}` : "⑂ 分岐（fork）への指示";
 }
 
-export function parseSubagentTranscript(jsonl: string): SubagentTranscriptResult {
+export function parseSubagentTranscript(jsonl: string, before?: number): SubagentTranscriptResult {
   const all: SubagentTranscriptEntry[] = [];
   // fork の transcript は親履歴を複製せず、先頭に参照レコード `fork-context-ref` を置き、その直後に
   // 親が fork を起こした Agent tool_use の写しが 1 行入る（実測 2026-09-14）。写しは fork 自身の
   // 行動ではないのでタイムラインから外す。
   let forkSpawnCopyPending = false;
+  // 落とした spawn 写しの tool_use id。直後の結果の写し（「Fork started — that fork is you.」/ 旧形の空）も落とす。
+  const forkSpawnCopyIds = new Set<string>();
   for (const line of jsonl.split(/\r?\n/)) {
     if (!line) continue;
     let value: unknown;
@@ -118,7 +136,13 @@ export function parseSubagentTranscript(jsonl: string): SubagentTranscriptResult
     const content = message?.["content"] ?? record["content"];
     if (forkSpawnCopyPending) {
       forkSpawnCopyPending = false;
-      if (role === "assistant" && isAgentSpawnOnlyContent(content)) continue;
+      if (role === "assistant" && isAgentSpawnOnlyContent(content)) {
+        for (const block of content as unknown[]) {
+          const id = object(block)?.["id"];
+          if (typeof id === "string") forkSpawnCopyIds.add(id);
+        }
+        continue;
+      }
     }
     // harness 注入の <system-reminder>（user 行のリマインダ / assistant text 末尾の背景通知）は
     // 表示せず、user 行で届く通知封筒はコンパクトな 1 行に畳む。除去で空になった text は行にしない。
@@ -190,24 +214,30 @@ export function parseSubagentTranscript(jsonl: string): SubagentTranscriptResult
           "tool", input ? `${block["name"]}: ${input}` : block["name"], ts, "tool_use",
         ));
       }
+      if (block["type"] === "tool_result" && typeof block["tool_use_id"] === "string"
+        && forkSpawnCopyIds.has(block["tool_use_id"])) {
+        continue;
+      }
       if (block["type"] === "tool_result") {
         // 入れ子の Agent の最終レポートは tool_result で届く。そこにも停止境界の注入が付き得る。
         const raw = toolResultText(block["content"]);
         const stripped = stripInjectedReminderBlocks(raw);
         const result = stripped === raw ? raw : stripped.trimEnd();
-        if (result.trim()) all.push(entry("tool", truncate(result, MAX_TOOL_TEXT), ts, "tool_result"));
+        // テキストの無い結果（画像を読んだ・ツール定義を読み込んだ等）も 1 行にする。省くと、iOS の会話画面が
+        // 結果を呼び出し順に付けるときに 1 つずつずれる（agent-conversation）。
+        const text = result.trim() ? truncate(result, MAX_TOOL_TEXT) : emptyToolResultLabel(block["content"]);
+        all.push(entry("tool", text, ts, "tool_result"));
       }
     }
   }
-  const omitted = Math.max(0, all.length - MAX_ENTRIES);
-  return { entries: all.slice(omitted), omitted };
+  return transcriptPage(all, before);
 }
 
 /**
  * fork された Codex rollout には親の履歴も複製される。親→子の agent_message を境界にし、
  * それより後の子自身の発話・ツール実行だけを返す。
  */
-export function parseCodexSubagentTranscript(jsonl: string): SubagentTranscriptResult {
+export function parseCodexSubagentTranscript(jsonl: string, before?: number): SubagentTranscriptResult {
   const records = jsonl.split(/\r?\n/).flatMap((line): Record<string, unknown>[] => {
     if (!line) return [];
     try {
@@ -266,8 +296,7 @@ export function parseCodexSubagentTranscript(jsonl: string): SubagentTranscriptR
     }
   }
 
-  const omitted = Math.max(0, all.length - MAX_ENTRIES);
-  return { entries: all.slice(omitted), omitted };
+  return transcriptPage(all, before);
 }
 
 function codexAgentPath(records: Record<string, unknown>[]): string | null {
@@ -393,6 +422,16 @@ function entry(
 function object(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown> : null;
+}
+
+/** テキストを持たないツール結果の代わりの 1 行（中身の種類だけを示す）。 */
+export function emptyToolResultLabel(value: unknown): string {
+  const blocks = Array.isArray(value) ? value.map(object).filter((block) => block !== null) : [];
+  const images = blocks.filter((block) => block["type"] === "image").length;
+  if (images > 0) return images === 1 ? "（画像）" : `（画像 ${images} 枚）`;
+  const references = blocks.filter((block) => block["type"] === "tool_reference").length;
+  if (references > 0) return `（ツールの定義 ${references} 件を読み込み）`;
+  return "（結果なし）";
 }
 
 function toolResultText(value: unknown): string {

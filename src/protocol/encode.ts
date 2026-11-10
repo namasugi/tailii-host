@@ -64,6 +64,9 @@ function wireObject(message: ControlMessage): Raw {
     out["toolUseId"] = node.toolUseId;
     out["ts"] = node.ts;
     if (node.kind !== undefined) out["kind"] = node.kind;
+    if (node.command !== undefined) out["command"] = node.command;
+    if (node.exitCode !== undefined) out["exitCode"] = node.exitCode;
+    if (node.startTs !== undefined) out["startTs"] = node.startTs;
   }
 
   return out;

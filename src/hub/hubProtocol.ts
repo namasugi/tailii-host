@@ -4,7 +4,11 @@
 import type { EngineRelayMessage, SessionProcessingMessage } from "./engineRelaySocket.js";
 import {
   isBackgroundCommandStopStatus,
+  isSubagentControlAction,
+  isSubagentControlStatus,
   type BackgroundCommandStopStatus,
+  type SubagentControlAction,
+  type SubagentControlStatus,
   decodeControlMessage,
   encodeControlMessage,
   type CodexCollaborationMode,
@@ -20,9 +24,10 @@ export type HubClientMessage =
   | { type: "conversation_subscribe"; session: string; afterSeq?: number; newerThanMs?: number; preview?: boolean }
   | { type: "conversation_unsubscribe"; session: string }
   | { type: "session_retire"; session: string }
-  | { type: "conversation_subagent_transcript_request"; id: string; session: string; nodeId: string }
+  | { type: "conversation_subagent_transcript_request"; id: string; session: string; nodeId: string; before?: number }
   /** バックグラウンドタスク一覧からの背景コマンドの停止（nodeId = taskId）。 */
   | { type: "background_command_stop"; id: string; session: string; nodeId: string }
+  | { type: "subagent_control"; id: string; session: string; action: SubagentControlAction; nodeId?: string; text?: string }
   /** 会話履歴のページ取得（history-page）。before* の行より前の最後の limit 行ぶん。 */
   | {
       type: "conversation_history_page_request";
@@ -161,7 +166,10 @@ export type HubServerMessage =
   | { type: "chat_receipt_query_result"; id: string; status: "delivered" | "deleted" | "uncertain" | "pending" | "unknown" }
   | { type: "chat_send_now_result"; id: string; status: "sent" | "nothing_queued" | "blocked" | "failed"; error?: string }
   | { type: "background_command_stop_result"; id: string; status: BackgroundCommandStopStatus; error?: string }
+  | { type: "subagent_control_result"; id: string; status: SubagentControlStatus; error?: string }
   | { type: "runtime_claim_result"; id: string; status: "granted" | "held" }
+  /** 会話で動いているエージェントの数（session-agent-count）。`replace` は接続直後の全件（載っていない会話は 0）。 */
+  | { type: "session_agents"; items: { session: string; running: number }[]; replace?: boolean }
   | EngineRelayMessage;
 
 export function encodeHubMessage(message: HubClientMessage | HubServerMessage): string {
@@ -206,10 +214,16 @@ export function decodeHubClientLine(line: string): HubClientMessage | null {
     const id = record["id"];
     const session = record["session"];
     const nodeId = record["nodeId"];
+    const before = record["before"];
+    // before は任意（agent-conversation-paging）。整数でない・負は無いものとして扱う（旧形式と同じ最新ページ）。
+    const validBefore = typeof before === "number" && Number.isInteger(before) && before >= 0 ? before : undefined;
     return typeof id === "string" && id.length > 0 &&
       typeof session === "string" && session.length > 0 &&
       typeof nodeId === "string" && nodeId.length > 0
-      ? { type: "conversation_subagent_transcript_request", id, session, nodeId }
+      ? {
+        type: "conversation_subagent_transcript_request", id, session, nodeId,
+        ...(validBefore !== undefined ? { before: validBefore } : {}),
+      }
       : null;
   }
   if (record["type"] === "conversation_history_page_request") {
@@ -331,6 +345,17 @@ export function decodeHubClientLine(line: string): HubClientMessage | null {
       ? { type: "chat_receipt_query", id, session, clientMessageId }
       : null;
   }
+  if (record["type"] === "subagent_control") {
+    const id = record["id"], session = record["session"], action = record["action"];
+    const nodeId = record["nodeId"], text = record["text"];
+    if (typeof id !== "string" || id.length === 0 || typeof session !== "string" || session.length === 0 ||
+      !isSubagentControlAction(action)) return null;
+    return {
+      type: "subagent_control", id, session, action,
+      ...(typeof nodeId === "string" && nodeId.length > 0 ? { nodeId } : {}),
+      ...(typeof text === "string" ? { text } : {}),
+    };
+  }
   if (record["type"] === "background_command_stop") {
     const id = record["id"], session = record["session"], nodeId = record["nodeId"];
     return typeof id === "string" && id.length > 0 && typeof session === "string" && session.length > 0 &&
@@ -408,6 +433,18 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
       ...(record["resumeHint"] === true ? { resumeHint: true as const } : {}),
     };
   }
+  if (record["type"] === "session_agents") {
+    const rawItems = record["items"];
+    if (!Array.isArray(rawItems)) return null;
+    const items = rawItems.flatMap((item) => {
+      if (typeof item !== "object" || item === null) return [];
+      const entry = item as Record<string, unknown>;
+      const session = entry["session"], running = entry["running"];
+      return typeof session === "string" && session.length > 0 && typeof running === "number" &&
+        Number.isInteger(running) && running >= 0 ? [{ session, running }] : [];
+    });
+    return { type: "session_agents", items, ...(record["replace"] === true ? { replace: true } : {}) };
+  }
   if (record["type"] === "hub_state_response") {
     const id = record["id"];
     const session = record["session"];
@@ -479,6 +516,12 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
       (status !== "delivered" && status !== "deleted" && status !== "uncertain" &&
         status !== "pending" && status !== "unknown")) return null;
     return { type: "chat_receipt_query_result", id, status };
+  }
+  if (record["type"] === "subagent_control_result") {
+    const id = record["id"], status = record["status"], error = record["error"];
+    if (typeof id !== "string" || !isSubagentControlStatus(status) ||
+      (error !== undefined && typeof error !== "string")) return null;
+    return { type: "subagent_control_result", id, status, ...(typeof error === "string" ? { error } : {}) };
   }
   if (record["type"] === "background_command_stop_result") {
     const id = record["id"], status = record["status"], error = record["error"];

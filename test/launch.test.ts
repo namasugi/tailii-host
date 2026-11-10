@@ -326,7 +326,8 @@ describe("claudeHookLaunchSettings", () => {
       expect(list[0]?.hooks[0]?.timeout).toBe(600);
     }
     // 処理中/処理完了のライフサイクル通知（reaper の処理中保護用）。matcher 無し・短 timeout。
-    for (const event of ["UserPromptSubmit", "Stop"]) {
+    // SubagentStart / SubagentStop は会話一覧の「エージェント N」用（session-agent-count）。
+    for (const event of ["UserPromptSubmit", "Stop", "SubagentStart", "SubagentStop"]) {
       const list = settings.hooks[event] as {
         matcher?: string;
         hooks: { command: string; timeout: number }[];

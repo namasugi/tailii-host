@@ -24,6 +24,7 @@ import {
   CodexRolloutTailer,
   CONTEXT_STREAM_ID as CODEX_CONTEXT_STREAM_ID,
   CONTEXT_WINDOW_STREAM_ID as CODEX_CONTEXT_WINDOW_STREAM_ID,
+  COLLABORATION_MODE_STREAM_ID as CODEX_COLLABORATION_MODE_STREAM_ID,
   MODEL_STREAM_ID as CODEX_MODEL_STREAM_ID,
 } from "../codex/codexRolloutTailer.js";
 import {
@@ -824,7 +825,12 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           const markerStreamId = payload.type === "chat_output" || payload.type === "session_chat_output"
             ? payload.streamId : null;
           if (message.serverSeq === 0) {
-            historyBackfillSessions.add(message.session);
+            // 状態の添え物（hub が backfill の前後に送るサブエージェントの最新状態・codex のモデル / モードの印）は
+            // 履歴の読み直しではない。数えると history-done の後に届いたとき「読み直し途中」の印が外れず、
+            // 再接続のたびに全履歴を取り直す（reconnect-full-replay の再発）。
+            const isStateSnapshot = payload.type === "subagent_node"
+              || markerStreamId === CODEX_MODEL_STREAM_ID || markerStreamId === CODEX_COLLABORATION_MODE_STREAM_ID;
+            if (!isStateSnapshot) historyBackfillSessions.add(message.session);
             if (markerStreamId === HISTORY_DONE_STREAM_ID || markerStreamId === HISTORY_CANCELLED_STREAM_ID) {
               historyBackfillSessions.delete(message.session);
             }
@@ -914,6 +920,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
         message.type === "chat_receipt_query_result" ||
         message.type === "chat_send_now_result" ||
         message.type === "background_command_stop_result" ||
+        message.type === "subagent_control_result" ||
         message.type === "presence_response" ||
         message.type === "conversation_subagent_transcript_response" ||
         message.type === "conversation_history_page_response") {
@@ -922,6 +929,19 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
         rpcDisconnectFailures.delete(message.id);
       } else if (message.type === "session_processing") handleSessionProcessing(message);
       else if (message.type === "question_event") handleQuestionEvent(message);
+      else if (message.type === "session_agents") {
+        // 会話一覧の「エージェント N」（session-agent-count）。hub の数をそのまま iOS へ。
+        try {
+          writer.write({
+            type: "session_agent_counts", v: state.negotiatedVersion, items: message.items,
+            ...(message.replace === true ? { replace: true } : {}),
+          });
+        } catch (error) {
+          process.stderr.write(`[tailii-host engine] session_agent_counts 書込失敗: ${String(error)}\n`);
+        }
+      } else if (message.type === "subagent_lifecycle") {
+        // hook → hub の内部通知。hub は配らないが、届いても iOS へは流さない。
+      }
       else {
         try { writer.write({ ...message, v: state.negotiatedVersion }); }
         catch (error) { process.stderr.write(`[tailii-host engine] remote_pending 書込失敗: ${String(error)}\n`); }

@@ -28,6 +28,8 @@ export type SessionProcessingMessage = {
   state: "active" | "done";
   event?: string;
   atMs?: number;
+  /** サブエージェントのツール呼び出しなら、その id（hub がエージェント数の鮮度に使う, session-agent-count）。 */
+  agentId?: string;
 };
 
 /**
@@ -47,7 +49,19 @@ export type QuestionEventMessage = {
   questions?: QuestionPromptQuestion[];
 };
 
-export type EngineRelayMessage = RemotePendingMessage | SessionProcessingMessage | QuestionEventMessage;
+/**
+ * hook → hub のサブエージェントの開始 / 終了（SubagentStart / SubagentStop, host 内部 IPC 専用。session-agent-count）。
+ * hub は会話ごとに動いているエージェントを数え、会話一覧の「エージェント N」に使う（ファイルは読まない）。
+ */
+export type SubagentLifecycleMessage = {
+  type: "subagent_lifecycle";
+  session: string;
+  event: "start" | "stop";
+  agentId: string;
+};
+
+export type EngineRelayMessage =
+  RemotePendingMessage | SessionProcessingMessage | QuestionEventMessage | SubagentLifecycleMessage;
 
 export interface EngineRelayServer {
   socketPath: string;
@@ -134,16 +148,25 @@ function decodeEngineRelayLine(line: string): EngineRelayMessage | null {
         if (typeof session === "string" && session.length > 0 && (state === "active" || state === "done")) {
           const event = record["event"];
           const atMs = record["atMs"];
+          const agentId = record["agentId"];
           return {
             type: "session_processing", session, state,
             ...(typeof event === "string" ? { event } : {}),
             ...(typeof atMs === "number" && Number.isFinite(atMs) ? { atMs } : {}),
+            ...(typeof agentId === "string" && agentId.length > 0 ? { agentId } : {}),
           };
         }
         return null;
       }
       if (record["type"] === "question_event") {
         return decodeQuestionEvent(record);
+      }
+      if (record["type"] === "subagent_lifecycle") {
+        const session = record["session"], event = record["event"], agentId = record["agentId"];
+        return typeof session === "string" && session.length > 0 && (event === "start" || event === "stop") &&
+          typeof agentId === "string" && agentId.length > 0
+          ? { type: "subagent_lifecycle", session, event, agentId }
+          : null;
       }
     }
   } catch {
@@ -184,6 +207,15 @@ function decodeQuestionEvent(record: Record<string, unknown>): QuestionEventMess
 /** hook から engine relay へ question_event を送る（接続不能は timeLimit 内リトライ後に諦める）。 */
 export async function sendQuestionEventToEngine(
   message: QuestionEventMessage,
+  socketPath: string = resolveEngineRelaySocketPath(),
+  timeLimitMs = 250,
+): Promise<void> {
+  await sendLineToEngine(JSON.stringify(message), socketPath, timeLimitMs);
+}
+
+/** hook から relay へサブエージェントの開始 / 終了を送る（session-agent-count）。 */
+export async function sendSubagentLifecycleToEngine(
+  message: SubagentLifecycleMessage,
   socketPath: string = resolveEngineRelaySocketPath(),
   timeLimitMs = 250,
 ): Promise<void> {

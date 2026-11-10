@@ -1408,6 +1408,14 @@ describe("CodexNativeTurnController", () => {
       summary: "npm test",
       cwd: "/tmp/work",
     }]);
+
+    // 子 thread（サブエージェント）からの承認には、どのエージェントかを添える（subagent-control）。
+    await openOptions?.onServerRequest?.({
+      id: 43,
+      method: "item/commandExecution/requestApproval",
+      params: { threadId: "thread-child", turnId: "turn-c", itemId: "item-c", command: "make", cwd: "/tmp/work" },
+    });
+    expect(approvals.at(-1)).toMatchObject({ id: "codex:thread-child:43", agentId: "thread-child" });
   });
 
   test("requestUserInput を既存 question_prompt へ変換し、iOS 回答を native response に戻す", async () => {

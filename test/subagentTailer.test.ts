@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, test } from "vitest";
 import type { ControlMessage, SubagentNode } from "../src/protocol.js";
-import { defaultProbeSessionAlive, SubagentTailer, type ProcessProbeExec } from "../src/chat/subagentTailer.js";
+import { defaultProbeSessionAlive, sliceWholeCodePoints, SubagentTailer, type ProcessProbeExec } from "../src/chat/subagentTailer.js";
 import { memoryBackgroundStopRecords } from "../src/chat/backgroundStopRecords.js";
 import { makeTempDir } from "./helpers.js";
 
@@ -463,6 +463,48 @@ describe("SubagentTailer", () => {
     ac.abort();
   });
 
+  test("fork の transcript 先頭にある起動の写し（Agent tool_use と「Fork started」）で親=自分・完了に化けない", async () => {
+    // 実測 2.1.321: fork の transcript は fork-context-ref の直後に、親が自分を起こした Agent tool_use と
+    // その結果「Fork started — that fork is you.」の写しを持つ。写しを拾うと親が自分自身（iOS の木に
+    // つながらず表示されない）・同期実行の結果（実行中なのに完了）に化けていた。
+    const project = makeTempDir("subagent-tailer-fork-copy");
+    const sessionId = "44444444-5555-6666-7777-88888888888f";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    const subagents = path.join(project, sessionId, "subagents");
+    fs.mkdirSync(subagents, { recursive: true });
+    const spawn = { type: "tool_use", id: "toolu_fork", name: "Agent", input: { description: "Stage 5", subagent_type: "fork", prompt: "x" } };
+    fs.writeFileSync(main, [
+      JSON.stringify({ message: { role: "assistant", content: [spawn] }, timestamp: "2026-11-09T21:26:25.393Z" }),
+      JSON.stringify({
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_fork", content: [{ type: "text", text: "Async agent launched successfully. agentId: fk1 …" }] }] },
+        toolUseResult: { isAsync: true, status: "async_launched", agentId: "fk1" },
+        timestamp: "2026-11-09T21:26:25.777Z",
+      }),
+    ].join("\n") + "\n");
+    fs.writeFileSync(path.join(subagents, "agent-fk1.meta.json"), JSON.stringify({
+      agentType: "fork", isFork: true, description: "Stage 5", toolUseId: "toolu_fork", spawnDepth: 1, requestShape: "background",
+    }));
+    fs.writeFileSync(path.join(subagents, "agent-fk1.jsonl"), [
+      JSON.stringify({ type: "fork-context-ref", agentId: "fk1", parentSessionId: sessionId, parentLastUuid: "u", contextLength: 10 }),
+      JSON.stringify({ isSidechain: true, agentId: "fk1", type: "assistant", message: { role: "assistant", content: [spawn] }, timestamp: "2026-11-09T21:26:25.393Z" }),
+      JSON.stringify({ isSidechain: true, agentId: "fk1", type: "user", message: { role: "user", content: [
+        { type: "tool_result", tool_use_id: "toolu_fork", content: [{ type: "text", text: "Fork started — that fork is you." }] },
+      ] }, timestamp: "2026-11-09T21:26:25.537Z" }),
+      JSON.stringify({ isSidechain: true, agentId: "fk1", type: "assistant", message: { role: "assistant", content: [
+        { type: "tool_use", id: "toolu_read", name: "Read", input: { file_path: "/tmp/a.md" } },
+      ] }, timestamp: "2026-11-09T21:26:30.000Z" }),
+    ].join("\n") + "\n");
+
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10 });
+    const gen = tailer.streamSession(main, ac.signal);
+    expect(await nextOfType(gen, "subagent_node")).toMatchObject({
+      node: { nodeId: "fk1", parentNodeId: "root", status: "running", agentType: "fork" },
+    });
+    expect(await nextWithin(gen, 80)).toBeNull();
+    ac.abort();
+  });
+
   test("task-notification で完了し resume 追記で running へ戻り再通知で再完了する", async () => {
     const project = makeTempDir("subagent-tailer-async-notify");
     const sessionId = "66666666-7777-8888-9999-aaaaaaaaaaaa";
@@ -624,8 +666,12 @@ describe("SubagentTailer", () => {
         status: "running",
         kind: "command",
         ts: Date.parse("2026-07-28T07:41:51.866Z"),
+        // 何を実行したか分かるよう command 全文と開始時刻を添える（background-task-detail）。
+        command: "npm test",
+        startTs: Date.parse("2026-07-28T07:41:51.866Z"),
       },
     });
+    expect((running as { node: { exitCode?: number } }).node.exitCode).toBeUndefined();
     expect(tailer.outputPath("btask1")).toBe(outputPath);
 
     fs.appendFileSync(
@@ -647,9 +693,48 @@ describe("SubagentTailer", () => {
         status: "error",
         kind: "command",
         ts: Date.parse("2026-07-28T07:45:00.000Z"),
+        // 終端後も開始時刻は残す（所要時間の表示用）。終了コードは通知の summary から。
+        startTs: Date.parse("2026-07-28T07:41:51.866Z"),
+        exitCode: 2,
+        command: "npm test",
       },
     });
     ac.abort();
+  });
+
+  test("切り詰めはサロゲートペアを割らない（孤立サロゲートで iOS が行ごと復号に失敗しないように）", () => {
+    const text = `${"a".repeat(2)}🤖${"b".repeat(5)}`; // 🤖 は code unit 2〜3
+    expect(sliceWholeCodePoints(text, 3)).toBe("aa");
+    expect(sliceWholeCodePoints(text, 4)).toBe("aa🤖");
+    expect(sliceWholeCodePoints(text, 2)).toBe("aa");
+    expect(sliceWholeCodePoints(text, 100)).toBe(text);
+    expect(sliceWholeCodePoints(text, 0)).toBe("");
+  });
+
+  test("背景コマンドの command は前後の空白を落とし、長すぎる分は 4000 字で切り詰める", async () => {
+    const project = makeTempDir("subagent-tailer-bg-command-long");
+    const sessionId = "55555555-6666-7777-8888-99999999999c";
+    const main = path.join(project, `${sessionId}.jsonl`);
+    fs.mkdirSync(path.join(project, sessionId, "subagents"), { recursive: true });
+    const longCommand = `cat <<'EOF'\n${"x".repeat(5_000)}\nEOF`;
+    fs.writeFileSync(main, [
+      JSON.stringify({ message: { role: "assistant", content: [
+        { type: "tool_use", id: "toolu_long", name: "Bash", input: { command: `  ${longCommand}  `, run_in_background: true } },
+      ] }, timestamp: "2026-01-01T01:00:00.000Z" }),
+      JSON.stringify({ message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_long",
+        content: "Command running in background with ID: blong1. Output is being written to: /tmp/t/blong1.output." }] },
+      timestamp: "2026-01-01T01:00:01.000Z" }),
+    ].join("\n") + "\n");
+    const ac = new AbortController();
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10, probeOutputOpen: () => Promise.resolve(true) });
+    const message = await nextOfType(tailer.streamSession(main, ac.signal), "subagent_node");
+    ac.abort();
+    const node = (message as { node: { command?: string; label: string } }).node;
+    expect(node.command?.length).toBe(4_000);
+    expect(node.command?.startsWith("cat <<'EOF'")).toBe(true);
+    expect(node.command?.endsWith("…")).toBe(true);
+    // description が無いときの label は従来どおり 60 字に詰めた先頭。
+    expect(node.label.length).toBe(60);
   });
 
   test("前面の Bash がタイムアウトで背景へ回った ack も背景コマンドとして出し、前面で終わった Bash は出さない", async () => {

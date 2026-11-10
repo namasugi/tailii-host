@@ -104,6 +104,12 @@ export interface SubagentNode {
    * `subAgentActivity.reasoningEffort`。値は CLI のものそのまま, additive, subagent-effort）。判明するまで省略。
    */
   effort?: string | null;
+  /** バックグラウンドコマンドの command 全文（上限 4000 字, additive, background-task-detail）。エージェントは省略。 */
+  command?: string;
+  /** バックグラウンドコマンドの終了コード（完了通知の `exit code N`, additive）。不明・実行中・利用者停止は省略。 */
+  exitCode?: number;
+  /** 開始時刻 epoch ms（additive）。`ts` は終端後に終了時刻へ変わるため所要時間の計算用に別に持つ。 */
+  startTs?: number;
 }
 
 /** セッション一覧応答の 1 要素。 */
@@ -407,6 +413,25 @@ export const REMOTE_PENDING_SNAPSHOT_MAX = 256;
  */
 export type BackgroundCommandStopStatus = "stopped" | "not_running" | "not_found" | "failed";
 
+/**
+ * subagent_control_request.action（subagent-control, バックグラウンドタスクからのエージェント操作）:
+ *   stop_all — 会話の背景エージェントを全部止める（Claude: TUI の `chat:killAgents` = Ctrl+X Ctrl+K を 2 回 /
+ *              Codex: 実行中の子 thread の turn を全部 interrupt）
+ *   stop     — 1 体止める（Codex のみ。Claude は iOS が会話本体へ TaskStop を頼む）
+ *   message  — 1 体へ追加の指示（Codex のみ。Claude は iOS が会話本体へ SendMessage を頼む）
+ */
+export type SubagentControlAction = "stop_all" | "stop" | "message";
+/** ok / not_running（止める相手がいない）/ unsupported（この会話では host で扱わない）/ failed（詳細は error）。 */
+export type SubagentControlStatus = "ok" | "not_running" | "unsupported" | "failed";
+
+export function isSubagentControlAction(value: unknown): value is SubagentControlAction {
+  return value === "stop_all" || value === "stop" || value === "message";
+}
+
+export function isSubagentControlStatus(value: unknown): value is SubagentControlStatus {
+  return value === "ok" || value === "not_running" || value === "unsupported" || value === "failed";
+}
+
 export function isBackgroundCommandStopStatus(value: unknown): value is BackgroundCommandStopStatus {
   return value === "stopped" || value === "not_running" || value === "not_found" || value === "failed";
 }
@@ -594,7 +619,11 @@ export type ControlMessage =
   | { type: "channel_hello"; v: number; maxVersion: number; serverVersion?: string; hostName?: string; managed?: boolean; updateError?: string; clientVersion?: string; clientBuild?: string; latestClientBuild?: string }
   | { type: "host_update_request"; v: number; id: string; version: string; integrity?: string }
   | { type: "host_update_response"; v: number; id: string; status: HostUpdateStatus; error?: string | null }
-  | { type: "approval_request"; v: number; id: string; tool: string; summary: string; cwd: string; diff?: ToolDiff }
+  /**
+   * `agentId` / `agentType`（additive, subagent-control）: サブエージェントが求めた承認なら、その id（Claude は hook の
+   * `agent_id`、Codex は子 thread の id = subagent_node の nodeId）と種類。会話本体の承認は省略。
+   */
+  | { type: "approval_request"; v: number; id: string; tool: string; summary: string; cwd: string; diff?: ToolDiff; agentId?: string; agentType?: string }
   | { type: "approval_decision"; v: number; id: string; decision: Decision; reason?: string }
   | { type: "remote_pending"; v: number; id: string; session: string; kind: RemotePendingKind; tool?: string; summary: string }
   | { type: "remote_pending_cleared"; v: number; id: string; session: string; kind: RemotePendingKind }
@@ -695,7 +724,11 @@ export type ControlMessage =
    */
   | { type: "image_fetch_request"; v: number; id: string; maxPixelSize?: number }
   | { type: "image_fetch_response"; v: number; id: string; seq: number; data: string; eof: boolean; mime: string }
-  | { type: "subagent_transcript_request"; v: number; id: string; nodeId: string }
+  /**
+   * `before`（additive, agent-conversation-paging）: この位置（全件の通し番号）より前の 200 件を返す。
+   * 省略時は最新の 200 件。応答の `omitted` は返した先頭の通し番号（= それより前の件数）。
+   */
+  | { type: "subagent_transcript_request"; v: number; id: string; nodeId: string; before?: number }
   /**
    * 会話履歴のページ取得（iOS→host, history-page）。`beforeStreamId` / `beforeToolId` の行より前の
    * 最後の `limit` 行ぶんを返す（どちらも無ければ最新のページ）。キャッシュの無い会話の初回表示と、
@@ -897,6 +930,14 @@ export type ControlMessage =
    * 手元の会話ログごとに「この時刻以降だけ送ればよい」を伝える。応答は無い。
    */
   | { type: "background_sync_hints"; v: number; sessions: BackgroundSyncHint[] }
+  /**
+   * 会話ごとの動いているエージェント数（Mac→iOS, session-agent-count）。会話一覧の「エージェント N」。
+   * `replace: true` は接続直後の全件（載っていない会話は 0）。旧アプリは未知 type として捨てる。
+   */
+  | { type: "session_agent_counts"; v: number; items: { session: string; running: number }[]; replace?: boolean }
+  /** バックグラウンドタスクからのエージェント操作（前面の会話, subagent-control）。 */
+  | { type: "subagent_control_request"; v: number; id: string; action: SubagentControlAction; nodeId?: string; text?: string }
+  | { type: "subagent_control_response"; v: number; id: string; status: SubagentControlStatus; error?: string }
   /** バックグラウンドタスク一覧から背景コマンドを止める（前面の会話。nodeId = taskId）。 */
   | { type: "background_command_stop_request"; v: number; id: string; nodeId: string }
   | {

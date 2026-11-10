@@ -91,8 +91,10 @@ describe("parseSubagentTranscript", () => {
       { type: "tool_result", content: "<system-reminder>\nMonitor event:\nprogress\n</system-reminder>\n" },
     ] } });
 
+    // 注入だけの結果は中身を出さず「（結果なし）」の 1 行にする（呼び出しと結果の対応をずらさない）。
     expect(parseSubagentTranscript(fixture).entries).toEqual([
       { role: "tool", text: "子のレポート。", kind: "tool_result" },
+      { role: "tool", text: "（結果なし）", kind: "tool_result" },
     ]);
   });
 
@@ -278,6 +280,17 @@ describe("readBackgroundOutput", () => {
     expect(result.omitted).toBe(1);
     expect(result.entries[0]!.text.length).toBe(8_000);
     expect(result.entries[0]!.text.endsWith("TAIL")).toBe(true);
+  });
+
+  it("末尾の切り出しはサロゲートペアの後半から始めない", () => {
+    const dir = makeTempDir("bg-output-surrogate");
+    const file = path.join(dir, "btask.output");
+    // 🤖（2 code unit）の後半がちょうど末尾 8000 の先頭に来る並び。
+    fs.writeFileSync(file, "a".repeat(100) + "🤖" + "b".repeat(7_999));
+
+    const text = readBackgroundOutput(file).entries[0]!.text;
+    expect(text).toBe("b".repeat(7_999));
+    expect(/[\udc00-\udfff]/.test(text.charAt(0))).toBe(false);
   });
 
   it("不在ファイル・null は空応答", () => {

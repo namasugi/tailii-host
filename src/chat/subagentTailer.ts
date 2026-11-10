@@ -155,6 +155,8 @@ interface TaskNotification {
 /** バックグラウンドコマンド（Bash run_in_background）の spawn 観測。 */
 interface BackgroundSpawn {
   label: string;
+  /** Bash の command 全文（上限 MAX_COMMAND_CHARS で切り詰め）。空なら null。 */
+  command: string | null;
   ts: number | null;
   /** run_in_background で起動した Bash（false = 前面。途中で背景へ回された確証があるときだけ登録する）。 */
   background: boolean;
@@ -165,6 +167,7 @@ interface BackgroundCommand {
   toolUseId: string;
   owner: string;
   label: string;
+  command: string | null;
   startTs: number | null;
   outputPath: string | null;
 }
@@ -343,11 +346,22 @@ export class SubagentTailer {
               node.firstJsonlTimestampMs = read.state.firstTimestampMs;
               if (lineTs !== null) node.lastJsonlTimestampMs = lineTs;
             }
-            for (const id of extractSpawnToolUseIds(line)) read.state.ownerByToolUseId.set(id, transcript.owner);
+            // fork（2.1.232〜）の transcript は先頭（`fork-context-ref` の直後）に、親が自分を起こした Agent
+            // tool_use とその結果（「Fork started — that fork is you.」）の写しを持つ（実測 2.1.321）。
+            // 写しを拾うと「自分が自分を起動した」（親 = 自分 → iOS の木のどこにもつながらず表示されない）と
+            // 「同期実行の結果が返った」（実行中なのに完了）に化けるので、自分を起こした id は自分の transcript では見ない。
+            const selfSpawnId = node?.meta.toolUseId ?? null;
+            for (const id of extractSpawnToolUseIds(line)) {
+              if (id === selfSpawnId) continue;
+              read.state.ownerByToolUseId.set(id, transcript.owner);
+            }
             for (const spawn of extractBackgroundSpawns(line)) {
-              read.state.bgSpawnByToolUseId.set(spawn.id, { label: spawn.label, ts: lineTs, background: spawn.background });
+              read.state.bgSpawnByToolUseId.set(spawn.id, {
+                label: spawn.label, command: spawn.command, ts: lineTs, background: spawn.background,
+              });
             }
             for (const hit of extractToolResults(line)) {
+              if (hit.id === selfSpawnId) continue;
               read.state.resultByToolUseId.set(hit.id, {
                 isError: hit.isError,
                 ts: hit.ts,
@@ -362,6 +376,7 @@ export class SubagentTailer {
                   toolUseId: hit.id,
                   owner: transcript.owner,
                   label: spawn.label,
+                  command: spawn.command,
                   startTs: spawn.ts ?? hit.ts,
                   outputPath: launch.outputPath,
                 });
@@ -679,6 +694,8 @@ export class SubagentTailer {
             : waitingOnBackground === true ? WAITING_ON_BACKGROUND_ACTIVITY
             : node.currentActivity,
           ts,
+          // 開始時刻（所要時間の表示用, background-task-detail）。ts は終端後に終了時刻へ変わるため別に持つ。
+          ...(node.firstJsonlTimestampMs !== null ? { startTs: node.firstJsonlTimestampMs } : {}),
           ...(node.model !== null ? { model: node.model } : {}),
           ...(node.effort !== null ? { effort: node.effort } : {}),
         };
@@ -741,6 +758,12 @@ export class SubagentTailer {
           currentActivity: null,
           ts: stoppedByUser ? userStoppedTs : (notification?.ts ?? orphanTs ?? command.startTs ?? 0),
           kind: "command",
+          // 何を実行したか分かるよう全文を添える（label は description 優先で、無ければ 60 字に詰めた先頭）。
+          ...(command.command !== null ? { command: command.command } : {}),
+          ...(command.startTs !== null ? { startTs: command.startTs } : {}),
+          // 利用者が止めたコマンドは停止由来の exit 143 等を出さない（完了扱いと揃える）。
+          ...(!stoppedByUser && notification !== null && notification.exitCode !== null
+            ? { exitCode: notification.exitCode } : {}),
         };
         const key = stableNodeKey(messageNode);
         if (key === bgLastKeyByTaskId.get(command.taskId)) continue;
@@ -1070,10 +1093,12 @@ function toolResultPlainText(content: unknown): string {
  * run_in_background に限らない: 前面の Bash もタイムアウトで背景へ回ることがある。ack の無い
  * 前面完了の分は tool_result を見た時点で捨てる。
  */
-function extractBackgroundSpawns(line: string): { id: string; label: string; background: boolean }[] {
+function extractBackgroundSpawns(
+  line: string,
+): { id: string; label: string; command: string | null; background: boolean }[] {
   const content = messageContent(line);
   if (!Array.isArray(content)) return [];
-  const out: { id: string; label: string; background: boolean }[] = [];
+  const out: { id: string; label: string; command: string | null; background: boolean }[] = [];
   for (const block of content) {
     if (typeof block !== "object" || block === null) continue;
     const rec = block as Record<string, unknown>;
@@ -1089,6 +1114,7 @@ function extractBackgroundSpawns(line: string): { id: string; label: string; bac
     out.push({
       id: rec["id"],
       label: label.length > 0 ? label : "background command",
+      command: clampCommand(command),
       background: input["run_in_background"] === true,
     });
   }
@@ -1384,7 +1410,8 @@ function executionEffort(value: unknown): string | null {
 function latestActivitySummary(line: string): string | null {
   const activities = extractToolActivities(messageContent(line));
   const latest = activities.at(-1);
-  return latest === undefined ? null : truncateActivityLabel(formatActivityLabel(latest));
+  // 実行中の作業は一覧では 1 行に詰めて見せ、詳細では全体を読めるよう長めに残す（iOS 側で行数を制限する）。
+  return latest === undefined ? null : truncateActivityLabel(formatActivityLabel(latest), 200);
 }
 
 function formatActivityLabel(activity: ToolActivity): string {
@@ -1424,9 +1451,28 @@ function stripActivityPrefix(label: string, fallback: string): string {
   return stripped.length > 0 ? stripped : fallback;
 }
 
-function truncateActivityLabel(label: string): string {
-  const limit = 60;
-  return label.length <= limit ? label : `${label.slice(0, limit - 1)}…`;
+/** subagent_node に載せる Bash command 全文の上限（巨大なヒアドキュメントで行が膨らまないように）。 */
+const MAX_COMMAND_CHARS = 4_000;
+
+function clampCommand(command: string): string | null {
+  const trimmed = command.trim();
+  if (trimmed.length === 0) return null;
+  return trimmed.length <= MAX_COMMAND_CHARS ? trimmed : `${sliceWholeCodePoints(trimmed, MAX_COMMAND_CHARS - 1)}…`;
+}
+
+function truncateActivityLabel(label: string, limit = 60): string {
+  return label.length <= limit ? label : `${sliceWholeCodePoints(label, limit - 1)}…`;
+}
+
+/**
+ * 先頭 `end` code unit で切る。ただし絵文字等のサロゲートペアの途中なら 1 つ手前で切る
+ * （孤立サロゲートが JSON に残ると iOS の JSONSerialization が行ごと復号に失敗し、ノードが出なくなる）。
+ */
+export function sliceWholeCodePoints(text: string, end: number): string {
+  if (end <= 0) return "";
+  if (end >= text.length) return text;
+  const last = text.charCodeAt(end - 1);
+  return text.slice(0, last >= 0xd800 && last <= 0xdbff ? end - 1 : end);
 }
 
 function messageContent(line: string): unknown {
@@ -1592,5 +1638,8 @@ function stableNodeKey(node: SubagentNode): string {
     node.kind ?? null,
     node.model ?? null,
     node.effort ?? null,
+    node.command ?? null,
+    node.exitCode ?? null,
+    node.startTs ?? null,
   ]);
 }

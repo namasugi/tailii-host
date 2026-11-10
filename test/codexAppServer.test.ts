@@ -2699,3 +2699,50 @@ describe("CodexAppServerThread 退避値（4 周目: plan の turn/start 失敗�
     expect(thread.planRestoreSnapshot).toEqual({ model: "gpt-6-astra", effort: "low" });
   });
 });
+
+describe("subagent-control: 子 thread（サブエージェント）の操作", () => {
+  const openWithChild = async (childTurns: Record<string, unknown>[]) => {
+    const probe = new FakeConnection();
+    const connection = new FakeConnection("thread-root");
+    const base = connection.request.bind(connection);
+    connection.request = async (method, params) => {
+      const record = (params ?? {}) as Record<string, unknown>;
+      if (method === "thread/turns/list" && record["threadId"] === "thread-child") {
+        connection.requests.push({ method, params });
+        return { data: childTurns, nextCursor: null };
+      }
+      if (method === "turn/start" && record["threadId"] === "thread-child") {
+        connection.requests.push({ method, params });
+        return { turn: { id: "turn-child-2" } };
+      }
+      return base(method, params);
+    };
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-subagent-control"),
+      connect: async () => probe.closed === 0 ? probe : connection,
+      launch: () => {},
+    });
+    const thread = await manager.openThread({ threadId: "thread-root", cwd: "/tmp/project" });
+    connection.requests.length = 0;
+    return { thread, connection };
+  };
+
+  test("実行中の子は turn/interrupt で止め、追加の指示は turn/steer（expectedTurnId 付き）", async () => {
+    const { thread, connection } = await openWithChild([{ id: "turn-child-1", status: "inProgress" }]);
+    await expect(thread.interruptOtherThread("thread-child")).resolves.toBe(true);
+    await thread.sendToOtherThread("thread-child", "テストも足して");
+    expect(connection.requests.filter((r) => r.method !== "thread/turns/list")).toEqual([
+      { method: "turn/interrupt", params: { threadId: "thread-child", turnId: "turn-child-1" } },
+      { method: "turn/steer", params: { threadId: "thread-child", input: [{ type: "text", text: "テストも足して" }], expectedTurnId: "turn-child-1" } },
+    ]);
+  });
+
+  test("待機中の子は止めず（false）、追加の指示は新しい turn/start", async () => {
+    const { thread, connection } = await openWithChild([{ id: "turn-child-1", status: "completed" }]);
+    await expect(thread.interruptOtherThread("thread-child")).resolves.toBe(false);
+    await thread.sendToOtherThread("thread-child", "続きをお願いします");
+    const start = connection.requests.find((r) => r.method === "turn/start");
+    expect(start?.params).toMatchObject({ threadId: "thread-child", input: [{ type: "text", text: "続きをお願いします" }] });
+    expect(connection.requests.some((r) => r.method === "turn/interrupt")).toBe(false);
+  });
+});

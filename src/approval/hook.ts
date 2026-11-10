@@ -44,6 +44,7 @@ import {
   sendQuestionEventToEngine,
   sendRemotePendingToEngine,
   sendSessionProcessingToEngine,
+  sendSubagentLifecycleToEngine,
 } from "../hub/engineRelaySocket.js";
 import type { QuestionEventMessage } from "../hub/engineRelaySocket.js";
 import { questionsFromToolInput } from "../chat/transcriptTailer.js";
@@ -202,6 +203,29 @@ export async function runHookCore(options: RunHookOptions): Promise<HookRunResul
     return { exitCode: 0, stdout: "" };
   }
 
+  // --- 0.05 サブエージェントの開始 / 終了（session-agent-count） ---
+  // 会話一覧の「エージェント N」用に hub へ一方向で知らせて即終了する（無出力 = 何も止めない）。
+  // CLI 内部の複製（agent_type が無い）は数えない。
+  if (parsed.eventName === "SubagentStart" || parsed.eventName === "SubagentStop") {
+    // 開始は種類つき（agent_type の無い CLI 内部の複製は数えない）。終了は種類が空のことがある
+    // （CLI 実装: `agent_type ?? ""`）ので id だけで送る（数えていない id の終了は hub で何も起きない）。
+    const countable = parsed.agentId !== undefined &&
+      (parsed.eventName === "SubagentStop" || parsed.agentType !== undefined);
+    if (countable && parsed.agentId !== undefined && session !== "default" && options.engineRelaySocketPath !== null) {
+      try {
+        await sendSubagentLifecycleToEngine(
+          { type: "subagent_lifecycle", session, event: parsed.eventName === "SubagentStart" ? "start" : "stop",
+            agentId: parsed.agentId },
+          options.engineRelaySocketPath,
+          60,
+        );
+      } catch {
+        // relay 不達は無視する（一覧の数が出ないだけ）。
+      }
+    }
+    return { exitCode: 0, stdout: "" };
+  }
+
   // --- 0.1 CLI 内部の複製（返答案など）のツール呼び出し（internal-fork-hook） ---
   // 処理中の通知・設問・承認のどれにも使わない。PreToolUse は判定を返さず（CLI 自身の判定に任せる。
   // 返答案の複製はツールを必ず拒否される）、PostToolUse は実行された記録として監査だけ残す。
@@ -212,7 +236,7 @@ export async function runHookCore(options: RunHookOptions): Promise<HookRunResul
 
   if (parsed.eventName === "PostToolUse") {
     // ツールイベント＝処理中ハートビート（長時間ターンでも処理中判定が失効しないよう更新）。
-    await notifySessionProcessing(options, session, "active", parsed.eventName);
+    await notifySessionProcessing(options, session, "active", parsed.eventName, undefined, subagentIdOf(parsed));
     // 設問の解決通知（iOS/TUI どちらで回答されても sheet/バッジを閉じる, question-hook-relay）。
     if (parsed.toolName === "AskUserQuestion") {
       await notifyQuestionEvent(options, {
@@ -227,7 +251,7 @@ export async function runHookCore(options: RunHookOptions): Promise<HookRunResul
 
   // === 以降 PreToolUse（既定） ===
   // ツールイベント＝処理中ハートビート（承認ゲート待ちの間も処理中扱いを維持する）。
-  await notifySessionProcessing(options, session, "active", parsed.eventName);
+  await notifySessionProcessing(options, session, "active", parsed.eventName, undefined, subagentIdOf(parsed));
 
   // --- 0.4 設問ツール（承認ゲートせず、設問を engine relay 経由で iOS へ届ける） ---
   // AskUserQuestion は「ユーザーへの設問」そのもので実行許可を問う意味がなく、ゲートすると
@@ -330,12 +354,18 @@ function previousScheduled(options: RunHookOptions, session: string): { previous
   }
 }
 
+/** サブエージェントのツール呼び出しなら、その id（CLI 内部の複製は種類が無いので除く, session-agent-count）。 */
+function subagentIdOf(parsed: { agentId?: string; agentType?: string }): string | undefined {
+  return parsed.agentId !== undefined && parsed.agentType !== undefined ? parsed.agentId : undefined;
+}
+
 async function notifySessionProcessing(
   options: RunHookOptions,
   session: string,
   state: "active" | "done",
   event: string,
   scheduled?: HeartbeatScheduled | null,
+  agentId?: string,
 ): Promise<void> {
   // heartbeat は engine の生死と無関係に書ける唯一の経路（reaper daemon が読む）。
   // session 未解決（"default"）は書かない — 実在しない tmux 名の残骸ファイルを作らない。
@@ -353,7 +383,12 @@ async function notifySessionProcessing(
   }
   if (options.engineRelaySocketPath === null) return;
   try {
-    const message = { type: "session_processing", session, state, event, atMs: hookSpawnedAtMs() } as const;
+    // agentId: サブエージェントのツール呼び出し。hub はそのエージェントの「最後に見た時刻」を更新する
+    // （長く走る背景エージェントを、まだ動いているのに数から外さない, session-agent-count）。
+    const message = {
+      type: "session_processing", session, state, event, atMs: hookSpawnedAtMs(),
+      ...(agentId !== undefined ? { agentId } : {}),
+    } as const;
     // best-effort・短予算（60ms）: engine 不在時にゲート/監査を遅らせない。
     if (options.engineRelaySocketPath !== undefined) {
       await sendSessionProcessingToEngine(message, options.engineRelaySocketPath, 60);
@@ -540,6 +575,9 @@ async function sendRequestAndReflect(
       summary,
       cwd: parsed.cwd,
       ...(diff !== undefined ? { diff } : {}),
+      // サブエージェントが求めた承認なら、どのエージェントか（subagent-control）。CLI 内部の複製はここまで来ない。
+      ...(parsed.agentId !== undefined && parsed.agentType !== undefined
+        ? { agentId: parsed.agentId, agentType: parsed.agentType } : {}),
     });
     try {
       socket.write(encoded + "\n");

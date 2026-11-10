@@ -34,6 +34,7 @@ import {
 } from "../backend/tmux.js";
 import { envWithoutTmux, screenHasConfirmFooter, screenHasSelectionFooter } from "../backend/herdr.js";
 import { readPackageVersion } from "../shared/version.js";
+import { killAgentsKeyIsDefault } from "../shared/claudeKeybindings.js";
 import { ChatTailController } from "../chat/chatTailController.js";
 import { fileBackgroundStopRecords } from "../chat/backgroundStopRecords.js";
 import { TranscriptTailer } from "../chat/transcriptTailer.js";
@@ -653,6 +654,15 @@ export async function runHubCommand(args: string[]): Promise<number> {
     usageLimitNotify: makeUsageLimitPushNotifier(log),
     // CLI のキューに溜まっている発話を今すぐ届ける（chat-send-now）。
     sendNowInjector: (session) => sessionBackend.sendQueuedNow(session),
+    // 背景エージェントの全停止（subagent-control）: Claude Code の `chat:killAgents`（既定 ctrl+x ctrl+k）は
+    // 2 回押しで確定する（1 回目は確認の案内）。割り当てが変えられていたら送らない。
+    killAllAgents: async (session) => {
+      if (!killAgentsKeyIsDefault()) return false;
+      await sessionBackend.sendKeys(session, ["C-x", "C-k"]);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      await sessionBackend.sendKeys(session, ["C-x", "C-k"]);
+      return true;
+    },
     // 本文+送信確定は backend 側の 1 操作に委ねる（herdr は本文+CR 単一コール必須。
     // 分割すると Ink のペースト取り込み窓に CR が飲まれ送信されない）。
     chatInjector: async (text, session, context) => {

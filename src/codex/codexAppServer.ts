@@ -703,6 +703,35 @@ export class CodexAppServerThread {
     });
   }
 
+  /**
+   * 子 thread（サブエージェント）の実行中 turn を止める（subagent-control）。子は App Server 上の独立した thread で、
+   * 同じ接続から threadId を変えて扱える。最新 turn が実行中でなければ何もしない。
+   */
+  async interruptOtherThread(threadId: string): Promise<boolean> {
+    const turns = await listThreadTurns(this.connection, threadId, {
+      limit: 1, sortDirection: "desc", itemsView: "notLoaded", all: false,
+    });
+    const turnId = activeTurnIdOfTurns(turns);
+    if (turnId === null) return false;
+    await this.connection.request("turn/interrupt", { threadId, turnId });
+    return true;
+  }
+
+  /** 子 thread へ追加の指示を送る。実行中なら turn/steer（expectedTurnId 必須）、待機中なら turn/start。 */
+  async sendToOtherThread(threadId: string, text: string): Promise<void> {
+    if (text.length === 0) throw new Error("Codex subagent message must not be empty");
+    const turns = await listThreadTurns(this.connection, threadId, {
+      limit: 1, sortDirection: "desc", itemsView: "notLoaded", all: false,
+    });
+    const activeTurnId = activeTurnIdOfTurns(turns);
+    const input = [{ type: "text", text }];
+    if (activeTurnId !== null) {
+      await this.connection.request("turn/steer", { threadId, input, expectedTurnId: activeTurnId });
+      return;
+    }
+    await this.connection.request("turn/start", { threadId, input, clientUserMessageId: randomUUID() });
+  }
+
   close(): void {
     this.connection.close();
   }
