@@ -2,13 +2,23 @@ import type { HandlerRegistry } from "../context.js";
 import { DelegateError, runClaudeApiDelegate } from "../../services/claudeApiDelegate.js";
 import { runOpenAIApiDelegate } from "../../services/openaiApiDelegate.js";
 import { claudeApiFederation, FederationError } from "../../services/claudeApiFederation.js";
-import { apiDelegateHostKeys } from "../../services/apiDelegateHostKeys.js";
+import { apiDelegateHostKeys, hostApiKey } from "../../services/apiDelegateHostKeys.js";
+import { apiDelegateKeyStore, validDelegateApiKey } from "../../services/apiDelegateKeyStore.js";
 
 export function createApiDelegateHandlers(run: typeof runClaudeApiDelegate = (request, signal) =>
   request.provider === "openai" ? runOpenAIApiDelegate(request, signal) : runClaudeApiDelegate(request, signal)): HandlerRegistry { return {
   api_delegate_options_request: async (message, ctx) => {
     ctx.writer.write({ type: "api_delegate_options_response", v: ctx.state.negotiatedVersion, id: message.id, supported: true, supportsAttachments: true, supportsHistory: true, supportsOpenAI: true,
-      federation: await claudeApiFederation.list(), hostApiKeys: apiDelegateHostKeys() });
+      federation: await claudeApiFederation.list(), hostApiKeys: { ...apiDelegateHostKeys(process.env, message.keySources), supportsRegistration: true, supportsKeySources: true } });
+  },
+  api_delegate_key_register_request: (message, ctx) => {
+    let error: string | undefined;
+    try {
+      if (!validDelegateApiKey(message.provider, message.apiKey)) error = "invalid_key";
+      else if (hostApiKey(message.provider)) error = "host_key_exists";
+      else apiDelegateKeyStore.create(message.provider, message.apiKey);
+    } catch (failure) { error = (failure as NodeJS.ErrnoException).code === "EEXIST" ? "host_key_exists" : "host_key_store_unavailable"; }
+    ctx.writer.write({ type: "api_delegate_key_register_response", v: ctx.state.negotiatedVersion, id: message.id, success: error === undefined, error });
   },
   api_federation_check_request: async (message, ctx) => {
     const status = await claudeApiFederation.check(message.selection, AbortSignal.timeout(18_000));

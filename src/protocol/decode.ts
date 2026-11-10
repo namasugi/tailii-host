@@ -637,13 +637,21 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
     case "account_usage_request":
       return compact({ type, v, id: requireString(raw, "id"), apiCredentials: decodeApiUsageCredentials(raw["apiCredentials"]) });
     case "api_usage_options_request":
-    case "api_delegate_options_request":
     case "api_delegate_cancel":
       return { type, v, id: requireString(raw, "id") };
+    case "api_delegate_options_request":
+      return compact({ type, v, id: requireString(raw, "id"), keySources: decodeApiUsageCredentials(raw["keySources"]) });
     case "api_usage_options_response":
       return { type, v, id: requireString(raw, "id"), supported: requireBoolean(raw, "supported") };
     case "api_federation_check_request":
       return { type, v, id: requireString(raw, "id"), selection: decodeFederationSelection(requireObject(raw["selection"], "selection")) };
+    case "api_delegate_key_register_request": {
+      const provider = requireString(raw, "provider");
+      if (provider !== "claude" && provider !== "openai") throw new Error("invalid API provider");
+      return { type, v, id: requireString(raw, "id"), provider, apiKey: requireString(raw, "apiKey") };
+    }
+    case "api_delegate_key_register_response":
+      return compact({ type, v, id: requireString(raw, "id"), success: requireBoolean(raw, "success"), error: optionalString(raw, "error") });
     case "api_federation_check_response": {
       const status = requireObject(raw["status"], "status");
       return { type, v, id: requireString(raw, "id"), status: compact({ authenticated: requireBoolean(status, "authenticated"), expiresAt: optionalNumber(status, "expiresAt"), error: optionalString(status, "error") }) };
@@ -660,7 +668,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         supportsAttachments: optionalBoolean(raw, "supportsAttachments"), supportsHistory: optionalBoolean(raw, "supportsHistory"), supportsOpenAI: optionalBoolean(raw, "supportsOpenAI"),
         federation: raw["federation"] === undefined ? undefined : (() => { const value = requireObject(raw["federation"], "federation");
           return compact({ profiles: requireArray(value, "profiles").slice(0, 32).map((item) => decodeFederationProfile(requireObject(item, "profiles"))), error: optionalString(value, "error") }); })(),
-        hostApiKeys: raw["hostApiKeys"] === undefined ? undefined : (() => { const keys = requireObject(raw["hostApiKeys"], "hostApiKeys"); return { claude: requireBoolean(keys, "claude"), openai: requireBoolean(keys, "openai") }; })() });
+        hostApiKeys: raw["hostApiKeys"] === undefined ? undefined : (() => { const keys = requireObject(raw["hostApiKeys"], "hostApiKeys"); return compact({ claude: requireBoolean(keys, "claude"), openai: requireBoolean(keys, "openai"), supportsRegistration: optionalBoolean(keys, "supportsRegistration"), supportsKeySources: optionalBoolean(keys, "supportsKeySources") }); })() });
     case "api_delegate_request": {
       const request = requireObject(raw["request"], "request");
       return { type, v, id: requireString(raw, "id"), request: {
@@ -671,6 +679,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         ...(request["imageOptions"] === undefined ? {} : { imageOptions: decodeApiImageOptions(requireObject(request["imageOptions"], "imageOptions")) }),
         ...(request["federation"] === undefined ? {} : { federation: decodeFederationSelection(requireObject(request["federation"], "federation")) }),
         ...(request["useHostApiKey"] === undefined ? {} : { useHostApiKey: requireBoolean(request, "useHostApiKey") }),
+        ...(request["keySource"] === undefined ? {} : { keySource: decodeApiUsageCredentials({ claude: request["keySource"] })!.claude }),
         ...(request["attachments"] === undefined ? {} : { attachments: requireArray(request, "attachments").map((value) => {
           const attachment = requireObject(value, "attachments");
           return { path: requireString(attachment, "path"), name: requireString(attachment, "name") };
@@ -1475,12 +1484,18 @@ function decodeApiUsageCredentials(value: unknown): import("./messages.js").ApiU
     if (value == null) return undefined;
     const record = requireObject(value, "apiCredentials.provider");
     const mode = requireString(record, "mode");
-    if (mode !== "automatic" && mode !== "custom" && mode !== "disabled") throw new ProtocolDecodeError("missing-field", "apiCredentials.mode");
+    if (!["automatic", "custom", "disabled", "file", "environment"].includes(mode)) throw new ProtocolDecodeError("missing-field", "apiCredentials.mode");
     const apiKey = optionalString(record, "apiKey");
     if (apiKey !== undefined && (apiKey.length > 4096 || /[\r\n]/.test(apiKey))) throw new ProtocolDecodeError("missing-field", "apiCredentials.apiKey");
-    return compact<import("./messages.js").ApiUsageCredential>({ mode, ...(mode === "custom" ? { apiKey } : {}) });
+    const path = optionalString(record, "path"), environmentVariable = optionalString(record, "environmentVariable");
+    const workspaceId = optionalString(record, "workspaceId");
+    if (workspaceId !== undefined && (!/^wrkspc_[A-Za-z0-9_-]{1,128}$/.test(workspaceId) || /\s/.test(workspaceId))) throw new ProtocolDecodeError("missing-field", "apiCredentials.workspaceId");
+    if (mode === "file" && (!path || path.length > 4096 || (!path.startsWith("/") && !path.startsWith("~/")) || /[\x00-\x1f]/.test(path))) throw new ProtocolDecodeError("missing-field", "apiCredentials.path");
+    if (mode === "environment" && (!environmentVariable || !/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(environmentVariable) || /\s/.test(environmentVariable))) throw new ProtocolDecodeError("missing-field", "apiCredentials.environmentVariable");
+    return compact<import("./messages.js").ApiUsageCredential>({ mode: mode as import("./messages.js").ApiUsageCredential["mode"],
+      workspaceId, ...(mode === "custom" ? { apiKey } : {}), ...(mode === "file" ? { path } : {}), ...(mode === "environment" ? { environmentVariable } : {}) });
   };
-  return compact({ openai: credential(obj["openai"]), claude: credential(obj["claude"]) });
+  return compact({ openai: credential(obj["openai"]), claude: credential(obj["claude"]), openaiExecution: credential(obj["openaiExecution"]), claudeExecution: credential(obj["claudeExecution"]) });
 }
 
 function decodeOpenAIApiUsage(value: unknown): import("./messages.js").OpenAIApiUsage | undefined {

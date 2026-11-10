@@ -11,6 +11,20 @@ const answer = () => Response.json({ content: [{ type: "text", text: result.text
 const abort = () => new AbortController();
 
 describe("Claude API への単発委譲", () => {
+  it.each(["sk-ant-usr-test-only-not-a-real-secret", "sk-ant-usr01-test-only-not-a-real-secret"])("個人用APIキーでも固定の推論APIへ送信できる: %s", async (apiKey) => {
+    const fetcher = vi.fn().mockResolvedValueOnce(Response.json({ input_tokens: 1000 })).mockResolvedValueOnce(answer());
+    expect(await runClaudeApiDelegate({ ...request, apiKey }, abort().signal, fetcher)).toEqual(result);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls[1]![1].headers["x-api-key"]).toBe(apiKey);
+    expect(fetcher.mock.calls[1]![1].body).not.toContain(apiKey);
+  });
+
+  it("組織の個人用キーに指定したワークスペースを計数と生成の両方へ渡す", async () => {
+    const fetcher = vi.fn().mockResolvedValueOnce(Response.json({ input_tokens: 1000 })).mockResolvedValueOnce(answer());
+    await runClaudeApiDelegate({ ...request, apiKey: "sk-ant-usr-test-only-not-a-real-secret", keySource: { mode: "automatic", workspaceId: "wrkspc_test" } }, abort().signal, fetcher);
+    for (const call of fetcher.mock.calls) expect(call[1].headers["anthropic-workspace-id"]).toBe("wrkspc_test");
+  });
+
   it("固定の公式 API だけへキーを送って事前計数し、指定モデルの料金を返す", async () => {
     const fetcher = vi.fn().mockResolvedValueOnce(Response.json({ input_tokens: 1000 })).mockResolvedValueOnce(answer());
     expect(await runClaudeApiDelegate(request, abort().signal, fetcher)).toEqual(result);
@@ -32,6 +46,9 @@ describe("Claude API への単発委譲", () => {
 
   it.each([
     { apiKey: "sk-ant-admin01-test-only" }, { apiKey: "sk-ant-api03-line\nbreak" },
+    { apiKey: "sk-ant-oat01-test-only-secret" }, { apiKey: "sk-ant-ort01-test-only-secret" },
+    { apiKey: "sk-ant-usr-line\nbreak" }, { apiKey: "sk-ant-usr-too short" }, { apiKey: "sk-ant-usr-short" },
+    { apiKey: "sk-ant-usr-test-only-secret\n" },
     { model: "unknown" }, { budgetCents: 0 }, { budgetCents: 501 }, { budgetCents: 10.5 }, { prompt: "  " },
     { context: "a".repeat(120_001) },
   ])("不正な設定では HTTP を送らない: %j", async (change) => {

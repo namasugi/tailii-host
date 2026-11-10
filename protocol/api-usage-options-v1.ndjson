@@ -1,4 +1,4 @@
 {"id":"api-options","type":"api_usage_options_request","v":1}
 {"id":"api-options","supported":true,"type":"api_usage_options_response","v":1}
-{"apiCredentials":{"claude":{"apiKey":"test-only-not-a-real-key","mode":"custom"},"openai":{"mode":"disabled"}},"id":"api-custom","type":"account_usage_request","v":1}
+{"apiCredentials":{"claude":{"environmentVariable":"ANTHROPIC_ADMIN_API_KEY","mode":"environment"},"openai":{"mode":"disabled"}},"id":"api-custom","type":"account_usage_request","v":1}
 {"claudeApi":{"cost":"12.3456789","currency":"USD","fetchedAt":"2026-11-09T00:00:00.000Z","month":"2026-11"},"id":"api-custom","type":"account_usage_response","v":1}

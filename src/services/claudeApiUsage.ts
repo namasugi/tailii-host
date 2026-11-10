@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import type { ApiUsageCredential } from "../protocol/messages.js";
 import type { OpenAIApiUsageProvider, OpenAIApiUsageResult } from "./openaiApiUsage.js";
 import { apiRecord as record, readApiJson, sumApiAmounts } from "./apiUsageSupport.js";
+import { resolveApiKeySource } from "./apiKeySource.js";
 
 interface Options {
   env?: NodeJS.ProcessEnv;
@@ -17,8 +18,8 @@ export function createClaudeApiUsageProvider(options: Options = {}): OpenAIApiUs
   return async (credential?: ApiUsageCredential) => {
     if (credential?.mode === "disabled") { cache = undefined; return null; }
     const env = options.env ?? process.env;
-    const custom = credential?.mode === "custom";
-    const explicit = custom ? credential.apiKey?.trim() : env["ANTHROPIC_ADMIN_KEY"]?.trim() || env["ANTHROPIC_ADMIN_API_KEY"]?.trim();
+    const custom = credential !== undefined && credential.mode !== "automatic";
+    const explicit = custom ? resolveApiKeySource(credential, env) : env["ANTHROPIC_ADMIN_KEY"]?.trim() || env["ANTHROPIC_ADMIN_API_KEY"]?.trim();
     const key = custom ? explicit : explicit || env["ANTHROPIC_API_KEY"]?.trim();
     if (!key) { cache = undefined; return custom ? { error: "key_required" } : null; }
     if (key.startsWith("sk-ant-api") || (!explicit && !key.startsWith("sk-ant-admin"))) return { error: "admin_key_required" };

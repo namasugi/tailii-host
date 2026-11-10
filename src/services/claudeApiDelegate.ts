@@ -1,6 +1,7 @@
 import { claudeApiFederation, FederationError, validFederationSelection,
   type ApiFederationSelection, type FederationErrorCode } from "./claudeApiFederation.js";
 import { resolvedHostApiRequest } from "./apiDelegateHostKeys.js";
+import { validClaudeApiKey } from "./claudeApiKey.js";
 // Claude API 会話の1ターン。Subscriptionの認証・CLI の設定は触らず、明示選択したAPI認証を使う。
 // 料金表: https://platform.claude.com/docs/en/about-claude/pricing （2026-11-09）。表示・予算は概算。
 export const DELEGATE_MODELS = {
@@ -17,6 +18,7 @@ export interface ClaudeApiDelegateHistoryTurn {
   response: string;
 }
 export interface ClaudeApiDelegateRequest {
+  keySource?: import("../protocol/messages.js").ApiUsageCredential;
   apiKey: string;
   model: string;
   prompt: string;
@@ -71,10 +73,11 @@ function tokens(value: unknown): number {
   return value;
 }
 export function validateDelegateRequest(request: ClaudeApiDelegateRequest): void {
+  if (request.keySource?.workspaceId !== undefined && (!/^wrkspc_[A-Za-z0-9_-]{1,128}$/.test(request.keySource.workspaceId) || /\s/.test(request.keySource.workspaceId))) throw new DelegateError("invalid_request");
   if (request.provider !== undefined && request.provider !== "claude") throw new DelegateError("invalid_request");
   if (request.federation) {
     if (request.apiKey !== "" || !validFederationSelection(request.federation)) throw new DelegateError("federation_invalid_config");
-  } else if (request.apiKey.trim() !== request.apiKey || !/^sk-ant-api\d+-[\x21-\x7e]{10,4000}$/.test(request.apiKey)) throw new DelegateError("invalid_key");
+  } else if (!validClaudeApiKey(request.apiKey)) throw new DelegateError("invalid_key");
   if (!Object.hasOwn(DELEGATE_MODELS, request.model)) throw new DelegateError("unsupported_model");
   if (!request.prompt.trim() || !Number.isInteger(request.budgetCents)
       || request.budgetCents < 1 || request.budgetCents > 500) throw new DelegateError("invalid_request");
@@ -127,6 +130,7 @@ export async function runClaudeApiDelegate(
     const authentication: Record<string, string> = request.federation
       ? { authorization: `Bearer ${(await federation.token(request.federation, combined)).token}` }
       : { "x-api-key": request.apiKey };
+    if (!request.federation && request.keySource?.workspaceId) authentication["anthropic-workspace-id"] = request.keySource.workspaceId;
     const response = await fetcher(`https://api.anthropic.com/v1/messages${endpoint}`, {
       method: "POST", redirect: "error", signal: combined,
       headers: { ...authentication, "anthropic-version": "2023-06-01", "content-type": "application/json" },

@@ -11,6 +11,11 @@ const claudeKey = "sk-ant-api03-host-test-only-key";
 const openAIKey = "sk-proj-host-test-only-not-a-live-secret";
 afterEach(() => { vi.unstubAllEnvs(); });
 describe("API実行用のホストの既存キー", () => {
+  it.each(["sk-ant-usr-test-only-not-a-real-secret", "sk-ant-usr01-test-only-not-a-real-secret"])("個人用APIキーもホストの既存キーとして検出する: %s", (key) => {
+    expect(hostApiKey("claude", { ANTHROPIC_API_KEY: key })).toBe(key);
+    expect(apiDelegateHostKeys({ ANTHROPIC_API_KEY: key })).toMatchObject({ claude: true });
+  });
+
   it("利用可能かどうかだけを返し、管理キー・Subscription認証を使わない", () => {
     expect(apiDelegateHostKeys({ ANTHROPIC_API_KEY: claudeKey, OPENAI_API_KEY: openAIKey })).toEqual({ claude: true, openai: true });
     expect(apiDelegateHostKeys({ ANTHROPIC_API_KEY: "sk-ant-admin01-test-key", OPENAI_API_KEY: "sk-admin-test-only-key-value" })).toEqual({ claude: false, openai: false });

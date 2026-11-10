@@ -513,14 +513,19 @@ export interface OpenAIApiUsage {
   fetchedAt: string;
 }
 
-/** キーは端末の Keychain から暗号化チャネルで渡し、応答・ログ・host の設定へ保存しない。 */
+/** キーの取得元。新クライアントはパス・環境変数名だけを送る。 */
 export interface ApiUsageCredential {
-  mode: "automatic" | "custom" | "disabled";
+  mode: "automatic" | "custom" | "disabled" | "file" | "environment";
   apiKey?: string;
+  path?: string;
+  environmentVariable?: string;
+  workspaceId?: string;
 }
 export interface ApiUsageCredentials {
   openai?: ApiUsageCredential;
   claude?: ApiUsageCredential;
+  openaiExecution?: ApiUsageCredential;
+  claudeExecution?: ApiUsageCredential;
 }
 
 /** 月内の Codex 追加クレジット消費（符号付き調整を含む）。UTC の暦月。 */
@@ -790,7 +795,9 @@ export type ControlMessage =
   /** アカウント使用量の要求（iOS→Mac, account-usage）。session 非依存 — 一覧からも呼べる。 */
   | { type: "api_usage_options_request"; v: number; id: string }
   | { type: "api_usage_options_response"; v: number; id: string; supported: boolean }
-  | { type: "api_delegate_options_request"; v: number; id: string }
+  | { type: "api_delegate_options_request"; v: number; id: string; keySources?: ApiUsageCredentials }
+  | { type: "api_delegate_key_register_request"; v: number; id: string; provider: "claude" | "openai"; apiKey: string }
+  | { type: "api_delegate_key_register_response"; v: number; id: string; success: boolean; error?: string }
   | { type: "api_delegate_options_response"; v: number; id: string; supported: boolean; supportsAttachments?: boolean; supportsHistory?: boolean; supportsOpenAI?: boolean; federation?: ApiFederationOptions; hostApiKeys?: ApiDelegateHostKeys }
   | { type: "api_federation_check_request"; v: number; id: string; selection: ApiFederationSelection }
   | { type: "api_federation_check_response"; v: number; id: string; status: ApiFederationStatus }

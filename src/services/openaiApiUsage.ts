@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { OpenAIApiUsage, ApiUsageCredential } from "../protocol/messages.js";
+import { resolveApiKeySource } from "./apiKeySource.js";
 
 const ENDPOINT = "https://api.openai.com/v1/organization/costs";
 const MAX_BYTES = 4 * 1024 * 1024;
@@ -27,8 +28,8 @@ export function createOpenAIApiUsageProvider(options: Options = {}): OpenAIApiUs
   return async (credential) => {
     if (credential?.mode === "disabled") { cache = undefined; return null; }
     const env = options.env ?? process.env;
-    const custom = credential?.mode === "custom";
-    const explicit = custom ? credential.apiKey?.trim() : env["OPENAI_ADMIN_KEY"]?.trim() || env["OPENAI_ADMIN_API_KEY"]?.trim();
+    const custom = credential !== undefined && credential.mode !== "automatic";
+    const explicit = custom ? resolveApiKeySource(credential, env) : env["OPENAI_ADMIN_KEY"]?.trim() || env["OPENAI_ADMIN_API_KEY"]?.trim();
     const key = custom ? explicit : explicit || env["OPENAI_API_KEY"]?.trim() || registeredCodexKey(options, env);
     if (custom && !key) return { error: "key_required" };
     if (!key) { cache = undefined; return null; }
