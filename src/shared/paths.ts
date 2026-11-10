@@ -47,12 +47,26 @@ export function canonicalPath(p: string): string {
   }
 }
 
+/** Claude Code が project ディレクトリ名をそのまま使う上限（超えた分は切ってハッシュを付ける）。 */
+const CLAUDE_SLUG_MAX_LENGTH = 200;
+
+/** Claude Code と同じ文字列ハッシュ（UTF-16 単位の `h*31 + c` を 32bit で回す）の絶対値を 36 進で。 */
+function claudeSlugHash(text: string): string {
+  let h = 0;
+  for (let i = 0; i < text.length; i++) h = ((h << 5) - h + text.charCodeAt(i)) | 0;
+  return Math.abs(h).toString(36);
+}
+
 /**
  * cwd → Claude Code の project ディレクトリ名（`~/.claude/projects/<slug>`）。
- * Claude は `/` に加えて `.` も `-` へ置換する（例: `.claude/worktrees/x` →
- * `--claude-worktrees-x`）。`/` だけ置換すると worktree など dot を含む cwd で
- * transcript を見失う（実機で会話が表示されない事故の根因）。
+ * Claude 本体と同じ規則: 英数字以外は UTF-16 の 1 単位ごとに `-`（`/` `.` `_` 空白・日本語も）。
+ * 200 文字を超えたら先頭 200 文字 + `-` + 元パスのハッシュ（36 進）。
+ * `/` と `.` だけ置換していた頃は、日本語や `_` を含むフォルダで transcript を見失い
+ * 会話ログが空になっていた（一覧は jsonl を直接走査するので出る）。
  */
 export function claudeProjectSlug(cwd: string): string {
-  return canonicalPath(cwd).replaceAll("/", "-").replaceAll(".", "-");
+  const canonical = canonicalPath(cwd);
+  const slug = canonical.replace(/[^a-zA-Z0-9]/g, "-");
+  if (slug.length <= CLAUDE_SLUG_MAX_LENGTH) return slug;
+  return `${slug.slice(0, CLAUDE_SLUG_MAX_LENGTH)}-${claudeSlugHash(canonical)}`;
 }

@@ -167,4 +167,24 @@ describe("claudeProjectSlug", () => {
     );
     expect(claudeProjectSlug("/Users/alice/app.v2")).toBe("-Users-alice-app-v2");
   });
+
+  test("英数字以外（日本語・_・空白）も 1 文字ずつ - にする", () => {
+    // 実機の Claude 2.1.322 が作ったディレクトリ名と同じになること。
+    expect(claudeProjectSlug("/Users/alice/Documents/ほdけjdkdっkdじぇjwっjsてすと")).toBe(
+      "-Users-alice-Documents--d-jdkd-kd--jw-js---",
+    );
+    expect(claudeProjectSlug("/Users/alice/my_app dir")).toBe("-Users-alice-my-app-dir");
+    // サロゲートペア（絵文字）は 2 単位なので - が 2 つ。
+    expect(claudeProjectSlug("/Users/alice/a😀b")).toBe("-Users-alice-a--b");
+  });
+
+  test("200 文字を超えたら先頭 200 文字 + ハッシュ", () => {
+    const cwd = `/Users/alice/${"x".repeat(250)}`;
+    const slug = claudeProjectSlug(cwd);
+    expect(slug.startsWith(`${cwd.replace(/[^a-zA-Z0-9]/g, "-").slice(0, 200)}-`)).toBe(true);
+    let h = 0;
+    for (let i = 0; i < cwd.length; i++) h = ((h << 5) - h + cwd.charCodeAt(i)) | 0;
+    expect(slug).toBe(`${cwd.replace(/[^a-zA-Z0-9]/g, "-").slice(0, 200)}-${Math.abs(h).toString(36)}`);
+    expect(claudeProjectSlug(`/Users/alice/${"y".repeat(150)}`).length).toBeLessThanOrEqual(200);
+  });
 });
