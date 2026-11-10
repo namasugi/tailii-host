@@ -200,7 +200,7 @@ export class CodexSubagentTracker {
       model: metadata?.model ?? existing?.model ?? this.pendingModels.get(nodeId)
         ?? stringValue(item["model"]),
       effort: effortValue(item["reasoningEffort"]) ?? existing?.effort,
-      status: kind === "interrupted" ? "completed" : "running",
+      status: subagentActivityStatus(kind, existing?.status),
       currentActivity: kind === "interacted" ? "親エージェントと連携中" : null,
     }, nowMs);
   }
@@ -252,6 +252,16 @@ export class CodexSubagentTracker {
     this.nodes.set(nodeId, node);
     return [node];
   }
+}
+
+/**
+ * subAgentActivity の kind → ノード状態。`started` / `interacted`（親が続きの依頼を送った）は動き出す。
+ * `completed`（子の turn が終わった）/ `interrupted` は終わり。先に子 thread の status でエラーと
+ * 分かっていれば、終わりの通知でエラーを消さない。
+ */
+function subagentActivityStatus(kind: string | null, existing: SubagentNodeStatus | undefined): SubagentNodeStatus {
+  if (kind === "completed" || kind === "interrupted") return existing === "error" ? "error" : "completed";
+  return "running";
 }
 
 function collabTargets(item: Record<string, unknown>): string[] {
