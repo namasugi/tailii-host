@@ -95,6 +95,48 @@ describe("CodexNativeTurnController", () => {
     ]);
   });
 
+  test("子 thread（サブエージェント）の本文・操作カードは親会話に流さず、workflow tree だけ更新する", async () => {
+    const thread = new FakeThread();
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const chats: { session: string; itemId: string; payload: unknown }[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return thread; } },
+      onChatItem: (event) => chats.push(event),
+    });
+    await controller.subscribeSession({ session: "work", threadId: "thread-root", cwd: "/tmp/work" });
+
+    // 子の最終報告・途中経過・コマンド実行・入れ子 spawn は同じ接続に届く。
+    for (const item of [
+      { id: "child-final", type: "agentMessage", text: "調査結果です。", phase: "final_answer" },
+      { id: "child-comment", type: "agentMessage", text: "読んでいます", phase: "commentary" },
+      { id: "child-exec", type: "commandExecution", command: "/bin/zsh -lc 'ls'", status: "completed",
+        exitCode: 0, aggregatedOutput: "a.txt\n" },
+      { id: "child-spawn", type: "collabAgentToolCall", tool: "spawnAgent", status: "completed",
+        senderThreadId: "thread-child", receiverThreadIds: ["thread-grandchild"], prompt: "孫タスク" },
+    ]) {
+      openOptions?.onNotification?.({ method: "item/completed", params: {
+        threadId: "thread-child", turnId: "turn-child", item,
+      } });
+    }
+    // 親 thread 自身の応答は従来どおり出す。
+    openOptions?.onNotification?.({ method: "item/completed", params: {
+      threadId: "thread-root", turnId: "turn-root",
+      item: { id: "root-final", type: "agentMessage", text: "まとめ", phase: "final_answer" },
+    } });
+
+    const chatItems = chats.filter((event) =>
+      (event.payload as { type?: string }).type !== "subagent_node");
+    expect(chatItems).toEqual([
+      { session: "work", itemId: "root-final", payload: { type: "chat_output", v: 1,
+        streamId: "codex-item-root-final", role: "assistant", text: "まとめ", eof: true } },
+    ]);
+    // 入れ子 spawn は子 thread 由来でも workflow tree へ反映する。
+    expect(chats.some((event) => {
+      const payload = event.payload as { type?: string; node?: { nodeId?: string } };
+      return payload.type === "subagent_node" && payload.node?.nodeId === "thread-grandchild";
+    })).toBe(true);
+  });
+
   test("commandExecution / fileChange completed を tool_activity として流す（codex-tool-cards）", async () => {
     const thread = new FakeThread();
     let openOptions: CodexAppServerThreadOptions | null = null;
@@ -253,6 +295,10 @@ describe("CodexNativeTurnController", () => {
     // plan が空の更新はカードにしない。
     openOptions?.onNotification?.({ method: "turn/plan/updated", params: {
       threadId: "thread-1", turnId: "turn-9", plan: [],
+    } });
+    // 子 thread（サブエージェント）のプラン更新は親会話のカードにしない。
+    openOptions?.onNotification?.({ method: "turn/plan/updated", params: {
+      threadId: "thread-1-child", turnId: "turn-child", plan: [{ step: "子の作業", status: "inProgress" }],
     } });
 
     expect(chats).toEqual([
@@ -1355,6 +1401,14 @@ describe("CodexNativeTurnController", () => {
           last: { totalTokens: 12_500 },
           modelContextWindow: null,
         },
+      },
+    });
+    // 子 thread の使用量で親会話のコンテキスト表示を上書きしない。
+    openOptions?.onNotification?.({
+      method: "thread/tokenUsage/updated",
+      params: {
+        threadId: "thread-1-child",
+        tokenUsage: { total: { totalTokens: 50 }, last: { totalTokens: 50 }, modelContextWindow: 100 },
       },
     });
 

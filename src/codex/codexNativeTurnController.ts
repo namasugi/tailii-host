@@ -1192,7 +1192,8 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     const notificationThreadId = params?.["threadId"];
     // App Server が接続をまたいで通知する版でも、別 thread の lifecycle が
     // このセッションの activeTurnId と processing 状態を上書きしないようにする。
-    // item は subagent thread 由来も表示対象になり得るため、ここでは一括破棄しない。
+    // 子 thread（サブエージェント）の item も同じ接続に届く。workflow tree の更新には使うが、
+    // 本文・操作カードは親会話に出さない（子の中身はエージェント会話画面で読む。rollout 再生とも一致）。
     const lifecycleMatchesThread =
       typeof notificationThreadId !== "string" || notificationThreadId === threadId;
     const current = this.open.get(session);
@@ -1246,13 +1247,14 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
           current.subagents.ingestItem(item, Date.now()),
         );
       }
-      if (notification.method === "item/completed" && item !== null && typeof id === "string") {
+      if (notification.method === "item/completed" && item !== null && typeof id === "string" &&
+        lifecycleMatchesThread) {
         const payload = codexItemToChatOutput(item);
         if (payload !== null) this.onChatItem({ session, itemId: id, payload });
         // 非同期質問（codex-async-question）は本文を最終回答と同じ吹き出しで残しつつ、回答できる設問として出す。
         // 子 thread（サブエージェント）は質問しない（ツールが root thread だけに登録される）。
         const itemTurnId = codexItemTurnId(item) ?? params?.["turnId"];
-        if (current?.threadId === threadId && lifecycleMatchesThread && current.activeTurnId !== null &&
+        if (current?.threadId === threadId && current.activeTurnId !== null &&
           (typeof itemTurnId !== "string" || itemTurnId === current.activeTurnId)) {
           this.ingestAsyncQuestions(session, current, item);
           this.resolveAsyncQuestionsFromInput(session, current, item);
@@ -1270,7 +1272,8 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
         });
       }
     }
-    if (notification.method === "turn/plan/updated" && params !== null) {
+    // 子 thread のプラン更新は親会話のカードにしない。
+    if (notification.method === "turn/plan/updated" && params !== null && lifecycleMatchesThread) {
       const current = this.open.get(session);
       if (current?.threadId === threadId) {
         const turnId = typeof params["turnId"] === "string" ? params["turnId"] : "turn";
@@ -1361,7 +1364,8 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     if (notification.method === "thread/goal/cleared" && lifecycleMatchesThread) {
       if (current?.threadId === threadId) this.applyGoal(session, current, null, { publishState: true });
     }
-    if (notification.method === "thread/tokenUsage/updated") {
+    // 子 thread の使用量で親会話のコンテキスト表示を上書きしない。
+    if (notification.method === "thread/tokenUsage/updated" && lifecycleMatchesThread) {
       const tokenUsage = asRecord(params?.["tokenUsage"]);
       const last = asRecord(tokenUsage?.["last"]);
       const contextTokens = nonNegativeInteger(last?.["totalTokens"]);
