@@ -1,4 +1,7 @@
-// Claude API 会話の1ターン。Subscriptionの認証・CLI の設定は触らず、指定キーをこの要求内だけで使う。
+import { claudeApiFederation, FederationError, validFederationSelection,
+  type ApiFederationSelection, type FederationErrorCode } from "./claudeApiFederation.js";
+import { resolvedHostApiRequest } from "./apiDelegateHostKeys.js";
+// Claude API 会話の1ターン。Subscriptionの認証・CLI の設定は触らず、明示選択したAPI認証を使う。
 // 料金表: https://platform.claude.com/docs/en/about-claude/pricing （2026-11-09）。表示・予算は概算。
 export const DELEGATE_MODELS = {
   "claude-sonnet-5-5": { input: 2, output: 10 },
@@ -23,6 +26,8 @@ export interface ClaudeApiDelegateRequest {
   history?: ClaudeApiDelegateHistoryTurn[];
   provider?: "claude" | "openai";
   imageOptions?: ApiImageOptions;
+  federation?: ApiFederationSelection;
+  useHostApiKey?: boolean;
 }
 export interface ApiImageOptions {
   quality: "low" | "medium" | "high" | "xhigh" | "max";
@@ -48,7 +53,7 @@ export interface ClaudeApiDelegateResult {
 export type DelegateErrorCode = "invalid_key" | "unsupported_model" | "invalid_request" | "request_too_large"
   | "budget_exceeded" | "auth_failed" | "quota_exhausted" | "rate_limited" | "unavailable"
   | "invalid_response" | "timeout" | "cancelled" | "attachment_unavailable" | "unsupported_attachment" | "attachments_too_large"
-  | "invalid_options" | "blocked";
+  | "invalid_options" | "blocked" | "host_key_unavailable" | FederationErrorCode;
 export class DelegateError extends Error {
   constructor(readonly code: DelegateErrorCode) { super(code); }
 }
@@ -67,7 +72,9 @@ function tokens(value: unknown): number {
 }
 export function validateDelegateRequest(request: ClaudeApiDelegateRequest): void {
   if (request.provider !== undefined && request.provider !== "claude") throw new DelegateError("invalid_request");
-  if (request.apiKey.trim() !== request.apiKey || !/^sk-ant-api\d+-[\x21-\x7e]{10,4000}$/.test(request.apiKey)) throw new DelegateError("invalid_key");
+  if (request.federation) {
+    if (request.apiKey !== "" || !validFederationSelection(request.federation)) throw new DelegateError("federation_invalid_config");
+  } else if (request.apiKey.trim() !== request.apiKey || !/^sk-ant-api\d+-[\x21-\x7e]{10,4000}$/.test(request.apiKey)) throw new DelegateError("invalid_key");
   if (!Object.hasOwn(DELEGATE_MODELS, request.model)) throw new DelegateError("unsupported_model");
   if (!request.prompt.trim() || !Number.isInteger(request.budgetCents)
       || request.budgetCents < 1 || request.budgetCents > 500) throw new DelegateError("invalid_request");
@@ -106,21 +113,29 @@ export async function runClaudeApiDelegate(
   request: ClaudeApiDelegateRequest,
   signal: AbortSignal,
   fetcher: typeof fetch = fetch,
+  federation = claudeApiFederation,
 ): Promise<ClaudeApiDelegateResult> {
+  const resolved = resolvedHostApiRequest(request, "claude");
+  if (!resolved) throw new DelegateError("host_key_unavailable");
+  request = resolved;
   validateDelegateRequest(request);
   const model = request.model as keyof typeof DELEGATE_MODELS;
   const timeout = AbortSignal.timeout(120_000);
   const combined = AbortSignal.any([signal, timeout]);
   async function post(endpoint: string, body: object): Promise<Record<string, unknown>> {
+    // 計数後に有効期限へ近づいた場合も、生成要求を送る前に更新する。生成POSTは再送しない。
+    const authentication: Record<string, string> = request.federation
+      ? { authorization: `Bearer ${(await federation.token(request.federation, combined)).token}` }
+      : { "x-api-key": request.apiKey };
     const response = await fetcher(`https://api.anthropic.com/v1/messages${endpoint}`, {
       method: "POST", redirect: "error", signal: combined,
-      headers: { "x-api-key": request.apiKey, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+      headers: { ...authentication, "anthropic-version": "2023-06-01", "content-type": "application/json" },
       body: JSON.stringify(body),
     });
     if (!response.ok) {
       // エラー本文はキー/本文を含み得る。ログ・応答には固定コードしか出さない。
       await response.body?.cancel();
-      throw new DelegateError(response.status === 401 || response.status === 403 ? "auth_failed"
+      throw new DelegateError(response.status === 401 || response.status === 403 ? (request.federation ? "federation_auth_failed" : "auth_failed")
         : response.status === 402 ? "quota_exhausted" : response.status === 413 ? "attachments_too_large"
         : response.status === 429 ? "rate_limited" : "unavailable");
     }
@@ -179,6 +194,7 @@ export async function runClaudeApiDelegate(
     if (signal.aborted) throw new DelegateError("cancelled");
     if (timeout.aborted) throw new DelegateError("timeout");
     if (error instanceof DelegateError) throw error;
+    if (error instanceof FederationError) throw new DelegateError(error.code);
     throw new DelegateError("unavailable");
   }
 }

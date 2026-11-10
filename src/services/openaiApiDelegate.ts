@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { DelegateError, validateDelegateRequest, type ClaudeApiDelegateRequest, type ClaudeApiDelegateResult,
   type ApiGeneratedImage, type ApiImageOptions } from "./claudeApiDelegate.js";
 import { loadDelegateAttachments } from "./claudeApiAttachments.js";
+import { resolvedHostApiRequest } from "./apiDelegateHostKeys.js";
 
 // 公式料金・モデル: developers.openai.com/api/docs/{pricing,guides/image-generation}（2026-11-10）。
 export const OPENAI_TEXT_MODELS = {
@@ -40,6 +41,7 @@ export function validOpenAIKey(key: string): boolean {
 }
 function validate(request: ClaudeApiDelegateRequest): boolean {
   if (request.provider !== "openai") throw new DelegateError("invalid_request");
+  if (request.federation !== undefined) throw new DelegateError("invalid_request");
   if (!validOpenAIKey(request.apiKey)) throw new DelegateError("invalid_key");
   const image = Object.hasOwn(OPENAI_IMAGE_MODELS, request.model);
   if (!image && !Object.hasOwn(OPENAI_TEXT_MODELS, request.model)) throw new DelegateError("unsupported_model");
@@ -69,6 +71,9 @@ export function validateImageOptions(options: ApiImageOptions | undefined, model
 export async function runOpenAIApiDelegate(request: ClaudeApiDelegateRequest, signal: AbortSignal,
   fetcher: typeof fetch = fetch, outputDirectory = join(homedir(), ".tailii", "uploads"),
 ): Promise<ClaudeApiDelegateResult> {
+  const resolved = resolvedHostApiRequest(request, "openai");
+  if (!resolved) throw new DelegateError("host_key_unavailable");
+  request = resolved;
   const image = validate(request);
   const timeout = AbortSignal.timeout(image ? 600_000 : 120_000);
   const combined = AbortSignal.any([signal, timeout]);

@@ -1,11 +1,27 @@
 import type { HandlerRegistry } from "../context.js";
 import { DelegateError, runClaudeApiDelegate } from "../../services/claudeApiDelegate.js";
 import { runOpenAIApiDelegate } from "../../services/openaiApiDelegate.js";
+import { claudeApiFederation, FederationError } from "../../services/claudeApiFederation.js";
+import { apiDelegateHostKeys } from "../../services/apiDelegateHostKeys.js";
 
 export function createApiDelegateHandlers(run: typeof runClaudeApiDelegate = (request, signal) =>
   request.provider === "openai" ? runOpenAIApiDelegate(request, signal) : runClaudeApiDelegate(request, signal)): HandlerRegistry { return {
-  api_delegate_options_request: (message, ctx) => {
-    ctx.writer.write({ type: "api_delegate_options_response", v: ctx.state.negotiatedVersion, id: message.id, supported: true, supportsAttachments: true, supportsHistory: true, supportsOpenAI: true });
+  api_delegate_options_request: async (message, ctx) => {
+    ctx.writer.write({ type: "api_delegate_options_response", v: ctx.state.negotiatedVersion, id: message.id, supported: true, supportsAttachments: true, supportsHistory: true, supportsOpenAI: true,
+      federation: await claudeApiFederation.list(), hostApiKeys: apiDelegateHostKeys() });
+  },
+  api_federation_check_request: async (message, ctx) => {
+    const status = await claudeApiFederation.check(message.selection, AbortSignal.timeout(18_000));
+    ctx.writer.write({ type: "api_federation_check_response", v: ctx.state.negotiatedVersion, id: message.id, status });
+  },
+  api_federation_create_request: async (message, ctx) => {
+    try {
+      const profile = await claudeApiFederation.create(message.configuration);
+      ctx.writer.write({ type: "api_federation_create_response", v: ctx.state.negotiatedVersion, id: message.id, profile });
+    } catch (error) {
+      ctx.writer.write({ type: "api_federation_create_response", v: ctx.state.negotiatedVersion, id: message.id,
+        error: error instanceof FederationError ? error.code : "federation_invalid_config" });
+    }
   },
   api_delegate_request: async (message, ctx) => {
     const { state, writer } = ctx;

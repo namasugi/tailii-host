@@ -54,6 +54,13 @@ import {
   type Raw,
 } from "./common.js";
 
+function decodeFederationSelection(raw: Raw): import("../services/claudeApiFederation.js").ApiFederationSelection {
+  return { profile: requireString(raw, "profile"), configurationHash: requireString(raw, "configurationHash") };
+}
+function decodeFederationProfile(raw: Raw): import("../services/claudeApiFederation.js").ApiFederationProfile {
+  return compact({ ...decodeFederationSelection(raw), organizationId: requireString(raw, "organizationId"),
+    federationRuleId: requireString(raw, "federationRuleId"), serviceAccountId: optionalString(raw, "serviceAccountId"), workspaceId: optionalString(raw, "workspaceId") });
+}
 function decodeApiImageOptions(raw: Raw): import("../services/claudeApiDelegate.js").ApiImageOptions {
   return compact({ quality: requireString(raw, "quality") as "low" | "medium" | "high" | "xhigh" | "max",
     size: requireString(raw, "size"), format: requireString(raw, "format") as "png" | "jpeg" | "webp",
@@ -635,9 +642,25 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
       return { type, v, id: requireString(raw, "id") };
     case "api_usage_options_response":
       return { type, v, id: requireString(raw, "id"), supported: requireBoolean(raw, "supported") };
+    case "api_federation_check_request":
+      return { type, v, id: requireString(raw, "id"), selection: decodeFederationSelection(requireObject(raw["selection"], "selection")) };
+    case "api_federation_check_response": {
+      const status = requireObject(raw["status"], "status");
+      return { type, v, id: requireString(raw, "id"), status: compact({ authenticated: requireBoolean(status, "authenticated"), expiresAt: optionalNumber(status, "expiresAt"), error: optionalString(status, "error") }) };
+    }
+    case "api_federation_create_request": {
+      const config = requireObject(raw["configuration"], "configuration");
+      return { type, v, id: requireString(raw, "id"), configuration: compact({ profile: requireString(config, "profile"), organizationId: requireString(config, "organizationId"),
+        federationRuleId: requireString(config, "federationRuleId"), serviceAccountId: optionalString(config, "serviceAccountId"), workspaceId: optionalString(config, "workspaceId"), identityTokenPath: requireString(config, "identityTokenPath") }) };
+    }
+    case "api_federation_create_response":
+      return compact({ type, v, id: requireString(raw, "id"), profile: raw["profile"] === undefined ? undefined : decodeFederationProfile(requireObject(raw["profile"], "profile")), error: optionalString(raw, "error") });
     case "api_delegate_options_response":
       return compact({ type, v, id: requireString(raw, "id"), supported: requireBoolean(raw, "supported"),
-        supportsAttachments: optionalBoolean(raw, "supportsAttachments"), supportsHistory: optionalBoolean(raw, "supportsHistory"), supportsOpenAI: optionalBoolean(raw, "supportsOpenAI") });
+        supportsAttachments: optionalBoolean(raw, "supportsAttachments"), supportsHistory: optionalBoolean(raw, "supportsHistory"), supportsOpenAI: optionalBoolean(raw, "supportsOpenAI"),
+        federation: raw["federation"] === undefined ? undefined : (() => { const value = requireObject(raw["federation"], "federation");
+          return compact({ profiles: requireArray(value, "profiles").slice(0, 32).map((item) => decodeFederationProfile(requireObject(item, "profiles"))), error: optionalString(value, "error") }); })(),
+        hostApiKeys: raw["hostApiKeys"] === undefined ? undefined : (() => { const keys = requireObject(raw["hostApiKeys"], "hostApiKeys"); return { claude: requireBoolean(keys, "claude"), openai: requireBoolean(keys, "openai") }; })() });
     case "api_delegate_request": {
       const request = requireObject(raw["request"], "request");
       return { type, v, id: requireString(raw, "id"), request: {
@@ -646,6 +669,8 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         budgetCents: requireNumber(request, "budgetCents"),
         ...(request["provider"] === undefined ? {} : { provider: requireString(request, "provider") as "claude" | "openai" }),
         ...(request["imageOptions"] === undefined ? {} : { imageOptions: decodeApiImageOptions(requireObject(request["imageOptions"], "imageOptions")) }),
+        ...(request["federation"] === undefined ? {} : { federation: decodeFederationSelection(requireObject(request["federation"], "federation")) }),
+        ...(request["useHostApiKey"] === undefined ? {} : { useHostApiKey: requireBoolean(request, "useHostApiKey") }),
         ...(request["attachments"] === undefined ? {} : { attachments: requireArray(request, "attachments").map((value) => {
           const attachment = requireObject(value, "attachments");
           return { path: requireString(attachment, "path"), name: requireString(attachment, "name") };
