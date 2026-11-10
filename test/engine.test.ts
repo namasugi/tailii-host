@@ -3406,14 +3406,15 @@ describe("EngineControl — 横断制御チャネル", () => {
     engine.writeLine('{"id":"SS1","query":"approval","type":"session_search_request","v":2}');
 
     const accepted = decodeControlMessage(await engine.lines.nextOfType("session_search_response"));
-    expect(accepted).toMatchObject({ id: "SS1", results: [], complete: false });
+    expect(accepted).toMatchObject({ id: "SS1", results: [], complete: false, supportsFilters: true });
     const progress = decodeControlMessage(await engine.lines.nextOfType("session_search_response"));
-    expect(progress).toMatchObject({ id: "SS1", complete: false });
+    expect(progress).toMatchObject({ id: "SS1", complete: false, supportsFilters: true });
     const resp = await engine.lines.nextOfType("session_search_response");
     expect(resp).toContain('"id":"SS1"');
     expect(resp).toContain('"sessionId":"99999999-8888-7777-6666-555555555555"');
     expect(resp).toContain('"snippet":"本文に Approval keyword が含まれる"');
     expect(resp).toContain('"title":"検索タイトル"');
+    expect(resp).toContain('"supportsFilters":true');
 
     await engine.teardown();
   });
@@ -3438,6 +3439,40 @@ describe("EngineControl — 横断制御チャネル", () => {
     } while (response.type === "session_search_response" && response.complete === false);
     expect(response).toMatchObject({ results: [{ sessionId: "codex-search", agent: "codex", snippet: "本文の Needle" }] });
     await engine.teardown();
+  });
+
+  test("本文検索はsource/cwdを件数制限より前に適用し、全応答でfilter対応を知らせる", async () => {
+    const projects = makeTempDir("search-filter-claude-engine");
+    fs.mkdirSync(path.join(projects, "-repo"));
+    fs.writeFileSync(path.join(projects, "-repo", "new-claude.jsonl"),
+      JSON.stringify({ type: "user", cwd: "/repo", message: { content: "new needle" } }) + "\n");
+    const home = makeTempDir("search-filter-codex-engine");
+    fs.mkdirSync(path.join(home, "sessions"));
+    for (const [id, cwd, time] of [["wrong-dir", "/other", 200], ["selected", "/repo/.claude/worktrees/topic", 100]] as const) {
+      const file = path.join(home, "sessions", `rollout-${id}.jsonl`);
+      fs.writeFileSync(file, [
+        { type: "session_meta", payload: { id, cwd, source: "cli" } },
+        { type: "event_msg", payload: { type: "user_message", message: "needle" } },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n");
+      fs.utimesSync(file, time, time);
+    }
+    const engine = startEngine({ sessionManager: makeManager(new MockTmuxRunner(() => ok(""))),
+      claudeSessionStore: new ClaudeSessionStore(projects), codexSessionStore: new CodexSessionStore(home) });
+    try {
+      await engine.lines.nextOfType("channel_hello");
+      engine.writeLine('{"id":"filtered","query":"needle","agents":["codex"],"cwd":"/repo/","limit":1,"type":"session_search_request","v":2}');
+      let response;
+      do {
+        response = decodeControlMessage(await engine.lines.nextOfType("session_search_response"));
+        expect(response).toMatchObject({ id: "filtered", supportsFilters: true });
+      } while (response.type === "session_search_response" && response.complete === false);
+      expect(response).toMatchObject({ results: [{ sessionId: "selected", agent: "codex" }] });
+      engine.writeLine('{"id":"no-sources","query":"needle","agents":[],"type":"session_search_request","v":2}');
+      do {
+        response = decodeControlMessage(await engine.lines.nextOfType("session_search_response"));
+        expect(response).toMatchObject({ id: "no-sources", supportsFilters: true, results: [] });
+      } while (response.type === "session_search_response" && response.complete === false);
+    } finally { await engine.teardown(); }
   });
 
   test("検索語の変更は前の全文走査を止め、制御要求を待たせない", async () => {

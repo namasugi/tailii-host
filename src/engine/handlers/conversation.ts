@@ -535,18 +535,20 @@ export const conversationHandlers: HandlerRegistry = {
     engineDiag(`session_search_request id=${message.id}`);
     try {
       // 全文走査の前に受理を知らせる。旧 host の無応答タイムアウトと長い検索を区別する。
-      writer.write({ type: "session_search_response", v, id: message.id, results: [], complete: false });
+      writer.write({ type: "session_search_response", v, id: message.id, results: [], complete: false, supportsFilters: true });
       const stores = [ctx.claudeSessionStore, ctx.codexSessionStore].filter((store) => store !== null);
       const response = await searchSessions(stores, message.query, {
         limit: message.limit,
+        agents: message.agents,
+        cwd: message.cwd,
         signal: controller.signal,
         onProgress: (results) => {
-          writer.write({ type: "session_search_response", v, id: message.id, results, complete: false });
+          writer.write({ type: "session_search_response", v, id: message.id, results, complete: false, supportsFilters: true });
         },
       });
       if (controller.signal.aborted) return;
       engineDiag(`session_search_response id=${message.id} count=${response.results.length} scanned=${response.stats.scannedFiles}`);
-      writer.write({ type: "session_search_response", v, id: message.id, results: response.results });
+      writer.write({ type: "session_search_response", v, id: message.id, results: response.results, supportsFilters: true });
     } catch (error) {
       if (!controller.signal.aborted) {
         process.stderr.write(`[tailii-host engine] session_search 失敗: ${String(error)}\n`);

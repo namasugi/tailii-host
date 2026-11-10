@@ -2,6 +2,7 @@
 // tailii (TS host) — Claude Code / Codex 会話本文の横断検索（session_search）
 
 import * as fs from "node:fs";
+import { posix } from "node:path";
 import { createInterface } from "node:readline";
 import { setImmediate as yieldToEngine } from "node:timers/promises";
 import { rolloutMessageText } from "../codex/codexSessionStore.js";
@@ -23,6 +24,8 @@ export interface SessionSearchSource {
 
 export interface SessionSearchOptions {
   limit?: number;
+  agents?: ("claude" | "codex")[];
+  cwd?: string;
   nowMs?: () => number;
   timeBudgetMs?: number;
   perFileBytes?: number;
@@ -80,8 +83,13 @@ export async function searchSessions(
   const snippetContext = options.snippetContextChars ?? SESSION_SEARCH_SNIPPET_CONTEXT_CHARS;
 
   options.signal?.throwIfAborted();
+  const agents = options.agents === undefined ? undefined : new Set<string>(options.agents);
+  if (agents?.size === 0) return { results: [], stats: { scannedFiles: 0, truncated: false } };
   const sessions = stores.flatMap((store) =>
-    (store.listForSearch?.() ?? store.list()).map((info) => ({ info, filePath: store.transcriptPath(info.sessionId) })),
+    (store.listForSearch?.() ?? store.list())
+      .filter((info) => (agents === undefined || agents.has(info.agent?.toLowerCase() ?? "claude"))
+        && (options.cwd === undefined || sameSearchDirectory(info.cwd, options.cwd)))
+      .map((info) => ({ info, filePath: store.transcriptPath(info.sessionId) })),
   ).sort((a, b) => (b.info.updatedAt ?? 0) - (a.info.updatedAt ?? 0) || a.info.sessionId.localeCompare(b.info.sessionId));
   const results: SessionSearchResult[] = [];
   let scannedFiles = 0;
@@ -115,6 +123,16 @@ export async function searchSessions(
   }
 
   return { results, stats: { scannedFiles, truncated } };
+}
+
+/** iOSのClaudeSessionSections.sameDirと同じ、完全一致＋worktreeからrepoへの正規化。IOは行わない。 */
+function sameSearchDirectory(candidate: string, selected: string): boolean {
+  const trim = (value: string): string => value.replace(/\/+$/, "") || (value.startsWith("/") ? "/" : "");
+  const base = trim(selected);
+  if (trim(candidate) === base) return true;
+  const normalized = posix.normalize(candidate);
+  const marker = normalized.indexOf("/.claude/worktrees/");
+  return trim(marker < 0 ? normalized : normalized.slice(0, marker)) === base;
 }
 
 function clampLimit(value: number): number {

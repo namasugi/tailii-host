@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
+import type { ClaudeSessionInfo } from "../src/protocol.js";
 import { CodexSessionStore } from "../src/codex/codexSessionStore.js";
 import { codexAsyncQuestionReplyText } from "../src/codex/codexAsyncQuestion.js";
 import { ClaudeSessionStore } from "../src/sessions/claudeSessionStore.js";
@@ -12,7 +13,77 @@ function writeLines(file: string, records: unknown[]): void {
   fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join("\n") + "\n");
 }
 
+function searchSource(infos: ClaudeSessionInfo[]) {
+  const root = makeTempDir("search-filter");
+  const files = new Map<string, string>();
+  for (const info of infos) {
+    const file = path.join(root, info.sessionId + ".jsonl");
+    writeLines(file, info.agent?.toLowerCase() === "codex"
+      ? [{ type: "event_msg", payload: { type: "agent_message", message: "共通のneedle本文" } }]
+      : [{ type: "assistant", message: { content: "共通のneedle本文" } }]);
+    files.set(info.sessionId, file);
+  }
+  return { list: () => infos, transcriptPath: vi.fn((id: string) => files.get(id) ?? null) };
+}
+
 describe("ホストの会話全文検索", () => {
+  test("先頭20件がClaudeでも、Codex指定は検索件数の打切りより前に適用する", async () => {
+    const source = searchSource([
+      ...Array.from({ length: 20 }, (_, index) => ({ sessionId: `claude-${index}`, title: "Claude", cwd: "/repo", agent: "claude", updatedAt: 100 - index })),
+      { sessionId: "older-codex", title: "Codex", cwd: "/repo", agent: "codex", updatedAt: 1 },
+    ]);
+    expect((await searchSessions([source], "needle")).results).toHaveLength(20);
+    source.transcriptPath.mockClear();
+    const progress: string[][] = [];
+    const filtered = await searchSessions([source], "needle", { agents: ["codex"], onProgress: (hits) => progress.push(hits.map((hit) => hit.sessionId)) });
+    expect(filtered.results.map((hit) => hit.sessionId)).toEqual(["older-codex"]);
+    expect(filtered.stats.scannedFiles).toBe(1);
+    expect(progress).toEqual([["older-codex"]]);
+    expect(source.transcriptPath.mock.calls).toEqual([["older-codex"]]);
+  });
+
+  test("先頭20件が別cwdでも、選択cwdの会話を検索件数の打切りより前に拾う", async () => {
+    const source = searchSource([
+      ...Array.from({ length: 20 }, (_, index) => ({ sessionId: `other-${index}`, title: "Other", cwd: "/other", updatedAt: 100 - index })),
+      { sessionId: "selected", title: "Selected", cwd: "/repo", updatedAt: 1 },
+    ]);
+    expect((await searchSessions([source], "needle")).results).toHaveLength(20);
+    source.transcriptPath.mockClear();
+    const filtered = await searchSessions([source], "needle", { cwd: "/repo/" });
+    expect(filtered.results.map((hit) => hit.sessionId)).toEqual(["selected"]);
+    expect(filtered.stats.scannedFiles).toBe(1);
+    expect(source.transcriptPath.mock.calls).toEqual([["selected"]]);
+  });
+
+  test("cwdは完全一致とworktreeのrepo正規化だけを採用し、agentsとのANDで絞る", async () => {
+    const source = searchSource([
+      { sessionId: "root", title: "Root", cwd: "/repo/", agent: "codex" },
+      { sessionId: "tree", title: "Tree", cwd: "/repo/.claude/worktrees/task", agent: "codex" },
+      { sessionId: "other-agent", title: "Claude", cwd: "/repo", agent: "claude" },
+      { sessionId: "child", title: "Child", cwd: "/repo/subdir", agent: "codex" },
+      { sessionId: "sibling", title: "Sibling", cwd: "/repo-other", agent: "codex" },
+      { sessionId: "prefix", title: "Prefix", cwd: "/repo/.claude/worktrees-not/task", agent: "codex" },
+    ]);
+    const result = await searchSessions([source], "needle", { agents: ["codex"], cwd: "/repo", limit: 1 });
+    expect(result.results.map((hit) => hit.sessionId)).toEqual(["root"]);
+    const all = await searchSessions([source], "needle", { agents: ["codex"], cwd: "/repo" });
+    expect(all.results.map((hit) => hit.sessionId)).toEqual(["root", "tree"]);
+    expect((await searchSessions([source], "needle", { cwd: "/repo/.claude/worktrees/task/" })).results.map((hit) => hit.sessionId)).toEqual(["tree"]);
+  });
+
+  test("旧形式のagent省略はClaude、未知agentは明示した種別へ混ぜず、空配列は走査しない", async () => {
+    const source = searchSource([
+      { sessionId: "legacy", title: "Legacy", cwd: "/repo" },
+      { sessionId: "upper", title: "Upper", cwd: "/repo", agent: "CLAUDE" },
+      { sessionId: "unknown", title: "Unknown", cwd: "/repo", agent: "future-agent" },
+    ]);
+    expect((await searchSessions([source], "needle")).results).toHaveLength(3);
+    expect((await searchSessions([source], "needle", { agents: ["claude"] })).results.map((hit) => hit.sessionId)).toEqual(["legacy", "upper"]);
+    source.transcriptPath.mockClear();
+    expect(await searchSessions([source], "needle", { agents: [] })).toEqual({ results: [], stats: { scannedFiles: 0, truncated: false } });
+    expect(source.transcriptPath).not.toHaveBeenCalled();
+  });
+
   test("1MB より後の日本語本文を拾い、結果を先に通知する", async () => {
     const root = makeTempDir("search-full");
     writeLines(path.join(root, "-tmp-proj", "long.jsonl"), [

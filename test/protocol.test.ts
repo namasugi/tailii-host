@@ -644,6 +644,31 @@ describe("decode 詳細", () => {
     });
   });
 
+  it("本文検索のsource/cwd条件と対応flagを追加フィールドとして往復する", () => {
+    const request = { type: "session_search_request", v: 2, id: "filtered-search", query: "needle", agents: ["codex"], cwd: "/repo", limit: 20 } as const;
+    expect(decodeControlMessage(JSON.stringify(request))).toEqual(request);
+    expect(decodeControlMessage(encodeControlMessage({ ...request, agents: ["codex"] }))).toEqual(request);
+    expect(decodeControlMessage('{"type":"session_search_request","v":2,"id":"empty","query":"needle","agents":[]}'))
+      .toMatchObject({ agents: [] });
+    expect(decodeControlMessage('{"type":"session_search_request","v":2,"id":"both","query":"needle","agents":["claude","codex","claude"]}'))
+      .toMatchObject({ agents: ["claude", "codex"] });
+    const response = { type: "session_search_response", v: 2, id: "filtered-search", results: [], complete: false, supportsFilters: true } as const;
+    expect(decodeControlMessage(encodeControlMessage({ ...response, results: [] }))).toEqual(response);
+    expect(decodeControlMessage('{"type":"session_search_response","v":2,"id":"legacy","results":[]}'))
+      .not.toHaveProperty("supportsFilters");
+  });
+
+  it("本文検索の不正な条件を無条件検索へ戻さず拒否する", () => {
+    for (const condition of [
+      { agents: "codex" }, { agents: ["openai"] }, { agents: [null] }, { agents: null },
+      { cwd: null }, { cwd: 42 }, { cwd: "" }, { cwd: "/repo\nother" }, { cwd: "/repo\u0000other" },
+      { cwd: "x".repeat(4097) },
+    ]) {
+      expect(() => decodeControlMessage(JSON.stringify({ type: "session_search_request", v: 2, id: "invalid", query: "needle", ...condition })))
+        .toThrow(ProtocolDecodeError);
+    }
+  });
+
   it("v2 subagent_node を復元する", () => {
     const line = goldenLines("approval-protocol-v2.ndjson").find((entry) =>
       entry.includes('"type":"subagent_node"') && entry.includes('"status":"running"')

@@ -26,3 +26,5 @@
 {"id":"pv11aa22-0000-0000-0000-000000001101","type":"preview_close","v":2}
 {"agentType":"Bash","depth":1,"kind":"command","label":"host 全テスト実行","nodeId":"b2b5uvze5","parentNodeId":"root","status":"running","toolUseId":"toolu_01975fevFoNfyxbkpfoGMbx5","ts":1783016361453,"type":"subagent_node","v":2}
 {"agentType":"Bash","depth":1,"kind":"command","label":"host 全テスト実行","nodeId":"b2b5uvze5","parentNodeId":"root","status":"completed","toolUseId":"toolu_01975fevFoNfyxbkpfoGMbx5","ts":1783016460000,"type":"subagent_node","v":2}
+{"agents":["codex"],"cwd":"/Users/alice/project","id":"source-filter-search","limit":2,"query":"approval","type":"session_search_request","v":2}
+{"id":"source-filter-search","results":[],"supportsFilters":true,"type":"session_search_response","v":2}

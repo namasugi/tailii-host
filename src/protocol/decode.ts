@@ -70,6 +70,18 @@ function decodeApiClaudeModelsSelection(value: unknown): import("../services/cla
     keySource: raw["keySource"] === undefined ? undefined : decodeApiUsageCredentials({ claude: raw["keySource"] })!.claude,
     federation: raw["federation"] === undefined ? undefined : decodeFederationSelection(requireObject(raw["federation"], "federation")) });
 }
+function decodeSessionSearchAgents(raw: Raw): ("claude" | "codex")[] | undefined {
+  if (raw["agents"] === undefined) return undefined;
+  const agents = requireStringArray(raw, "agents");
+  if (agents.some((agent) => agent !== "claude" && agent !== "codex")) throw new ProtocolDecodeError("missing-field", "agents");
+  return [...new Set(agents)] as ("claude" | "codex")[];
+}
+function decodeSessionSearchCwd(raw: Raw): string | undefined {
+  if (raw["cwd"] === undefined) return undefined;
+  const cwd = requireString(raw, "cwd");
+  if (!cwd || cwd.length > 4096 || /[\x00-\x1f\x7f]/.test(cwd)) throw new ProtocolDecodeError("missing-field", "cwd");
+  return cwd;
+}
 function decodeApiClaudeModelsResult(value: unknown): import("../services/claudeApiModels.js").ApiClaudeModelsResult | undefined {
   if (value === undefined) return undefined;
   const raw = requireObject(value, "claudeModels"), models = requireArray(raw, "models");
@@ -1349,6 +1361,8 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         id: requireString(raw, "id"),
         query: requireString(raw, "query"),
         limit: optionalNumber(raw, "limit"),
+        agents: decodeSessionSearchAgents(raw),
+        cwd: decodeSessionSearchCwd(raw),
       });
 
     case "session_search_response":
@@ -1356,6 +1370,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         type, v,
         id: requireString(raw, "id"),
         complete: optionalBoolean(raw, "complete"),
+        supportsFilters: optionalBoolean(raw, "supportsFilters"),
         results: requireArray(raw, "results").map((element) => {
           const obj = requireObject(element, "results");
           return compact<SessionSearchResult>({

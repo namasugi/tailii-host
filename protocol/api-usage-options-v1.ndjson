@@ -2,3 +2,7 @@
 {"id":"api-options","supported":true,"type":"api_usage_options_response","v":1}
 {"apiCredentials":{"claude":{"environmentVariable":"ANTHROPIC_ADMIN_API_KEY","mode":"environment"},"openai":{"mode":"disabled"}},"id":"api-custom","type":"account_usage_request","v":1}
 {"claudeApi":{"cost":"12.3456789","currency":"USD","fetchedAt":"2026-11-09T00:00:00.000Z","month":"2026-11"},"id":"api-custom","type":"account_usage_response","v":1}
+{"claudeModels":{"keySource":{"environmentVariable":"ANTHROPIC_API_KEY","mode":"environment","workspaceId":"wrkspc_example"},"useHostApiKey":true},"id":"api-models","type":"api_delegate_options_request","v":1}
+{"claudeModels":{"models":[{"id":"claude-fable-5-2-20261109","name":"Claude Fable 5.2","priceKnown":true},{"id":"claude-future-6","name":"Claude Future 6","priceKnown":false}]},"id":"api-models","supported":true,"supportsAttachments":true,"supportsHistory":true,"supportsOpenAI":true,"type":"api_delegate_options_response","v":1}
+{"claudeModels":{"models":[]},"id":"api-models-empty","supported":true,"supportsAttachments":true,"supportsHistory":true,"supportsOpenAI":true,"type":"api_delegate_options_response","v":1}
+{"claudeModels":{"error":"auth_failed","models":[]},"id":"api-models-failed","supported":true,"supportsAttachments":true,"supportsHistory":true,"supportsOpenAI":true,"type":"api_delegate_options_response","v":1}
