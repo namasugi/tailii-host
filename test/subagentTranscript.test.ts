@@ -365,4 +365,88 @@ describe("parseCodexSubagentTranscript", () => {
       omitted: 0,
     });
   });
+
+  it("現行形式: 発話は response_item/message から読み、暗号化された依頼は区切りだけ出す", () => {
+    const at = (s: number) => `2026-11-10T12:42:${String(s).padStart(2, "0")}.000Z`;
+    const fixture = [
+      JSON.stringify({ type: "session_meta", payload: { agent_path: "/root/investigate" } }),
+      JSON.stringify({ timestamp: at(1), type: "response_item", payload: {
+        type: "agent_message", author: "/root", recipient: "/root/investigate",
+        content: [
+          { type: "input_text", text: "Message Type: NEW_TASK\nTask name: /root/investigate\nSender: /root\nPayload:\n" },
+          { type: "encrypted_content", encrypted_content: "gAAAA" },
+        ],
+      } }),
+      JSON.stringify({ timestamp: at(2), type: "response_item", payload: {
+        type: "message", role: "assistant", phase: "commentary",
+        content: [{ type: "output_text", text: "読んでいます" }],
+      } }),
+      // 内部区分の本文は出さない。
+      JSON.stringify({ timestamp: at(3), type: "response_item", payload: {
+        type: "message", role: "assistant", phase: "analysis",
+        content: [{ type: "output_text", text: "内部" }],
+      } }),
+      JSON.stringify({ timestamp: at(4), type: "event_msg", payload: {
+        type: "item_completed", item: { type: "AgentMessage", id: "m1", content: [{ type: "Text", text: "調査結果です" }] },
+      } }),
+      JSON.stringify({ timestamp: at(4), type: "response_item", payload: {
+        type: "message", role: "assistant", phase: "final_answer", id: "m1",
+        content: [{ type: "output_text", text: "調査結果です" }],
+      } }),
+      // 同じ子への続きの依頼（親以外の送り手は名前を添える）。
+      JSON.stringify({ timestamp: at(5), type: "response_item", payload: {
+        type: "agent_message", author: "/root/other_agent", recipient: "/root/investigate",
+        content: [
+          { type: "input_text", text: "Message Type: MESSAGE\nTask name: /root/investigate\nSender: /root/other_agent" },
+          { type: "encrypted_content", encrypted_content: "gAAAA" },
+        ],
+      } }),
+      // 旧形式: event_msg と直後の response_item が同じ本文なら 1 行。
+      JSON.stringify({ timestamp: at(6), type: "event_msg", payload: { type: "agent_message", message: "了解" } }),
+      JSON.stringify({ timestamp: at(6), type: "response_item", payload: {
+        type: "message", role: "assistant", content: [{ type: "output_text", text: "了解" }],
+      } }),
+    ].join("\n");
+
+    expect(parseCodexSubagentTranscript(fixture).entries).toEqual([
+      { role: "user", text: "📩 新しい依頼\n\n内容は暗号化されていて表示できません。", ts: Date.parse(at(1)) },
+      { role: "assistant", text: "読んでいます", ts: Date.parse(at(2)) },
+      { role: "assistant", text: "調査結果です", ts: Date.parse(at(4)) },
+      { role: "user", text: "📩 追加の連絡（other_agent から）\n\n内容は暗号化されていて表示できません。",
+        ts: Date.parse(at(5)) },
+      { role: "assistant", text: "了解", ts: Date.parse(at(6)) },
+    ]);
+  });
+
+  it("同じ本文の発言が続いても潰さず、送り手は Sender 行でも拾い、自分の位置が不明なら名前を添えない", () => {
+    const message = (text: string) => JSON.stringify({ type: "response_item", payload: {
+      type: "message", role: "assistant", phase: "commentary", content: [{ type: "output_text", text }],
+    } });
+    const inbound = (author: string | null, header: string) => JSON.stringify({ type: "response_item", payload: {
+      type: "agent_message", ...(author === null ? {} : { author }), recipient: "/root/a",
+      content: [{ type: "input_text", text: header }, { type: "encrypted_content", encrypted_content: "x" }],
+    } });
+    const withPath = [
+      JSON.stringify({ type: "session_meta", payload: { agent_path: "/root/a" } }),
+      inbound(null, "Message Type: MESSAGE\nTask name: /root/a\nSender: /root/b\nPayload:\n"),
+      message("確認中"),
+      message("確認中"),
+    ].join("\n");
+    expect(parseCodexSubagentTranscript(withPath).entries.map((e) => e.text)).toEqual([
+      "📩 追加の連絡（b から）\n\n内容は暗号化されていて表示できません。",
+      "確認中",
+      "確認中",
+    ]);
+    // session_meta に agent_path が無い（自分の位置が不明）なら、親かどうか判断できないので名前なし。
+    const withoutPath = inbound("/root", "Message Type: NEW_TASK\nTask name: /root/a\nSender: /root\nPayload:\n");
+    expect(parseCodexSubagentTranscript(withoutPath).entries.map((e) => e.text)).toEqual([
+      "📩 新しい依頼\n\n内容は暗号化されていて表示できません。",
+    ]);
+    // 暗号化された本文が無い（平文だけで Payload の目印も無い）依頼は区切りを出さない。
+    const plainOnly = JSON.stringify({ type: "response_item", payload: {
+      type: "agent_message", author: "/root", recipient: "/root/a",
+      content: [{ type: "input_text", text: "Message Type: MESSAGE\nSender: /root" }],
+    } });
+    expect(parseCodexSubagentTranscript(plainOnly).entries).toEqual([]);
+  });
 });

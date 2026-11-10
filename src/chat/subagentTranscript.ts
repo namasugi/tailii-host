@@ -7,6 +7,7 @@ import {
   rolloutPatchApplyActivities,
   rolloutResponseItemToolActivities,
 } from "../codex/codexToolActivity.js";
+import { isVisibleCodexMessagePhase } from "../codex/codexMessagePhase.js";
 import { isCompactSummaryRecord } from "../shared/compactSummary.js";
 import { isNonMessageRecordType } from "../shared/transcriptRecord.js";
 import { narrationText } from "../shared/narration.js";
@@ -236,6 +237,12 @@ export function parseSubagentTranscript(jsonl: string, before?: number): Subagen
 /**
  * fork された Codex rollout には親の履歴も複製される。親→子の agent_message を境界にし、
  * それより後の子自身の発話・ツール実行だけを返す。
+ *
+ * 子の発話は `response_item/message`（assistant）から読む。現行 Codex（0.16x）は子の rollout に
+ * `event_msg/agent_message` を書かない。旧形式は event_msg の直後に同じ本文の response_item が続くので、
+ * その写しだけを重ねない（同じ本文の発言が続く正当なケースは潰さない）。
+ * 親や他のエージェントから届く依頼は本文が暗号化されている（`encrypted_content`）。読めないときは
+ * 依頼の区切りだけを出す（同じ子に続けて別の依頼が来るので、どこからが次の依頼か分かるように）。
  */
 export function parseCodexSubagentTranscript(jsonl: string, before?: number): SubagentTranscriptResult {
   const records = jsonl.split(/\r?\n/).flatMap((line): Record<string, unknown>[] => {
@@ -250,6 +257,8 @@ export function parseCodexSubagentTranscript(jsonl: string, before?: number): Su
   const agentPath = codexAgentPath(records);
   let childHistoryStarted = false;
   const all: SubagentTranscriptEntry[] = [];
+  // 最後に読んだ旧形式 event_msg/agent_message の本文。次の response_item が同文の写しかの判定に使う。
+  let eventAssistantText: string | null = null;
 
   for (const record of records) {
     const ts = parseTimestamp(record["timestamp"]);
@@ -261,7 +270,7 @@ export function parseCodexSubagentTranscript(jsonl: string, before?: number): Su
       typeof payload["recipient"] === "string" &&
       (agentPath === null || payload["recipient"] === agentPath)) {
       childHistoryStarted = true;
-      const task = interAgentPayloadText(payload["content"]);
+      const task = interAgentPayloadText(payload["content"]) ?? interAgentPlaceholder(payload, agentPath);
       if (task !== null) all.push(entry("user", task, ts));
       continue;
     }
@@ -271,6 +280,7 @@ export function parseCodexSubagentTranscript(jsonl: string, before?: number): Su
       if (payload["type"] === "agent_message" && typeof payload["message"] === "string" &&
         payload["message"].length > 0) {
         all.push(entry("assistant", payload["message"], ts));
+        eventAssistantText = payload["message"];
       }
       for (const activity of rolloutPatchApplyActivities(payload)) {
         all.push(entry("tool", transcriptToolText(activity), ts, "tool_use"));
@@ -278,6 +288,15 @@ export function parseCodexSubagentTranscript(jsonl: string, before?: number): Su
       continue;
     }
     if (recordType !== "response_item") continue;
+    const pendingEventText = eventAssistantText;
+    eventAssistantText = null;
+
+    const message = codexAssistantMessageText(payload);
+    if (message !== null) {
+      // 旧形式は event_msg の直後に同じ本文の response_item が続く。その写しだけを重ねない。
+      if (message !== pendingEventText) all.push(entry("assistant", message, ts));
+      continue;
+    }
 
     const activities = rolloutResponseItemToolActivities(payload);
     for (const activity of activities) {
@@ -310,6 +329,45 @@ function codexAgentPath(records: Record<string, unknown>[]): string | null {
     if (typeof path === "string" && path.length > 0) return path;
   }
   return null;
+}
+
+/** `response_item/message`（assistant）のうち会話に出す区分の本文。 */
+function codexAssistantMessageText(payload: Record<string, unknown>): string | null {
+  if (payload["type"] !== "message" || payload["role"] !== "assistant") return null;
+  if (!isVisibleCodexMessagePhase(payload["phase"])) return null;
+  const content = payload["content"];
+  if (!Array.isArray(content)) return null;
+  const text = content.flatMap((raw): string[] => {
+    const block = object(raw);
+    return block?.["type"] === "output_text" && typeof block["text"] === "string" ? [block["text"]] : [];
+  }).join("\n");
+  return text.length > 0 ? text : null;
+}
+
+/**
+ * 本文を読めない依頼（暗号化）の区切り。`Message Type: NEW_TASK` は新しい依頼、それ以外は途中の連絡。
+ * 送り手が親（自分の 1 つ上）でなければ送り手の名前を添える。
+ */
+function interAgentPlaceholder(payload: Record<string, unknown>, agentPath: string | null): string | null {
+  const content = payload["content"];
+  if (!Array.isArray(content)) return null;
+  // 暗号化された本文があるときだけ区切りにする（平文だけで目印の無い依頼は従来どおり出さない）。
+  if (!content.some((raw) => object(raw)?.["type"] === "encrypted_content")) return null;
+  const header = content.flatMap((raw): string[] => {
+    const block = object(raw);
+    return block?.["type"] === "input_text" && typeof block["text"] === "string" ? [block["text"]] : [];
+  }).join("\n");
+  const isNewTask = /^Message Type:\s*NEW_TASK\s*$/mu.test(header);
+  const author = typeof payload["author"] === "string" && payload["author"].length > 0
+    ? payload["author"] : (/^Sender:[ \t]*(\S+)[ \t]*$/mu.exec(header)?.[1] ?? null);
+  // 自分の位置が分からないときは親かどうか判断できないので、名前は添えない。
+  const parentPath = agentPath !== null && agentPath.includes("/")
+    ? agentPath.slice(0, agentPath.lastIndexOf("/")) : null;
+  const senderName = author !== null && parentPath !== null && author !== parentPath
+    ? author.slice(author.lastIndexOf("/") + 1) : null;
+  const title = isNewTask ? "📩 新しい依頼" : "📩 追加の連絡";
+  const from = senderName !== null && senderName.length > 0 ? `（${senderName} から）` : "";
+  return `${title}${from}\n\n内容は暗号化されていて表示できません。`;
 }
 
 function interAgentPayloadText(value: unknown): string | null {
