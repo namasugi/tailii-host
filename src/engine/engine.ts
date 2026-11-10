@@ -53,7 +53,7 @@ import {
 } from "../services/accountIdentity.js";
 import { fetchHostVersions, type HostVersionsProvider } from "../services/hostVersions.js";
 import {
-  fetchPlanUsage,
+  sharedPlanUsage,
   primeClaudeKeychainMirror,
   type PlanUsageProvider,
 } from "../services/planUsageFetcher.js";
@@ -424,7 +424,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     officialApps = new OfficialAppsService(),
     codexTurnController: injectedCodexTurnController = null,
     maxVersion = PROTOCOL_MAX_SUPPORTED,
-    planUsage = () => fetchPlanUsage(),
+    planUsage = sharedPlanUsage,
     claudeModelList = () => fetchClaudeModelList(),
     codexAccountUsage: injectedCodexAccountUsage = undefined,
     hostVersions = fetchHostVersions,

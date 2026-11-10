@@ -1431,6 +1431,26 @@ function decodeClaudeAccountUsage(value: unknown): ClaudeAccountUsage | undefine
     plan: optionalString(obj, "plan"),
     rateLimitTier: optionalString(obj, "rateLimitTier"),
     account: optionalString(obj, "account"),
+    limitResets: obj["limitResets"] === undefined
+      ? undefined
+      : requireArray(obj, "limitResets").map((item) => {
+          const grant = requireObject(item, "claude.limitResets[]");
+          return compact({
+            kind: requireString(grant, "kind"),
+            remaining: requireNumber(grant, "remaining"),
+            total: optionalNumber(grant, "total"),
+            expiresAt: optionalString(grant, "expiresAt"),
+            usableNow: optionalBoolean(grant, "usableNow"),
+          });
+        }),
+    stale: obj["stale"] == null ? undefined : (() => {
+      const stale = requireObject(obj["stale"], "claude.stale");
+      return compact({
+        reason: requireString(stale, "reason"),
+        fetchedAt: requireString(stale, "fetchedAt"),
+        retryAt: optionalString(stale, "retryAt"),
+      });
+    })(),
   });
 }
 

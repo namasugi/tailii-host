@@ -76,7 +76,8 @@ export const usageHandlers: HandlerRegistry = {
     const totals = transcript !== null ? aggregateUsage(transcript) : emptyUsageTotals();
     // 会話スコープの usage_response は plan 系フィールドを省略するだけ（理由文は account_usage が担う）。
     const planResult = await ctx.planUsage();
-    const plan = isPlanUsageFailure(planResult) ? null : planResult;
+    // 前回値（stale）は取得時刻を出せないこの応答では今の値に見えるため載せない。
+    const plan = isPlanUsageFailure(planResult) || planResult?.stale !== undefined ? null : planResult;
     try {
       writer.write({
         type: "usage_response",

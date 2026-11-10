@@ -462,6 +462,36 @@ export interface ClaudeAccountUsage {
    * 生 email は host 内で捨て、ワイヤーへはマスク済み文字列しか載せない。
    */
   account?: string;
+  /**
+   * 付与済みの利用枠リセット権（Claude Code の `/limit-reset` で使う）。
+   * 欠落は不明（取得不可・対象外）、空配列は「使えるリセット権なし」。
+   */
+  limitResets?: ClaudeLimitReset[];
+  /** 最新を取れず前回値を載せているときだけ付く（1 時間以内に取れた値に限る）。 */
+  stale?: ClaudeUsageStale;
+}
+
+/** 前回値を載せている理由と、その値の取得時刻（ISO 8601）。 */
+export interface ClaudeUsageStale {
+  /** "rate_limited"（問い合わせ過多）| "unavailable"（通信断・API 異常）。未知の値もそのまま運ぶ。 */
+  reason: string;
+  fetchedAt: string;
+  /** 問い合わせを再開する予定時刻（429 のときだけ）。 */
+  retryAt?: string;
+}
+
+/** 利用枠リセット権 1 件（使用量 API の `cedar_ember.grants[]` 由来）。 */
+export interface ClaudeLimitReset {
+  /** 種類の生値: "fable" | "session" | "weekly" | "full"（未知の値も運び、表示側が汎用表示する）。 */
+  kind: string;
+  /** 残り回数（1 以上）。 */
+  remaining: number;
+  /** 付与回数。 */
+  total?: number;
+  /** 使用期限（ISO 8601）。 */
+  expiresAt?: string;
+  /** 今すぐ使えるか（一時停止中・他の枠で塞がれている間は false）。 */
+  usableNow?: boolean;
 }
 
 /** Codex の追加クレジット。API Platform の無料・購入済み API 残高とは別枠。 */

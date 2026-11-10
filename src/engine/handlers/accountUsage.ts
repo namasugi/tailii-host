@@ -14,6 +14,7 @@
 import type {
   ClaudeAccountUsage,
   ClaudeExtraUsage,
+  ClaudeLimitReset,
   CodexAccountUsage,
   HostVersions,
 } from "../../protocol/messages.js";
@@ -48,6 +49,10 @@ export const CLAUDE_ACCOUNT_USAGE_ERROR =
 export const CLAUDE_ACCOUNT_USAGE_LOGIN_REQUIRED =
   "Claude のログインが切れています。会話で /login を実行してログインし直してください。";
 
+/** 使用量 API が 429（問い合わせ過多）を返したときの理由文。 */
+export const CLAUDE_ACCOUNT_USAGE_RATE_LIMITED =
+  "Claude の使用量の問い合わせが多すぎるため、一時的に取得できません。しばらくしてから更新してください。";
+
 /** Codex 側の取得失敗時に返す理由文。 */
 export const CODEX_ACCOUNT_USAGE_ERROR =
   "Codex の使用量を取得できませんでした（Codex App Server に接続できません）。";
@@ -69,6 +74,10 @@ interface CacheEntry<T> {
   value: T | null;
   /** 失敗の分類（分かるときだけ。null は理由不明 / 成功）。 */
   failure: PlanUsageFailure | null;
+  /** 値の実際の取得時刻（前回値を返したときは atMs より古い）。fetchedAt はこちらを使う。 */
+  dataAtMs?: number;
+  /** 前回値・429 は取得ガードが API を叩かないので、短い TTL で見直して復旧を早く見せる。 */
+  shortTtl?: boolean;
 }
 
 /** キャッシュが TTL 内か（`login_required` の失敗エントリだけ短い failureTtlMs で判定する）。 */
@@ -79,12 +88,14 @@ function cacheFresh<T>(
   failureTtlMs: number,
 ): entry is CacheEntry<T> {
   if (entry === null) return false;
-  const ttl = entry.value === null && entry.failure === "login_required" ? failureTtlMs : successTtlMs;
+  const ttl = entry.shortTtl === true || (entry.value === null && entry.failure === "login_required")
+    ? failureTtlMs : successTtlMs;
   return nowMs - entry.atMs < ttl;
 }
 
 /** Claude 側の失敗理由文（分類に応じて出し分け）。 */
 export function claudeAccountUsageErrorText(failure: PlanUsageFailure | null): string {
+  if (failure === "rate_limited") return CLAUDE_ACCOUNT_USAGE_RATE_LIMITED;
   return failure === "login_required"
     ? CLAUDE_ACCOUNT_USAGE_LOGIN_REQUIRED
     : CLAUDE_ACCOUNT_USAGE_ERROR;
@@ -118,17 +129,40 @@ export function createAccountUsageHandlers(
     if (cacheFresh(claudeCache, at, claudeTtlMs, failureTtlMs)) return claudeCache;
     let value: ClaudeAccountUsage | null = null;
     let failure: PlanUsageFailure | null = null;
+    let dataAtMs: number | undefined;
+    let shortTtl = false;
     try {
       const result = await ctx.planUsage();
       if (isPlanUsageFailure(result)) {
         failure = result.failure;
+        shortTtl = result.failure === "rate_limited";
       } else {
         value = toClaudeAccountUsage(result);
+        // ガードが前回値を返したとき（間引き・429・通信断）も、fetchedAt は実際の取得時刻にする。
+        if (result !== null && result.fetchedAtMs !== undefined) dataAtMs = result.fetchedAtMs;
+        if (result !== null && value !== null && result.stale !== undefined && result.fetchedAtMs !== undefined) {
+          value = {
+            ...value,
+            stale: {
+              reason: result.stale.reason,
+              fetchedAt: new Date(result.fetchedAtMs).toISOString(),
+              ...(result.stale.retryAtMs !== undefined
+                ? { retryAt: new Date(result.stale.retryAtMs).toISOString() } : {}),
+            },
+          };
+          // 429 中はガードが API を叩かないので、短い TTL で見直して解除後すぐ戻す。
+          // 通信断は従来どおりの TTL（オフライン中に候補×timeout を繰り返さない）。
+          shortTtl = result.stale.reason === "rate_limited";
+        }
       }
     } catch {
       value = null;
     }
-    claudeCache = { atMs: at, value, failure };
+    claudeCache = {
+      atMs: at, value, failure,
+      ...(dataAtMs !== undefined ? { dataAtMs } : {}),
+      ...(shortTtl ? { shortTtl } : {}),
+    };
     return claudeCache;
   }
 
@@ -215,7 +249,7 @@ export function createAccountUsageHandlers(
           ...(host !== null ? { host } : {}),
           ...(api !== null ? ("value" in api ? { openaiApi: api.value } : { openaiApiError: api.error }) : {}),
           ...(claudeApi !== null ? ("value" in claudeApi ? { claudeApi: claudeApi.value } : { claudeApiError: claudeApi.error }) : {}),
-          fetchedAt: new Date(Math.min(claude.atMs, codex.atMs,
+          fetchedAt: new Date(Math.min(claude.dataAtMs ?? claude.atMs, codex.atMs,
             ...(api && "value" in api && Number.isFinite(Date.parse(api.value.fetchedAt))
               ? [Date.parse(api.value.fetchedAt)] : []),
             ...(claudeApi && "value" in claudeApi && Number.isFinite(Date.parse(claudeApi.value.fetchedAt))
@@ -308,6 +342,7 @@ export function toClaudeAccountUsage(
     /** 使用量取得に成功した同じ OAuth token のマスク済みアカウント。 */
     account?: string | null;
     extraUsage?: ClaudeExtraUsage;
+    limitResets?: ClaudeLimitReset[];
   } | null,
 ): ClaudeAccountUsage | null {
   if (plan === null) return null;
@@ -324,6 +359,7 @@ export function toClaudeAccountUsage(
     ...(plan.subscriptionType ? { plan: plan.subscriptionType } : {}),
     ...(plan.rateLimitTier ? { rateLimitTier: plan.rateLimitTier } : {}),
     ...(plan.account ? { account: plan.account } : {}),
+    ...(plan.limitResets !== undefined ? { limitResets: plan.limitResets } : {}),
   };
   // undefined は旧provider/fixture（auth status fallback可）、null は同tokenで解決不能
   // （別認証源のアカウントを誤表示しないため fallback 不可）。

@@ -9,3 +9,6 @@
 {"claude":{"extraUsage":{"currency":"USD","decimalPlaces":2,"isEnabled":false},"plan":"max"},"id":"au-8","type":"account_usage_response","v":1}
 {"id":"au-9","openaiApi":{"cost":"0.3","currency":"USD","fetchedAt":"2026-11-09T00:00:00.000Z","month":"2026-11"},"type":"account_usage_response","v":1}
 {"id":"au-10","openaiApiError":"admin_key_required","type":"account_usage_response","v":1}
+{"claude":{"limitResets":[{"expiresAt":"2027-03-09T07:59:00.000Z","kind":"fable","remaining":1,"total":1,"usableNow":true},{"expiresAt":"2027-03-09T07:59:00.000Z","kind":"fable","remaining":1,"total":1,"usableNow":true},{"kind":"session","remaining":1,"usableNow":false}],"plan":"max","sevenDayPercent":91},"id":"au-11","type":"account_usage_response","v":1}
+{"claude":{"limitResets":[],"plan":"pro","sevenDayPercent":10},"id":"au-12","type":"account_usage_response","v":1}
+{"claude":{"plan":"max","sevenDayPercent":91,"stale":{"fetchedAt":"2026-11-10T02:10:00.000Z","reason":"rate_limited","retryAt":"2026-11-10T02:20:00.000Z"}},"fetchedAt":"2026-11-10T02:10:00.000Z","id":"au-13","type":"account_usage_response","v":1}
