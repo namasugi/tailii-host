@@ -6,6 +6,7 @@ import { posix } from "node:path";
 import { createInterface } from "node:readline";
 import { setImmediate as yieldToEngine } from "node:timers/promises";
 import { rolloutMessageText } from "../codex/codexSessionStore.js";
+import { createCompressedRolloutReadStream, isCompressedRollout } from "../codex/rolloutFile.js";
 import { codexAsyncQuestionReplyDisplayText } from "../codex/codexAsyncQuestion.js";
 import { codexPlanChatOutput } from "../codex/codexPlanItem.js";
 import type { ClaudeSessionInfo, SessionSearchResult } from "../protocol.js";
@@ -149,16 +150,26 @@ async function searchTranscriptFile(
   signal?: AbortSignal,
 ): Promise<string | null> {
   if (byteLimit <= 0) return null;
-  const input = fs.createReadStream(filePath, {
-    encoding: "utf8",
-    ...(Number.isFinite(byteLimit) ? { end: byteLimit - 1 } : {}),
-    signal,
-  });
+  // Codex が圧縮した古い rollout（.jsonl.zst）は解凍しながら読み、上限は解凍後のバイト数で数える。
+  const compressed = isCompressedRollout(filePath);
+  const input = compressed
+    ? createCompressedRolloutReadStream(filePath, signal)
+    : fs.createReadStream(filePath, {
+      encoding: "utf8",
+      ...(Number.isFinite(byteLimit) ? { end: byteLimit - 1 } : {}),
+      signal,
+    });
   const lines = createInterface({ input, crlfDelay: Infinity });
   let lastYield = Date.now();
+  let readBytes = 0;
   try {
     for await (const line of lines) {
       signal?.throwIfAborted();
+      if (compressed && Number.isFinite(byteLimit)) {
+        // 平文の `end` と同じく、上限をまたぐ行までは読む（その先は読まない）。
+        if (readBytes >= byteLimit) break;
+        readBytes += Buffer.byteLength(line, "utf8") + 1;
+      }
       // まとめて届いた行の JSON 解析でも engine の制御ループへ定期的に実行権を戻す。
       if (Date.now() - lastYield >= 8) {
         await yieldToEngine();

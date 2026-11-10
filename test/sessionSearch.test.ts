@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as zlib from "node:zlib";
 import { describe, expect, test, vi } from "vitest";
 import type { ClaudeSessionInfo } from "../src/protocol.js";
 import { CodexSessionStore } from "../src/codex/codexSessionStore.js";
@@ -27,6 +28,26 @@ function searchSource(infos: ClaudeSessionInfo[]) {
 }
 
 describe("ホストの会話全文検索", () => {
+  test("Codex が圧縮した古い rollout（.jsonl.zst）の本文も解凍して検索し、読取上限は解凍後で数える", async () => {
+    const root = makeTempDir("search-zst");
+    const plain = path.join(root, "old.jsonl");
+    writeLines(plain, [
+      { type: "event_msg", payload: { type: "user_message", message: "前置き" } },
+      { type: "event_msg", payload: { type: "agent_message", message: "圧縮された会話のneedle本文" } },
+    ]);
+    const compressed = `${plain}.zst`;
+    fs.writeFileSync(compressed, zlib.zstdCompressSync(fs.readFileSync(plain)));
+    fs.rmSync(plain);
+    const source = {
+      list: () => [{ sessionId: "old", title: "Old", cwd: "/repo", agent: "codex", updatedAt: 1 }],
+      transcriptPath: () => compressed,
+    };
+    const found = await searchSessions([source], "needle");
+    expect(found.results.map((hit) => [hit.sessionId, hit.snippet.includes("needle")])).toEqual([["old", true]]);
+    // 1 行目だけ読む上限なら 2 行目の一致は拾わない。
+    expect((await searchSessions([source], "needle", { perFileBytes: 10 })).results).toEqual([]);
+  });
+
   test("先頭20件がClaudeでも、Codex指定は検索件数の打切りより前に適用する", async () => {
     const source = searchSource([
       ...Array.from({ length: 20 }, (_, index) => ({ sessionId: `claude-${index}`, title: "Claude", cwd: "/repo", agent: "claude", updatedAt: 100 - index })),

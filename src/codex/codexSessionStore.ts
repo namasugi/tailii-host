@@ -3,7 +3,8 @@
 //
 // claude の ClaudeSessionStore に対応する codex 版。`ClaudeSessionStore` が
 // `~/.claude/projects/**.jsonl` を列挙するのに対し、codex は 2 ソースを突合する:
-//   1. `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` の先頭 `session_meta` 行 → { id, cwd, timestamp, source }
+//   1. `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`（古い会話は Codex が圧縮した `rollout-*.jsonl.zst`）の
+//      先頭 `session_meta` 行 → { id, cwd, timestamp, source }
 //   2. `~/.codex/session_index.jsonl` の各行 → { id, thread_name(=タイトル), updated_at }
 // session UUID(id) をキーに結合し、`ClaudeSessionInfo`（agent:"codex"）へ落として updatedAt 降順で返す。
 //
@@ -22,6 +23,7 @@ import { isInsideBase } from "../shared/paths.js";
 import { noteReadFailure, readFailureCount } from "../shared/readFailures.js";
 import type { ListMemoFile } from "../sessions/listMemoFile.js";
 import { isVisibleCodexMessagePhase } from "./codexMessagePhase.js";
+import { isCompressedRollout, isRolloutFileName, readCompressedRollout, readRolloutHead } from "./rolloutFile.js";
 
 /** session_meta 先頭行を読む最大バイト数（先頭 1 行のみ使用。base_instructions を含み得るため広め）。 */
 const META_READ_LIMIT_BYTES = 512 * 1024;
@@ -33,8 +35,16 @@ const LAST_MESSAGE_MAX_LENGTH = 80;
 const TAIL_CHUNK_BYTES = 16 * 1024;
 /** 最終メッセージの後方スキャンの上限バイト数（token_count 等が延々続くファイルへの保険）。 */
 const TAIL_BYTES_CAP = 256 * 1024;
-/** 返す対話セッションの上限（mtime 新しい順）。 */
-const DEFAULT_MAX_SESSIONS = 200;
+/**
+ * 返す対話セッションの上限（mtime 新しい順）。既定は上限なし（Claude の会話一覧と同じ）。
+ * 以前は 200 件で切っていたため、取得元を Codex に絞ると古い会話が出なかった。
+ */
+const DEFAULT_MAX_SESSIONS = Number.POSITIVE_INFINITY;
+/**
+ * 圧縮 rollout の末尾を読むために解凍する上限（解凍後のバイト数）。超える巨大な会話は
+ * 最終メッセージのプレビューを出さない（題名・更新時刻は先頭とファイル情報から出る）。
+ */
+const COMPRESSED_TAIL_DECOMPRESS_LIMIT_BYTES = 32 * 1024 * 1024;
 
 /** 既定の codex ホーム（`~/.codex`）。 */
 export function defaultCodexHome(): string {
@@ -104,7 +114,7 @@ export class CodexSessionStore {
 
   /**
    * @param home codex ホーム（既定 `~/.codex`）。テストは一時 dir を注入する。
-   * @param maxSessions 返却上限（既定 200、mtime 新しい順）。
+   * @param maxSessions 返却上限（既定は上限なし、mtime 新しい順）。
    * @param options.memoFile 読み取りメモの保存先（engine だけが渡す）。
    */
   constructor(
@@ -119,7 +129,7 @@ export class CodexSessionStore {
     this.memoFile = options.memoFile ?? null;
   }
 
-  /** 本文検索では通常の一覧上限（200 件）より古い対話も列挙する。 */
+  /** 本文検索では一覧の上限（テストで指定したとき）より古い対話も列挙する。 */
   listForSearch(): ClaudeSessionInfo[] {
     return this.list(undefined, Number.POSITIVE_INFINITY);
   }
@@ -237,7 +247,7 @@ export class CodexSessionStore {
     return map;
   }
 
-  /** rollout ファイル（`rollout-*.jsonl`）を再帰列挙する（path + mtimeMs）。 */
+  /** rollout ファイル（`rollout-*.jsonl` / 圧縮された `rollout-*.jsonl.zst`）を再帰列挙する（path + mtimeMs）。 */
   private listRollouts(): RolloutFile[] {
     this.loadMemoFileOnce();
     const out: RolloutFile[] = [];
@@ -252,7 +262,7 @@ export class CodexSessionStore {
         const p = path.join(dir, entry.name);
         if (entry.isDirectory()) {
           walk(p);
-        } else if (entry.isFile() && entry.name.endsWith(".jsonl") && entry.name.startsWith("rollout-")) {
+        } else if (entry.isFile() && isRolloutFileName(entry.name)) {
           let mtimeMs = 0;
           let size = -1;
           try {
@@ -359,6 +369,28 @@ const USER_TURN_SCAN_CHUNK_BYTES = 64 * 1024;
  * とは別で、形式を問わず発話の有無だけを見る。上限まで見つからなければ false。読めなければ null。
  */
 function readHasUserTurn(rolloutPath: string): boolean | null {
+  if (isCompressedRollout(rolloutPath)) {
+    // 圧縮ファイルは、改行で終わった行の中に発話が見つかった所で解凍を止める。
+    let scanned = 0;
+    let found = false;
+    const scan = (head: Buffer, includeLastLine: boolean): boolean => {
+      while (!found && scanned < head.length) {
+        const nl = head.indexOf(0x0a, scanned);
+        if (nl < 0 && !includeLastLine) break;
+        const end = nl >= 0 ? nl : head.length;
+        found = isUserTurnLine(head.subarray(scanned, end));
+        scanned = end + 1;
+      }
+      return found;
+    };
+    try {
+      const head = readRolloutHead(rolloutPath, USER_TURN_SCAN_LIMIT_BYTES, (partial) => scan(partial, false));
+      return found || scan(head, true);
+    } catch (error) {
+      noteReadFailure(error);
+      return null;
+    }
+  }
   let fd: number;
   try {
     fd = fs.openSync(rolloutPath, "r");
@@ -422,18 +454,9 @@ function readSessionMeta(
   timestamp: string | null;
   isBackgroundSession: boolean;
 } | null {
-  let fd: number;
   try {
-    fd = fs.openSync(rolloutPath, "r");
-  } catch (error) {
-    noteReadFailure(error);
-    return null;
-  }
-  try {
-    const buf = Buffer.alloc(META_READ_LIMIT_BYTES);
-    const bytesRead = fs.readSync(fd, buf, 0, buf.length, 0);
-    if (bytesRead === 0) return null;
-    const slice = buf.subarray(0, bytesRead);
+    const slice = readRolloutHead(rolloutPath, META_READ_LIMIT_BYTES, (partial) => partial.includes(0x0a));
+    if (slice.length === 0) return null;
     const nl = slice.indexOf(0x0a);
     const firstLine = (nl >= 0 ? slice.subarray(0, nl) : slice).toString("utf8");
     const parsed = JSON.parse(firstLine) as unknown;
@@ -461,12 +484,6 @@ function readSessionMeta(
   } catch (error) {
     noteReadFailure(error);
     return null;
-  } finally {
-    try {
-      fs.closeSync(fd);
-    } catch {
-      // close 失敗は無視。
-    }
   }
 }
 
@@ -478,50 +495,44 @@ function readSessionMeta(
  * （`response_item/message/user` は注入込みなので使わない）。先頭 512KB のみ走査し、見つからなければ null。
  */
 function readFirstUserMessage(rolloutPath: string): string | null {
-  let fd: number;
   try {
-    fd = fs.openSync(rolloutPath, "r");
+    // 圧縮ファイルは、改行で終わった行の中に発話が見つかった所で解凍を止める。
+    const head = readRolloutHead(rolloutPath, META_READ_LIMIT_BYTES, (partial) => {
+      const lastNewline = partial.lastIndexOf(0x0a);
+      return lastNewline >= 0 && firstUserMessageIn(partial.subarray(0, lastNewline).toString("utf8")) !== null;
+    });
+    if (head.length === 0) return null;
+    return firstUserMessageIn(head.toString("utf8"));
   } catch (error) {
     noteReadFailure(error);
     return null;
   }
-  try {
-    const buf = Buffer.alloc(META_READ_LIMIT_BYTES);
-    const bytesRead = fs.readSync(fd, buf, 0, buf.length, 0);
-    if (bytesRead === 0) return null;
-    const text = buf.subarray(0, bytesRead).toString("utf8");
-    for (const line of text.split("\n")) {
-      // 早期スキップ（大半の行は user_message を含まない）。末尾行は途中で切れ得るが
-      // その場合 JSON.parse が失敗して安全にスキップされる。
-      if (!line || !line.includes("user_message")) continue;
-      let obj: unknown;
-      try {
-        obj = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      if (typeof obj !== "object" || obj === null) continue;
-      if ((obj as { type?: unknown }).type !== "event_msg") continue;
-      const payload = (obj as { payload?: unknown }).payload;
-      if (typeof payload !== "object" || payload === null) continue;
-      const pl = payload as Record<string, unknown>;
-      if (pl["type"] !== "user_message") continue;
-      const message = pl["message"];
-      if (typeof message === "string" && message.trim().length > 0) {
-        return normalizeTitle(message);
-      }
-    }
-    return null;
-  } catch (error) {
-    noteReadFailure(error);
-    return null;
-  } finally {
+}
+
+/** rollout 先頭の文字列から最初の素のユーザー発話を題名の形で返す（無ければ null）。 */
+function firstUserMessageIn(text: string): string | null {
+  for (const line of text.split("\n")) {
+    // 早期スキップ（大半の行は user_message を含まない）。末尾行は途中で切れ得るが
+    // その場合 JSON.parse が失敗して安全にスキップされる。
+    if (!line || !line.includes("user_message")) continue;
+    let obj: unknown;
     try {
-      fs.closeSync(fd);
+      obj = JSON.parse(line);
     } catch {
-      // close 失敗は無視。
+      continue;
+    }
+    if (typeof obj !== "object" || obj === null) continue;
+    if ((obj as { type?: unknown }).type !== "event_msg") continue;
+    const payload = (obj as { payload?: unknown }).payload;
+    if (typeof payload !== "object" || payload === null) continue;
+    const pl = payload as Record<string, unknown>;
+    if (pl["type"] !== "user_message") continue;
+    const message = pl["message"];
+    if (typeof message === "string" && message.trim().length > 0) {
+      return normalizeTitle(message);
     }
   }
+  return null;
 }
 
 /** タイトルを 1 行・先頭 ~60 字へ整形する。 */
@@ -545,6 +556,18 @@ function normalizeSnippet(raw: string, maxLength: number): string {
  * 上限まで遡って無ければ null。
  */
 function readLastRolloutMessage(rolloutPath: string): string | null {
+  if (isCompressedRollout(rolloutPath)) {
+    let content: Buffer | null;
+    try {
+      content = readCompressedRollout(rolloutPath, COMPRESSED_TAIL_DECOMPRESS_LIMIT_BYTES);
+    } catch (error) {
+      noteReadFailure(error);
+      return null;
+    }
+    if (content === null) return null;
+    const whole = content;
+    return lastRolloutMessageFromTail(whole.length, (span) => whole.subarray(whole.length - span));
+  }
   let fd: number;
   try {
     fd = fs.openSync(rolloutPath, "r");
@@ -554,33 +577,11 @@ function readLastRolloutMessage(rolloutPath: string): string | null {
   }
   try {
     const size = fs.fstatSync(fd).size;
-    const maxSpan = Math.min(size, TAIL_BYTES_CAP);
-    let span = 0;
-    while (span < maxSpan) {
-      span = Math.min(span + TAIL_CHUNK_BYTES, maxSpan);
+    return lastRolloutMessageFromTail(size, (span) => {
       const buf = Buffer.alloc(span);
       const bytesRead = fs.readSync(fd, buf, 0, span, size - span);
-      const lines = buf.subarray(0, bytesRead).toString("utf8").split("\n");
-      // 途中から読んだ場合、先頭要素は行の途中で切れている可能性があるため捨てる。
-      const first = span < size ? 1 : 0;
-      for (let i = lines.length - 1; i >= first; i--) {
-        const line = lines[i] ?? "";
-        // 早期スキップ（大半の行は対象 payload を含まない）。
-        if (!line.includes("message") && !line.includes("item_completed")) continue;
-        let obj: unknown;
-        try {
-          obj = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        const message = rolloutMessageText(obj);
-        if (message !== null && message.trim().length > 0) {
-          return normalizeSnippet(message, LAST_MESSAGE_MAX_LENGTH);
-        }
-      }
-      if (span >= size) return null;
-    }
-    return null;
+      return buf.subarray(0, bytesRead);
+    });
   } catch (error) {
     noteReadFailure(error);
     return null;
@@ -591,6 +592,35 @@ function readLastRolloutMessage(rolloutPath: string): string | null {
       // close 失敗は無視。
     }
   }
+}
+
+/** 末尾 `span` バイトを返す `readTail` で、最後の表示用メッセージを後方スキャンする。 */
+function lastRolloutMessageFromTail(size: number, readTail: (span: number) => Buffer): string | null {
+  const maxSpan = Math.min(size, TAIL_BYTES_CAP);
+  let span = 0;
+  while (span < maxSpan) {
+    span = Math.min(span + TAIL_CHUNK_BYTES, maxSpan);
+    const lines = readTail(span).toString("utf8").split("\n");
+    // 途中から読んだ場合、先頭要素は行の途中で切れている可能性があるため捨てる。
+    const first = span < size ? 1 : 0;
+    for (let i = lines.length - 1; i >= first; i--) {
+      const line = lines[i] ?? "";
+      // 早期スキップ（大半の行は対象 payload を含まない）。
+      if (!line.includes("message") && !line.includes("item_completed")) continue;
+      let obj: unknown;
+      try {
+        obj = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const message = rolloutMessageText(obj);
+      if (message !== null && message.trim().length > 0) {
+        return normalizeSnippet(message, LAST_MESSAGE_MAX_LENGTH);
+      }
+    }
+    if (span >= size) return null;
+  }
+  return null;
 }
 
 /** 新旧 rollout の表示用本文だけを取り出す。思考・ツール・注入された指示は採用しない。 */

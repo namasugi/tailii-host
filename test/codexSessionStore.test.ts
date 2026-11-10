@@ -2,6 +2,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as zlib from "node:zlib";
 import { describe, expect, test } from "vitest";
 import { CodexSessionStore } from "../src/codex/codexSessionStore.js";
 import { makeTempDir } from "./helpers.js";
@@ -448,5 +449,118 @@ describe("CodexSessionStore.list", () => {
 
     const list = new CodexSessionStore(home, 1).list();
     expect(list.map((session) => session.sessionId)).toEqual(["parent-id"]);
+  });
+
+  test("既定では件数で切らず、古い対話セッションも全部返す", () => {
+    const home = makeTempDir("codex-store-no-cap");
+    for (let i = 0; i < 205; i++) {
+      writeRollout(
+        home, "2026/07/10", `rollout-${String(i).padStart(3, "0")}.jsonl`, `id-${i}`, "/work/project",
+        new Date(Date.UTC(2026, 6, 10, 0, 0, i)), `発話${i}`, "vscode",
+      );
+    }
+    const list = new CodexSessionStore(home).list();
+    expect(list).toHaveLength(205);
+    expect(list.at(-1)?.sessionId).toBe("id-0");
+  });
+});
+
+/** 平文で書いた rollout を Codex と同じく `.jsonl.zst` に圧縮して元を消す（更新時刻は保つ）。 */
+function compressRollout(plainPath: string): string {
+  const stat = fs.statSync(plainPath);
+  const compressedPath = `${plainPath}.zst`;
+  fs.writeFileSync(compressedPath, zlib.zstdCompressSync(fs.readFileSync(plainPath)));
+  fs.utimesSync(compressedPath, stat.atime, stat.mtime);
+  fs.rmSync(plainPath);
+  return compressedPath;
+}
+
+describe("CodexSessionStore.list（圧縮された rollout）", () => {
+  test("Codex が圧縮した古い会話（.jsonl.zst）も題名・更新時刻・最終メッセージ付きで一覧に出す", () => {
+    const home = makeTempDir("codex-store-zst");
+    const mtime = new Date("2026-06-12T00:00:00Z");
+    const plain = writeRollout(
+      home, "2026/06/12", "rollout-old.jsonl", "old-id", "/work/project", mtime, "古い会話の最初の発話", "vscode",
+    );
+    fs.appendFileSync(plain, JSON.stringify({
+      type: "event_msg", payload: { type: "agent_message", message: "古い会話の最後の返事" },
+    }) + "\n");
+    fs.utimesSync(plain, mtime, mtime);
+    const compressed = compressRollout(plain);
+    writeRollout(
+      home, "2026/11/10", "rollout-new.jsonl", "new-id", "/work/project",
+      new Date("2026-11-10T00:00:00Z"), "新しい会話", "vscode",
+    );
+
+    const store = new CodexSessionStore(home);
+    const list = store.list();
+    expect(list.map((session) => session.sessionId)).toEqual(["new-id", "old-id"]);
+    expect(list[1]).toMatchObject({
+      title: "古い会話の最初の発話",
+      lastMessage: "古い会話の最後の返事",
+      updatedAt: Math.floor(mtime.getTime() / 1000),
+      agent: "codex",
+    });
+    expect(store.transcriptPath("old-id")).toBe(compressed);
+  });
+
+  test("圧縮された exec・発話の無い会話は平文と同じく除外する", () => {
+    const home = makeTempDir("codex-store-zst-hidden");
+    compressRollout(writeRollout(home, "2026/06/12", "rollout-exec.jsonl", "exec-id", "/w", undefined, "自動", "exec"));
+    const silent = path.join(home, "sessions", "2026/06/12", "rollout-silent.jsonl");
+    fs.writeFileSync(silent, JSON.stringify({
+      type: "session_meta", payload: { id: "silent-id", cwd: "/w", source: "vscode" },
+    }) + "\n");
+    compressRollout(silent);
+    expect(new CodexSessionStore(home).list()).toEqual([]);
+  });
+
+  test("圧縮データの先頭で収まらない巨大な先頭行も読み、解凍上限を超える会話もプレビュー無しで出す", () => {
+    const home = makeTempDir("codex-store-zst-large");
+    const dir = path.join(home, "sessions", "2026/06/12");
+    fs.mkdirSync(dir, { recursive: true });
+    const plain = path.join(dir, "rollout-large.jsonl");
+    // 圧縮が効きにくい先頭行（base_instructions 相当）で、先頭読みの初回（64KB）を越えさせる。
+    const noise = Array.from({ length: 30000 }, (_, i) => ((i * 2654435761) >>> 0).toString(36)).join("");
+    fs.writeFileSync(plain, [
+      JSON.stringify({ type: "session_meta", payload: { id: "large-id", cwd: "/w", source: "cli", base_instructions: noise } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "大きい会話" } }),
+      "",
+    ].join("\n"));
+    compressRollout(plain);
+    const list = new CodexSessionStore(home).list();
+    expect(list.map((session) => [session.sessionId, session.title])).toEqual([["large-id", "大きい会話"]]);
+  });
+
+  test("先頭の直後に同じ文字が数 MB 続く（圧縮が極端に効く）会話も平文と同じく出す", () => {
+    const home = makeTempDir("codex-store-zst-rle");
+    const dir = path.join(home, "sessions", "2026/06/12");
+    fs.mkdirSync(dir, { recursive: true });
+    const plain = path.join(dir, "rollout-rle.jsonl");
+    fs.writeFileSync(plain, [
+      JSON.stringify({ type: "session_meta", payload: { id: "rle-id", cwd: "/w", source: "vscode" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "最初の発話" } }),
+      JSON.stringify({ type: "response_item", payload: { type: "function_call_output", output: "=".repeat(8 * 1024 * 1024) } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "agent_message", message: "最後の返事" } }),
+      "",
+    ].join("\n"));
+    const expected = new CodexSessionStore(home).list().map((s) => [s.sessionId, s.title, s.lastMessage]);
+    expect(expected).toEqual([["rle-id", "最初の発話", "最後の返事"]]);
+    compressRollout(plain);
+    expect(new CodexSessionStore(home).list().map((s) => [s.sessionId, s.title, s.lastMessage])).toEqual(expected);
+  });
+
+  test("再開で平文に戻りかけて両方ある会話は 1 行だけ出し、新しい方を読む", () => {
+    const home = makeTempDir("codex-store-zst-dup");
+    compressRollout(writeRollout(
+      home, "2026/06/12", "rollout-a.jsonl", "same-id", "/w", new Date("2026-06-12T00:00:00Z"), "圧縮側", "vscode",
+    ));
+    writeRollout(
+      home, "2026/06/12", "rollout-a.jsonl", "same-id", "/w", new Date("2026-11-11T00:00:00Z"), "平文側", "vscode",
+    );
+    const store = new CodexSessionStore(home);
+    const list = store.list();
+    expect(list.map((session) => session.title)).toEqual(["平文側"]);
+    expect(store.transcriptPath("same-id")?.endsWith(".jsonl")).toBe(true);
   });
 });
