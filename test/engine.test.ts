@@ -8,6 +8,7 @@ import {
   CodexAppServerManager,
   type CodexAppServerThreadOptions,
 } from "../src/codex/codexAppServer.js";
+import { claudeProjectSlug } from "../src/shared/paths.js";
 import { ImageService } from "../src/chat/imageService.js";
 import { CONCURRENT_MESSAGE_TYPES } from "../src/engine/engine.js";
 import { ENGINE_HANDLERS } from "../src/engine/handlers/index.js";
@@ -239,7 +240,7 @@ describe("EngineControl — 横断制御チャネル", () => {
   test("Hub の retire 後、前面会話はその場では張り直さず（heartbeat 蘇生 → tick ごとの retire ループを避ける）、次の処理中通知で 1 回だけ境界付きで張り直す", async () => {
     const projectsRoot = makeTempDir("retire-active-projects");
     const cwd = makeTempDir("retire-active-cwd");
-    const dir = path.join(projectsRoot, fs.realpathSync.native(cwd).replaceAll("/", "-"));
+    const dir = path.join(projectsRoot, claudeProjectSlug(cwd));
     fs.mkdirSync(dir, { recursive: true });
     const transcript = path.join(dir, "id-work.jsonl");
     fs.writeFileSync(transcript, [
@@ -1473,7 +1474,7 @@ describe("EngineControl — 横断制御チャネル", () => {
     // 上書き・消灯してしまう（再オープン時にモーダルが一瞬出て消えるバグの再発防止）。
     const projectsRoot = makeTempDir("tailii-question-projects");
     const cwd = makeTempDir("tailii-question-cwd");
-    const slug = fs.realpathSync.native(cwd).replaceAll("/", "-");
+    const slug = claudeProjectSlug(cwd);
     const projectDir = path.join(projectsRoot, slug);
     fs.mkdirSync(projectDir, { recursive: true });
     const transcriptPath = path.join(projectDir, "qsess.jsonl");
@@ -1760,7 +1761,7 @@ describe("EngineControl — 横断制御チャネル", () => {
     // 履歴を再生せず、tmux 名の変化でクライアントキャッシュも外れて空表示になる（根治の回帰テスト）。
     const projectsRoot = makeTempDir("tailii-kill-reopen-projects");
     const cwd = makeTempDir("tailii-kill-reopen-cwd");
-    const slug = fs.realpathSync.native(cwd).replaceAll("/", "-");
+    const slug = claudeProjectSlug(cwd);
     const projectDir = path.join(projectsRoot, slug);
     fs.mkdirSync(projectDir, { recursive: true });
     fs.writeFileSync(
