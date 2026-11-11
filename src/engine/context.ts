@@ -384,7 +384,9 @@ export function sessionInfoFromMeta(
     name,
     cwd: meta?.cwd ?? fallbackCwd,
     alive: true,
-    ...(meta !== null ? { backend: meta.backend ?? "tmux" } : {}),
+    // 端末なしの会話（API 作業）は backend を名乗らず、実行経路だけを示す。
+    ...(meta?.executionRoute === "api" ? { executionRoute: "api" as const }
+      : meta !== null ? { backend: meta.backend ?? "tmux" } : {}),
     ...(meta?.claudeSessionId !== undefined ? { claudeSessionId: meta.claudeSessionId } : {}),
     ...(agent !== undefined ? { agent } : {}),
     ...(providerSessionId !== undefined ? { providerSessionId } : {}),

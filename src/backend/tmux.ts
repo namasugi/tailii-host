@@ -2278,13 +2278,14 @@ export class TmuxSessionManager {
     const alive = await this.liveSessionNames();
     const allMetas = this.store.all();
     // herdr backend のメタは HerdrSessionManager が列挙する（Composite で和を取る）。
-    const metas = allMetas.filter((meta) => meta.backend !== "herdr");
+    // 端末なしの会話（API 作業, executionRoute: "api"）は ApiAgentSessionBackend が列挙する。
+    const metas = allMetas.filter((meta) => meta.backend !== "herdr" && meta.executionRoute !== "api");
     // herdr 担当の名前は tmux の生存集合からも外す。backend 切替前の同名 tmux セッションが
     // 生き残っている間（reaper の idle 回収まで）、ここが backend:"tmux" を確定申告すると
     // Composite の tmux 優先マージで正しい herdr 行（メタ = ルーティング権威）が消え、
     // iOS の観測が tmux に固定される（cwd/会話 id も欠けて稼働中ピルの join からも落ちる）。
     const herdrNames = new Set(
-      allMetas.filter((meta) => meta.backend === "herdr").map((meta) => meta.name),
+      allMetas.filter((meta) => meta.backend === "herdr" || meta.executionRoute === "api").map((meta) => meta.name),
     );
 
     const cwdByName = new Map<string, string>();

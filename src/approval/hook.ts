@@ -1015,7 +1015,7 @@ function imagePaths(toolInput: Record<string, unknown>): string[] {
 // MARK: - summary / diff 生成（6.2/6.3）
 
 /** tool_input から1行の summary を生成する。 */
-function buildSummary(toolName: string, toolInput: Record<string, unknown>): string {
+export function buildSummary(toolName: string, toolInput: Record<string, unknown>): string {
   switch (toolName) {
     case "Bash": {
       const command = toolInput["command"];
@@ -1052,7 +1052,7 @@ function oneLine(s: string): string {
 }
 
 /** tool_input から構造化 diff を生成する（Write=create+全文 / Edit=edit+old/new / 他は undefined）。 */
-function buildDiff(toolName: string, toolInput: Record<string, unknown>): ToolDiff | undefined {
+export function buildDiff(toolName: string, toolInput: Record<string, unknown>): ToolDiff | undefined {
   const filePath = toolInput["file_path"];
   if (typeof filePath !== "string" || filePath.length === 0) return undefined;
   switch (toolName) {

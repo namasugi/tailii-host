@@ -60,13 +60,21 @@ interface ClaudeHolderProcess {
   procStart: string | null;
 }
 
-/** 成功（対象が既に無い場合を含む）は null、拒否・失敗は利用者向けの理由。想定外の例外は throw する。 */
-export async function deleteConversation(deps: ConversationDeleteDeps): Promise<string | null> {
-  const { sessionId, agent } = deps;
-  if (!isConversationId(sessionId)) return CONVERSATION_DELETE_MESSAGES.invalidId;
-  if (agent === "claude" && deps.deleteClaude === null) return CONVERSATION_DELETE_MESSAGES.claudeUnavailable;
-  if (agent === "codex" && deps.deleteCodex === null) return CONVERSATION_DELETE_MESSAGES.codexUnavailable;
+/** 会話を掴んでいる実行を止めた結果（conversation-delete と API 作業への引き継ぎが共有する）。 */
+export type ConversationStopOutcome =
+  | { ok: true }
+  | { ok: false; reason: "external"; names: string[] }
+  | { ok: false; reason: "kill_failed" }
+  | { ok: false; reason: "exit_timeout" };
 
+/**
+ * 会話を収容中の Tailii セッションを終了し、会話を掴んでいた claude が pid で死んだのを確かめる（上の ①〜③）。
+ * Tailii 外の claude が掴んでいれば何も終了せずに断る。
+ */
+export async function stopConversationHolders(
+  deps: Omit<ConversationDeleteDeps, "deleteClaude" | "deleteCodex">,
+): Promise<ConversationStopOutcome> {
+  const { sessionId, agent } = deps;
   const holders = (await deps.listSessions()).filter((info) => holdsConversation(info, sessionId, agent));
 
   let tailiiProcesses: ClaudeHolderProcess[] = [];
@@ -79,20 +87,20 @@ export async function deleteConversation(deps: ConversationDeleteDeps): Promise<
       else external.push(proc);
     }
     if (external.length > 0) {
-      deps.log(`conversation_delete 拒否: Tailii 外の claude pid=${external.map((p) => p.pid).join(",")}`);
-      return externalHolderMessage(external.map((p) => p.name));
+      deps.log(`conversation stop 拒否: Tailii 外の claude pid=${external.map((p) => p.pid).join(",")}`);
+      return { ok: false, reason: "external", names: external.map((p) => p.name) };
     }
   }
 
   for (const holder of holders) {
-    deps.log(`conversation_delete kill session=${holder.name}`);
+    deps.log(`conversation stop kill session=${holder.name}`);
     try {
       await deps.killSession(holder.name);
     } catch (error) {
       // list と kill の間に消えた（reaper・同時の終了操作・自然終了）なら目的は達している。
-      deps.log(`conversation_delete kill 失敗 session=${holder.name}: ${String(error)}`);
+      deps.log(`conversation stop kill 失敗 session=${holder.name}: ${String(error)}`);
       const stillAlive = (await deps.listSessions()).some((info) => info.name === holder.name && info.alive);
-      if (stillAlive) return CONVERSATION_DELETE_MESSAGES.killFailed;
+      if (stillAlive) return { ok: false, reason: "kill_failed" };
     }
   }
 
@@ -107,11 +115,26 @@ export async function deleteConversation(deps: ConversationDeleteDeps): Promise<
       tailiiProcesses = remaining;
       if (tailiiProcesses.length === 0) break;
       if (Date.now() >= deadline) {
-        deps.log(`conversation_delete 終了待ち超過 pid=${tailiiProcesses.map((p) => p.pid).join(",")}`);
-        return CONVERSATION_DELETE_MESSAGES.exitTimeout;
+        deps.log(`conversation stop 終了待ち超過 pid=${tailiiProcesses.map((p) => p.pid).join(",")}`);
+        return { ok: false, reason: "exit_timeout" };
       }
       await new Promise((resolve) => setTimeout(resolve, deps.exitPollMs ?? 200));
     }
+  }
+  return { ok: true };
+}
+
+/** 成功（対象が既に無い場合を含む）は null、拒否・失敗は利用者向けの理由。想定外の例外は throw する。 */
+export async function deleteConversation(deps: ConversationDeleteDeps): Promise<string | null> {
+  const { sessionId, agent } = deps;
+  if (!isConversationId(sessionId)) return CONVERSATION_DELETE_MESSAGES.invalidId;
+  if (agent === "claude" && deps.deleteClaude === null) return CONVERSATION_DELETE_MESSAGES.claudeUnavailable;
+  if (agent === "codex" && deps.deleteCodex === null) return CONVERSATION_DELETE_MESSAGES.codexUnavailable;
+
+  const stopped = await stopConversationHolders(deps);
+  if (!stopped.ok) {
+    if (stopped.reason === "external") return externalHolderMessage(stopped.names);
+    return stopped.reason === "kill_failed" ? CONVERSATION_DELETE_MESSAGES.killFailed : CONVERSATION_DELETE_MESSAGES.exitTimeout;
   }
 
   if (agent === "claude") {
@@ -182,7 +205,7 @@ function pidAlive(pid: number): boolean {
 async function ownedByTailii(
   proc: ClaudeHolderProcess,
   holders: readonly SessionInfo[],
-  deps: ConversationDeleteDeps,
+  deps: Pick<ConversationDeleteDeps, "paneProcessIds">,
   paneCache: Map<string, readonly number[] | null>,
 ): Promise<boolean> {
   if (proc.tmux !== null && holders.some((holder) => proc.tmux!.startsWith(`${holder.name}:`))) {

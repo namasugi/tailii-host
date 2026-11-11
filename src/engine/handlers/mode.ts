@@ -2,6 +2,7 @@
 // pane TUI との相互作用: permission mode の読み取り/切替（BTab 巡回）と、
 // Codex TUI 番号付きダイアログへの選択返送（pane_choice_send）。
 
+import { interruptApiAgent } from "./apiAgent.js";
 import { parsePermissionMode } from "../../shared/permissionMode.js";
 import { parseUsageLimitWait, usageLimitAutoContinueCancelled } from "../../shared/usageLimitWait.js";
 import { sleep } from "../../shared/sleep.js";
@@ -119,6 +120,21 @@ export const modeHandlers: HandlerRegistry = {
         type: "pane_key_send_result", v, id: message.id,
         ok: false, error: `不正なキーです: ${message.key}`,
       });
+      return;
+    }
+    // 端末なしの会話（API 作業, api-agent）: 中断キー（Escape / C-c）はターンの中断へ写す。他のキーは非対応。
+    if (ctx.metadataStore?.get(message.session)?.executionRoute === "api") {
+      if (message.key !== "Escape" && message.key !== "C-c") {
+        writer.write({ type: "pane_key_send_result", v, id: message.id, ok: false, error: "この会話（API 作業）ではこのキーを使えません。" });
+        return;
+      }
+      try {
+        await interruptApiAgent(ctx, message.session);
+        writer.write({ type: "pane_key_send_result", v, id: message.id, ok: true, error: null });
+      } catch (error) {
+        engineDiag(`pane_key_send api-agent 中断失敗 id=${message.id}: ${String(error)}`);
+        writer.write({ type: "pane_key_send_result", v, id: message.id, ok: false, error: "中断できませんでした。" });
+      }
       return;
     }
     try {

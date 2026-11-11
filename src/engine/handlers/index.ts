@@ -5,6 +5,8 @@
 
 import type { HandlerRegistry } from "../context.js";
 import { createAccountUsageHandlers } from "./accountUsage.js";
+import { apiAgentHandlers } from "./apiAgent.js";
+import { apiAgentHandoffHandlers } from "./apiAgentHandoff.js";
 import { apiDelegateHandlers } from "./apiDelegate.js";
 import { claudeModelHandlers } from "./claudeModels.js";
 import { codexHandlers } from "./codex.js";
@@ -22,6 +24,8 @@ import { workspaceHandlers } from "./workspace.js";
 
 export const ENGINE_HANDLERS: HandlerRegistry = {
   ...apiDelegateHandlers,
+  ...apiAgentHandlers,
+  ...apiAgentHandoffHandlers,
   ...coreHandlers,
   ...sessionHandlers,
   ...conversationHandlers,

@@ -1,0 +1,26 @@
+{"agentType":"claude","apiAgent":{"budget":{"conversationUsd":5,"maxTurns":20,"turnUsd":0.5},"keySource":{"mode":"automatic","workspaceId":"wrkspc_01ABC"},"model":"claude-sonnet-5-5","permissionMode":"default"},"cwd":"/Users/u/proj","executionRoute":"api","id":"req-api-1","name":"cs-api-1","type":"session_start","v":2}
+{"apiAgent":{"budget":{"conversationUsd":1,"maxTurns":10,"turnUsd":0.2},"keySource":{"mode":"file","path":"~/.tailii/api-keys/claude"},"model":"claude-haiku-5-5","permissionMode":"acceptEdits"},"cwd":"/Users/u/proj","executionRoute":"api","id":"req-api-2","name":"cs-api-2","resumeSessionId":"7b2c6a3f-ba60-45fd-89ae-cba51afaf7dc","type":"session_start","v":2}
+{"budget":{"conversationUsd":5,"maxTurns":20,"turnUsd":0.5},"model":"claude-sonnet-5-5","queued":0,"session":"cs-api-1","state":"running","type":"api_agent_status","usage":{"totalUsd":0,"turns":0,"unconfirmedTurns":0},"v":2}
+{"budget":{"conversationUsd":5,"maxTurns":20,"turnUsd":0.5},"model":"claude-sonnet-5-5","outcome":"interrupted","queued":0,"restoredTexts":["続きはテストも直して"],"session":"cs-api-1","state":"idle","type":"api_agent_status","usage":{"lastTurnUsd":0.0007,"totalUsd":0.0026,"turns":2,"unconfirmedTurns":1},"v":2}
+{"budget":{"conversationUsd":5,"maxTurns":20,"turnUsd":0.5},"error":"budget_exhausted","model":"claude-sonnet-5-5","outcome":"turn_budget_reached","queued":1,"session":"cs-api-1","state":"idle","type":"api_agent_status","usage":{"lastTurnUsd":0.6,"totalUsd":5.01,"turns":9,"unconfirmedTurns":0},"v":2}
+{"config":{"budget":{"conversationUsd":10,"maxTurns":30,"turnUsd":1},"keySource":{"environmentVariable":"ANTHROPIC_API_KEY","mode":"environment"},"model":"claude-sonnet-5-5","permissionMode":"plan"},"id":"cfg-1","session":"cs-api-1","type":"api_agent_configure","v":2}
+{"id":"cfg-1","ok":true,"session":"cs-api-1","type":"api_agent_configure_result","v":2}
+{"error":"invalid_config","id":"cfg-2","ok":false,"session":"cs-api-1","type":"api_agent_configure_result","v":2}
+{"adoptedName":"cs-api-1","id":"req-api-1","sessions":[{"alive":true,"claudeSessionId":"7b2c6a3f-ba60-45fd-89ae-cba51afaf7dc","cwd":"/Users/u/proj","executionRoute":"api","name":"cs-api-1","providerSessionId":"7b2c6a3f-ba60-45fd-89ae-cba51afaf7dc"}],"type":"session_list_response","v":2}
+{"budget":{"conversationUsd":5,"maxTurns":20,"turnUsd":0.5},"error":"sdk_version_mismatch","model":"claude-sonnet-5-5","queued":0,"session":"cs-api-1","state":"idle","type":"api_agent_status","usage":{"totalUsd":0,"turns":0,"unconfirmedTurns":0},"v":2}
+{"claudeSessions":[{"cwd":"/Users/u/proj","executionRoute":"api","liveSessionName":"cs-api-1","sessionId":"7b2c6a3f-ba60-45fd-89ae-cba51afaf7dc","title":"API 作業","updatedAt":1794364152},{"cwd":"/Users/u/proj","executionRoute":"api","sessionId":"11111111-2222-4333-8444-555555555555","title":"停止中の API 作業","updatedAt":1794364000}],"id":"list-1","liveSessionsResolved":true,"type":"claude_session_list_response","v":2}
+{"budget":{"conversationUsd":1,"maxTurns":10,"turnUsd":0.2},"model":"claude-haiku-5-5","permissionMode":"acceptEdits","queued":2,"session":"cs-api-1","state":"stopping","type":"api_agent_status","usage":{"lastTurnUsd":0.1,"totalUsd":0.25,"turns":3,"unconfirmedTurns":0},"v":2}
+{"conversationId":"98cc4122-019a-4cf5-aa55-020565ae2eca","cwd":"/Users/u/proj","id":"est-1","model":"claude-sonnet-5-5","type":"api_agent_handoff_estimate_request","v":2}
+{"contextTokens":67809,"estimatedUsd":0.2095,"id":"est-1","ok":true,"suggestedPermissionMode":"acceptEdits","type":"api_agent_handoff_estimate_response","v":2}
+{"blocked":"terminal_busy","contextTokens":10009,"estimatedUsd":0.0033,"id":"est-2","ok":true,"suggestedPermissionMode":"default","type":"api_agent_handoff_estimate_response","v":2}
+{"config":{"budget":{"conversationUsd":10,"maxTurns":30,"turnUsd":1},"model":"claude-sonnet-5-5","permissionMode":"acceptEdits"},"conversationId":"98cc4122-019a-4cf5-aa55-020565ae2eca","cwd":"/Users/u/proj","id":"ho-1","name":"cs-98cc4122","type":"api_agent_handoff","v":2}
+{"id":"ho-1","ok":true,"session":"cs-98cc4122","type":"api_agent_handoff_result","v":2}
+{"error":"held_externally","id":"ho-2","message":"Tailii 以外（ターミナルや公式アプリ）でこの会話が実行中のため、API キーで続けられません（code0630）。そちらを終了してからやり直してください。","ok":false,"type":"api_agent_handoff_result","v":2}
+{"id":"ret-1","session":"cs-98cc4122","type":"api_agent_return","v":2}
+{"id":"ret-1","ok":true,"type":"api_agent_return_result","v":2}
+{"error":"turn_running","id":"ret-2","ok":false,"type":"api_agent_return_result","v":2}
+{"id":"prep-1","start":true,"type":"api_agent_prepare_request","v":2}
+{"id":"prep-1","phase":"downloading","startedAtMs":1794364152000,"state":"installing","type":"api_agent_prepare_response","v":2}
+{"id":"prep-2","start":false,"type":"api_agent_prepare_request","v":2}
+{"id":"prep-2","state":"ready","type":"api_agent_prepare_response","v":2,"version":"0.3.322"}
+{"error":"npm_missing","id":"prep-3","message":"API 作業の準備に必要な npm がホストに見つかりません。Node.js（npm を含む）を入れてから、もう一度お試しください。","state":"failed","type":"api_agent_prepare_response","v":2}

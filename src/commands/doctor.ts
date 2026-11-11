@@ -10,6 +10,7 @@
 // エージェント側の実行環境と同じ条件で探すことで「ターミナルでは見えるが
 // SSH 経由では見えない」タイプの偽陽性を避ける。
 
+import { agentSdkStatus, describeAgentSdkStatus, type AgentSdkStatus } from "../apiAgent/sdkStatus.js";
 import * as fs from "node:fs";
 import { execFile } from "node:child_process";
 import * as net from "node:net";
@@ -570,6 +571,9 @@ export async function collectDoctorChecks(envPath: string = defaultInjectedPath(
     ...(!shimOk ? { remediation: "tailii setup" } : {}),
   });
 
+  // API 作業（api-agent）の Agent SDK。任意機能なので必須にしない。導入は利用者の操作（tailii api-agent install）。
+  checks.push(agentSdkDoctorCheck(agentSdkStatus()));
+
   // QUIC は macOS 専用の任意機能。SSH / version 検査と並行し、launchctl は上限付き。
   checks.push(...await quicChecksPromise);
 
@@ -622,6 +626,22 @@ export function pushDoctorCheck(options: {
       ? "登録端末なし（アプリで通知を許可して接続すると登録されます）"
       : `端末 ${devices.length} 台（${routes}）・${lastText}` +
         (invalid > 0 ? `・capability 無効 ${invalid} 台（アプリが次の接続で取り直します）` : ""),
+  };
+}
+
+/** API 作業の Agent SDK の検査項目（任意）。 */
+export function agentSdkDoctorCheck(status: AgentSdkStatus): DoctorCheck {
+  const ok = status.compatibility === "ok" || status.compatibility === "unknown";
+  return {
+    id: "api-agent-sdk",
+    label: "Agent SDK(API 作業・任意)",
+    ok,
+    required: false,
+    detail: describeAgentSdkStatus(status),
+    // 未導入はアプリで API 作業を始めるときに自動で準備されるので、任意の項目として手動の入れ直しだけ案内する。
+    // claude が古いときも、まず claude に合う版へ入れ直す（直らなければ detail の claude update）。
+    ...(status.compatibility === "claude_missing" ? { remediation: "curl -fsSL https://claude.ai/install.sh | bash" }
+      : !ok ? { remediation: "tailii api-agent install" } : {}),
   };
 }
 

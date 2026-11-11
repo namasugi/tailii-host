@@ -838,7 +838,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
             // 状態の添え物（hub が backfill の前後に送るサブエージェントの最新状態・codex のモデル / モードの印）は
             // 履歴の読み直しではない。数えると history-done の後に届いたとき「読み直し途中」の印が外れず、
             // 再接続のたびに全履歴を取り直す（reconnect-full-replay の再発）。
-            const isStateSnapshot = payload.type === "subagent_node"
+            const isStateSnapshot = payload.type === "subagent_node" || payload.type === "api_agent_status"
               || markerStreamId === CODEX_MODEL_STREAM_ID || markerStreamId === CODEX_COLLABORATION_MODE_STREAM_ID;
             if (!isStateSnapshot) historyBackfillSessions.add(message.session);
             if (markerStreamId === HISTORY_DONE_STREAM_ID || markerStreamId === HISTORY_CANCELLED_STREAM_ID) {
@@ -925,7 +925,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
       if (message.type === "hub_state_response" || message.type === "question_answer_result" ||
         message.type === "input_claim_result" || message.type === "runtime_claim_result" ||
         message.type === "codex_turn_result" || message.type === "chat_send_result" ||
-        message.type === "codex_goal_result" ||
+        message.type === "codex_goal_result" || message.type === "api_agent_result" ||
         message.type === "pending_message_delete_result" ||
         message.type === "chat_receipt_query_result" ||
         message.type === "chat_send_now_result" ||

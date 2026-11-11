@@ -18,7 +18,10 @@ import type { SessionInfo, TerminalBackendKind } from "../protocol.js";
 /** 会話 1 行へ載せる生存セッション情報（live-pill）。 */
 export interface LiveSessionAnnotation {
   liveSessionName: string;
-  liveSessionBackend: TerminalBackendKind;
+  /** 端末バックエンド。端末なしの会話（API 作業）では載せない。 */
+  liveSessionBackend?: TerminalBackendKind;
+  /** 端末なしの会話（API 作業, api-agent）。 */
+  executionRoute?: "api";
 }
 
 /**
@@ -66,11 +69,14 @@ export function buildLiveSessionIndex(
       if (lhsCreated !== rhsCreated) return rhsCreated - lhsCreated;
       return lhs.name < rhs.name ? -1 : lhs.name > rhs.name ? 1 : 0;
     })[0]!;
-    index.set(key, {
-      liveSessionName: chosen.name,
-      // backend 未指定は後方互換で tmux 相当（session-backend の既存規約に合わせる）。
-      liveSessionBackend: chosen.backend ?? "tmux",
-    });
+    index.set(key, chosen.executionRoute === "api"
+      // 端末なしの会話（API 作業）は backend を名乗らない（終了・バッジを端末の扱いにしない）。
+      ? { liveSessionName: chosen.name, executionRoute: "api" }
+      : {
+        liveSessionName: chosen.name,
+        // backend 未指定は後方互換で tmux 相当（session-backend の既存規約に合わせる）。
+        liveSessionBackend: chosen.backend ?? "tmux",
+      });
   }
   return index;
 }

@@ -10,6 +10,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { HerdrSessionManager } from "./herdr.js";
+import { ApiAgentSessionBackend, isApiAgentMeta } from "./apiAgentBackend.js";
 import type { SessionInfo, TerminalBackendKind } from "../protocol.js";
 import { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
 import {
@@ -131,34 +132,46 @@ export class CompositeSessionBackend implements SessionBackend {
   readonly store: SessionMetadataStore;
   private readonly tmux: SessionBackend;
   private readonly herdr: SessionBackend;
+  /** 端末なしの会話（API 作業, api-agent）。メタの executionRoute 欄が "api" の会話をここへ送る。 */
+  private readonly api: SessionBackend | null;
 
   constructor(options: {
     tmux: SessionBackend;
     herdr: SessionBackend;
     store: SessionMetadataStore;
+    api?: SessionBackend;
   }) {
     this.tmux = options.tmux;
     this.herdr = options.herdr;
     this.store = options.store;
+    this.api = options.api ?? null;
   }
 
   private backendFor(name: string): SessionBackend {
-    return this.store.get(name)?.backend === "herdr" ? this.herdr : this.tmux;
+    const meta = this.store.get(name);
+    if (this.api !== null && isApiAgentMeta(meta)) return this.api;
+    return meta?.backend === "herdr" ? this.herdr : this.tmux;
+  }
+
+  private async apiInfos(): Promise<SessionInfo[]> {
+    if (this.api === null) return [];
+    try { return await this.api.list(); } catch { return []; }
   }
 
   async list(): Promise<SessionInfo[]> {
-    const [tmuxInfos, herdrInfos] = await Promise.all([this.tmux.list(), this.herdr.list()]);
-    return mergeSessionInfos(tmuxInfos, herdrInfos);
+    const [tmuxInfos, herdrInfos, apiInfos] = await Promise.all([this.tmux.list(), this.herdr.list(), this.apiInfos()]);
+    return mergeSessionInfos(mergeSessionInfos(tmuxInfos, herdrInfos), apiInfos);
   }
 
   async listAvailable(): Promise<{ sessions: SessionInfo[]; unavailable: SessionBackendKind[] }> {
-    const [tmux, herdr] = await Promise.allSettled([this.tmux.list(), this.herdr.list()]);
+    const [tmux, herdr, api] = await Promise.allSettled([this.tmux.list(), this.herdr.list(), this.apiInfos()]);
     const unavailable: SessionBackendKind[] = [];
     if (tmux.status === "rejected") unavailable.push("tmux");
     if (herdr.status === "rejected") unavailable.push("herdr");
     return {
-      sessions: mergeSessionInfos(
+      sessions: mergeSessionInfos(mergeSessionInfos(
         tmux.status === "fulfilled" ? tmux.value : [], herdr.status === "fulfilled" ? herdr.value : []),
+        api.status === "fulfilled" ? api.value : []),
       unavailable,
     };
   }
@@ -219,11 +232,13 @@ export class CompositeSessionBackend implements SessionBackend {
  * herdr メタが 1 つも無ければ herdr 側 list は CLI を呼ばず空を返すため、
  * 純 tmux 環境（herdr 未導入含む）では従来と同じ挙動・コストになる。
  */
-export function makeSessionBackend(options: { store: SessionMetadataStore }): SessionBackend {
+export function makeSessionBackend(options: { store: SessionMetadataStore; api?: SessionBackend }): SessionBackend {
   return new CompositeSessionBackend({
     tmux: new TmuxSessionManager({ store: options.store }),
     herdr: new HerdrSessionManager({ store: options.store }),
     store: options.store,
+    // 端末なしの会話（API 作業）。指定が無ければ記録を読むだけの既定（送信は hub だけが持つ）。
+    api: options.api ?? new ApiAgentSessionBackend({ store: options.store }),
   });
 }
 
@@ -235,6 +250,8 @@ export function makeBackendForSession(
   session: string,
   store: SessionMetadataStore = new SessionMetadataStore(),
 ): SessionBackend {
-  if (store.get(session)?.backend === "herdr") return new HerdrSessionManager({ store });
+  const meta = store.get(session);
+  if (isApiAgentMeta(meta)) return new ApiAgentSessionBackend({ store });
+  if (meta?.backend === "herdr") return new HerdrSessionManager({ store });
   return new TmuxSessionManager({ store });
 }

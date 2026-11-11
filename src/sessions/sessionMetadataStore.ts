@@ -31,6 +31,11 @@ export interface SessionMeta {
    * 再リネームする。人為リネーム（それ以外のラベル）とを区別する権威。
    */
   autoTabTitle?: string;
+  /**
+   * 実行経路（api-agent）。`api` = 端末を作らず hub が Agent SDK で 1 ターンずつ動かす会話。
+   * 未記録は端末（tmux / herdr）。`backend` 欄は書かない（旧 host は tmux 扱いにして pane 不在と見る）。
+   */
+  executionRoute?: "api";
 }
 
 /** session 名が安全でないときに投げる型付きエラー。 */
@@ -78,6 +83,7 @@ export class SessionMetadataStore {
         ...(meta.claudeSessionId !== undefined ? { claudeSessionId: meta.claudeSessionId } : {}),
         createdAt: meta.createdAt,
         cwd: meta.cwd,
+        ...(meta.executionRoute !== undefined ? { executionRoute: meta.executionRoute } : {}),
         ...(meta.herdrPaneId !== undefined ? { herdrPaneId: meta.herdrPaneId } : {}),
         name: meta.name,
         ...(meta.providerSessionId !== undefined ? { providerSessionId: meta.providerSessionId } : {}),
@@ -171,10 +177,12 @@ function decodeMeta(raw: unknown): SessionMeta | null {
     typeof obj["autoTabTitle"] === "string" && obj["autoTabTitle"].length > 0
       ? obj["autoTabTitle"]
       : undefined;
+  const executionRoute = obj["executionRoute"] === "api" ? "api" as const : undefined;
   return {
     name: obj["name"],
     cwd: obj["cwd"],
     createdAt: obj["createdAt"],
+    ...(executionRoute !== undefined ? { executionRoute } : {}),
     ...(agent !== undefined ? { agent } : {}),
     ...(claudeSessionId !== undefined ? { claudeSessionId } : {}),
     ...(providerSessionId !== undefined ? { providerSessionId } : {}),

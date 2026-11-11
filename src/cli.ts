@@ -25,6 +25,7 @@ import { runDoctorCommand } from "./commands/doctor.js";
 import { runHubCommand } from "./hub/hubDaemon.js";
 import { runQuicInfoCommand } from "./services/quicGateway.js";
 import { runSelfUpdateCommand } from "./commands/selfUpdate.js";
+import { runApiAgentCommand } from "./commands/apiAgentCommand.js";
 import { migrateLegacyHome } from "./commands/legacyHomeMigration.js";
 import { readPackageVersion } from "./shared/version.js";
 
@@ -40,6 +41,7 @@ const PORTED: Record<string, (args: string[]) => Promise<number>> = {
   hub: runHubCommand,
   "quic-info": runQuicInfoCommand,
   "self-update": runSelfUpdateCommand,
+  "api-agent": runApiAgentCommand,
 };
 
 async function main(): Promise<number> {
@@ -53,7 +55,7 @@ async function main(): Promise<number> {
   }
   if (!subcommand || subcommand === "--help" || subcommand === "-h") {
     process.stderr.write(
-      "usage: tailii <engine|serve|hook|launch|kick|push-token|setup|doctor|hub|self-update> [options]\n",
+      "usage: tailii <engine|serve|hook|launch|kick|push-token|setup|doctor|hub|self-update|api-agent> [options]\n",
     );
     return 64;
   }

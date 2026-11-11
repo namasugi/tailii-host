@@ -30,6 +30,7 @@
 // heartbeat 未採番の生存セッション(過去の残骸)は「今を idle」として採番し、次周期から計時する。
 // 対象セッションが 0 になったら自然終了する(次の engine 接続 / hook 発火で ensure され再起動)。
 
+import { ApiAgentSessionStore } from "../apiAgent/sessionState.js";
 import {
   bumpHeartbeat,
   type Heartbeat,
@@ -121,7 +122,14 @@ export interface HerdrReaperOps {
   setDisplayTitle?(name: string, title: string | null): Promise<void>;
 }
 
+/** API 作業の会話が開いているか（hub の記録 `~/.tailii/api-agent/sessions/<名前>.json` の有無）。 */
+function defaultApiAgentSessionOpen(name: string): boolean {
+  return new ApiAgentSessionStore().get(name) !== null;
+}
+
 export interface ReaperTickOptions {
+  /** API 作業の会話が開いているか（テスト注入用。既定は hub の記録を読む）。 */
+  apiAgentSessionOpen?: (name: string) => boolean;
   runner: TmuxCommandRunner;
   heartbeatDir: string;
   metadataStore: SessionMetadataStore;
@@ -620,6 +628,11 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
       // 一時的な CLI 失敗を「消滅」と誤判定すると、実行中の会話が retire され（queue 破棄・
       // 「Session disappeared」通知）、アプリ上は会話が消えたように見える。
       if (herdrUnavailable && metadataStore.get(name)?.backend === "herdr") continue;
+      // 端末なしの会話（API 作業, api-agent）は pane を持たない。開いている間（hub の記録がある間）は
+      // pane が無いことを「消滅」と読まない（読むと retire され、実行中のターンが止まる）。閉じた後に
+      // 残った heartbeat は通常どおり回収する。
+      if (metadataStore.get(name)?.executionRoute === "api" &&
+        (options.apiAgentSessionOpen ?? defaultApiAgentSessionOpen)(name)) continue;
       // tmux の生存判定ができなかった tick では、herdr と分かっている会話以外（tmux・backend 不明）を回収しない。
       // socket ファイルだけが消えてサーバは動いている場合に、生きている会話を retire して送信待ちを捨てない。
       if (tmuxUnavailable && metadataStore.get(name)?.backend !== "herdr") continue;

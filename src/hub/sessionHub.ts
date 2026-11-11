@@ -6,7 +6,7 @@ import { reaperTick } from "./reaper.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { bumpHeartbeat, listHeartbeatSessions, readHeartbeat, writeHeartbeat } from "../sessions/heartbeat.js";
+import { bumpHeartbeat, listHeartbeatSessions, readHeartbeat, removeHeartbeat, writeHeartbeat } from "../sessions/heartbeat.js";
 import { claudeProjectSlug, ensureDirectory0700 } from "../shared/paths.js";
 import type { EngineRelayMessage } from "./engineRelaySocket.js";
 import { encodeControlMessage } from "../protocol.js";
@@ -48,6 +48,9 @@ import {
   type SendQueuedNowOutcome,
 } from "../backend/tmux.js";
 import { CodexAppServerManager } from "../codex/codexAppServer.js";
+import type { ApiAgentManagerOptions, ApiAgentStatusMessage } from "../apiAgent/manager.js";
+import { ApiAgentRejectedError } from "../apiAgent/config.js";
+import type { ApiAgentConfig } from "../protocol.js";
 import {
   CodexNativeTurnController,
   chatContentKey,
@@ -211,6 +214,8 @@ export type SessionHubOptions = Omit<ReaperTickOptions, "now"> & {
   killAllAgents?: (session: string) => Promise<boolean>;
   codexAppServerFactory?: () => CodexAppServerThreadRuntime;
   codexTurnControllerFactory?: (options: CodexNativeTurnControllerOptions) => CodexTurnControllerRuntime;
+  /** API 作業（api-agent）の制御を作る。省略時は API 作業を受け付けない（not_open）。 */
+  apiAgentFactory?: (callbacks: ApiAgentHubCallbacks) => ApiAgentHubRuntime;
   /** 未回答設問の永続化先。省略時は永続化しない（daemon は既定パスを明示する）。 */
   pendingQuestionsPath?: string;
   /** chat_send の durable queue / 配送済み receipt。daemon は既定パスを明示する。 */
@@ -220,6 +225,25 @@ export type SessionHubOptions = Omit<ReaperTickOptions, "now"> & {
 };
 
 type PendingQuestion = NonNullable<SessionActor["pendingQuestion"]>;
+
+/**
+ * API 作業（api-agent）の hub 側の面。実体は ApiAgentManager（テストは差し替える）。
+ * hub はこの会話の発話（chatInjector 経由の submit）・中断・設定・廃棄・設問の回答を橋渡しする。
+ */
+export interface ApiAgentHubRuntime {
+  restore(): string[];
+  open(session: string, request: { conversationId: string; cwd: string; config: ApiAgentConfig; resume: boolean }): void;
+  configure(session: string, config: ApiAgentConfig): void;
+  submit(session: string, text: string): Promise<"started" | "queued">;
+  interrupt(session: string): boolean;
+  dispose(session: string): void;
+  close(session: string): "closed" | "running" | "not_open";
+  answerQuestion(id: string, answers: QuestionAnswer[]): boolean;
+  has(session: string): boolean;
+  status(session: string): ApiAgentStatusMessage | null;
+  readonly hasTurnsInFlight: boolean;
+}
+export type ApiAgentHubCallbacks = Required<Pick<ApiAgentManagerOptions, "onProcessing" | "onStatus" | "onQuestion" | "onQuestionDismiss">>;
 
 interface SubscriberState { preview: boolean; backfilling: boolean }
 interface ReplayEvent { serverSeq: number; payload: ControlMessage }
@@ -296,7 +320,7 @@ interface SessionActor {
   pendingQuestion: {
     id: string;
     questions: QuestionPromptQuestion[];
-    answerRoute: "tui" | "codex_native";
+    answerRoute: "tui" | "codex_native" | "api_agent";
     /** 注入失敗の自己修復で復元済みか。復元は毎回だが prompt 再配信は1回まで（再提示ループ防止）。 */
     restoredAfterInjectionFailure?: boolean;
   } | null;
@@ -540,6 +564,7 @@ export class SessionHub {
   /** Codex の現在のターンの最後の回答（購読者の有無に関係なく持つ。ターンの開始で捨てる）。 */
   private readonly codexTurnAnswers = new Map<string, string>();
   private readonly pushDispatcher: PushDispatcher | null;
+  private apiAgentRuntime: ApiAgentHubRuntime | null = null;
 
   constructor(private readonly options: SessionHubOptions) {
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
@@ -556,6 +581,52 @@ export class SessionHub {
   get hasInjectionsInFlight(): boolean { return this.injectionsInFlight > 0; }
   get hasCodexTurnsInFlight(): boolean {
     return this.codexStartsInFlight > 0 || this.activeCodexTurns.size > 0;
+  }
+  /** この会話を購読している端末の数（API 作業の承認で push を送るかの判定）。 */
+  subscriberCount(session: string): number { return this.actors.get(session)?.subscribers.size ?? 0; }
+  /** API 作業のターンが動いているか（hub の自然終了を止める）。 */
+  get hasApiAgentTurnsInFlight(): boolean { return this.apiAgentRuntime?.hasTurnsInFlight === true; }
+
+  /** API 作業の制御（初回に作る）。factory が無ければ null。 */
+  private ensureApiAgent(): ApiAgentHubRuntime | null {
+    if (this.apiAgentRuntime !== null) return this.apiAgentRuntime;
+    const factory = this.options.apiAgentFactory;
+    if (factory === undefined) return null;
+    this.apiAgentRuntime = factory({
+      onProcessing: (session, state) => {
+        if (!this.applyProcessing(session, state)) return;
+        this.broadcast({ type: "session_processing", session, state });
+      },
+      onStatus: (session, status) => this.publishConversationEvent(session, this.actor(session), status),
+      onQuestion: ({ session, id, questions }) => {
+        const actor = this.actor(session);
+        this.setPendingQuestion(session, actor, { id, questions, answerRoute: "api_agent" });
+        this.broadcast({ type: "question_event", session, event: "prompt", id, questions });
+      },
+      onQuestionDismiss: (session, id) => {
+        const actor = this.actors.get(session);
+        if (actor?.pendingQuestion?.id !== id) return;
+        this.setPendingQuestion(session, actor, null);
+        this.broadcast({ type: "question_event", session, event: "dismiss", id });
+        void this.drainChatQueue(session, actor);
+      },
+    });
+    return this.apiAgentRuntime;
+  }
+
+  /** hub 起動時: 開いていた API 作業の会話を待機状態で戻す。 */
+  restoreApiAgents(): string[] {
+    return this.ensureApiAgent()?.restore() ?? [];
+  }
+
+  /**
+   * API 作業の会話への発話（hubDaemon の chatInjector から呼ぶ）。始められない（キー無し・予算到達・
+   * 使用中）ときは ApiAgentRejectedError（何も送っていない = 配送されていないことが確か）。
+   */
+  async apiAgentSubmit(session: string, text: string): Promise<"started" | "queued"> {
+    const runtime = this.ensureApiAgent();
+    if (runtime === null) throw new ApiAgentRejectedError("not_open");
+    return runtime.submit(session, text);
   }
 
   /**
@@ -620,6 +691,9 @@ export class SessionHub {
       // 失った死んだ turn。復元して bump すると「bump 停止=ターン死亡」の reaper シグナルが
       // 壊れて kill されなくなるため復元しない(reaper.ts 冒頭の設計原則)。
       if (this.options.metadataStore.get(session)?.agent === "codex") continue;
+      // API 作業（api-agent）のターンも作業プロセス（hub の子）と運命共同体。再起動を越えた active は
+      // 死んだターン（台帳は manager.restore が利用額未確認へ移す）なので処理中に戻さない。
+      if (this.options.metadataStore.get(session)?.executionRoute === "api") continue;
       // 鮮度切れの active はクラッシュ残骸。復元すると tick の bump で計時が止まるため捨てる
       // (稼働中の hub は毎 tick bump しているので、直前まで生きていた heartbeat は必ず新しい)。
       if (this.now() - heartbeat.ts >= this.options.timeoutSeconds) continue;
@@ -686,7 +760,7 @@ export class SessionHub {
     const restored = this.readPendingQuestions();
     let changed = false;
     for (const [session, pending] of Object.entries(restored)) {
-      if (pending.answerRoute === "codex_native") {
+      if (pending.answerRoute === "codex_native" || pending.answerRoute === "api_agent") {
         changed = true;
         this.broadcast({ type: "question_event", session, event: "dismiss", id: pending.id });
         continue;
@@ -939,6 +1013,12 @@ export class SessionHub {
     if (message.type === "conversation_subscribe") {
       // preview は後から加わった内部フラグ。省略する旧 engine は従来どおり前面購読として扱う。
       this.subscribe(client, message.session, message.afterSeq, message.newerThanMs, message.preview ?? true);
+      // API 作業の会話は現在の状態（予算・利用額・止めた理由）を添える。replay buffer に無くても
+      // （hub の再起動後・状態が変わっていない会話）、開いた端末が最新値を持てるように。
+      const apiStatus = this.ensureApiAgent()?.status(message.session) ?? null;
+      if (apiStatus !== null) {
+        this.sendTo(client, { type: "conversation_event", session: message.session, serverSeq: 0, payload: apiStatus });
+      }
       return;
     }
     if (message.type === "conversation_unsubscribe") {
@@ -1111,7 +1191,13 @@ export class SessionHub {
         const restoreSnapshot: PendingQuestion = actor.pendingQuestion;
         this.setPendingQuestion(message.session, actor, null);
         this.broadcast({ type: "question_event", session: message.session, event: "dismiss", id: message.questionId });
-        if (answerRoute === "codex_native") {
+        if (answerRoute === "api_agent") {
+          this.sendTo(client, { type: "question_answer_result", id: message.id, status: "accepted" });
+          if (this.apiAgentRuntime?.answerQuestion(message.questionId, message.answers) !== true) {
+            this.options.log?.(`api-agent 設問回答失敗: pending 不在 (${message.questionId})`);
+          }
+          void this.drainChatQueue(message.session, actor);
+        } else if (answerRoute === "codex_native") {
           this.sendTo(client, { type: "question_answer_result", id: message.id, status: "accepted" });
           try {
             if (this.codexTurnController?.answerQuestion?.(message.questionId, message.answers) !== true) {
@@ -1326,6 +1412,11 @@ export class SessionHub {
           this.maybeCloseIdleCodexSession(message.session);
         },
       );
+      return;
+    }
+    if (message.type === "api_agent_open" || message.type === "api_agent_configure" || message.type === "api_agent_interrupt" ||
+      message.type === "api_agent_close") {
+      this.handleApiAgentMessage(client, message);
       return;
     }
     if (message.type === "codex_turn_interrupt") {
@@ -1602,7 +1693,54 @@ export class SessionHub {
   }
 
   /** tmux セッションの確定 kill に追従し、同名で将来作られる会話へ状態を持ち越さない。 */
+  private handleApiAgentMessage(
+    client: object,
+    message: Extract<HubClientMessage, { type: "api_agent_open" | "api_agent_configure" | "api_agent_interrupt" | "api_agent_close" }>,
+  ): void {
+    const runtime = this.ensureApiAgent();
+    if (runtime === null) {
+      this.sendTo(client, { type: "api_agent_result", id: message.id, status: "failed", error: "not_open" });
+      return;
+    }
+    try {
+      if (message.type === "api_agent_open") {
+        runtime.open(message.session, {
+          conversationId: message.conversationId, cwd: message.cwd, config: message.config, resume: message.resume,
+        });
+        this.sendTo(client, { type: "api_agent_result", id: message.id, status: "ok" });
+      } else if (message.type === "api_agent_configure") {
+        runtime.configure(message.session, message.config);
+        this.sendTo(client, { type: "api_agent_result", id: message.id, status: "ok" });
+      } else if (message.type === "api_agent_close") {
+        const closed = runtime.close(message.session);
+        if (closed === "closed") {
+          // 閉じた会話の heartbeat も消す（retire と同じ。reaper は開いていない API 会話の残りを回収する）。
+          removeHeartbeat(this.options.heartbeatDir, message.session);
+          this.sendTo(client, { type: "api_agent_result", id: message.id, status: "ok" });
+        } else {
+          this.sendTo(client, { type: "api_agent_result", id: message.id, status: "failed",
+            error: closed === "running" ? "turn_running" : "not_open" });
+        }
+      } else {
+        const interrupted = runtime.interrupt(message.session);
+        this.sendTo(client, { type: "api_agent_result", id: message.id, status: "ok", interrupted });
+      }
+    } catch (error) {
+      this.sendTo(client, {
+        type: "api_agent_result", id: message.id, status: "failed",
+        error: error instanceof ApiAgentRejectedError ? error.code : "worker_failed",
+      });
+    }
+  }
+
   private retireSession(session: string, reason = "Session was retired"): void {
+    // API 作業の会話は actor が無くても作業プロセスを止めて記録を消す（下の early return より前）。
+    // heartbeat も消す: pane が無いので reaper は「消滅」として回収しない（reaper.ts）。残すと
+    // 終わった会話の heartbeat が溜まり続ける。
+    this.apiAgentRuntime?.dispose(session);
+    if (this.options.metadataStore.get(session)?.executionRoute === "api") {
+      removeHeartbeat(this.options.heartbeatDir, session);
+    }
     // live-pill Phase 2: 一覧 watcher へ死亡を push する（iOS は「一覧を取り直せ」の合図として使う）。
     // ここは tick の killed/demoted/reclaimed と engine 発 kill が集まる全死亡経路の合流点。
     // actor 不在（購読も処理もされないまま外部で死んだ会話）でも一覧の表示は古くなるため、
@@ -4079,7 +4217,8 @@ function isPersistedPendingQuestion(value: unknown): value is PendingQuestion {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
   if (typeof record["id"] !== "string" || !Array.isArray(record["questions"]) ||
-    (record["answerRoute"] !== "tui" && record["answerRoute"] !== "codex_native")) return false;
+    (record["answerRoute"] !== "tui" && record["answerRoute"] !== "codex_native" &&
+      record["answerRoute"] !== "api_agent")) return false;
   return record["questions"].every((question) => {
     if (typeof question !== "object" || question === null || Array.isArray(question)) return false;
     const item = question as Record<string, unknown>;

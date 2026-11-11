@@ -34,6 +34,7 @@
 //   - payload の JSON は Swift JSONEncoder `.prettyPrinted + .sortedKeys` と byte 一致で符号化する
 //     （2スペース字下げ・`" : "` 区切り・キー辞書順・`/`→`\/` エスケープ）。golden 契約を維持。
 
+import { runApiAgentSetupStep, shouldSkipApiAgentSetup } from "../apiAgent/setupStep.js";
 import { execFileSync } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
@@ -289,6 +290,8 @@ interface SetupArgs {
   host?: string;
   /** QUIC ゲートウェイの設置を飛ばす（稼働中のゲートウェイを載せ直さない）。 */
   skipQuic?: boolean;
+  /** Agent SDK（API 作業用）の準備を省く（`--no-api-agent`。環境変数 TAILII_SKIP_API_AGENT=1 でも同じ）。 */
+  skipApiAgent?: boolean;
 }
 
 function parseSetupArgs(argv: string[]): SetupArgs {
@@ -306,6 +309,9 @@ function parseSetupArgs(argv: string[]): SetupArgs {
         break;
       case "--no-quic":
         args.skipQuic = true;
+        break;
+      case "--no-api-agent":
+        args.skipApiAgent = true;
         break;
       case "--session":
         if (i + 1 < argv.length) args.sessionName = argv[++i];
@@ -384,6 +390,13 @@ export async function runSetupCommand(argv: string[]): Promise<number> {
   const quic = args.skipQuic
     ? (process.stdout.write("QUIC ゲートウェイ: --no-quic のため設置を飛ばします（SSH のみでペアリングします）。\n"), null)
     : await setupQuicGateway();
+
+  // --- 2.8) Agent SDK（API 作業用, 任意機能）: ペアリングの待受と並行して準備する（1 分程度かかり得る）。
+  // 失敗しても setup は失敗させない。結果は 1 行で知らせる。
+  const apiAgentStep = runApiAgentSetupStep({
+    skip: shouldSkipApiAgentSetup(args.skipApiAgent === true),
+    write: (line) => process.stdout.write(line + "\n"),
+  }).catch(() => undefined);
 
   // --- 3) ペアリング payload を構築 ---
   // 接続先は自動選定（Tailscale があれば優先・無ければ LAN）。--host で明示上書きも可。
@@ -473,7 +486,7 @@ export async function runSetupCommand(argv: string[]): Promise<number> {
 
   // --- 6) 直接入力（host:port + 6桁コード）の案内を出し、同じサーバで両モードを待受 ---
   // QR スキャン客は psk 付き hello、直接入力客は psk なし hello（SAS 照合）で到着する。
-  return runCodePairingServer(server, {
+  const pairingResult = await runCodePairingServer(server, {
     payloadJSON: ensureLegacyPayload,
     payloadJSONNoKey: noKeyPayloadJSON,
     psk,
@@ -488,6 +501,8 @@ export async function runSetupCommand(argv: string[]): Promise<number> {
     lanIP,
     port: boundPort,
   });
+  await apiAgentStep;
+  return pairingResult;
 }
 
 /**

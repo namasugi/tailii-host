@@ -150,6 +150,8 @@ export interface SessionInfo {
    * 異なるとき（アプリ/Mac どちらかでの命名済み）だけ載る。tmux は常に未指定。
    */
   displayTitle?: string;
+  /** 実行経路（api-agent）。`api` = 端末なしで API 作業として動いている。未指定は端末（従来）。 */
+  executionRoute?: "api";
 }
 
 /** マシン内会話 1 件（claude=jsonl / codex=rollout）。 */
@@ -183,6 +185,11 @@ export interface ClaudeSessionInfo {
   peerSessionName?: string;
   /** `peerSessionName` の CLI が Remote Control（公式アプリ / claude.ai）にも繋がっているか。 */
   peerBridged?: boolean;
+  /**
+   * API 作業の会話（api-agent）。生存セッションがあればその実行経路、無ければ最後の実行経路が API の会話に載る。
+   * iOS は開き直し（停止中の再開）を API 作業で行う。旧 host は省略（= 端末）。
+   */
+  executionRoute?: "api";
 }
 
 /** session_search_response の 1 検索結果。 */
@@ -565,6 +572,46 @@ export interface ApiUsageCredential {
   environmentVariable?: string;
   workspaceId?: string;
 }
+/**
+ * API 作業（Claude Agent SDK で 1 ターンずつ実行する Claude 会話, api-agent）。端末は作らず、
+ * Console の API キーで host が実行する。会話 id・履歴ファイルは通常の Claude 会話と同じ。
+ * 権限モードは承認カードで確かめられる 4 値だけ（bypassPermissions / auto は受け付けない）。
+ */
+export type ApiAgentPermissionMode = "default" | "acceptEdits" | "plan" | "dontAsk";
+export interface ApiAgentBudget {
+  /** 1 ターン（1 回の送信）の概算上限（USD）。SDK の maxBudgetUsd。超過は直後のモデル呼び出し 1 回分ありうる。 */
+  turnUsd: number;
+  /** この会話の累計の概算上限（USD）。到達後は上限を上げるまで新しいターンを始めない。 */
+  conversationUsd: number;
+  /** 1 ターン内のモデル往復の上限（SDK の maxTurns）。 */
+  maxTurns: number;
+}
+export interface ApiAgentConfig {
+  model: string;
+  permissionMode: ApiAgentPermissionMode;
+  budget: ApiAgentBudget;
+  /** API 実行用のキーの取得元（automatic / file / environment）。キー本体は送らない。 */
+  keySource?: ApiUsageCredential;
+}
+export type ApiAgentState = "idle" | "running" | "stopping";
+/** ターンの終わり方。 */
+export type ApiAgentTurnOutcome =
+  | "success" | "turn_budget_reached" | "max_turns_reached" | "interrupted" | "failed" | "result_unknown";
+/** 止めた理由（固定値。API のエラー本文・キーは返さない）。 */
+export type ApiAgentErrorCode =
+  | "no_api_key" | "unsupported_key_source" | "unexpected_auth" | "budget_exhausted"
+  | "conversation_in_use" | "sdk_unavailable" | "sdk_version_mismatch" | "worker_failed" | "not_open" | "invalid_config"
+  // 引き継ぎ / 元へ戻す（api-agent-handoff）
+  | "terminal_busy" | "held_externally" | "terminal_stop_failed" | "turn_running";
+export interface ApiAgentUsage {
+  /** 結果を受け取れたターンの概算額の合計（USD）。 */
+  totalUsd: number;
+  turns: number;
+  /** 結果を受け取れなかったターンの数（利用額未確認。合計には推測で足さない）。 */
+  unconfirmedTurns: number;
+  lastTurnUsd?: number;
+}
+
 export interface ApiUsageCredentials {
   openai?: ApiUsageCredential;
   claude?: ApiUsageCredential;
@@ -655,7 +702,39 @@ export type ControlMessage =
   | { type: "remote_pending_snapshot"; v: number; kind: RemotePendingKind; items: RemotePendingSnapshotItem[] }
   | { type: "session_list_request"; v: number; id: string; limit?: number; cursor?: string }
   | { type: "session_list_response"; v: number; id: string; sessions: SessionInfo[]; nextCursor?: string; adoptedName?: string; worktreePath?: string; worktreeRemoved?: boolean; worktreeDirty?: boolean; worktreeUncommittedCount?: number; worktreeUnmergedCommitCount?: number }
-  | { type: "session_start"; v: number; id: string; cwd: string; name: string; baseDir?: string; resumeSessionId?: string; title?: string; agentType?: "claude" | "codex"; model?: string; permissionMode?: "default" | "acceptEdits" | "plan" | "auto"; effort?: "low" | "medium" | "high" | "xhigh" | "max"; codexModel?: string; codexSandbox?: "read-only" | "workspace-write" | "danger-full-access"; deferSubscribe?: boolean; outputStyle?: string; worktree?: string; todoTools?: boolean }
+  | { type: "session_start"; v: number; id: string; cwd: string; name: string; baseDir?: string; resumeSessionId?: string; title?: string; agentType?: "claude" | "codex"; model?: string; permissionMode?: "default" | "acceptEdits" | "plan" | "auto"; effort?: "low" | "medium" | "high" | "xhigh" | "max"; codexModel?: string; codexSandbox?: "read-only" | "workspace-write" | "danger-full-access"; deferSubscribe?: boolean; outputStyle?: string; worktree?: string; todoTools?: boolean; executionRoute?: "api"; apiAgent?: ApiAgentConfig }
+  /**
+   * API 作業の状態（host→iOS, api-agent）。会話のストリームに載る（後から開いた端末にも最新値が届く）。
+   * `restoredTexts` は中断で送らなかった処理中の発話（入力欄へ戻す）。旧アプリは未知 type として捨てる。
+   */
+  | { type: "api_agent_status"; v: number; session: string; state: ApiAgentState; model: string; budget: ApiAgentBudget; usage: ApiAgentUsage; queued: number; outcome?: ApiAgentTurnOutcome; error?: ApiAgentErrorCode; restoredTexts?: string[]; permissionMode?: ApiAgentPermissionMode }
+  /** API 作業の設定変更（モデル・権限モード・予算・キーの取得元）。処理中は次のターンから効く。 */
+  | { type: "api_agent_configure"; v: number; id: string; session: string; config: ApiAgentConfig }
+  | { type: "api_agent_configure_result"; v: number; id: string; session: string; ok: boolean; error?: ApiAgentErrorCode }
+  /**
+   * 既存の会話を API 作業へ引き継ぐ前の見積もり（api-agent-handoff）。`contextTokens` は最後の応答の文脈の大きさ、
+   * `estimatedUsd` は初回の概算（履歴全体を入力として数える多めの見積もり。料金不明のモデルは省略）。
+   * `blocked` は今は引き継げない理由（処理中・Tailii 外で実行中）。
+   */
+  | { type: "api_agent_handoff_estimate_request"; v: number; id: string; conversationId: string; cwd: string; model: string }
+  | { type: "api_agent_handoff_estimate_response"; v: number; id: string; ok: boolean; contextTokens?: number; estimatedUsd?: number; suggestedPermissionMode?: ApiAgentPermissionMode; blocked?: ApiAgentErrorCode; error?: ApiAgentErrorCode }
+  /**
+   * 既存の会話を API 作業へ引き継ぐ（同じ会話 id を resume で続ける）。端末側を終えて（作業フォルダは消さない）、
+   * claude の終了を確かめてから API 作業を開く。成功時の `session` は API 作業の会話名（開き直しはこの名前で）。
+   * 失敗時は何も変えないか、端末で今までどおり開き直せる状態に留める。
+   */
+  | { type: "api_agent_handoff"; v: number; id: string; conversationId: string; cwd: string; name: string; config: ApiAgentConfig }
+  | { type: "api_agent_handoff_result"; v: number; id: string; ok: boolean; session?: string; error?: ApiAgentErrorCode; message?: string }
+  /**
+   * API 作業の準備（Agent SDK の導入、api-agent-sdk-prepare）。アプリが API 作業を始める前に送る。host は必要なら導入を
+   * 始めて今の状態をすぐ返し、アプリは `installing` の間これを聞き直す（導入は 1 分程度かかり得るので会話開始の応答に
+   * 入れない）。`start: false` は失敗の後に入れ直さない聞き直し。`error` は固定の理由、`message` は利用者向けの文言。
+   */
+  | { type: "api_agent_prepare_request"; v: number; id: string; start: boolean }
+  | { type: "api_agent_prepare_response"; v: number; id: string; state: "ready" | "installing" | "failed"; phase?: string; version?: string; startedAtMs?: number; error?: string; message?: string }
+  /** API 作業を閉じて、いつもの実行（端末）へ戻す。実行中のターンがあれば turn_running で断る。 */
+  | { type: "api_agent_return"; v: number; id: string; session: string }
+  | { type: "api_agent_return_result"; v: number; id: string; ok: boolean; error?: ApiAgentErrorCode }
   /**
    * 会話の開き直し（iOS→host）。`newerThanMs` はキャッシュ済みログが追いついていた時刻（epoch ms,
    * reattach-since）。指定時は全履歴を頭から再送せず、この時刻より後の行だけを送る（古い順）。

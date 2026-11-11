@@ -18,7 +18,10 @@ import {
   type ControlMessage,
   type QuestionAnswer,
   type QuestionPromptQuestion,
+  type ApiAgentConfig,
+  type ApiAgentErrorCode,
 } from "../protocol.js";
+import { API_AGENT_ERROR_MESSAGES, parseApiAgentConfig } from "../apiAgent/config.js";
 
 export type HubClientMessage =
   | { type: "hub_hello" }
@@ -73,6 +76,15 @@ export type HubClientMessage =
       collaborationMode?: CodexCollaborationMode | null;
     }
   | { type: "codex_turn_interrupt"; id: string; session: string }
+  /**
+   * API 作業（api-agent）。engine が会話の作成・設定変更・中断を hub へ頼む。ターンの所有者は hub の
+   * ApiAgentManager（発話は通常の chat_send → chatInjector から入る）。キーの値は載せない。
+   */
+  | { type: "api_agent_open"; id: string; session: string; conversationId: string; cwd: string; config: ApiAgentConfig; resume: boolean }
+  | { type: "api_agent_configure"; id: string; session: string; config: ApiAgentConfig }
+  | { type: "api_agent_interrupt"; id: string; session: string }
+  /** 元へ戻すために閉じる（実行中なら閉じない）。結果は api_agent_result（error: turn_running / not_open）。 */
+  | { type: "api_agent_close"; id: string; session: string }
   /** Codex thread の目標操作（engine→hub, codex-goal）。hub 所有の App Server 接続で `thread/goal/*` を実行する。 */
   | {
       type: "codex_goal_submit";
@@ -197,6 +209,8 @@ export type HubServerMessage =
   | { type: "question_answer_result"; id: string; status: "accepted" | "already_resolved" | "unknown" | "stale" }
   | { type: "input_claim_result"; id: string; status: "granted" | "duplicate" }
   | { type: "codex_turn_result"; id: string; status: "started" | "duplicate" | "failed"; error?: string }
+  /** api_agent_open / configure / interrupt の結果。interrupt の `interrupted=false` は処理中のターンが無かった。 */
+  | { type: "api_agent_result"; id: string; status: "ok" | "failed"; error?: ApiAgentErrorCode; interrupted?: boolean }
   | { type: "codex_goal_result"; id: string; status: "ok" | "failed"; goal?: CodexGoalInfo; cleared?: boolean; error?: string }
   | { type: "chat_send_result"; id: string; status: "accepted" | "duplicate" | "failed"; error?: string }
   | { type: "pending_message_delete_result"; id: string; status: "deleted" | "not_found" | "processing" | "failed"; error?: string }
@@ -372,6 +386,28 @@ export function decodeHubClientLine(line: string): HubClientMessage | null {
           ...(typeof objective === "string" ? { objective } : {}),
           ...(typeof status === "string" ? { status } : {}),
           ...(typeof tokenBudget === "number" ? { tokenBudget } : {}) }
+      : null;
+  }
+  if (record["type"] === "api_agent_open") {
+    const id = record["id"], session = record["session"], conversationId = record["conversationId"], cwd = record["cwd"];
+    const config = parseApiAgentConfig(record["config"]);
+    return typeof id === "string" && id.length > 0 && typeof session === "string" && session.length > 0 &&
+      typeof conversationId === "string" && conversationId.length > 0 && typeof cwd === "string" && cwd.length > 0 &&
+      typeof record["resume"] === "boolean" && config !== null
+      ? { type: "api_agent_open", id, session, conversationId, cwd, config, resume: record["resume"] }
+      : null;
+  }
+  if (record["type"] === "api_agent_configure") {
+    const id = record["id"], session = record["session"];
+    const config = parseApiAgentConfig(record["config"]);
+    return typeof id === "string" && id.length > 0 && typeof session === "string" && session.length > 0 && config !== null
+      ? { type: "api_agent_configure", id, session, config }
+      : null;
+  }
+  if (record["type"] === "api_agent_interrupt" || record["type"] === "api_agent_close") {
+    const id = record["id"], session = record["session"];
+    return typeof id === "string" && id.length > 0 && typeof session === "string" && session.length > 0
+      ? { type: record["type"], id, session }
       : null;
   }
   if (record["type"] === "codex_turn_interrupt") {
@@ -581,6 +617,15 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
     const id = record["id"], status = record["status"];
     return typeof id === "string" && (status === "granted" || status === "duplicate")
       ? { type: "input_claim_result", id, status } : null;
+  }
+  if (record["type"] === "api_agent_result") {
+    const id = record["id"], status = record["status"], error = record["error"], interrupted = record["interrupted"];
+    if (typeof id !== "string" || (status !== "ok" && status !== "failed") ||
+      (error !== undefined && (typeof error !== "string" || !Object.hasOwn(API_AGENT_ERROR_MESSAGES, error))) ||
+      (interrupted !== undefined && typeof interrupted !== "boolean")) return null;
+    return { type: "api_agent_result", id, status,
+      ...(typeof error === "string" ? { error: error as ApiAgentErrorCode } : {}),
+      ...(typeof interrupted === "boolean" ? { interrupted } : {}) };
   }
   if (record["type"] === "codex_turn_result") {
     const id = record["id"], status = record["status"], error = record["error"];

@@ -25,7 +25,10 @@ import { claimHubStartup, classifyHubProcess, type HubExclusiveLock, isSocketAli
 import { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
 import { abortableSleep } from "../shared/sleep.js";
 import { resolveHubSocketPath } from "../shared/socketPath.js";
+import { ApiAgentRejectedError } from "../apiAgent/config.js";
+import { createDefaultApiAgentManager } from "../apiAgent/defaults.js";
 import {
+  ChatInjectionRejectedError,
   processTmuxCommandRunner,
   JUMP_TO_LATEST_SEQUENCE,
   jumpToLatestAllowed,
@@ -46,6 +49,8 @@ import { createProductionPushDispatcher } from "../push/pushDispatcher.js";
 import { makeSessionTitleResolver } from "../push/pushContent.js";
 import { PushDeviceStore } from "../push/pushDeviceStore.js";
 import { ClaudeVersionRecorder } from "../shared/claudeVersionRecord.js";
+import { makeProductionPushNotifier } from "../push/approvalPushNotifier.js";
+import { requestApiAgentApproval } from "../apiAgent/approvalBridge.js";
 import { parseUsageLimitWait } from "../shared/usageLimitWait.js";
 import { makeSessionBackend } from "../backend/sessionBackend.js";
 import { Writable } from "node:stream";
@@ -698,7 +703,35 @@ export async function runHubCommand(args: string[]): Promise<number> {
     },
     // 本文+送信確定は backend 側の 1 操作に委ねる（herdr は本文+CR 単一コール必須。
     // 分割すると Ink のペースト取り込み窓に CR が飲まれ送信されない）。
+    // API 作業（api-agent）: 端末なしの会話。ターンは hub の ApiAgentManager が作業プロセスで動かす。
+    apiAgentFactory: (callbacks) => {
+      const notifier = makeProductionPushNotifier();
+      return createDefaultApiAgentManager({
+        ...callbacks, log,
+        // 承認は端末の hook と同じ保留に合流する（一覧の「承認待ち」・push・つながり直したら再提示）。
+        approval: (request) => requestApiAgentApproval(request, {
+          publishPending: (message) => hub.handleRelayMessage(message),
+          notifier: (pushRequest, timeLimitMs) => notifier(pushRequest, timeLimitMs),
+          hasSubscribers: (session) => hub.subscriberCount(session) > 0,
+        }),
+      });
+    },
     chatInjector: async (text, session, context) => {
+      // 端末なしの会話（API 作業）は pane へ打たず、ターンとして渡す。始められなかったら 1 文字も
+      // 送っていないので「非配達が確定」として返す（キー無し・予算到達・別の場所で使用中）。
+      if (metadataStore.get(session)?.executionRoute === "api") {
+        try {
+          const outcome = await hub.apiAgentSubmit(session, text);
+          log(`audit api-agent-submit session=${session} outcome=${outcome}`);
+        } catch (error) {
+          if (error instanceof ApiAgentRejectedError) {
+            log(`audit api-agent-submit-rejected session=${session} code=${error.code}`);
+            throw new ChatInjectionRejectedError(error.message);
+          }
+          throw error;
+        }
+        return;
+      }
       // 注入の所要時間を残す（実機 2026-09-07: 処理中の会話への送信が 14.5s かかり、アプリ側では
       // その間 pending 表示のまま → 利用者が開き直す事案）。所要時間は毎回 1 行で記録し、iOS の
       // ACK 予算 18s に迫る 4 秒以上は `chat-inject-slow` として目立たせる（事後解析用）。
@@ -750,6 +783,8 @@ export async function runHubCommand(args: string[]): Promise<number> {
   });
   hub.restoreFromHeartbeats();
   hub.restorePendingQuestions();
+  // 開いていた API 作業の会話を待機状態で戻す（前回の hub が残した実行中のターンは利用額未確認へ）。
+  hub.restoreApiAgents();
   // 受理記録は socket を開く前に戻す（つないできた engine の明示再送を、配送済みとして見分けるため）。queue の
   // 注入は socket を勝ち取ってから始める（起動競合で負けた hub が、勝った hub と同じ発話を注入しないように）。
   hub.restoreChatReceipts({ startDrains: false });
@@ -787,7 +822,7 @@ export async function runHubCommand(args: string[]): Promise<number> {
       }
       if (once) break;
       if (result.liveCount === 0 && hub.clientCount === 0 && !hub.hasPendingQuestions &&
-        !hub.hasInjectionsInFlight && !hub.hasCodexTurnsInFlight) {
+        !hub.hasInjectionsInFlight && !hub.hasCodexTurnsInFlight && !hub.hasApiAgentTurnsInFlight) {
         log("対象セッション 0 / client 0 → 自然終了");
         break;
       }

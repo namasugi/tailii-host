@@ -2,6 +2,7 @@
 // 会話まわり: 本文送信（chat_send, Claude）・設問回答・サブエージェント履歴・
 // 会話一覧（claude+codex マージ）・本文検索・画像オンデマンド配信。
 
+import { ApiAgentLedgerStore } from "../../apiAgent/ledger.js";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -402,6 +403,11 @@ export const conversationHandlers: HandlerRegistry = {
         live, (name) => ctx.metadataStore?.get(name)?.createdAt ?? null,
       );
       annotated = annotateLiveSessions(sessions, index);
+      // API 作業の会話（api-agent）: 停止中でも最後の実行経路が API の Claude の会話には印を付ける（開き直しを API 作業で行う。
+      // 端末へ戻した会話は付けない, api-agent-handoff）。
+      const ledger = new ApiAgentLedgerStore();
+      annotated = annotated.map((row) => row.liveSessionName === undefined && (row.agent ?? "claude") === "claude" &&
+        row.executionRoute === undefined && ledger.routeOf(row.sessionId) === "api" ? { ...row, executionRoute: "api" as const } : row);
       liveResolved = true;
       engineDiag(`claude_session_list live join count=${index.size}`);
       // peer-live: Tailii 管理外の生存 CLI（Mac の端末 / `claude remote-control`）が掴んでいる会話を

@@ -18,6 +18,7 @@
 // 失敗は ~/.tailii/host/last-update.json に記録し、次回 channel_hello の
 // updateError としてアプリへ届く（成功は serverVersion の変化そのものが証明）。
 
+import { alignInstalledSdkAfterUpdate } from "../apiAgent/sdkInstaller.js";
 import { execFile, spawn } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
@@ -550,6 +551,7 @@ export async function runSelfUpdateCommand(argv: string[]): Promise<number> {
     io.log("別の更新が進行中のため何もしません");
     return 0;
   }
+  let updated = false;
   try {
     const packageDir = await installPackageTree(target, integrity, io);
     const newCliPath = path.join(packageDir, "dist", "cli.js");
@@ -560,7 +562,7 @@ export async function runSelfUpdateCommand(argv: string[]): Promise<number> {
     gcOldVersions(target);
     writeLastUpdate({ target, ok: true, tsMs: Date.now() });
     io.log(`完了: ${current ?? "?"} → ${target}(次回接続から新版)`);
-    return 0;
+    updated = true;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     process.stderr.write(`[self-update] 失敗: ${message}\n`);
@@ -569,6 +571,10 @@ export async function runSelfUpdateCommand(argv: string[]): Promise<number> {
   } finally {
     releaseLock();
   }
+  // 更新の確定と lock の解放の後に、導入済みの Agent SDK（API 作業用）だけ版の整合を確かめる（未導入の host には入れない）。
+  // 失敗しても更新の成否・last-update の記録は変えない（トランザクションを巻き添えにしない）。
+  if (updated) await alignInstalledSdkAfterUpdate({ log: io.log });
+  return 0;
 }
 
 // MARK: - engine からの起動（RPC ハンドラ用）

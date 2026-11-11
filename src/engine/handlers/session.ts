@@ -33,6 +33,8 @@ import type { SessionBackendKind } from "../../backend/sessionBackend.js";
 import type { SessionMeta } from "../../sessions/sessionMetadataStore.js";
 import { PREWARM_TTL_SECONDS, prewarmExpired, prewarmFingerprint } from "../../sessions/prewarmStore.js";
 import { claudeTranscriptExists } from "../../sessions/claudeTranscriptExists.js";
+import { startApiAgentSession } from "./apiAgent.js";
+import { ApiAgentLedgerStore } from "../../apiAgent/ledger.js";
 
 /** 会話を開き直せなかった（答えられない backend で動いている可能性がある）ときの文言。backend 名は出さない。 */
 export const RESUME_BLOCKED_BY_UNAVAILABLE_BACKEND =
@@ -334,6 +336,11 @@ export const sessionHandlers: HandlerRegistry = {
   },
 
   session_start: async (message, ctx) => {
+    // 端末なしの会話（API 作業, api-agent）。pane は作らず、hub の ApiAgentManager に開かせる。
+    if (message.executionRoute === "api") {
+      await withLaunchLock(message.name, () => startApiAgentSession(message, ctx));
+      return;
+    }
     const { writer, state, sessionManager, metadataStore } = ctx;
     const v = state.negotiatedVersion;
     // session_start → launch() 結線。agentType でセッション毎に claude/codex を選ぶ
@@ -669,6 +676,11 @@ async function startUnderLock(
     `session_start launcher 結果 exit=${result.exitCode} err=${result.errorText.slice(0, 100)}`,
   );
   if (result.exitCode === 0) {
+    // API 作業を使ったことがある会話を端末で再開した → 最後の実行経路を端末にする（一覧からの開き直しを端末にする。
+    // 台帳＝利用額の記録は消さない。台帳が無い会話には何も書かない, api-agent-handoff）。
+    if (resumeSessionId !== null && sessionAgent === "claude") {
+      try { new ApiAgentLedgerStore().setRoute(resumeSessionId, "terminal"); } catch { /* 一覧の印だけの問題。 */ }
+    }
     const providerSessionId =
       result.providerSessionId ?? resumeSessionId ?? newSessionId;
     // cwd は launcher が権威記録した解決後 cwd（メタ）を優先。
@@ -707,7 +719,12 @@ async function rollbackLaunchWorktree(
 export async function killSessionForUser(
   ctx: HandlerContext,
   name: string,
-  options: { tailiiWorktreesOnly?: boolean } = {},
+  /**
+   * `tailiiWorktreesOnly`: Tailii が作った worktree だけを片付け対象にする（会話の完全削除）。
+   * `keepWorktree`: 作業フォルダ（worktree）を消さない。API 作業への引き継ぎ・元へ戻すでは
+   * 同じ作業フォルダで会話を続けるので、変更なしの worktree の自動削除を走らせない（api-agent-handoff）。
+   */
+  options: { tailiiWorktreesOnly?: boolean; keepWorktree?: boolean } = {},
 ): Promise<WorktreeResponseFields | null> {
   const { sessionManager, metadataStore } = ctx;
   // cwd の権威は tmux の現在位置ではなく永続 SessionMetadataStore。
@@ -728,6 +745,7 @@ export async function killSessionForUser(
   // kill 成功後だけ Hub の actor / durable queue / delivered receipt を廃棄する。
   // 同名セッションを後日作り直しても、旧会話の queued 入力を注入させない。
   ctx.hubLink.send({ type: "session_retire", session: name });
+  if (options.keepWorktree === true) return null;
   if (killedCwd === null) return null;
   try {
     return await settleWorktreeAfterKill(

@@ -71,6 +71,35 @@ function decodeApiClaudeModelsSelection(value: unknown): import("../services/cla
     keySource: raw["keySource"] === undefined ? undefined : decodeApiUsageCredentials({ claude: raw["keySource"] })!.claude,
     federation: raw["federation"] === undefined ? undefined : decodeFederationSelection(requireObject(raw["federation"], "federation")) });
 }
+const API_AGENT_OUTCOMES = ["success", "turn_budget_reached", "max_turns_reached", "interrupted", "failed", "result_unknown"] as const;
+const API_AGENT_ERRORS = ["no_api_key", "unsupported_key_source", "unexpected_auth", "budget_exhausted",
+  "conversation_in_use", "sdk_unavailable", "sdk_version_mismatch", "worker_failed", "not_open", "invalid_config",
+  "terminal_busy", "held_externally", "terminal_stop_failed", "turn_running"] as const;
+function decodeApiAgentErrorCode(value: string | undefined): import("./messages.js").ApiAgentErrorCode | undefined {
+  return value !== undefined && (API_AGENT_ERRORS as readonly string[]).includes(value)
+    ? value as import("./messages.js").ApiAgentErrorCode : undefined;
+}
+function decodeApiAgentBudget(value: unknown): import("./messages.js").ApiAgentBudget {
+  const raw = requireObject(value, "budget");
+  return { turnUsd: requireNumber(raw, "turnUsd"), conversationUsd: requireNumber(raw, "conversationUsd"), maxTurns: requireNumber(raw, "maxTurns") };
+}
+/** API 作業の設定（api-agent）。キー本体（keySource.apiKey）・使えない取得元は受け付けない。 */
+function decodeApiAgentConfig(value: unknown): import("./messages.js").ApiAgentConfig {
+  const raw = requireObject(value, "config");
+  const permissionMode = requireString(raw, "permissionMode");
+  if (permissionMode !== "default" && permissionMode !== "acceptEdits" && permissionMode !== "plan" && permissionMode !== "dontAsk") {
+    throw new ProtocolDecodeError("missing-field", "permissionMode");
+  }
+  const keySource = raw["keySource"] === undefined ? undefined : decodeApiUsageCredentials({ claudeExecution: raw["keySource"] })?.claudeExecution;
+  if (keySource !== undefined && (keySource.mode === "custom" || keySource.mode === "disabled")) {
+    throw new ProtocolDecodeError("missing-field", "keySource");
+  }
+  return compact({ model: requireString(raw, "model"), permissionMode, budget: decodeApiAgentBudget(raw["budget"]), keySource });
+}
+function decodeSessionStartRoute(raw: Raw): { executionRoute?: "api"; apiAgent?: import("./messages.js").ApiAgentConfig } {
+  if (optionalString(raw, "executionRoute") !== "api") return {};
+  return { executionRoute: "api", apiAgent: decodeApiAgentConfig(raw["apiAgent"]) };
+}
 function decodeSessionSearchAgents(raw: Raw): ("claude" | "codex")[] | undefined {
   if (raw["agents"] === undefined) return undefined;
   const agents = requireStringArray(raw, "agents");
@@ -252,6 +281,8 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
             // tmux も明示値として保持する（欄なし = 未申告。iOS 側の復号と同じ規約, session-backend）。
             backend: decodeSessionBackend(optionalString(obj, "backend")),
             displayTitle: optionalString(obj, "displayTitle"),
+            // 実行経路（api-agent）。既知値 "api" だけ採用、未知値は欄なし（端末扱い）。
+            executionRoute: optionalString(obj, "executionRoute") === "api" ? "api" : undefined,
           });
         }),
         nextCursor: optionalString(raw, "nextCursor"),
@@ -301,6 +332,8 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         worktree: decodeWorktreeRef(optionalString(raw, "worktree")),
         // Task/Todo ツールの有効化（`CLAUDE_CODE_ENABLE_TODO_TOOLS=1`）。
         todoTools: optionalBoolean(raw, "todoTools"),
+        // 実行経路（api-agent）。"api" のときは apiAgent（モデル・権限・予算）が必須。未知値は端末（従来）。
+        ...decodeSessionStartRoute(raw),
       });
     }
 
@@ -1368,6 +1401,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
             liveSessionBackend,
             peerSessionName: optionalString(obj, "peerSessionName"),
             peerBridged: optionalBoolean(obj, "peerBridged"),
+            executionRoute: optionalString(obj, "executionRoute") === "api" ? "api" : undefined,
           });
         }),
         liveSessionsResolved: optionalBoolean(raw, "liveSessionsResolved"),
@@ -1612,6 +1646,106 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
     case "presence_ping":
     case "presence_pong":
       return { type, v, id: requireString(raw, "id") };
+
+    case "api_agent_status": {
+      const state = requireString(raw, "state");
+      if (state !== "idle" && state !== "running" && state !== "stopping") throw new ProtocolDecodeError("missing-field", "state");
+      const usage = requireObject(raw["usage"], "usage");
+      const outcome = optionalString(raw, "outcome");
+      const error = optionalString(raw, "error");
+      return compact({
+        type, v,
+        session: requireString(raw, "session"),
+        state,
+        model: requireString(raw, "model"),
+        budget: decodeApiAgentBudget(raw["budget"]),
+        usage: compact<import("./messages.js").ApiAgentUsage>({
+          totalUsd: requireNumber(usage, "totalUsd"),
+          turns: requireNumber(usage, "turns"),
+          unconfirmedTurns: requireNumber(usage, "unconfirmedTurns"),
+          lastTurnUsd: optionalNumber(usage, "lastTurnUsd"),
+        }),
+        queued: requireNumber(raw, "queued"),
+        // 未知の値は欄なし（新しい host の値を旧 host が読んでも落とさない）。
+        outcome: outcome !== undefined && (API_AGENT_OUTCOMES as readonly string[]).includes(outcome)
+          ? outcome as import("./messages.js").ApiAgentTurnOutcome : undefined,
+        error: decodeApiAgentErrorCode(error),
+        restoredTexts: raw["restoredTexts"] === undefined ? undefined : requireStringArray(raw, "restoredTexts"),
+        permissionMode: ((value) => value === "default" || value === "acceptEdits" || value === "plan" || value === "dontAsk"
+          ? value : undefined)(optionalString(raw, "permissionMode")),
+      });
+    }
+
+    case "api_agent_configure":
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        session: requireString(raw, "session"),
+        config: decodeApiAgentConfig(raw["config"]),
+      };
+
+    case "api_agent_handoff_estimate_request":
+      return {
+        type, v, id: requireString(raw, "id"), conversationId: requireString(raw, "conversationId"),
+        cwd: requireString(raw, "cwd"), model: requireString(raw, "model"),
+      };
+
+    case "api_agent_handoff_estimate_response": {
+      const mode = optionalString(raw, "suggestedPermissionMode");
+      return compact({
+        type, v, id: requireString(raw, "id"), ok: requireBoolean(raw, "ok"),
+        contextTokens: optionalNumber(raw, "contextTokens"),
+        estimatedUsd: optionalNumber(raw, "estimatedUsd"),
+        suggestedPermissionMode: mode === "default" || mode === "acceptEdits" || mode === "plan" || mode === "dontAsk" ? mode : undefined,
+        blocked: decodeApiAgentErrorCode(optionalString(raw, "blocked")),
+        error: decodeApiAgentErrorCode(optionalString(raw, "error")),
+      });
+    }
+
+    case "api_agent_handoff":
+      return {
+        type, v, id: requireString(raw, "id"), conversationId: requireString(raw, "conversationId"),
+        cwd: requireString(raw, "cwd"), name: requireString(raw, "name"), config: decodeApiAgentConfig(raw["config"]),
+      };
+
+    case "api_agent_handoff_result":
+      return compact({
+        type, v, id: requireString(raw, "id"), ok: requireBoolean(raw, "ok"),
+        session: optionalString(raw, "session"),
+        error: decodeApiAgentErrorCode(optionalString(raw, "error")),
+        message: optionalString(raw, "message"),
+      });
+
+    case "api_agent_prepare_request":
+      return { type, v, id: requireString(raw, "id"), start: requireBoolean(raw, "start") };
+
+    case "api_agent_prepare_response": {
+      const state = requireString(raw, "state");
+      if (state !== "ready" && state !== "installing" && state !== "failed") throw new ProtocolDecodeError("missing-field", "state");
+      return compact({
+        type, v, id: requireString(raw, "id"), state,
+        phase: optionalString(raw, "phase"), version: optionalString(raw, "version"),
+        startedAtMs: optionalNumber(raw, "startedAtMs"), error: optionalString(raw, "error"), message: optionalString(raw, "message"),
+      });
+    }
+
+    case "api_agent_return":
+      return { type, v, id: requireString(raw, "id"), session: requireString(raw, "session") };
+
+    case "api_agent_return_result":
+      return compact({
+        type, v, id: requireString(raw, "id"), ok: requireBoolean(raw, "ok"),
+        error: decodeApiAgentErrorCode(optionalString(raw, "error")),
+      });
+
+    case "api_agent_configure_result":
+      return compact({
+        type, v,
+        id: requireString(raw, "id"),
+        session: requireString(raw, "session"),
+        ok: requireBoolean(raw, "ok"),
+        error: decodeApiAgentErrorCode(optionalString(raw, "error")),
+      });
 
     default:
       throw new ProtocolDecodeError("unknown-type", type);
