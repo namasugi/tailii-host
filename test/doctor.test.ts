@@ -209,3 +209,25 @@ describe("quicServiceDoctorCheck", () => {
     expect(check.remediation).toBeUndefined();
   });
 });
+
+describe("Node の対応下限（22.13。hub の単一起動の保証）", () => {
+  it("22.13 未満は ✗ で、hub の単一起動を保証できないことを伝える", async () => {
+    const { nodeVersionCheck } = await import("../src/commands/doctor.js");
+    for (const version of ["20.19.0", "22.12.0"]) {
+      const check = nodeVersionCheck(version, "fix");
+      expect(check).toMatchObject({ id: "node", ok: false, required: true, remediation: "fix" });
+      expect(check.detail).toContain("単一起動を保証できません");
+    }
+    for (const version of ["22.13.0", "24.22.2"]) {
+      expect(nodeVersionCheck(version, "fix", true)).toMatchObject({ ok: true, detail: `v${version}` });
+    }
+  });
+
+  it("版が足りていても node:sqlite が実際に使えなければ同じ警告（--no-experimental-sqlite・Node 23.0〜23.3）", async () => {
+    const { nodeVersionCheck } = await import("../src/commands/doctor.js");
+    const check = nodeVersionCheck("24.22.2", "fix", false);
+    expect(check).toMatchObject({ ok: false, required: true });
+    expect(check.detail).toContain("node:sqlite が使えない");
+    expect(check.detail).toContain("単一起動を保証できません");
+  });
+});

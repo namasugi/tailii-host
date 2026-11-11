@@ -195,6 +195,7 @@ describe("hub lock / ensure", () => {
     fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, version: readPackageVersion() }));
 
     ensureHubDaemon({
+      classifyProcess: () => "hub",
       lockPath,
       cliPath: "/x/cli.js",
       logPath: path.join(dir, "hub.log"),
@@ -212,6 +213,7 @@ describe("hub lock / ensure", () => {
     const kill = vi.spyOn(process, "kill").mockReturnValue(true);
 
     ensureHubDaemon({
+      classifyProcess: () => "hub",
       lockPath,
       cliPath: "/x/cli.js",
       logPath: path.join(dir, "hub.log"),
@@ -220,6 +222,68 @@ describe("hub lock / ensure", () => {
 
     expect(kill).toHaveBeenCalledWith(process.pid, "SIGTERM");
     expect(recorder.args).toEqual([[process.execPath, "/x/cli.js", "hub"]]);
+  });
+
+  test("lock の pid が生きていても hub でない（pid の再利用）・hub か確認できないなら、SIGTERM を送らずに起動する", () => {
+    for (const identity of ["other", "unknown"] as const) {
+      for (const version of [readPackageVersion(), "old-version"]) {
+        const dir = makeTempDir("hub-lock-reused");
+        const lockPath = path.join(dir, "hub.lock");
+        const recorder = spawnRecorder();
+        fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, version }));
+        const kill = vi.spyOn(process, "kill");
+        ensureHubDaemon({
+          classifyProcess: () => identity,
+          lockPath, cliPath: "/x/cli.js", logPath: path.join(dir, "hub.log"), spawnImpl: recorder.spawnImpl,
+        });
+        expect(kill.mock.calls.filter((call) => call[1] === "SIGTERM")).toEqual([]);
+        expect(recorder.args).toEqual([[process.execPath, "/x/cli.js", "hub"]]);
+        kill.mockRestore();
+      }
+    }
+  });
+
+  test("hub の実体の判定: node + Tailii の cli.js + 直後の hub だけを hub とみなす（偽陽性・偽陰性の具体例）", async () => {
+    const { classifyHubProcess } = await import("../src/hub/hubStartup.js");
+    const root = makeTempDir("hub-identity");
+    // 自分の cli.js（空白と日本語を含むパス）と、別の場所に入った版違いの host、npm の bin の symlink。
+    const own = path.join(root, "my host 作業", "dist", "cli.js");
+    const other = path.join(root, "lib", "node_modules", "tailii-host", "dist", "cli.js");
+    const unrelated = path.join(root, "other-pkg", "dist", "cli.js");
+    for (const file of [own, other, unrelated]) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, "");
+    }
+    const bin = path.join(root, "bin", "tailii");
+    fs.mkdirSync(path.dirname(bin), { recursive: true });
+    fs.symlinkSync(other, bin);
+    const argv = (...values: string[]) => () => ({ kind: "argv" as const, argv: values });
+    const ps = (command: string) => () => ({ kind: "command" as const, command });
+    const is = (read: Parameters<typeof classifyHubProcess>[1]) => classifyHubProcess(1, read, own);
+    // hub とみなす（Linux の argv）
+    expect(is(argv("/usr/local/bin/node", own, "hub"))).toBe("hub");
+    expect(is(argv("node", "--max-old-space-size=512", own, "hub", "--once"))).toBe("hub");
+    expect(is(argv("/opt/homebrew/bin/node", other, "hub"))).toBe("hub");
+    expect(is(argv("node", bin, "hub"))).toBe("hub");
+    // hub とみなす（macOS の ps。空白を含む自分のパス・空白を含む node のパス）
+    expect(is(ps(`/usr/local/bin/node ${own} hub`))).toBe("hub");
+    expect(is(ps(`/Users/u/my tools/node --no-warnings ${own} hub --once`))).toBe("hub");
+    expect(is(ps(`/opt/homebrew/bin/node ${other} hub`))).toBe("hub");
+    // hub とみなさない（偽陽性の例）
+    expect(is(argv("vim", "/tmp/cli.js", "hub"))).toBe("other");
+    expect(is(ps("vim /tmp/cli.js hub"))).toBe("other");
+    expect(is(argv("node", unrelated, "hub"))).toBe("other");
+    expect(is(ps(`node ${unrelated} hub`))).toBe("other");
+    expect(is(argv("node", own, "engine"))).toBe("other");
+    expect(is(ps(`node ${own} engine hub`))).toBe("other");
+    expect(is(ps(`vim ${own} hub`))).toBe("other");
+    expect(is(argv("/usr/bin/vim", own, "hub"))).toBe("other");
+    expect(is(argv("node", own, "hubx"))).toBe("other");
+    // 取得できない・居ない
+    expect(is(() => ({ kind: "unknown" }))).toBe("unknown");
+    expect(is(() => ({ kind: "gone" }))).toBe("gone");
+    // このテストを動かしている vitest は hub ではない（実際のプロセス情報で確かめる）。
+    expect(classifyHubProcess(process.pid)).toBe("other");
   });
 
   test("不在なら detached spawn", () => {

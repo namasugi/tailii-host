@@ -21,6 +21,7 @@ import {
   type ReaperTickResult,
 } from "./reaper.js";
 import { SessionHub } from "./sessionHub.js";
+import { claimHubStartup, classifyHubProcess, type HubExclusiveLock, isSocketAlive } from "./hubStartup.js";
 import { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
 import { abortableSleep } from "../shared/sleep.js";
 import { resolveHubSocketPath } from "../shared/socketPath.js";
@@ -170,16 +171,6 @@ export function pidAlive(pid: number): boolean {
   }
 }
 
-async function isSocketAlive(socketPath: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    const probe = net.connect(socketPath);
-    probe.once("connect", () => {
-      probe.destroy();
-      resolve(true);
-    });
-    probe.once("error", () => resolve(false));
-  });
-}
 
 export interface HubSocketServer {
   socketPath: string;
@@ -503,6 +494,8 @@ export async function shutdownHub(options: {
 }
 
 export interface EnsureHubDaemonOptions {
+  /** `hub.lock` の pid の実体（テスト注入用。既定はコマンドラインで確かめる）。 */
+  classifyProcess?: (pid: number) => "hub" | "other" | "gone" | "unknown";
   lockPath?: string;
   cliPath?: string;
   logPath?: string;
@@ -516,7 +509,10 @@ export function ensureHubDaemon(options: EnsureHubDaemonOptions = {}): void {
     const lockPath = options.lockPath ?? defaultHubLockPath();
     const currentVersion = readPackageVersion();
     const lock = readHubLock(lockPath);
-    if (lock !== null && pidAlive(lock.pid)) {
+    // pid だけで起動の抑止・終了の要求を決めない。実体が hub と確かめられたときだけ抑止・SIGTERM する。
+    // 無関係なプロセス（pid の再利用）・確認できないときは何も送らずに hub を起動する（起動した hub が排他と実体の
+    // 確認で決着を付ける）。
+    if (lock !== null && pidAlive(lock.pid) && (options.classifyProcess ?? classifyHubProcess)(lock.pid) === "hub") {
       if (lock.version === currentVersion) return;
       // stale dist は退かせ、現行 cli から立て直す。
       try {
@@ -559,22 +555,50 @@ export async function runHubCommand(args: string[]): Promise<number> {
   if (!Number.isFinite(intervalSeconds) || intervalSeconds <= 0) return 64;
 
   const lockPath = defaultHubLockPath();
-  const existing = readHubLock(lockPath);
-  if (existing !== null && existing.pid !== process.pid && pidAlive(existing.pid)) {
-    log(`既存 daemon 生存(pid=${existing.pid})のため終了`);
-    return 0;
-  }
   const socketPath = resolveHubSocketPath();
-  if (await isSocketAlive(socketPath)) {
-    log(`既存 Hub socket 生存(${socketPath})のため終了`);
-    return 0;
-  }
-
   const startupVersion = readPackageVersion();
   const bootId = randomUUID();
-  if (!acquireHubLock(lockPath, startupVersion)) {
-    log("lock 取得競合のため終了");
+  // 単一起動: OS が解放する排他（hubStartup.ts）を取れたプロセスだけが hub として動く。取れなかった側は何も消さずに退く。
+  // 排他を持ったまま graceful shutdown の待ちに入るので、次の hub は前の hub が終わるまで起動を見送る（従来どおり）。
+  let claim: Awaited<ReturnType<typeof claimHubStartup>>;
+  try {
+    claim = await claimHubStartup({ lockPath, socketPath, version: startupVersion });
+  } catch (error) {
+    // 排他の保存先の障害（DB の破損・権限・I/O）。既存の hub が居ると誤診して正常終了せず、理由を残して失敗終了する
+    // （DB ファイルは自動で消さない。稼働中の hub と別 inode になって排他の根拠が分かれるため）。
+    log(`hub の排他ロックを取れないため終了(失敗): ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
+  let exclusive: HubExclusiveLock | null = null;
+  if (claim.kind === "failed") {
+    log(claim.reason === "owner-unverifiable"
+      ? `hub.lock の pid=${claim.pid} が生きているが hub かどうか確認できないため起動を見送る(失敗)`
+      : `hub.lock の hub(pid=${claim.pid})が応答せず終了の要求にも応じないため起動を諦める(失敗)`);
+    return 1;
+  }
+  if (claim.kind === "busy") {
+    log(claim.reason === "exclusive-held" ? "既存 daemon が排他を保持しているため終了" : `既存 Hub socket 生存(${socketPath})のため終了`);
     return 0;
+  }
+  if (claim.kind === "claimed") {
+    exclusive = claim.exclusive;
+  } else {
+    // node:sqlite の無い Node（20・22.12 以前 = 対応外）: 従来の pid の lock と socket の生存確認で判定する最善努力。
+    // 同時起動の競合が残る（単一起動の保証は Node 22.13 以降だけ）。退避した事実を起動ログに残す。
+    log(`node:sqlite が使えない Node(${process.versions.node})のため従来の判定に退避(hub の単一起動は保証されません。Node 22.13 以上を推奨)`);
+    const existing = readHubLock(lockPath);
+    if (existing !== null && existing.pid !== process.pid && pidAlive(existing.pid)) {
+      log(`既存 daemon 生存(pid=${existing.pid})のため終了`);
+      return 0;
+    }
+    if (await isSocketAlive(socketPath)) {
+      log(`既存 Hub socket 生存(${socketPath})のため終了`);
+      return 0;
+    }
+    if (!acquireHubLock(lockPath, startupVersion)) {
+      log("lock 取得競合のため終了");
+      return 0;
+    }
   }
   const abort = new AbortController();
   const onSignal = (signal: NodeJS.Signals): void => {
@@ -747,8 +771,8 @@ export async function runHubCommand(args: string[]): Promise<number> {
       throw error;
     }
     if (socketServer === null) return 0;
-    // socket を勝ち取った時点で lock の権威は自分。起動競合の名残(敗者の lock や
-    // own-pid ガード付き削除)があっても、ここで上書きすれば最終状態は必ず整合する。
+    // socket を勝ち取った時点で lock（pid と版の情報）の権威は自分。従来の判定で起動した場合の名残があっても、
+    // ここで上書きすれば最終状態は必ず整合する。
     fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, version: startupVersion }));
     hub.startRestoredDrains();
     relayServer = await startEngineRelaySocket({ onMessage: (message) => hub.handleRelayMessage(message), log });
@@ -784,6 +808,8 @@ export async function runHubCommand(args: string[]): Promise<number> {
         process.off("SIGTERM", onSignal);
         process.off("SIGINT", onSignal);
         releaseOwnHubLock(lockPath);
+        // 排他は最後に外す（ここまで次の hub は起動を見送る）。
+        exclusive?.release();
       },
     });
   }

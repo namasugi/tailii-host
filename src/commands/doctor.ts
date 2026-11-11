@@ -22,6 +22,7 @@ import { HERDR_RESTART_COMMAND } from "../backend/herdr.js";
 // 型だけ。実体は quicGateway が doctor の findCommand を import する循環を避けるため動的 import。
 import type { QuicGatewayServiceState } from "../services/quicGateway.js";
 import { ApnsConfigStore } from "../push/apnsConfigStore.js";
+import { isNodeSqliteAvailable } from "../hub/hubStartup.js";
 import { PushDeviceStore } from "../push/pushDeviceStore.js";
 import { PushLastResultStore } from "../push/pushStateFiles.js";
 import { choosePushTransport } from "../push/pushTransport.js";
@@ -136,8 +137,13 @@ export interface DoctorCheck {
   remediation?: string;
 }
 
-/** Tailii が依存している／相互運用を確認済みの最低版。最新版追従ではなく互換性境界。 */
-export const MINIMUM_NODE_MAJOR = 20;
+/**
+ * 対応する Node の最低版。22.13 は `node:sqlite` がフラグ無しで使える最初の版で、hub の単一起動（OS が解放する
+ * 排他, hub/hubStartup.ts）はこの版以降でだけ保証される。これより古い Node でも host は動く（最善努力の従来判定）。
+ */
+export const MINIMUM_NODE_VERSION = "22.13.0";
+/** 旧名（メジャー版だけの比較）。互換のため残す。 */
+export const MINIMUM_NODE_MAJOR = 22;
 export { MINIMUM_CLAUDE_CLI_VERSION, MINIMUM_CODEX_CLI_VERSION, parseNumericVersion, versionAtLeast };
 export const MINIMUM_HERDR_VERSION = "0.7.5";
 /** launchctl の応答がなくても診断全体を止めない上限。 */
@@ -297,12 +303,35 @@ export function sshServerRemediation(
   return "ホストOSの手順で SSH サーバーをインストールし、TCP 22 で起動する";
 }
 
+/**
+ * Node の版の検査。下限（22.13）未満は対応外として ✗ にし、hub の単一起動を保証できないことを伝える
+ * （host 自体は動き続ける。単一起動は従来の判定の最善努力になる）。
+ */
+export function nodeVersionCheck(version: string, remediation: string, sqliteAvailable: boolean = isNodeSqliteAvailable()): DoctorCheck {
+  const versionOk = versionAtLeast(version, MINIMUM_NODE_VERSION) === true;
+  // 版が足りていても node:sqlite が実際に使えない（`--no-experimental-sqlite` で起動・Node 23.0〜23.3）なら同じ警告。
+  const ok = versionOk && sqliteAvailable;
+  const caution = "hub の単一起動を保証できません。hub が二重に動くと通知の端末登録などが失われることがあります";
+  return {
+    id: "node",
+    label: "Node.js 22.13+",
+    ok,
+    required: true,
+    detail: ok
+      ? `v${version}`
+      : versionOk
+        ? `v${version}（node:sqlite が使えないため${caution}。NODE_OPTIONS などで無効にしていないか確認してください）`
+        : `v${version}（対応外: 22.13 未満では${caution}）`,
+    ...(ok ? {} : { remediation }),
+  };
+}
+
 function nodeUpdateRemediation(envPath: string): string {
   if (findCommand("mise", envPath) !== null || process.execPath.includes("/mise/")) {
     return "mise use -g node@24";
   }
   if (findCommand("brew", envPath) !== null) return "brew upgrade node";
-  return "https://nodejs.org/en/download の手順で Node.js 20 以上へ更新する";
+  return "https://nodejs.org/en/download の手順で Node.js 22.13 以上へ更新する";
 }
 
 /** herdr は直接導入とパッケージ管理下で更新手順が異なる。 */
@@ -405,16 +434,7 @@ export function quicServiceDoctorCheck(state: QuicGatewayServiceState): DoctorCh
 export async function collectDoctorChecks(envPath: string = defaultInjectedPath()): Promise<DoctorCheck[]> {
   const checks: DoctorCheck[] = [];
 
-  const nodeMajor = Number(process.versions.node.split(".")[0]);
-  const nodeRemediation = nodeUpdateRemediation(envPath);
-  checks.push({
-    id: "node",
-    label: `Node.js ${MINIMUM_NODE_MAJOR}+`,
-    ok: nodeMajor >= MINIMUM_NODE_MAJOR,
-    required: true,
-    detail: `v${process.versions.node}`,
-    ...(nodeMajor >= MINIMUM_NODE_MAJOR ? {} : { remediation: nodeRemediation }),
-  });
+  checks.push(nodeVersionCheck(process.versions.node, nodeUpdateRemediation(envPath)));
 
   const tmux = findCommand("tmux", envPath);
   const herdr = findCommand("herdr", envPath);

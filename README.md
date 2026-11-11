@@ -15,7 +15,7 @@ Tailii is an iPhone app for controlling Claude Code and Codex sessions running o
 
 ## Requirements
 
-- Node.js 20 以上
+- Node.js 22.13 以上（それより古い Node でも動きますが、hub〔常駐プロセス〕の単一起動は保証されません。単一起動は `node:sqlite` の排他で保証しており、22.13 以降でだけ使えます）
 - macOS または Linux（QUIC ゲートウェイは macOS のみ）
 - tmux(任意で herdr — セッション収容先をアプリ設定から herdr に切り替えられます)
 - SSH サーバーが有効であること(macOS では「リモートログイン」を ON)
