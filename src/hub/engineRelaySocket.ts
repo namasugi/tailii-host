@@ -30,6 +30,8 @@ export type SessionProcessingMessage = {
   atMs?: number;
   /** サブエージェントのツール呼び出しなら、その id（hub がエージェント数の鮮度に使う, session-agent-count）。 */
   agentId?: string;
+  /** StopFailure hook のエラー種別（`rate_limit` / `server_error` 等, push v1）。それ以外の event では省略。 */
+  error?: string;
 };
 
 /**
@@ -149,11 +151,13 @@ function decodeEngineRelayLine(line: string): EngineRelayMessage | null {
           const event = record["event"];
           const atMs = record["atMs"];
           const agentId = record["agentId"];
+          const error = record["error"];
           return {
             type: "session_processing", session, state,
             ...(typeof event === "string" ? { event } : {}),
             ...(typeof atMs === "number" && Number.isFinite(atMs) ? { atMs } : {}),
             ...(typeof agentId === "string" && agentId.length > 0 ? { agentId } : {}),
+            ...(typeof error === "string" && error.length > 0 && error.length <= 100 ? { error } : {}),
           };
         }
         return null;

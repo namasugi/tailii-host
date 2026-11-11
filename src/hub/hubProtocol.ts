@@ -2,6 +2,7 @@
 // tailii (TS host) — Hub と engine の間だけで使う内部 NDJSON プロトコル。
 
 import type { EngineRelayMessage, SessionProcessingMessage } from "./engineRelaySocket.js";
+import { PUSH_KINDS, type PushKind } from "../push/pushEnvelope.js";
 import {
   isBackgroundCommandStopStatus,
   isSubagentControlAction,
@@ -39,6 +40,21 @@ export type HubClientMessage =
     }
   | { type: "hub_state_request"; id: string; session: string }
   | { type: "presence_request"; id: string; session: string }
+  /**
+   * 在席の申告（engine→hub, push v1）。iOS の `client_presence` を中継する。hub は接続ごとに
+   * `{deviceId, state}` を持ち、push の在席判定に使う。hub 再接続時は engine が最新値を送り直す。
+   */
+  | { type: "client_presence"; deviceId: string; state: "foreground" | "background" }
+  /** hub の `presence_ping` に iOS が応えた（engine→hub）。 */
+  | { type: "presence_pong"; id: string }
+  /**
+   * 通知の送信依頼（hook→hub, push v1）。`presence_request` と同じ短命接続。hub は受理を即答し、
+   * 在席判定・送信は自分の dispatcher で行う。
+   */
+  | { type: "push_request"; id: string; event: HubPushEvent }
+  /** 端末登録・解除の中継（engine→hub, push v1）。端末記録を書くのは hub だけ。payload は iOS の push_register そのまま。 */
+  | { type: "push_device_register"; id: string; payload: Extract<ControlMessage, { type: "push_register" }> }
+  | { type: "push_device_unregister"; id: string; deviceId: string }
   | { type: "question_answer_submit"; id: string; session: string; questionId: string; answers: QuestionAnswer[] }
   | { type: "input_claim"; id: string; session: string; clientMessageId: string }
   | {
@@ -99,6 +115,18 @@ export interface PendingQuestionSnapshotEntry {
   questions: QuestionPromptQuestion[];
 }
 
+/** hook から hub へ渡す通知 1 件（秘密は載せない。本文は要約済み）。 */
+export interface HubPushEvent {
+  kind: PushKind;
+  session: string;
+  id?: string;
+  body?: string;
+  tool?: string;
+}
+
+/** hub へ渡す要約の上限（字）。dispatcher がさらに切り詰める。 */
+const HUB_PUSH_BODY_MAX_CHARS = 2_000;
+
 export type HubServerMessage =
   | {
     type: "hub_hello_ack"; version: string | null; bootId: string; processingSessions?: string[];
@@ -119,6 +147,15 @@ export type HubServerMessage =
       processing: boolean;
     }
   | { type: "presence_response"; id: string; session: string; subscriberCount: number }
+  /** 送る直前の生存確認（hub→engine）。engine は iOS へ `presence_ping` として渡す。 */
+  | { type: "presence_ping"; id: string }
+  /** `push_request` の受理（`unavailable` = この hub は送信器を持たない。hook は自分で送る）。 */
+  | { type: "push_request_result"; id: string; status: "accepted" | "unavailable" }
+  | {
+      type: "push_device_register_result"; id: string; status: "ok" | "failed"; transport: "relay" | "direct" | "none";
+      capabilityInvalid?: boolean; error?: string;
+    }
+  | { type: "push_device_unregister_result"; id: string; status: "ok" | "failed" }
   | { type: "conversation_event"; session: string; serverSeq: number; payload: ControlMessage }
   | {
       type: "conversation_subagent_transcript_response";
@@ -250,6 +287,36 @@ export function decodeHubClientLine(line: string): HubClientMessage | null {
     return typeof id === "string" && id.length > 0 && typeof session === "string" && session.length > 0
       ? { type: "presence_request", id, session }
       : null;
+  }
+  if (record["type"] === "client_presence") {
+    const deviceId = record["deviceId"], state = record["state"];
+    return typeof deviceId === "string" && deviceId.length > 0 && (state === "foreground" || state === "background")
+      ? { type: "client_presence", deviceId, state } : null;
+  }
+  if (record["type"] === "presence_pong") {
+    const id = record["id"];
+    return typeof id === "string" && id.length > 0 ? { type: "presence_pong", id } : null;
+  }
+  if (record["type"] === "push_device_register") {
+    const id = record["id"];
+    let payload: ControlMessage | null = null;
+    try {
+      payload = decodeControlMessage(JSON.stringify(record["payload"]));
+    } catch {
+      payload = null;
+    }
+    return typeof id === "string" && id.length > 0 && payload?.type === "push_register"
+      ? { type: "push_device_register", id, payload } : null;
+  }
+  if (record["type"] === "push_device_unregister") {
+    const id = record["id"], deviceId = record["deviceId"];
+    return typeof id === "string" && id.length > 0 && typeof deviceId === "string"
+      ? { type: "push_device_unregister", id, deviceId } : null;
+  }
+  if (record["type"] === "push_request") {
+    const id = record["id"];
+    const event = parseHubPushEvent(record["event"]);
+    return typeof id === "string" && id.length > 0 && event !== null ? { type: "push_request", id, event } : null;
   }
   if (record["type"] === "question_answer_submit") {
     const id = record["id"], session = record["session"], questionId = record["questionId"], answers = record["answers"];
@@ -385,6 +452,23 @@ export function decodeHubClientLine(line: string): HubClientMessage | null {
   return decodeProcessing(record);
 }
 
+/** `push_request.event` の検証（種別・会話名は必須。本文は上限で切る）。 */
+function parseHubPushEvent(value: unknown): HubPushEvent | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const kind = raw["kind"], session = raw["session"], id = raw["id"], body = raw["body"], tool = raw["tool"];
+  if (!PUSH_KINDS.includes(kind as PushKind) || typeof session !== "string" || session.length === 0) return null;
+  if ((id !== undefined && typeof id !== "string") || (body !== undefined && typeof body !== "string") ||
+    (tool !== undefined && typeof tool !== "string")) return null;
+  return {
+    kind: kind as PushKind,
+    session,
+    ...(typeof id === "string" ? { id } : {}),
+    ...(typeof body === "string" ? { body: [...body].slice(0, HUB_PUSH_BODY_MAX_CHARS).join("") } : {}),
+    ...(typeof tool === "string" ? { tool } : {}),
+  };
+}
+
 /** `codex_goal_result.goal` の検証。形が違えば null（行ごと捨てる）。 */
 function parseCodexGoal(value: unknown): CodexGoalInfo | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
@@ -452,6 +536,31 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
     if (typeof id !== "string" || typeof session !== "string" || typeof record["processing"] !== "boolean") return null;
     if (pending !== null && !isPendingQuestion(pending)) return null;
     return { type: "hub_state_response", id, session, pendingQuestion: pending, processing: record["processing"] };
+  }
+  if (record["type"] === "presence_ping") {
+    const id = record["id"];
+    return typeof id === "string" && id.length > 0 ? { type: "presence_ping", id } : null;
+  }
+  if (record["type"] === "push_device_register_result") {
+    const id = record["id"], status = record["status"], transport = record["transport"];
+    const capabilityInvalid = record["capabilityInvalid"], error = record["error"];
+    if (typeof id !== "string" || (status !== "ok" && status !== "failed") ||
+      (transport !== "relay" && transport !== "direct" && transport !== "none")) return null;
+    return {
+      type: "push_device_register_result", id, status, transport,
+      ...(capabilityInvalid === true ? { capabilityInvalid: true } : {}),
+      ...(typeof error === "string" ? { error } : {}),
+    };
+  }
+  if (record["type"] === "push_device_unregister_result") {
+    const id = record["id"], status = record["status"];
+    return typeof id === "string" && (status === "ok" || status === "failed")
+      ? { type: "push_device_unregister_result", id, status } : null;
+  }
+  if (record["type"] === "push_request_result") {
+    const id = record["id"], status = record["status"];
+    return typeof id === "string" && (status === "accepted" || status === "unavailable")
+      ? { type: "push_request_result", id, status } : null;
   }
   if (record["type"] === "presence_response") {
     const id = record["id"];

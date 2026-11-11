@@ -36,10 +36,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import {
-  makeProductionPushNotifier,
   ObservationLogPushObserver,
   type PushObserving,
 } from "../push/approvalPushNotifier.js";
+import { createProductionPushDispatcher, type PushDispatcher } from "../push/pushDispatcher.js";
+import { makeSessionTitleResolver, summarizeForNotification } from "../push/pushContent.js";
+import { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
 import {
   sendQuestionEventToEngine,
   sendRemotePendingToEngine,
@@ -57,7 +59,7 @@ import {
 import { scheduledFromSessionCrons } from "../sessions/cronSchedule.js";
 import { claudePidOfHook } from "../sessions/claudeLiveStatus.js";
 import { ensureHubDaemon } from "../hub/hubDaemon.js";
-import { decodeHubServerLine, encodeHubMessage } from "../hub/hubProtocol.js";
+import { decodeHubServerLine, encodeHubMessage, type HubPushEvent } from "../hub/hubProtocol.js";
 import { ObservationLog, defaultObservationBase } from "../shared/observationLog.js";
 import { parsePermissionMode } from "../shared/permissionMode.js";
 import { resolveHubSocketPath, resolveSocketPath } from "../shared/socketPath.js";
@@ -102,6 +104,8 @@ export interface ApprovalPushRequest {
   approvalId: string;
   tool: string;
   session: string;
+  /** 承認内容の要約（通知本文 `ツール名 · 要約` に使う。暗号化して送るのでリレーには見えない）。 */
+  summary?: string;
 }
 
 /**
@@ -121,6 +125,9 @@ export const PRESENCE_PROBE_TIME_LIMIT_MS = 500;
 
 /** Hub への使い捨て presence RPC の上限。 */
 export const HUB_PRESENCE_RPC_TIMEOUT_MS = 300;
+
+/** Hub への push_request の接続・書き込みの上限（ここまでに接続できなければ hub が居ないとみなして自分で送る）。 */
+export const HUB_PUSH_RPC_TIMEOUT_MS = 500;
 
 // MARK: - テスタブルコア
 
@@ -200,6 +207,17 @@ export async function runHookCore(options: RunHookOptions): Promise<HookRunResul
       : undefined;
     await notifySessionProcessing(
       options, session, parsed.eventName === "Stop" ? "done" : "active", parsed.eventName, scheduled);
+    return { exitCode: 0, stdout: "" };
+  }
+
+  // --- 0.01 API エラーでのターン終了（StopFailure。Stop の代わりに発火し、出力と終了コードは無視される）---
+  // 処理完了として heartbeat / hub へ知らせ、エラー種別を添える（hub が turn_error の push と、rate_limit なら
+  // 使用量制限の見張りを始める。transcript を誰も購読していなくても届く, push v1）。サブエージェント・CLI 内部の
+  // 複製（agent_id 付き）の失敗は会話のターン終了ではないので扱わない。
+  if (parsed.eventName === "StopFailure") {
+    if (parsed.agentId === undefined) {
+      await notifySessionProcessing(options, session, "done", "StopFailure", undefined, undefined, parsed.stopFailureError);
+    }
     return { exitCode: 0, stdout: "" };
   }
 
@@ -366,6 +384,7 @@ async function notifySessionProcessing(
   event: string,
   scheduled?: HeartbeatScheduled | null,
   agentId?: string,
+  error?: string,
 ): Promise<void> {
   // heartbeat は engine の生死と無関係に書ける唯一の経路（reaper daemon が読む）。
   // session 未解決（"default"）は書かない — 実在しない tmux 名の残骸ファイルを作らない。
@@ -388,6 +407,7 @@ async function notifySessionProcessing(
     const message = {
       type: "session_processing", session, state, event, atMs: hookSpawnedAtMs(),
       ...(agentId !== undefined ? { agentId } : {}),
+      ...(error !== undefined ? { error } : {}),
     } as const;
     // best-effort・短予算（60ms）: engine 不在時にゲート/監査を遅らせない。
     if (options.engineRelaySocketPath !== undefined) {
@@ -520,7 +540,7 @@ async function publishPendingAndAwaitReconnect(
     } else {
       await sendBackgroundPush(
         options.notifier,
-        { approvalId: requestId, tool: parsed.toolName, session },
+        { approvalId: requestId, tool: parsed.toolName, session, summary },
         options.notifierTimeLimitMs ?? 5000,
       );
     }
@@ -825,6 +845,99 @@ export function makePresenceProbe(
   };
 }
 
+/**
+ * 本番の presence probe（push v1）: Mac の端末に attach 中なら承認の push を抑える。端末ごとの在席
+ * （前面 / 背景・生存確認）は hub の dispatcher が判断するので、ここでは hub の購読者数を見ない
+ * （背景へ移った直後の猶予中も購読が残り、従来の `client-live` は不在を在席と誤認していた）。
+ */
+export function makeMacAttachedProbe(runner: TmuxCommandRunner = processTmuxCommandRunner()): PresenceProbe {
+  return async (session) => ((await attachedSessions(runner)).has(session) ? "mac-attached" : null);
+}
+
+/**
+ * Hub socket へ短命接続して push_request を書き込む（`requestHubPresence` と同じ流儀）。
+ * 接続でき、要求を書き込めたら `delivered`（以後 hook は自分では送らない。hub の応答は待たない = 承認の
+ * 判断も hook の終了も遅らせない）。接続できない（hub が居ない）・書き込めないときだけ `unreachable`。
+ */
+export function requestHubPush(
+  event: HubPushEvent,
+  socketPath: string,
+  timeoutMs = HUB_PUSH_RPC_TIMEOUT_MS,
+  /** 接続の作成（テスト注入用）。 */
+  connect: (path: string) => net.Socket = (path) => net.createConnection(path),
+): Promise<"delivered" | "unreachable"> {
+  return new Promise((resolve) => {
+    const id = randomUUID();
+    const socket = connect(socketPath);
+    let settled = false;
+    // 接続できた後は、結果が分からなくても（書き込みのエラー・socket の error・期限切れ）一貫して delivered に倒す
+    // （hub が受け取った可能性がある = 自前送信へ切り替えると二重送信・在席抑止の迂回になる）。
+    let connected = false;
+    let writeTimer: ReturnType<typeof setTimeout> | null = null;
+    const finish = (value: "delivered" | "unreachable"): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(connectTimer);
+      if (writeTimer !== null) clearTimeout(writeTimer);
+      const result = connected ? "delivered" : value;
+      if (result === "delivered" && value === "delivered") socket.end();
+      else socket.destroy();
+      resolve(result);
+    };
+    // 接続できないまま時間切れ = hub が居ない。
+    const connectTimer = setTimeout(() => finish("unreachable"), Math.max(0, timeoutMs));
+    socket.once("connect", () => {
+      connected = true;
+      clearTimeout(connectTimer);
+      // 書き込みの完了通知が来なくても短い期限で打ち切って後始末する。
+      writeTimer = setTimeout(() => finish("unreachable"), Math.max(0, timeoutMs));
+      socket.write(encodeHubMessage({ type: "push_request", id, event }), (error) => {
+        finish(error === undefined || error === null ? "delivered" : "unreachable");
+      });
+    });
+    socket.on("error", () => finish("unreachable"));
+  });
+}
+
+/** 承認の通知本文（`ツール名 · 要約`）。 */
+export function approvalNotificationBody(request: ApprovalPushRequest): string {
+  const summary = summarizeForNotification(request.summary, 280);
+  return summary === null ? request.tool : `${request.tool} · ${summary}`;
+}
+
+/**
+ * 本番の承認 push 送出子（push v1）。送るかどうかの判断は hub の dispatcher へ依頼し（在席判定・間引きを
+ * 一元化）、hub に届かないときだけ同じ dispatcher を自プロセスで動かす（在席情報なし = 登録端末すべてへ）。
+ * 成否は承認の可否判断に影響しない（呼び手が時間上限で打ち切る）。
+ */
+export function makeHookPushNotifier(options: {
+  hubSocketPath?: string;
+  hubRequestTimeoutMs?: number;
+  localDispatcher?: () => PushDispatcher;
+} = {}): ApprovalPushNotifier {
+  return async (request) => {
+    const event: HubPushEvent = {
+      kind: "approval",
+      session: request.session,
+      id: request.approvalId,
+      tool: request.tool,
+      body: approvalNotificationBody(request),
+    };
+    const socketPath = options.hubSocketPath ?? resolveHubSocketPath();
+    // hub へ渡せたら、その後は決して自分では送らない（hub の応答が遅くても二重に送らない）。
+    if (await requestHubPush(event, socketPath, options.hubRequestTimeoutMs ?? HUB_PUSH_RPC_TIMEOUT_MS) === "delivered") return;
+    // hub が居ないときだけ自分で送る。端末記録は読むだけで、間引きの記録・端末記録・最後の送信結果は書かない
+    // （書き手は hub だけ。同じ承認の重複は apns-collapse-id = 承認 id で表示上 1 件になる）。
+    const dispatcher = options.localDispatcher?.() ?? createProductionPushDispatcher({
+      titleFor: makeSessionTitleResolver(new SessionMetadataStore()),
+      // hook の送信予算（既定 5 秒）に 1 回分が収まる長さ。打ち切られても送信自体は続く（hook は再接続待ちで残る）。
+      relayTimeoutMs: 3_500,
+      readOnly: true,
+    });
+    await dispatcher.notify(event);
+  };
+}
+
 /** 背景 push を送出する。timeLimit で打ち切り、成否は deny 判断に影響しない。 */
 async function sendBackgroundPush(
   notifier: ApprovalPushNotifier,
@@ -983,6 +1096,8 @@ interface ParsedPreToolUse {
   agentId?: string;
   /** サブエージェントの種類（`agent_type`）。CLI 内部の複製には付かない。 */
   agentType?: string;
+  /** StopFailure の `error`（`rate_limit` / `server_error` / `authentication_failed` 等。実測 2.1.322）。 */
+  stopFailureError?: string;
 }
 
 /**
@@ -1039,6 +1154,9 @@ function parsePreToolUse(data: Buffer): ParsedPreToolUse {
   if (typeof raw["session_id"] === "string" && raw["session_id"].length > 0) parsed.sessionId = raw["session_id"];
   if (typeof raw["agent_id"] === "string" && raw["agent_id"].length > 0) parsed.agentId = raw["agent_id"];
   if (typeof raw["agent_type"] === "string" && raw["agent_type"].length > 0) parsed.agentType = raw["agent_type"];
+  if (parsed.eventName === "StopFailure" && typeof raw["error"] === "string" && /^[a-z_]{1,64}$/u.test(raw["error"])) {
+    parsed.stopFailureError = raw["error"];
+  }
   const response = raw["tool_response"];
   if (typeof response === "object" && response !== null && !Array.isArray(response)) {
     const decision = (response as Record<string, unknown>)["permissionDecision"];
@@ -1151,7 +1269,7 @@ export async function runHookCommand(args: string[]): Promise<number> {
     observationBase: defaultObservationBase(),
     imagesPendingBase:
       imagesDirArg !== null ? path.join(imagesDirArg, "pending") : defaultImagesPendingBase(),
-    notifier: makeProductionPushNotifier(),
+    notifier: makeHookPushNotifier(),
     pushObserver,
     retryConnectIntervalSeconds: retryIntervalSeconds,
     heartbeatDir: defaultHeartbeatDir(),
@@ -1161,7 +1279,7 @@ export async function runHookCommand(args: string[]): Promise<number> {
     ...(effectiveSession !== null
       ? {
           permissionModeProvider: makeTmuxPermissionModeProvider(effectiveSession),
-          presenceProbe: makePresenceProbe(),
+          presenceProbe: makeMacAttachedProbe(),
         }
       : {}),
   });

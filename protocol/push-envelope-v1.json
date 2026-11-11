@@ -1,0 +1,13 @@
+{
+  "description": "push envelope v1 golden vector (ChaCha20-Poly1305)",
+  "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  "nonce": "QEFCQ0RFRkdISUpL",
+  "aad": "tailii-push-v1:Yw3NKWbEM2Y",
+  "plaintext": "{\"v\":1,\"kind\":\"turn_done\",\"session\":\"s-29702ec1\",\"title\":\"通知の設計\",\"body\":\"作業が完了しました。テストは全て通っています。\",\"id\":\"turn-1\",\"ts\":1794300000}",
+  "tp": {
+    "v": 1,
+    "k": "Yw3NKWbEM2Y",
+    "n": "QEFCQ0RFRkdISUpL",
+    "c": "g3YKo0h7wiMzpphkmdVPucG-DUcgky8K3CDwKI9USQOf3btKBDhPxDNYH3UPN9-8zXEYoIoa6A3h4Oa7koysxCixh7X7vg-DyixBq6FBQRP_YbLKQSEGyxCSLaHp8g6QJL5t27tnlMnhWgcniiaFOSAaNn43HSauapdG-tu5gaM9tZ4qFCcTHepbp4ZYfxRRCqc8BkVPgiVwshTgSJz2WVEYCAVxWU_RUZqzHVvbtUcL-q96tZ6VhOh8LjmSKsIjtwUa84ekUcc"
+  }
+}

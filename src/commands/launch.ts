@@ -5,6 +5,7 @@
 // この起動プロセス限定に渡し（settings.json は書かない）、SessionMetadataStore に cwd を権威記録
 // する。SSH exec は非ログインシェルのため PATH を明示注入する。
 
+import { readObservedClaudeVersion } from "../shared/claudeVersionRecord.js";
 import { execFile, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -626,6 +627,11 @@ export async function launchCore(options: {
    * 会話を始めるため、transcript slug / 画面の起点をそちらに揃える（worktree-from-pr）。
    */
   recordCwd?: string | null;
+  /**
+   * host が起動した claude の版（hub が transcript で観測した最新の値。StopFailure hook の出し分け, push v1）。
+   * テスト注入用。既定は `~/.tailii/host/claude-version.json` を読む（同期の読み込み 1 回）。
+   */
+  claudeVersion?: () => string | null;
 }): Promise<number> {
   const { session, binaryPath, tmuxPath, store, now, errorSink } = options;
   const agent: LaunchAgent = options.agent ?? "claude";
@@ -665,6 +671,7 @@ export async function launchCore(options: {
       ...(options.hookGlobalMarkerPath !== undefined && {
         globalMarkerPath: options.hookGlobalMarkerPath,
       }),
+      claudeVersion: (options.claudeVersion ?? (() => readObservedClaudeVersion()))(),
     });
     // 出力スタイル（Concise 等）も同じ起動限定 `--settings` に合成する（settings.json は書かない）。
     const launchSettings = mergeClaudeLaunchSettings(hookSettings, options.outputStyle ?? null);

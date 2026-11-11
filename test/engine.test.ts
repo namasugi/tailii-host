@@ -1686,9 +1686,9 @@ describe("EngineControl — 横断制御チャネル", () => {
 
     // managed は host-auto-update の能力広告（開発ツリー実行のため false）。
     // latestClientBuild は記録が無くても host 版のピンを広告する（host 先行更新でも
-    // 古いアプリへ更新導線を出すため）。
+    // 古いアプリへ更新導線を出すため）。push: 1 はプッシュ通知の登録を受け付ける能力（push v1）。
     expect(await engine.lines.nextOfType("channel_hello")).toBe(
-      `{"latestClientBuild":"${CLIENT_BUILD_PIN}","managed":false,"maxVersion":2,`
+      `{"latestClientBuild":"${CLIENT_BUILD_PIN}","managed":false,"maxVersion":2,"push":1,`
         + '"serverVersion":"0.1.0","type":"channel_hello","v":1}',
     );
     currentVersion = "0.2.0";

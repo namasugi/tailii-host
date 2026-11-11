@@ -41,7 +41,10 @@ import { TranscriptTailer } from "../chat/transcriptTailer.js";
 import { LineWriter } from "../shared/lineWriter.js";
 import { NdjsonLineSplitter } from "../shared/lineSplitter.js";
 import { PanePreviewPump } from "./panePreviewPump.js";
-import { makeUsageLimitPushNotifier } from "../push/approvalPushNotifier.js";
+import { createProductionPushDispatcher } from "../push/pushDispatcher.js";
+import { makeSessionTitleResolver } from "../push/pushContent.js";
+import { PushDeviceStore } from "../push/pushDeviceStore.js";
+import { ClaudeVersionRecorder } from "../shared/claudeVersionRecord.js";
 import { parseUsageLimitWait } from "../shared/usageLimitWait.js";
 import { makeSessionBackend } from "../backend/sessionBackend.js";
 import { Writable } from "node:stream";
@@ -598,6 +601,7 @@ export async function runHubCommand(args: string[]): Promise<number> {
     followupWork.add(work);
     void work.finally(() => followupWork.delete(work));
   };
+  const pushDevices = new PushDeviceStore();
   const hub = new SessionHub({
     runner,
     imageService,
@@ -650,8 +654,13 @@ export async function runHubCommand(args: string[]): Promise<number> {
     questionInjector: (answers, session) => injectQuestionAnswers(answers, session, sessionBackend),
     // 回答キーは設問ダイアログが TUI に出ているときだけ打つ（question-stale）。
     questionDialogVisible: (session) => questionDialogVisible(session, sessionBackend),
-    // 使用量制限の自動再開待ちを push で知らせる（usage-limit-wait。APNs 未設定なら内部で skip）。
-    usageLimitNotify: makeUsageLimitPushNotifier(log),
+    // プッシュ通知（push v1）: 完了・設問・エラー・使用量制限・hook からの承認の送信判断と在席判定。
+    // 登録端末が無ければ内部で見送る（観測ログだけ残る）。
+    pushDispatcher: createProductionPushDispatcher({ titleFor: makeSessionTitleResolver(metadataStore), log, store: pushDevices }),
+    // 端末記録の書き手は hub だけ（engine の登録・解除はここへ中継される）。dispatcher と同じ一覧を共有する。
+    pushDevices,
+    // host が起動した Claude の版（transcript で観測）。launch が StopFailure hook の出し分けに読む。
+    claudeVersionRecorder: new ClaudeVersionRecorder(),
     // CLI のキューに溜まっている発話を今すぐ届ける（chat-send-now）。
     sendNowInjector: (session) => sessionBackend.sendQueuedNow(session),
     // 背景エージェントの全停止（subagent-control）: Claude Code の `chat:killAgents`（既定 ctrl+x ctrl+k）は

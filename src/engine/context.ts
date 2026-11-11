@@ -53,6 +53,8 @@ export interface EngineState {
   apiDelegateResponses?: Map<string, Extract<ControlMessage, { type: "api_delegate_response" }>>;
   apiDelegateCancelled?: Set<string>;
   apiDelegateAttempted?: Set<string>;
+  /** この接続の端末が最後に申告した在席（push v1。hub 再接続時に送り直す）。 */
+  pushPresence?: { deviceId: string; state: "foreground" | "background" };
 }
 
 export interface ModeTiming {

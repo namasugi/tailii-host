@@ -171,7 +171,7 @@ describe("ChatTailController — codex モード", () => {
       ["assistant", "完了しました"],
       ["system", "<host-now>"], // pc:history-done（本文は追いついた時点の host 時刻）
     ]);
-    expect(lifecycle).toEqual([{ state: "done", turnId: "turn-x" }]);
+    expect(lifecycle).toEqual([{ state: "done", turnId: "turn-x", outcome: "completed" }]);
     // codex モードでは usage 集計対象パスは返さない。
     expect(controller.currentTranscriptPath()).toBeNull();
   });

@@ -1,0 +1,12 @@
+{"bundleId":"com.namasugi.tailii","deviceId":"7B0C3A52-6E7B-4C1D-9A55-0F2E4B1C9D10","deviceName":"iPhone","deviceToken":"0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9","environment":"production","id":"pr-1","prefs":{"approval":true,"question":true,"showBody":true,"turnDone":true,"turnError":true,"usageLimit":true},"pushKey":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8","relay":{"capability":"v1.c2VhbGVkLWNhcGFiaWxpdHk","expiresAt":1802076000,"url":"https://example.lambda-url.ap-northeast-1.on.aws"},"type":"push_register","v":1}
+{"bundleId":"com.namasugi.tailii","deviceId":"7B0C3A52-6E7B-4C1D-9A55-0F2E4B1C9D10","deviceName":"iPhone","deviceToken":"0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9","environment":"sandbox","id":"pr-2","prefs":{"approval":true,"question":true,"showBody":false,"turnDone":false,"turnError":true,"usageLimit":true},"pushKey":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8","type":"push_register","v":1}
+{"id":"pr-1","status":"ok","transport":"relay","type":"push_register_result","v":1}
+{"capabilityInvalid":true,"id":"pr-3","status":"ok","transport":"none","type":"push_register_result","v":1}
+{"error":"pushKey が 32 バイトではありません","id":"pr-4","status":"failed","transport":"none","type":"push_register_result","v":1}
+{"deviceId":"7B0C3A52-6E7B-4C1D-9A55-0F2E4B1C9D10","id":"pu-1","type":"push_unregister","v":1}
+{"id":"pu-1","status":"ok","type":"push_unregister_result","v":1}
+{"deviceId":"7B0C3A52-6E7B-4C1D-9A55-0F2E4B1C9D10","state":"foreground","type":"client_presence","v":1}
+{"deviceId":"7B0C3A52-6E7B-4C1D-9A55-0F2E4B1C9D10","state":"background","type":"client_presence","v":1}
+{"id":"pp-1","type":"presence_ping","v":1}
+{"id":"pp-1","type":"presence_pong","v":1}
+{"hostName":"Alice's Mac mini","maxVersion":2,"push":1,"serverVersion":"0.21.0","type":"channel_hello","v":2}

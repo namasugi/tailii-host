@@ -53,6 +53,7 @@ import {
   chatContentKey,
   type CodexAppServerThreadRuntime,
   type CodexNativeTurnControllerOptions,
+  type CodexTurnOutcome,
   type CodexTurnControllerRuntime,
 } from "../codex/codexNativeTurnController.js";
 import {
@@ -65,6 +66,19 @@ import {
 import type { SessionMeta } from "../sessions/sessionMetadataStore.js";
 import { claudeTranscriptPathFor } from "../sessions/transcriptPath.js";
 import { isNonBlockingQuestionId } from "../codex/codexAsyncQuestion.js";
+import { randomUUID } from "node:crypto";
+import { describeUsageLimitWait } from "../shared/usageLimitWait.js";
+import type { PresenceState, PushDispatcher, PushPresenceConnection } from "../push/pushDispatcher.js";
+import { isValidDeviceId, normalizeDeviceId, type PushDeviceStore } from "../push/pushDeviceStore.js";
+import { handlePushRegister, handlePushUnregister } from "../push/pushRegistration.js";
+import { findTrailingClaudeVersion } from "../shared/claudeVersionRecord.js";
+import type { ApnsConfigStore } from "../push/apnsConfigStore.js";
+import {
+  findTrailingAssistantText,
+  questionNotificationBody,
+  summarizeForNotification,
+  TURN_DONE_BODY_CHARS,
+} from "../push/pushContent.js";
 
 export interface HubTail {
   open(cwd: string, preferredSessionId: string | null, newerThanMs?: number | null, agent?: ChatAgent): void;
@@ -164,6 +178,26 @@ export type SessionHubOptions = Omit<ReaperTickOptions, "now"> & {
    * Enter 待ち・停止・再開を 1 回ずつ通知する。省略時は通知しない（テスト / push 未設定）。
    */
   usageLimitNotify?: (session: string, state: UsageLimitWaitState | { kind: "resumed" }) => void;
+  /**
+   * プッシュ通知の送信判断（push v1, docs/push-notifications.md §5・§6）。指定すると完了・設問・エラー・
+   * 使用量制限・hook からの承認をここへ渡し、在席判定（接続ごとの `client_presence` と presence_ping）も
+   * この hub の接続一覧から行う。使用量制限は `usageLimitNotify`（購読者ゼロでだけ送る旧経路）より優先する。
+   */
+  pushDispatcher?: PushDispatcher;
+  /**
+   * 端末記録（push v1）。書き手は hub だけで、engine から中継された登録・解除をここへ保存する。
+   * dispatcher と同じインスタンスを渡す（メモリ上の一覧を共有する）。省略時は登録を failed で返す。
+   */
+  pushDevices?: PushDeviceStore;
+  /** 登録の結果に返す経路の判断に使う APNs 設定（テスト注入用。既定は `~/.tailii/apns/config.json`）。 */
+  pushApnsConfigStore?: ApnsConfigStore;
+  /**
+   * host が起動した Claude の版の記録（transcript の `version` をターンの終わりに観測して渡す。launch が
+   * StopFailure hook の登録の出し分けに読む）。省略時は観測しない。
+   */
+  claudeVersionRecorder?: { observe(version: string): void };
+  /** presence_ping の応答待ちのタイマー（テスト注入用。既定は setTimeout）。 */
+  pushPingTimers?: { set: (callback: () => void, ms: number) => unknown; clear: (handle: unknown) => void };
   chatInjector?: (text: string, session: string, context: ChatInjectContext) => Promise<void>;
   /**
    * CLI のキューに溜まっている発話を今すぐ届ける（chat-send-now）。backend の `sendQueuedNow`。
@@ -432,6 +466,33 @@ class StaleQuestionError extends Error {
   }
 }
 
+/** 通知済みの Codex の turn の保持上限と保持期間。 */
+const NOTIFIED_CODEX_TURNS_MAX = 1_000;
+const NOTIFIED_CODEX_TURN_TTL_MS = 6 * 60 * 60 * 1000;
+
+/** 承認の保留・解決の記録の上限（push の前の照合用）。 */
+const APPROVAL_STATES_MAX = 1_000;
+
+/** Claude の API エラー終端の通知本文（transcript の error 種別から。不明は汎用の文言）。 */
+export function claudeApiErrorNotificationBody(errorKind: string | null | undefined): string {
+  switch (errorKind) {
+    case "server_error":
+    case "overloaded":
+      return "API が混み合っているため作業が止まりました";
+    case "authentication_failed":
+    case "oauth_org_not_allowed":
+      return "認証エラーで作業が止まりました。ログインし直してください";
+    case "billing_error":
+      return "支払い・利用枠の問題で作業が止まりました";
+    case "max_output_tokens":
+      return "出力の上限に達して作業が止まりました";
+    case "model_not_found":
+      return "モデルが見つからず作業が止まりました";
+    default:
+      return "API エラーで作業が止まりました";
+  }
+}
+
 export class SessionHub {
   private readonly clients = new Map<object, (line: string) => void>();
   /** 一覧 Mission Control の watcher（処理中会話全体の pane_preview 配信先）。 */
@@ -459,11 +520,33 @@ export class SessionHub {
   private retiredChatDeliveries = new Map<string, number>();
   private readonly activeCodexTurns = new Set<string>();
   private codexTurnController: CodexTurnControllerRuntime | null = null;
+  /** 接続ごとの在席の申告（push v1 §6。engine が iOS の `client_presence` を中継する）。 */
+  private readonly clientPresence = new Map<object, { deviceId: string; state: PresenceState }>();
+  /** 応答待ちの presence_ping（id → 送った接続と待ち手）。 */
+  private readonly presencePings = new Map<string, { client: object; settle: (alive: boolean) => void }>();
+  /** 会話ごとに最後に push した設問 id（同じ設問の再提示・復元で二重に送らない）。 */
+  private readonly pushedQuestionIds = new Map<string, string>();
+  /** 会話ごとに終端を通知した最後の Codex の turn id。 */
+  /** 終端を通知した Codex の turn（`session\0turnId` → 通知時刻 ms）。上限と保持期間つき。 */
+  private readonly notifiedCodexTurns = new Map<string, number>();
+  /** 会話ごとの世代（retire で進める）。承認の push は依頼を受けた時点の世代のままのときだけ送る。 */
+  private readonly sessionGenerations = new Map<string, number>();
+  /** push の送信待ちの承認 id（記録の上限による追い出しから守る）。 */
+  private readonly approvalPushesInFlight = new Set<string>();
+  /** hub の終了（close）後は push の受付・登録をしない。 */
+  private closed = false;
+  /** 承認の保留・解決（remote_pending / remote_pending_cleared から）。push の前に解決済みでないか照合する。 */
+  private readonly approvalStates = new Map<string, { session: string; resolved: boolean; generation: number }>();
+  /** Codex の現在のターンの最後の回答（購読者の有無に関係なく持つ。ターンの開始で捨てる）。 */
+  private readonly codexTurnAnswers = new Map<string, string>();
+  private readonly pushDispatcher: PushDispatcher | null;
 
   constructor(private readonly options: SessionHubOptions) {
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
     this.nowMs = options.nowMs ?? (() => Date.now());
     this.replayLimit = options.replayLimit ?? 500;
+    this.pushDispatcher = options.pushDispatcher ?? null;
+    this.pushDispatcher?.setPresence({ connections: (session) => this.pushConnections(session) });
   }
 
   get clientCount(): number { return this.clients.size; }
@@ -737,6 +820,8 @@ export class SessionHub {
 
   unregisterClient(client: object): void {
     this.clients.delete(client);
+    this.clientPresence.delete(client);
+    this.settlePresencePings(client, false);
     const wasWatcher = this.previewWatchers.delete(client);
     for (const [session, actor] of this.actors) {
       actor.focusedBy.delete(client);
@@ -815,6 +900,9 @@ export class SessionHub {
   }
 
   handleRelayMessage(message: EngineRelayMessage): void {
+    if ((message.type === "remote_pending" || message.type === "remote_pending_cleared") && message.kind === "approval") {
+      this.trackApproval(message.id, message.session, message.type === "remote_pending_cleared");
+    }
     if (message.type === "subagent_lifecycle") {
       const actor = this.actor(message.session);
       this.setAgentRunning(message.session, actor, message.agentId, message.event === "start", "hook");
@@ -835,7 +923,7 @@ export class SessionHub {
         const agent = this.actors.get(message.session)?.runningAgents.get(message.agentId);
         if (agent !== undefined) agent.seenAt = Date.now();
       }
-      if (!this.applyProcessing(message.session, message.state, message.event, message.atMs)) return;
+      if (!this.applyProcessing(message.session, message.state, message.event, message.atMs, message.error)) return;
     }
     this.broadcast(message);
   }
@@ -921,6 +1009,81 @@ export class SessionHub {
         session: message.session,
         subscriberCount,
       });
+      return;
+    }
+    if (message.type === "client_presence") {
+      // 在席の申告（push v1 §6）。deviceId は UUID の形だけ受け付ける（端末の記録と照合するため正規化する）。
+      if (isValidDeviceId(message.deviceId)) {
+        this.clientPresence.set(client, { deviceId: normalizeDeviceId(message.deviceId), state: message.state });
+        // 背景へ移った接続への応答待ちは、もう前面の証拠にならない（不在として解く）。
+        if (message.state === "background") this.settlePresencePings(client, false);
+      }
+      return;
+    }
+    if (message.type === "presence_pong") {
+      const ping = this.presencePings.get(message.id);
+      if (ping !== undefined && ping.client === client) {
+        this.presencePings.delete(message.id);
+        // pong を受けた時点の最新の申告で判断する（ping の後に背景を申告した接続の pong は在席にしない）。
+        ping.settle(this.clientPresence.get(client)?.state === "foreground");
+      }
+      return;
+    }
+    if (message.type === "push_device_register") {
+      // 端末登録（engine から中継）。書き手は hub だけなので、プロセス間の排他は要らない。
+      const devices = this.options.pushDevices;
+      if (devices === undefined || this.closed) {
+        this.sendTo(client, { type: "push_device_register_result", id: message.id, status: "failed", transport: "none",
+          error: "ホスト側の通知の受付が使えません" });
+        return;
+      }
+      const result = handlePushRegister(message.payload, {
+        store: devices,
+        ...(this.options.pushApnsConfigStore !== undefined ? { apnsConfigStore: this.options.pushApnsConfigStore } : {}),
+        nowSeconds: this.now(),
+      });
+      this.sendTo(client, {
+        type: "push_device_register_result", id: message.id, status: result.status, transport: result.transport,
+        ...(result.capabilityInvalid === true ? { capabilityInvalid: true } : {}),
+        ...(result.error !== undefined ? { error: result.error } : {}),
+      });
+      return;
+    }
+    if (message.type === "push_device_unregister") {
+      const devices = this.options.pushDevices;
+      const status = devices === undefined || this.closed ? "failed" : handlePushUnregister(message.deviceId, devices);
+      this.sendTo(client, { type: "push_device_unregister_result", id: message.id, status });
+      return;
+    }
+    if (message.type === "push_request") {
+      // hook からの送信依頼（承認）。受理だけ即答し、在席判定と送信は dispatcher に任せる（hook を待たせない）。
+      if (this.pushDispatcher === null) {
+        this.sendTo(client, { type: "push_request_result", id: message.id, status: "unavailable" });
+        return;
+      }
+      if (this.closed) {
+        this.sendTo(client, { type: "push_request_result", id: message.id, status: "unavailable" });
+        return;
+      }
+      this.sendTo(client, { type: "push_request_result", id: message.id, status: "accepted" });
+      const event = message.event;
+      const approvalId = event.kind === "approval" ? event.id : undefined;
+      if (approvalId === undefined) {
+        void this.pushDispatcher.notify(event);
+        return;
+      }
+      // 依頼を受けた時点で追跡を始める（remote_pending が届いていなくても）。送信待ちの間は記録を追い出さない。
+      // 在席確認・再試行の間に hook が再接続して承認・拒否された（remote_pending_cleared）・会話が終わった
+      // （retire で世代が進んだ）承認は「承認待ち」として送らない。
+      this.trackApproval(approvalId, event.session, false);
+      this.approvalPushesInFlight.add(approvalId);
+      void this.pushDispatcher.notify({
+        ...event,
+        stillValid: () => {
+          const state = this.approvalStates.get(approvalId);
+          return state !== undefined && !state.resolved && state.generation === this.sessionGeneration(event.session);
+        },
+      }).finally(() => this.approvalPushesInFlight.delete(approvalId));
       return;
     }
     if (message.type === "question_answer_submit") {
@@ -1376,7 +1539,7 @@ export class SessionHub {
       if (actor?.runtimeClaim?.client === client) actor.runtimeClaim = null;
       return;
     }
-    if (!this.applyProcessing(message.session, message.state, message.event, message.atMs)) return;
+    if (!this.applyProcessing(message.session, message.state, message.event, message.atMs, message.error)) return;
     this.broadcast(message);
   }
 
@@ -1423,6 +1586,10 @@ export class SessionHub {
   }
 
   close(): void {
+    // push の受付を止め、予約・保留を解く（終了後にタイマーが発火して通知を送らない）。
+    this.closed = true;
+    this.pushDispatcher?.dispose();
+    for (const client of [...this.clientPresence.keys()]) this.settlePresencePings(client, false);
     for (const recheck of this.staleQuestionRechecks.values()) clearTimeout(recheck.timer);
     this.staleQuestionRechecks.clear();
     for (const actor of this.actors.values()) {
@@ -1442,6 +1609,17 @@ export class SessionHub {
     // 下の early return より前で送る。誕生イベントは出さない（一覧は起動時に自分で取り直す）。
     for (const watcher of this.previewWatchers) {
       this.sendTo(watcher, { type: "conversation_liveness", session, alive: false });
+    }
+    // 終わった会話の完了通知の予約・設問の送信記録は持ち越さない。保留中の承認は解決済みにする（push v1）。
+    this.pushDispatcher?.cancelTurnDone(session);
+    this.pushedQuestionIds.delete(session);
+    this.codexTurnAnswers.delete(session);
+    for (const state of this.approvalStates.values()) {
+      if (state.session === session) state.resolved = true;
+    }
+    this.sessionGenerations.set(session, this.sessionGeneration(session) + 1);
+    for (const key of this.notifiedCodexTurns.keys()) {
+      if (key.startsWith(`${session}\0`)) this.notifiedCodexTurns.delete(key);
     }
     const actor = this.actors.get(session);
     if (actor === undefined) return;
@@ -1906,6 +2084,14 @@ export class SessionHub {
           this.options.log?.(
             `Codex rollout terminal event で処理完了を補完 session=${session} turn=${event.turnId}`,
           );
+          // 補完した turn の終わり方も rollout から回収して知らせる（この後で最後の購読者が離れて thread が閉じると、
+          // App Server の turn/completed は届かない）。後から turn/completed が届いても turn id で 1 回にまとまる。
+          if (event.outcome !== undefined) {
+            this.handleCodexTurnOutcomePush(session, {
+              status: event.outcome, turnId: event.turnId,
+              ...(event.errorMessage !== undefined ? { errorMessage: event.errorMessage } : {}),
+            }, true);
+          }
         }
       },
     );
@@ -2883,11 +3069,19 @@ export class SessionHub {
     this.codexTurnController = create({
       appServer,
       log: (message) => this.options.log?.(message),
-      onProcessing: (session, state) => {
-        if (state === "active") this.activeCodexTurns.add(session);
-        else this.activeCodexTurns.delete(session);
+      onProcessing: (session, state, outcome) => {
+        if (state === "active") {
+          // 新しいターン: 前のターンの回答は完了通知の本文に使わない。
+          if (!this.activeCodexTurns.has(session)) this.codexTurnAnswers.delete(session);
+          this.activeCodexTurns.add(session);
+        } else {
+          this.activeCodexTurns.delete(session);
+        }
+        const wasProcessing = this.actors.get(session)?.processingSince != null;
         this.applyProcessing(session, state);
         this.broadcast({ type: "session_processing", session, state });
+        // Codex の turn 終了（turn/completed の status）を push へ（完了 = 3 秒待ち / 失敗 = turn_error / 中断 = 送らない）。
+        if (state === "done" && outcome !== undefined) this.handleCodexTurnOutcomePush(session, outcome, wasProcessing);
         // 購読者ゼロで turn が終われば接続を畳む。ただし目標（goal）が active な会話は畳まない:
         // 継続 turn は server 起点で、購読を落とすと処理中 / heartbeat / 完了通知を観測できない
         // （reaper が idle 扱いで pane を掃除する）ため（codex-goal）。
@@ -2930,8 +3124,14 @@ export class SessionHub {
         this.broadcast({ type: "question_event", session, event: "dismiss", id });
         void this.drainChatQueue(session, actor);
       },
-      onChatItem: ({ session, itemId, payload }) =>
-        this.handleCodexChatItem(session, itemId, payload),
+      onChatItem: ({ session, itemId, payload }) => {
+        // 完了通知の本文用に、今のターンの最後の回答を持つ（購読者ゼロでも。下の配信は購読者がいるときだけ）。
+        if (payload.type === "chat_output" && payload.role === "assistant" && !payload.streamId.startsWith("pc:") &&
+          payload.text.trim().length > 0) {
+          this.codexTurnAnswers.set(session, payload.text);
+        }
+        this.handleCodexChatItem(session, itemId, payload);
+      },
       onDisconnect: (session, error) => this.handleCodexDisconnect(session, error),
       onThreadTitle: ({ session, threadId, title, source, attempts, error }) => {
         if (error !== null) {
@@ -3188,8 +3388,13 @@ export class SessionHub {
     // API エラー後は queued 発話の自動 dequeue や task-notification の再開が数十 ms で始まり得る
     // （実測 51〜69ms）ため、窓を張ると生きた新ターンの継続 hook を握り潰して idle へ書き戻す。
     if (event.kind === "interrupted") actor.lastInterruptDoneMs = this.nowMs();
+    // 現在のターンの終端と確かめた後でだけ完了通知の予約を取り消す（履歴再生の古いマーカーで、今回の Stop の
+    // 予約を消さない）。
+    this.pushDispatcher?.cancelTurnDone(session);
     this.applyProcessing(session, "done");
     this.broadcast({ type: "session_processing", session, state: "done" });
+    // 進行中のターンが API エラーで終わった（rate_limit は使用量制限の見張りが知らせる）→ turn_error。
+    if (event.kind === "api_error" && event.errorKind !== "rate_limit") this.notifyTurnError(session, actor, claudeApiErrorNotificationBody(event.errorKind));
   }
 
   /** 見張りを武装する制限到達マーカーの新しさ（履歴再生の古い rate_limit では武装しない）。 */
@@ -3252,8 +3457,9 @@ export class SessionHub {
         watch.missingTimer = null;
       }
       // 同じ状態への戻り（猶予中の再観測）は再通知しない。
-      if (unattended && !sameUsageLimitWait(previous, state)) this.options.usageLimitNotify?.(session, state);
+      // 状態を更新してから通知する（dispatcher の有効性確認は「いまの待機の状態」と照合する）。
       watch.state = state;
+      if (!sameUsageLimitWait(previous, state)) this.notifyUsageLimit(session, state, unattended);
       if (watch.timer !== null) clearTimeout(watch.timer);
       watch.timer = setTimeout(() => {
         if (this.actors.get(session) === actor && actor.usageLimitWatch === watch) {
@@ -3271,8 +3477,8 @@ export class SessionHub {
     watch.missingTimer = setTimeout(() => {
       if (this.actors.get(session) !== actor || actor.usageLimitWatch !== watch) return;
       this.options.log?.(`usage-limit-wait 消失で解除 session=${session} last=${previous.kind}`);
-      if (previous.kind === "resuming" && actor.subscribers.size === 0) {
-        this.options.usageLimitNotify?.(session, { kind: "resumed" });
+      if (previous.kind === "resuming") {
+        this.notifyUsageLimit(session, { kind: "resumed" }, actor.subscribers.size === 0);
       }
       this.disarmUsageLimitWatch(session, actor);
     }, SessionHub.USAGE_LIMIT_MISSING_GRACE_MS);
@@ -3295,8 +3501,9 @@ export class SessionHub {
    * 処理中状態を反映する。戻り値 false は「中断済みターンの残響として無視した」（呼び手は
    * broadcast しない）。`event` は hook 名（relay 由来。codex controller / 旧 hook は undefined）。
    */
-  private applyProcessing(session: string, state: "active" | "done", event?: string, atMs?: number): boolean {
+  private applyProcessing(session: string, state: "active" | "done", event?: string, atMs?: number, error?: string): boolean {
     const actor = this.actor(session);
+    const wasProcessing = actor.processingSince !== null;
     if (state === "active") {
       // 発火時刻付きの hook（hook プロセスの開始時刻。node 起動遅延を含まない）が transcript の最新の
       // ターン終端（中断確定 / API エラー）より前（かつ配送遅延として説明できる古さ）なら、既に終わった
@@ -3331,11 +3538,13 @@ export class SessionHub {
         return false;
       }
       actor.processingSince = this.now();
+      // 完了通知の 3 秒待ちの間に処理へ戻った（送信待ちの自動投入・task-notification の再開・遅着 Stop）→ 送らない。
+      this.pushDispatcher?.cancelTurnDone(session);
       // 使用量制限の待機中に処理へ戻った = 自動再開（usage-limit-wait）。pane の過渡表示を取りこぼしても
       // 処理中遷移を権威に「再開した」を知らせ、見張りを畳む。
       if (actor.usageLimitWatch !== null && actor.usageLimitWatch.state !== null) {
         this.options.log?.(`usage-limit-wait 処理再開で解除 session=${session}`);
-        if (actor.subscribers.size === 0) this.options.usageLimitNotify?.(session, { kind: "resumed" });
+        this.notifyUsageLimit(session, { kind: "resumed" }, actor.subscribers.size === 0);
         this.disarmUsageLimitWatch(session, actor);
       }
       // ターン開始は UserPromptSubmit で確定し、継続 hook では進めない（未確定なら今）。
@@ -3368,6 +3577,17 @@ export class SessionHub {
       actor.processingSince = null;
       actor.processingSinceMs = null;
       actor.turnStartFiredAtMs = null;
+      // Claude のターン完了（Stop hook）。利用者の中断・API エラーは Stop が来ないので含まれない。
+      if (event === "Stop" && wasProcessing) this.scheduleTurnDonePush(session, actor);
+      if (event === "Stop" || event === "StopFailure") this.observeClaudeVersion(session);
+      // API エラーで終わったターン（StopFailure hook）。購読者がいなくても届く唯一の失敗の知らせ。
+      if (event === "StopFailure") {
+        // 終端の時刻は処理中だったかどうかに関係なく記録する（開始の hook より先に届いた失敗でも、後から遅着した
+        // その開始の hook を「終わったターンの遅着」として捨てられるように）。時刻は hook の発火時刻（late-hook
+        // 判定と同じ基準）。通知するかどうかだけを、処理中だったかで決める。
+        actor.lastTurnEndMs = Math.max(actor.lastTurnEndMs ?? 0, atMs ?? this.nowMs());
+        if (wasProcessing) this.handleStopFailurePush(session, actor, error);
+      }
     }
     // 一覧 watch 中は処理開始/完了で pump を起動/停止する（前面購読とは独立）。
     this.syncPreview(session, actor);
@@ -3450,8 +3670,216 @@ export class SessionHub {
   }
 
   private setPendingQuestion(session: string, actor: SessionActor, pending: PendingQuestion | null): void {
+    const previousId = actor.pendingQuestion?.id ?? null;
     actor.pendingQuestion = pending;
     this.persistPendingQuestions();
+    // 新しい設問を push（push v1 §5）。turn を止めない Codex の非同期質問は送らない。同じ設問の
+    // 再提示（stale の再確認・注入失敗の復元）では送り直さない。
+    if (pending !== null && pending.id !== previousId && !isNonBlockingQuestionId(pending.id) &&
+      this.pushedQuestionIds.get(session) !== pending.id && this.pushDispatcher !== null) {
+      this.pushedQuestionIds.set(session, pending.id);
+      const questions = pending.questions;
+      const questionId = pending.id;
+      void this.pushDispatcher.notify({
+        kind: "question", session, id: questionId, body: () => questionNotificationBody(questions),
+        // 在席確認の間に答えられた・片付いた設問は送らない。
+        stillValid: () => this.actors.get(session) === actor && actor.pendingQuestion?.id === questionId,
+      }).then((outcome) => {
+        // 送れなかった（見送り・失敗）なら記録を戻し、同じ設問の再提示で改めて判断できるようにする。
+        if (outcome.status !== "sent" && this.pushedQuestionIds.get(session) === questionId) {
+          this.pushedQuestionIds.delete(session);
+        }
+      });
+    }
+  }
+
+  // MARK: - プッシュ通知（push v1）
+
+  /** 在席判定に渡す、生きている接続の申告と表示中の会話（push v1 §6）。 */
+  private pushConnections(session: string): PushPresenceConnection[] {
+    const actor = this.actors.get(session);
+    const connections: PushPresenceConnection[] = [];
+    for (const [client, presence] of this.clientPresence) {
+      if (!this.clients.has(client)) continue;
+      connections.push({
+        key: client,
+        deviceId: presence.deviceId,
+        state: presence.state,
+        // preview = 前面購読（engine の activeChatSession）。背景購読は「表示中」ではない。
+        viewing: actor?.subscribers.get(client)?.preview === true,
+        ping: (timeoutMs) => this.pingClient(client, timeoutMs),
+      });
+    }
+    return connections;
+  }
+
+  /** host が起動した Claude の会話の transcript 末尾から版を読み、記録へ渡す（ターンの終わりに 1 回）。 */
+  private observeClaudeVersion(session: string): void {
+    const recorder = this.options.claudeVersionRecorder;
+    if (recorder === undefined) return;
+    const meta = this.options.metadataStore.get(session);
+    if (meta === null || meta.agent === "codex") return;
+    const transcriptPath = (this.options.transcriptPathFor ?? defaultTranscriptPathFor)(meta);
+    const version = transcriptPath === null ? null : findTrailingClaudeVersion(transcriptPath);
+    if (version !== null) recorder.observe(version);
+  }
+
+  /** 承認の保留・解決を記録する（古いものから捨て、上限を超えて溜めない）。 */
+  private trackApproval(id: string, session: string, resolved: boolean): void {
+    const previous = this.approvalStates.get(id);
+    this.approvalStates.delete(id);
+    this.approvalStates.set(id, {
+      session,
+      resolved: resolved || previous?.resolved === true,
+      generation: previous?.generation ?? this.sessionGeneration(session),
+    });
+    // 古いものから捨てる。送信待ちの承認の記録は捨てない（捨てると解決済みが分からなくなる）。
+    if (this.approvalStates.size <= APPROVAL_STATES_MAX) return;
+    for (const key of [...this.approvalStates.keys()]) {
+      if (this.approvalStates.size <= APPROVAL_STATES_MAX) break;
+      if (!this.approvalPushesInFlight.has(key)) this.approvalStates.delete(key);
+    }
+  }
+
+  private sessionGeneration(session: string): number {
+    return this.sessionGenerations.get(session) ?? 0;
+  }
+
+  /** その接続への応答待ちの presence_ping をすべて解く。 */
+  private settlePresencePings(client: object, alive: boolean): void {
+    for (const [id, ping] of this.presencePings) {
+      if (ping.client === client) {
+        this.presencePings.delete(id);
+        ping.settle(alive);
+      }
+    }
+  }
+
+  /** 接続へ presence_ping を送り、timeoutMs 以内に presence_pong が返れば true。 */
+  private pingClient(client: object, timeoutMs: number): Promise<boolean> {
+    if (!this.clients.has(client)) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      const id = randomUUID();
+      const timers = this.options.pushPingTimers ?? {
+        set: (callback: () => void, ms: number): unknown => {
+          const timer = setTimeout(callback, ms);
+          timer.unref?.();
+          return timer;
+        },
+        clear: (handle: unknown): void => clearTimeout(handle as ReturnType<typeof setTimeout>),
+      };
+      const timer = timers.set(() => {
+        if (this.presencePings.delete(id)) resolve(false);
+      }, Math.max(0, timeoutMs));
+      this.presencePings.set(id, {
+        client,
+        settle: (alive) => {
+          timers.clear(timer);
+          resolve(alive);
+        },
+      });
+      this.sendTo(client, { type: "presence_ping", id });
+    });
+  }
+
+  /** Claude / Codex のターン完了 → 3 秒後に完了通知（その間に処理中へ戻ったら送らない）。 */
+  private scheduleTurnDonePush(session: string, actor: SessionActor): void {
+    this.pushDispatcher?.scheduleTurnDone(session, {
+      isStillDone: () => this.actors.get(session) === actor && actor.processingSince === null,
+      body: () => summarizeForNotification(this.lastAssistantText(session), TURN_DONE_BODY_CHARS),
+    });
+  }
+
+  /**
+   * 最後の応答の本文。Claude は transcript 末尾、Codex は今のターンで受けた最後の回答（購読者の有無に関係なく
+   * 持つ）。取れなければ null（定型文）。replay buffer は前のターンの内容が残りうるので使わない。
+   */
+  private lastAssistantText(session: string): string | null {
+    const meta = this.options.metadataStore.get(session);
+    if (meta?.agent === "codex") return this.codexTurnAnswers.get(session) ?? null;
+    if (meta === null) return null;
+    const transcriptPath = (this.options.transcriptPathFor ?? defaultTranscriptPathFor)(meta);
+    return transcriptPath === null ? null : findTrailingAssistantText(transcriptPath);
+  }
+
+  /** Codex の turn の終わり方を push へ写す。 */
+  private handleCodexTurnOutcomePush(session: string, outcome: CodexTurnOutcome, wasProcessing: boolean): void {
+    const actor = this.actors.get(session);
+    if (actor === undefined) return;
+    // 処理中フラグとは別に、turn id ごとに終端を 1 回だけ知らせる（rollout からの補完が先に outcome 無しの done を
+    // 出して処理中を落としても、後から来た turn/completed の結果を捨てない）。turn id が無い旧形式は従来どおり。
+    if (outcome.turnId !== undefined) {
+      const key = `${session}\0${outcome.turnId}`;
+      if (this.notifiedCodexTurns.has(key)) return;
+      this.rememberNotifiedCodexTurn(key);
+    } else if (!wasProcessing) {
+      return;
+    }
+    if (outcome.status === "completed") {
+      this.scheduleTurnDonePush(session, actor);
+      return;
+    }
+    this.pushDispatcher?.cancelTurnDone(session);
+    if (outcome.status === "failed") this.notifyTurnError(session, actor, outcome.errorMessage ?? null, outcome.turnId);
+  }
+
+  /** 通知済みの Codex の turn を覚える（保持期間 6 時間・上限 1000 件。古いものから捨てる）。 */
+  private rememberNotifiedCodexTurn(key: string): void {
+    const now = this.nowMs();
+    this.notifiedCodexTurns.set(key, now);
+    for (const [entry, at] of this.notifiedCodexTurns) {
+      if (this.notifiedCodexTurns.size <= NOTIFIED_CODEX_TURNS_MAX && now - at <= NOTIFIED_CODEX_TURN_TTL_MS) break;
+      this.notifiedCodexTurns.delete(entry);
+    }
+  }
+
+  /** エラーで止まったターンを知らせる（在席確認の間に処理が再開していたら送らない = 利用者は既に対応している）。 */
+  private notifyTurnError(session: string, actor: SessionActor, body: string | null, id?: string): void {
+    this.pushDispatcher?.cancelTurnDone(session);
+    void this.pushDispatcher?.notify({
+      kind: "turn_error",
+      session,
+      ...(id !== undefined ? { id } : {}),
+      body,
+      stillValid: () => this.actors.get(session) === actor && actor.processingSince === null,
+    });
+  }
+
+  /**
+   * StopFailure hook（API エラーでターンが終わった。Stop の代わりに発火し、購読の有無に関係なく届く）。
+   * rate_limit は使用量制限の見張りを始め、それ以外は turn_error を送る。transcript の終端マーカー経由の
+   * 検知と二重にならないのは、どちらも「処理中だったターンを終わらせた側」だけが知らせるため
+   * （先に来た方が処理中を落とし、後から来た方は wasProcessing = false で何もしない）。
+   */
+  private handleStopFailurePush(session: string, actor: SessionActor, error: string | undefined): void {
+    this.pushDispatcher?.cancelTurnDone(session);
+    if (error === "rate_limit") {
+      this.armUsageLimitWatch(session, actor);
+      return;
+    }
+    this.notifyTurnError(session, actor, claudeApiErrorNotificationBody(error));
+  }
+
+  /**
+   * 使用量制限の遷移を知らせる。dispatcher があればそちらの在席判定に任せる（背景へ移った直後の猶予中の
+   * 接続も正しく不在と判定できる）。無ければ旧経路（購読者ゼロのときだけ `usageLimitNotify`）。
+   */
+  private notifyUsageLimit(session: string, state: UsageLimitWaitState | { kind: "resumed" }, unattended: boolean): void {
+    if (this.pushDispatcher !== null) {
+      const body = state.kind === "resumed"
+        ? "使用量制限の待機が終わり、作業を再開しました"
+        : describeUsageLimitWait(state);
+      const actor = this.actors.get(session);
+      void this.pushDispatcher.notify({
+        kind: "usage_limit", session, body,
+        // 待機の状態がまだ同じときだけ送る（在席確認の間に再開・別の状態へ移っていれば古い）。
+        ...(state.kind !== "resumed" && actor !== undefined
+          ? { stillValid: () => this.actors.get(session) === actor && sameUsageLimitWait(actor.usageLimitWatch?.state ?? null, state) }
+          : {}),
+      });
+      return;
+    }
+    if (unattended) this.options.usageLimitNotify?.(session, state);
   }
 
   private persistPendingQuestions(): void {

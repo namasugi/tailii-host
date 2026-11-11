@@ -7,12 +7,16 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { versionAtLeast } from "../shared/cliVersions.js";
 
 /**
  * Claude Code フックの外部タイムアウト（秒）。
  * hook の内部デッドラインより厳密に大きい値（内部 540 < OS 600）。
  */
 export const HOOK_EXTERNAL_TIMEOUT_SECONDS = 600;
+
+/** StopFailure hook を登録する claude の最低版（実在を確かめた最も古い版）。 */
+export const STOP_FAILURE_MINIMUM_CLAUDE_VERSION = "2.1.319";
 
 /**
  * claude 起動時に `--settings` へ渡す承認フック設定を JSON 文字列で返す。
@@ -33,6 +37,12 @@ export function claudeHookLaunchSettings(options: {
   session: string;
   /** グローバル無効化マーカーのパス（注入可能）。省略時は `~/.tailii/nohook`。 */
   globalMarkerPath?: string;
+  /**
+   * host が起動した claude の版（hub が transcript で観測した最新の値, "2.1.322"）。StopFailure は実在を確かめた
+   * 2.1.319 以上のときだけ登録する（それより古い版が未知の hook 名を含む `--settings` をどう扱うか確かめられない
+   * ため。未観測・null・省略は登録しない = 初回の会話では登録されず、版を観測した次の会話から登録される）。
+   */
+  claudeVersion?: string | null;
 }): string | null {
   const { dir, binaryPath, session } = options;
 
@@ -73,6 +83,11 @@ export function claudeHookLaunchSettings(options: {
       PostToolUse: entry(),
       UserPromptSubmit: lifecycleEntry(),
       Stop: lifecycleEntry(),
+      // API エラーでのターン終了（Stop の代わりに発火。購読に関係なく届く失敗の知らせ, push v1）。
+      // 2.1.319 / 2.1.321 / 2.1.322 の本体で実在を確認。それより古い版・版不明では登録しない。
+      ...(versionAtLeast(options.claudeVersion ?? null, STOP_FAILURE_MINIMUM_CLAUDE_VERSION) === true
+        ? { StopFailure: lifecycleEntry() }
+        : {}),
       // サブエージェントの開始 / 終了（会話一覧の「エージェント N」, session-agent-count）。
       SubagentStart: lifecycleEntry(),
       SubagentStop: lifecycleEntry(),

@@ -638,6 +638,8 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
       managed: installState.managed,
       ...(updateError !== undefined ? { updateError } : {}),
       ...(latestClientBuild !== null ? { latestClientBuild } : {}),
+      // プッシュ通知の登録を受け付ける（push v1）。アプリはこれがある host にだけ push_register を送る。
+      push: 1,
     });
 
     // ---- 1.5 画像 pending を drain し image_available を送出 ----
@@ -779,6 +781,14 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     const rpcDisconnectFailures = new Map<string, () => void>();
     hubLink.onMessage = (message) => {
       if (message.type === "hub_hello_ack") return;
+      if (message.type === "presence_ping") {
+        // push 直前の生存確認（push v1 §6）。iOS がすぐ presence_pong で応える（presence_pong ハンドラが hub へ返す）。
+        try { writer.write({ type: "presence_ping", v: state.negotiatedVersion, id: message.id }); }
+        catch (error) { process.stderr.write(`[tailii-host engine] presence_ping 書込失敗: ${String(error)}\n`); }
+        return;
+      }
+      // engine は push_request を送らない（hook の短命接続だけが使う）。届いても iOS へ流さない。
+      if (message.type === "push_request_result") return;
       if (message.type === "conversation_event") {
         let payload: ControlMessage | null = null;
         const isActive = message.session === activeChatSession.name;
@@ -922,6 +932,8 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
         message.type === "background_command_stop_result" ||
         message.type === "subagent_control_result" ||
         message.type === "presence_response" ||
+        message.type === "push_device_register_result" ||
+        message.type === "push_device_unregister_result" ||
         message.type === "conversation_subagent_transcript_response" ||
         message.type === "conversation_history_page_response") {
         rpcWaiters.get(message.id)?.(message);
@@ -1040,6 +1052,10 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
             active: true,
           });
         }
+      }
+      // 在席の申告も hub 側の接続状態なので、再接続（hub 再起動含む）ごとに送り直す（push v1 §6）。
+      if (state.pushPresence !== undefined) {
+        hubLink.send({ type: "client_presence", ...state.pushPresence });
       }
       // 一覧 watch は hub 側 client 状態なので、再接続（hub 再起動含む）ごとに再送する。
       if (listPreviewWatch.enabled) {

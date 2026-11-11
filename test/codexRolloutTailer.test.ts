@@ -253,7 +253,7 @@ describe("CodexRolloutTailer.streamForCwd（有限 tail）", () => {
 
     await collect(tailer, cwd);
 
-    expect(lifecycle).toEqual([{ state: "done", turnId: "turn-current" }]);
+    expect(lifecycle).toEqual([{ state: "done", turnId: "turn-current", outcome: "completed" }]);
   });
 
   test("初回EOF後に追記されたtask_completeをライブ通知する", async () => {
@@ -281,7 +281,37 @@ describe("CodexRolloutTailer.streamForCwd（有限 tail）", () => {
     fs.appendFileSync(rollout, taskLifecycle("task_complete", "turn-live") + "\n");
     await vi.waitFor(() => expect(lifecycle).toEqual([
       { state: "active", turnId: "turn-live" },
-      { state: "done", turnId: "turn-live" },
+      { state: "done", turnId: "turn-live", outcome: "completed" },
+    ]));
+    abort.abort();
+    await pump;
+  });
+
+  test("終端の終わり方: task_complete = 完了 / error 付き = 失敗（本文つき）/ turn_aborted = 中断（予算到達も中断）", async () => {
+    const root = makeTempDir("codex-lifecycle-outcome");
+    const cwd = makeTempDir("codex-lifecycle-outcome-cwd");
+    const rollout = writeRollout(root, "2026/07/31", "r.jsonl", cwd, [taskLifecycle("task_started", "t-ok")]);
+    const lifecycle: CodexTurnLifecycleEvent[] = [];
+    const abort = new AbortController();
+    const tailer = new CodexRolloutTailer({
+      sessionsRoot: root, pollIntervalMs: 5, tailIndefinitely: true, onTurnLifecycle: (event) => lifecycle.push(event),
+    });
+    const pump = (async () => {
+      for await (const _ of tailer.streamForCwd(cwd, null, abort.signal)) {
+        // lifecycle だけを検証する。
+      }
+    })();
+    await vi.waitFor(() => expect(lifecycle).toHaveLength(1));
+    fs.appendFileSync(rollout, [
+      taskLifecycle("task_complete", "t-ok"),
+      JSON.stringify({ type: "event_msg", payload: { type: "task_complete", turn_id: "t-fail",
+        error: { message: "Selected model is at capacity" } } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "turn_aborted", turn_id: "t-budget", reason: "budget_limited" } }),
+    ].join("\n") + "\n");
+    await vi.waitFor(() => expect(lifecycle.filter((event) => event.state === "done")).toEqual([
+      { state: "done", turnId: "t-ok", outcome: "completed" },
+      { state: "done", turnId: "t-fail", outcome: "failed", errorMessage: "Selected model is at capacity" },
+      { state: "done", turnId: "t-budget", outcome: "interrupted" },
     ]));
     abort.abort();
     await pump;
@@ -312,7 +342,7 @@ describe("CodexRolloutTailer.streamForCwd（有限 tail）", () => {
     fs.appendFileSync(rollout, taskLifecycle("turn_aborted", "turn-aborted") + "\n");
     await vi.waitFor(() => expect(lifecycle).toEqual([
       { state: "active", turnId: "turn-aborted" },
-      { state: "done", turnId: "turn-aborted" },
+      { state: "done", turnId: "turn-aborted", outcome: "interrupted" },
     ]));
     abort.abort();
     await pump;

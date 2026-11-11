@@ -143,6 +143,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         clientVersion: optionalString(raw, "clientVersion"),
         clientBuild: optionalString(raw, "clientBuild"),
         latestClientBuild: optionalString(raw, "latestClientBuild"),
+        push: optionalNumber(raw, "push"),
       });
 
     case "host_update_request":
@@ -1561,9 +1562,85 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         error: optionalNullableString(raw, "error") ?? null,
       };
 
+    // ---- プッシュ通知（push v1, protocol/push-v1.md §1）----
+    case "push_register":
+      return compact({
+        type, v,
+        id: requireString(raw, "id"),
+        deviceId: requireString(raw, "deviceId"),
+        deviceName: requireString(raw, "deviceName"),
+        deviceToken: requireString(raw, "deviceToken"),
+        environment: requirePushEnvironment(raw),
+        bundleId: requireString(raw, "bundleId"),
+        pushKey: requireString(raw, "pushKey"),
+        relay: decodePushRegisterRelay(raw["relay"]),
+        prefs: decodePushPrefs(raw["prefs"]),
+      });
+
+    case "push_register_result": {
+      const status = raw["status"];
+      const transport = raw["transport"];
+      if (status !== "ok" && status !== "failed") throw new ProtocolDecodeError("missing-field", "status");
+      if (transport !== "relay" && transport !== "direct" && transport !== "none") {
+        throw new ProtocolDecodeError("missing-field", "transport");
+      }
+      return compact({
+        type, v,
+        id: requireString(raw, "id"),
+        status,
+        transport,
+        capabilityInvalid: optionalBoolean(raw, "capabilityInvalid"),
+        error: optionalString(raw, "error"),
+      });
+    }
+
+    case "push_unregister":
+      return { type, v, id: requireString(raw, "id"), deviceId: requireString(raw, "deviceId") };
+
+    case "push_unregister_result": {
+      const status = raw["status"];
+      if (status !== "ok" && status !== "failed") throw new ProtocolDecodeError("missing-field", "status");
+      return { type, v, id: requireString(raw, "id"), status };
+    }
+
+    case "client_presence": {
+      const state = raw["state"];
+      if (state !== "foreground" && state !== "background") throw new ProtocolDecodeError("missing-field", "state");
+      return { type, v, deviceId: requireString(raw, "deviceId"), state };
+    }
+
+    case "presence_ping":
+    case "presence_pong":
+      return { type, v, id: requireString(raw, "id") };
+
     default:
       throw new ProtocolDecodeError("unknown-type", type);
   }
+}
+
+/** push_register の environment（`production` | `sandbox`）。 */
+function requirePushEnvironment(raw: Raw): "production" | "sandbox" {
+  const value = raw["environment"];
+  if (value !== "production" && value !== "sandbox") throw new ProtocolDecodeError("missing-field", "environment");
+  return value;
+}
+
+/** push_register の relay（省略可。あれば url / capability / expiresAt が揃っていること）。 */
+function decodePushRegisterRelay(value: unknown): { url: string; capability: string; expiresAt: number } | undefined {
+  if (value === undefined) return undefined;
+  const relay = requireObject(value, "relay");
+  return { url: requireString(relay, "url"), capability: requireString(relay, "capability"), expiresAt: requireNumber(relay, "expiresAt") };
+}
+
+/** push_register の prefs。bool のキーだけ拾う（無いキーは host 側で true 扱い）。 */
+function decodePushPrefs(value: unknown): Partial<Record<"turnDone" | "question" | "approval" | "usageLimit" | "turnError" | "showBody", boolean>> {
+  const prefs: Partial<Record<"turnDone" | "question" | "approval" | "usageLimit" | "turnError" | "showBody", boolean>> = {};
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return prefs;
+  for (const key of ["turnDone", "question", "approval", "usageLimit", "turnError", "showBody"] as const) {
+    const flag = (value as Raw)[key];
+    if (typeof flag === "boolean") prefs[key] = flag;
+  }
+  return prefs;
 }
 
 /** `account_usage_response.claude` を読む（欠落は undefined = 「Claude 側は載っていない」）。 */

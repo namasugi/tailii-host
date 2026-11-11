@@ -11,6 +11,7 @@
 //     patch_apply_end から tool_activity カードへ写像する（codex-tool-cards）。
 //   - reasoning / 承認は扱わない。
 
+import { turnErrorMessage } from "./codexSystemNotice.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -59,6 +60,10 @@ export const COLLABORATION_MODE_STREAM_ID = "pc:collab";
 export interface CodexTurnLifecycleEvent {
   state: "active" | "done";
   turnId: string;
+  /** done の終わり方（task_complete = 完了 / error 付きの task_complete = 失敗 / turn_aborted = 中断, push v1）。 */
+  outcome?: "completed" | "failed" | "interrupted";
+  /** 失敗の本文（利用者向け）。 */
+  errorMessage?: string;
 }
 
 /** 既定の codex セッションルート（`~/.codex/sessions`）。 */
@@ -406,16 +411,22 @@ function parseTurnLifecycle(line: Buffer): CodexTurnLifecycleEvent | null {
     if (record.type !== "event_msg" ||
       typeof record.payload !== "object" || record.payload === null ||
       Array.isArray(record.payload)) return null;
-    const payload = record.payload as { type?: unknown; turn_id?: unknown };
+    const payload = record.payload as { type?: unknown; turn_id?: unknown; error?: unknown };
     if (
       payload.type !== "task_started" &&
       payload.type !== "task_complete" &&
       payload.type !== "turn_aborted"
     ) return null;
     if (typeof payload.turn_id !== "string" || payload.turn_id.length === 0) return null;
+    if (payload.type === "task_started") return { state: "active", turnId: payload.turn_id };
+    if (payload.type === "turn_aborted") return { state: "done", turnId: payload.turn_id, outcome: "interrupted" };
+    const failed = typeof payload.error === "object" && payload.error !== null;
+    const errorMessage = failed ? turnErrorMessage(payload.error) : null;
     return {
-      state: payload.type === "task_started" ? "active" : "done",
+      state: "done",
       turnId: payload.turn_id,
+      outcome: failed ? "failed" : "completed",
+      ...(errorMessage !== null ? { errorMessage } : {}),
     };
   } catch {
     return null;

@@ -632,7 +632,7 @@ export type ControlMessage =
    * `updateError` に加え、このホストへ接続した最も新しいアプリビルド `latestClientBuild` を広告する
    * （アプリ側の「より新しいビルドがある」判定に使う, host-auto-update）。
    */
-  | { type: "channel_hello"; v: number; maxVersion: number; serverVersion?: string; hostName?: string; managed?: boolean; updateError?: string; clientVersion?: string; clientBuild?: string; latestClientBuild?: string }
+  | { type: "channel_hello"; v: number; maxVersion: number; serverVersion?: string; hostName?: string; managed?: boolean; updateError?: string; clientVersion?: string; clientBuild?: string; latestClientBuild?: string; push?: number }
   | { type: "host_update_request"; v: number; id: string; version: string; integrity?: string }
   | { type: "host_update_response"; v: number; id: string; status: HostUpdateStatus; error?: string | null }
   /**
@@ -984,7 +984,50 @@ export type ControlMessage =
       ok: boolean;
       backend: TerminalBackendKind;
       error: string | null;
-    };
+    }
+  // ---- プッシュ通知（push v1。契約の正本は protocol/push-v1.md §1。名前・形は変えない）----
+  /** 端末登録（iOS→host）。接続が成立するたびに送られる（host は冪等に上書き）。 */
+  | {
+      type: "push_register";
+      v: number;
+      id: string;
+      deviceId: string;
+      deviceName: string;
+      deviceToken: string;
+      environment: "production" | "sandbox";
+      bundleId: string;
+      pushKey: string;
+      relay?: PushRegisterRelay;
+      /** 無いキーは true 扱い（解決は host 側）。 */
+      prefs: Partial<Record<PushPrefKey, boolean>>;
+    }
+  | {
+      type: "push_register_result";
+      v: number;
+      id: string;
+      status: "ok" | "failed";
+      transport: "relay" | "direct" | "none";
+      capabilityInvalid?: boolean;
+      error?: string;
+    }
+  | { type: "push_unregister"; v: number; id: string; deviceId: string }
+  | { type: "push_unregister_result"; v: number; id: string; status: "ok" | "failed" }
+  /** 在席の申告（iOS→host。応答なし）。 */
+  | { type: "client_presence"; v: number; deviceId: string; state: "foreground" | "background" }
+  /** 送る直前の生存確認（host→iOS）と応答（iOS→host）。 */
+  | { type: "presence_ping"; v: number; id: string }
+  | { type: "presence_pong"; v: number; id: string };
+
+/** push_register の relay 欄（capability は不透明な秘密）。 */
+export interface PushRegisterRelay {
+  url: string;
+  capability: string;
+  /** epoch 秒。 */
+  expiresAt: number;
+}
+
+/** push_register の prefs キー。 */
+export type PushPrefKey = "turnDone" | "question" | "approval" | "usageLimit" | "turnError" | "showBody";
 
 /** セッションを収容する端末バックエンド種別（backend_get/set, session-backend）。 */
 export type TerminalBackendKind = "tmux" | "herdr";

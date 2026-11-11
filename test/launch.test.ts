@@ -314,6 +314,7 @@ describe("claudeHookLaunchSettings", () => {
       binaryPath: "/usr/local/bin/tailii",
       session: "work",
       globalMarkerPath: path.join(dir, "no-such-marker"),
+      claudeVersion: "2.1.322",
     });
     expect(json).not.toBeNull();
     const settings = JSON.parse(json!) as { hooks: Record<string, unknown> };
@@ -327,7 +328,8 @@ describe("claudeHookLaunchSettings", () => {
     }
     // 処理中/処理完了のライフサイクル通知（reaper の処理中保護用）。matcher 無し・短 timeout。
     // SubagentStart / SubagentStop は会話一覧の「エージェント N」用（session-agent-count）。
-    for (const event of ["UserPromptSubmit", "Stop", "SubagentStart", "SubagentStop"]) {
+    // StopFailure は API エラーでのターン終了（push v1 の turn_error / 使用量制限の見張り）。
+    for (const event of ["UserPromptSubmit", "Stop", "StopFailure", "SubagentStart", "SubagentStop"]) {
       const list = settings.hooks[event] as {
         matcher?: string;
         hooks: { command: string; timeout: number }[];
@@ -336,6 +338,26 @@ describe("claudeHookLaunchSettings", () => {
       expect(list[0]?.matcher).toBeUndefined();
       expect(list[0]?.hooks[0]?.command).toBe("/usr/local/bin/tailii hook --session work");
       expect(list[0]?.hooks[0]?.timeout).toBe(30);
+    }
+  });
+
+  test("StopFailure は claude 2.1.319 以上のときだけ登録する（版不明・古い版では登録しない）", () => {
+    const dir = makeTempDir("hooks-stopfailure");
+    const hooksFor = (claudeVersion: string | null | undefined) => {
+      const json = claudeHookLaunchSettings({
+        dir, binaryPath: "/usr/local/bin/tailii", session: "work",
+        globalMarkerPath: path.join(dir, "no-such-marker"),
+        ...(claudeVersion !== undefined ? { claudeVersion } : {}),
+      });
+      return Object.keys((JSON.parse(json!) as { hooks: Record<string, unknown> }).hooks);
+    };
+    expect(hooksFor("2.1.319")).toContain("StopFailure");
+    expect(hooksFor("2.2.0")).toContain("StopFailure");
+    for (const version of ["2.1.318", "2.1.215", null, undefined, "unknown"]) {
+      const hooks = hooksFor(version);
+      expect(hooks).not.toContain("StopFailure");
+      // ほかの hook は版に関係なく登録する。
+      expect(hooks).toEqual(expect.arrayContaining(["PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SubagentStart", "SubagentStop"]));
     }
   });
 

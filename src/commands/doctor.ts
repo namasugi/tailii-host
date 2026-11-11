@@ -21,6 +21,10 @@ import { resolveSessionBackendKind } from "../backend/sessionBackend.js";
 import { HERDR_RESTART_COMMAND } from "../backend/herdr.js";
 // 型だけ。実体は quicGateway が doctor の findCommand を import する循環を避けるため動的 import。
 import type { QuicGatewayServiceState } from "../services/quicGateway.js";
+import { ApnsConfigStore } from "../push/apnsConfigStore.js";
+import { PushDeviceStore } from "../push/pushDeviceStore.js";
+import { PushLastResultStore } from "../push/pushStateFiles.js";
+import { choosePushTransport } from "../push/pushTransport.js";
 import {
   MINIMUM_CLAUDE_CLI_VERSION,
   MINIMUM_CODEX_CLI_VERSION,
@@ -549,7 +553,56 @@ export async function collectDoctorChecks(envPath: string = defaultInjectedPath(
   // QUIC は macOS 専用の任意機能。SSH / version 検査と並行し、launchctl は上限付き。
   checks.push(...await quicChecksPromise);
 
+  // プッシュ通知（任意）: 経路・端末数・最後の送信結果。
+  checks.push(pushDoctorCheck());
+
   return checks;
+}
+
+/**
+ * プッシュ通知の状態（push v1）。登録端末ごとの経路（relay / direct / なし）と、最後の送信結果を出す。
+ * 秘密（capability・device token・pushKey）は出さない。任意項目（exit code に影響しない）。
+ */
+export function pushDoctorCheck(options: {
+  store?: Pick<PushDeviceStore, "list">;
+  apnsConfigStore?: Pick<ApnsConfigStore, "load">;
+  lastResult?: Pick<PushLastResultStore, "load">;
+  nowSeconds?: number;
+} = {}): DoctorCheck {
+  const nowSeconds = options.nowSeconds ?? Math.floor(Date.now() / 1000);
+  let devices: ReturnType<PushDeviceStore["list"]> = [];
+  let config: ReturnType<ApnsConfigStore["load"]> = null;
+  let last: ReturnType<PushLastResultStore["load"]> = null;
+  try { devices = (options.store ?? new PushDeviceStore()).list(); } catch { devices = []; }
+  try { config = (options.apnsConfigStore ?? new ApnsConfigStore()).load(); } catch { config = null; }
+  try { last = (options.lastResult ?? new PushLastResultStore()).load(); } catch { last = null; }
+  const counts = { relay: 0, direct: 0, none: 0 };
+  let invalid = 0;
+  for (const device of devices) {
+    counts[choosePushTransport(device, config, nowSeconds)] += 1;
+    if (device.relay?.invalid === true) invalid += 1;
+  }
+  const routes = [
+    counts.relay > 0 ? `relay ${counts.relay}` : null,
+    counts.direct > 0 ? `direct ${counts.direct}` : null,
+    counts.none > 0 ? `経路なし ${counts.none}` : null,
+  ].filter((part): part is string => part !== null).join(" / ");
+  const lastText = last === null
+    ? "送信履歴なし"
+    : `最後の送信 ${new Date(last.at * 1000).toISOString()} ${last.kind} ${last.status}` +
+      (last.reason !== undefined ? `(${last.reason})` : "") +
+      (last.transport !== undefined ? ` via ${last.transport}` : "");
+  const usable = counts.relay + counts.direct > 0;
+  return {
+    id: "push",
+    label: "プッシュ通知(任意)",
+    ok: usable,
+    required: false,
+    detail: devices.length === 0
+      ? "登録端末なし（アプリで通知を許可して接続すると登録されます）"
+      : `端末 ${devices.length} 台（${routes}）・${lastText}` +
+        (invalid > 0 ? `・capability 無効 ${invalid} 台（アプリが次の接続で取り直します）` : ""),
+  };
 }
 
 /** 検査結果を人間向けに整形する。 */

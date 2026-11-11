@@ -17,9 +17,10 @@ export type ObsEvent =
   | { kind: "approvalRequested"; id: string; tool: string }
   | { kind: "approvalDecided"; id: string; decision: string }
   | { kind: "toolExecuted"; id: string; tool: string; decision: string }
-  | { kind: "pushSent"; id: string; tool: string }
-  | { kind: "pushSkipped"; id: string; reason: string }
-  | { kind: "pushFailed"; id: string; reason: string }
+  // pushKind = 通知の種類（turn_done / question / approval / usage_limit / turn_error）。旧経路は省略。
+  | { kind: "pushSent"; id: string; tool: string; pushKind?: string }
+  | { kind: "pushSkipped"; id: string; reason: string; pushKind?: string }
+  | { kind: "pushFailed"; id: string; reason: string; pushKind?: string }
   | { kind: "deviceTokenRegistered"; environment: string };
 
 /** 直列化時の名前空間付きイベント種別名（iOS ミラーと区別可能）。 */
@@ -92,9 +93,13 @@ function encodeLine(event: ObsEvent, at: number): string {
     case "sessionKilled":
       break;
     case "approvalRequested":
+      record["id"] = event.id;
+      record["tool"] = event.tool;
+      break;
     case "pushSent":
       record["id"] = event.id;
       record["tool"] = event.tool;
+      if (event.pushKind !== undefined) record["pushKind"] = event.pushKind;
       break;
     case "approvalDecided":
       record["id"] = event.id;
@@ -109,6 +114,7 @@ function encodeLine(event: ObsEvent, at: number): string {
     case "pushFailed":
       record["id"] = event.id;
       record["reason"] = event.reason;
+      if (event.pushKind !== undefined) record["pushKind"] = event.pushKind;
       break;
     case "deviceTokenRegistered":
       record["environment"] = event.environment;

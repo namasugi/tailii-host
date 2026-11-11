@@ -315,7 +315,8 @@ function noticeMessage(payload: Record<string, unknown>): string | null {
   return turnErrorMessage(payload["error"]);
 }
 
-function turnErrorMessage(value: unknown): string | null {
+/** turn の error（文字列 / `{message, additionalDetails}`）から利用者向けの本文を取り出す。push の本文にも使う。 */
+export function turnErrorMessage(value: unknown): string | null {
   if (typeof value === "string") return value.trim().length > 0 ? readableErrorText(value) : null;
   const error = asRecord(value);
   if (error === null) return null;

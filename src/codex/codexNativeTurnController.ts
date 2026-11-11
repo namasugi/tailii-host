@@ -44,6 +44,7 @@ import {
   codexGoalNoticeKey,
   codexAsyncAnswerFailedNotice,
   codexSystemNoticeContentKey,
+  turnErrorMessage,
 } from "./codexSystemNotice.js";
 import {
   CODEX_ASYNC_QUESTION_ID_PREFIX,
@@ -76,10 +77,21 @@ export interface CodexNativeApproval {
 
 export type CodexApprovalBroker = (approval: CodexNativeApproval) => Promise<Decision>;
 
+/**
+ * turn の終わり方（`turn/completed` の status, push v1）。完了・失敗・中断を区別できるのは App Server の
+ * turn/completed だけなので、それ以外の done（接続の切断・close・開始失敗・rollout からの補完）では渡さない。
+ */
+export interface CodexTurnOutcome {
+  status: "completed" | "failed" | "interrupted";
+  turnId?: string;
+  /** 失敗の本文（利用者向け。無ければ省略）。 */
+  errorMessage?: string;
+}
+
 export interface CodexNativeTurnControllerOptions {
   appServer: CodexAppServerThreadRuntime;
   approvalBroker?: CodexApprovalBroker;
-  onProcessing?: (session: string, state: "active" | "done") => void;
+  onProcessing?: (session: string, state: "active" | "done", outcome?: CodexTurnOutcome) => void;
   onModel?: (session: string, model: string) => void;
   onTokenUsage?: (
     session: string,
@@ -370,7 +382,7 @@ function isAnsweredAsyncEntry(
 export class CodexNativeTurnController implements CodexTurnControllerRuntime {
   private readonly appServer: CodexAppServerThreadRuntime;
   private readonly approvalBroker: CodexApprovalBroker;
-  private readonly onProcessing: (session: string, state: "active" | "done") => void;
+  private readonly onProcessing: (session: string, state: "active" | "done", outcome?: CodexTurnOutcome) => void;
   private readonly onModel: NonNullable<CodexNativeTurnControllerOptions["onModel"]>;
   private readonly onTokenUsage: NonNullable<
     CodexNativeTurnControllerOptions["onTokenUsage"]
@@ -1309,7 +1321,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
           current.subagents.settleRunning(turnStatus === "failed" ? "error" : "completed", Date.now()),
         );
         current.activeTurnId = null;
-        this.onProcessing(session, "done");
+        this.onProcessing(session, "done", codexTurnOutcome(asRecord(params?.["turn"])));
         this.resolvePendingQuestionsForSession(session);
       }
     }
@@ -1765,6 +1777,19 @@ function fileChangeSummary(item: Record<string, unknown> | undefined, reason: st
     if (paths.length > 0) return `ファイル変更: ${paths.join(", ")}`;
   }
   return reason ?? "ファイルの変更を許可しますか？";
+}
+
+/** `turn/completed` の turn から終わり方を読む（未知の status は完了扱いにしない = push しない）。 */
+function codexTurnOutcome(turn: Record<string, unknown> | null): CodexTurnOutcome | undefined {
+  const status = turn?.["status"];
+  const turnId = typeof turn?.["id"] === "string" && turn["id"].length > 0 ? turn["id"] : undefined;
+  if (status !== "completed" && status !== "failed" && status !== "interrupted") return undefined;
+  const errorMessage = status === "failed" ? turnErrorMessage(turn?.["error"]) : null;
+  return {
+    status,
+    ...(turnId !== undefined ? { turnId } : {}),
+    ...(errorMessage !== null ? { errorMessage } : {}),
+  };
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
