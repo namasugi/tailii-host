@@ -18,8 +18,10 @@ import {
   type BackgroundCommandStopResult,
 } from "./backgroundCommandStop.js";
 import type { BackgroundStopRecords } from "./backgroundStopRecords.js";
+import { CODEX_EXEC_NODE_PREFIX } from "./codexExecLinker.js";
 import {
   readBackgroundOutput,
+  readCodexExecTranscript,
   readCodexSubagentTranscript,
   readSubagentTranscript,
   type SubagentTranscriptResult,
@@ -113,6 +115,10 @@ export class ChatTailController {
     if (this.openAgent === "codex" && this.currentDir !== null) {
       const rollout = this.codexTailer.resolve(this.currentDir, null, nodeId);
       return readCodexSubagentTranscript(rollout, before);
+    }
+    // Claude の Bash が `codex exec` で起動した Codex の実行（codex-exec-delegation）は、その記録を読む。
+    if (nodeId.startsWith(CODEX_EXEC_NODE_PREFIX)) {
+      return readCodexExecTranscript(this.subagentTailer.codexExecRolloutPath(nodeId), before);
     }
     const jsonl = this.subagentTranscriptPath(nodeId);
     if (jsonl !== null) return readSubagentTranscript(jsonl, before);

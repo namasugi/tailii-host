@@ -8,6 +8,8 @@ import {
   rolloutResponseItemToolActivities,
 } from "../codex/codexToolActivity.js";
 import { isVisibleCodexMessagePhase } from "../codex/codexMessagePhase.js";
+import { isCompressedRollout, readCompressedRollout } from "../codex/rolloutFile.js";
+import { userMessageItemText } from "./codexExecLinker.js";
 import { isCompactSummaryRecord } from "../shared/compactSummary.js";
 import { isNonMessageRecordType } from "../shared/transcriptRecord.js";
 import { narrationText } from "../shared/narration.js";
@@ -245,7 +247,118 @@ export function parseSubagentTranscript(jsonl: string, before?: number): Subagen
  * 依頼の区切りだけを出す（同じ子に続けて別の依頼が来るので、どこからが次の依頼か分かるように）。
  */
 export function parseCodexSubagentTranscript(jsonl: string, before?: number): SubagentTranscriptResult {
-  const records = jsonl.split(/\r?\n/).flatMap((line): Record<string, unknown>[] => {
+  const records = parseJsonlRecords(jsonl);
+  const parser = new CodexRolloutEntryParser("subagent", codexAgentPath(records));
+  for (const record of records) parser.consume(record);
+  return transcriptPage(parser.entries, before);
+}
+
+/**
+ * Claude の Bash から `codex exec` で起動した Codex の記録（`source: exec`）を全文表示向けの行へ変換する
+ * （codex-exec-delegation）。最初の素の利用者発話（`event_msg/item_completed` の UserMessage、旧形式は
+ * `event_msg/user_message`）から読み始め、それを利用者側の行として出す。返事とツールの読み方は sub-agent と同じ。
+ */
+export function parseCodexExecTranscript(jsonl: string, before?: number): SubagentTranscriptResult {
+  const parser = new CodexRolloutEntryParser("exec", null);
+  for (const record of parseJsonlRecords(jsonl)) parser.consume(record);
+  return transcriptPage(parser.entries, before);
+}
+
+/** 解析結果の覚え（パスごと。サイズ・更新時刻が同じなら読み直さず、伸びただけなら追記分だけ読む）。 */
+interface ExecTranscriptCacheEntry {
+  size: number;
+  mtimeMs: number;
+  position: number;
+  partial: Buffer;
+  parser: CodexRolloutEntryParser;
+}
+const EXEC_TRANSCRIPT_CACHE_LIMIT = 8;
+const EXEC_COMPRESSED_LIMIT_BYTES = 64 * 1024 * 1024;
+const execTranscriptCache = new Map<string, ExecTranscriptCacheEntry>();
+
+/**
+ * `exec` の記録を読んでページを返す。画像生成を含む記録は数 MB になり、engine → hub の問い合わせは 1.5 秒で
+ * 切れるので、解析結果を「パス・サイズ・更新時刻」で覚え、ページ送りのたびに読み直さない（実行中は追記分だけ読む）。
+ */
+export function readCodexExecTranscript(file: string | null, before?: number): SubagentTranscriptResult {
+  if (file === null) return { entries: [], omitted: 0 };
+  try {
+    const stat = fs.statSync(file);
+    let cached = execTranscriptCache.get(file);
+    if (cached !== undefined && (cached.size !== stat.size || cached.mtimeMs !== stat.mtimeMs)) {
+      // 縮んだ・圧縮済み（書き換えはしない）なら作り直す。伸びただけなら続きから読む。
+      if (stat.size < cached.position || isCompressedRollout(file)) cached = undefined;
+    }
+    if (cached === undefined) {
+      cached = { size: -1, mtimeMs: -1, position: 0, partial: Buffer.alloc(0), parser: new CodexRolloutEntryParser("exec", null) };
+    }
+    if (cached.size !== stat.size || cached.mtimeMs !== stat.mtimeMs) {
+      if (isCompressedRollout(file)) {
+        const data = readCompressedRollout(file, EXEC_COMPRESSED_LIMIT_BYTES);
+        if (data === null) return { entries: [], omitted: 0 };
+        consumeExecChunk(cached, data, true);
+      } else {
+        const fd = fs.openSync(file, "r");
+        try {
+          const chunk = Buffer.alloc(1024 * 1024);
+          for (;;) {
+            const bytesRead = fs.readSync(fd, chunk, 0, chunk.length, cached.position);
+            if (bytesRead === 0) break;
+            cached.position += bytesRead;
+            consumeExecChunk(cached, chunk.subarray(0, bytesRead), false);
+          }
+        } finally {
+          fs.closeSync(fd);
+        }
+      }
+      cached.size = stat.size;
+      cached.mtimeMs = stat.mtimeMs;
+    }
+    // 最近使った順に保つ（古いものから捨てる）。
+    execTranscriptCache.delete(file);
+    execTranscriptCache.set(file, cached);
+    while (execTranscriptCache.size > EXEC_TRANSCRIPT_CACHE_LIMIT) {
+      const oldest = execTranscriptCache.keys().next().value;
+      if (oldest === undefined) break;
+      execTranscriptCache.delete(oldest);
+    }
+    return transcriptPage(cached.parser.entries, before);
+  } catch {
+    return { entries: [], omitted: 0 };
+  }
+}
+
+function consumeExecChunk(entry: ExecTranscriptCacheEntry, data: Buffer, complete: boolean): void {
+  let buffer = entry.partial.length > 0 ? Buffer.concat([entry.partial, data]) : data;
+  let offset = 0;
+  for (;;) {
+    const nl = buffer.indexOf(0x0a, offset);
+    if (nl < 0) break;
+    consumeExecLine(entry.parser, buffer.subarray(offset, nl));
+    offset = nl + 1;
+  }
+  buffer = buffer.subarray(offset);
+  if (complete) {
+    if (buffer.length > 0) consumeExecLine(entry.parser, buffer);
+    entry.partial = Buffer.alloc(0);
+  } else {
+    entry.partial = Buffer.from(buffer);
+  }
+}
+
+function consumeExecLine(parser: CodexRolloutEntryParser, line: Buffer): void {
+  if (line.length === 0) return;
+  try {
+    const value = JSON.parse(line.toString("utf8")) as unknown;
+    const record = object(value);
+    if (record !== null) parser.consume(record);
+  } catch {
+    // 壊れた行は飛ばす。
+  }
+}
+
+function parseJsonlRecords(jsonl: string): Record<string, unknown>[] {
+  return jsonl.split(/\r?\n/).flatMap((line): Record<string, unknown>[] => {
     if (!line) return [];
     try {
       const value = JSON.parse(line) as unknown;
@@ -254,48 +367,90 @@ export function parseCodexSubagentTranscript(jsonl: string, before?: number): Su
       return [];
     }
   });
-  const agentPath = codexAgentPath(records);
-  let childHistoryStarted = false;
-  const all: SubagentTranscriptEntry[] = [];
-  // 最後に読んだ旧形式 event_msg/agent_message の本文。次の response_item が同文の写しかの判定に使う。
-  let eventAssistantText: string | null = null;
+}
 
-  for (const record of records) {
+/**
+ * Codex の記録を 1 行ずつ受けて表示用の行を積む。
+ *   - "subagent": 親→子の agent_message を境界にし、それより後の子自身の発話・ツール実行だけ。
+ *   - "exec": 最初の素の利用者発話から（それを利用者側の行として出す）。以後の利用者発話（`exec resume`）も出す。
+ */
+class CodexRolloutEntryParser {
+  readonly entries: SubagentTranscriptEntry[] = [];
+  private started = false;
+  // 最後に読んだ旧形式 event_msg/agent_message の本文。次の response_item が同文の写しかの判定に使う。
+  private eventAssistantText: string | null = null;
+  // exec で素の発話イベントが無い記録の代わり: 注入でない最初の response_item の利用者発話。
+  private pendingExecRequest: { text: string; ts: number | undefined } | null = null;
+
+  constructor(private readonly mode: "subagent" | "exec", private readonly agentPath: string | null) {}
+
+  consume(record: Record<string, unknown>): void {
+    const all = this.entries;
     const ts = parseTimestamp(record["timestamp"]);
     const recordType = record["type"];
     const payload = object(record["payload"]);
-    if (payload === null) continue;
+    if (payload === null) return;
 
-    if (recordType === "response_item" && payload["type"] === "agent_message" &&
+    if (this.mode === "subagent" && recordType === "response_item" && payload["type"] === "agent_message" &&
       typeof payload["recipient"] === "string" &&
-      (agentPath === null || payload["recipient"] === agentPath)) {
-      childHistoryStarted = true;
-      const task = interAgentPayloadText(payload["content"]) ?? interAgentPlaceholder(payload, agentPath);
+      (this.agentPath === null || payload["recipient"] === this.agentPath)) {
+      this.started = true;
+      const task = interAgentPayloadText(payload["content"]) ?? interAgentPlaceholder(payload, this.agentPath);
       if (task !== null) all.push(entry("user", task, ts));
-      continue;
+      return;
     }
-    if (!childHistoryStarted) continue;
+    if (this.mode === "exec" && recordType === "event_msg") {
+      const request = payload["type"] === "user_message" && typeof payload["message"] === "string"
+        && payload["message"].trim().length > 0
+        ? payload["message"]
+        : payload["type"] === "item_completed" ? userMessageItemText(payload["item"]) : null;
+      if (request !== null) {
+        this.started = true;
+        this.pendingExecRequest = null;
+        all.push(entry("user", request, ts));
+        return;
+      }
+    }
+    if (!this.started) {
+      if (this.mode !== "exec" || recordType !== "response_item") return;
+      if (payload["type"] === "message" && payload["role"] === "user") {
+        const text = interAgentPayloadText(payload["content"]) === null ? userInputText(payload["content"]) : null;
+        if (this.pendingExecRequest === null && text !== null && !isInjectedCodexContext(text)) {
+          this.pendingExecRequest = { text, ts };
+        }
+        return;
+      }
+      const codexActed = (payload["type"] === "message" && payload["role"] === "assistant")
+        || payload["type"] === "custom_tool_call" || payload["type"] === "function_call";
+      if (!codexActed) return;
+      // 素の発話イベントを書かない記録: Codex が動き出した時点から読み、控えた依頼文を先に出す。
+      this.started = true;
+      if (this.pendingExecRequest !== null) {
+        all.push(entry("user", this.pendingExecRequest.text, this.pendingExecRequest.ts));
+        this.pendingExecRequest = null;
+      }
+    }
 
     if (recordType === "event_msg") {
       if (payload["type"] === "agent_message" && typeof payload["message"] === "string" &&
         payload["message"].length > 0) {
         all.push(entry("assistant", payload["message"], ts));
-        eventAssistantText = payload["message"];
+        this.eventAssistantText = payload["message"];
       }
       for (const activity of rolloutPatchApplyActivities(payload)) {
         all.push(entry("tool", transcriptToolText(activity), ts, "tool_use"));
       }
-      continue;
+      return;
     }
-    if (recordType !== "response_item") continue;
-    const pendingEventText = eventAssistantText;
-    eventAssistantText = null;
+    if (recordType !== "response_item") return;
+    const pendingEventText = this.eventAssistantText;
+    this.eventAssistantText = null;
 
     const message = codexAssistantMessageText(payload);
     if (message !== null) {
       // 旧形式は event_msg の直後に同じ本文の response_item が続く。その写しだけを重ねない。
       if (message !== pendingEventText) all.push(entry("assistant", message, ts));
-      continue;
+      return;
     }
 
     const activities = rolloutResponseItemToolActivities(payload);
@@ -314,8 +469,22 @@ export function parseCodexSubagentTranscript(jsonl: string, before?: number): Su
       }
     }
   }
+}
 
-  return transcriptPage(all, before);
+/** `response_item/message`（user）の input_text を連結する。 */
+function userInputText(content: unknown): string | null {
+  if (!Array.isArray(content)) return null;
+  const text = content.flatMap((raw): string[] => {
+    const block = object(raw);
+    return block?.["type"] === "input_text" && typeof block["text"] === "string" ? [block["text"]] : [];
+  }).join("\n");
+  return text.trim().length > 0 ? text : null;
+}
+
+/** Codex が利用者発話として差し込む文脈（AGENTS.md・環境情報など）か。 */
+function isInjectedCodexContext(text: string): boolean {
+  const head = text.trimStart();
+  return head.startsWith("<") || head.startsWith("# AGENTS.md instructions");
 }
 
 function codexAgentPath(records: Record<string, unknown>[]): string | null {

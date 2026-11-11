@@ -2229,7 +2229,8 @@ export class SessionHub {
     if (payload.type === "subagent_node") {
       actor.latestSubagentNodes.set(payload.node.nodeId, payload);
       // tail している会話は transcript が権威（hook の取りこぼし・遅着を揃える）。コマンドは数えない。
-      if (payload.node.kind === undefined) {
+      // Claude の Bash から起動した Codex の実行（codex_exec）はエージェントとして数える（codex-exec-delegation）。
+      if (payload.node.kind === undefined || payload.node.kind === "codex_exec") {
         this.setAgentRunning(session, actor, payload.node.nodeId, payload.node.status === "running", "tail");
       }
     }

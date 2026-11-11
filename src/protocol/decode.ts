@@ -1915,7 +1915,7 @@ function decodeSubagentNode(raw: Raw): SubagentNode {
     throw new ProtocolDecodeError("missing-field", "status");
   }
   const kind = optionalString(raw, "kind");
-  if (kind !== undefined && kind !== "command") {
+  if (kind !== undefined && kind !== "command" && kind !== "codex_exec") {
     throw new ProtocolDecodeError("missing-field", "kind");
   }
   return compact<SubagentNode>({

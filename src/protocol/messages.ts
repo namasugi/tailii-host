@@ -93,8 +93,11 @@ export interface SubagentNode {
   status: SubagentNodeStatus;
   currentActivity?: string | null;
   ts: number;
-  /** "command" = バックグラウンドコマンド（Bash run_in_background）。省略時はエージェント。 */
-  kind?: "command";
+  /**
+   * "command" = バックグラウンドコマンド（Bash run_in_background）/ "codex_exec" = Claude の Bash が `codex exec` で
+   * 起動した Codex の 1 回の実行（additive, codex-exec-delegation）。省略時はエージェント。
+   */
+  kind?: "command" | "codex_exec";
   /**
    * 実行モデルの slug（Claude: サブエージェント transcript の assistant 行 `message.model` /
    * Codex: 子 thread の `model`、無ければ spawnAgent の `model`）。判明するまで省略。

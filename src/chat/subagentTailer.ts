@@ -12,6 +12,7 @@ import { injectedReminderBodies } from "../shared/harnessReminder.js";
 import { abortableSleep } from "../shared/sleep.js";
 import { isApiRequestBlobLine } from "../shared/transcriptRecord.js";
 import { processBackgroundStopRecords, type BackgroundStopRecords } from "./backgroundStopRecords.js";
+import { CodexExecLinker, invokesCodex, type BashCall, type CodexExecRun } from "./codexExecLinker.js";
 import { extractToolActivities, TranscriptTailer } from "./transcriptTailer.js";
 
 /** 1 回に読む transcript の上限。超えたらイベントループへ譲ってから続きを読む。 */
@@ -59,6 +60,11 @@ export interface SubagentTailerOptions {
    * 誤判定しても transcript が伸びれば自動で running へ回復する。
    */
   sessionStaleMs?: number;
+  /**
+   * Claude の Bash が `codex exec` で起動した Codex の実行を対応づける（codex-exec-delegation）。
+   * 既定は実物（`~/.codex` と ps / lsof）。null で無効。テストは偽物の ps / lsof を持つものを渡す。
+   */
+  codexExecLinker?: CodexExecLinker | null;
 }
 
 interface Meta {
@@ -162,6 +168,22 @@ interface BackgroundSpawn {
   background: boolean;
 }
 
+/** Bash の呼び出しの観測（codex-exec-delegation の対応づけに使う）。 */
+interface BashObservation {
+  toolUseId: string;
+  owner: string;
+  command: string;
+  /** 引用符の外に単語 `codex` があるか（取り込み時に一度だけ求める）。 */
+  codex: boolean;
+  /** tool_use の行の top-level `cwd`。 */
+  cwd: string | null;
+  startMs: number;
+  /** tool_result の時刻（背景起動なら ack の時刻で、終わりではない）。 */
+  resultMs: number | null;
+  /** 背景へ回った Bash の taskId（終わりは完了通知・孤児判定の時刻）。 */
+  bgTaskId: string | null;
+}
+
 interface BackgroundCommand {
   taskId: string;
   toolUseId: string;
@@ -180,6 +202,7 @@ interface FileTailState {
   notificationByTaskId: Map<string, TaskNotification>;
   bgSpawnByToolUseId: Map<string, BackgroundSpawn>;
   bgCommandByTaskId: Map<string, BackgroundCommand>;
+  bashByToolUseId: Map<string, BashObservation>;
   firstTimestampMs: number | null;
 }
 
@@ -205,6 +228,8 @@ export class SubagentTailer {
    * 同じく完了として出す。tail より長く生きる記録（hub はファイル）を使う。
    */
   private readonly stopRecords: BackgroundStopRecords;
+  /** `codex exec` の実行の対応づけ（null = 無効）。 */
+  private readonly codexExec: CodexExecLinker | null;
 
   constructor(options: SubagentTailerOptions = {}) {
     this.pollIntervalMs = options.pollIntervalMs ?? 50;
@@ -216,6 +241,7 @@ export class SubagentTailer {
     this.probeOutputOpen = options.probeOutputOpen ?? defaultProbeOutputOpen;
     this.sessionStaleMs = options.sessionStaleMs ?? 6 * 60 * 60 * 1000;
     this.stopRecords = options.stopRecords ?? processBackgroundStopRecords();
+    this.codexExec = options.codexExecLinker === undefined ? new CodexExecLinker() : options.codexExecLinker;
     this.probeSessionAlive = options.probeSessionAlive
       ?? ((sessionId, lastActivityMs) => defaultProbeSessionAlive(sessionId, lastActivityMs, this.sessionStaleMs));
   }
@@ -223,6 +249,11 @@ export class SubagentTailer {
   /** 現在 tail 中の nodeId から transcript 実体を引く。 */
   jsonlPath(nodeId: string): string | null {
     return this.jsonlPaths.get(nodeId) ?? null;
+  }
+
+  /** `codex-exec:<id>` のノードから Codex の記録（rollout）を引く。 */
+  codexExecRolloutPath(nodeId: string): string | null {
+    return this.codexExec?.rolloutPath(nodeId) ?? null;
   }
 
   /** バックグラウンドコマンドの nodeId(taskId) から出力ファイルを引く。 */
@@ -253,6 +284,7 @@ export class SubagentTailer {
   ): AsyncGenerator<ControlMessage, void, void> {
     this.jsonlPaths.clear();
     this.outputPaths.clear();
+    this.codexExec?.reset();
     const start = Date.now();
     let mainTranscript: string | null = null;
     while (!signal?.aborted) {
@@ -279,6 +311,9 @@ export class SubagentTailer {
     const notificationByTaskId = new Map<string, TaskNotification>();
     const bgCommandByTaskId = new Map<string, BackgroundCommand>();
     const bgLastKeyByTaskId = new Map<string, string>();
+    // Bash の呼び出し（全 transcript の集約）と、流した Codex の実行ノードの最終キー（codex-exec-delegation）。
+    const bashByToolUseId = new Map<string, BashObservation>();
+    const codexLastKeyByNodeId = new Map<string, string>();
     // 通知が握り潰された背景コマンドの孤児判定（taskId → 終了扱いにした ts）。
     const bgOrphanTsByTaskId = new Map<string, number>();
     const bgFirstSeenMsByTaskId = new Map<string, number>();
@@ -355,10 +390,24 @@ export class SubagentTailer {
               if (id === selfSpawnId) continue;
               read.state.ownerByToolUseId.set(id, transcript.owner);
             }
-            for (const spawn of extractBackgroundSpawns(line)) {
+            const spawns = extractBackgroundSpawns(line);
+            const spawnCwd = spawns.length > 0 ? lineCwd(line) : null;
+            for (const spawn of spawns) {
               read.state.bgSpawnByToolUseId.set(spawn.id, {
                 label: spawn.label, command: spawn.command, ts: lineTs, background: spawn.background,
               });
+              if (lineTs !== null && spawn.rawCommand.length > 0) {
+                read.state.bashByToolUseId.set(spawn.id, {
+                  toolUseId: spawn.id,
+                  owner: transcript.owner,
+                  command: spawn.rawCommand,
+                  codex: invokesCodex(spawn.rawCommand),
+                  cwd: spawnCwd,
+                  startMs: lineTs,
+                  resultMs: null,
+                  bgTaskId: null,
+                });
+              }
             }
             for (const hit of extractToolResults(line)) {
               if (hit.id === selfSpawnId) continue;
@@ -370,6 +419,11 @@ export class SubagentTailer {
               const launch = hit.backgroundLaunch;
               const spawn = read.state.bgSpawnByToolUseId.get(hit.id);
               read.state.bgSpawnByToolUseId.delete(hit.id);
+              const bash = read.state.bashByToolUseId.get(hit.id);
+              if (bash !== undefined) {
+                bash.resultMs = hit.ts ?? lineTs;
+                if (launch !== null && spawn !== undefined && (spawn.background || launch.confirmed)) bash.bgTaskId = launch.taskId;
+              }
               if (launch !== null && spawn !== undefined && (spawn.background || launch.confirmed)) {
                 read.state.bgCommandByTaskId.set(launch.taskId, {
                   taskId: launch.taskId,
@@ -455,6 +509,7 @@ export class SubagentTailer {
         resultByToolUseId.clear();
         notificationByTaskId.clear();
         bgCommandByTaskId.clear();
+        bashByToolUseId.clear();
         for (const transcript of transcriptOwners) {
           const state = fileStates.get(transcript.path);
           if (state === undefined) continue;
@@ -478,6 +533,7 @@ export class SubagentTailer {
             }
           }
           for (const [id, command] of state.bgCommandByTaskId) bgCommandByTaskId.set(id, command);
+          for (const [id, bash] of state.bashByToolUseId) bashByToolUseId.set(id, bash);
         }
         aggregateDirty = false;
       }
@@ -771,9 +827,72 @@ export class SubagentTailer {
         yield { type: "subagent_node", v: PROTOCOL_V2, node: messageNode };
       }
 
+      // Claude の Bash が `codex exec` で起動した Codex の実行（codex-exec-delegation）。1 回の実行 = 1 ノード。
+      if (this.codexExec !== null && !signal?.aborted && this.codexExec.due()) {
+        const calls: BashCall[] = [];
+        for (const bash of bashByToolUseId.values()) {
+          let endMs: number | null = bash.resultMs;
+          if (bash.bgTaskId !== null) {
+            // 背景へ回った Bash の終わりは完了通知（なければ孤児判定・iPhone からの停止）の時刻。
+            endMs = this.stopRecords.get(bash.bgTaskId)
+              ?? notificationByTaskId.get(bash.bgTaskId)?.ts
+              ?? bgOrphanTsByTaskId.get(bash.bgTaskId)
+              ?? null;
+          }
+          // 死亡確定のセッションで結果の無い Bash（中断等）は、最後の活動で終わったとみなす。
+          if (endMs === null && sessionAlive === false && lastActivityTsMs !== null) endMs = lastActivityTsMs;
+          calls.push({
+            toolUseId: bash.toolUseId, owner: bash.owner, command: bash.command, codex: bash.codex,
+            cwd: bash.cwd, startMs: bash.startMs, endMs,
+          });
+        }
+        const runs = await this.codexExec.evaluate({ sessionId, calls, sessionAlive }).catch(() => null);
+        for (const run of runs ?? []) {
+          const messageNode = codexExecNode(run, tracked.get(run.owner)?.meta.spawnDepth ?? null);
+          const key = stableNodeKey(messageNode);
+          if (key === codexLastKeyByNodeId.get(run.nodeId)) continue;
+          codexLastKeyByNodeId.set(run.nodeId, key);
+          yield { type: "subagent_node", v: PROTOCOL_V2, node: messageNode };
+        }
+      }
+
       if (!this.tailIndefinitely) return;
       await abortableSleep(this.pollIntervalMs, signal);
     }
+  }
+}
+
+/**
+ * Codex の 1 回の実行を subagent_node にする（codex-exec-delegation の表）。実行中の `ts` は開始時刻
+ * （他のノードと同じ）、終わったら記録の最後の行の時刻。
+ */
+function codexExecNode(run: CodexExecRun, ownerDepth: number | null): SubagentNode {
+  return {
+    nodeId: run.nodeId,
+    toolUseId: run.toolUseId,
+    parentNodeId: run.owner,
+    agentType: "Codex",
+    label: run.label,
+    depth: ownerDepth === null ? 1 : ownerDepth + 1,
+    status: run.status,
+    currentActivity: run.status === "running" && run.activity !== null
+      ? truncateActivityLabel(formatActivityLabel(run.activity), 200)
+      : null,
+    ts: run.status === "running" ? run.startMs : (run.lastTs ?? run.startMs),
+    kind: "codex_exec",
+    startTs: run.startMs,
+    ...(run.model !== null ? { model: run.model } : {}),
+    ...(run.effort !== null ? { effort: run.effort } : {}),
+  };
+}
+
+/** 行の top-level `cwd`（Claude の記録の各行に入っている）。 */
+function lineCwd(line: string): string | null {
+  try {
+    const cwd = (JSON.parse(line) as Record<string, unknown>)["cwd"];
+    return typeof cwd === "string" && cwd.length > 0 ? cwd : null;
+  } catch {
+    return null;
   }
 }
 
@@ -903,6 +1022,7 @@ function readNewLines(
     state.notificationByTaskId.clear();
     state.bgSpawnByToolUseId.clear();
     state.bgCommandByTaskId.clear();
+    state.bashByToolUseId.clear();
     state.firstTimestampMs = null;
     reset = true;
   }
@@ -983,6 +1103,7 @@ function ensureFileState(file: string, states: Map<string, FileTailState>): File
       notificationByTaskId: new Map(),
       bgSpawnByToolUseId: new Map(),
       bgCommandByTaskId: new Map(),
+      bashByToolUseId: new Map(),
       firstTimestampMs: null,
     };
     states.set(file, state);
@@ -1095,10 +1216,10 @@ function toolResultPlainText(content: unknown): string {
  */
 function extractBackgroundSpawns(
   line: string,
-): { id: string; label: string; command: string | null; background: boolean }[] {
+): { id: string; label: string; command: string | null; rawCommand: string; background: boolean }[] {
   const content = messageContent(line);
   if (!Array.isArray(content)) return [];
-  const out: { id: string; label: string; command: string | null; background: boolean }[] = [];
+  const out: { id: string; label: string; command: string | null; rawCommand: string; background: boolean }[] = [];
   for (const block of content) {
     if (typeof block !== "object" || block === null) continue;
     const rec = block as Record<string, unknown>;
@@ -1115,6 +1236,8 @@ function extractBackgroundSpawns(
       id: rec["id"],
       label: label.length > 0 ? label : "background command",
       command: clampCommand(command),
+      // 対応づけ（cd / -C の解析）用。巨大なヒアドキュメントで膨らまないよう上限を置く。
+      rawCommand: command.length <= MAX_RAW_COMMAND_CHARS ? command : command.slice(0, MAX_RAW_COMMAND_CHARS),
       background: input["run_in_background"] === true,
     });
   }
@@ -1453,6 +1576,8 @@ function stripActivityPrefix(label: string, fallback: string): string {
 
 /** subagent_node に載せる Bash command 全文の上限（巨大なヒアドキュメントで行が膨らまないように）。 */
 const MAX_COMMAND_CHARS = 4_000;
+/** Bash の観測に残すコマンドの上限（codex-exec-delegation の解析用）。 */
+const MAX_RAW_COMMAND_CHARS = 16_000;
 
 function clampCommand(command: string): string | null {
   const trimmed = command.trim();
