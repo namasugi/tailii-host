@@ -475,7 +475,10 @@ function compressRollout(plainPath: string): string {
   return compressedPath;
 }
 
-describe("CodexSessionStore.list（圧縮された rollout）", () => {
+/** zstd は Node 22.15 / 23.8 以降。対応下限の Node 20 では製品も圧縮ファイルを扱わないので、この群は飛ばす。 */
+const ZSTD_AVAILABLE = typeof (zlib as { zstdCompressSync?: unknown }).zstdCompressSync === "function";
+
+describe.skipIf(!ZSTD_AVAILABLE)("CodexSessionStore.list（圧縮された rollout）", () => {
   test("Codex が圧縮した古い会話（.jsonl.zst）も題名・更新時刻・最終メッセージ付きで一覧に出す", () => {
     const home = makeTempDir("codex-store-zst");
     const mtime = new Date("2026-06-12T00:00:00Z");

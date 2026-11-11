@@ -28,7 +28,9 @@ function searchSource(infos: ClaudeSessionInfo[]) {
 }
 
 describe("ホストの会話全文検索", () => {
-  test("Codex が圧縮した古い rollout（.jsonl.zst）の本文も解凍して検索し、読取上限は解凍後で数える", async () => {
+  // zstd は Node 22.15 / 23.8 以降。対応下限の Node 20 では製品も圧縮ファイルを扱わないので飛ばす。
+  test.skipIf(typeof (zlib as { zstdCompressSync?: unknown }).zstdCompressSync !== "function")(
+    "Codex が圧縮した古い rollout（.jsonl.zst）の本文も解凍して検索し、読取上限は解凍後で数える", async () => {
     const root = makeTempDir("search-zst");
     const plain = path.join(root, "old.jsonl");
     writeLines(plain, [

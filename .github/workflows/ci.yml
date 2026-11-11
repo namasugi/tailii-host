@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
       # 版上げ直後は optionalDependencies（@tailii/quic-gw-darwin-*）が未 publish で
       # lock にも registry にも無い。--omit=optional は TypeScript 自身の
