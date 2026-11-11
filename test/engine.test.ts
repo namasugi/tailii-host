@@ -2984,7 +2984,10 @@ describe("EngineControl — 横断制御チャネル", () => {
   });
 
   test("並行にしてよい要求は読み取り専用の RPC だけ（順序が意味を持つ要求は含めない）", () => {
-    for (const type of ["api_delegate_options_request", "claude_session_list_request", "git_status_request", "file_list_request"] as const) {
+    for (const type of [
+      "api_delegate_options_request", "claude_session_list_request", "git_status_request", "file_list_request",
+      "git_worktree_create_request", "git_worktree_list_request",
+    ] as const) {
       expect(CONCURRENT_MESSAGE_TYPES.has(type)).toBe(true);
     }
     for (const type of [

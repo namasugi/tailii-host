@@ -20,9 +20,12 @@ import {
   engineDiag,
   subscribeConversation,
   writeError,
+  type HandlerContext,
   type HandlerRegistry,
+  type WorktreeResponseFields,
 } from "../context.js";
 import { killSessionForUser } from "./session.js";
+import { settleWorktreeAfterConversationDelete } from "../worktreeJanitor.js";
 
 /** 履歴ページの Hub 待ち上限。Hub 側の読み切り上限（20 秒）より少し長く待つ（history-page）。 */
 const HISTORY_PAGE_RPC_TIMEOUT_MS = 22_000;
@@ -496,12 +499,20 @@ export const conversationHandlers: HandlerRegistry = {
     // kill から削除までを打ち切らないよう engine の終了待ち（background）へ載せる。
     ctx.trackBackground((async () => {
       let error: string | null;
+      // 会話の作業フォルダ（worktree の後片付け用）。消す前に控える（消した後は一覧から引けない）。
+      const conversationCwd = conversationCwdOf(ctx, message.agent, message.sessionId);
+      const killedWorktrees: WorktreeResponseFields[] = [];
       try {
         error = await deleteConversation({
           sessionId: message.sessionId,
           agent: message.agent,
           listSessions: () => ctx.sessionManager.list(),
-          killSession: (name) => killSessionForUser(ctx, name),
+          killSession: async (name) => {
+            // 完全削除の後片付けは Tailii が作った worktree だけ（kill 単体より狭い）。
+            const worktree = await killSessionForUser(ctx, name, { tailiiWorktreesOnly: true });
+            if (worktree !== null) killedWorktrees.push(worktree);
+            return worktree;
+          },
           paneProcessIds: (name) => ctx.sessionManager.agentProcessIds?.(name) ?? Promise.resolve(null),
           claudeSessionsDir: defaultClaudeSessionsDir(),
           deleteClaude: ctx.claudeSessionStore === null
@@ -517,9 +528,21 @@ export const conversationHandlers: HandlerRegistry = {
         engineDiag(`conversation_delete 失敗 id=${message.id}: ${String(thrown)}`);
         error = CONVERSATION_DELETE_MESSAGES.failed;
       }
+      let worktree: WorktreeResponseFields | null = null;
+      if (error === null) {
+        try {
+          worktree = await settleConversationWorktree(ctx, conversationCwd, killedWorktrees);
+        } catch (thrown) {
+          // 後片付けは fail-open。削除の成功を覆さない。
+          engineDiag(`conversation_delete worktree 後片付け失敗 id=${message.id}: ${String(thrown)}`);
+        }
+      }
       engineDiag(`conversation_delete_result id=${message.id} ok=${error === null}${error !== null ? ` error=${error}` : ""}`);
       try {
-        writer.write({ type: "conversation_delete_result", v, id: message.id, ok: error === null, error });
+        writer.write({
+          type: "conversation_delete_result", v, id: message.id, ok: error === null, error,
+          ...(worktree !== null ? worktree : {}),
+        });
       } catch (writeFailure) {
         process.stderr.write(`[tailii-host engine] conversation_delete_result 書込失敗: ${String(writeFailure)}\n`);
       }
@@ -592,3 +615,32 @@ export const conversationHandlers: HandlerRegistry = {
     })();
   },
 };
+
+/** 会話一覧から会話の作業フォルダを引く（見つからなければ null）。 */
+function conversationCwdOf(ctx: HandlerContext, agent: "claude" | "codex", sessionId: string): string | null {
+  try {
+    const sessions = agent === "codex"
+      ? ctx.codexSessionStore?.list(undefined, Number.MAX_SAFE_INTEGER) ?? []
+      : ctx.claudeSessionStore?.list() ?? [];
+    const cwd = sessions.find((info) => info.sessionId === sessionId)?.cwd ?? null;
+    return cwd !== null && cwd.length > 0 ? cwd : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 会話の完全削除の後片付け（worktree）。終了時に既に消せていればそれを返し、そうでなければ
+ * 会話の作業フォルダ（または終了したセッションの worktree）を、もう使うものが無いかで判定し直す。
+ */
+async function settleConversationWorktree(
+  ctx: HandlerContext,
+  conversationCwd: string | null,
+  killed: readonly WorktreeResponseFields[],
+): Promise<WorktreeResponseFields | null> {
+  const removed = killed.find((fields) => fields.worktreeRemoved === true);
+  if (removed !== undefined) return { worktreePath: removed.worktreePath, worktreeRemoved: true };
+  const cwd = conversationCwd ?? killed[0]?.worktreePath ?? null;
+  if (cwd === null) return null;
+  return settleWorktreeAfterConversationDelete(ctx, cwd);
+}

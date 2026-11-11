@@ -389,11 +389,18 @@ export function sessionInfoFromMeta(
   };
 }
 
-/** session_list_response の worktree 掃除結果フィールド（session_kill 応答に同乗）。 */
+/**
+ * worktree 掃除結果フィールド（session_kill の session_list_response・conversation_delete_result に同乗）。
+ * 件数は変更あり（worktreeDirty）のときだけ、判定できた場合に載る。
+ */
 export interface WorktreeResponseFields {
   worktreePath: string;
   worktreeRemoved?: boolean;
   worktreeDirty?: boolean;
+  /** 未保存（未コミット・未追跡）のファイル数。 */
+  worktreeUncommittedCount?: number;
+  /** 他のブランチにもリモートにも含まれないコミット数。 */
+  worktreeUnmergedCommitCount?: number;
 }
 
 /** session_list_response を書き出す（optional cursor / host 採用名は null なら省略）。 */

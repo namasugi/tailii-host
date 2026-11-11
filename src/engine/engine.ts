@@ -1260,6 +1260,11 @@ export const CONCURRENT_MESSAGE_TYPES: ReadonlySet<ControlMessage["type"]> = new
   "git_diff_request",
   "git_log_request",
   "git_branch_list_request",
+  // worktree の作成（checkout は最大 120 秒）と一覧（孤児掃除を含む）は read loop を塞がない。
+  // 同じリポジトリの作成・掃除は gitService の列で直列化され、作成→session_start の順序は
+  // アプリが作成の応答を待ってから session_start を送ることで保たれる（worktree-janitor）。
+  "git_worktree_create_request",
+  "git_worktree_list_request",
   "file_list_request",
   "file_read_request",
   "file_search_request",

@@ -6,11 +6,10 @@ import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import type { ChatAgent } from "../../chat/chatTailController.js";
 import {
-  gitWorktreeIsClean,
-  gitWorktreeRemove,
-  gitWorktreeUnlock,
-  isTailiiWorktreePath,
-} from "../../services/gitService.js";
+  beginWorktreeLaunch,
+  rollbackFailedLaunchWorktree,
+  settleWorktreeAfterKill,
+} from "../worktreeJanitor.js";
 import { makeSessionLauncher, claudeInnerCommand } from "../../commands/launch.js";
 import type { ControlMessage, SessionInfo } from "../../protocol.js";
 import {
@@ -637,6 +636,8 @@ async function startUnderLock(
     `session_start launcher 呼出前 cwd=${message.cwd} name=${message.name} resume=${resumeSessionId ?? "nil"} newId=${newSessionId ?? "nil"}`,
   );
   let result;
+  // 起動中の cwd は掃除・巻き戻しの対象にしない（同じ worktree へ並行して起動する場合の保護）。
+  const releaseLaunch = beginWorktreeLaunch(message.cwd);
   try {
     result = await chosenLauncher(
       message.cwd, message.name, message.baseDir ?? null, resumeSessionId, newSessionId,
@@ -656,7 +657,12 @@ async function startUnderLock(
             }
           : undefined,
     );
+  } catch (error) {
+    releaseLaunch();
+    await rollbackLaunchWorktree(ctx, message, resumeSessionId);
+    throw error;
   } finally {
+    releaseLaunch();
     ctx.hubLink.send({ type: "runtime_claim_release", session: message.name });
   }
   engineDiag(
@@ -676,8 +682,22 @@ async function startUnderLock(
     await writeLaunchedResponse(ctx, message, shouldSubscribe);
   } else {
     const m = result.errorText || `launch 失敗 (exit ${result.exitCode})`;
+    await rollbackLaunchWorktree(ctx, message, resumeSessionId);
     writeError(writer, v, message.id, "launch_failed", m);
   }
+}
+
+/**
+ * 新規起動に失敗したとき、ドラフトが今作った worktree を巻き戻す（再送のたびに増えないように）。
+ * resume や PR / MR worktree（claude 自身が作る）は対象外。判定は worktreeJanitor が安全側で行う。
+ */
+async function rollbackLaunchWorktree(
+  ctx: HandlerContext,
+  message: Extract<ControlMessage, { type: "session_start" }>,
+  resumeSessionId: string | null,
+): Promise<void> {
+  if (resumeSessionId !== null || message.worktree !== undefined) return;
+  await rollbackFailedLaunchWorktree(ctx, message.cwd);
 }
 
 /**
@@ -687,10 +707,13 @@ async function startUnderLock(
 export async function killSessionForUser(
   ctx: HandlerContext,
   name: string,
+  options: { tailiiWorktreesOnly?: boolean } = {},
 ): Promise<WorktreeResponseFields | null> {
   const { sessionManager, metadataStore } = ctx;
   // cwd の権威は tmux の現在位置ではなく永続 SessionMetadataStore。
-  const killedCwd = metadataStore?.get(name)?.cwd ?? null;
+  const killedMeta = metadataStore?.get(name) ?? null;
+  const killedCwd = killedMeta?.cwd ?? null;
+  const killedConversationId = killedMeta?.providerSessionId ?? killedMeta?.claudeSessionId ?? null;
   // 明示 kill はユーザー意思なので処理中保護より優先する（保護記録も掃除）。
   ctx.processingSessions.delete(name);
   ctx.backgroundChatSessions.delete(name);
@@ -705,27 +728,15 @@ export async function killSessionForUser(
   // kill 成功後だけ Hub の actor / durable queue / delivered receipt を廃棄する。
   // 同名セッションを後日作り直しても、旧会話の queued 入力を注入させない。
   ctx.hubLink.send({ type: "session_retire", session: name });
-  if (killedCwd === null || !isTailiiWorktreePath(killedCwd)) return null;
-  const worktreeResponse: WorktreeResponseFields = { worktreePath: killedCwd };
+  if (killedCwd === null) return null;
   try {
-    if (await gitWorktreeIsClean(killedCwd)) {
-      const removed = await gitWorktreeRemove(killedCwd, false);
-      if (removed.ok) {
-        worktreeResponse.worktreeRemoved = true;
-      } else {
-        engineDiag(`session_kill worktree 削除失敗 path=${killedCwd}: ${removed.error ?? "unknown"}`);
-      }
-    } else {
-      engineDiag(`session_kill worktree dirty または clean 判定不能のため保持 path=${killedCwd}`);
-      worktreeResponse.worktreeDirty = true;
-      const unlocked = await gitWorktreeUnlock(killedCwd);
-      if (!unlocked.ok) {
-        engineDiag(`session_kill worktree unlock 失敗 path=${killedCwd}: ${unlocked.error ?? "unknown"}`);
-      }
-    }
+    return await settleWorktreeAfterKill(
+      ctx, { name, cwd: killedCwd, conversationId: killedConversationId },
+      { tailiiOnly: options.tailiiWorktreesOnly === true },
+    );
   } catch (error) {
     // worktree の判定・掃除は fail-open。ユーザーが要求した kill の成功を覆さない。
     engineDiag(`session_kill worktree 掃除失敗 path=${killedCwd}: ${String(error)}`);
+    return { worktreePath: killedCwd };
   }
-  return worktreeResponse;
 }

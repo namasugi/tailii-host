@@ -14,6 +14,7 @@ import {
   gitWorktreeRemove,
 } from "../../services/gitService.js";
 import { engineDiag, type HandlerRegistry } from "../context.js";
+import { listWorktreesForApp, sweepOrphanWorktrees } from "../worktreeJanitor.js";
 
 export const gitHandlers: HandlerRegistry = {
   git_status_request: async (message, ctx) => {
@@ -114,12 +115,34 @@ export const gitHandlers: HandlerRegistry = {
     try {
       const response = await gitWorktreeCreate(message.path, message.baseBranch);
       writer.write({ type: "git_worktree_create_response", v, id: message.id, ...response });
+      // 同じリポジトリの孤児を掃除する。作成の応答（＝会話の開始）を待たせないよう応答の後に回す。
+      // 作成と掃除は同じリポジトリの列で直列化され、今作ったものは作成直後の猶予で対象外になる。
+      ctx.trackBackground(sweepOrphanWorktrees(ctx, message.path).catch((error: unknown) => {
+        engineDiag(`孤児 worktree の掃除失敗 path=${message.path}: ${String(error)}`);
+      }));
     } catch (error) {
       engineDiag(`git_worktree_create_response 失敗 id=${message.id}: ${String(error)}`);
       writer.write({
         type: "git_worktree_create_response", v, id: message.id,
         ok: false, branch: "", worktreePath: "", error: String(error),
       });
+    }
+  },
+
+  git_worktree_list_request: async (message, ctx) => {
+    const { writer, state } = ctx;
+    const v = state.negotiatedVersion;
+    try {
+      const listed = await listWorktreesForApp(ctx, message.path);
+      writer.write(listed === null
+        ? { type: "git_worktree_list_response", v, id: message.id, isRepo: false, worktrees: [] }
+        : {
+            type: "git_worktree_list_response", v, id: message.id, isRepo: true, worktrees: listed.worktrees,
+            ...(listed.removedPaths.length > 0 ? { removedPaths: listed.removedPaths } : {}),
+          });
+    } catch (error) {
+      engineDiag(`git_worktree_list_response 失敗 id=${message.id}: ${String(error)}`);
+      writer.write({ type: "git_worktree_list_response", v, id: message.id, isRepo: false, worktrees: [] });
     }
   },
 

@@ -114,6 +114,21 @@ export interface SubagentNode {
 }
 
 /** セッション一覧応答の 1 要素。 */
+/** Git 画面のワークツリー一覧の 1 件（git_worktree_list_response）。 */
+export interface GitWorktreeListItem {
+  path: string;
+  /** ブランチ名（detached は null）。 */
+  branch: string | null;
+  /** 未保存の変更か未マージのコミットがある（判定できないときも true）。 */
+  hasChanges: boolean;
+  /** 稼働中のセッションか会話一覧の会話が使っている（判定できないときも true）。 */
+  inUse: boolean;
+  /** 登録は残っているがフォルダが見つからない（省略 = 見つかる）。 */
+  missing?: boolean;
+  uncommittedCount?: number;
+  unmergedCommitCount?: number;
+}
+
 export interface SessionInfo {
   name: string;
   cwd: string;
@@ -636,7 +651,7 @@ export type ControlMessage =
    */
   | { type: "remote_pending_snapshot"; v: number; kind: RemotePendingKind; items: RemotePendingSnapshotItem[] }
   | { type: "session_list_request"; v: number; id: string; limit?: number; cursor?: string }
-  | { type: "session_list_response"; v: number; id: string; sessions: SessionInfo[]; nextCursor?: string; adoptedName?: string; worktreePath?: string; worktreeRemoved?: boolean; worktreeDirty?: boolean }
+  | { type: "session_list_response"; v: number; id: string; sessions: SessionInfo[]; nextCursor?: string; adoptedName?: string; worktreePath?: string; worktreeRemoved?: boolean; worktreeDirty?: boolean; worktreeUncommittedCount?: number; worktreeUnmergedCommitCount?: number }
   | { type: "session_start"; v: number; id: string; cwd: string; name: string; baseDir?: string; resumeSessionId?: string; title?: string; agentType?: "claude" | "codex"; model?: string; permissionMode?: "default" | "acceptEdits" | "plan" | "auto"; effort?: "low" | "medium" | "high" | "xhigh" | "max"; codexModel?: string; codexSandbox?: "read-only" | "workspace-write" | "danger-full-access"; deferSubscribe?: boolean; outputStyle?: string; worktree?: string; todoTools?: boolean }
   /**
    * 会話の開き直し（iOS→host）。`newerThanMs` はキャッシュ済みログが追いついていた時刻（epoch ms,
@@ -810,7 +825,7 @@ export type ControlMessage =
    * Tailii 外（Mac の端末など）で実行中なら ok=false で拒否する。対象が既に無いのは ok=true。
    */
   | { type: "conversation_delete"; v: number; id: string; sessionId: string; agent: "claude" | "codex" }
-  | { type: "conversation_delete_result"; v: number; id: string; ok: boolean; error: string | null }
+  | { type: "conversation_delete_result"; v: number; id: string; ok: boolean; error: string | null; worktreePath?: string; worktreeRemoved?: boolean; worktreeDirty?: boolean; worktreeUncommittedCount?: number; worktreeUnmergedCommitCount?: number }
   | { type: "question_prompt"; v: number; id: string; questions: QuestionPromptQuestion[] }
   | { type: "question_answer"; v: number; id: string; session: string; answers: QuestionAnswer[] }
   | { type: "question_dismiss"; v: number; id: string }
@@ -902,6 +917,8 @@ export type ControlMessage =
   | { type: "git_worktree_create_response"; v: number; id: string; ok: boolean; branch: string; worktreePath: string; error: string | null }
   | { type: "git_worktree_remove_request"; v: number; id: string; path: string; force: boolean }
   | { type: "git_worktree_remove_response"; v: number; id: string; ok: boolean; error: string | null }
+  | { type: "git_worktree_list_request"; v: number; id: string; path: string }
+  | { type: "git_worktree_list_response"; v: number; id: string; isRepo: boolean; worktrees: GitWorktreeListItem[]; removedPaths?: string[] }
   | { type: "claude_session_list_request"; v: number; id: string }
   | {
       type: "claude_session_list_response"; v: number; id: string; claudeSessions: ClaudeSessionInfo[];

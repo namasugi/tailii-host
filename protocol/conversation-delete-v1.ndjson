@@ -2,3 +2,6 @@
 {"error":null,"id":"cd1","ok":true,"type":"conversation_delete_result","v":1}
 {"agent":"codex","id":"cd2","sessionId":"019a0000-1111-7222-8333-444455556666","type":"conversation_delete","v":1}
 {"error":"Tailii 以外（ターミナルや公式アプリ）でこの会話が実行中のため削除できません（work）。そちらを終了してから削除してください。","id":"cd2","ok":false,"type":"conversation_delete_result","v":1}
+{"agent":"claude","id":"cd3","sessionId":"22222222-3333-4444-5555-666666666666","type":"conversation_delete","v":1}
+{"error":null,"id":"cd3","ok":true,"type":"conversation_delete_result","v":1,"worktreeDirty":true,"worktreePath":"/Users/alice/project/.claude/worktrees/20260713-120000","worktreeUncommittedCount":0,"worktreeUnmergedCommitCount":3}
+{"error":null,"id":"cd4","ok":true,"type":"conversation_delete_result","v":1,"worktreePath":"/Users/alice/project/.claude/worktrees/20260713-120001","worktreeRemoved":true}

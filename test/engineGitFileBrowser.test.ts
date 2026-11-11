@@ -3,8 +3,11 @@
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
+import type { EngineLauncher } from "../src/commands/launch.js";
 import { gitWorktreeCreate } from "../src/services/gitService.js";
+import { ClaudeSessionStore } from "../src/sessions/claudeSessionStore.js";
+import { claudeProjectSlug } from "../src/shared/paths.js";
 import { decodeControlMessage } from "../src/protocol.js";
 import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
 import { TmuxSessionManager } from "../src/backend/tmux.js";
@@ -171,7 +174,7 @@ describe("EngineControl — file/git browser", () => {
     const dirtyResponse = decodeControlMessage(await engine.lines.nextOfType("session_list_response"));
     expect(dirtyResponse).toMatchObject({
       type: "session_list_response", id: "wk-dirty", worktreePath,
-      worktreeDirty: true,
+      worktreeDirty: true, worktreeUncommittedCount: 1, worktreeUnmergedCommitCount: 0,
     });
     expect(dirtyResponse).not.toHaveProperty("worktreeRemoved");
     expect(fs.existsSync(worktreePath)).toBe(true);
@@ -181,6 +184,116 @@ describe("EngineControl — file/git browser", () => {
     expect(git(root, ["branch", "--list", created.branch])).toContain(created.branch);
 
     await engine.teardown();
+  });
+});
+
+function makeEngineRepository(label: string): string {
+  const root = fs.realpathSync(makeTempDir(label));
+  git(root, ["init", "-b", "main"]);
+  git(root, ["config", "user.name", "Engine Test"]);
+  git(root, ["config", "user.email", "engine@example.invalid"]);
+  fs.writeFileSync(path.join(root, "tracked.txt"), "one\n");
+  git(root, ["add", "tracked.txt"]);
+  git(root, ["commit", "-m", "initial"]);
+  return root;
+}
+
+describe("EngineControl — worktree の片付け（worktree-janitor）", () => {
+  test("git_worktree_list_request は一覧を git_worktree_list_response で返す", async () => {
+    vi.stubEnv("TAILII_CLAUDE_SESSIONS_DIR", makeTempDir("engine-wt-list-registry"));
+    const root = makeEngineRepository("engine-wt-list");
+    const created = await gitWorktreeCreate(root, "main");
+    const worktreePath = fs.realpathSync(created.worktreePath);
+    fs.writeFileSync(path.join(worktreePath, "new.txt"), "x\n");
+    const manager = new TmuxSessionManager({ runner: new MockTmuxRunner(() => ({ exitCode: 0, stdout: "", stderr: "" })).runner });
+    const engine = startEngine({
+      sessionManager: manager, claudeSessionStore: new ClaudeSessionStore(makeTempDir("engine-wt-list-projects")),
+    });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine(JSON.stringify({ type: "git_worktree_list_request", v: 1, id: "wl", path: root }));
+    expect(decodeControlMessage(await engine.lines.nextOfType("git_worktree_list_response"))).toEqual({
+      type: "git_worktree_list_response", v: 2, id: "wl", isRepo: true,
+      worktrees: [{
+        path: worktreePath, branch: created.branch, hasChanges: true, inUse: false,
+        uncommittedCount: 1, unmergedCommitCount: 0,
+      }],
+    });
+    engine.writeLine(JSON.stringify({ type: "git_worktree_list_request", v: 1, id: "wl2", path: makeTempDir("engine-wt-nonrepo") }));
+    expect(decodeControlMessage(await engine.lines.nextOfType("git_worktree_list_response"))).toEqual({
+      type: "git_worktree_list_response", v: 2, id: "wl2", isRepo: false, worktrees: [],
+    });
+    // 範囲外のパスの削除要求は拒否する。
+    engine.writeLine(JSON.stringify({ type: "git_worktree_remove_request", v: 1, id: "wr", path: root, force: true }));
+    expect(decodeControlMessage(await engine.lines.nextOfType("git_worktree_remove_response"))).toMatchObject({
+      type: "git_worktree_remove_response", id: "wr", ok: false,
+    });
+    expect(fs.existsSync(path.join(root, "tracked.txt"))).toBe(true);
+    await engine.teardown();
+    vi.unstubAllEnvs();
+  });
+
+  test("session_start が失敗したら今作った worktree を巻き戻す（項目3）", async () => {
+    vi.stubEnv("TAILII_CLAUDE_SESSIONS_DIR", makeTempDir("engine-wt-start-registry"));
+    const root = makeEngineRepository("engine-wt-start");
+    const created = await gitWorktreeCreate(root, "main");
+    const worktreePath = fs.realpathSync(created.worktreePath);
+    const launcher: EngineLauncher = async () => ({ exitCode: 1, errorText: "起動に失敗しました" });
+    const manager = new TmuxSessionManager({ runner: new MockTmuxRunner(() => ({ exitCode: 0, stdout: "", stderr: "" })).runner });
+    const engine = startEngine({
+      sessionManager: manager, launcher,
+      claudeSessionStore: new ClaudeSessionStore(makeTempDir("engine-wt-start-projects")),
+    });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine(JSON.stringify({ type: "session_start", v: 1, id: "ss", name: "cs-wt-fail", cwd: worktreePath }));
+    expect(await engine.lines.nextOfType("error")).toContain('"code":"launch_failed"');
+    expect(fs.existsSync(worktreePath)).toBe(false);
+    expect(git(root, ["branch", "--list", created.branch]).trim()).toBe("");
+    await engine.teardown();
+    vi.unstubAllEnvs();
+  });
+
+  test("conversation_delete は会話の worktree を片付け、変更ありは件数を応答に載せる（項目2）", async () => {
+    vi.stubEnv("TAILII_CLAUDE_SESSIONS_DIR", makeTempDir("engine-wt-delete-registry"));
+    const root = makeEngineRepository("engine-wt-delete");
+    const projects = makeTempDir("engine-wt-delete-projects");
+    const writeConversation = (cwd: string, id: string): void => {
+      const dir = path.join(projects, claudeProjectSlug(cwd));
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, `${id}.jsonl`),
+        `${JSON.stringify({ type: "user", cwd, timestamp: "2026-11-11T00:00:00.000Z", message: { content: "hi" } })}\n`);
+    };
+    const clean = await gitWorktreeCreate(root, "main");
+    const cleanPath = fs.realpathSync(clean.worktreePath);
+    const cleanId = "11111111-2222-3333-4444-555555555555";
+    writeConversation(cleanPath, cleanId);
+    const dirty = await gitWorktreeCreate(root, "main");
+    const dirtyPath = fs.realpathSync(dirty.worktreePath);
+    const dirtyId = "66666666-7777-8888-9999-000000000000";
+    writeConversation(dirtyPath, dirtyId);
+    fs.writeFileSync(path.join(dirtyPath, "c.txt"), "c\n");
+    git(dirtyPath, ["add", "c.txt"]);
+    git(dirtyPath, ["commit", "-m", "unmerged"]);
+
+    const manager = new TmuxSessionManager({ runner: new MockTmuxRunner(() => ({ exitCode: 0, stdout: "", stderr: "" })).runner });
+    const engine = startEngine({ sessionManager: manager, claudeSessionStore: new ClaudeSessionStore(projects) });
+    await engine.lines.nextOfType("channel_hello");
+
+    engine.writeLine(JSON.stringify({ type: "conversation_delete", v: 1, id: "cd-clean", sessionId: cleanId, agent: "claude" }));
+    expect(decodeControlMessage(await engine.lines.nextOfType("conversation_delete_result"))).toEqual({
+      type: "conversation_delete_result", v: 2, id: "cd-clean", ok: true, error: null,
+      worktreePath: cleanPath, worktreeRemoved: true,
+    });
+    expect(fs.existsSync(cleanPath)).toBe(false);
+
+    engine.writeLine(JSON.stringify({ type: "conversation_delete", v: 1, id: "cd-dirty", sessionId: dirtyId, agent: "claude" }));
+    expect(decodeControlMessage(await engine.lines.nextOfType("conversation_delete_result"))).toEqual({
+      type: "conversation_delete_result", v: 2, id: "cd-dirty", ok: true, error: null,
+      worktreePath: dirtyPath, worktreeDirty: true, worktreeUncommittedCount: 0, worktreeUnmergedCommitCount: 1,
+    });
+    expect(fs.existsSync(dirtyPath)).toBe(true);
+    await engine.teardown();
+    vi.unstubAllEnvs();
   });
 });
 

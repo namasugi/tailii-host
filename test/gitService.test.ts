@@ -13,11 +13,17 @@ import {
   gitInit,
   gitLog,
   gitStatus,
+  classifyWorktreeAddFailure,
+  gitManagedWorktrees,
+  gitWorktreeChangeSummary,
   gitWorktreeCreate,
   gitWorktreeIsClean,
   gitWorktreeRemove,
   isTailiiWorktreePath,
   parsePorcelainV2,
+  parseWorktreeList,
+  resolveManagedWorktree,
+  resolveManagedWorktreeForCwd,
   tailiiWorktreeRepoRoot,
 } from "../src/services/gitService.js";
 import { makeTempDir } from "./helpers.js";
@@ -413,14 +419,15 @@ describe("gitService worktree", () => {
 
     const root = makeRepository();
     const missingBase = await gitWorktreeCreate(root, "does-not-exist");
-    expect(missingBase).toMatchObject({ ok: false, error: expect.any(String) });
-    expect(missingBase.branch).toMatch(/^worktree-/);
-    expect(fs.existsSync(missingBase.worktreePath)).toBe(false);
+    // 起点は名前を決める前に検証する（存在しない起点で worktree もブランチも作らない）。
+    expect(missingBase).toMatchObject({ ok: false, branch: "", worktreePath: "", error: expect.stringContaining("does-not-exist") });
+    expect(git(root, ["branch", "--list", "worktree-*"]).trim()).toBe("");
+    expect(fs.existsSync(path.join(root, ".claude", "worktrees"))).toBe(false);
 
     const unborn = fs.realpathSync(makeTempDir("git-worktree-unborn"));
     git(unborn, ["init", "-b", "main"]);
     await expect(gitWorktreeCreate(unborn, "main")).resolves.toMatchObject({
-      ok: false, branch: expect.stringMatching(/^worktree-/), error: expect.any(String),
+      ok: false, branch: "", error: expect.any(String),
     });
   });
 
@@ -517,5 +524,258 @@ describe("gitService worktree", () => {
     expect(tailiiWorktreeRepoRoot("/repo/.claude/worktrees")).toBeNull();
     expect(tailiiWorktreeRepoRoot("/repo/src")).toBeNull();
     expect(tailiiWorktreeRepoRoot("/.claude/worktrees/x")).toBeNull();
+  });
+});
+
+describe("gitService worktree 堅牢化（worktree-hardening）", () => {
+  test("parseWorktreeList は本体・ブランチ・detached・ロック理由を読む", () => {
+    const parsed = parseWorktreeList([
+      "worktree /repo", "HEAD aaa", "branch refs/heads/main", "",
+      "worktree /repo/.claude/worktrees/a", "HEAD bbb", "branch refs/heads/worktree-a", "locked tailii-session", "",
+      "worktree /repo/.claude/worktrees/b", "HEAD ccc", "detached", "locked", "",
+    ].join("\n"));
+    expect(parsed).toEqual([
+      { path: "/repo", head: "aaa", branch: "main", bare: false, lockReason: null },
+      { path: "/repo/.claude/worktrees/a", head: "bbb", branch: "worktree-a", bare: false, lockReason: "tailii-session" },
+      { path: "/repo/.claude/worktrees/b", head: "ccc", branch: null, bare: false, lockReason: "" },
+    ]);
+  });
+
+  test("除外設定の追記に失敗したら worktree とブランチを巻き戻して ok:false（項目4）", async () => {
+    const root = makeRepository();
+    // info を通常ファイルにして info/exclude を書けなくする。
+    fs.rmSync(path.join(root, ".git", "info"), { recursive: true, force: true });
+    fs.writeFileSync(path.join(root, ".git", "info"), "not a directory\n");
+    const created = await gitWorktreeCreate(root, "main");
+    expect(created.ok).toBe(false);
+    expect(created.branch).toMatch(/^worktree-/);
+    expect(fs.existsSync(created.worktreePath)).toBe(false);
+    expect(git(root, ["branch", "--list", created.branch]).trim()).toBe("");
+    expect(git(root, ["worktree", "list", "--porcelain"])).not.toContain(created.worktreePath);
+  });
+
+  test("旧版の作成者が同じ名前で作り終えていたら、相手の worktree とブランチに触れない（7周目1）", async () => {
+    const root = makeRepository();
+    const realGit = execFileSync("/usr/bin/which", ["git"], { encoding: "utf8" }).trim();
+    const binDir = makeTempDir("git-worktree-fake-bin");
+    const marker = path.join(binDir, "competed");
+    // `worktree add <path> -b <branch> <base>` の直前に、フォルダを確保しない作成者が同じパス・
+    // 同じブランチ名で作り終える（引数: -C <repo> worktree add <path> -b <branch> <base>）。
+    fs.writeFileSync(path.join(binDir, "git"), [
+      "#!/bin/sh",
+      `if [ "$3" = worktree ] && [ "$4" = add ] && [ ! -e '${marker}' ]; then`,
+      `  touch '${marker}'`,
+      `  '${realGit}' -C "$2" worktree add "$5" -b "$7" "$8" >/dev/null 2>&1`,
+      "fi",
+      `exec '${realGit}' "$@"`,
+      "",
+    ].join("\n"), { mode: 0o755 });
+    vi.stubEnv("PATH", `${binDir}:${process.env["PATH"] ?? ""}`);
+    try {
+      const created = await gitWorktreeCreate(root, "main");
+      expect(created.ok).toBe(false);
+      expect(fs.existsSync(marker)).toBe(true);
+      const entries = parseWorktreeList(git(root, ["worktree", "list", "--porcelain"]));
+      expect(entries).toHaveLength(2);
+      const competitor = entries[1]!;
+      expect(competitor.branch).toMatch(/^worktree-/);
+      expect(fs.existsSync(path.join(competitor.path, "tracked.txt"))).toBe(true);
+      expect(git(root, ["branch", "--list", competitor.branch!])).toContain(competitor.branch!);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  test("checkout 後のフックの中の git が別名で断っても、衝突と取り違えず巻き戻す（8周目）", async () => {
+    const root = makeRepository();
+    const hook = path.join(root, ".git", "hooks", "post-checkout");
+    fs.mkdirSync(path.dirname(hook), { recursive: true });
+    fs.writeFileSync(hook, "#!/bin/sh\ngit branch main\nexit 1\n", { mode: 0o755 });
+    const created = await gitWorktreeCreate(root, "main");
+    expect(created.ok).toBe(false);
+    expect(git(root, ["branch", "--list", "worktree-*"]).trim()).toBe("");
+    expect(git(root, ["worktree", "list", "--porcelain"]).split("\n").filter((line) => line.startsWith("worktree ")))
+      .toHaveLength(1);
+  });
+
+  test("checkout 後のフックが File exists 等を出して失敗しても、衝突と取り違えず 1 組だけ巻き戻す（6周目1）", async () => {
+    const root = makeRepository();
+    const hook = path.join(root, ".git", "hooks", "post-checkout");
+    fs.mkdirSync(path.dirname(hook), { recursive: true });
+    fs.writeFileSync(hook, "#!/bin/sh\necho 'mkdir: /x/cache: File exists' >&2\necho 'fatal: something already exists' >&2\nexit 1\n", { mode: 0o755 });
+    const created = await gitWorktreeCreate(root, "main");
+    expect(created.ok).toBe(false);
+    expect(git(root, ["branch", "--list", "worktree-*"]).trim()).toBe("");
+    expect(git(root, ["worktree", "list", "--porcelain"]).split("\n").filter((line) => line.startsWith("worktree ")))
+      .toHaveLength(1);
+    const container = path.join(root, ".claude", "worktrees");
+    expect(fs.existsSync(container) ? fs.readdirSync(container) : []).toEqual([]);
+  });
+
+  test("worktree add 自体が途中で失敗したら作りかけを巻き戻す（項目4・12）", async () => {
+    const root = makeRepository();
+    // checkout 後のフックが失敗すると add は失敗を返すが、作りかけの worktree とブランチが残る。
+    const hook = path.join(root, ".git", "hooks", "post-checkout");
+    fs.mkdirSync(path.dirname(hook), { recursive: true });
+    fs.writeFileSync(hook, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    const created = await gitWorktreeCreate(root, "main");
+    expect(created.ok).toBe(false);
+    expect(fs.existsSync(created.worktreePath)).toBe(false);
+    expect(git(root, ["branch", "--list", "worktree-*"]).trim()).toBe("");
+    expect(git(root, ["worktree", "list", "--porcelain"]).split("\n").filter((line) => line.startsWith("worktree ")))
+      .toHaveLength(1);
+  });
+
+  test("push 済みのコミットは変更なし扱いで、非 force 削除でブランチも消える（項目6）", async () => {
+    const root = makeRepository();
+    const remote = fs.realpathSync(makeTempDir("git-worktree-remote"));
+    execFileSync("git", ["init", "--bare", "-b", "main", remote]);
+    git(root, ["remote", "add", "origin", remote]);
+    git(root, ["push", "-q", "origin", "main"]);
+    const created = await gitWorktreeCreate(root, "main");
+    expect(created.ok).toBe(true);
+    const worktreePath = fs.realpathSync(created.worktreePath);
+    fs.writeFileSync(path.join(worktreePath, "pushed.txt"), "pushed\n");
+    git(worktreePath, ["add", "pushed.txt"]);
+    git(worktreePath, ["commit", "-m", "pushed commit"]);
+    await expect(gitWorktreeChangeSummary(worktreePath)).resolves.toEqual({ uncommitted: 0, unmergedCommits: 1 });
+    expect(await gitWorktreeIsClean(worktreePath)).toBe(false);
+
+    git(worktreePath, ["push", "-q", "origin", `HEAD:refs/heads/${created.branch}`]);
+    await expect(gitWorktreeChangeSummary(worktreePath)).resolves.toEqual({ uncommitted: 0, unmergedCommits: 0 });
+    expect(await gitWorktreeIsClean(worktreePath)).toBe(true);
+    await expect(gitWorktreeRemove(worktreePath, false)).resolves.toEqual({ ok: true, error: null });
+    expect(fs.existsSync(worktreePath)).toBe(false);
+    expect(git(root, ["branch", "--list", created.branch]).trim()).toBe("");
+  });
+
+  test("変更件数は未保存ファイル数と未マージのコミット数を数える（項目7）", async () => {
+    const root = makeRepository();
+    const created = await gitWorktreeCreate(root, "main");
+    const worktreePath = fs.realpathSync(created.worktreePath);
+    fs.writeFileSync(path.join(worktreePath, "c1.txt"), "1\n");
+    git(worktreePath, ["add", "c1.txt"]);
+    git(worktreePath, ["commit", "-m", "c1"]);
+    fs.writeFileSync(path.join(worktreePath, "c2.txt"), "2\n");
+    git(worktreePath, ["add", "c2.txt"]);
+    git(worktreePath, ["commit", "-m", "c2"]);
+    fs.appendFileSync(path.join(worktreePath, "tracked.txt"), "dirty\n");
+    fs.mkdirSync(path.join(worktreePath, "newdir"));
+    fs.writeFileSync(path.join(worktreePath, "newdir", "a.txt"), "a\n");
+    fs.writeFileSync(path.join(worktreePath, "newdir", "b.txt"), "b\n");
+    await expect(gitWorktreeChangeSummary(worktreePath)).resolves.toEqual({ uncommitted: 3, unmergedCommits: 2 });
+  });
+
+  test("削除は .claude/worktrees 配下の登録済み worktree 以外を拒否する（項目8）", async () => {
+    const root = makeRepository();
+    const manual = path.join(fs.realpathSync(makeTempDir("git-worktree-manual")), "manual");
+    git(root, ["worktree", "add", manual, "-b", "manual-branch", "main"]);
+    fs.appendFileSync(path.join(manual, "tracked.txt"), "unsaved\n");
+    const rejected = await gitWorktreeRemove(manual, true);
+    expect(rejected.ok).toBe(false);
+    expect(fs.readFileSync(path.join(manual, "tracked.txt"), "utf8")).toContain("unsaved");
+
+    await expect(gitWorktreeRemove(root, true)).resolves.toMatchObject({ ok: false });
+    expect(fs.existsSync(path.join(root, "tracked.txt"))).toBe(true);
+
+    const created = await gitWorktreeCreate(root, "main");
+    const worktreePath = fs.realpathSync(created.worktreePath);
+    fs.mkdirSync(path.join(worktreePath, "sub"));
+    await expect(gitWorktreeRemove(path.join(worktreePath, "sub"), true)).resolves.toMatchObject({ ok: false });
+    expect(fs.existsSync(worktreePath)).toBe(true);
+
+    // 未登録の（ただのディレクトリの）.claude/worktrees 配下も拒否する。
+    const stray = path.join(root, ".claude", "worktrees", "stray");
+    fs.mkdirSync(stray, { recursive: true });
+    await expect(gitWorktreeRemove(stray, true)).resolves.toMatchObject({ ok: false });
+    expect(fs.existsSync(stray)).toBe(true);
+  });
+
+  test("起点ブランチ名の - 始まりを拒否し、何も作らない（項目9）", async () => {
+    const root = makeRepository();
+    for (const base of ["--detach", "-b", "-", ""]) {
+      const created = await gitWorktreeCreate(root, base);
+      expect(created).toMatchObject({ ok: false, branch: "", worktreePath: "" });
+    }
+    expect(git(root, ["branch", "--list", "worktree-*"]).trim()).toBe("");
+    expect(git(root, ["worktree", "list", "--porcelain"]).split("\n").filter((line) => line.startsWith("worktree ")))
+      .toHaveLength(1);
+    // 実在するコミットを指す名前（ブランチ・タグ・コミット）は通す。
+    git(root, ["tag", "v1"]);
+    await expect(gitWorktreeCreate(root, "v1")).resolves.toMatchObject({ ok: true });
+  });
+
+  test("同じ秒の並行作成は両方成功し、別のブランチになる（項目10）", async () => {
+    const root = makeRepository();
+    const results = await Promise.all([
+      gitWorktreeCreate(root, "main"), gitWorktreeCreate(root, "main"), gitWorktreeCreate(root, "main"),
+    ]);
+    expect(results.map((result) => result.ok)).toEqual([true, true, true]);
+    expect(new Set(results.map((result) => result.branch)).size).toBe(3);
+    expect(new Set(results.map((result) => result.worktreePath)).size).toBe(3);
+  });
+
+  test("worktree の中から作っても本体ルート基準で作る（項目11）", async () => {
+    const root = makeRepository();
+    const first = await gitWorktreeCreate(root, "main");
+    const firstPath = fs.realpathSync(first.worktreePath);
+    fs.mkdirSync(path.join(firstPath, "src"));
+    const nested = await gitWorktreeCreate(path.join(firstPath, "src"), "main");
+    expect(nested.ok).toBe(true);
+    expect(path.dirname(nested.worktreePath)).toBe(path.join(root, ".claude", "worktrees"));
+    expect(fs.existsSync(path.join(firstPath, ".claude", "worktrees"))).toBe(false);
+  });
+
+  test("worktree add の失敗の分類: 今回のブランチ名・パスを名指しした fatal 行だけを衝突とみなす（5周目3・8周目）", () => {
+    const branch = "worktree-20261111-120000";
+    const wt = "/r/.claude/worktrees/20261111-120000";
+    const classify = (stderr: string): string => classifyWorktreeAddFailure(stderr, branch, wt);
+    expect(classify(`Preparing worktree (new branch '${branch}')\nfatal: a branch named '${branch}' already exists`))
+      .toBe("branch-collision");
+    expect(classify(`fatal: cannot lock ref 'refs/heads/${branch}': File exists.`)).toBe("branch-collision");
+    expect(classify(`fatal: '${wt}' already exists`)).toBe("name-collision");
+    // 古い git の文言（大文字始まり・末尾ピリオド）も同じに扱う。名前の大小違いは別物。
+    expect(classify(`fatal: A branch named '${branch}' already exists.`)).toBe("branch-collision");
+    expect(classify(`fatal: a branch named '${branch.toUpperCase()}' already exists`)).toBe("failure");
+    expect(classify("error: hook 'post-checkout' failed")).toBe("failure");
+    expect(classify("")).toBe("failure");
+    // フックの出力に混ざった文言・別名を名指しした fatal 行は衝突ではない（6周目1・8周目）。
+    expect(classify("mkdir: /x/cache: File exists\nln: link already exists")).toBe("failure");
+    expect(classify("fatal: a branch named 'main' already exists")).toBe("failure");
+    expect(classify("fatal: cannot lock ref 'refs/heads/foo': File exists.")).toBe("failure");
+    expect(classify("fatal: '/x/y' already exists")).toBe("failure");
+  });
+
+  test("detached の非 force 削除は、どこにも無いコミットがあれば消さない（5周目1）", async () => {
+    const root = makeRepository();
+    const created = await gitWorktreeCreate(root, "main");
+    const worktreePath = fs.realpathSync(created.worktreePath);
+    git(worktreePath, ["checkout", "-q", "--detach"]);
+    fs.writeFileSync(path.join(worktreePath, "d.txt"), "d\n");
+    git(worktreePath, ["add", "d.txt"]);
+    git(worktreePath, ["commit", "-m", "detached only"]);
+    const removed = await gitWorktreeRemove(worktreePath, false);
+    expect(removed.ok).toBe(false);
+    expect(fs.existsSync(path.join(worktreePath, "d.txt"))).toBe(true);
+    expect(git(root, ["worktree", "list", "--porcelain"])).toContain("locked tailii-session");
+    // 二段階確認を経た force は利用者の明示なので消す。
+    await expect(gitWorktreeRemove(worktreePath, true)).resolves.toMatchObject({ ok: true });
+    expect(fs.existsSync(worktreePath)).toBe(false);
+  });
+
+  test("管理対象の解決と一覧は .claude/worktrees 配下だけを返す", async () => {
+    const root = makeRepository();
+    const created = await gitWorktreeCreate(root, "main");
+    const worktreePath = fs.realpathSync(created.worktreePath);
+    const manual = path.join(fs.realpathSync(makeTempDir("git-worktree-manual-list")), "m");
+    git(root, ["worktree", "add", manual, "-b", "manual-list", "main"]);
+    const listed = await gitManagedWorktrees(worktreePath);
+    expect(listed?.mainRoot).toBe(root);
+    expect(listed?.worktrees.map((entry) => fs.realpathSync(entry.path))).toEqual([worktreePath]);
+    expect(listed?.worktrees[0]).toMatchObject({ branch: created.branch, lockReason: "tailii-session" });
+    fs.mkdirSync(path.join(worktreePath, "deep"));
+    expect((await resolveManagedWorktreeForCwd(path.join(worktreePath, "deep")))?.mainRoot).toBe(root);
+    expect(await resolveManagedWorktree(path.join(worktreePath, "deep"))).toBeNull();
+    expect(await resolveManagedWorktree(manual)).toBeNull();
   });
 });

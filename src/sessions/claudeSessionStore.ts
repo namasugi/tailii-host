@@ -8,7 +8,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ClaudeSessionInfo } from "../protocol.js";
-import { isInsideBase } from "../shared/paths.js";
+import { claudeProjectSlug, isInsideBase } from "../shared/paths.js";
 import { stripInjectedReminderBlocks, stripReminderTagBlocks } from "../shared/harnessReminder.js";
 import { crossSessionOriginHint, crossSessionPreviewLine, presentCrossSessionMessage } from "../shared/crossSession.js";
 import { isCompactSummaryRecord } from "../shared/compactSummary.js";
@@ -107,6 +107,21 @@ export class ClaudeSessionStore {
       }
     }
     return best ?? candidates[0] ?? null;
+  }
+
+  /**
+   * `cwd` を作業フォルダにした会話ログ（`*.jsonl`）が保存先（slug）に 1 つでもあるか（worktree の使用中判定）。
+   * 一覧の cwd は会話ログの中身から読むので、こちらは保存先の名前だけで見る保険（中身が読めない記録も拾う）。
+   * 配下のフォルダは slug だけでは兄弟（`…-122202` と `…-122202-2`）と区別できないため、一覧の cwd で見る。
+   */
+  hasTranscriptsAt(cwd: string): boolean {
+    const dir = path.join(this.root, claudeProjectSlug(cwd));
+    try {
+      return fs.readdirSync(dir).some((file) => file.endsWith(".jsonl"));
+    } catch (error) {
+      // 無いなら会話も無い。読めないときは「使用中」とみなす（判定できないものは残す）。
+      return (error as NodeJS.ErrnoException).code !== "ENOENT";
+    }
   }
 
   /**

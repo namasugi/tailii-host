@@ -22,3 +22,8 @@
 {"error":null,"id":"gw2","ok":true,"type":"git_worktree_remove_response","v":1}
 {"id":"fs1","limit":200,"path":"/Users/alice/project","query":"a.t","type":"file_search_request","v":1}
 {"entries":[{"kind":"file","mtimeMs":1720000000000,"name":"a.txt","size":120},{"kind":"dir","mtimeMs":0,"name":"src/a.tools","size":0}],"id":"fs1","path":"/Users/alice/project","query":"a.t","truncated":false,"type":"file_search_response","v":1}
+{"id":"gw3","path":"/Users/alice/project","type":"git_worktree_list_request","v":1}
+{"id":"gw3","isRepo":true,"removedPaths":["/Users/alice/project/.claude/worktrees/20260701-090000"],"type":"git_worktree_list_response","v":1,"worktrees":[{"branch":"worktree-20260713-120000","hasChanges":true,"inUse":false,"path":"/Users/alice/project/.claude/worktrees/20260713-120000","uncommittedCount":2,"unmergedCommitCount":1},{"branch":null,"hasChanges":false,"inUse":true,"path":"/Users/alice/project/.claude/worktrees/pr-42","uncommittedCount":0,"unmergedCommitCount":0}]}
+{"id":"gw4","isRepo":false,"type":"git_worktree_list_response","v":1,"worktrees":[]}
+{"id":"sk1","sessions":[],"type":"session_list_response","v":1,"worktreeDirty":true,"worktreePath":"/Users/alice/project/.claude/worktrees/20260713-120000","worktreeUncommittedCount":2,"worktreeUnmergedCommitCount":1}
+{"id":"gw5","isRepo":true,"type":"git_worktree_list_response","v":1,"worktrees":[{"branch":"worktree-20260601-080000","hasChanges":true,"inUse":false,"missing":true,"path":"/Users/alice/project/.claude/worktrees/20260601-080000"}]}

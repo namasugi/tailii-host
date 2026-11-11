@@ -17,6 +17,7 @@ import {
   type ControlMessage,
   type FileEntry,
   type GitBranchInfo,
+  type GitWorktreeListItem,
   type GitCommitInfo,
   type GitStatusFile,
   type HostUpdateStatus,
@@ -257,6 +258,8 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         worktreePath: optionalString(raw, "worktreePath"),
         worktreeRemoved: optionalBoolean(raw, "worktreeRemoved"),
         worktreeDirty: optionalBoolean(raw, "worktreeDirty"),
+        worktreeUncommittedCount: optionalNumber(raw, "worktreeUncommittedCount"),
+        worktreeUnmergedCommitCount: optionalNumber(raw, "worktreeUnmergedCommitCount"),
       });
 
     case "session_start": {
@@ -944,13 +947,25 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
     case "login_code_send_result":
     case "session_title_set_result":
     case "codex_thread_title_set_result":
-    case "conversation_delete_result":
       return {
         type, v,
         id: requireString(raw, "id"),
         ok: requireBoolean(raw, "ok"),
         error: optionalNullableString(raw, "error") ?? null,
       };
+
+    case "conversation_delete_result":
+      return compact({
+        type, v,
+        id: requireString(raw, "id"),
+        ok: requireBoolean(raw, "ok"),
+        error: optionalNullableString(raw, "error") ?? null,
+        worktreePath: optionalString(raw, "worktreePath"),
+        worktreeRemoved: optionalBoolean(raw, "worktreeRemoved"),
+        worktreeDirty: optionalBoolean(raw, "worktreeDirty"),
+        worktreeUncommittedCount: optionalNumber(raw, "worktreeUncommittedCount"),
+        worktreeUnmergedCommitCount: optionalNumber(raw, "worktreeUnmergedCommitCount"),
+      });
 
     case "session_title_set":
       return {
@@ -1138,6 +1153,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
     case "git_status_request":
     case "git_branch_list_request":
     case "git_init_request":
+    case "git_worktree_list_request":
       return { type, v, id: requireString(raw, "id"), path: requireString(raw, "path") };
 
     case "git_worktree_create_request":
@@ -1297,6 +1313,24 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         type, v, id: requireString(raw, "id"), ok: requireBoolean(raw, "ok"),
         error: optionalNullableString(raw, "error") ?? null,
       };
+
+    case "git_worktree_list_response":
+      return compact({
+        type, v, id: requireString(raw, "id"), isRepo: requireBoolean(raw, "isRepo"),
+        worktrees: requireArray(raw, "worktrees").map((element): GitWorktreeListItem => {
+          const item = requireObject(element, "worktrees");
+          return compact({
+            path: requireString(item, "path"),
+            branch: optionalNullableString(item, "branch") ?? null,
+            hasChanges: requireBoolean(item, "hasChanges"),
+            inUse: requireBoolean(item, "inUse"),
+            missing: optionalBoolean(item, "missing"),
+            uncommittedCount: optionalNumber(item, "uncommittedCount"),
+            unmergedCommitCount: optionalNumber(item, "unmergedCommitCount"),
+          });
+        }),
+        removedPaths: raw["removedPaths"] === undefined ? undefined : requireStringArray(raw, "removedPaths"),
+      });
 
     case "git_worktree_create_response":
       return {
