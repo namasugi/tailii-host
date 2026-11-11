@@ -70,12 +70,13 @@ describe("承認の保留（端末がつながっていないとき）", () => {
       { id: "a2", session: "cs-a", tool: "Bash", summary: "npm test", cwd: "/w" },
       {
         socketPathFor: () => socketPath, publishPending: (m) => published.push(m), retryIntervalMs: 20, connectTimeoutMs: 50,
-        notifier: async (request) => { pushes.push(request.approvalId); }, hasSubscribers: () => false,
+        notifier: (request) => { pushes.push(`${request.approvalId}:${request.tool}:${request.summary}`); },
       },
     );
     await vi.waitFor(() => expect(published).toHaveLength(1));
     expect(published[0]).toEqual({ type: "remote_pending", v: 1, id: "a2", session: "cs-a", kind: "approval", tool: "Bash", summary: "npm test" });
-    expect(pushes).toEqual(["a2"]);
+    // 送るかどうか（在席判定）は hub の dispatcher が決める。bridge は保留に入ったとき 1 回だけ依頼する。
+    expect(pushes).toEqual(["a2:Bash:npm test"]);
     const serve = fakeServe(socketPath, () => "deny");
     await serve.listen();
     expect(await pending).toBe("deny");
@@ -84,7 +85,7 @@ describe("承認の保留（端末がつながっていないとき）", () => {
     await serve.close();
   });
 
-  test("会話を見ている端末がいれば push は送らない。決定待ち中に切れたら保留へ戻る", async () => {
+  test("決定待ち中に切れたら保留へ戻る。push の依頼は保留に入ったときの 1 回だけ", async () => {
     const socketPath = shortSocketPath("s.sock");
     let first = true;
     const serve = fakeServe(socketPath, () => { if (first) { first = false; return "close"; } return "allow"; });
@@ -94,11 +95,11 @@ describe("承認の保留（端末がつながっていないとき）", () => {
     const decision = await requestApiAgentApproval(
       { id: "a3", session: "cs-a", tool: "Bash", summary: "x", cwd: "/w" },
       { socketPathFor: () => socketPath, publishPending: (m) => published.push(m), retryIntervalMs: 20,
-        notifier: async (r) => { pushes.push(r.approvalId); }, hasSubscribers: () => true },
+        notifier: (r) => { pushes.push(r.approvalId); } },
     );
     expect(decision).toBe("allow");
     expect(serve.received).toEqual(["a3", "a3"]);
-    expect(pushes).toEqual([]);
+    expect(pushes).toEqual(["a3"]);
     expect(published.map((m) => m.type)).toEqual(["remote_pending", "remote_pending_cleared"]);
     await serve.close();
   });

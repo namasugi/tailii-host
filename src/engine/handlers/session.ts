@@ -338,7 +338,18 @@ export const sessionHandlers: HandlerRegistry = {
   session_start: async (message, ctx) => {
     // 端末なしの会話（API 作業, api-agent）。pane は作らず、hub の ApiAgentManager に開かせる。
     if (message.executionRoute === "api") {
-      await withLaunchLock(message.name, () => startApiAgentSession(message, ctx));
+      await withLaunchLock(message.name, async () => {
+        // 端末の起動と同じく、開いている間は掃除・巻き戻しの対象にせず、開けなければ今作った worktree を巻き戻す
+        // （判定は worktreeJanitor が安全側で行う。resume・使用中・変更ありは消さない）。
+        const releaseLaunch = beginWorktreeLaunch(message.cwd);
+        let opened = false;
+        try {
+          opened = await startApiAgentSession(message, ctx);
+        } finally {
+          releaseLaunch();
+          if (!opened) await rollbackLaunchWorktree(ctx, message, message.resumeSessionId ?? null);
+        }
+      });
       return;
     }
     const { writer, state, sessionManager, metadataStore } = ctx;

@@ -252,3 +252,83 @@ describe("SessionHub への合流", () => {
     expect(runtime!.calls).toContain("submit:cs-a:hello");
   });
 });
+
+describe("プッシュ通知（push v1）への合流", () => {
+  type Notified = { kind: string; session: string; id?: string; body?: unknown; stillValid?: () => boolean };
+  function makePushHub() {
+    let runtime: FakeRuntime | null = null;
+    const notified: Notified[] = [];
+    const scheduled: string[] = [];
+    const cancelled: string[] = [];
+    const dispatcher = {
+      notify: async (event: Notified) => { notified.push(event); return { status: "sent" }; },
+      scheduleTurnDone: (session: string) => { scheduled.push(session); },
+      cancelTurnDone: (session: string) => { cancelled.push(session); },
+      setPresence: () => {},
+    };
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir: makeTempDir("api-agent-hub-push"), metadataStore: makeTempStore(), timeoutSeconds: 1800,
+      pushDispatcher: dispatcher as unknown as NonNullable<ConstructorParameters<typeof SessionHub>[0]["pushDispatcher"]>,
+      apiAgentFactory: (callbacks) => { runtime = new FakeRuntime(callbacks); return runtime; },
+    });
+    hub.restoreApiAgents();
+    const status = (state: "idle" | "running", extra: Record<string, unknown> = {}) => ({
+      type: "api_agent_status" as const, v: 2, session: "cs-a", state, model: CONFIG.model, budget: CONFIG.budget,
+      usage: { totalUsd: 0, turns: 0, unconfirmedTurns: 0 }, queued: 0, ...extra,
+    });
+    return { hub, notified, scheduled, cancelled, status, runtime: () => runtime! };
+  }
+
+  test("ターンの成功は端末の Stop と同じ完了の予約。状態の再送・設定の変更では送り直さない", () => {
+    const { notified, scheduled, status, runtime } = makePushHub();
+    const { callbacks } = runtime();
+    callbacks.onProcessing("cs-a", "active");
+    callbacks.onStatus("cs-a", status("running"));
+    expect(scheduled).toEqual([]);
+    callbacks.onProcessing("cs-a", "done");
+    callbacks.onStatus("cs-a", status("idle", { outcome: "success" }));
+    expect(scheduled).toEqual(["cs-a"]);
+    // 同じ結果の状態がもう一度来ても（購読時の現在値・設定の変更）、ターンが始まっていなければ送らない。
+    callbacks.onStatus("cs-a", status("idle", { outcome: "success" }));
+    expect(scheduled).toEqual(["cs-a"]);
+    expect(notified).toEqual([]);
+  });
+
+  test("上限・失敗は turn_error（何で止まったかの文言）、利用者の中断は送らない", () => {
+    const { notified, scheduled, cancelled, status, runtime } = makePushHub();
+    const { callbacks } = runtime();
+    const turn = (extra: Record<string, unknown>) => {
+      callbacks.onProcessing("cs-a", "active");
+      callbacks.onProcessing("cs-a", "done");
+      callbacks.onStatus("cs-a", status("idle", extra));
+    };
+    turn({ outcome: "turn_budget_reached" });
+    turn({ outcome: "max_turns_reached" });
+    turn({ outcome: "failed", error: "unexpected_auth" });
+    turn({ outcome: "interrupted" });
+    expect(scheduled).toEqual([]);
+    expect(notified.map((event) => [event.kind, event.body])).toEqual([
+      ["turn_error", "1 回の送信の上限額に達して、API 作業が止まりました"],
+      ["turn_error", "往復の上限に達して、API 作業が止まりました"],
+      ["turn_error", "API キーの認証が想定と違うため、API 作業を止めました"],
+    ]);
+    // 中断でも、前のターンの完了の予約は取り消す。
+    expect(cancelled.length).toBeGreaterThanOrEqual(4);
+  });
+
+  test("設問待ちは端末の会話と同じ設問の push。承認待ちは hook と同じく決着したら送らない", () => {
+    const { hub, notified, runtime } = makePushHub();
+    runtime().callbacks.onQuestion({ session: "cs-a", id: "api-q1", questions: [{ question: "どちら?", header: "", options: [{ label: "A", description: "" }], multiSelect: false }] });
+    expect(notified.map((event) => [event.kind, event.id])).toEqual([["question", "api-q1"]]);
+    expect(hub.requestPush({ kind: "approval", session: "cs-a", id: "ap-1", tool: "Write", body: "Write · a.txt" })).toBe(true);
+    const approval = notified.find((event) => event.kind === "approval")!;
+    expect(approval.stillValid?.()).toBe(true);
+    hub.handleRelayMessage({ type: "remote_pending_cleared", v: 1, id: "ap-1", session: "cs-a", kind: "approval" });
+    expect(approval.stillValid?.()).toBe(false);
+  });
+
+  test("送信器が無い hub は承認の push を受け付けない", () => {
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("api-agent-hub-nopush"), metadataStore: makeTempStore(), timeoutSeconds: 1800 });
+    expect(hub.requestPush({ kind: "approval", session: "cs-a", id: "ap-2", tool: "Write" })).toBe(false);
+  });
+});

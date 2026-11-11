@@ -24,7 +24,10 @@ import {
 } from "../src/services/gitService.js";
 import { ClaudeSessionStore } from "../src/sessions/claudeSessionStore.js";
 import { claudeProjectSlug } from "../src/shared/paths.js";
-import { makeTempDir } from "./helpers.js";
+import { makeTempDir, makeTempStore } from "./helpers.js";
+import { ApiAgentSessionBackend } from "../src/backend/apiAgentBackend.js";
+import { ApiAgentSessionStore } from "../src/apiAgent/sessionState.js";
+import { killSessionForUser } from "../src/engine/handlers/session.js";
 
 function git(root: string, args: string[]): string {
   return execFileSync("git", ["-C", root, ...args], { encoding: "utf8" });
@@ -440,5 +443,72 @@ describe("worktreeJanitor", () => {
       ],
     });
     expect(await listWorktreesForApp(world.ctx, makeTempDir("worktree-janitor-non-repo"))).toBeNull();
+  });
+});
+
+describe("worktreeJanitor と API 作業（api-agent）", () => {
+  const CONV = "7b2c6a3f-ba60-45fd-89ae-cba51afaf7dc";
+  const CONFIG = { model: "claude-haiku-5-5", permissionMode: "default" as const, budget: { turnUsd: 0.5, conversationUsd: 5, maxTurns: 20 } };
+  let world: FakeWorld;
+  beforeEach(() => {
+    world = makeWorld();
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  test("開いている API 作業の会話の worktree は、会話ログができる前でも孤児として消さない（端末なしでも稼働中に数える）", async () => {
+    const root = makeRepository();
+    const worktree = await createWorktree(root);
+    const metadataStore = makeTempStore();
+    const sessions = new ApiAgentSessionStore(makeTempDir("worktree-janitor-api-sessions"));
+    metadataStore.put({ name: "cs-api", cwd: worktree.path, createdAt: 0, claudeSessionId: CONV, executionRoute: "api" });
+    sessions.put({ name: "cs-api", conversationId: CONV, cwd: worktree.path, config: CONFIG, openedAt: 0 });
+    Object.assign(world.ctx, { metadataStore, sessionManager: new ApiAgentSessionBackend({ store: metadataStore, sessions }) });
+    expect((await sweepOrphanWorktrees(world.ctx, root, LATER)).removed).toEqual([]);
+    expect(registered(root, worktree.path)).toBe(true);
+    // 閉じた（記録が消えた）会話ログの無い worktree は、端末の会話と同じく孤児として片付く。
+    sessions.remove("cs-api");
+    expect((await sweepOrphanWorktrees(world.ctx, root, LATER)).removed).toEqual([worktree.path]);
+  });
+
+  test("引き継ぎ: 端末側を keepWorktree で終えても worktree は消さず、直後に掃除が走っても会話があるので残る", async () => {
+    const root = makeRepository();
+    const handedOff = await createWorktree(root);
+    const killedNormally = await createWorktree(root);
+    writeConversation(world, handedOff.path, CONV);
+    writeConversation(world, killedNormally.path);
+    const metadataStore = makeTempStore();
+    metadataStore.put({ name: "cs-term", cwd: handedOff.path, createdAt: 0, claudeSessionId: CONV });
+    metadataStore.put({ name: "cs-other", cwd: killedNormally.path, createdAt: 0 });
+    world.sessions = [
+      { name: "cs-term", cwd: handedOff.path, alive: true },
+      { name: "cs-other", cwd: killedNormally.path, alive: true },
+    ];
+    const hubMessages: unknown[] = [];
+    Object.assign(world.ctx, {
+      metadataStore,
+      sessionManager: {
+        list: async () => world.sessions,
+        kill: async (name: string) => { world.sessions = world.sessions.filter((info) => info.name !== name); },
+      },
+      processingSessions: new Set<string>(),
+      backgroundChatSessions: new Set<string>(),
+      activeChatSession: { name: null },
+      codexTurnController: null,
+      hubLink: { send: (message: unknown) => hubMessages.push(message) },
+    });
+    expect(await killSessionForUser(world.ctx, "cs-term", { keepWorktree: true })).toBeNull();
+    expect(registered(root, handedOff.path)).toBe(true);
+    // Tailii のロックも外さない（API 作業がそのまま同じ作業フォルダで続く）。
+    expect(git(root, ["worktree", "list", "--porcelain"])).toContain(`worktree ${handedOff.path}\nHEAD`);
+    expect(git(root, ["worktree", "list", "--porcelain"]).split("\n\n").find((block) => block.startsWith(`worktree ${handedOff.path}\n`)))
+      .toContain("locked tailii-session");
+    // API 作業を開く前（稼働中のセッションが無い）に孤児掃除が走っても、会話が一覧にあるので消さない。
+    expect((await sweepOrphanWorktrees(world.ctx, root, LATER)).removed).toEqual([]);
+    expect(registered(root, handedOff.path)).toBe(true);
+    // 比較: keepWorktree なしの終了は、変更なしの worktree を従来どおり片付ける。
+    expect(await killSessionForUser(world.ctx, "cs-other")).toEqual({ worktreePath: killedNormally.path, worktreeRemoved: true });
+    expect(hubMessages).toContainEqual({ type: "session_retire", session: "cs-term" });
   });
 });

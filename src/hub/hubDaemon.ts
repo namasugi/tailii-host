@@ -49,8 +49,8 @@ import { createProductionPushDispatcher } from "../push/pushDispatcher.js";
 import { makeSessionTitleResolver } from "../push/pushContent.js";
 import { PushDeviceStore } from "../push/pushDeviceStore.js";
 import { ClaudeVersionRecorder } from "../shared/claudeVersionRecord.js";
-import { makeProductionPushNotifier } from "../push/approvalPushNotifier.js";
 import { requestApiAgentApproval } from "../apiAgent/approvalBridge.js";
+import { approvalNotificationBody } from "../approval/hook.js";
 import { parseUsageLimitWait } from "../shared/usageLimitWait.js";
 import { makeSessionBackend } from "../backend/sessionBackend.js";
 import { Writable } from "node:stream";
@@ -704,18 +704,20 @@ export async function runHubCommand(args: string[]): Promise<number> {
     // 本文+送信確定は backend 側の 1 操作に委ねる（herdr は本文+CR 単一コール必須。
     // 分割すると Ink のペースト取り込み窓に CR が飲まれ送信されない）。
     // API 作業（api-agent）: 端末なしの会話。ターンは hub の ApiAgentManager が作業プロセスで動かす。
-    apiAgentFactory: (callbacks) => {
-      const notifier = makeProductionPushNotifier();
-      return createDefaultApiAgentManager({
-        ...callbacks, log,
-        // 承認は端末の hook と同じ保留に合流する（一覧の「承認待ち」・push・つながり直したら再提示）。
-        approval: (request) => requestApiAgentApproval(request, {
-          publishPending: (message) => hub.handleRelayMessage(message),
-          notifier: (pushRequest, timeLimitMs) => notifier(pushRequest, timeLimitMs),
-          hasSubscribers: (session) => hub.subscriberCount(session) > 0,
-        }),
-      });
-    },
+    apiAgentFactory: (callbacks) => createDefaultApiAgentManager({
+      ...callbacks, log,
+      // 承認は端末の hook と同じ保留に合流する（一覧の「承認待ち」・push・つながり直したら再提示）。push は hook の
+      // push_request と同じく hub の dispatcher が在席判定・決着済みの照合をして送る（push v1）。
+      approval: (request) => requestApiAgentApproval(request, {
+        publishPending: (message) => hub.handleRelayMessage(message),
+        notifier: (pushRequest) => {
+          hub.requestPush({
+            kind: "approval", session: pushRequest.session, id: pushRequest.approvalId, tool: pushRequest.tool,
+            body: approvalNotificationBody(pushRequest),
+          });
+        },
+      }),
+    }),
     chatInjector: async (text, session, context) => {
       // 端末なしの会話（API 作業）は pane へ打たず、ターンとして渡す。始められなかったら 1 文字も
       // 送っていないので「非配達が確定」として返す（キー無し・予算到達・別の場所で使用中）。

@@ -14,6 +14,7 @@ import {
   decodeHubClientLine,
   encodeHubMessage,
   type HubClientMessage,
+  type HubPushEvent,
   type HubServerMessage,
   type PendingQuestionSnapshotEntry,
 } from "./hubProtocol.js";
@@ -517,6 +518,33 @@ export function claudeApiErrorNotificationBody(errorKind: string | null | undefi
   }
 }
 
+/**
+ * API 作業のターンが成功以外で終わったときの通知本文（api-agent）。上限での停止は「何を上げれば続くか」が
+ * 分かる文言にする。API のエラー本文・キーは載せない。
+ */
+export function apiAgentTurnEndNotificationBody(status: Pick<ApiAgentStatusMessage, "outcome" | "error">): string {
+  switch (status.error) {
+    case "unexpected_auth":
+      return "API キーの認証が想定と違うため、API 作業を止めました";
+    case "sdk_unavailable":
+      return "API 作業の準備（Agent SDK）が見つからず、作業を始められませんでした";
+    case "worker_failed":
+      return "API 作業が途中で止まりました";
+    default:
+      break;
+  }
+  switch (status.outcome) {
+    case "turn_budget_reached":
+      return "1 回の送信の上限額に達して、API 作業が止まりました";
+    case "max_turns_reached":
+      return "往復の上限に達して、API 作業が止まりました";
+    case "result_unknown":
+      return "API 作業の結果を受け取れませんでした（利用額は未確認です）";
+    default:
+      return "API エラーで作業が止まりました";
+  }
+}
+
 export class SessionHub {
   private readonly clients = new Map<object, (line: string) => void>();
   /** 一覧 Mission Control の watcher（処理中会話全体の pane_preview 配信先）。 */
@@ -565,6 +593,8 @@ export class SessionHub {
   private readonly codexTurnAnswers = new Map<string, string>();
   private readonly pushDispatcher: PushDispatcher | null;
   private apiAgentRuntime: ApiAgentHubRuntime | null = null;
+  /** 終わりを push へまだ写していない API 作業のターン（会話名）。 */
+  private readonly apiAgentTurnsAwaitingPush = new Set<string>();
 
   constructor(private readonly options: SessionHubOptions) {
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
@@ -582,8 +612,6 @@ export class SessionHub {
   get hasCodexTurnsInFlight(): boolean {
     return this.codexStartsInFlight > 0 || this.activeCodexTurns.size > 0;
   }
-  /** この会話を購読している端末の数（API 作業の承認で push を送るかの判定）。 */
-  subscriberCount(session: string): number { return this.actors.get(session)?.subscribers.size ?? 0; }
   /** API 作業のターンが動いているか（hub の自然終了を止める）。 */
   get hasApiAgentTurnsInFlight(): boolean { return this.apiAgentRuntime?.hasTurnsInFlight === true; }
 
@@ -594,10 +622,18 @@ export class SessionHub {
     if (factory === undefined) return null;
     this.apiAgentRuntime = factory({
       onProcessing: (session, state) => {
+        if (state === "active") this.apiAgentTurnsAwaitingPush.add(session);
         if (!this.applyProcessing(session, state)) return;
         this.broadcast({ type: "session_processing", session, state });
       },
-      onStatus: (session, status) => this.publishConversationEvent(session, this.actor(session), status),
+      onStatus: (session, status) => {
+        const actor = this.actor(session);
+        this.publishConversationEvent(session, actor, status);
+        // ターンの終わり（idle へ戻った最初の状態）を push へ写す。状態の再送・設定の変更では送らない。
+        if (status.state === "idle" && this.apiAgentTurnsAwaitingPush.delete(session)) {
+          this.handleApiAgentTurnEndPush(session, actor, status);
+        }
+      },
       onQuestion: ({ session, id, questions }) => {
         const actor = this.actor(session);
         this.setPendingQuestion(session, actor, { id, questions, answerRoute: "api_agent" });
@@ -1146,24 +1182,7 @@ export class SessionHub {
         return;
       }
       this.sendTo(client, { type: "push_request_result", id: message.id, status: "accepted" });
-      const event = message.event;
-      const approvalId = event.kind === "approval" ? event.id : undefined;
-      if (approvalId === undefined) {
-        void this.pushDispatcher.notify(event);
-        return;
-      }
-      // 依頼を受けた時点で追跡を始める（remote_pending が届いていなくても）。送信待ちの間は記録を追い出さない。
-      // 在席確認・再試行の間に hook が再接続して承認・拒否された（remote_pending_cleared）・会話が終わった
-      // （retire で世代が進んだ）承認は「承認待ち」として送らない。
-      this.trackApproval(approvalId, event.session, false);
-      this.approvalPushesInFlight.add(approvalId);
-      void this.pushDispatcher.notify({
-        ...event,
-        stillValid: () => {
-          const state = this.approvalStates.get(approvalId);
-          return state !== undefined && !state.resolved && state.generation === this.sessionGeneration(event.session);
-        },
-      }).finally(() => this.approvalPushesInFlight.delete(approvalId));
+      this.requestPush(message.event);
       return;
     }
     if (message.type === "question_answer_submit") {
@@ -1738,6 +1757,7 @@ export class SessionHub {
     // heartbeat も消す: pane が無いので reaper は「消滅」として回収しない（reaper.ts）。残すと
     // 終わった会話の heartbeat が溜まり続ける。
     this.apiAgentRuntime?.dispose(session);
+    this.apiAgentTurnsAwaitingPush.delete(session);
     if (this.options.metadataStore.get(session)?.executionRoute === "api") {
       removeHeartbeat(this.options.heartbeatDir, session);
     }
@@ -3834,6 +3854,32 @@ export class SessionHub {
 
   // MARK: - プッシュ通知（push v1）
 
+  /**
+   * hook・API 作業の承認からの送信依頼を dispatcher へ渡す（在席判定・間引きは dispatcher が一元に行う）。
+   * 送信器が無い・終了後は false（呼び手は送らない）。結果は待たない（承認の待機を止めない）。
+   */
+  requestPush(event: HubPushEvent): boolean {
+    if (this.pushDispatcher === null || this.closed) return false;
+    const approvalId = event.kind === "approval" ? event.id : undefined;
+    if (approvalId === undefined) {
+      void this.pushDispatcher.notify(event);
+      return true;
+    }
+    // 依頼を受けた時点で追跡を始める（remote_pending が届いていなくても）。送信待ちの間は記録を追い出さない。
+    // 在席確認・再試行の間に hook が再接続して承認・拒否された（remote_pending_cleared）・会話が終わった
+    // （retire で世代が進んだ）承認は「承認待ち」として送らない。
+    this.trackApproval(approvalId, event.session, false);
+    this.approvalPushesInFlight.add(approvalId);
+    void this.pushDispatcher.notify({
+      ...event,
+      stillValid: () => {
+        const state = this.approvalStates.get(approvalId);
+        return state !== undefined && !state.resolved && state.generation === this.sessionGeneration(event.session);
+      },
+    }).finally(() => this.approvalPushesInFlight.delete(approvalId));
+    return true;
+  }
+
   /** 在席判定に渡す、生きている接続の申告と表示中の会話（push v1 §6）。 */
   private pushConnections(session: string): PushPresenceConnection[] {
     const actor = this.actors.get(session);
@@ -3960,6 +4006,20 @@ export class SessionHub {
     }
     this.pushDispatcher?.cancelTurnDone(session);
     if (outcome.status === "failed") this.notifyTurnError(session, actor, outcome.errorMessage ?? null, outcome.turnId);
+  }
+
+  /**
+   * API 作業のターンの終わり方を push へ写す（端末の Stop / StopFailure と同じ判断に乗せる）。
+   * 成功は完了の予約（在席判定・遅延は端末の会話と同じ）、上限・失敗は turn_error、利用者の中断は送らない。
+   */
+  private handleApiAgentTurnEndPush(session: string, actor: SessionActor, status: ApiAgentStatusMessage): void {
+    if (status.outcome === "success" && status.error === undefined) {
+      this.scheduleTurnDonePush(session, actor);
+      return;
+    }
+    this.pushDispatcher?.cancelTurnDone(session);
+    if (status.outcome === "interrupted") return;
+    this.notifyTurnError(session, actor, apiAgentTurnEndNotificationBody(status));
   }
 
   /** 通知済みの Codex の turn を覚える（保持期間 6 時間・上限 1000 件。古いものから捨てる）。 */

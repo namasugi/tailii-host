@@ -46,31 +46,34 @@ function resolveCwd(cwd: string, baseDir: string | undefined): string | null {
   }
 }
 
-/** session_start（executionRoute:"api"）。成功時は通常の起動と同じ様式（一覧）で応答する。 */
-export async function startApiAgentSession(message: SessionStartMessage, ctx: HandlerContext): Promise<void> {
+/**
+ * session_start（executionRoute:"api"）。成功時は通常の起動と同じ様式（一覧）で応答する。
+ * 返り値は会話を開けた（既存の API 作業を使った場合を含む）か。false なら呼び手が今作った worktree を巻き戻す。
+ */
+export async function startApiAgentSession(message: SessionStartMessage, ctx: HandlerContext): Promise<boolean> {
   const { writer, state, metadataStore, sessionManager } = ctx;
   const v = state.negotiatedVersion;
   const config = message.apiAgent;
   if (config === undefined || metadataStore === null || (message.agentType !== undefined && message.agentType !== "claude")) {
     writeError(writer, v, message.id, "launch_failed", errorText("invalid_config"));
-    return;
+    return false;
   }
   const cwd = resolveCwd(message.cwd, message.baseDir);
   if (cwd === null) {
     writeError(writer, v, message.id, "launch_failed", "作業フォルダが見つかりません。");
-    return;
+    return false;
   }
   const resume = message.resumeSessionId !== undefined;
   const conversationId = message.resumeSessionId ?? randomUUID();
   if (!isConversationUuid(conversationId)) {
     writeError(writer, v, message.id, "launch_failed", errorText("invalid_config"));
-    return;
+    return false;
   }
   // 同じ会話を端末側（Tailii の pane・Tailii 外の claude）で動かしていれば作らない（hub もターンの直前に確かめる）。
   const existing = metadataStore.get(message.name);
   if (existing !== null && existing.executionRoute !== "api") {
     writeError(writer, v, message.id, "launch_failed", errorText("conversation_in_use"));
-    return;
+    return false;
   }
   const shouldSubscribe = message.deferSubscribe !== true;
   try {
@@ -79,16 +82,16 @@ export async function startApiAgentSession(message: SessionStartMessage, ctx: Ha
     if (live !== undefined && live.executionRoute === "api") {
       // 同じ会話を別の名前の API 作業で開いている → それを使う（端末の会話の別名再利用と同じ）。
       engineDiag(`api-agent resume alias reuse existing=${live.name} requested=${message.name}`);
-      if (!await activateOrTouchSession(ctx, writer, v, message.id, live.name, shouldSubscribe)) return;
+      if (!await activateOrTouchSession(ctx, writer, v, message.id, live.name, shouldSubscribe)) return true;
       writeSessionListResponse(writer, v, message.id, [live], null, live.name);
-      return;
+      return true;
     }
     // 既に自分（この名前の API 作業）が開いている会話なら、実行中のターンの claude が登録簿に載っていても断らない。
     const ownsAlready = existing?.executionRoute === "api" &&
       (existing.providerSessionId ?? existing.claudeSessionId) === conversationId;
     if (live !== undefined || (!ownsAlready && conversationHolders(conversationId).length > 0)) {
       writeError(writer, v, message.id, "launch_failed", errorText("conversation_in_use"));
-      return;
+      return false;
     }
   } catch {
     // 一覧が取れなくても、hub がターンの直前に登録簿で確かめる。
@@ -96,16 +99,17 @@ export async function startApiAgentSession(message: SessionStartMessage, ctx: Ha
   const opened = await openApiAgentRuntime(ctx, { name: message.name, cwd, conversationId, resume, config });
   if (opened !== null) {
     writeError(writer, v, message.id, "launch_failed", errorText(opened));
-    return;
+    return false;
   }
   engineDiag(`api-agent open name=${message.name} id=${conversationId} resume=${resume}`);
-  if (!await activateOrTouchSession(ctx, writer, v, message.id, message.name, shouldSubscribe)) return;
+  if (!await activateOrTouchSession(ctx, writer, v, message.id, message.name, shouldSubscribe)) return true;
   try {
     writeSessionListResponse(writer, v, message.id,
       shouldSubscribe ? await sessionManager.list() : [sessionInfoFromMeta(metadataStore, message.name, cwd)], null, message.name);
   } catch {
     writeSessionListResponse(writer, v, message.id, [sessionInfoFromMeta(metadataStore, message.name, cwd)], null, message.name);
   }
+  return true;
 }
 
 /**

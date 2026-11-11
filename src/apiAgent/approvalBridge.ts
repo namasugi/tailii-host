@@ -4,8 +4,8 @@
 // API のターンは承認を待っている間は課金されない（SDK の canUseTool には待ちの期限が無い）。そこで端末の
 // hook の「つながっていないときの保留」（hook.ts publishPendingAndAwaitReconnect）と同じ形に合流する:
 //   1. 会話の serve socket（resolveSocketPath(会話名)）へ approval_request を送り、同じ id の決定を待つ。
-//   2. つながらない・待っている間に切れた → remote_pending（一覧の「承認待ち」）を出し、会話を見ている端末が
-//      無ければ push で知らせ、つながり直すまで待つ。つながり直したら同じ id で approval_request を送り直す。
+//   2. つながらない・待っている間に切れた → remote_pending（一覧の「承認待ち」）を出し、hub の dispatcher へ
+//      push を依頼して（在席判定は dispatcher）、つながり直すまで待つ。つながり直したら同じ id で送り直す。
 //   3. 期限（既定 60 分）・ターンの中止で拒否。決着したら remote_pending_cleared を出す。
 // hook と違い hub の中で動くので、remote_pending は relay socket を通さず hub へ直接渡す。
 
@@ -29,10 +29,11 @@ export interface ApiAgentApprovalDeps {
   socketPathFor?: (session: string) => string;
   /** remote_pending / remote_pending_cleared を一覧へ出す（hub.handleRelayMessage）。 */
   publishPending?: (message: RemotePendingMessage) => void;
-  /** 背景 push（未設定なら送らない）。 */
-  notifier?: (request: { approvalId: string; tool: string; session: string }, timeLimitMs: number) => Promise<void>;
-  /** この会話を見ている端末がいるか（いれば push しない）。 */
-  hasSubscribers?: (session: string) => boolean;
+  /**
+   * 背景 push の依頼（未設定なら送らない）。hub の dispatcher（push v1）へ渡すだけで、送るかどうか（在席判定・
+   * 間引き・決着済みの照合）は dispatcher が端末の hook の承認と同じ規則で決める。結果は待たない。
+   */
+  notifier?: (request: { approvalId: string; tool: string; session: string; summary: string }) => void;
   deadlineMs?: number;
   retryIntervalMs?: number;
   connectTimeoutMs?: number;
@@ -133,12 +134,9 @@ export async function requestApiAgentApproval(request: ApiAgentApprovalRequestLi
         type: "remote_pending", v: PROTOCOL_V1, id: request.id, session: request.session, kind: "approval",
         tool: request.tool, summary: request.summary,
       });
-      if (deps.notifier !== undefined && deps.hasSubscribers?.(request.session) !== true) {
-        await Promise.race([
-          deps.notifier({ approvalId: request.id, tool: request.tool, session: request.session }, 5_000).catch(() => undefined),
-          abortableSleep(5_000, request.signal),
-        ]);
-      }
+      try {
+        deps.notifier?.({ approvalId: request.id, tool: request.tool, session: request.session, summary: request.summary });
+      } catch { /* push の失敗は承認の待機を止めない。 */ }
     }
     await abortableSleep(deps.retryIntervalMs ?? 1_000, request.signal);
   }
