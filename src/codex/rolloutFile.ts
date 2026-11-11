@@ -52,25 +52,37 @@ export function readRolloutHead(
     const outputCap = Math.max(limit * 8, 1024 * 1024);
     let decodedSpan = 0;
     let decoded: Buffer = Buffer.alloc(0);
+    // 出力上限を超えると分かっている最小の読み量（ここ以上へは広げ直さない）。
+    let tooLargeSpan = Number.POSITIVE_INFINITY;
     let span = Math.min(size, HEAD_FIRST_COMPRESSED_BYTES);
-    for (;;) {
+    // 倍々と二分はどちらも 64 回ほどで尽きる。挙動の違う Node でも往復し続けないよう回数でも止める。
+    for (let attempt = 0; attempt < 256; attempt++) {
       const compressed = Buffer.alloc(span);
       const bytesRead = fs.readSync(fd, compressed, 0, span, 0);
       const complete = bytesRead >= size;
       let out: Buffer;
       try {
-        out = zlib.zstdDecompressSync(compressed.subarray(0, bytesRead), { maxOutputLength: outputCap });
+        // finishFlush: 途中で切れた入力から解けた分を返させる。既定（ZSTD_e_end）だと Node 24.22 以降は
+        // 切れた入力を一律 `unexpected end of file` にする（24.18 までは解けた分を返していた）。
+        out = zlib.zstdDecompressSync(compressed.subarray(0, bytesRead), {
+          maxOutputLength: outputCap,
+          finishFlush: zlib.constants.ZSTD_e_flush,
+        });
       } catch (error) {
         if ((error as { code?: unknown }).code === "ERR_BUFFER_TOO_LARGE") {
           // 広げ過ぎた: 前回解けた量との中間まで戻す。同じ文字の連続は数バイトで 128KB に解けるので、
           // 1 バイト単位まで詰める（数バイトでは出力上限 1MB 以上に届かないので、必ずどこかで解ける）。
+          tooLargeSpan = Math.min(tooLargeSpan, span);
           if (span - decodedSpan <= 1) return decoded.subarray(0, limit);
           span = decodedSpan + Math.floor((span - decodedSpan) / 2);
           continue;
         }
         // 途中までの圧縮データで解けない形なら、もっと読んでやり直す。全体でも解けなければ壊れている。
+        // 上限を超えると分かっている量へは戻らない（戻すと「超過 → 二分 → 解けない → 倍」を往復する）。
         if (complete) throw error;
-        span = Math.min(size, span * 2);
+        const next = Math.min(size, span * 2, tooLargeSpan - 1);
+        if (next <= span) return decoded.subarray(0, limit);
+        span = next;
         continue;
       }
       if (out.length >= limit || complete || enough(out)) return out.subarray(0, limit);
@@ -78,6 +90,7 @@ export function readRolloutHead(
       decoded = out;
       span = Math.min(size, span * 2);
     }
+    return decoded.subarray(0, limit);
   } finally {
     try {
       fs.closeSync(fd);
