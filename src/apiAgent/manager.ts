@@ -195,7 +195,10 @@ export class ApiAgentManager {
   configure(session: string, config: ApiAgentConfig): void {
     const conversation = this.require(session);
     if (!validApiAgentConfig(config)) throw new ApiAgentRejectedError("invalid_config");
-    conversation.config = config;
+    // 権限だけを変える入力欄にはキーの取得元を返していない。省略時は現在値を保ち、
+    // 自動検出へ戻す場合は keySource: { mode: "automatic" } を明示する。
+    const keySource = config.keySource ?? conversation.config.keySource;
+    conversation.config = { ...config, ...(keySource !== undefined ? { keySource } : {}) };
     conversation.lastError = undefined;
     this.persistSession(conversation);
     this.emitStatus(conversation);

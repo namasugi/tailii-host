@@ -7,7 +7,7 @@
 import type { ApiAgentPermissionMode } from "../protocol/messages.js";
 export type { ApiAgentPermissionMode };
 
-export const API_AGENT_PERMISSION_MODES: readonly ApiAgentPermissionMode[] = ["default", "acceptEdits", "plan", "dontAsk"];
+export const API_AGENT_PERMISSION_MODES: readonly ApiAgentPermissionMode[] = ["default", "acceptEdits", "plan", "dontAsk", "auto"];
 
 export interface WorkerStartCommand {
   t: "start";

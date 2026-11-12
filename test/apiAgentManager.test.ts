@@ -116,6 +116,28 @@ describe("ApiAgentManager", () => {
     expect(t.last()).toMatchObject({ state: "running", queued: 0 });
   });
 
+  test("権限の変更は次のターンへ反映し、モデル・予算・キーの取得元を保つ", async () => {
+    const t = setup();
+    const keySource = { mode: "file" as const, path: "~/api-key" };
+    const config = { ...CONFIG, keySource };
+    t.manager.open("cs-a", { conversationId: CONV, cwd: "/tmp/w", config, resume: true });
+    await t.manager.submit("cs-a", "one");
+    await t.manager.submit("cs-a", "two");
+    t.manager.configure("cs-a", { ...CONFIG, permissionMode: "auto" });
+    expect(t.workers[0]!.start.permissionMode).toBe("default");
+    expect(t.last().permissionMode).toBe("auto");
+    expect(t.sessionStore.get("cs-a")!.config).toEqual({ ...config, permissionMode: "auto" });
+    t.workers[0]!.succeed(0.01);
+    await vi.waitFor(() => expect(t.workers).toHaveLength(2));
+    expect(t.workers[1]!.start).toMatchObject({
+      resume: true, prompt: "two", model: CONFIG.model, permissionMode: "auto",
+      maxTurns: CONFIG.budget.maxTurns, maxBudgetUsd: CONFIG.budget.turnUsd,
+    });
+    t.workers[1]!.succeed(0.02);
+    t.manager.configure("cs-a", { ...CONFIG, keySource: { mode: "automatic" } });
+    expect(t.sessionStore.get("cs-a")!.config.keySource).toEqual({ mode: "automatic" });
+  });
+
   test("中断: interrupt を送り、終わらなければ強制終了。貯まっていた発話は送らずに返す", async () => {
     const t = setup();
     t.manager.open("cs-a", { conversationId: CONV, cwd: "/tmp/w", config: CONFIG, resume: true });

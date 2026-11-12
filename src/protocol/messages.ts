@@ -577,9 +577,9 @@ export interface ApiUsageCredential {
 /**
  * API 作業（Claude Agent SDK で 1 ターンずつ実行する Claude 会話, api-agent）。端末は作らず、
  * Console の API キーで host が実行する。会話 id・履歴ファイルは通常の Claude 会話と同じ。
- * 権限モードは承認カードで確かめられる 4 値だけ（bypassPermissions / auto は受け付けない）。
+ * auto は SDK の分類器で判断し、判断できないときは承認カードへ。bypassPermissions は受け付けない。
  */
-export type ApiAgentPermissionMode = "default" | "acceptEdits" | "plan" | "dontAsk";
+export type ApiAgentPermissionMode = "default" | "acceptEdits" | "plan" | "dontAsk" | "auto";
 export interface ApiAgentBudget {
   /** 1 ターン（1 回の送信）の概算上限（USD）。SDK の maxBudgetUsd。超過は直後のモデル呼び出し 1 回分ありうる。 */
   turnUsd: number;

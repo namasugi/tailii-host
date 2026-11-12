@@ -36,6 +36,17 @@ describe("ワイヤー（api-agent）", () => {
       apiAgent: { ...CONFIG, permissionMode: "bypassPermissions" } }))).toThrow(ProtocolDecodeError);
   });
 
+  test("auto の設定は iOS・engine・hub・状態のワイヤーを通る", () => {
+    const config = { ...CONFIG, permissionMode: "auto" as const };
+    const configure = { type: "api_agent_configure", v: 2, id: "auto", session: "cs-a", config } as const;
+    expect(decodeControlMessage(encodeControlMessage(configure))).toEqual(configure);
+    const hub = { type: "api_agent_configure", id: "auto", session: "cs-a", config } as const;
+    expect(decodeHubClientLine(encodeHubMessage(hub))).toEqual(hub);
+    const status = { type: "api_agent_status", v: 2, session: "cs-a", state: "idle", model: CONFIG.model,
+      budget: CONFIG.budget, usage: { totalUsd: 0, turns: 0, unconfirmedTurns: 0 }, queued: 0, permissionMode: "auto" } as const;
+    expect(decodeControlMessage(encodeControlMessage(status))).toEqual(status);
+  });
+
   test("api_agent_status の未知の outcome / error は欄なしにする（新しい host の値で落ちない）", () => {
     const decoded = decodeControlMessage(JSON.stringify({ type: "api_agent_status", v: 2, session: "s", state: "idle", model: "m",
       budget: CONFIG.budget, usage: { totalUsd: 0, turns: 0, unconfirmedTurns: 0 }, queued: 0, outcome: "future", error: "future" }));

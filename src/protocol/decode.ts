@@ -87,7 +87,7 @@ function decodeApiAgentBudget(value: unknown): import("./messages.js").ApiAgentB
 function decodeApiAgentConfig(value: unknown): import("./messages.js").ApiAgentConfig {
   const raw = requireObject(value, "config");
   const permissionMode = requireString(raw, "permissionMode");
-  if (permissionMode !== "default" && permissionMode !== "acceptEdits" && permissionMode !== "plan" && permissionMode !== "dontAsk") {
+  if (permissionMode !== "default" && permissionMode !== "acceptEdits" && permissionMode !== "plan" && permissionMode !== "dontAsk" && permissionMode !== "auto") {
     throw new ProtocolDecodeError("missing-field", "permissionMode");
   }
   const keySource = raw["keySource"] === undefined ? undefined : decodeApiUsageCredentials({ claudeExecution: raw["keySource"] })?.claudeExecution;
@@ -1672,7 +1672,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
           ? outcome as import("./messages.js").ApiAgentTurnOutcome : undefined,
         error: decodeApiAgentErrorCode(error),
         restoredTexts: raw["restoredTexts"] === undefined ? undefined : requireStringArray(raw, "restoredTexts"),
-        permissionMode: ((value) => value === "default" || value === "acceptEdits" || value === "plan" || value === "dontAsk"
+        permissionMode: ((value) => value === "default" || value === "acceptEdits" || value === "plan" || value === "dontAsk" || value === "auto"
           ? value : undefined)(optionalString(raw, "permissionMode")),
       });
     }

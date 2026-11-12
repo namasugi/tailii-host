@@ -98,6 +98,27 @@ describe("acceptableAgentAuth", () => {
 });
 
 describe("runApiAgentWorker", () => {
+  test("auto は SDK に同名で渡し、判断できない操作の canUseTool を残す", async () => {
+    const { code, seen } = await runWith({
+      account: { apiKeySource: "ANTHROPIC_API_KEY", apiProvider: "firstParty" },
+      async *onPrompt(_prompt, canUseTool) {
+        expect(await canUseTool("Bash", { command: "test-command" })).toEqual({ behavior: "allow", updatedInput: { command: "test-command" } });
+        yield { type: "result", subtype: "success", is_error: false, total_cost_usd: 0.01, num_turns: 1, session_id: CONV };
+      },
+    }, { ANTHROPIC_API_KEY: KEY }, {
+      startLine: start({ permissionMode: "auto", resume: true }),
+      onWrite(message, lines) {
+        if (message.t === "permission_request") lines.push(JSON.stringify({
+          t: "permission_response", requestId: message.requestId, behavior: "allow",
+        }));
+      },
+    });
+    expect(code).toBe(0);
+    expect(seen.options!["permissionMode"]).toBe("auto");
+    expect(seen.options!["resume"]).toBe(CONV);
+    expect(seen.options!["allowDangerouslySkipPermissions"]).toBeUndefined();
+  });
+
   test("成功: 認証を確かめてからプロンプトを送り、結果をそのまま返す。新規は sessionId で会話 id を固定する", async () => {
     const { code, out, seen } = await runWith({
       account: { apiKeySource: "ANTHROPIC_API_KEY", apiProvider: "firstParty" },
