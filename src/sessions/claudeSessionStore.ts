@@ -301,12 +301,16 @@ function isInfoMemoEntry(value: unknown): value is InfoMemoEntry {
 
 /**
  * transcript の「最終会話時刻」（Unix 秒）を末尾から後方スキャンで解決する。
- * 権威はエントリ自身の `timestamp` フィールド（user/assistant/system 行が持つ）。
+ * 権威は会話の行（user / assistant）自身の `timestamp` フィールド。
+ * 会話以外の行の時刻は数えない: CLI は `queue-operation`（待ち行列の後始末）・`attachment`・
+ * `api-request`・`frame-link` などにも時刻を付け、セッションの終了時にも書く（背景タスクを抱えた
+ * セッションを終了すると `cost-state` の後ろに `queue-operation` が並ぶ）。これを数えると、
+ * 終了しただけの会話が一覧の先頭へ上がり、未読にもなる（2026-11-12 ユーザー報告の根治）。
  * ファイル mtime は使わない: `claude --resume` は開くだけで `mode`/`last-prompt` 等の
  * タイムスタンプ無し状態行を追記して mtime を進めるため、mtime を順位に使うと
  * 「開いただけの会話」が実会話より上に浮く（2026-07-08 ユーザー報告の根治）。
- * - 全体を読み切って timestamp 行が無い = 状態行のみ（会話なし）→ null（最下位へ）
- * - 上限まで読んでも見つからない（巨大な無 timestamp 行）→ mtime へ保守的にフォールバック
+ * - 全体を読み切って会話の行が無い = 状態行のみ（会話なし）→ null（最下位へ）
+ * - 上限まで読んでも見つからない（会話の行の後ろに巨大な行が続く）→ mtime へ保守的にフォールバック
  */
 export function lastConversationTimestamp(filePath: string): number | null {
   return scanTranscriptTail(filePath).updatedAt;
@@ -371,8 +375,9 @@ export function scanTranscriptTail(filePath: string): TranscriptTailSummary {
         if (titles.aiTitle === undefined && rec["type"] === "ai-title") {
           titles.aiTitle = normalizeExplicitTitle(rec["aiTitle"]);
         }
-        if (updatedAt === null) updatedAt = entryTimestamp(rec);
-        if (lastMessage === null && (rec["type"] === "user" || rec["type"] === "assistant")) {
+        const isConversationEntry = rec["type"] === "user" || rec["type"] === "assistant";
+        if (updatedAt === null && isConversationEntry) updatedAt = entryTimestamp(rec);
+        if (lastMessage === null && isConversationEntry) {
           lastMessage = extractMessageText(rec, LAST_MESSAGE_MAX_LENGTH);
         }
         if (updatedAt !== null && lastMessage !== null) {
@@ -380,7 +385,7 @@ export function scanTranscriptTail(filePath: string): TranscriptTailSummary {
           break;
         }
       }
-      // 全読みして timestamp 無し = 会話エントリなし（状態行のみ）。
+      // 全読みして会話の行の timestamp 無し = 会話エントリなし（状態行のみ）。
       if (span >= size) {
         scannedAll = true;
         break;
