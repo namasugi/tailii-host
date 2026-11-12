@@ -7,10 +7,12 @@ import type {
 } from "../src/codex/codexAppServer.js";
 import {
   CodexNativeTurnController,
+  chatContentKey,
   type CodexNativeApproval,
   type CodexThreadClient,
 } from "../src/codex/codexNativeTurnController.js";
 import type { CodexCollaborationMode, CodexGoalInfo, ControlMessage } from "../src/protocol.js";
+import { codexItemToolActivities, toolActivityMessage } from "../src/codex/codexToolActivity.js";
 
 class FakeThread implements CodexThreadClient {
   readonly starts: { text: string; clientId?: string | null; effort?: string | null }[] = [];
@@ -57,6 +59,24 @@ class FakeThread implements CodexThreadClient {
 }
 
 describe("CodexNativeTurnController", () => {
+  test("購読時の画像 snapshot は境界照合で使うカード ID と出現数を含める", async () => {
+    const images = [
+      { id: "view-1", type: "imageView", path: "/tmp/design.png" },
+      { id: "view-2", type: "imageView", path: "/tmp/design.png" },
+      { id: "gen-1", type: "imageGeneration", status: "completed", failure: null, savedPath: "/tmp/design.png" },
+    ];
+    const thread = Object.assign(new FakeThread(), { initialItems: images });
+    const controller = new CodexNativeTurnController({ appServer: { openThread: async () => thread } });
+    const snapshot = await controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" });
+    expect(snapshot.itemIds).toEqual(new Set([
+      "view-1", "view-1#tool-0", "view-2", "view-2#tool-0", "gen-1", "gen-1#tool-0",
+    ]));
+    const keys = images.map((item) => chatContentKey(toolActivityMessage(codexItemToolActivities(item)[0]!))!);
+    expect(new Set(keys).size).toBe(3);
+    expect(snapshot.contentCounts).toEqual(new Map(keys.map((key) => [key, 1])));
+    controller.close();
+  });
+
   test("userMessage / agentMessage completed を rollout と同じ chat_output へ写像する", async () => {
     const thread = Object.assign(new FakeThread(), {
       initialItems: [{ id: "old", type: "agentMessage", text: "履歴" }],
@@ -169,6 +189,31 @@ describe("CodexNativeTurnController", () => {
         activity: expect.objectContaining({ id: "exec-2", name: "Edit",
           label: "編集済み a.txt", addedLines: 1, removedLines: 1 }) } },
     ]);
+  });
+
+  test("画像の閲覧・生成完了をサムネのアンカーになる Read カードとして流す", async () => {
+    const thread = new FakeThread();
+    let openOptions: CodexAppServerThreadOptions | null = null;
+    const chats: { session: string; itemId: string; payload: unknown }[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return thread; } },
+      onChatItem: (event) => chats.push(event),
+    });
+    await controller.subscribeSession({ session: "work", threadId: "thread-1", cwd: "/tmp/work" });
+    const view = { id: "view-1", type: "imageView", path: "file:///tmp/view.png" };
+    openOptions?.onNotification?.({ method: "item/started", params: { item: view } });
+    expect(chats).toEqual([]);
+    for (const item of [view, { id: "gen-1", type: "imageGeneration", status: "completed",
+      failure: null, savedPath: "/tmp/generated.png", result: "base64" }]) {
+      openOptions?.onNotification?.({ method: "item/completed", params: { item } });
+    }
+    expect(chats).toEqual([
+      { session: "work", itemId: "view-1#tool-0", payload: { type: "tool_activity", v: 1,
+        activity: expect.objectContaining({ id: "view-1", name: "Read", file: "/tmp/view.png" }) } },
+      { session: "work", itemId: "gen-1#tool-0", payload: { type: "tool_activity", v: 1,
+        activity: expect.objectContaining({ id: "gen-1", name: "Read", file: "/tmp/generated.png" }) } },
+    ]);
+    controller.close();
   });
 
   test("MCP は操作カード、App Server の error / warning は system 注記として流す", async () => {

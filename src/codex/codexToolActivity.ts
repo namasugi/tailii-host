@@ -19,6 +19,7 @@
 //   - plan status は live "inProgress"（camel）/ rollout "in_progress"（snake）
 
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { codexMcpItemActivity } from "./codexMcpActivity.js";
 import {
   PROTOCOL_V1,
@@ -55,6 +56,32 @@ export function toolActivityMessage(activity: ToolActivity): ControlMessage {
 }
 
 // MARK: - builder（live / rollout 共通）
+
+/** 画像閲覧・生成を既存の Read カードへ載せ、read-<id> のサムネ挿入先にする。 */
+function codexImageActivity(id: string, value: unknown, generated: boolean): ToolActivity | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+  let imagePath = value;
+  try {
+    if (value.startsWith("file:")) imagePath = fileURLToPath(value);
+  } catch {
+    return null;
+  }
+  if (!path.isAbsolute(imagePath)) return null;
+  return {
+    id, name: "Read", file: imagePath,
+    label: `${generated ? "生成済み" : "既読"} ${path.basename(imagePath)}`,
+    commandTruncated: false, descriptionTruncated: false,
+  };
+}
+
+/** 現行 rollout の item_completed は ImageView / Extension で保存される。 */
+export function codexRolloutImageActivity(item: Record<string, unknown>): ToolActivity | null {
+  if (item["type"] === "ImageView") return codexItemToolActivities({ ...item, type: "imageView" })[0] ?? null;
+  if (item["type"] === "Extension" && item["kind"] === "image_gen.generation") {
+    return codexItemToolActivities({ ...item, type: "imageGeneration" })[0] ?? null;
+  }
+  return null;
+}
 
 /** コマンド実行カード。rawCommand は shell ラッパーを剥がしてから渡す必要はない（内部で正規化）。 */
 export function codexCommandActivity(id: string, rawCommand: string): ToolActivity {
@@ -161,6 +188,8 @@ export function toolActivityContentKey(activity: ToolActivity): string {
   // MCP は両系統とも同じ call_id（旧 system 注記と同じ出来事の identity）。
   // 引数 JSON のキー順や本文の表記差で同じ操作を二重表示しない。
   if (activity.name === "MCP") return ["tool", "MCP", activity.id, activity.outcome ?? ""].join("\u0000");
+  // 画像 item の id は live / rollout で同じ。同じファイルを何度開いても別の閲覧として照合する。
+  if (activity.name === "Read") return ["tool", "Read", activity.id].join("\u0000");
   const todos = (activity.todos ?? []).map((todo) => `${todo.content}=${todo.status}`).join("");
   return [
     "tool",
@@ -185,6 +214,12 @@ export function codexItemToolActivities(item: Record<string, unknown>): ToolActi
   const id = item["id"];
   const type = item["type"];
   if (typeof id !== "string" || id.length === 0) return [];
+  if (type === "imageView" || type === "imageGeneration") {
+    const generated = type === "imageGeneration";
+    if (generated && (item["status"] !== "completed" || item["failure"] != null)) return [];
+    const activity = codexImageActivity(id, generated ? item["savedPath"] : item["path"], generated);
+    return activity === null ? [] : [activity];
+  }
   if (type === "mcpToolCall") {
     const activity = codexMcpItemActivity(item);
     return activity === null ? [] : [activity];

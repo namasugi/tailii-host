@@ -9,6 +9,7 @@ import {
   codexItemToolActivities,
   codexPlanActivity,
   codexPlanUpdateActivity,
+  codexRolloutImageActivity,
   containsApplyPatch,
   extractExecCommands,
   normalizeShellCommand,
@@ -16,6 +17,36 @@ import {
   rolloutResponseItemToolActivities,
   toolActivityContentKey,
 } from "../src/codex/codexToolActivity.js";
+
+describe("Codex の画像閲覧・生成", () => {
+  test.each([
+    [{ type: "imageView", id: "view-1", path: "file:///tmp/design%20one.png" },
+      { type: "ImageView", id: "view-1", path: "file:///tmp/design%20one.png" }, "既読 design one.png"],
+    [{ type: "imageGeneration", id: "gen-1", status: "completed", failure: null, savedPath: "/tmp/design one.png" },
+      { type: "Extension", kind: "image_gen.generation", id: "gen-1", status: "completed", failure: null,
+        savedPath: "/tmp/design one.png", result: "送信しない画像base64", revisedPrompt: "送信しないプロンプト" },
+      "生成済み design one.png"],
+  ])("live と実採取形式の rollout を同じカードへ写像する", (live, rollout, label) => {
+    const activity = codexItemToolActivities(live)[0];
+    expect(activity).toEqual({ id: live.id, name: "Read", file: "/tmp/design one.png", label,
+      commandTruncated: false, descriptionTruncated: false });
+    const restored = codexRolloutImageActivity(rollout);
+    expect(restored).toEqual(activity);
+    expect(toolActivityContentKey(restored!)).toBe(toolActivityContentKey(activity!));
+  });
+
+  test.each([
+    { type: "imageView", id: "x", path: "https://example.com/image.png" },
+    { type: "imageView", id: "x", path: "file://remote/tmp/image.png" },
+    { type: "imageView", id: "x", path: "file:///tmp/%zz.png" },
+    { type: "imageView", id: "x", path: "relative.png" },
+    { type: "imageGeneration", id: "x", status: "inProgress", savedPath: "/tmp/image.png" },
+    { type: "imageGeneration", id: "x", status: "completed", failure: { message: "failed" }, savedPath: "/tmp/image.png" },
+    { type: "imageGeneration", id: "x", status: "completed", result: "base64だけ" },
+  ])("失敗・生成中・ローカル保存先無しはサムネ化しない: %j", (item) => {
+    expect(codexItemToolActivities(item)).toEqual([]);
+  });
+});
 
 describe("normalizeShellCommand", () => {
   test("unifiedExecStartup の shell ラッパーを剥がす", () => {

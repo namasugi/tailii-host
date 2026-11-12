@@ -457,8 +457,13 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     for (const item of opened.thread.initialItems ?? []) {
       const id = item["id"];
       if (typeof id === "string" && id.length > 0) itemIds.add(id);
-      const payloads = [codexItemToChatOutput(item),
-        ...codexItemToolActivities(item).filter((activity) => activity.name === "MCP").map(toolActivityMessage)];
+      const payloads = [codexItemToChatOutput(item)];
+      codexItemToolActivities(item).forEach((activity, index) => {
+        if (activity.name !== "MCP" && activity.name !== "Read") return;
+        payloads.push(toolActivityMessage(activity));
+        // 画像は backfill 中にも buffer し、rollout へまだ書かれていない完了を補完する。
+        if (activity.name === "Read" && typeof id === "string") itemIds.add(`${id}#tool-${index}`);
+      });
       for (const payload of payloads) {
         const key = payload === null || payload === undefined ? null : chatContentKey(payload);
         if (key !== null) contentCounts.set(key, (contentCounts.get(key) ?? 0) + 1);

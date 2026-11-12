@@ -19,6 +19,7 @@ import { PROTOCOL_V1, type ControlMessage } from "../protocol.js";
 import { canonicalPath } from "../shared/paths.js";
 import { abortableSleep } from "../shared/sleep.js";
 import {
+  codexRolloutImageActivity,
   rolloutPatchApplyActivities,
   rolloutResponseItemToolActivities,
   toolActivityMessage,
@@ -635,6 +636,11 @@ export function* emitLine(line: Buffer, state: TailState): Generator<ControlMess
 
   if (kind === "item_completed") {
     const item = asRecord((payload as Record<string, unknown>)["item"]);
+    const imageActivity = item === null ? null : codexRolloutImageActivity(item);
+    if (imageActivity !== null) {
+      yield toolActivityMessage(imageActivity);
+      return;
+    }
     if (item?.["type"] === "Plan") {
       // プランモードの提案プラン（codex-plan-mode）。live の item/completed(plan) と同じ streamId / 本文。
       const planId = item["id"];

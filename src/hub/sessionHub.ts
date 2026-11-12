@@ -33,7 +33,7 @@ import {
 import type { ChatAgent } from "../chat/chatTailController.js";
 import type { BackgroundCommandStopResult } from "../chat/backgroundCommandStop.js";
 import { sliceHistoryPage, type HistoryPageAnchor } from "./historyPage.js";
-import type { ImageService } from "../chat/imageService.js";
+import { readImagePath, type ImageService } from "../chat/imageService.js";
 import type { PanePreviewMode } from "./panePreviewPump.js";
 import { sameUsageLimitWait, type UsageLimitWaitState } from "../shared/usageLimitWait.js";
 import type { QuestionAnswer } from "../protocol.js";
@@ -288,6 +288,9 @@ interface CodexLiveState {
   seenItemIds: Set<string>;
   /** backfill と fallback の同文複数回を occurrence 単位で照合する。 */
   publishedContentCounts: Map<string, number>;
+  /** サムネは発話順で処理し、添付の生成中に同じ画像を開いた場合も二重挿入しない。本文は待たせない。 */
+  imageQueue: Promise<void>;
+  attachedImagePaths: Set<string>;
   scanContentCounts: Map<string, number>;
   fallbackBaselineCounts: Map<string, number>;
   /**
@@ -2068,6 +2071,9 @@ export class SessionHub {
       buffered: [],
       seenItemIds: new Set(),
       publishedContentCounts: new Map(),
+      imageQueue: Promise.resolve(),
+      attachedImagePaths: new Set(actor.replayBuffer.flatMap(({ payload }) =>
+        payload.type === "image_available" && payload.id.startsWith("att-") ? [payload.path] : [])),
       scanContentCounts: new Map(),
       fallbackBaselineCounts: new Map(),
       newerThanMs,
@@ -2268,11 +2274,12 @@ export class SessionHub {
     // 一次ソースにし、運良く届いた App Server item を backfill buffer へ混ぜて重複させない。
     if (state.disconnected) return;
     if (state.phase === "backfill") {
-      // tool_activity は buffer せず捨てる。履歴は rollout（backfill）側が同じカードを
+      // 画像以外の tool_activity は buffer せず捨てる。履歴は rollout（backfill）側が同じカードを
       // 供給するのが正で、live 由来と rollout 由来のカードは id が一致しないため
       // snapshot occurrence 照合に混ぜると開くたびに重複しうる。backfill 中に完了した
       // カードが落ちても、次回オープンの rollout 履歴で必ず表示される。
-      if (payload.type === "tool_activity") return;
+      // 画像の id は両系統で同じなので、境界での欠落を buffer + occurrence 照合で補完できる。
+      if (payload.type === "tool_activity" && payload.activity.name !== "Read") return;
       state.buffered.push({ itemId, payload });
       return;
     }
@@ -2370,20 +2377,32 @@ export class SessionHub {
     const key = chatContentKey(payload);
     if (key !== null) incrementCount(state.publishedContentCounts, key);
     this.publishConversationEvent(session, actor, payload);
-    if (payload.type === "chat_output" && payload.role === "user" && this.options.imageService !== undefined) {
-      // 本文配信は止めず、完成したサムネを同じ streamId へ後着させる。
-      void this.options.imageService.makeAttachmentsAvailable(payload.text, payload.streamId).then(
-        (images) => {
-          // サムネ生成中の離脱/再購読/actor 破棄で、古い会話へ届かせない。
-          if (this.actors.get(session) !== actor || actor.codexLive !== state || actor.subscribers.size === 0) return;
-          for (const image of images) this.publishConversationEvent(session, actor, image);
-        },
-        (error) => this.options.log?.(`Codex 添付サムネ生成失敗 session=${session}: ${String(error)}`),
-      );
-    }
+    const imageService = this.options.imageService;
+    if (imageService === undefined) return;
+    const imagePath = payload.type === "tool_activity" ? readImagePath(payload.activity) : null;
+    const attachment = payload.type === "chat_output" && payload.role === "user" ? payload : null;
+    if (attachment === null && imagePath === null) return;
+    const isCurrent = () => this.actors.get(session) === actor && actor.codexLive === state && actor.subscribers.size > 0;
+    state.imageQueue = state.imageQueue.then(async () => {
+      if (!isCurrent()) return;
+      let images: Extract<ControlMessage, { type: "image_available" }>[];
+      if (attachment !== null) {
+        images = await imageService.makeAttachmentsAvailable(attachment.text, attachment.streamId);
+      } else if (imagePath !== null && payload.type === "tool_activity") {
+        // 先行する添付の結果を待つ。添付が失敗した場合は閲覧側でサムネ生成を再試行できる。
+        if (state.attachedImagePaths.has(imagePath)) return;
+        const image = await imageService.makeAvailable(imagePath, `read-${payload.activity.id}`);
+        images = image === null ? [] : [image];
+      } else return;
+      if (!isCurrent()) return;
+      for (const image of images) this.publishConversationEvent(session, actor, image);
+    }).catch((error) => this.options.log?.(`Codex 画像サムネ生成失敗 session=${session}: ${String(error)}`));
   }
 
   private publishConversationEvent(session: string, actor: SessionActor, payload: ControlMessage): void {
+    if (payload.type === "image_available" && payload.id.startsWith("att-")) {
+      actor.codexLive?.attachedImagePaths.add(payload.path);
+    }
     if (payload.type === "subagent_node") {
       actor.latestSubagentNodes.set(payload.node.nodeId, payload);
       // tail している会話は transcript が権威（hook の取りこぼし・遅着を揃える）。コマンドは数えない。

@@ -300,6 +300,55 @@ describe("ChatTailController — Tailii 添付画像のインライン化", () =
 });
 
 describe("ImageService — サムネ生成メモ", () => {
+  test.each(["null", "throw"])("同時縮小が %s で失敗しても次の要求で再試行する", async (failure) => {
+    const imagePath = path.join(makeTempDir("is-retry-img"), "render.png");
+    fs.writeFileSync(imagePath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    let attempts = 0;
+    const service = new ImageService({ indexBase: makeTempDir("is-retry-index"),
+      thumbnailer: async () => {
+        attempts += 1;
+        if (attempts > 1) return { thumbnailBase64: "QUFB", width: 8, height: 6 };
+        if (failure === "throw") throw new Error("変換失敗");
+        return null;
+      },
+    });
+    const failed = await Promise.allSettled([
+      service.makeAvailable(imagePath, "read-a"), service.makeAvailable(imagePath, "read-b"),
+    ]);
+    expect(attempts).toBe(1);
+    expect(failed.map((result) => result.status)).toEqual(
+      failure === "throw" ? ["rejected", "rejected"] : ["fulfilled", "fulfilled"]);
+    expect(await service.makeAvailable(imagePath, "read-c")).toMatchObject({ id: "read-c", thumbnail: "QUFB" });
+    expect(attempts).toBe(2);
+  });
+
+  test("rollout と hub が同じ画像を同時要求しても縮小は1回で、各 id から原本を取得できる", async () => {
+    const imagePath = path.join(makeTempDir("is-concurrent-img"), "render.png");
+    const original = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+    fs.writeFileSync(imagePath, original);
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    let calls = 0;
+    const service = new ImageService({ indexBase: makeTempDir("is-concurrent-index"),
+      thumbnailer: async () => {
+        calls += 1;
+        await pending;
+        return { thumbnailBase64: "QUFB", width: 8, height: 6 };
+      },
+    });
+    const first = service.makeAvailable(imagePath, "read-a");
+    const second = service.makeAvailable(imagePath, "read-b");
+    release();
+    expect(await Promise.all([first, second])).toMatchObject([
+      { id: "read-a", thumbnail: "QUFB" }, { id: "read-b", thumbnail: "QUFB" },
+    ]);
+    expect(calls).toBe(1);
+    for (const id of ["read-a", "read-b"]) {
+      expect(await service.fetch(id)).toMatchObject([{ type: "image_fetch_response", id,
+        data: original.toString("base64"), eof: true }]);
+    }
+  });
+
   test("未変更ファイルの再生成はメモ命中で thumbnailer を再実行しない", async () => {
     const imagePath = path.join(makeTempDir("is-memo-img"), "render.png");
     fs.writeFileSync(imagePath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));

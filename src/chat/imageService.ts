@@ -12,7 +12,7 @@ import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { PROTOCOL_V1, type ControlMessage } from "../protocol.js";
+import { PROTOCOL_V1, type ControlMessage, type ToolActivity } from "../protocol.js";
 import { ensureDirectory0700 } from "../shared/paths.js";
 
 /** サムネ生成結果（サムネ画像 base64 + 原寸）。base64 は HEIC（環境非対応時は PNG）。 */
@@ -53,6 +53,12 @@ const FETCH_CHUNK_SIZE = 32 * 1024;
 export const IMAGE_EXTENSIONS = new Set([
   "png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "tiff", "tif",
 ]);
+
+/** Claude の Read と Codex の画像閲覧・生成カードで共有する画像パス判定。 */
+export function readImagePath(activity: Pick<ToolActivity, "name" | "file" | "denial">): string | null {
+  if (activity.name !== "Read" || activity.denial !== undefined || !activity.file) return null;
+  return IMAGE_EXTENSIONS.has(path.extname(activity.file).slice(1).toLowerCase()) ? activity.file : null;
+}
 
 /** 拡張子 → mime（index に mime を持たないため拡張子起点）。 */
 const MIME_BY_EXTENSION: Record<string, string> = {
@@ -232,6 +238,8 @@ export class ImageService {
    * 走らせない。ファイルが書き換われば mtime/size が変わり自然に再生成される。
    */
   private readonly thumbnailMemo = new Map<string, ThumbnailResult>();
+  /** rollout と hub が同時に同じファイルを要求した場合は、処理中の縮小も共有する。 */
+  private readonly thumbnailInFlight = new Map<string, Promise<ThumbnailResult | null>>();
   private static readonly THUMBNAIL_MEMO_LIMIT = 256;
   private readonly resizer: ImageResizer;
   /**
@@ -394,7 +402,16 @@ export class ImageService {
       this.thumbnailMemo.delete(memoKey);
       this.thumbnailMemo.set(memoKey, thumb);
     } else {
-      thumb = await this.thumbnailer(imagePath, this.thumbnailMaxPixelSize);
+      let pending = this.thumbnailInFlight.get(memoKey);
+      if (pending === undefined) {
+        pending = this.thumbnailer(imagePath, this.thumbnailMaxPixelSize);
+        this.thumbnailInFlight.set(memoKey, pending);
+      }
+      try {
+        thumb = await pending;
+      } finally {
+        this.thumbnailInFlight.delete(memoKey);
+      }
       if (thumb === null) {
         return { type: "error", v: PROTOCOL_V1, id: imageId, code: "not_an_image", message: "画像として読み取れません" };
       }

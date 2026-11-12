@@ -9,7 +9,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { LineWriter } from "../shared/lineWriter.js";
-import { attachmentImagePaths, type ImageService } from "./imageService.js";
+import { attachmentImagePaths, readImagePath, type ImageService } from "./imageService.js";
 import { TranscriptTailer, type ClaudeTurnLifecycleEvent } from "./transcriptTailer.js";
 import { SubagentTailer } from "./subagentTailer.js";
 import {
@@ -328,6 +328,7 @@ export class ChatTailController {
     );
     this.currentPump = (async () => {
       let count = 0;
+      const attachedImagePaths = new Set<string>();
       try {
         for await (const message of codexTailer.streamForCwd(
           cwd,
@@ -344,7 +345,15 @@ export class ChatTailController {
             if (imageService !== null && message.type === "chat_output" && message.role === "user") {
               for (const available of await imageService.makeAttachmentsAvailable(message.text, message.streamId)) {
                 if (ac.signal.aborted) break;
+                attachedImagePaths.add(available.path);
                 writer.write(available);
+              }
+            }
+            if (imageService !== null && message.type === "tool_activity") {
+              const imagePath = readImagePath(message.activity);
+              if (imagePath !== null && !attachedImagePaths.has(imagePath)) {
+                const available = await imageService.makeAvailable(imagePath, `read-${message.activity.id}`);
+                if (available !== null && !ac.signal.aborted) writer.write(available);
               }
             }
           } catch (error) {
@@ -357,11 +366,6 @@ export class ChatTailController {
       }
     })();
   }
-
-  /** 画像として扱う拡張子集合（小文字・ドットなし）。添付検出と Read サムネ判定で共有。 */
-  private static readonly IMAGE_EXTENSIONS = new Set([
-    "png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "tiff", "tif",
-  ]);
 
   /**
    * user 発話テキストから添付「画像」ファイルの絶対パスを抽出する（chat-attachments, TESTABLE）。
@@ -378,11 +382,7 @@ export class ChatTailController {
    * （chat-inline-read-image, TESTABLE）。Read 以外・パス無し・非画像拡張子は null。
    */
   static readImagePath(activity: { name: string; file?: string }): string | null {
-    if (activity.name !== "Read") return null;
-    const file = activity.file;
-    if (typeof file !== "string" || file.length === 0) return null;
-    const ext = path.extname(file).slice(1).toLowerCase();
-    return ChatTailController.IMAGE_EXTENSIONS.has(ext) ? file : null;
+    return readImagePath(activity);
   }
 
   /** 現在 tail 中の会話 jsonl の絶対パスを解決して返す（usage 集計用）。未開始・未出現は null。 */

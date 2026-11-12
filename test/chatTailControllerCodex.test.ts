@@ -58,6 +58,47 @@ function writeRollout(root: string, cwd: string, sessionId = "x", suffix = "", t
 }
 
 describe("ChatTailController — codex モード", () => {
+  test("ImageView と image_gen.generation を実ファイルのサムネと原本取得へ結ぶ", async () => {
+    const root = makeTempDir("cc-codex-image-results");
+    const imagePath = path.join(root, "generated design.png");
+    const original = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+    fs.writeFileSync(imagePath, original);
+    const sessionsRoot = path.join(root, "sessions");
+    writeRollout(sessionsRoot, root);
+    const rollout = path.join(sessionsRoot, "2026", "07", "06", "rollout.jsonl");
+    fs.appendFileSync(rollout, [
+      // 問題のセッション（Codex 0.167.0）の実形式。画像の base64 を wire へコピーしない。
+      { type: "ImageView", id: "view-1", path: new URL(`file://${imagePath}`).href },
+      { type: "Extension", kind: "image_gen.generation", id: "gen-1", status: "completed",
+        failure: null, savedPath: imagePath, result: "巨大な画像base64" },
+      { type: "ImageView", id: "view-2", path: new URL(`file://${imagePath}`).href },
+      { type: "ImageView", id: "missing", path: path.join(root, "missing.png") },
+    ].map((item) => JSON.stringify({ type: "event_msg", payload: { type: "item_completed", item } })).join("\n") + "\n");
+    const imageService = new ImageService({ indexBase: path.join(root, "index"),
+      thumbnailer: async () => ({ thumbnailBase64: "QUFB", width: 8, height: 6 }) });
+    for (let replay = 0; replay < 2; replay += 1) {
+      const { writer, messages } = capturingWriter();
+      const controller = new ChatTailController({ writer, tailer: undefined as never, projectsRoot: root,
+        agent: "codex", imageService,
+        codexTailer: new CodexRolloutTailer({ sessionsRoot, tailDeadlineMs: 0 }) });
+      controller.open(root, "x");
+      await (controller as unknown as { currentPump: Promise<void> | null }).currentPump;
+      const output = messages();
+      expect(output.filter((m) => m.type === "image_available").map((m) => m.id))
+        .toEqual(["read-view-1", "read-gen-1", "read-view-2"]);
+      for (const id of ["view-1", "gen-1", "view-2"]) {
+        const anchor = output.findIndex((m) => m.type === "tool_activity" && m.activity.id === id);
+        expect(output[anchor + 1]).toMatchObject({ type: "image_available", id: `read-${id}`, path: imagePath });
+      }
+      expect(JSON.stringify(output)).not.toContain("巨大な画像base64");
+      controller.stop();
+    }
+    expect(await imageService.fetch("read-gen-1")).toEqual([{
+      type: "image_fetch_response", v: 1, id: "read-gen-1", seq: 0,
+      data: original.toString("base64"), eof: true, mime: "image/png",
+    }]);
+  });
+
   test.each(["client-attachment", null])("現行 UserMessage の添付を live/楽観バブルと同じ ID へ紐づける（%s）", async (clientId) => {
     const root = makeTempDir("cc-codex-current-attachment");
     const imagePath = path.join(root, ".tailii", "uploads", "img-A7BCDDF4.jpg");
