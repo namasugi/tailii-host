@@ -2524,6 +2524,75 @@ describe("SessionHub actor", () => {
     expect(hub.actors.has("codex-session")).toBe(false);
   });
 
+  test("巡回中に開始した Codex 会話のログ購読とライブビューを保持する", async () => {
+    const heartbeatDir = makeTempDir("hub-launch-during-reaper");
+    const metadataStore = makeTempStore();
+    let releaseList!: () => void;
+    let listStarted!: () => void;
+    const listing = new Promise<void>((resolve) => { listStarted = resolve; });
+    const staleList = new Promise<void>((resolve) => { releaseList = resolve; });
+    const tailStop = vi.fn();
+    const previewStop = vi.fn();
+    const closeSession = vi.fn();
+    let tailWrite!: (payload: ControlMessage) => void;
+    let previewWrite!: (payload: ControlMessage) => void;
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir, metadataStore,
+      timeoutSeconds: 1800, now: () => 100,
+      herdrOps: {
+        list: async () => { listStarted(); await staleList; return []; },
+        agentProcessAlive: async () => true,
+        kill: async () => {},
+      },
+      tailFactory: (write) => {
+        tailWrite = write;
+        return { open() {}, stop: tailStop };
+      },
+      previewPumpFactory: (write) => {
+        previewWrite = write;
+        return { start() {}, stop: previewStop };
+      },
+      codexTurnControllerFactory: () => ({
+        startTurn: async () => "turn-new",
+        closeSession,
+        subscribeSession: async () => ({
+          itemIds: new Set(), contentCounts: new Map(), liveSubscribed: false,
+        }),
+      }),
+    });
+    const tick = hub.tick();
+    await listing;
+    metadataStore.put({ name: "s-new", cwd: "/w", createdAt: 100, backend: "herdr",
+      agent: "codex", providerSessionId: "thread-new" });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({
+      type: "conversation_subscribe", session: "s-new", preview: true,
+    }));
+    tailWrite({ type: "chat_output", v: 1, streamId: HISTORY_DONE_STREAM_ID,
+      role: "system", text: "", eof: true });
+    await Promise.resolve(); // 初回 turn 前の rollout fallback が確定。
+    releaseList();
+    const result = await tick;
+
+    const reply: ControlMessage = { type: "chat_output", v: 1, streamId: "reply-new",
+      role: "assistant", text: "最初の返答", eof: true };
+    const preview: ControlMessage = { type: "pane_preview", v: 2, session: "s-new", seq: 1,
+      active: true, text: "• Working (2s • esc to interrupt)", mode: "codex_terminal" };
+    tailWrite(reply);
+    previewWrite(preview);
+    expect(result.reclaimed).toEqual([]);
+    expect(received).not.toContainEqual({ type: "conversation_retired", session: "s-new" });
+    expect(received).toContainEqual(expect.objectContaining({
+      type: "conversation_event", session: "s-new", payload: reply,
+    }));
+    expect(received).toContainEqual({ type: "conversation_pane_preview", session: "s-new", payload: preview });
+    expect(tailStop).not.toHaveBeenCalled();
+    expect(previewStop).not.toHaveBeenCalled();
+    expect(closeSession).not.toHaveBeenCalled();
+    hub.unregisterClient(client);
+  });
+
   test("reaper の demote/reclaimでactorをretireし旧queueの持越しを防ぐ", async () => {
     const heartbeatDir = makeTempDir("hub-demote-sync");
     const receiptsPath = path.join(makeTempDir("hub-demote-receipts"), "receipts.json");

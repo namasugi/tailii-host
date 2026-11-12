@@ -250,6 +250,11 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
   const { runner, heartbeatDir, metadataStore, timeoutSeconds, now } = options;
   const prewarmStore = options.prewarmStore === undefined ? new PrewarmStore() : options.prewarmStore;
   const log = options.log ?? (() => {});
+  // 生存一覧の取得より前に回収候補を固定する。tmux / herdr の列挙やタイトル同期を await する間に
+  // 始まった会話は、この tick の一覧には載らない。後から heartbeat を列挙すると、その新規会話まで
+  // 消滅扱いして Hub のログ購読・ライブビュー・turn 接続を破棄してしまう。
+  const heartbeatsAtStart = new Map(listHeartbeatSessions(heartbeatDir).map((name) =>
+    [name, JSON.stringify(readHeartbeat(heartbeatDir, name))] as const));
   // 「tmux が答えられなかった」tick（サーバ不在以外の失敗: socket ファイルが無い・権限・タイムアウト等）では、
   // tmux の会話の回収だけを見送り、herdr の巡回は続ける（herdrUnavailable と対称）。以前は tick ごと投げて、
   // herdr の回収・空 server の停止・タブ名の同期まで止まっていた（実ログ 2026-08-05 に約 8 分）。
@@ -622,7 +627,7 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
   // 生存セッションの無い heartbeat は残骸 → 掃除(メタデータ = cwd 権威記録は消さない)。
   // herdr 生存分も和に含める(含めないと herdr セッションの heartbeat を毎周期誤回収する)。
   const liveSet = new Set([...live, ...herdrLive]);
-  for (const name of listHeartbeatSessions(heartbeatDir)) {
+  for (const [name, initialHeartbeat] of heartbeatsAtStart) {
     if (!liveSet.has(name)) {
       // herdr の生存判定ができなかった tick では herdr backend のセッションを回収しない。
       // 一時的な CLI 失敗を「消滅」と誤判定すると、実行中の会話が retire され（queue 破棄・
@@ -636,8 +641,12 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
       // tmux の生存判定ができなかった tick では、herdr と分かっている会話以外（tmux・backend 不明）を回収しない。
       // socket ファイルだけが消えてサーバは動いている場合に、生きている会話を retire して送信待ちを捨てない。
       if (tmuxUnavailable && metadataStore.get(name)?.backend !== "herdr") continue;
+      // 既存の名前でも巡回中に再開・更新されたものは次 tick の生存一覧で確認する。
+      // ts だけでは同じ秒の state / event 更新を見落とすため、読んだ記録全体で照合する。
+      if (JSON.stringify(readHeartbeat(heartbeatDir, name)) !== initialHeartbeat) continue;
       removeHeartbeat(heartbeatDir, name);
       reclaimed.push(name);
+      log(`reclaim ${name} (session absent from backend snapshot)`);
     }
   }
 

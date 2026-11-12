@@ -322,6 +322,70 @@ describe("reaperTick", () => {
     expect(result.killed).toEqual([]);
   });
 
+  test.each(["tmux", "herdr"] as const)(
+    "%s の生存一覧を取得中に始まった会話を、古い一覧で消滅扱いしない",
+    async (backend) => {
+      const dir = makeTempDir("reaper-launch-during-scan");
+      const store = makeTempStore();
+      let started = false;
+      const startConversation = () => {
+        if (started) return;
+        started = true;
+        store.put({ name: "s-new", cwd: "/w", createdAt: NOW, backend, agent: "codex" });
+        writeHeartbeat(dir, "s-new", { ts: NOW, state: "active", event: "hub-processing" });
+      };
+      const runner = new MockTmuxRunner((args) => {
+        if (backend === "tmux" && args[0] === "ls") startConversation();
+        return ok(""); // 起動直前に採った生存一覧。
+      });
+      const options = {
+        runner: runner.runner, heartbeatDir: dir, metadataStore: store,
+        timeoutSeconds: TIMEOUT, now: NOW,
+        herdrOps: backend === "herdr" ? {
+          list: async () => { startConversation(); return []; },
+          agentProcessAlive: async () => true,
+          kill: async () => {},
+        } : null,
+      };
+      const result = await reaperTick(options);
+
+      expect(result.reclaimed).toEqual([]);
+      expect(readHeartbeat(dir, "s-new")).toMatchObject({ state: "active", ts: NOW });
+      // 次の一覧でも不在で活動記録も変わらなければ、延期した分を通常どおり掃除する。
+      const next = await reaperTick(options);
+      expect(next.reclaimed).toEqual(["s-new"]);
+      expect(readHeartbeat(dir, "s-new")).toBeNull();
+    },
+  );
+
+  test("生存一覧を取得中に再開した会話は、同じ秒の heartbeat 更新でも回収を延期する", async () => {
+    const dir = makeTempDir("reaper-reopen-during-scan");
+    const store = makeTempStore();
+    store.put({ name: "s-reopened", cwd: "/w", createdAt: 1 });
+    writeHeartbeat(dir, "s-reopened", { ts: NOW, state: "idle", event: "chat-leave" });
+    writeHeartbeat(dir, "s-gone", { ts: NOW - 10, state: "idle" });
+    const runner = new MockTmuxRunner((args) => {
+      if (args[0] === "ls") {
+        writeHeartbeat(dir, "s-reopened", { ts: NOW, state: "active", event: "hub-processing" });
+      }
+      return ok("");
+    });
+    const result = await reaperTick({
+      runner: runner.runner, heartbeatDir: dir, metadataStore: store,
+      timeoutSeconds: TIMEOUT, now: NOW, herdrOps: null,
+    });
+
+    expect(result.reclaimed).toEqual(["s-gone"]);
+    expect(readHeartbeat(dir, "s-reopened")).toMatchObject({ state: "active", ts: NOW });
+    expect(readHeartbeat(dir, "s-gone")).toBeNull();
+    const next = await reaperTick({
+      runner: runnerWithSessions([]).runner, heartbeatDir: dir, metadataStore: store,
+      timeoutSeconds: TIMEOUT, now: NOW, herdrOps: null,
+    });
+    expect(next.reclaimed).toEqual(["s-reopened"]);
+    expect(readHeartbeat(dir, "s-reopened")).toBeNull();
+  });
+
   test("tmux が答えられない tick（socket ファイルが無い・権限）は tmux の会話を回収せず、herdr の巡回は続ける", async () => {
     // socket ファイルが無い（`No such file or directory`）のは、tmux 以外が消したとき。サーバは動いていることがある
     // （`kill -USR1` で作り直すと会話が出てくる）。サーバ不在と読むと、生きている会話を回収して送信待ちを捨て、
