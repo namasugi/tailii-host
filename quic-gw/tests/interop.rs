@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use tailii_quic_gw::{
     load_or_create_credentials, make_client_endpoint, make_server_endpoint, read_line,
-    run_endpoint, Credentials, HEADER_CAP,
+    run_endpoint, run_selfcheck, Credentials, HEADER_CAP, IDLE_TIMEOUT,
 };
 
 struct TestGateway {
@@ -105,7 +105,7 @@ async fn exec_pipes_stdio_and_propagates_fin() {
     );
     send.write_all(header.as_bytes()).await.unwrap();
     let ok = read_line(&mut recv, HEADER_CAP).await.unwrap().unwrap();
-    assert!(ok.contains("\"ok\":true"), "unexpected response: {ok}");
+    assert_eq!(ok, "{\"ok\":true}");
 
     send.write_all(b"hello-exec\n").await.unwrap();
     let echoed = read_line(&mut recv, HEADER_CAP).await.unwrap().unwrap();
@@ -486,13 +486,28 @@ async fn diagnostic_echo_still_works() {
     let header = format!("{{\"t\":\"echo\",\"v\":1,\"token\":\"{}\"}}\n", gw.token_b64);
     send.write_all(header.as_bytes()).await.unwrap();
     let ok = read_line(&mut recv, HEADER_CAP).await.unwrap().unwrap();
-    assert!(ok.contains("\"ok\":true"));
+    assert!(ok.starts_with("{\"ok\":true"));
+    assert_eq!(
+        ok,
+        format!("{{\"ok\":true,\"idle\":{}}}", IDLE_TIMEOUT.as_secs())
+    );
+    let response: serde_json::Value = serde_json::from_str(&ok).unwrap();
+    assert_eq!(response["idle"].as_u64(), Some(600));
     send.write_all(b"ping\n").await.unwrap();
     let back = read_line(&mut recv, HEADER_CAP).await.unwrap().unwrap();
     assert_eq!(back, "ping");
     send.finish().unwrap();
     let fin = read_line(&mut recv, HEADER_CAP).await.unwrap();
     assert!(fin.is_none());
+}
+
+#[tokio::test]
+async fn selfcheck_client_still_works() {
+    let gw = start_gateway("selfcheck").await;
+    let pin = B64.encode(gw.cert_pin);
+    run_selfcheck("127.0.0.1", gw.addr.port(), &pin, &gw.token_b64)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

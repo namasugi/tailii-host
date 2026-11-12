@@ -12,6 +12,7 @@
 //     診断 kind（副作用なし・M0 プローブ互換）: echo / sink / source
 //   応答（GW→クライアント, NDJSON 1行）:
 //     { "ok": true } / { "ok": false, "err": "auth" | "spawn" | "connect" | "proto" }
+//     echo の成功応答のみ idle（サーバの idle timeout、整数秒）を付加する。
 //
 // 0-RTT 規律: early data の受信は許可するが、副作用（プロセス spawn / TCP 接続）は
 // TLS handshake confirmed 後にのみ実行する（診断 kind は副作用なしのため即時可）。
@@ -35,7 +36,9 @@ use tokio::sync::watch;
 
 pub const ALPN: &[u8] = b"tailii/1";
 pub const DEFAULT_PORT: u16 = 46853;
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+// 自己検証クライアントは従来の idle timeout を保つ。
+const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 pub const KEEPALIVE: Duration = Duration::from_secs(20);
 /// ヘッダ 1 行の上限バイト数。exec の `cmd` には iOS の添付アップロード
 /// （ImageUploadPlan: 原データ 96,000 bytes → base64 128,000 字）がそのまま乗るため、
@@ -829,12 +832,16 @@ async fn handle_tcp(
 
 // ---------------------------------------------------------------- 診断 kind（M0 互換）
 
+fn echo_header_response() -> String {
+    format!("{{\"ok\":true,\"idle\":{}}}\n", IDLE_TIMEOUT.as_secs())
+}
+
 async fn handle_echo(
     conn_id: usize,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
 ) -> Result<()> {
-    send.write_all(b"{\"ok\":true}\n").await?;
+    send.write_all(echo_header_response().as_bytes()).await?;
     let mut buf = vec![0u8; CHUNK];
     let mut total = 0u64;
     while let Some(n) = recv.read(&mut buf).await? {
@@ -953,7 +960,7 @@ pub fn make_client_endpoint(cert_pin: [u8; 32]) -> Result<quinn::Endpoint> {
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?));
     let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(IDLE_TIMEOUT.try_into()?));
+    transport.max_idle_timeout(Some(CLIENT_IDLE_TIMEOUT.try_into()?));
     transport.keep_alive_interval(Some(KEEPALIVE));
     client_config.transport_config(Arc::new(transport));
 
@@ -1101,6 +1108,23 @@ pub async fn run_selfcheck(host: &str, port: u16, cert_pin_b64: &str, token_b64:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_timeouts_preserve_selfcheck_client_behavior() {
+        assert_eq!(IDLE_TIMEOUT, Duration::from_secs(600));
+        assert_eq!(CLIENT_IDLE_TIMEOUT, Duration::from_secs(90));
+    }
+
+    #[test]
+    fn echo_header_advertises_idle_timeout() {
+        let response = echo_header_response();
+        assert!(response.starts_with("{\"ok\":true,"));
+        assert!(response.ends_with('\n'));
+        let header: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(header["ok"], true);
+        assert_eq!(header["idle"].as_u64(), Some(IDLE_TIMEOUT.as_secs()));
+        assert_eq!(response, "{\"ok\":true,\"idle\":600}\n");
+    }
 
     #[test]
     fn constant_time_eq_basics() {
