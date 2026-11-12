@@ -17,6 +17,8 @@ class FakeConnection implements CodexAppServerConnection {
   initialized = 0;
   closed = 0;
   readonly requests: { method: string; params: unknown }[] = [];
+  /** request ごとに指定された応答待ち（未指定は undefined = 接続既定）。 */
+  readonly requestTimeouts: { method: string; timeoutMs: number | undefined }[] = [];
   notificationHandler: ((notification: CodexAppServerNotification) => void) | null = null;
   serverRequestHandler: ((request: CodexAppServerRequest) => void) | null = null;
   readonly responses: { id: CodexAppServerRequestId; result?: unknown; error?: unknown }[] = [];
@@ -27,8 +29,9 @@ class FakeConnection implements CodexAppServerConnection {
     this.initialized += 1;
   }
 
-  async request(method: string, params: unknown, _timeoutMs?: number): Promise<unknown> {
+  async request(method: string, params: unknown, timeoutMs?: number): Promise<unknown> {
     this.requests.push({ method, params });
+    this.requestTimeouts.push({ method, timeoutMs });
     if (method === "thread/turns/list") return { data: [], nextCursor: null };
     // thread/read の turns は protocol 上必ず配列（履歴無しは空配列）。
     if (method === "thread/read") return { thread: { id: this.threadId, turns: [] } };
@@ -323,6 +326,24 @@ describe("CodexAppServerManager", () => {
     expect(connections).toHaveLength(2); // readiness probe + thread/start client
     expect(connections[0]?.closed).toBe(1); // readiness probe
     expect(connections[1]?.closed).toBe(0); // bootstrap subscriber
+  });
+
+  test("thread/start は接続既定（5 秒）より長く待つ（暖まっていない App Server は 5 秒を超える）", async () => {
+    const connections: FakeConnection[] = [];
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-app-server-start-timeout"),
+      launch: () => {},
+      connect: async () => {
+        const connection = new FakeConnection("thread-slow");
+        connections.push(connection);
+        return connection;
+      },
+    });
+
+    expect(await manager.startThread({ cwd: "/tmp/slow" })).toBe("thread-slow");
+    const start = connections.at(-1)?.requestTimeouts.find((entry) => entry.method === "thread/start");
+    // 0.167.2 実測で 8.5 秒超。既定のままだと thread は出来ているのに開始失敗を返していた。
+    expect(start?.timeoutMs).toBe(20_000);
   });
 
   test("gpt-5.6-luna の read-only ephemeral turn で短いタイトルを生成して保存する", async () => {

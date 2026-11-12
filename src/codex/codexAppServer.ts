@@ -28,6 +28,19 @@ const THREAD_HISTORY_MAX_PAGES = 2_000;
 const THREAD_HISTORY_SNAPSHOT_TIMEOUT_MS = 3_000;
 /** タイトル生成で最初の user prompt を探す上限ページ数（paginated の thread/items/list）。 */
 const THREAD_TITLE_PROMPT_MAX_PAGES = 4;
+/**
+ * 新規 thread 作成（thread/start）の応答待ち。App Server はシェル環境の取り込み等を thread/start の中で
+ * 済ませるので、暖まっていない時は 5 秒（接続既定）を超える（0.167.2 実測 8.5 秒超。2 回目は 3 秒弱）。
+ * 既定のままだと Codex 側では thread が出来ているのに開始失敗を返し、再試行で通る形になった。
+ * iOS の開始待ち（30 秒。起動確認と端末起動を含む）に収まる値にする。
+ */
+const THREAD_START_TIMEOUT_MS = 20_000;
+/**
+ * thread 削除（thread/delete）の応答待ち。読み込み中の thread は止めてから消すので 5 秒を超える
+ * （0.167.2 実測 5.4〜6.8 秒）。既定のままだと Codex 側では削除が済んでいるのに失敗を返した。
+ * iOS の削除待ち（60 秒。セッションの終了待ちを含む）に収まる値にする。
+ */
+const THREAD_DELETE_TIMEOUT_MS = 30_000;
 const THREAD_TITLE_OUTPUT_SCHEMA = {
   type: "object",
   properties: {
@@ -1466,7 +1479,7 @@ export class CodexAppServerManager {
     const connection = await this.connect(this.socketPath);
     try {
       await connection.initialize();
-      await connection.request("thread/delete", { threadId: normalizedThreadId });
+      await connection.request("thread/delete", { threadId: normalizedThreadId }, THREAD_DELETE_TIMEOUT_MS);
     } catch (error) {
       // 既に無い thread（2 度目の削除・別経路で削除済み・存在しない id）は 0.158 実測で
       // `no rollout found for thread id …` が返る。削除の目的は達しているので成功扱い（冪等）。
@@ -1514,7 +1527,7 @@ export class CodexAppServerManager {
       };
       if (options.model) params["model"] = options.model;
       if (options.sandbox) params["sandbox"] = options.sandbox;
-      const response = await connection.request("thread/start", params);
+      const response = await connection.request("thread/start", params, THREAD_START_TIMEOUT_MS);
       const threadId = extractThreadId(response);
       if (threadId === null) throw new Error("Codex App Server thread/start response omitted thread.id");
       // turn が1件も無い thread は rollout がまだ存在せず、作成元購読を閉じると直後の

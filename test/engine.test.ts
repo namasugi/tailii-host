@@ -3346,7 +3346,8 @@ describe("EngineControl — 横断制御チャネル", () => {
     vi.spyOn(internals, "connect").mockResolvedValue({ initialize: async () => ({}), request, close: () => {} });
 
     await expect(manager.deleteThread("019a0000-1111-7222-8333-444455556666")).resolves.toBeUndefined();
-    expect(request).toHaveBeenCalledWith("thread/delete", { threadId: "019a0000-1111-7222-8333-444455556666" });
+    // 読み込み中の thread は止めてから消すので接続既定の 5 秒では足りない（0.167.2 実測 5.4〜6.8 秒）。
+    expect(request).toHaveBeenCalledWith("thread/delete", { threadId: "019a0000-1111-7222-8333-444455556666" }, 30_000);
 
     request.mockRejectedValueOnce(new Error("permission denied"));
     await expect(manager.deleteThread("019a0000-1111-7222-8333-444455556666")).rejects.toThrow("permission denied");
