@@ -396,6 +396,8 @@ export interface SubagentTranscriptEntry {
   text: string;
   ts?: number;
   kind?: SubagentTranscriptKind;
+  /** 起動先ノードとの照合に使う呼び出し ID（tool_use のみ。旧 host は省略）。 */
+  toolUseId?: string;
 }
 export type Decision = "allow" | "deny";
 export type RemotePendingKind = "approval" | "question";

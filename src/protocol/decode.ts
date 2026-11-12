@@ -845,6 +845,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
             text: requireString(entry, "text"),
             ts: optionalNumber(entry, "ts"),
             kind,
+            toolUseId: kind === "tool_use" ? optionalString(entry, "toolUseId") : undefined,
           });
         }),
         omitted: requireNumber(raw, "omitted"),

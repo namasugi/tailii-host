@@ -9,6 +9,26 @@ import {
 import { makeTempDir } from "./helpers.js";
 
 describe("parseSubagentTranscript", () => {
+  it("tool_use の呼び出し ID を保持し、欠落・不正な ID と結果には載せない", () => {
+    const fixture = [
+      { type: "assistant", message: { role: "assistant", content: [
+        { type: "tool_use", id: "agent-call", name: "Agent", input: { description: "調査" } },
+        { type: "tool_use", id: "bash-call", name: "Bash", input: { command: "codex exec" } },
+        { type: "tool_use", name: "Read", input: {} },
+        { type: "tool_use", id: 42, name: "Grep", input: {} },
+      ] } },
+      { type: "user", message: { role: "user", content: [
+        { type: "tool_result", tool_use_id: "agent-call", content: "孫の最終報告" },
+      ] } },
+    ].map((record) => JSON.stringify(record)).join("\n");
+    const { entries } = parseSubagentTranscript(fixture);
+    expect(entries[0]).toMatchObject({ kind: "tool_use", toolUseId: "agent-call" });
+    expect(entries[1]).toMatchObject({ kind: "tool_use", toolUseId: "bash-call" });
+    for (const entry of entries.slice(2)) expect(entry).not.toHaveProperty("toolUseId");
+    expect(entries[4]).toEqual({ role: "tool", text: "孫の最終報告", kind: "tool_result" });
+    expect(parseSubagentTranscript(fixture, 1).entries[0]?.toolUseId).toBe("agent-call");
+  });
+
   it("文脈圧縮の要約（isCompactSummary の user 行）はタイムラインに出さない", () => {
     const fixture = [
       JSON.stringify({ timestamp: "2026-07-12T01:02:03.456Z", type: "user", message: { role: "user", content: "調べて" } }),

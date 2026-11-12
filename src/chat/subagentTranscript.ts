@@ -215,6 +215,7 @@ export function parseSubagentTranscript(jsonl: string, before?: number): Subagen
         const input = snippet(block["input"], MAX_TOOL_INPUT);
         all.push(entry(
           "tool", input ? `${block["name"]}: ${input}` : block["name"], ts, "tool_use",
+          typeof block["id"] === "string" ? block["id"] : undefined,
         ));
       }
       if (block["type"] === "tool_result" && typeof block["tool_use_id"] === "string"
@@ -637,12 +638,14 @@ function entry(
   text: string,
   ts: number | undefined,
   kind?: SubagentTranscriptEntry["kind"],
+  toolUseId?: string,
 ): SubagentTranscriptEntry {
   return {
     role,
     text,
     ...(ts === undefined ? {} : { ts }),
     ...(kind === undefined ? {} : { kind }),
+    ...(toolUseId === undefined ? {} : { toolUseId }),
   };
 }
 

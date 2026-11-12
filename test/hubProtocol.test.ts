@@ -204,7 +204,11 @@ describe("hubProtocol subagent transcript RPC", () => {
         v: 2,
         id: "transcript-1",
         nodeId: "agent-a",
-        entries: [{ role: "assistant", text: "調査結果", ts: 1_000 }],
+        entries: [
+          { role: "assistant", text: "調査結果", ts: 1_000 },
+          { role: "tool", text: "Agent: 調査", kind: "tool_use", toolUseId: "agent-call" },
+          { role: "tool", text: "Read: x", kind: "tool_use" },
+        ],
         omitted: 0,
       },
     };

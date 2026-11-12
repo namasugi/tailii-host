@@ -713,6 +713,27 @@ describe("decode 詳細", () => {
     ]);
   });
 
+  it("subagent transcript の toolUseId は呼び出しだけ保持し、旧 host の省略も受け入れる", () => {
+    const entries = [
+      { role: "tool", text: "Agent: 調査", kind: "tool_use", toolUseId: "agent-call" },
+      { role: "tool", text: "Read: x", kind: "tool_use" },
+      { role: "tool", text: "Grep: x", kind: "tool_use", toolUseId: 42 },
+      { role: "tool", text: "報告", kind: "tool_result", toolUseId: "ignored" },
+      { role: "assistant", text: "発言", toolUseId: "ignored" },
+    ];
+    const decoded = decodeControlMessage(JSON.stringify({
+      type: "subagent_transcript_response", v: 2, id: "tr", nodeId: "n", entries, omitted: 0,
+    }));
+    if (decoded.type !== "subagent_transcript_response") throw new Error("transcript を期待");
+    expect(decoded.entries).toEqual([
+      entries[0], entries[1],
+      { role: "tool", text: "Grep: x", kind: "tool_use" },
+      { role: "tool", text: "報告", kind: "tool_result" },
+      { role: "assistant", text: "発言" },
+    ]);
+    expect(decodeControlMessage(encodeControlMessage(decoded))).toEqual(decoded);
+  });
+
   it("v2 golden の codex_turn_interrupt を復元する", () => {
     const line = goldenLines("approval-protocol-v2.ndjson").find((entry) =>
       entry.includes('"type":"codex_turn_interrupt"')

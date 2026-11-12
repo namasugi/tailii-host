@@ -46,6 +46,10 @@ describe("golden: subagent-transcript-page-v1.ndjson", () => {
     for (const line of lines) expect(encodeControlMessage(decodeControlMessage(line))).toBe(line);
     expect((decodeControlMessage(lines[0]!) as { before?: number }).before).toBe(200);
     expect((decodeControlMessage(lines[1]!) as { before?: number }).before).toBeUndefined();
+    const response = decodeControlMessage(lines[2]!);
+    if (response.type !== "subagent_transcript_response") throw new Error("transcript を期待");
+    expect(response.entries[0]?.toolUseId).toBe("tool-read-a");
+    expect(response.entries[1]).not.toHaveProperty("toolUseId");
   });
 
   it("負・小数の before は不正", () => {
