@@ -61,7 +61,7 @@ export function parseApiAgentConfig(value: unknown): ApiAgentConfig | null {
 }
 
 export const API_AGENT_ERROR_MESSAGES: Record<ApiAgentErrorCode, string> = {
-  no_api_key: "API キーが見つかりません。API 作業には Console の API キーを設定してください（サブスクのログインには切り替えません）。",
+  no_api_key: "API キーが見つかりません。API 作業には Console の API キーを設定してください（定額プランのログインには切り替えません）。",
   unsupported_key_source: "このキーの取得元は API 作業では使えません。自動検出・ホスト上のファイル・環境変数から選んでください。",
   unexpected_auth: "API キー以外の認証で動こうとしたため、モデルを呼ぶ前に止めました。",
   budget_exhausted: "この会話の API 予算の上限に達しました。上限を上げると続けられます。",
@@ -73,7 +73,7 @@ export const API_AGENT_ERROR_MESSAGES: Record<ApiAgentErrorCode, string> = {
   invalid_config: "API 作業の設定が正しくありません。",
   terminal_busy: "この会話はいま処理中か、承認・質問への回答を待っています。止めるか終わるのを待ってから API キーで続けてください。",
   held_externally: "Tailii 以外（ターミナルや公式アプリ）でこの会話が実行中のため、API キーで続けられません。そちらを終了してからやり直してください。",
-  terminal_stop_failed: "いつもの実行を終えられなかったため、API キーで続けられませんでした。会話は今までどおり開き直せます。",
+  terminal_stop_failed: "定額プラン側の会話を終えられなかったため、API キーで続けられませんでした。会話は今までどおり開き直せます。",
   turn_running: "API 作業のターンが実行中です。止めるか終わるのを待ってから戻してください。",
 };
 

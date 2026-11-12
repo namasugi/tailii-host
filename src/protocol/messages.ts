@@ -732,7 +732,7 @@ export type ControlMessage =
    */
   | { type: "api_agent_prepare_request"; v: number; id: string; start: boolean }
   | { type: "api_agent_prepare_response"; v: number; id: string; state: "ready" | "installing" | "failed"; phase?: string; version?: string; startedAtMs?: number; error?: string; message?: string }
-  /** API 作業を閉じて、いつもの実行（端末）へ戻す。実行中のターンがあれば turn_running で断る。 */
+  /** API 作業を閉じて、Subscription（端末）へ戻す。実行中のターンがあれば turn_running で断る。 */
   | { type: "api_agent_return"; v: number; id: string; session: string }
   | { type: "api_agent_return_result"; v: number; id: string; ok: boolean; error?: ApiAgentErrorCode }
   /**
