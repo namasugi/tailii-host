@@ -48,7 +48,10 @@ export const conversationHandlers: HandlerRegistry = {
     // 一覧 Mission Control: 一覧表示中だけ有効化される。応答不要（冪等・再入場で再送）。
     ctx.listPreviewWatch.enabled = message.enabled;
     engineDiag(`session_preview_watch enabled=${message.enabled}`);
-    ctx.hubLink.send({ type: "session_preview_watch", enabled: message.enabled });
+    // 背景中の有効化は希望値だけ覚え、前面復帰時に送る。無効化は即時に中継する。
+    if (!message.enabled || ctx.state.pushPresence?.state !== "background") {
+      ctx.hubLink.send({ type: "session_preview_watch", enabled: message.enabled });
+    }
   },
 
   chat_send: (message, ctx) => {

@@ -56,9 +56,25 @@ export const pushHandlers: HandlerRegistry = {
   client_presence: (message, ctx) => {
     if (!isValidDeviceId(message.deviceId)) return;
     const presence = { deviceId: normalizeDeviceId(message.deviceId), state: message.state };
+    const wasBackground = ctx.state.pushPresence?.state === "background";
     ctx.state.pushPresence = presence;
     engineDiag(`client_presence state=${message.state}`);
     ctx.hubLink.send({ type: "client_presence", ...presence });
+    if (message.state === "background") {
+      if (!wasBackground && ctx.listPreviewWatch.enabled) {
+        ctx.hubLink.send({ type: "session_preview_watch", enabled: false });
+      }
+    } else if (wasBackground) {
+      // watch 再開が新しいフレームを同期的に返しても、保存した古いフレームが後着しないよう先に送る。
+      for (const preview of ctx.state.pendingPanePreviews.values()) {
+        try { ctx.writer.write(preview); }
+        catch (error) { process.stderr.write(`[tailii-host engine] pane_preview 書込失敗: ${String(error)}\n`); }
+      }
+      ctx.state.pendingPanePreviews.clear();
+      if (ctx.listPreviewWatch.enabled) {
+        ctx.hubLink.send({ type: "session_preview_watch", enabled: true });
+      }
+    }
   },
 
   presence_pong: (message, ctx) => {

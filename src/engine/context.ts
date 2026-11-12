@@ -55,6 +55,8 @@ export interface EngineState {
   apiDelegateAttempted?: Set<string>;
   /** この接続の端末が最後に申告した在席（push v1。hub 再接続時に送り直す）。 */
   pushPresence?: { deviceId: string; state: "foreground" | "background" };
+  /** アプリ背景中に転送を止めた画面プレビュー。会話ごとの最新 1 枚だけを前面復帰時に送る。 */
+  pendingPanePreviews: Map<string, Extract<ControlMessage, { type: "pane_preview" }>>;
 }
 
 export interface ModeTiming {
@@ -137,7 +139,7 @@ export interface HandlerContext {
   /** host 側の既定エージェント（session_start が agentType を指定しないときのフォールバック）。 */
   defaultAgent: ChatAgent;
   activeChatSession: { name: string | null };
-  /** 一覧 Mission Control の watch 状態（有効中は非前面会話の pane_preview もリレーする）。 */
+  /** アプリが望む一覧 watch 状態。アプリ背景中は保持したまま hub 側だけ無効にする。 */
   listPreviewWatch: { enabled: boolean };
   /** 処理中セッションの最終ハートビート（Unix 秒）。明示 kill 時に掃除する。 */
   processingSessions: Map<string, number>;
