@@ -149,6 +149,7 @@ describe("DirectTransport", () => {
     expect(JSON.parse(sent.body.toString("utf8"))).toEqual({
       aps: {
         alert: { title: "Tailii", body: "新しい通知があります" },
+        "content-available": 1,
         "mutable-content": 1,
         sound: "default",
         "interruption-level": "time-sensitive",

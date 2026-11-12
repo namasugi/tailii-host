@@ -59,6 +59,7 @@
   "aps": {
     "alert": { "title": "Tailii", "body": "新しい通知があります" },
     "mutable-content": 1,
+    "content-available": 1,
     "sound": "default",
     "interruption-level": "active"
   },
@@ -67,6 +68,7 @@
 ```
 
 - ヘッダ: `apns-push-type: alert` / `apns-priority: 10` / `apns-topic: com.namasugi.tailii` / `apns-collapse-id`(64 バイト以下の ASCII)/ `apns-expiration`(**絶対時刻**の epoch 秒)。
+- `content-available: 1` は通知を表示しつつアプリの背景起動を求める。起こすかは iOS 次第で、背景モードを持たない古い版のアプリは無視する。
 - 通知サービス拡張は復号後、題名・本文・`threadIdentifier`(`k` + `:` + `session`)を書き込み、`userInfo` に `kind` / `session` / `id` / `k` を足す。復号できなければ何も書き換えない。
 
 ## 4. リレー API

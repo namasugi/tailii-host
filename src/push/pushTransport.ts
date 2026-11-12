@@ -82,6 +82,7 @@ export function apnsPayloadBody(tp: PushTp, interruptionLevel: PushInterruptionL
   const payload = {
     aps: {
       alert: { body: PUSH_FALLBACK_ALERT.body, title: PUSH_FALLBACK_ALERT.title },
+      "content-available": 1,
       "interruption-level": interruptionLevel,
       "mutable-content": 1,
       sound: "default",
