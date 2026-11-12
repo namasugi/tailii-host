@@ -2272,11 +2272,10 @@ export class TmuxSessionManager {
    * 現存する各セッションを name/cwd/alive で列挙する（name 昇順、メタのみは alive:false）。
    * updatedAt はここでは付与しない。tmux `#{session_activity}` はセッション作成自体を「活動」
    * として刻むため、会話ゼロの新規セッションが実会話より上に浮く。整列時刻の権威は
-   * SessionActivityProvider（セッション自身の transcript mtime）に一本化する。
+   * SessionActivityProvider（Claude の会話行の時刻 / Codex の rollout mtime）に一本化する。
    */
   async list(): Promise<SessionInfo[]> {
-    const alive = await this.liveSessionNames();
-    const allMetas = this.store.all();
+    const [alive, allMetas] = await Promise.all([this.liveSessionNames(), this.store.allAsync()]);
     // herdr backend のメタは HerdrSessionManager が列挙する（Composite で和を取る）。
     // 端末なしの会話（API 作業, executionRoute: "api"）は ApiAgentSessionBackend が列挙する。
     const metas = allMetas.filter((meta) => meta.backend !== "herdr" && meta.executionRoute !== "api");

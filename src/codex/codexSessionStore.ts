@@ -18,8 +18,10 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { setImmediate } from "node:timers/promises";
 import type { ClaudeSessionInfo } from "../protocol.js";
-import { isInsideBase } from "../shared/paths.js";
+import { isInsideBase, standardize } from "../shared/paths.js";
+import { mapConcurrent } from "../sessions/mapConcurrent.js";
 import { noteReadFailure, readFailureCount } from "../shared/readFailures.js";
 import type { ListMemoFile } from "../sessions/listMemoFile.js";
 import { isVisibleCodexMessagePhase } from "./codexMessagePhase.js";
@@ -62,6 +64,17 @@ interface RolloutFile {
   path: string;
   mtimeMs: number;
   size: number;
+}
+
+interface RolloutDirectory {
+  mtimeMs: number;
+  ctimeMs: number;
+  entries: fs.Dirent[];
+}
+
+interface ActivityRow {
+  cwd: string;
+  updatedAt: number | undefined;
 }
 
 /** rollout 1 本分の読み取り結果のメモ（undefined = まだ読んでいない, session-list-memo）。 */
@@ -111,6 +124,9 @@ export class CodexSessionStore {
   private memoFileLoaded = false;
   /** 前回の書き出しから `rolloutMemo` が変わったか。 */
   private memoDirty = false;
+  /** ディレクトリの内容だけ再利用する。対象ファイルの mtime は要求ごとに必ず読み直す。 */
+  private readonly rolloutDirectories = new Map<string, RolloutDirectory>();
+  private readingActivity: { cwds: Set<string>; started: boolean; promise: Promise<ActivityRow[]> } | null = null;
 
   /**
    * @param home codex ホーム（既定 `~/.codex`）。テストは一時 dir を注入する。
@@ -137,6 +153,106 @@ export class CodexSessionStore {
   /** 直前の列挙で解決したパス（検索側は非同期読取の前にパスを取得する）。 */
   transcriptPath(sessionId: string): string | null {
     return this.transcriptPaths.get(sessionId) ?? null;
+  }
+
+  /**
+   * 稼働一覧用の cwd 近似。並行した cwd の問い合わせを 1 回の列挙へまとめ、タイトル・
+   * プレビューを作らない。列挙内容は list() と共有するが、stat の結果を次の要求へ持ち越さない。
+   */
+  async latestActivity(cwd: string): Promise<number | null> {
+    const normalized = standardize(cwd);
+    if (this.readingActivity?.started && !this.readingActivity.cwds.has(normalized)) {
+      await this.readingActivity.promise;
+      return this.latestActivity(cwd);
+    }
+    if (this.readingActivity === null) {
+      const cwds = new Set<string>();
+      const pending = { cwds, started: false, promise: Promise.resolve([] as ActivityRow[]) };
+      pending.promise = Promise.resolve().then(() => {
+        pending.started = true;
+        return this.readActivityRows(cwds);
+      });
+      this.readingActivity = pending;
+    }
+    const pending = this.readingActivity;
+    pending.cwds.add(normalized);
+    let rows: ActivityRow[];
+    try {
+      rows = await pending.promise;
+    } finally {
+      if (this.readingActivity === pending) this.readingActivity = null;
+    }
+    let count = 0;
+    let latest: number | null = null;
+    for (const row of rows) {
+      // list(cwd) の上限は配下の cwd も含めて数える（テスト用 maxSessions も同じ意味）。
+      if (count >= this.maxSessions) break;
+      if (!isInsideBase(row.cwd, normalized)) continue;
+      count++;
+      if (standardize(row.cwd) === normalized && row.updatedAt !== undefined
+        && (latest === null || row.updatedAt > latest)) latest = row.updatedAt;
+    }
+    return latest;
+  }
+
+  private async readActivityRows(cwds: ReadonlySet<string>): Promise<ActivityRow[]> {
+    this.loadMemoFileOnce();
+    // session_meta は rollout の不変な先頭行。既知の別 cwd の本文の追記はこの一覧に影響しない。
+    // 未知のファイルは必ず読み、同じ id のコピーは cwd をまたいで mtime の新しい方を選ぶ。
+    const relevantIds = new Set<string>();
+    const pathsById = new Map<string, string[]>();
+    for (const [file, memo] of this.rolloutMemo) {
+      const meta = memo.meta;
+      if (meta?.isBackgroundSession) continue;
+      if (meta?.id != null) {
+        const paths = pathsById.get(meta.id) ?? [];
+        paths.push(file);
+        pathsById.set(meta.id, paths);
+        if (meta.cwd !== null && [...cwds].some((cwd) => isInsideBase(meta.cwd!, cwd))) relevantIds.add(meta.id);
+      }
+    }
+    const selected = (file: string): boolean => {
+      const meta = this.rolloutMemo.get(file)?.meta;
+      if (meta?.isBackgroundSession) return false;
+      return meta == null || meta.cwd === null
+        || (meta.id !== null && relevantIds.has(meta.id))
+        || [...cwds].some((cwd) => isInsideBase(meta.cwd!, cwd));
+    };
+    const { files, paths } = await this.listRolloutsAsync(selected);
+    const order = new Map(paths.map((file, index) => [file, index]));
+    // 新しい（メモの無い）コピーの id が既知の別 cwd と重なる場合も、両方を比較する。
+    const included = new Set(files.map((file) => file.path));
+    for (let i = 0; i < files.length; i++) {
+      if (i > 0 && i % 32 === 0) await setImmediate();
+      const meta = this.sessionMeta(files[i]!);
+      if (meta?.id == null) continue;
+      for (const sibling of pathsById.get(meta.id) ?? []) {
+        if (included.has(sibling) || !this.rolloutMemo.has(sibling)) continue;
+        included.add(sibling);
+        files.push(await this.statRollout(sibling));
+      }
+    }
+    files.sort((a, b) => b.mtimeMs - a.mtimeMs || order.get(a.path)! - order.get(b.path)!);
+    const rows: ActivityRow[] = [];
+    const seen = new Set<string>();
+    let index: Map<string, IndexEntry> | undefined;
+    for (let i = 0; i < files.length; i++) {
+      // メモが無い engine でも全 rollout の同期読取で read loop を占有し続けない。
+      if (i > 0 && i % 32 === 0) await setImmediate();
+      const file = files[i]!;
+      const meta = this.sessionMeta(file);
+      if (meta === null || meta.cwd === null || meta.isBackgroundSession || !this.hasUserTurn(file)) continue;
+      const id = meta.id ?? path.basename(file.path);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      if (file.mtimeMs <= 0) index ??= this.readIndex();
+      rows.push({
+        cwd: meta.cwd,
+        updatedAt: file.mtimeMs > 0 ? Math.floor(file.mtimeMs / 1000) : index?.get(id)?.updatedAt ?? undefined,
+      });
+    }
+    // 保存用メモの書出しは会話一覧 list() に任せる（稼働一覧で巨大 JSON を同期保存しない）。
+    return rows;
   }
 
   /**
@@ -254,7 +370,14 @@ export class CodexSessionStore {
     const walk = (dir: string): void => {
       let entries: fs.Dirent[];
       try {
-        entries = fs.readdirSync(dir, { withFileTypes: true });
+        const stat = fs.statSync(dir);
+        const hit = this.rolloutDirectories.get(dir);
+        if (hit?.mtimeMs === stat.mtimeMs && hit.ctimeMs === stat.ctimeMs) {
+          entries = hit.entries;
+        } else {
+          entries = fs.readdirSync(dir, { withFileTypes: true });
+          this.rolloutDirectories.set(dir, { mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, entries });
+        }
       } catch {
         return;
       }
@@ -277,6 +400,52 @@ export class CodexSessionStore {
       }
     };
     walk(this.sessionsRoot);
+    this.pruneRolloutMemo(out);
+    return out;
+  }
+
+  /** ディレクトリを再検証し、必要な cwd・未知の rollout の stat を上限付きで並行して行う。 */
+  private async listRolloutsAsync(selected: (file: string) => boolean): Promise<{ files: RolloutFile[]; paths: string[] }> {
+    this.loadMemoFileOnce();
+    const paths: string[] = [];
+    const walk = async (dir: string): Promise<void> => {
+      let entries: fs.Dirent[];
+      try {
+        const stat = await fs.promises.stat(dir);
+        const hit = this.rolloutDirectories.get(dir);
+        if (hit?.mtimeMs === stat.mtimeMs && hit.ctimeMs === stat.ctimeMs) {
+          entries = hit.entries;
+        } else {
+          entries = await fs.promises.readdir(dir, { withFileTypes: true });
+          this.rolloutDirectories.set(dir, { mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, entries });
+        }
+      } catch {
+        this.rolloutDirectories.delete(dir);
+        return;
+      }
+      // readdir 順を保つ（同じ mtime の duplicate id の先勝ちを変えない）。
+      for (const entry of entries) {
+        const file = path.join(dir, entry.name);
+        if (entry.isDirectory()) await walk(file);
+        else if (entry.isFile() && isRolloutFileName(entry.name)) paths.push(file);
+      }
+    };
+    await walk(this.sessionsRoot);
+    this.pruneRolloutMemo(paths.map((file) => ({ path: file })));
+    const files = await mapConcurrent(paths.filter(selected), (file) => this.statRollout(file));
+    return { files, paths };
+  }
+
+  private async statRollout(file: string): Promise<RolloutFile> {
+    try {
+      const stat = await fs.promises.stat(file);
+      return { path: file, mtimeMs: stat.mtimeMs, size: stat.size };
+    } catch {
+      return { path: file, mtimeMs: 0, size: -1 };
+    }
+  }
+
+  private pruneRolloutMemo(out: readonly { path: string }[]): void {
     const seen = new Set(out.map((file) => file.path));
     for (const memoPath of this.rolloutMemo.keys()) {
       if (!seen.has(memoPath)) {
@@ -284,7 +453,6 @@ export class CodexSessionStore {
         this.memoDirty = true;
       }
     }
-    return out;
   }
 
   /** 最初の列挙の前に、前の engine が書き出したメモを読み戻す。 */

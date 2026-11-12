@@ -26,6 +26,7 @@ import { scrollBottomKeyIsDefault } from "../shared/claudeKeybindings.js";
 import {
   HERDR_PANE_ID_PATTERN,
   SessionMetadataStore,
+  type SessionMeta,
   validateSessionName,
 } from "../sessions/sessionMetadataStore.js";
 import {
@@ -588,8 +589,9 @@ export class HerdrSessionManager {
    */
   async list(): Promise<SessionInfo[]> {
     // herdr メタが皆無なら CLI を呼ばない（常時 Composite 構成でも純 tmux 環境に副作用ゼロ）。
-    if (!this.store.all().some((meta) => meta.backend === "herdr")) return [];
-    return this.listFromPanes(await this.livePanes());
+    const metas = await this.store.allAsync();
+    if (!metas.some((meta) => meta.backend === "herdr")) return [];
+    return this.listFromPanes(await this.livePanes(), metas);
   }
 
   /**
@@ -599,18 +601,18 @@ export class HerdrSessionManager {
    * （`ReaperTickOptions.listLocalServers` の「null=検出不能」と同じ規約）。
    */
   async listLive(): Promise<SessionInfo[] | null> {
-    if (!this.store.all().some((meta) => meta.backend === "herdr")) return [];
+    const metas = await this.store.allAsync();
+    if (!metas.some((meta) => meta.backend === "herdr")) return [];
     const panes = await this.livePanesOrNull();
     if (panes === null) return null;
-    return this.listFromPanes(panes);
+    return this.listFromPanes(panes, metas);
   }
 
-  private async listFromPanes(panes: HerdrPane[]): Promise<SessionInfo[]> {
+  private async listFromPanes(panes: HerdrPane[], metas: SessionMeta[]): Promise<SessionInfo[]> {
     // タブラベル（Mac 側リネーム含む会話タイトル表示）を name→label で引けるようにする
     // （session-title 逆方向同期: セッション名と異なるラベルを displayTitle として載せる）。
     const tabLabels = await this.tabLabels();
 
-    const metas = this.store.all();
     const tailiiNames = new Set(metas.map((meta) => meta.name));
     const infos: SessionInfo[] = [];
     for (const meta of metas) {

@@ -9,28 +9,28 @@
 // 会話ゼロの新規セッションがどの実会話よりも上に浮いてしまう（2026-07-08 ユーザー報告の根治）。
 // cwd 単位の共有 mtime（旧実装）も使わない: 同一 cwd の別セッションの会話を継承してしまう。
 
-import { lastConversationTimestamp, type ClaudeSessionStore } from "./claudeSessionStore.js";
+import type { ClaudeSessionStore } from "./claudeSessionStore.js";
 import type { CodexSessionStore } from "../codex/codexSessionStore.js";
 import type { SessionInfo } from "../protocol.js";
 import type { SessionMeta, SessionMetadataStore } from "./sessionMetadataStore.js";
-import { claudeProjectSlug, standardize } from "../shared/paths.js";
+import { claudeProjectSlug } from "../shared/paths.js";
 
 /** セッションの更新時刻（Unix 秒）を解決する注入可能な抽象。解決不能は null。 */
-export type SessionActivityProvider = (session: SessionInfo) => number | null;
+export type SessionActivityProvider = (session: SessionInfo) => number | null | Promise<number | null>;
 
 /** cwd を Claude Code projects の slug へ写す（共通変換 claudeProjectSlug に委譲）。 */
 export function activitySlugForCwd(cwd: string): string {
   return claudeProjectSlug(cwd);
 }
 
-/** セッション自身の会話 transcript の mtime を updatedAt として返す既定実装。 */
+/** Claude は会話行の時刻、Codex は同一 cwd の rollout mtime を返す既定実装。 */
 export function ownTranscriptActivityProvider(options: {
   metadataStore: SessionMetadataStore;
   claudeStore: ClaudeSessionStore;
   codexStore: CodexSessionStore;
 }): SessionActivityProvider {
   const { metadataStore, claudeStore, codexStore } = options;
-  return (session) => {
+  return async (session) => {
     let meta: SessionMeta | null;
     try {
       meta = metadataStore.get(session.name);
@@ -41,25 +41,15 @@ export function ownTranscriptActivityProvider(options: {
 
     if (meta.agent === "codex") {
       // codex は新規起動時に会話 id を永続していないため、同一 cwd の会話の最新で近似する。
-      const cwd = standardize(meta.cwd);
-      let latest: number | null = null;
       try {
-        for (const info of codexStore.list(cwd)) {
-          if (standardize(info.cwd) !== cwd) continue;
-          if (info.updatedAt !== undefined && (latest === null || info.updatedAt > latest)) {
-            latest = info.updatedAt;
-          }
-        }
+        return await codexStore.latestActivity(meta.cwd);
       } catch {
         return null;
       }
-      return latest;
     }
 
     const sessionId = meta.claudeSessionId;
     if (!sessionId) return null;
-    const transcript = claudeStore.transcriptPath(sessionId);
-    if (transcript === null) return null;
-    return lastConversationTimestamp(transcript);
+    return claudeStore.transcriptActivity(sessionId, meta.cwd);
   };
 }

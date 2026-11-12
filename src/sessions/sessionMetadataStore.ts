@@ -7,6 +7,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { ensureDirectory0700 } from "../shared/paths.js";
+import { mapConcurrent } from "./mapConcurrent.js";
 
 /** 1 セッション分のメタデータ（createdAt は Unix 秒）。 */
 export interface SessionMeta {
@@ -65,6 +66,8 @@ export function defaultSessionsBase(): string {
  */
 export class SessionMetadataStore {
   private readonly base: string;
+  private readonly readMemo = new Map<string, { mtimeMs: number; ctimeMs: number; size: number; meta: SessionMeta | null }>();
+  private readingAll: Promise<SessionMeta[]> | null = null;
 
   constructor(base?: string) {
     this.base = base ?? defaultSessionsBase();
@@ -91,6 +94,7 @@ export class SessionMetadataStore {
       },
     );
     const target = this.fileFor(meta.name);
+    this.readMemo.delete(target);
     const tmp = target + ".tmp";
     fs.writeFileSync(tmp, payload);
     fs.renameSync(tmp, target); // atomic 相当
@@ -104,7 +108,15 @@ export class SessionMetadataStore {
       return null;
     }
     try {
-      const raw = JSON.parse(fs.readFileSync(this.fileFor(name), "utf8")) as unknown;
+      const file = this.fileFor(name);
+      const hit = this.readMemo.get(file);
+      if (hit !== undefined) {
+        const stat = fs.statSync(file);
+        if (hit.mtimeMs === stat.mtimeMs && hit.ctimeMs === stat.ctimeMs && hit.size === stat.size) {
+          return hit.meta === null ? null : { ...hit.meta };
+        }
+      }
+      const raw = JSON.parse(fs.readFileSync(file, "utf8")) as unknown;
       return decodeMeta(raw);
     } catch {
       return null;
@@ -131,6 +143,49 @@ export class SessionMetadataStore {
       }
     }
     return result;
+  }
+
+  /**
+   * 一覧は終了済みメタも含むので全件が必要。同期の全読みを避け、Composite の並行した
+   * tmux/herdr/api の要求は 1 回の読み取りへまとめる。内容はファイルごとの stat で再検証する。
+   */
+  async allAsync(): Promise<SessionMeta[]> {
+    if (this.readingAll === null) {
+      this.readingAll = this.readAllAsync();
+    }
+    const pending = this.readingAll;
+    try {
+      return (await pending).map((meta) => ({ ...meta }));
+    } finally {
+      if (this.readingAll === pending) this.readingAll = null;
+    }
+  }
+
+  private async readAllAsync(): Promise<SessionMeta[]> {
+    let entries: string[];
+    try {
+      entries = await fs.promises.readdir(this.base);
+    } catch {
+      return [];
+    }
+    const files = entries.filter((entry) => entry.endsWith(".json") && !entry.startsWith("."))
+      .map((entry) => path.join(this.base, entry));
+    const seen = new Set(files);
+    for (const file of this.readMemo.keys()) if (!seen.has(file)) this.readMemo.delete(file);
+    const metas = await mapConcurrent(files, async (file) => {
+      try {
+        const stat = await fs.promises.stat(file);
+        const hit = this.readMemo.get(file);
+        if (hit?.mtimeMs === stat.mtimeMs && hit.ctimeMs === stat.ctimeMs && hit.size === stat.size) return hit.meta;
+        const meta = decodeMeta(JSON.parse(await fs.promises.readFile(file, "utf8")));
+        this.readMemo.set(file, { mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, size: stat.size, meta });
+        return meta;
+      } catch {
+        this.readMemo.delete(file);
+        return null;
+      }
+    });
+    return metas.filter((meta): meta is SessionMeta => meta !== null);
   }
 
   /** provider + 会話 ID から現在の tmux メタデータを逆引きする。 */

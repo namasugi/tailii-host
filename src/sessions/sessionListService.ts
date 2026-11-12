@@ -53,30 +53,31 @@ export class SessionListService {
     const raw = await this.sessionManager.list();
 
     // updatedAt を付与する（未解決は省略 = 比較上 0 で最下位）。
-    // 権威は provider（セッション自身の会話 transcript の mtime = 最終会話時刻）。
+    // 権威は provider（Claude の会話行の時刻 / Codex の rollout mtime）。
     // tmux の活動時刻や cwd 共有の mtime は使わない: 前者は作成だけで最新になり、
     // 後者は同一 cwd の別セッションの会話を継承するため、どちらも
     // 「会話していないセッションが実会話より上に浮く」誤整列を生む。
-    // Codex の activity provider は rollout 一覧を走査する。同一 cwd の複数メタは設計上
+    // Codex の activity provider は必要な rollout をまとめて調べる。同一 cwd の複数メタは設計上
     // 同じ updatedAt 近似値になるため、1ページ生成中は cwd ごとに1回だけ解決する。
     // これが無いと過去セッション数に比例して同じ ~/.codex/sessions を再走査し、iOS の
     // 一覧更新を不必要に遅らせる。
-    const codexActivityByCwd = new Map<string, number | null>();
-    const annotated: SessionInfo[] = raw.map((info) => {
+    const codexActivityByCwd = new Map<string, Promise<number | null>>();
+    const annotated: SessionInfo[] = await Promise.all(raw.map(async (info) => {
       if (info.updatedAt !== undefined) return info;
       let updatedAt: number | null;
       if (info.agent === "codex") {
         if (codexActivityByCwd.has(info.cwd)) {
-          updatedAt = codexActivityByCwd.get(info.cwd) ?? null;
+          updatedAt = await codexActivityByCwd.get(info.cwd)!;
         } else {
-          updatedAt = this.activityProvider(info);
-          codexActivityByCwd.set(info.cwd, updatedAt);
+          const activity = Promise.resolve(this.activityProvider(info));
+          codexActivityByCwd.set(info.cwd, activity);
+          updatedAt = await activity;
         }
       } else {
-        updatedAt = this.activityProvider(info);
+        updatedAt = await this.activityProvider(info);
       }
       return updatedAt === null ? { ...info } : { ...info, updatedAt };
-    });
+    }));
 
     // (updatedAt desc, name asc) の安定ソート。
     const sorted = annotated.slice().sort((lhs, rhs) => {

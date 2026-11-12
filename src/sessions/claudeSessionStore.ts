@@ -18,6 +18,7 @@ import { isInjectedSkillContent } from "../shared/skillInjection.js";
 import { isTurnCompanionRecord } from "../shared/commandExpansion.js";
 import { noteReadFailure, readFailureCount } from "../shared/readFailures.js";
 import type { ListMemoFile } from "./listMemoFile.js";
+import { mapConcurrent } from "./mapConcurrent.js";
 
 /** タイトル抽出の最大長（先頭 ~60 字）。 */
 const TITLE_MAX_LENGTH = 60;
@@ -61,6 +62,9 @@ export class ClaudeSessionStore {
    * ファイルは前回の結果を使い、変わったものだけ読み直す。今回の列挙に無かったパスは捨てる。
    */
   private readonly infoMemo = new Map<string, InfoMemoEntry>();
+  private readonly activityMemo = new Map<string, { mtimeMs: number; size: number; updatedAt: number | null }>();
+  private readonly transcriptDirectories = new Map<string, { mtimeMs: number; ctimeMs: number; names: string[] }>();
+  private readingTranscriptPaths: Promise<Map<string, string[]>> | null = null;
   /** `infoMemo` の保存先（engine だけが渡す。次の engine の最初の一覧へ引き継ぐ, session-list-memo-persist）。 */
   private readonly memoFile: ListMemoFile | null;
   private memoFileLoaded = false;
@@ -80,7 +84,12 @@ export class ClaudeSessionStore {
    * その場合は**会話本体（timestamp 行）を持つ方**を返す。readdir 順の先勝ちだと、
    * 残骸を掴んで検索・タブ名同期・再移設が空振りする。
    */
-  transcriptPath(sessionId: string): string | null {
+  transcriptPath(sessionId: string, cwd?: string): string | null {
+    // メタの保存先に会話本体があれば全 projects を探さない。状態行だけの残骸は採らない。
+    if (cwd !== undefined) {
+      const candidate = path.join(this.root, claudeProjectSlug(cwd), `${sessionId}.jsonl`);
+      if (this.lastConversationTimestamp(candidate) !== null) return candidate;
+    }
     let slugs: string[];
     try {
       slugs = fs.readdirSync(this.root);
@@ -100,13 +109,90 @@ export class ClaudeSessionStore {
     let best: string | null = null;
     let bestUpdatedAt = Number.NEGATIVE_INFINITY;
     for (const candidate of candidates) {
-      const updatedAt = lastConversationTimestamp(candidate);
+      const updatedAt = this.lastConversationTimestamp(candidate);
       if (updatedAt !== null && updatedAt > bestUpdatedAt) {
         best = candidate;
         bestUpdatedAt = updatedAt;
       }
     }
     return best ?? candidates[0] ?? null;
+  }
+
+  /** 稼働一覧の複数 ID が fallback しても、全 slug の確認は 1 回にまとめる。 */
+  async transcriptActivity(sessionId: string, cwd: string): Promise<number | null> {
+    const hinted = path.join(this.root, claudeProjectSlug(cwd), `${sessionId}.jsonl`);
+    const activity = this.lastConversationTimestamp(hinted);
+    if (activity !== null) return activity;
+    if (this.readingTranscriptPaths === null) this.readingTranscriptPaths = this.readTranscriptPaths();
+    const pending = this.readingTranscriptPaths;
+    let paths: Map<string, string[]>;
+    try {
+      paths = await pending;
+    } finally {
+      if (this.readingTranscriptPaths === pending) this.readingTranscriptPaths = null;
+    }
+    let latest: number | null = null;
+    for (const file of paths.get(sessionId) ?? []) {
+      const value = this.lastConversationTimestamp(file);
+      if (value !== null && (latest === null || value > latest)) latest = value;
+    }
+    return latest;
+  }
+
+  private async transcriptDirectoryNames(dir: string): Promise<string[]> {
+    try {
+      const stat = await fs.promises.stat(dir);
+      const hit = this.transcriptDirectories.get(dir);
+      if (hit?.mtimeMs === stat.mtimeMs && hit.ctimeMs === stat.ctimeMs) return hit.names;
+      const names = await fs.promises.readdir(dir);
+      this.transcriptDirectories.set(dir, { mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, names });
+      return names;
+    } catch {
+      this.transcriptDirectories.delete(dir);
+      return [];
+    }
+  }
+
+  private async readTranscriptPaths(): Promise<Map<string, string[]>> {
+    const slugs = await this.transcriptDirectoryNames(this.root);
+    const directories = await mapConcurrent(slugs, async (slug) => {
+      const dir = path.join(this.root, slug);
+      return { dir, names: await this.transcriptDirectoryNames(dir) };
+    });
+    const byId = new Map<string, string[]>();
+    for (const { dir, names } of directories) {
+      for (const name of names) {
+        if (!name.endsWith(".jsonl")) continue;
+        const id = name.slice(0, -6);
+        const candidates = byId.get(id) ?? [];
+        candidates.push(path.join(dir, name));
+        byId.set(id, candidates);
+      }
+    }
+    return byId;
+  }
+
+  /** 保存済み一覧メモと時刻専用メモを共有する。毎回 stat し、追記・削除・移設を見逃さない。 */
+  lastConversationTimestamp(filePath: string): number | null {
+    this.loadMemoFileOnce();
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(filePath);
+      if (!stat.isFile()) return null;
+    } catch {
+      this.activityMemo.delete(filePath);
+      return null;
+    }
+    const info = this.infoMemo.get(filePath);
+    if (info?.mtimeMs === stat.mtimeMs && info.size === stat.size) return info.info.updatedAt ?? null;
+    const hit = this.activityMemo.get(filePath);
+    if (hit?.mtimeMs === stat.mtimeMs && hit.size === stat.size) return hit.updatedAt;
+    const failuresBefore = readFailureCount();
+    const updatedAt = lastConversationTimestamp(filePath);
+    if (failuresBefore === readFailureCount()) {
+      this.activityMemo.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, updatedAt });
+    }
+    return updatedAt;
   }
 
   /**
@@ -313,7 +399,7 @@ function isInfoMemoEntry(value: unknown): value is InfoMemoEntry {
  * - 上限まで読んでも見つからない（会話の行の後ろに巨大な行が続く）→ mtime へ保守的にフォールバック
  */
 export function lastConversationTimestamp(filePath: string): number | null {
-  return scanTranscriptTail(filePath).updatedAt;
+  return scanTranscriptTail(filePath, true).updatedAt;
 }
 
 /**
@@ -339,8 +425,9 @@ export interface TranscriptTailSummary extends TranscriptTitleEntries {
  * updatedAt の解決規則は `lastConversationTimestamp` の docstring の通り。
  * lastMessage はテキストを持つ最後の user/assistant 行から取る（tool_result/thinking
  * のみの行はテキスト抽出に失敗して自然に skip される）。見つからなければ null。
+ * timestampOnly のときは時刻が確定した所で打ち切り、本文・タイトルは抽出しない。
  */
-export function scanTranscriptTail(filePath: string): TranscriptTailSummary {
+export function scanTranscriptTail(filePath: string, timestampOnly = false): TranscriptTailSummary {
   let fd: number;
   try {
     fd = fs.openSync(filePath, "r");
@@ -369,18 +456,18 @@ export function scanTranscriptTail(filePath: string): TranscriptTailSummary {
         const rec = parseEntry(lines[i] ?? "");
         if (rec === null) continue;
         // 後方スキャンなので最初に出会ったタイトルエントリ = ファイル内で最新。
-        if (titles.customTitle === undefined && rec["type"] === "custom-title") {
+        if (!timestampOnly && titles.customTitle === undefined && rec["type"] === "custom-title") {
           titles.customTitle = normalizeExplicitTitle(rec["customTitle"]);
         }
-        if (titles.aiTitle === undefined && rec["type"] === "ai-title") {
+        if (!timestampOnly && titles.aiTitle === undefined && rec["type"] === "ai-title") {
           titles.aiTitle = normalizeExplicitTitle(rec["aiTitle"]);
         }
         const isConversationEntry = rec["type"] === "user" || rec["type"] === "assistant";
         if (updatedAt === null && isConversationEntry) updatedAt = entryTimestamp(rec);
-        if (lastMessage === null && isConversationEntry) {
+        if (!timestampOnly && lastMessage === null && isConversationEntry) {
           lastMessage = extractMessageText(rec, LAST_MESSAGE_MAX_LENGTH);
         }
-        if (updatedAt !== null && lastMessage !== null) {
+        if (updatedAt !== null && (timestampOnly || lastMessage !== null)) {
           done = true;
           break;
         }
@@ -398,7 +485,7 @@ export function scanTranscriptTail(filePath: string): TranscriptTailSummary {
     // タイトル専用の深掘り: updatedAt/lastMessage は末尾数行で即確定して打ち切るため、
     // CLI が定期再フラッシュするタイトルエントリ（custom-title/ai-title）がその少し上に
     // あると取りこぼす。窓内（TAIL_BYTES_CAP）全体を substring 前置フィルタで走査して補完する。
-    if (!scannedAll && (titles.customTitle === undefined || titles.aiTitle === undefined)) {
+    if (!timestampOnly && !scannedAll && (titles.customTitle === undefined || titles.aiTitle === undefined)) {
       scanTailTitleCheckpoints(fd, size, titles);
     }
     return summary();

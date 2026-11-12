@@ -56,7 +56,7 @@ export class ApiAgentSessionBackend implements SessionBackend {
   }
 
   async list(): Promise<SessionInfo[]> {
-    return this.store.all().filter(isApiAgentMeta).map((meta) => this.infoFor(meta));
+    return (await this.store.allAsync()).filter(isApiAgentMeta).map((meta) => this.infoFor(meta));
   }
 
   async reattach(name: string): Promise<ReattachResult> {
