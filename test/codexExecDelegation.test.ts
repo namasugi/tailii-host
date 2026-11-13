@@ -5,7 +5,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import {
   candidateWorkDirs,
   CodexExecLinker,
@@ -25,6 +25,7 @@ import { parseCodexExecTranscript, readCodexExecTranscript } from "../src/chat/s
 import { CodexSessionStore } from "../src/codex/codexSessionStore.js";
 import { decodeControlMessage, encodeControlMessage, type ControlMessage, type SubagentNode } from "../src/protocol.js";
 import { makeTempDir } from "./helpers.js";
+import { periodicWorkLimiter } from "../src/shared/loadShed.js";
 
 const hostRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -322,6 +323,159 @@ describe("matchByRules（記録だけの規則）", () => {
 // MARK: - 状態
 
 describe("CodexExecLinker の状態の判定", () => {
+  test("プローブ中の同サイズ・mtime 更新でも終端行を読み直す", async () => {
+    const home = makeTempDir("cx-rewritten-in-probe"), repo = path.join(home, "repo"); fs.mkdirSync(repo);
+    const spec = { id: "live", cwd: repo, startMs: T0 + 1000 };
+    const file = writeRollout(path.join(home, ".codex"), { ...spec, terminal: null });
+    fs.appendFileSync(file, " ".repeat(2047) + "\n");
+    const before = fs.statSync(file);
+    let finish!: Parameters<ProcessProbeExec>[2];
+    const linker = new CodexExecLinker({ home, now: () => T0 + 3_600_000, exec: (_cmd, _args, callback) => { finish = callback; } });
+    const pending = linker.evaluate({ sessionId: "s", calls: calls(repo), sessionAlive: false });
+    const completed = rolloutLines({ ...spec, terminal: "complete" }).map((line) => JSON.stringify(line)).join("\n") + "\n";
+    fs.writeFileSync(file, completed + " ".repeat(before.size - Buffer.byteLength(completed) - 1) + "\n");
+    fs.utimesSync(file, before.atime, new Date(before.mtimeMs + 2000));
+    expect(fs.statSync(file).size).toBe(before.size);
+    finish(Object.assign(new Error("no holder"), { code: 1 }), "");
+    expect((await pending)?.[0]?.status).toBe("completed");
+  });
+  test.each(["complete", "aborted", "updated"] as const)("枠待ち中に記録が %s へ更新されたら、同じ評価で読み直す", async (terminal) => {
+    vi.useFakeTimers();
+    const home = makeTempDir("cx-finished-in-queue"), repo = path.join(home, "repo"); fs.mkdirSync(repo);
+    const file = writeRollout(path.join(home, ".codex"), { id: "live", cwd: repo, startMs: T0 + 1000, terminal: null });
+    let release!: () => void;
+    const blocker = periodicWorkLimiter.run("busy-preview", "background", () => new Promise<void>((resolve) => { release = resolve; }));
+    let probe: Promise<void> | undefined;
+    const exec: ProcessProbeExec = (_cmd, _args, callback, signal) => {
+      probe = periodicWorkLimiter.run("queued-lsof", "background", async () => {
+        callback(Object.assign(new Error("no holder"), { code: 1 }), "");
+      }, signal);
+      void probe.catch((error) => callback(error, ""));
+    };
+    const linker = new CodexExecLinker({ home, exec, now: Date.now });
+    const pending = linker.evaluate({ sessionId: "s", calls: calls(repo), sessionAlive: false });
+    try {
+      expect(periodicWorkLimiter.waiting).toBe(1);
+      await vi.advanceTimersByTimeAsync(20_000);
+      const ts = T0 + 80_000;
+      fs.appendFileSync(file, JSON.stringify({ timestamp: iso(ts), type: "event_msg", payload: {
+        type: terminal === "complete" ? "task_complete" : terminal === "aborted" ? "turn_aborted" : "task_started",
+      } }) + "\n");
+      release(); await blocker; await vi.advanceTimersByTimeAsync(0);
+      const runs = await pending;
+      expect(runs?.[0]).toMatchObject({ status: terminal === "complete" ? "completed" : terminal === "aborted" ? "error" : "running", lastTs: ts });
+      // 長い休止中も最初から正しい状態を返しており、次の評価による訂正を必要としない。
+      expect(linker.due()).toBe(false);
+    } finally {
+      release(); await blocker; await vi.advanceTimersByTimeAsync(0); await probe; await pending; vi.useRealTimers();
+    }
+  });
+  test("reset 前の遅いプローブは新世代のキャッシュ・次回評価時刻を上書きしない", async () => {
+    const home = makeTempDir("cx-generation"), repo = path.join(home, "repo"); fs.mkdirSync(repo);
+    writeRollout(path.join(home, ".codex"), { id: "live", cwd: repo, startMs: T0 + 1000, terminal: null });
+    let now = T0 + 3_600_000;
+    const callbacks: Parameters<ProcessProbeExec>[2][] = [];
+    const linker = new CodexExecLinker({ home, now: () => now,
+      exec: (_cmd, _args, callback) => { callbacks.push(callback); } });
+    const input = { calls: calls(repo), sessionAlive: false };
+    const old = linker.evaluate({ ...input, sessionId: "old" });
+    expect(callbacks).toHaveLength(1);
+    linker.reset();
+    now += 10_000;
+    const next = linker.evaluate({ ...input, sessionId: "new" });
+    expect(callbacks).toHaveLength(2);
+    expect(await old).toBeNull();
+    callbacks[1]!(null, "1234\n");
+    expect((await next)?.[0]?.status).toBe("running");
+    now += 2_000;
+    expect(linker.due()).toBe(true);
+    // 取消を無視した旧プローブが後から「死亡」を返しても、新世代の running を保つ。
+    callbacks[0]!(Object.assign(new Error("no holder"), { code: 1 }), "");
+    await Promise.resolve(); await Promise.resolve();
+    expect(linker.due()).toBe(true);
+    expect((await linker.evaluate({ ...input, sessionId: "new" }))?.[0]?.status).toBe("running");
+    expect(callbacks).toHaveLength(2);
+  });
+  test("生存確認の古い待ちが置き換わっても、死亡扱いで登録簿を捨てない", async () => {
+    const home = makeTempDir("cx-skipped-probe");
+    const registryDir = path.join(home, "registry");
+    fs.mkdirSync(registryDir);
+    const registryPath = path.join(registryDir, "424242.json");
+    const registry = JSON.stringify({
+      pid: 424242, sessionId: "s", status: "busy",
+    });
+    fs.writeFileSync(registryPath, registry);
+    const { exec, calls: execCalls } = fakeExec({
+      ps: () => psRow(424242, 1, 424242, T0, "claude"),
+    });
+    const linker = new CodexExecLinker({
+      home, codexHome: path.join(home, ".codex"), linksPath: path.join(home, "links.jsonl"),
+      claudeSessionsDir: registryDir, exec, now: () => T0 + 3_600_000,
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    // 背景は同時 1 件までなので、1 件塞げば対象の生存確認は待ちに入る。
+    const blocker = periodicWorkLimiter.run("busy-background", "background", () => gate);
+    const replacementProbe = vi.fn(async () => true);
+    let replacement: Promise<boolean> | undefined;
+    try {
+      expect(periodicWorkLimiter.running).toBe(1);
+      expect(periodicWorkLimiter.waiting).toBe(0);
+      const pending = linker.evaluate({ sessionId: "s", sessionAlive: true, calls: [{
+        toolUseId: "b1", owner: "root", command: "codex exec -", cwd: home, startMs: T0, endMs: null,
+      }] });
+      expect(periodicWorkLimiter.waiting).toBe(1);
+      // 古い確認だけを置き換え、実物の pid / ps は調べない。
+      replacement = periodicWorkLimiter.run("claude-pid:424242", "background", replacementProbe);
+      expect(periodicWorkLimiter.waiting).toBe(1);
+      await pending;
+      expect(replacementProbe).not.toHaveBeenCalled();
+      expect(fs.readFileSync(registryPath, "utf8")).toBe(registry);
+      expect(execCalls.some((command) => command.startsWith("ps "))).toBe(true);
+      expect(execCalls.some((command) => command.startsWith("pgrep "))).toBe(false);
+    } finally {
+      release();
+      await Promise.all([blocker, replacement]);
+    }
+    expect(replacementProbe).toHaveBeenCalledOnce();
+    expect(periodicWorkLimiter.running).toBe(0);
+    expect(periodicWorkLimiter.waiting).toBe(0);
+  });
+
+  test.each([
+    { duration: 20, rest: 2000 },
+    { duration: 1000, rest: 3000 },
+    { duration: 20000, rest: 30000 },
+  ])("定期評価は所要 $duration ms の後 $rest ms 休み、force でも重ねない", async ({ duration, rest }) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0 + 3_600_000);
+    try {
+      const home = makeTempDir("cx-load-shed");
+      const repo = path.join(home, "repo");
+      fs.mkdirSync(repo);
+      writeRollout(path.join(home, ".codex"), { id: "live", cwd: repo, startMs: T0 + 1000, terminal: null });
+      const exec: ProcessProbeExec = (_cmd, _args, callback) => {
+        setTimeout(() => callback(null, "4242\n"), duration);
+      };
+      const linker = new CodexExecLinker({
+        home, codexHome: path.join(home, ".codex"), linksPath: path.join(home, "links.jsonl"),
+        exec, now: Date.now,
+      });
+      const input = { sessionId: "s", calls: calls(repo), sessionAlive: false };
+      const pending = linker.evaluate(input);
+      expect(linker.due()).toBe(false);
+      expect(await linker.evaluate({ ...input, force: true })).toBeNull();
+      await vi.advanceTimersByTimeAsync(duration);
+      expect((await pending)?.[0]?.status).toBe("running");
+      await vi.advanceTimersByTimeAsync(rest - 1);
+      expect(linker.due()).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(linker.due()).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   function linkerFor(home: string, lsof: (args: string[]) => string | null | undefined): CodexExecLinker {
     const { exec } = fakeExec({ lsof });
     return new CodexExecLinker({ home, codexHome: path.join(home, ".codex"), linksPath: path.join(home, "links.jsonl"), exec, now: () => T0 + 3_600_000, intervalMs: 0 });

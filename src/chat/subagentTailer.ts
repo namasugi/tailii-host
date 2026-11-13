@@ -4,7 +4,7 @@
 // claude の `<sessionId>/subagents/agent-*.meta.json` と main/subagent transcript を監視し、
 // subagent_node（spawn/running → completed/error）を engine チャネルへ流す。
 
-import { execFile } from "node:child_process";
+import { nextStartAtMs, probeExecFile } from "../shared/loadShed.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { PROTOCOL_V2, type ControlMessage, type SubagentNode, type SubagentNodeStatus, type ToolActivity } from "../protocol.js";
@@ -45,14 +45,14 @@ export interface SubagentTailerOptions {
    */
   tentativeFinalGraceMs?: number;
   /** output ファイルを開いているプロセスの有無（null=判定不能）。テスト差し替え用。 */
-  probeOutputOpen?: (filePath: string) => Promise<boolean | null>;
+  probeOutputOpen?: (filePath: string, signal?: AbortSignal) => Promise<boolean | null>;
   /**
    * セッション（claude プロセス）の生存判定。テスト・上位配線の差し替え用。
    * true=生存確定 / false=死亡確定 / null=不明（生存扱い・安全側）。
    * lastActivityMs はセッションの transcript 群が最後に更新された時刻（不明なら null）。
    * 既定実装は defaultProbeSessionAlive を参照。
    */
-  probeSessionAlive?: (sessionId: string, lastActivityMs: number | null) => Promise<boolean | null>;
+  probeSessionAlive?: (sessionId: string, lastActivityMs: number | null, signal?: AbortSignal) => Promise<boolean | null>;
   /**
    * 既定プローブが「argv 不一致 + transcript 静止」を死亡確定とみなす静止時間（ms）。
    * 既定 6h。SendMessage 待機など「生きているが transcript が静かな」セッションを
@@ -214,10 +214,11 @@ export class SubagentTailer {
   private readonly orphanProbeIntervalMs: number;
   private readonly agentOrphanGraceMs: number;
   private readonly tentativeFinalGraceMs: number;
-  private readonly probeOutputOpen: (filePath: string) => Promise<boolean | null>;
+  private readonly probeOutputOpen: (filePath: string, signal?: AbortSignal) => Promise<boolean | null>;
   private readonly probeSessionAlive: (
     sessionId: string,
     lastActivityMs: number | null,
+    signal?: AbortSignal,
   ) => Promise<boolean | null>;
   private readonly sessionStaleMs: number;
   private readonly jsonlPaths = new Map<string, string>();
@@ -243,7 +244,7 @@ export class SubagentTailer {
     this.stopRecords = options.stopRecords ?? processBackgroundStopRecords();
     this.codexExec = options.codexExecLinker === undefined ? new CodexExecLinker() : options.codexExecLinker;
     this.probeSessionAlive = options.probeSessionAlive
-      ?? ((sessionId, lastActivityMs) => defaultProbeSessionAlive(sessionId, lastActivityMs, this.sessionStaleMs));
+      ?? ((sessionId, lastActivityMs, signal) => defaultProbeSessionAlive(sessionId, lastActivityMs, this.sessionStaleMs, undefined, signal));
   }
 
   /** 現在 tail 中の nodeId から transcript 実体を引く。 */
@@ -302,6 +303,18 @@ export class SubagentTailer {
     mainTranscript: string,
     signal?: AbortSignal,
   ): AsyncGenerator<ControlMessage, void, void> {
+    // transcript を直接指定した購読でも、前の会話の評価・休止を引き継がない。
+    this.codexExec?.reset();
+    const abort = new AbortController();
+    const subscriptionSignal = signal === undefined ? abort.signal : AbortSignal.any([signal, abort.signal]);
+    try { yield* this.streamSessionCore(mainTranscript, subscriptionSignal); }
+    finally { abort.abort(); }
+  }
+
+  private async *streamSessionCore(
+    mainTranscript: string,
+    signal: AbortSignal,
+  ): AsyncGenerator<ControlMessage, void, void> {
     const sessionId = path.basename(mainTranscript, ".jsonl");
     const subagentsDir = path.join(path.dirname(mainTranscript), sessionId, "subagents");
     const tracked = new Map<string, TrackedNode>();
@@ -326,8 +339,13 @@ export class SubagentTailer {
     let lastActivityTsMs: number | null = null;
     // セッション（claude プロセス）の生存。false のみが「死亡確定」。null は生存扱い（安全側）。
     let sessionAlive: boolean | null = null;
-    let lastSessionProbeMs = 0;
-    let lastOrphanProbeMs = 0;
+    let transcriptRevision = 0;
+    let sessionProbeRunning = false;
+    let orphanProbeRunning = false;
+    let codexEvaluation: Promise<void> | null = null;
+    let readyCodexRuns: CodexExecRun[] = [];
+    let nextSessionProbeMs = this.orphanProbeIntervalMs;
+    let nextOrphanProbeMs = this.orphanProbeIntervalMs;
     let aggregateDirty = true;
 
     let lastMetaRefreshMs = 0;
@@ -362,6 +380,12 @@ export class SubagentTailer {
               // まだ無い tick に model 無しのノードを配信しないよう、直前値を保持する
               // （再読込で別の値が出れば最新行が勝つ）。
             }
+          }
+          if (read.reset || read.lines.length > 0) {
+            transcriptRevision++;
+            // 前の生存判定後に記録が動いたら、古い死亡判定で新しい作業を終了扱いにしない。
+            // 不明へ戻しても、直前のプローブの所要時間に応じた休止は縮めない。
+            if (sessionAlive === false) sessionAlive = null;
           }
           if (node !== null) node.firstJsonlTimestampMs = read.state.firstTimestampMs;
           if (read.lines.length > 0) aggregateDirty = true;
@@ -610,9 +634,27 @@ export class SubagentTailer {
       };
 
       const nowMs = Date.now();
-      if (nowMs - lastSessionProbeMs >= this.orphanProbeIntervalMs) {
-        lastSessionProbeMs = nowMs;
-        sessionAlive = await this.probeSessionAlive(sessionId, lastActivityTsMs);
+      if (!sessionProbeRunning && nowMs >= nextSessionProbeMs) {
+        const startedAt = Date.now();
+        const revision = transcriptRevision;
+        const inputs = transcriptOwners.map(({ path }) => [path, fileFingerprint(path)] as const);
+        sessionProbeRunning = true;
+        const sessionProbe = (async () => {
+          try {
+            const alive = await this.probeSessionAlive(sessionId, lastActivityTsMs, signal);
+            const changed = alive === false && (revision !== transcriptRevision ||
+              inputs.some(([file, fingerprint]) => fileFingerprint(file) !== fingerprint));
+            if (!signal?.aborted) sessionAlive = changed ? null : alive;
+          } catch {
+            if (!signal?.aborted) sessionAlive = null;
+          } finally {
+            nextSessionProbeMs = nextStartAtMs(startedAt, Date.now(), this.orphanProbeIntervalMs, 120_000);
+            sessionProbeRunning = false;
+          }
+        })();
+        // 単発取得は死亡 sweep の前に結果を回収する。継続監視は即座に完了した分だけ取り込む。
+        if (this.tailIndefinitely) await Promise.resolve();
+        else await sessionProbe;
       }
 
       // 孤児判定（エージェント）: 背景エージェントの task-notification は「起動元の transcript に、
@@ -765,24 +807,45 @@ export class SubagentTailer {
       // 届かないまま消えることがある（完了信号の消失）。output ファイルを開いているプロセスが
       // いなければ「終了済みなのに通知が来ない孤児」として完了へ落とす。
       // 実行中のコマンドはシェルが output の fd を保持し続けるため誤爆しない。
-      if (nowMs - lastOrphanProbeMs >= this.orphanProbeIntervalMs) {
-        lastOrphanProbeMs = nowMs;
-        for (const command of bgCommandByTaskId.values()) {
-          if (notificationByTaskId.has(command.taskId)) continue;
-          if (bgOrphanTsByTaskId.has(command.taskId)) continue;
-          if (command.outputPath === null) continue;
-          let bornMs = bgFirstSeenMsByTaskId.get(command.taskId);
-          if (bornMs === undefined) {
-            bornMs = command.startTs ?? nowMs;
-            bgFirstSeenMsByTaskId.set(command.taskId, bornMs);
+      if (!orphanProbeRunning && Date.now() >= nextOrphanProbeMs) {
+        const startedAt = Date.now();
+        orphanProbeRunning = true;
+        const orphanProbe = (async () => {
+          try {
+            for (const command of [...bgCommandByTaskId.values()]) {
+              if (signal?.aborted) return;
+              if (notificationByTaskId.has(command.taskId)) continue;
+              if (bgOrphanTsByTaskId.has(command.taskId)) continue;
+              if (command.outputPath === null) continue;
+              let bornMs = bgFirstSeenMsByTaskId.get(command.taskId);
+              if (bornMs === undefined) {
+                bornMs = command.startTs ?? nowMs;
+                bgFirstSeenMsByTaskId.set(command.taskId, bornMs);
+              }
+              if (nowMs - bornMs < this.orphanGraceMs) continue;
+              // fd 判定の対象はこの output だけ。別の作業の transcript 更新では否定結果を捨てない。
+              const fingerprint = fileFingerprint(command.outputPath);
+              let open: boolean | null;
+              try { open = await this.probeOutputOpen(command.outputPath, signal); }
+              catch { open = null; }
+              if (signal?.aborted) return;
+              if (open === false) {
+                // 対象が更新・差し替えされた場合は不明のまま、休止後の巡回で再確認する。
+                if (fileFingerprint(command.outputPath) !== fingerprint) continue;
+                const endTs = mtimeMs(command.outputPath);
+                bgOrphanTsByTaskId.set(command.taskId, endTs > 0 ? endTs : nowMs);
+              }
+            }
+          } finally {
+            // 対象の更新で結果を見送った場合も完了から休ませ、即時の再確認を繰り返さない。
+            // 待機中は重ねず、未完了の項目は直前値（無ければ不明）で配信する。
+            nextOrphanProbeMs = nextStartAtMs(startedAt, Date.now(), this.orphanProbeIntervalMs, 120_000);
+            orphanProbeRunning = false;
           }
-          if (nowMs - bornMs < this.orphanGraceMs) continue;
-          const open = await this.probeOutputOpen(command.outputPath);
-          if (open === false) {
-            const endTs = mtimeMs(command.outputPath);
-            bgOrphanTsByTaskId.set(command.taskId, endTs > 0 ? endTs : nowMs);
-          }
-        }
+        })().catch(() => { /* 判定不能は生存側。次の巡回で再試行する。 */ });
+        // 単発取得は最終ノードを計算する前に回収する。継続監視の配信は待たせない。
+        if (this.tailIndefinitely) await Promise.resolve();
+        else await orphanProbe;
       }
 
       for (const command of bgCommandByTaskId.values()) {
@@ -828,7 +891,7 @@ export class SubagentTailer {
       }
 
       // Claude の Bash が `codex exec` で起動した Codex の実行（codex-exec-delegation）。1 回の実行 = 1 ノード。
-      if (this.codexExec !== null && !signal?.aborted && this.codexExec.due()) {
+      if (this.codexExec !== null && codexEvaluation === null && !signal?.aborted && this.codexExec.due()) {
         const calls: BashCall[] = [];
         for (const bash of bashByToolUseId.values()) {
           let endMs: number | null = bash.resultMs;
@@ -846,14 +909,21 @@ export class SubagentTailer {
             cwd: bash.cwd, startMs: bash.startMs, endMs,
           });
         }
-        const runs = await this.codexExec.evaluate({ sessionId, calls, sessionAlive }).catch(() => null);
-        for (const run of runs ?? []) {
-          const messageNode = codexExecNode(run, tracked.get(run.owner)?.meta.spawnDepth ?? null);
-          const key = stableNodeKey(messageNode);
-          if (key === codexLastKeyByNodeId.get(run.nodeId)) continue;
-          codexLastKeyByNodeId.set(run.nodeId, key);
-          yield { type: "subagent_node", v: PROTOCOL_V2, node: messageNode };
-        }
+        // この評価にも生存プローブがある。継続配信は待たせず、結果だけ次の巡回で取り込む。
+        codexEvaluation = this.codexExec.evaluate({ sessionId, calls, sessionAlive, signal }).then((runs) => {
+          if (!signal?.aborted && runs !== null) readyCodexRuns = runs;
+        }, () => {}).finally(() => { codexEvaluation = null; });
+        // 単発の履歴取得では、既に取得した通常ノードを配信した後に Codex の結果も回収して終える。
+        if (!this.tailIndefinitely) await codexEvaluation;
+      }
+      const runs = readyCodexRuns;
+      readyCodexRuns = [];
+      for (const run of runs) {
+        const messageNode = codexExecNode(run, tracked.get(run.owner)?.meta.spawnDepth ?? null);
+        const key = stableNodeKey(messageNode);
+        if (key === codexLastKeyByNodeId.get(run.nodeId)) continue;
+        codexLastKeyByNodeId.set(run.nodeId, key);
+        yield { type: "subagent_node", v: PROTOCOL_V2, node: messageNode };
       }
 
       if (!this.tailIndefinitely) return;
@@ -1632,6 +1702,14 @@ function mtimeMs(file: string): number {
   }
 }
 
+/** プローブ前後で読んでいる記録が変わっていないかを確かめる。差し替えも更新とみなす。 */
+function fileFingerprint(file: string): string | null {
+  try {
+    const stat = fs.statSync(file);
+    return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+  } catch { return null; }
+}
+
 function fallbackParent(depth: number): string | null {
   return depth <= 1 ? "root" : null;
 }
@@ -1641,15 +1719,16 @@ function fallbackParent(depth: number): string | null {
  * ハーネスは背景シェルの stdout/stderr を output へ向けるため、コマンド（と子孫）が
  * 生きている限り fd 保持者が存在する。true=生存 / false=誰も開いていない / null=判定不能。
  */
-async function defaultProbeOutputOpen(filePath: string): Promise<boolean | null> {
-  const viaLsof = await probeViaLsof(filePath);
+async function defaultProbeOutputOpen(filePath: string, signal?: AbortSignal): Promise<boolean | null> {
+  const viaLsof = await probeViaLsof(filePath, signal);
   if (viaLsof !== null) return viaLsof;
+  if (signal?.aborted) return null;
   return probeViaProcFd(filePath);
 }
 
-function probeViaLsof(filePath: string): Promise<boolean | null> {
+function probeViaLsof(filePath: string, signal?: AbortSignal): Promise<boolean | null> {
   return new Promise((resolve) => {
-    execFile("lsof", ["-t", "--", filePath], { timeout: 10_000 }, (error, stdout) => {
+    probeExecFile("lsof", ["-t", "--", filePath], { timeout: 1_000, signal }, (error, stdout) => {
       if (error === null) {
         resolve(stdout.trim().length > 0);
         return;
@@ -1667,10 +1746,11 @@ export type ProcessProbeExec = (
   cmd: string,
   args: string[],
   callback: (error: (Error & { code?: unknown }) | null, stdout: string) => void,
+  signal?: AbortSignal,
 ) => void;
 
-const defaultProbeExec: ProcessProbeExec = (cmd, args, callback) => {
-  execFile(cmd, args, { timeout: 10_000 }, (error, stdout) => {
+const defaultProbeExec: ProcessProbeExec = (cmd, args, callback, signal) => {
+  probeExecFile(cmd, args, { timeout: 1_000, signal }, (error, stdout) => {
     callback(error as (Error & { code?: unknown }) | null, stdout ?? "");
   });
 };
@@ -1693,8 +1773,9 @@ export async function defaultProbeSessionAlive(
   lastActivityMs: number | null,
   staleMs: number,
   exec: ProcessProbeExec = defaultProbeExec,
+  signal?: AbortSignal,
 ): Promise<boolean | null> {
-  const byArgv = await probeArgvAlive(sessionId, exec);
+  const byArgv = await probeArgvAlive(sessionId, exec, signal);
   if (byArgv === true) return true;
   if (byArgv === null) return null;
   if (lastActivityMs === null) return null;
@@ -1702,7 +1783,7 @@ export async function defaultProbeSessionAlive(
 }
 
 /** argv にセッション id を持つプロセスの有無。true / false / null(判定不能)。 */
-function probeArgvAlive(sessionId: string, exec: ProcessProbeExec): Promise<boolean | null> {
+function probeArgvAlive(sessionId: string, exec: ProcessProbeExec, signal?: AbortSignal): Promise<boolean | null> {
   return new Promise((resolve) => {
     exec("pgrep", ["-f", sessionId], (error, stdout) => {
       if (error === null) {
@@ -1712,7 +1793,7 @@ function probeArgvAlive(sessionId: string, exec: ProcessProbeExec): Promise<bool
       // exit 1 = 一致なし。それ以外（pgrep 不在・タイムアウト等）は判定不能。
       const code: unknown = error.code;
       resolve(code === 1 ? false : null);
-    });
+    }, signal);
   });
 }
 

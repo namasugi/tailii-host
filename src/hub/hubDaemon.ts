@@ -4,13 +4,11 @@
 // reaper の heartbeat 判定は SessionHub.tick() に吸収する。heartbeat.ts が唯一の判定権威で、
 // Hub は engine / hook と並ぶ書き手・周期実行者にすぎない。
 
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { defaultHeartbeatDir } from "../sessions/heartbeat.js";
 import { startEngineRelaySocket, type EngineRelayServer } from "./engineRelaySocket.js";
 import { encodeHubMessage } from "./hubProtocol.js";
@@ -21,7 +19,7 @@ import {
   type ReaperTickResult,
 } from "./reaper.js";
 import { SessionHub } from "./sessionHub.js";
-import { claimHubStartup, classifyHubProcess, type HubExclusiveLock, isSocketAlive } from "./hubStartup.js";
+import { claimHubStartup, type HubExclusiveLock, isSocketAlive } from "./hubStartup.js";
 import { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
 import { abortableSleep } from "../shared/sleep.js";
 import { resolveHubSocketPath } from "../shared/socketPath.js";
@@ -36,7 +34,7 @@ import {
   screenInLoginFlow,
   screenShowsApprovalDialog,
 } from "../backend/tmux.js";
-import { envWithoutTmux, screenHasConfirmFooter, screenHasSelectionFooter } from "../backend/herdr.js";
+import { screenHasConfirmFooter, screenHasSelectionFooter } from "../backend/herdr.js";
 import { readPackageVersion } from "../shared/version.js";
 import { killAgentsKeyIsDefault } from "../shared/claudeKeybindings.js";
 import { ChatTailController } from "../chat/chatTailController.js";
@@ -45,6 +43,7 @@ import { TranscriptTailer } from "../chat/transcriptTailer.js";
 import { LineWriter } from "../shared/lineWriter.js";
 import { NdjsonLineSplitter } from "../shared/lineSplitter.js";
 import { PanePreviewPump } from "./panePreviewPump.js";
+import { PreviewLoadMonitor } from "./previewLoad.js";
 import { createProductionPushDispatcher } from "../push/pushDispatcher.js";
 import { makeSessionTitleResolver } from "../push/pushContent.js";
 import { PushDeviceStore } from "../push/pushDeviceStore.js";
@@ -68,15 +67,11 @@ import {
 } from "./effortDialog.js";
 import { ImageService } from "../chat/imageService.js";
 import { listLocalServerProcesses } from "./localServerProcesses.js";
-
-export interface HubLock {
-  pid: number;
-  version: string | null;
-}
-
-export function defaultHubLockPath(): string {
-  return path.join(os.homedir(), ".tailii", "hub.lock");
-}
+import { delegateHubToGateway } from "./gatewaySpawn.js";
+import { defaultHubLockPath, readHubLock, pidAlive } from "./hubDaemonClient.js";
+// 既存の import 元は互換のままにする。
+export { defaultHubLockPath, readHubLock, pidAlive, ensureHubDaemon } from "./hubDaemonClient.js";
+export type { HubLock, EnsureHubDaemonOptions } from "./hubDaemonClient.js";
 
 export function defaultPendingQuestionsPath(): string {
   return path.join(os.homedir(), ".tailii", "hub", "pending-questions.json");
@@ -106,20 +101,6 @@ export function controlMessageCallbackWriter(
       }
     },
   }));
-}
-
-/** lockfile を読む。不在・壊れは null。 */
-export function readHubLock(lockPath: string): HubLock | null {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(lockPath, "utf8")) as {
-      pid?: unknown;
-      version?: unknown;
-    };
-    if (typeof parsed.pid !== "number") return null;
-    return { pid: parsed.pid, version: typeof parsed.version === "string" ? parsed.version : null };
-  } catch {
-    return null;
-  }
 }
 
 /** 自分（ownerPid）の lock だけを消す。後継 daemon の lock は壊さない。残っても pid の生存判定があるので無害。 */
@@ -165,17 +146,6 @@ export function acquireHubLock(
   }
   return false;
 }
-
-/** pid が生きているか。権限不足(EPERM)は生存扱い。 */
-export function pidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
 
 export interface HubSocketServer {
   socketPath: string;
@@ -498,55 +468,15 @@ export async function shutdownHub(options: {
   }
 }
 
-export interface EnsureHubDaemonOptions {
-  /** `hub.lock` の pid の実体（テスト注入用。既定はコマンドラインで確かめる）。 */
-  classifyProcess?: (pid: number) => "hub" | "other" | "gone" | "unknown";
-  lockPath?: string;
-  cliPath?: string;
-  logPath?: string;
-  spawnImpl?: typeof spawn;
-}
-
-/** engine / hook から Hub の常駐を冪等・best-effort で保証する。 */
-export function ensureHubDaemon(options: EnsureHubDaemonOptions = {}): void {
-  let logFd: number | null = null;
-  try {
-    const lockPath = options.lockPath ?? defaultHubLockPath();
-    const currentVersion = readPackageVersion();
-    const lock = readHubLock(lockPath);
-    // pid だけで起動の抑止・終了の要求を決めない。実体が hub と確かめられたときだけ抑止・SIGTERM する。
-    // 無関係なプロセス（pid の再利用）・確認できないときは何も送らずに hub を起動する（起動した hub が排他と実体の
-    // 確認で決着を付ける）。
-    if (lock !== null && pidAlive(lock.pid) && (options.classifyProcess ?? classifyHubProcess)(lock.pid) === "hub") {
-      if (lock.version === currentVersion) return;
-      // stale dist は退かせ、現行 cli から立て直す。
-      try {
-        process.kill(lock.pid, "SIGTERM");
-      } catch {
-        // 消えていればそのまま起動へ進む。
-      }
-    }
-    const cliPath = options.cliPath ?? fileURLToPath(new URL("../cli.js", import.meta.url));
-    const logPath = options.logPath ?? path.join(os.homedir(), ".tailii", "hub.log");
-    ensureDirectory0700(path.dirname(logPath));
-    logFd = fs.openSync(logPath, "a");
-    // tmux 内の hook から ensure されると TMUX / TMUX_PANE を引き継ぐ。hub が起こす herdr server 経由で
-    // herdr 内の Claude がこの tmux pane 名を状態ファイルの `tmux` 欄に書き、reaper が取り違えるので外す。
-    const child = (options.spawnImpl ?? spawn)(process.execPath, [cliPath, "hub"], {
-      detached: true,
-      stdio: ["ignore", logFd, logFd],
-      env: envWithoutTmux(),
-    });
-    child.unref();
-  } catch {
-    // 次の engine 接続 / hook 発火で再試行する。
-  } finally {
-    if (logFd !== null) fs.closeSync(logFd);
-  }
-}
-
 /** `tailii hub` エントリ。 */
 export async function runHubCommand(args: string[]): Promise<number> {
+  const viaGateway = process.env["TAILII_HUB_VIA_GATEWAY"] === "1";
+  // この起動だけの印。端末サーバ・worker・その先の hook には引き継がない。
+  delete process.env["TAILII_HUB_VIA_GATEWAY"];
+  if (!viaGateway && args.length === 0 && await delegateHubToGateway({ log })) {
+    log("ゲートウェイの系統で hub を起動するため、このプロセスは終了");
+    return 0;
+  }
   let timeoutSeconds = REAPER_IDLE_TIMEOUT_SECONDS;
   let intervalSeconds = REAPER_CHECK_INTERVAL_SECONDS;
   let once = false;
@@ -631,6 +561,7 @@ export async function runHubCommand(args: string[]): Promise<number> {
     void work.finally(() => followupWork.delete(work));
   };
   const pushDevices = new PushDeviceStore();
+  const previewLoad = new PreviewLoadMonitor({ log });
   const hub = new SessionHub({
     runner,
     imageService,
@@ -652,7 +583,7 @@ export async function runHubCommand(args: string[]): Promise<number> {
       onCodexTurnLifecycle,
       onClaudeTurnLifecycle,
     }),
-    previewPumpFactory: (write, onPermissionMode, pollIntervalMs, onUsageLimitWait, isIdle) => new PanePreviewPump({
+    previewPumpFactory: (write, onPermissionMode, pollIntervalMs, onUsageLimitWait, isIdle, isForeground) => new PanePreviewPump({
       writer: controlMessageCallbackWriter(write),
       capture: (session) => sessionBackend.capturePane(session, { lines: 60, joinWrappedLines: true }),
       // プロンプト提案（薄字ゴースト）抽出用の viewport ANSI キャプチャ（prompt-suggestion-chip）。
@@ -661,7 +592,11 @@ export async function runHubCommand(args: string[]): Promise<number> {
       ...(isIdle !== undefined ? { isIdle } : {}),
       onPermissionMode,
       ...(onUsageLimitWait !== undefined ? { onUsageLimitWait } : {}),
-      ...(pollIntervalMs !== undefined ? { pollIntervalMs } : {}),
+      pollIntervalMs: () => {
+        const baseMs = pollIntervalMs?.() ?? 250;
+        return isForeground?.() === false ? previewLoad.intervalMs(baseMs) : baseMs;
+      },
+      priority: () => isForeground?.() === false ? "background" : "foreground",
       log,
       // 静止した入力待ちダイアログ（選択 / 確認系 / /login / hook で通らなかった承認）は初回フレームから送る
       // （開き直しで転写カードを出す）。使用量制限の待機フッター（usage-limit-wait）も静止画面なので
@@ -836,6 +771,7 @@ export async function runHubCommand(args: string[]): Promise<number> {
       await abortableSleep(intervalSeconds * 1000, abort.signal);
     }
   } finally {
+    previewLoad.close();
     // 実行中の注入を終わらせてから接続を閉じ、最後に lock を外す（graceful shutdown）。待っている間に重ねて届く
     // SIGTERM（版違いの engine が ensure のたびに送る）は abort を繰り返すだけで、待ちを打ち切らない。
     await shutdownHub({

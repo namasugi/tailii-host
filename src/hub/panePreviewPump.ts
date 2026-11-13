@@ -7,6 +7,8 @@ import { parseUsageLimitWait, sameUsageLimitWait, type UsageLimitWaitState } fro
 import { extractInputBoxSuggestion, inputBoxResidueText, inputResidueExcerpt } from "../backend/tmux.js";
 import { PROTOCOL_V2 } from "../protocol.js";
 import { abortableSleep } from "../shared/sleep.js";
+import { performance } from "node:perf_hooks";
+import { periodicWorkLimiter, restAfterWorkMs, type KeyedLimiter, type LoadShedPriority } from "../shared/loadShed.js";
 
 export type PanePreviewCapture = (session: string) => Promise<string>;
 export type PanePreviewMode = "claude_status" | "codex_terminal";
@@ -19,6 +21,10 @@ export interface PanePreviewPumpOptions {
    * 関数を渡すと毎周期評価する（前面購読あり=250ms / 一覧 watch のみ=低頻度、の動的切替用）。
    */
   pollIntervalMs?: number | (() => number);
+  /** 定期取得の共有枠。既定はプロセス全体で同時 2 件。 */
+  limiter?: KeyedLimiter;
+  /** 待機中も再評価する優先度。前面購読の追加・解除に追随する。 */
+  priority?: () => LoadShedPriority;
   /** 変化停止後に inactive を送るまでの閾値（ms）。既定 2.5s。 */
   quietThresholdMs?: number;
   /** negotiated protocol version。未指定は v2。 */
@@ -79,9 +85,13 @@ export class PanePreviewPump {
   private readonly writer: LineWriter;
   private readonly capture: PanePreviewCapture;
   private readonly pollIntervalMs: () => number;
+  private readonly limiter: KeyedLimiter;
+  private readonly priority: () => LoadShedPriority;
   private readonly quietThresholdMs: number;
   private readonly protocolVersion: () => number;
   private abortController: AbortController | null = null;
+  private restAbort: AbortController | null = null;
+  private refreshRequested = false;
   private task: Promise<void> | null = null;
   private seq = 0;
   private lastText: string | null = null;
@@ -136,6 +146,8 @@ export class PanePreviewPump {
     this.capture = options.capture;
     const pollIntervalMs = options.pollIntervalMs ?? 250;
     this.pollIntervalMs = typeof pollIntervalMs === "function" ? pollIntervalMs : () => pollIntervalMs;
+    this.limiter = options.limiter ?? periodicWorkLimiter;
+    this.priority = options.priority ?? (() => "foreground");
     this.quietThresholdMs = options.quietThresholdMs ?? 2500;
     this.protocolVersion = options.protocolVersion ?? (() => PROTOCOL_V2);
     this.onPermissionMode = options.onPermissionMode ?? null;
@@ -183,6 +195,7 @@ export class PanePreviewPump {
   ): void {
     if (this.session === session && this.mode === mode && this.task !== null) return;
     this.stop();
+    this.refreshRequested = false;
     this.session = session;
     this.mode = mode;
     this.emitInitial = opts?.emitInitial ?? false;
@@ -209,6 +222,7 @@ export class PanePreviewPump {
   /** preview を停止する。active 中なら UI 側の表示を消すため inactive を一度だけ流す。 */
   stop(): void {
     this.abortController?.abort();
+    this.restAbort?.abort();
     this.abortController = null;
     this.task = null;
     if (this.session !== null && this.active && !this.inactiveSent) {
@@ -238,16 +252,35 @@ export class PanePreviewPump {
     this.inactiveSent = false;
   }
 
+  /** 前面購読が付いた。休止中なら起こし、取得中なら完了直後に次の取得へ進む。 */
+  requestRefresh(): void {
+    this.refreshRequested = true;
+    this.limiter.prioritiesChanged();
+    this.restAbort?.abort();
+  }
+
   private async run(session: string, mode: PanePreviewMode, signal: AbortSignal): Promise<void> {
     // pane 消滅（reaper kill 等）後も購読が残る間はポーリングが失敗し続けるため、
     // 連続失敗は初回と約1分ごとだけログする（250ms 間隔の連打でログを埋めない）。
     let consecutiveFailures = 0;
     while (!signal.aborted) {
+      this.refreshRequested = false;
+      // 順番待ちは作業時間に含めない。通常 capture と ANSI capture の実作業を合算する。
+      let workMs = 0;
+      const capture = (read: PanePreviewCapture): Promise<string> => this.limiter.run(
+        `preview:${session}`, this.priority, async () => {
+          const startedAt = performance.now();
+          try { return await read(session); }
+          finally { workMs += Math.max(0, performance.now() - startedAt); }
+        }, signal,
+      );
       let text: string | null = null;
       try {
-        text = await this.capture(session);
+        text = await capture(this.capture);
+        if (signal.aborted) return;
         consecutiveFailures = 0;
       } catch (error) {
+        if (signal.aborted) return;
         consecutiveFailures += 1;
         if (consecutiveFailures === 1 || consecutiveFailures % 240 === 0) {
           process.stderr.write(
@@ -274,6 +307,8 @@ export class PanePreviewPump {
           this.onUsageLimitWait(wait);
         }
       }
+      // 遷移通知の中で見張りが解除され、pump 自身が stop されることもある。
+      if (signal.aborted) return;
 
       const now = Date.now();
       if (text !== null && mode === "claude_status") this.maybeJumpToLatest(session, text, now);
@@ -336,7 +371,8 @@ export class PanePreviewPump {
       ) {
         this.lastSuggestionAt = now;
         try {
-          const ansi = await this.captureSuggestion(session);
+          const ansi = await capture(this.captureSuggestion);
+          if (signal.aborted) return;
           const suggestion = extractInputBoxSuggestion(ansi) ?? "";
           // 未配信（null）から「提案なし("")」への遷移は流さない（購読開始のたびの無駄打ちを避ける）。
           // 以降は変化時だけ流す。baseline は常に更新して後続の遷移検出を成立させる。
@@ -351,7 +387,19 @@ export class PanePreviewPump {
         }
       }
 
-      await abortableSleep(this.pollIntervalMs(), signal);
+      if (this.refreshRequested || signal.aborted) continue;
+      const rest = new AbortController();
+      const stopRest = (): void => rest.abort();
+      this.restAbort = rest;
+      signal.addEventListener("abort", stopRest, { once: true });
+      try {
+        await abortableSleep(restAfterWorkMs(
+          this.pollIntervalMs(), workMs, this.priority() === "foreground" ? 5_000 : 10_000,
+        ), rest.signal);
+      } finally {
+        signal.removeEventListener("abort", stopRest);
+        if (this.restAbort === rest) this.restAbort = null;
+      }
     }
   }
 

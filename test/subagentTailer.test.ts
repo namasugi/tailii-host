@@ -2,11 +2,13 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import type { ControlMessage, SubagentNode } from "../src/protocol.js";
 import { defaultProbeSessionAlive, sliceWholeCodePoints, SubagentTailer, type ProcessProbeExec } from "../src/chat/subagentTailer.js";
 import { memoryBackgroundStopRecords } from "../src/chat/backgroundStopRecords.js";
 import { makeTempDir } from "./helpers.js";
+import { periodicWorkLimiter } from "../src/shared/loadShed.js";
+import { CodexExecLinker } from "../src/chat/codexExecLinker.js";
 
 async function nextOfType(
   gen: AsyncGenerator<ControlMessage, void, void>,
@@ -22,6 +24,52 @@ async function nextOfType(
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+test("重いセッション・fd プローブは各々 3 倍休み、本文 tail は停止しない", async () => {
+  vi.useFakeTimers();
+  const ac = new AbortController();
+  let task: Promise<void> | undefined;
+  try {
+    const project = makeTempDir("subagent-load-shed");
+    const main = path.join(project, "session.jsonl");
+    fs.mkdirSync(path.join(project, "session", "subagents"), { recursive: true });
+    const output = path.join(project, "output");
+    fs.writeFileSync(output, "working");
+    writeBgSpawn(main, "toolu_bg", "bg", output);
+    const origin = Date.now();
+    const sessionStarts: number[] = [];
+    const outputStarts: number[] = [];
+    const tailer = new SubagentTailer({
+      pollIntervalMs: 10, orphanGraceMs: 0, orphanProbeIntervalMs: 100, codexExecLinker: null,
+      probeSessionAlive: async () => {
+        sessionStarts.push(Date.now() - origin);
+        await sleep(80);
+        return true;
+      },
+      probeOutputOpen: async () => {
+        outputStarts.push(Date.now() - origin);
+        await sleep(80);
+        return true;
+      },
+    });
+    const messages: ControlMessage[] = [];
+    task = (async () => {
+      for await (const message of tailer.streamSession(main, ac.signal)) messages.push(message);
+    })();
+    await vi.advanceTimersByTimeAsync(319);
+    expect(sessionStarts).toEqual([0]);
+    expect(outputStarts).toEqual([0]);
+    expect(messages.some((m) => m.type === "subagent_node" && m.node.nodeId === "bg")).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sessionStarts).toEqual([0, 320]);
+    expect(outputStarts).toEqual([0, 320]);
+  } finally {
+    ac.abort();
+    await vi.advanceTimersByTimeAsync(200);
+    await task;
+    vi.useRealTimers();
+  }
+});
 
 async function nextWithin(
   gen: AsyncGenerator<ControlMessage, void, void>,
@@ -3020,6 +3068,294 @@ describe("SubagentTailer session liveness", () => {
     fs.writeFileSync(childJsonl, JSON.stringify(lastLine) + "\n");
     return { main, childJsonl };
   };
+
+  test.each([false, true, null, "error"] as const)("単発取得は遅い生存・fd プローブ（%s）の最終状態を反映して終了する", async (result) => {
+    vi.useFakeTimers();
+    const fixture = writeAgentSession("liveness-single-pass", "00000000-0000-0000-0000-000000000050", false);
+    const original = fs.readFileSync(fixture.main, "utf8"), output = path.join(path.dirname(fixture.main), "bg.output");
+    fs.writeFileSync(output, "done"); writeBgSpawn(fixture.main, "bg-tool", "bg", output);
+    fs.writeFileSync(fixture.main, original + fs.readFileSync(fixture.main, "utf8"));
+    const delayedResult = async (): Promise<boolean | null> => {
+      await sleep(5);
+      if (result === "error") throw new Error("プローブ失敗");
+      return result;
+    };
+    const sessionProbe = vi.fn(delayedResult), outputProbe = vi.fn(delayedResult);
+    const tailer = new SubagentTailer({ tailIndefinitely: false, pollIntervalMs: 10,
+      orphanGraceMs: 0, agentOrphanGraceMs: 0, codexExecLinker: null,
+      probeSessionAlive: sessionProbe, probeOutputOpen: outputProbe });
+    const ac = new AbortController(), nodes = new Map<string, SubagentNode>();
+    let finished = false;
+    const task = (async () => {
+      for await (const message of tailer.streamSession(fixture.main, ac.signal)) {
+        if (message.type === "subagent_node") nodes.set(message.node.nodeId, message.node);
+      }
+      finished = true;
+    })();
+    try {
+      await vi.advanceTimersByTimeAsync(4);
+      expect(finished).toBe(false);
+      await vi.advanceTimersByTimeAsync(20);
+      expect(finished).toBe(true);
+      await task;
+      expect(sessionProbe).toHaveBeenCalledOnce();
+      expect(outputProbe).toHaveBeenCalledOnce();
+      expect(nodes.get("lvworker")).toMatchObject({ status: result === false ? "error" : "running" });
+      expect(nodes.get("bg")).toMatchObject({ status: result === false ? "completed" : "running" });
+      if (result === false) {
+        expect(nodes.get("lvworker")?.ts).toBe(Date.parse("2026-08-10T15:05:00.000Z"));
+        expect(nodes.get("bg")?.ts).toBe(Math.floor(fs.statSync(output).mtimeMs));
+      }
+    } finally { ac.abort(); await vi.advanceTimersByTimeAsync(100); await task; vi.useRealTimers(); }
+  });
+
+  test.each(["main", "sibling"])("%s の transcript が更新し続けても、終了した起動元の背景コマンドは静止 output の fd 判定で完了する", async (writer) => {
+    vi.useFakeTimers();
+    const fixture = writeAgentSession("liveness-unrelated-update", "00000000-0000-0000-0000-000000000040", false);
+    const output = path.join(path.dirname(fixture.main), "bg.output");
+    fs.writeFileSync(output, "done");
+    writeBgSpawn(fixture.childJsonl, "bg-tool", "bg", output);
+    fs.appendFileSync(fixture.main, JSON.stringify({ timestamp: "2026-08-10T15:10:00.000Z",
+      message: { role: "user", content: "<task-notification><task-id>lvworker</task-id><status>completed</status><summary>done</summary></task-notification>" },
+    }) + "\n");
+    const sibling = path.join(path.dirname(fixture.childJsonl), "agent-active.jsonl");
+    fs.writeFileSync(sibling, "");
+    fs.writeFileSync(sibling.replace(".jsonl", ".meta.json"), JSON.stringify({
+      agentType: "Explore", description: "Other worker", spawnDepth: 1,
+    }));
+    const updated = writer === "main" ? fixture.main : sibling;
+    const timer = setInterval(() => fs.appendFileSync(updated, JSON.stringify({ timestamp: new Date().toISOString(),
+      message: { role: "assistant", content: [{ type: "text", text: "別の作業の進捗" }] },
+    }) + "\n"), 20);
+    const probe = vi.fn(async () => { await sleep(80); return false; });
+    const tailer = new SubagentTailer({ ...aliveSession, pollIntervalMs: 10, orphanGraceMs: 0,
+      orphanProbeIntervalMs: 100, probeOutputOpen: probe, codexExecLinker: null });
+    const ac = new AbortController(), nodes: SubagentNode[] = [];
+    const task = (async () => { for await (const message of tailer.streamSession(fixture.main, ac.signal)) {
+      if (message.type === "subagent_node") nodes.push(message.node);
+    } })();
+    try {
+      await vi.advanceTimersByTimeAsync(200);
+      expect(nodes).toContainEqual(expect.objectContaining({ nodeId: "lvworker", status: "completed" }));
+      expect(nodes.filter((node) => node.nodeId === "bg").map((node) => node.status)).toEqual(["running", "completed"]);
+      expect(probe).toHaveBeenCalledOnce();
+      expect(fs.readFileSync(output, "utf8")).toBe("done");
+      // 休止中でも transcript の通知は読み続け、遅配の本物の終了状態を優先する。
+      fs.appendFileSync(fixture.main, JSON.stringify({ timestamp: new Date().toISOString(),
+        message: { role: "user", content: "<task-notification><task-id>bg</task-id><status>failed</status><summary>failed</summary></task-notification>" },
+      }) + "\n");
+      await vi.advanceTimersByTimeAsync(10);
+      expect(nodes.filter((node) => node.nodeId === "bg").at(-1)?.status).toBe("error");
+      expect(probe).toHaveBeenCalledOnce();
+    } finally {
+      clearInterval(timer); ac.abort(); await vi.advanceTimersByTimeAsync(100); await task; vi.useRealTimers();
+    }
+  });
+
+  test.each(["session", "output"])("%s の対象がプローブ中に更新されても、再確認は所要時間の 3 倍休み、静止後は否定結果を反映する", async (kind) => {
+    vi.useFakeTimers();
+    const fixture = writeAgentSession("liveness-recheck-rest", "00000000-0000-0000-0000-000000000041", false);
+    const original = fs.readFileSync(fixture.main, "utf8"), output = path.join(path.dirname(fixture.main), "bg.output");
+    fs.writeFileSync(output, "before"); writeBgSpawn(fixture.main, "bg-tool", "bg", output);
+    fs.writeFileSync(fixture.main, original + fs.readFileSync(fixture.main, "utf8"));
+    const origin = Date.now(), starts: number[] = [];
+    const probe = async () => {
+      starts.push(Date.now() - origin);
+      await sleep(40);
+      if (starts.length <= 2) {
+        if (kind === "session") fs.appendFileSync(fixture.childJsonl, JSON.stringify({ timestamp: new Date().toISOString(),
+          message: { role: "assistant", content: [{ type: "tool_use", id: `work-${starts.length}`, name: "Bash", input: { command: "echo active" } }] },
+        }) + "\n");
+        else fs.appendFileSync(output, "more");
+      }
+      await sleep(40);
+      return false;
+    };
+    const tailer = new SubagentTailer({ pollIntervalMs: 10, orphanProbeIntervalMs: 100, agentOrphanGraceMs: 0, orphanGraceMs: 0,
+      probeSessionAlive: kind === "session" ? probe : async () => true,
+      probeOutputOpen: kind === "output" ? probe : async () => true, codexExecLinker: null });
+    const ac = new AbortController(), nodes: SubagentNode[] = [], target = kind === "session" ? "lvworker" : "bg";
+    const task = (async () => { for await (const message of tailer.streamSession(fixture.main, ac.signal)) {
+      if (message.type === "subagent_node" && message.node.nodeId === target) nodes.push(message.node);
+    } })();
+    try {
+      await vi.advanceTimersByTimeAsync(319);
+      expect(starts).toEqual([0]);
+      expect([...new Set(nodes.map((node) => node.status))]).toEqual(["running"]);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(starts).toEqual([0, 320]);
+      await vi.advanceTimersByTimeAsync(319);
+      expect(starts).toEqual([0, 320]);
+      expect(nodes.every((node) => node.status === "running")).toBe(true);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(starts).toEqual([0, 320, 640]);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(nodes.at(-1)?.status).toBe(kind === "session" ? "error" : "completed");
+    } finally { ac.abort(); await vi.advanceTimersByTimeAsync(1000); await task; vi.useRealTimers(); }
+  });
+
+  test.each(["session", "output", "codex"])("共有背景枠で %s プローブが詰まってもノードと更新を配信し、解放後に判定を反映する", async (kind) => {
+    vi.useFakeTimers();
+    const fixture = writeAgentSession("liveness-blocked", "00000000-0000-0000-0000-000000000020", false);
+    const original = fs.readFileSync(fixture.main, "utf8");
+    const output = path.join(path.dirname(fixture.main), "bg.output"); fs.writeFileSync(output, "output");
+    writeBgSpawn(fixture.main, "bg-tool", "bg", output);
+    fs.writeFileSync(fixture.main, original + fs.readFileSync(fixture.main, "utf8"));
+    let release!: () => void;
+    const blocker = periodicWorkLimiter.run("blocked-preview", "background", () => new Promise<void>((resolve) => { release = resolve; }));
+    const work = vi.fn(async () => false);
+    const probe = vi.fn(() => periodicWorkLimiter.run(`blocked-probe:${kind}`, "background", work));
+    const registry = path.join(path.dirname(fixture.main), "registry"); fs.mkdirSync(registry);
+    fs.writeFileSync(path.join(registry, "123456.json"), JSON.stringify({ pid: 123456,
+      sessionId: path.basename(fixture.main, ".jsonl"), status: "busy" }));
+    const codex = kind === "codex" ? new CodexExecLinker({ home: path.dirname(fixture.main),
+      claudeSessionsDir: registry, processAlive: probe, exec: (_cmd, _args, callback) => callback(null, "") }) : null;
+    const tailer = new SubagentTailer({ pollIntervalMs: 10, orphanGraceMs: 0, agentOrphanGraceMs: 0,
+      orphanProbeIntervalMs: 100, codexExecLinker: codex,
+      probeSessionAlive: kind === "session" ? probe : async () => true,
+      probeOutputOpen: kind === "output" ? probe : async () => true });
+    const ac = new AbortController(), nodes: SubagentNode[] = [];
+    const task = (async () => {
+      for await (const message of tailer.streamSession(fixture.main, ac.signal)) {
+        if (message.type === "subagent_node") nodes.push(message.node);
+      }
+    })();
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(nodes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ nodeId: "lvworker", status: "running" }),
+        expect.objectContaining({ nodeId: "bg", status: "running" }),
+      ]));
+      fs.appendFileSync(fixture.childJsonl, JSON.stringify({ message: { role: "assistant", content: [
+        { type: "tool_use", id: "progress", name: "Bash", input: { command: "echo advanced" } },
+      ] }, timestamp: "2026-08-10T15:06:00.000Z" }) + "\n");
+      await vi.advanceTimersByTimeAsync(20);
+      expect(nodes.some((node) => node.nodeId === "lvworker" && node.currentActivity?.includes("echo advanced"))).toBe(true);
+      expect(probe).toHaveBeenCalledOnce();
+      expect(work).not.toHaveBeenCalled();
+      release(); await blocker;
+      await vi.advanceTimersByTimeAsync(20);
+      // session の対象は更新されたが、output は静止したままなので fd 判定をそのまま使う。
+      expect(work).toHaveBeenCalledOnce();
+      if (kind === "session") {
+        expect(nodes.filter((node) => node.nodeId === "lvworker").every((node) => node.status === "running")).toBe(true);
+        await vi.advanceTimersByTimeAsync(79);
+        expect(work).toHaveBeenCalledOnce();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(work).toHaveBeenCalledTimes(2);
+        await vi.advanceTimersByTimeAsync(10);
+      }
+      if (kind !== "codex") expect(nodes).toContainEqual(expect.objectContaining(kind === "session"
+        ? { nodeId: "lvworker", status: "error" } : { nodeId: "bg", status: "completed" }));
+    } finally {
+      ac.abort(); release(); await vi.advanceTimersByTimeAsync(1000); await task; await blocker;
+      vi.useRealTimers();
+    }
+  });
+
+  test("次の生存判定が未完了なら直前の死亡判定を保ち、結果が出た後に回復する", async () => {
+    vi.useFakeTimers();
+    const fixture = writeAgentSession("liveness-previous", "00000000-0000-0000-0000-000000000021", false);
+    let finish!: (value: boolean) => void;
+    const probe = vi.fn().mockResolvedValueOnce(false).mockImplementation(() => new Promise<boolean>((resolve) => { finish = resolve; }));
+    const ac = new AbortController(), statuses: string[] = [];
+    const tailer = new SubagentTailer({ pollIntervalMs: 10, orphanProbeIntervalMs: 100, agentOrphanGraceMs: 0,
+      probeSessionAlive: probe, codexExecLinker: null });
+    const task = (async () => {
+      for await (const message of tailer.streamSession(fixture.main, ac.signal)) {
+        if (message.type === "subagent_node") statuses.push(message.node.status);
+      }
+    })();
+    try {
+      await vi.advanceTimersByTimeAsync(200);
+      expect(probe).toHaveBeenCalledTimes(2);
+      expect(statuses).toEqual(["error"]);
+      finish(true); await vi.advanceTimersByTimeAsync(10);
+      expect(statuses).toEqual(["error", "running"]);
+    } finally { ac.abort(); finish?.(true); await vi.advanceTimersByTimeAsync(1000); await task; vi.useRealTimers(); }
+  });
+
+  test("死亡判定後に記録が更新されたら running へ戻すが、直前のプローブの休止は飛ばさない", async () => {
+    vi.useFakeTimers();
+    const fixture = writeAgentSession("liveness-update-after-probe", "00000000-0000-0000-0000-000000000042", false);
+    const origin = Date.now(), starts: number[] = [];
+    const probe = async () => {
+      starts.push(Date.now() - origin);
+      await sleep(80);
+      return starts.length > 1;
+    };
+    const ac = new AbortController(), nodes: SubagentNode[] = [];
+    const tailer = new SubagentTailer({ pollIntervalMs: 10, orphanProbeIntervalMs: 100, agentOrphanGraceMs: 0,
+      probeSessionAlive: probe, codexExecLinker: null });
+    const task = (async () => { for await (const message of tailer.streamSession(fixture.main, ac.signal)) {
+      if (message.type === "subagent_node") nodes.push(message.node);
+    } })();
+    try {
+      await vi.advanceTimersByTimeAsync(100);
+      expect(nodes.at(-1)?.status).toBe("error");
+      fs.appendFileSync(fixture.childJsonl, JSON.stringify({ timestamp: new Date().toISOString(),
+        message: { role: "assistant", content: [{ type: "tool_use", id: "new-work", name: "Bash", input: { command: "echo active" } }] },
+      }) + "\n");
+      await vi.advanceTimersByTimeAsync(10);
+      expect(nodes.at(-1)?.status).toBe("running");
+      await vi.advanceTimersByTimeAsync(209);
+      expect(starts).toEqual([0]);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(starts).toEqual([0, 320]);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(nodes.at(-1)?.status).toBe("running");
+    } finally { ac.abort(); await vi.advanceTimersByTimeAsync(100); await task; vi.useRealTimers(); }
+  });
+
+  test.each([
+    ["session", "transcript"], ["output", "size"], ["output", "mtime"], ["output", "replacement"],
+  ])("%s プローブの待機中に対象の %s が変わったら、古い否定結果で完了扱いにせず休止後に再確認する", async (kind, update) => {
+    vi.useFakeTimers();
+    const fixture = writeAgentSession("liveness-raced-update", "00000000-0000-0000-0000-000000000030", false);
+    const original = fs.readFileSync(fixture.main, "utf8"), output = path.join(path.dirname(fixture.main), "bg.output");
+    fs.writeFileSync(output, "before"); writeBgSpawn(fixture.main, "bg-tool", "bg", output);
+    const stamp = new Date("2026-08-10T15:00:00.000Z"); fs.utimesSync(output, stamp, stamp);
+    fs.writeFileSync(fixture.main, original + fs.readFileSync(fixture.main, "utf8"));
+    let release!: () => void;
+    const blocker = periodicWorkLimiter.run("busy-preview", "background", () => new Promise<void>((resolve) => { release = resolve; }));
+    const result = vi.fn().mockResolvedValueOnce(false).mockResolvedValue(true);
+    const probe = () => periodicWorkLimiter.run(`raced:${kind}`, "background", result);
+    const tailer = new SubagentTailer({ pollIntervalMs: 10, orphanProbeIntervalMs: 1000, agentOrphanGraceMs: 0, orphanGraceMs: 0,
+      probeSessionAlive: kind === "session" ? probe : async () => true,
+      probeOutputOpen: kind === "output" ? probe : async () => true, codexExecLinker: null });
+    const ac = new AbortController(), nodes: SubagentNode[] = [];
+    const task = (async () => { for await (const message of tailer.streamSession(fixture.main, ac.signal)) {
+      if (message.type === "subagent_node") nodes.push(message.node);
+    } })();
+    try {
+      await vi.advanceTimersByTimeAsync(50);
+      expect(periodicWorkLimiter.waiting).toBe(1);
+      if (kind === "session") fs.appendFileSync(fixture.childJsonl, JSON.stringify({ timestamp: new Date().toISOString(),
+        message: { role: "assistant", content: [{ type: "tool_use", id: "new-work", name: "Bash", input: { command: "echo active" } }] },
+      }) + "\n");
+      else if (update === "size") fs.appendFileSync(output, "after");
+      else if (update === "mtime") fs.utimesSync(output, stamp, new Date(stamp.getTime() + 1_000));
+      else {
+        const before = fs.statSync(output), replacement = `${output}.new`;
+        fs.writeFileSync(replacement, "before"); fs.utimesSync(replacement, stamp, stamp);
+        fs.renameSync(replacement, output);
+        const after = fs.statSync(output);
+        expect(after.size).toBe(before.size);
+        expect(after.mtimeMs).toBe(before.mtimeMs);
+        expect(after.ino).not.toBe(before.ino);
+      }
+      release(); await blocker; await vi.advanceTimersByTimeAsync(30);
+      expect(result).toHaveBeenCalledOnce();
+      const target = kind === "session" ? "lvworker" : "bg";
+      expect(nodes.filter((node) => node.nodeId === target).map((node) => node.status)).not.toContain("error");
+      expect(nodes.filter((node) => node.nodeId === target).every((node) => node.status === "running")).toBe(true);
+      await vi.advanceTimersByTimeAsync(969);
+      expect(result).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(result).toHaveBeenCalledTimes(2);
+      expect(nodes.filter((node) => node.nodeId === target).every((node) => node.status === "running")).toBe(true);
+    } finally { ac.abort(); release(); await blocker; await vi.advanceTimersByTimeAsync(1000); await task; vi.useRealTimers(); }
+  });
 
   test("死亡 sweep は最終レポート済み=completed / tool_use のまま=error(中断) に分ける", async () => {
     const done = writeAgentSession("liveness-sweep-done", "00000000-0000-0000-0000-000000000010", true);

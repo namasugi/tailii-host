@@ -3289,6 +3289,44 @@ describe("SessionHub conversation stream", () => {
     expect(stops).toBe(1);
   });
 
+  test("一覧 watch の pump を作り直さず、前面購読の追加・解除を優先度へ反映する", () => {
+    const metadataStore = makeTempStore();
+    metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0 });
+    let isForeground: (() => boolean) | undefined;
+    let interval: (() => number) | undefined;
+    let starts = 0, refreshes = 0;
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir: makeTempDir("hub-preview-priority"),
+      metadataStore, timeoutSeconds: 1800,
+      previewPumpFactory: (_write, _mode, poll, _usage, _idle, foreground) => {
+        isForeground = foreground;
+        interval = poll;
+        return { start() { starts++; }, stop() {}, requestRefresh() { refreshes++; } };
+      },
+    });
+    const watcher = {}, front = {};
+    hub.registerClient(watcher, () => {});
+    hub.handleClientMessage(watcher, JSON.stringify({ type: "session_preview_watch", enabled: true }));
+    hub.handleRelayMessage({ type: "session_processing", session: "work", state: "active" });
+    expect(isForeground?.()).toBe(false);
+    expect(interval?.()).toBe(1000);
+    expect(refreshes).toBe(0);
+    subscribe(hub, front, [], { preview: true });
+    expect(isForeground?.()).toBe(true);
+    expect(interval?.()).toBe(250);
+    expect(refreshes).toBe(1);
+    hub.handleClientMessage(front, JSON.stringify({ type: "conversation_unsubscribe", session: "work" }));
+    expect(isForeground?.()).toBe(false);
+    expect(interval?.()).toBe(1000);
+    expect(refreshes).toBe(1);
+    // 同じ購読の preview=false → true でも休止を解除する。
+    subscribe(hub, front, [], { preview: false });
+    subscribe(hub, front, [], { preview: true });
+    expect(refreshes).toBe(2);
+    expect(starts).toBe(1);
+    hub.close();
+  });
+
   test("前面購読が始まったときだけ、最新位置へ戻す準備をする（jump-to-latest）", () => {
     const metadataStore = makeTempStore();
     metadataStore.put({ name: "work", cwd: "/tmp/work", createdAt: 0 });

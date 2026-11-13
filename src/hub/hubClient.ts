@@ -2,7 +2,7 @@
 // tailii (TS host) — engine から Session Hub へ接続する再接続可能な link。
 
 import * as net from "node:net";
-import { ensureHubDaemon } from "./hubDaemon.js";
+import { ensureHubDaemonAsync } from "./hubDaemonClient.js";
 import {
   decodeHubServerLine,
   encodeHubMessage,
@@ -46,13 +46,16 @@ export interface HubLink {
 
 export function connectHubSocket(options: {
   socketPath?: string;
-  ensureDaemon?: () => void;
+  ensureDaemon?: () => void | Promise<void>;
+  /** 接続できず error → close を完了したときの通知（診断・テスト用）。 */
+  onConnectionFailure?: (error: Error) => void;
   /** TCP 接続後に有効な hello ack が来ない候補を破棄して再接続する猶予。 */
   helloTimeoutMs?: number;
 } = {}): HubLink {
   const socketPath = options.socketPath ?? resolveHubSocketPath();
   let socket: net.Socket | null = null;
   let closed = false;
+  let ensuringDaemon = false;
   let retryMs = 250;
   let disconnectedAtMs: number | null = null;
   let reconnectHandler: HubLink["onReconnect"] = null;
@@ -128,6 +131,7 @@ export function connectHubSocket(options: {
     const candidate = net.connect(socketPath);
     socket = candidate;
     let connected = false;
+    let connectionError: Error | null = null;
     let helloHandled = false;
     let helloTimer: ReturnType<typeof setTimeout> | null = null;
     const splitter = new NdjsonLineSplitter();
@@ -205,8 +209,13 @@ export function connectHubSocket(options: {
         }
       });
     });
-    candidate.once("error", () => {
-      (options.ensureDaemon ?? ensureHubDaemon)();
+    candidate.once("error", (error: Error) => {
+      connectionError = error;
+      if (closed || ensuringDaemon) return;
+      ensuringDaemon = true;
+      void Promise.resolve().then(() => (options.ensureDaemon ?? ensureHubDaemonAsync)())
+        .catch(() => { /* 次の接続エラーで再試行する。 */ })
+        .finally(() => { ensuringDaemon = false; });
     });
     candidate.once("close", () => {
       if (helloTimer !== null) clearTimeout(helloTimer);
@@ -217,6 +226,7 @@ export function connectHubSocket(options: {
       const delay = retryMs;
       retryMs = Math.min(5_000, retryMs * 2);
       setTimeout(connect, delay).unref();
+      if (!connected && connectionError !== null) options.onConnectionFailure?.(connectionError);
     });
   };
   connect();

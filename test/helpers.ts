@@ -102,6 +102,7 @@ export function makeTempStore(): SessionMetadataStore {
 
 /** engine を in-memory ストリームで駆動するハーネス。 */
 export interface EngineHarness {
+  output: PassThrough;
   writeLine(line: string): void;
   lines: LineQueue;
   /** input を EOF にして engine の完了を待つ（Swift 版 teardown と対）。 */
@@ -179,6 +180,7 @@ export function startEngine(
   done.catch(() => {});
 
   return {
+    output,
     writeLine: (line) => input.write(line + "\n"),
     lines,
     done,

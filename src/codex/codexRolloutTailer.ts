@@ -170,6 +170,7 @@ export class CodexRolloutTailer {
   ): AsyncGenerator<ControlMessage, void, void> {
     const start = Date.now();
     let resolved: string | null = null;
+    let discoveryDelayMs = Math.min(this.pollIntervalMs, 1_000);
     while (!signal?.aborted) {
       resolved = CodexRolloutTailer.resolveRollout(
         cwd,
@@ -181,7 +182,11 @@ export class CodexRolloutTailer {
       if (!this.tailIndefinitely) {
         if (this.tailDeadlineMs === null || Date.now() - start >= this.tailDeadlineMs) return;
       }
-      await abortableSleep(this.pollIntervalMs, signal);
+      const remaining = this.tailIndefinitely ? discoveryDelayMs
+        : Math.min(discoveryDelayMs, Math.max(0, this.tailDeadlineMs! - (Date.now() - start)));
+      await abortableSleep(remaining, signal);
+      // 出現待ちだけを間引く。解決後の追記 tail は従来の間隔に戻す。
+      discoveryDelayMs = Math.min(discoveryDelayMs * 2, 1_000);
     }
     if (resolved !== null && !signal?.aborted) {
       yield* this.runTail(resolved, newerThanMs, signal);
@@ -203,7 +208,7 @@ export class CodexRolloutTailer {
     preferredSessionId: string | null = null,
   ): string | null {
     const target = canonicalPath(cwd);
-    const files = listRolloutFiles(sessionsRoot);
+    const files = listRolloutFiles(sessionsRoot, preferredSessionId);
     // 最新から順に見て、cwd 一致の最初の 1 本を返す（新しい会話を優先）。
     files.sort((a, b) => b.mtimeMs - a.mtimeMs);
     for (const file of files) {
@@ -435,7 +440,10 @@ function parseTurnLifecycle(line: Buffer): CodexTurnLifecycleEvent | null {
 }
 
 /** rollout ファイル（mtime 付き）を日付階層から列挙する。 */
-function listRolloutFiles(sessionsRoot: string): { path: string; mtimeMs: number }[] {
+// 日付部分の後ろが会話 UUID。日付を決め打ちせず、移動・同一 ID の複数ファイルも毎回照合する。
+const ROLLOUT_SESSION_ID = /^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl(?:\.zst)?$/iu;
+
+function listRolloutFiles(sessionsRoot: string, preferredSessionId: string | null): { path: string; mtimeMs: number }[] {
   const out: { path: string; mtimeMs: number }[] = [];
   const walk = (dir: string): void => {
     let entries: fs.Dirent[];
@@ -448,7 +456,14 @@ function listRolloutFiles(sessionsRoot: string): { path: string; mtimeMs: number
       const p = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         walk(p);
-      } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+      } else if (entry.isFile()) {
+        const compressed = entry.name.endsWith(".jsonl.zst");
+        if (!compressed && !entry.name.endsWith(".jsonl")) continue;
+        // 規則の分かる別 ID は stat / open すらしない。旧形式・改名された名前は従来の先頭解析へ。
+        const namedId = ROLLOUT_SESSION_ID.exec(entry.name)?.[1];
+        if (preferredSessionId !== null && namedId !== undefined && namedId.toLowerCase() !== preferredSessionId.toLowerCase()) continue;
+        // .jsonl.zst は従来どおり tail 対象外。再開時に Codex が展開した平文を次の走査で拾う。
+        if (compressed) continue;
         let mtimeMs = 0;
         try {
           mtimeMs = fs.statSync(p).mtimeMs;

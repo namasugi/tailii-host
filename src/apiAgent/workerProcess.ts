@@ -2,9 +2,14 @@
 // API 作業プロセスを起動する（hub 側）。`node <dist>/apiAgent/workerMain.js` を子プロセスとして起動し、
 // 標準入出力の NDJSON で制御する。env は呼び出し側が組んだもの（キーはここだけ）をそのまま渡し、
 // 親の env は継承しない。標準エラーは捨てる（秘密を含みうる出力をログへ持ち込まない）。
+//
+// 作業プロセスは hub の子だが、中で動くのはエージェント（Agent SDK とその claude・ツールの実行）なので、
+// utility の優先度に固定して起動する（agent-priority。hub の優先度を引き継がせない）。taskpolicy は node を
+// exec するため、pid・標準入出力・終了コードは付けないときと同じ。
 
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { agentClampArgv, withAgentClamp } from "../shared/agentPriority.js";
 import type { ApiAgentWorkerHandle } from "./manager.js";
 import { decodeWorkerToHub, encodeWorkerLine, type WorkerToHub } from "./workerProtocol.js";
 
@@ -12,11 +17,26 @@ export function defaultWorkerEntry(): string {
   return fileURLToPath(new URL("./workerMain.js", import.meta.url));
 }
 
+/**
+ * 作業プロセスの起動コマンド（純ロジック, TESTABLE）。utility に固定する接頭辞を node の前に足す。
+ * 固定しない環境（macOS 以外・taskpolicy 不在・`TAILII_AGENT_CLAMP=off`）では node をそのまま起動する。
+ */
+export function apiAgentWorkerCommand(
+  options: { entry?: string; nodePath?: string; agentClamp?: readonly string[] } = {},
+): { executable: string; args: string[] } {
+  return withAgentClamp(
+    options.nodePath ?? process.execPath,
+    [options.entry ?? defaultWorkerEntry()],
+    options.agentClamp ?? agentClampArgv(),
+  );
+}
+
 export function spawnApiAgentWorker(
   env: NodeJS.ProcessEnv,
-  options: { entry?: string; nodePath?: string; cwd?: string } = {},
+  options: { entry?: string; nodePath?: string; cwd?: string; agentClamp?: readonly string[] } = {},
 ): ApiAgentWorkerHandle {
-  const child = spawn(options.nodePath ?? process.execPath, [options.entry ?? defaultWorkerEntry()], {
+  const command = apiAgentWorkerCommand(options);
+  const child = spawn(command.executable, command.args, {
     env,
     cwd: options.cwd ?? env["HOME"] ?? "/",
     stdio: ["pipe", "pipe", "ignore"],

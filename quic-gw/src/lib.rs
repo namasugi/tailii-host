@@ -34,6 +34,38 @@ use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
+pub mod hub_spawn;
+pub mod standby;
+
+#[derive(Default)]
+pub struct GatewayServices {
+    pub standby: Option<standby::StandbyOptions>,
+    pub hub_spawn: Option<hub_spawn::HubSpawnOptions>,
+    /// テスト用の exec HOME。通常はゲートウェイの環境を継承する。
+    pub exec_home: Option<PathBuf>,
+}
+
+struct ExecContext {
+    path: String,
+    home: Option<PathBuf>,
+    standby: Option<standby::StandbyHandle>,
+}
+
+// ローカル制御は短い NDJSON 1 行だけ。EOF・過大な要求は失敗へ倒す。
+async fn read_control_line<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
+    let mut line = Vec::new();
+    loop {
+        let byte = reader.read_u8().await?;
+        if byte == b'\n' {
+            return Ok(line);
+        }
+        line.push(byte);
+        if line.len() > 4096 {
+            bail!("control line too long");
+        }
+    }
+}
+
 pub const ALPN: &[u8] = b"tailii/1";
 pub const DEFAULT_PORT: u16 = 46853;
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -285,7 +317,16 @@ pub async fn serve(options: GatewayOptions) -> Result<()> {
         options.dir.display(),
         creds.spki_pin(),
     ));
-    run_endpoint(endpoint, creds, options.injected_path).await
+    run_endpoint_with_services(
+        endpoint,
+        creds,
+        options.injected_path,
+        GatewayServices {
+            standby: Some(standby::StandbyOptions::default()),
+            hub_spawn: Some(hub_spawn::HubSpawnOptions::default()),
+            ..GatewayServices::default()
+        },
+    ).await
 }
 
 /// accept ループ（テストは port=0 の endpoint を渡して並走させる）。
@@ -294,8 +335,35 @@ pub async fn run_endpoint(
     creds: Credentials,
     injected_path: Option<String>,
 ) -> Result<()> {
+    run_endpoint_with_services(endpoint, creds, injected_path, GatewayServices::default()).await
+}
+
+/// 埋め込み・テストではローカルサービスを明示的に差し替える（実 HOME の host を起動しない）。
+pub async fn run_endpoint_with_services(
+    endpoint: quinn::Endpoint,
+    creds: Credentials,
+    injected_path: Option<String>,
+    services: GatewayServices,
+) -> Result<()> {
     let token = Arc::new(creds.token.clone());
-    let path = Arc::new(injected_path.unwrap_or_else(default_injected_path));
+    let path = injected_path.unwrap_or_else(default_injected_path);
+    // この待ち受けが失敗しても QUIC の accept は続ける。
+    let _hub_spawn = services.hub_spawn.and_then(|options| {
+        match hub_spawn::HubSpawnServer::start(options, path.clone()) {
+            Ok(server) => Some(server),
+            Err(e) => {
+                log_line(&format!("gw-spawn listen failed (continuing): {e}"));
+                None
+            }
+        }
+    });
+    let standby = services.standby
+        .map(|options| standby::StandbyPool::start(options, path.clone()));
+    let path = Arc::new(ExecContext {
+        path,
+        home: services.exec_home,
+        standby: standby.as_ref().map(|pool| pool.handle.clone()),
+    });
     while let Some(incoming) = endpoint.accept().await {
         let token = token.clone();
         let path = path.clone();
@@ -311,7 +379,7 @@ pub async fn run_endpoint(
 async fn handle_incoming(
     incoming: quinn::Incoming,
     token: Arc<Vec<u8>>,
-    injected_path: Arc<String>,
+    injected_path: Arc<ExecContext>,
 ) -> Result<()> {
     let connecting = incoming.accept()?;
     // 0-RTT を受理する。early data はストリームヘッダの受信までに留め、副作用
@@ -378,7 +446,7 @@ async fn handle_stream(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     token: Arc<Vec<u8>>,
-    injected_path: Arc<String>,
+    injected_path: Arc<ExecContext>,
     mut hs_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let header_line = match read_line(&mut recv, HEADER_CAP).await? {
@@ -408,7 +476,10 @@ async fn handle_stream(
             if !wait_handshake_confirmed(&mut hs_rx).await {
                 return reject(&mut send, "proto").await;
             }
-            handle_exec(id, send, recv, cmd, header.pty.as_ref(), &injected_path).await?;
+            handle_exec(
+                id, send, recv, cmd, header.pty.as_ref(), &injected_path.path,
+                injected_path.standby.as_ref(), injected_path.home.as_deref(),
+            ).await?;
         }
         "tcp" => {
             let Some(port) = header.port else {
@@ -437,28 +508,40 @@ async fn handle_exec(
     cmd: &str,
     pty: Option<&PtyRequest>,
     injected_path: &str,
+    standby: Option<&standby::StandbyHandle>,
+    home: Option<&Path>,
 ) -> Result<()> {
     match pty {
         Some(request) => handle_exec_pty(conn_id, send, recv, cmd, request, injected_path).await,
         None => {
-            let mut child = match tokio::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg(cmd)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                // v1 は stderr を破棄する（現行 SSH exec も stdout へ合流させない）。
-                .stderr(Stdio::null())
-                .env("PATH", injected_path)
-                .spawn()
-            {
-                Ok(child) => child,
-                Err(e) => {
-                    log_line(&format!("conn {conn_id} exec spawn failed: {e}"));
-                    return reject(&mut send, "spawn").await;
+            let warmed = match (standby, standby::parse_command(cmd)) {
+                (Some(pool), Some(argv)) => pool.activate(argv).await,
+                _ => None,
+            };
+            let from_standby = warmed.is_some();
+            let mut child = if let Some(child) = warmed {
+                child
+            } else {
+                match tokio::process::Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg(cmd)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    // v1 は stderr を破棄する（現行 SSH exec も stdout へ合流させない）。
+                    .stderr(Stdio::null())
+                    .env("PATH", injected_path)
+                    .envs(home.map(|home| ("HOME", home)))
+                    .spawn()
+                {
+                    Ok(child) => child,
+                    Err(e) => {
+                        log_line(&format!("conn {conn_id} exec spawn failed: {e}"));
+                        return reject(&mut send, "spawn").await;
+                    }
                 }
             };
             log_line(&format!(
-                "conn {conn_id} exec spawn pid={} cmd={}",
+                "conn {conn_id} exec spawn pid={} standby={from_standby} cmd={}",
                 child.id().unwrap_or(0),
                 truncate_for_log(cmd)
             ));
@@ -523,7 +606,7 @@ async fn handle_exec(
             let status = child.wait().await;
             stdin_task.abort();
             log_line(&format!(
-                "conn {conn_id} exec exit status={:?} clientGone={client_gone}",
+                "conn {conn_id} exec exit status={:?} clientGone={client_gone} standby={from_standby}",
                 status.map(|s| s.code())
             ));
             Ok(())

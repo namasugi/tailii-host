@@ -100,6 +100,10 @@ describe("quicLaunchAgentPlist", () => {
     expect(plist).toContain("<string>/Users/alice</string>");
   });
 
+  it("制御側の優先度を上げる ProcessType=Interactive を指定する", () => {
+    expect(quicLaunchAgentPlist(config)).toMatch(/<key>ProcessType<\/key>\s*<string>Interactive<\/string>/);
+  });
+
   it("--dir / --path を絶対パスで明示的に渡す（HOME 展開へ依存しない）", () => {
     const plist = quicLaunchAgentPlist(config);
     expect(plist).toContain("<string>--dir</string>");
@@ -146,6 +150,42 @@ const PRINT_PENDED = `gui/502/com.tailii.quic-gw = {
 `;
 
 describe("installQuicLaunchAgent", () => {
+  it("設置済みの daemon ジョブも bootout → bootstrap で新しい plist を読み直す", async () => {
+    const plistPath = path.join(tempDir("launchd-reload"), "com.tailii.quic-gw.plist");
+    const calls: string[] = [];
+    let loaded = true;
+    let spawnType = "daemon";
+    // 旧版の plist と、その定義を読んで動いているジョブを模す。
+    fs.writeFileSync(plistPath, "<plist><dict/></plist>");
+    const options = {
+      gatewayPath: "/fake/gw", plistPath, uid: 501, installBinary: (src: string) => src,
+      launchctl: async (args: string[]) => {
+        calls.push(args[0]!);
+        if (args[0] === "bootout") loaded = false;
+        if (args[0] === "bootstrap") {
+          expect(loaded).toBe(false);
+          expect(fs.readFileSync(args[2]!, "utf8")).toMatch(
+            /<key>ProcessType<\/key>\s*<string>Interactive<\/string>/,
+          );
+          spawnType = "interactive";
+          loaded = true;
+        }
+        if (args[0] === "print") {
+          if (!loaded) throw new Error("not loaded");
+          return `${PRINT_RUNNING}\n\tspawn type = ${spawnType} (4)\n`;
+        }
+      },
+    };
+    // setup / self-update 共通の設置関数。再実行でも定義を載せ直す。
+    expect(await installQuicLaunchAgent(options)).toEqual({ running: true, pid: 12796 });
+    expect((await quicGatewayServiceState(501, options.launchctl))).toMatchObject({ spawnType: "interactive" });
+    expect(await installQuicLaunchAgent(options)).toEqual({ running: true, pid: 12796 });
+    expect(calls).toEqual([
+      "bootout", "bootstrap", "kickstart", "print", "print",
+      "bootout", "bootstrap", "kickstart", "print",
+    ]);
+  });
+
   it("バイナリを設置先へコピーし、plist はそのコピーを指す + bootout → bootstrap → kickstart → print", async () => {
     const dir = tempDir("launchd");
     const plistPath = path.join(dir, "com.tailii.quic-gw.plist");
@@ -271,6 +311,7 @@ describe("parseLaunchctlPrintState / quicGatewayServiceState", () => {
       pid: 12796,
       runs: 1,
       lastExitCode: null,
+      spawnType: null,
     });
   });
 
@@ -280,6 +321,7 @@ describe("parseLaunchctlPrintState / quicGatewayServiceState", () => {
       pid: null,
       runs: 0,
       lastExitCode: null,
+      spawnType: null,
     });
   });
 
@@ -289,6 +331,7 @@ describe("parseLaunchctlPrintState / quicGatewayServiceState", () => {
       pid: null,
       runs: 3,
       lastExitCode: 1,
+      spawnType: null,
     });
   });
 
@@ -300,6 +343,7 @@ describe("parseLaunchctlPrintState / quicGatewayServiceState", () => {
       pid: null,
       runs: 0,
       lastExitCode: null,
+      spawnType: null,
     });
     expect(await isQuicGatewayLoaded(502, runner)).toBe(true);
     expect(await isQuicGatewayRunning(502, runner)).toBe(false);
@@ -312,6 +356,7 @@ describe("parseLaunchctlPrintState / quicGatewayServiceState", () => {
       pid: null,
       runs: null,
       lastExitCode: null,
+      spawnType: null,
     });
   });
 
@@ -321,6 +366,14 @@ describe("parseLaunchctlPrintState / quicGatewayServiceState", () => {
     };
     expect(await quicGatewayServiceState(502, runner)).toEqual({ loaded: false });
     expect(await isQuicGatewayRunning(502, runner)).toBe(false);
+  });
+
+  it("spawn type の名前を読み、行が無い・不正なら判定を省く", () => {
+    for (const type of ["interactive", "daemon", "background", "noninteractive"]) {
+      expect(parseLaunchctlPrintState(`${PRINT_RUNNING}\n\tspawn type = ${type} (4)\n`).spawnType).toBe(type);
+    }
+    expect(parseLaunchctlPrintState("spawn type = ???\n").spawnType).toBeNull();
+    expect(parseLaunchctlPrintState("spawn type = interactive\n").spawnType).toBe("interactive");
   });
 
   it("稼働中 → isQuicGatewayRunning は true", async () => {

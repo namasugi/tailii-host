@@ -10,7 +10,7 @@
 //
 // ps / lsof / 時計 / ホームはすべて差し替えられる（テストは偽物を渡す）。
 
-import { execFile } from "node:child_process";
+import { nextStartAtMs, periodicWorkLimiter, probeExecFile } from "../shared/loadShed.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -19,6 +19,23 @@ import { rolloutResponseItemToolActivities } from "../codex/codexToolActivity.js
 import { isCompressedRollout, isRolloutFileName, readCompressedRollout, readRolloutHead } from "../codex/rolloutFile.js";
 import { claudeProcessAlive, defaultClaudeSessionsDir, readClaudeLiveRecords } from "../sessions/claudeLiveStatus.js";
 import type { ProcessProbeExec } from "./subagentTailer.js";
+
+/** 差し替えたプローブが signal を扱わなくても、取消後は巡回を先へ進めない。 */
+function withProbeAbort<T>(start: () => T | Promise<T>, signal?: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const cleanup = (): void => signal?.removeEventListener("abort", onAbort);
+    const onAbort = (): void => { cleanup(); reject(signal!.reason); };
+    if (signal?.aborted) { reject(signal.reason); return; }
+    signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      Promise.resolve(start()).then((value) => {
+        cleanup();
+        if (signal?.aborted) reject(signal.reason);
+        else resolve(value);
+      }, (error) => { cleanup(); reject(error); });
+    } catch (error) { cleanup(); reject(error); }
+  });
+}
 
 /** 起動した Bash の終わりから、記録の開始を待つ猶予（ms）。 */
 export const EXEC_LINK_TAIL_MS = 10_000;
@@ -519,9 +536,12 @@ export interface RolloutSummary {
   lastActivity: ToolActivity | null;
 }
 
-interface SummaryState extends RolloutSummary {
+interface RolloutSummarySnapshot extends RolloutSummary {
   size: number;
   mtimeMs: number;
+}
+
+interface SummaryState extends RolloutSummarySnapshot {
   position: number;
   partial: Buffer;
 }
@@ -539,7 +559,7 @@ const INTERESTING_HEAD = new RegExp(
 export class RolloutSummaryCache {
   private readonly states = new Map<string, SummaryState>();
 
-  summary(file: string): RolloutSummary | null {
+  summary(file: string): RolloutSummarySnapshot | null {
     let stat: fs.Stats;
     try {
       stat = fs.statSync(file);
@@ -548,7 +568,8 @@ export class RolloutSummaryCache {
     }
     let state = this.states.get(file);
     if (state !== undefined && state.size === stat.size && state.mtimeMs === stat.mtimeMs) return state;
-    if (state === undefined || stat.size < state.position || isCompressedRollout(file)) {
+    if (state === undefined || stat.size < state.position ||
+        (state.size === stat.size && state.mtimeMs !== stat.mtimeMs) || isCompressedRollout(file)) {
       state = {
         size: 0, mtimeMs: 0, position: 0, partial: Buffer.alloc(0),
         firstUserText: null, model: null, effort: null, lastTs: null, terminal: null, lastActivity: null,
@@ -865,11 +886,11 @@ export class CodexExecObserver {
   private readonly liveRollouts = new Map<number, string>();
 
   private readonly claudeSessionsDir: string;
-  private readonly processAlive: (pid: number, procStart: string | null) => boolean | Promise<boolean>;
+  private readonly processAlive: (pid: number, procStart: string | null, signal?: AbortSignal) => boolean | Promise<boolean>;
 
   constructor(options: {
     exec: ProcessProbeExec; now: () => number; index: ExecRolloutIndex; home: string;
-    claudeSessionsDir: string; processAlive: (pid: number, procStart: string | null) => boolean | Promise<boolean>;
+    claudeSessionsDir: string; processAlive: (pid: number, procStart: string | null, signal?: AbortSignal) => boolean | Promise<boolean>;
   }) {
     this.exec = options.exec;
     this.now = options.now;
@@ -888,12 +909,16 @@ export class CodexExecObserver {
     sessionId: string,
     calls: readonly BashCall[],
     knownRolloutIds: ReadonlySet<string>,
+    signal?: AbortSignal,
   ): Promise<ObservationResult | null> {
-    const roots = await this.findClaudeRoots(sessionId);
+    signal?.throwIfAborted();
+    const roots = await this.findClaudeRoots(sessionId, signal);
+    signal?.throwIfAborted();
     if (roots === null) return null;
     // Claude のプロセスが見つからず、追跡中のものも無ければ ps は回さない（端末なし・別マシンの会話など）。
     if (roots.pids.size === 0 && this.tracked.size === 0) return { links: [], liveRolloutPaths: new Set() };
-    const psOut = await this.run("ps", ["-axww", "-o", "pid=,ppid=,pgid=,lstart=,command="]);
+    const psOut = await this.run("ps", ["-axww", "-o", "pid=,ppid=,pgid=,lstart=,command="], false, signal);
+    signal?.throwIfAborted();
     if (psOut === null) return null;
     const rows = parsePsOutput(psOut);
     const byPid = new Map(rows.map((row) => [row.pid, row]));
@@ -964,7 +989,8 @@ export class CodexExecObserver {
     for (const [pid, tracked] of this.tracked) {
       if (!tracked.isCodexExec) continue;
       if (!this.liveRollouts.has(pid)) {
-        const open = await this.openRollout(pid);
+        const open = await this.openRollout(pid, signal);
+        signal?.throwIfAborted();
         if (open !== null) this.liveRollouts.set(pid, open);
       }
       if (tracked.resolved || tracked.origin === null) continue;
@@ -975,7 +1001,8 @@ export class CodexExecObserver {
       if (openPath !== undefined) {
         meta = this.index.meta(openPath);
       } else if (nowMs - tracked.firstSeenMs >= LSOF_FALLBACK_AFTER_MS) {
-        meta = await this.byCwdAndStart(pid, tracked.startMs, knownRolloutIds);
+        meta = await this.byCwdAndStart(pid, tracked.startMs, knownRolloutIds, signal);
+        signal?.throwIfAborted();
       }
       if (meta === null) continue;
       tracked.resolved = true;
@@ -998,16 +1025,19 @@ export class CodexExecObserver {
    * 登録簿で別の会話のものと分かっている pid（`/clear` 前の id を argv に残したプロセス）は採らない。
    * 判定不能なら null。
    */
-  private async findClaudeRoots(sessionId: string): Promise<{ pids: Set<number>; fromRegistry: boolean } | null> {
+  private async findClaudeRoots(sessionId: string, signal?: AbortSignal): Promise<{ pids: Set<number>; fromRegistry: boolean } | null> {
     const records = readClaudeLiveRecords(this.claudeSessionsDir);
     const alive = (pid: number, procStart: string | null): Promise<boolean> =>
-      Promise.resolve(this.processAlive(pid, procStart)).catch(() => false);
+      withProbeAbort(() => this.processAlive(pid, procStart, signal), signal).catch((error) => {
+        if (signal?.aborted) throw error;
+        return false;
+      });
     const mine: number[] = [];
     for (const record of records) {
       if (record.sessionId === sessionId && await alive(record.pid, record.procStart)) mine.push(record.pid);
     }
     if (mine.length > 0) return { pids: new Set(mine), fromRegistry: true };
-    const out = await this.run("pgrep", ["-f", sessionId], true);
+    const out = await this.run("pgrep", ["-f", sessionId], true, signal);
     if (out === null) return null;
     const pids: number[] = [];
     for (const pid of out.split(/\s+/).filter((text) => /^\d+$/.test(text)).map(Number)) {
@@ -1020,8 +1050,9 @@ export class CodexExecObserver {
   }
 
   /** `lsof -p <pid> -Fn` でそのプロセスが開いている `rollout-*.jsonl`。 */
-  private async openRollout(pid: number): Promise<string | null> {
-    const out = await this.run("lsof", ["-p", String(pid), "-Fn"], true);
+  private async openRollout(pid: number, signal?: AbortSignal): Promise<string | null> {
+    const out = await this.run("lsof", ["-p", String(pid), "-Fn"], true, signal);
+    signal?.throwIfAborted();
     if (out === null) return null;
     for (const line of out.split("\n")) {
       if (!line.startsWith("n")) continue;
@@ -1032,8 +1063,9 @@ export class CodexExecObserver {
   }
 
   /** プロセスの作業フォルダと開始時刻（開始から 30 秒以内に始まった exec の記録）で 1 件に絞れたときだけ採る。 */
-  private async byCwdAndStart(pid: number, startMs: number, known: ReadonlySet<string>): Promise<ExecRolloutMeta | null> {
-    const out = await this.run("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], true);
+  private async byCwdAndStart(pid: number, startMs: number, known: ReadonlySet<string>, signal?: AbortSignal): Promise<ExecRolloutMeta | null> {
+    const out = await this.run("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], true, signal);
+    signal?.throwIfAborted();
     if (out === null) return null;
     const cwdLine = out.split("\n").find((line) => line.startsWith("n"));
     if (cwdLine === undefined) return null;
@@ -1045,16 +1077,16 @@ export class CodexExecObserver {
   }
 
   /** exit 1 を「該当なし」（空文字）として返すか。その他の失敗は null（判定不能）。 */
-  private run(cmd: string, args: string[], exitOneIsEmpty = false): Promise<string | null> {
-    return new Promise((resolve) => {
+  private run(cmd: string, args: string[], exitOneIsEmpty = false, signal?: AbortSignal): Promise<string | null> {
+    return withProbeAbort(() => new Promise<string | null>((resolve) => {
       this.exec(cmd, args, (error, stdout) => {
         if (error === null) {
           resolve(stdout);
           return;
         }
         resolve(exitOneIsEmpty && error.code === 1 ? "" : null);
-      });
-    });
+      }, signal);
+    }), signal);
   }
 }
 
@@ -1125,11 +1157,11 @@ export interface CodexExecLinkerOptions {
   /** Claude の登録簿（既定 `~/.claude/sessions`。`CLAUDE_CONFIG_DIR` / `TAILII_CLAUDE_SESSIONS_DIR` に従う）。 */
   claudeSessionsDir?: string;
   /** 登録簿の pid の生存と起動時刻の一致（既定 claudeProcessAlive）。 */
-  processAlive?: (pid: number, procStart: string | null) => boolean | Promise<boolean>;
+  processAlive?: (pid: number, procStart: string | null, signal?: AbortSignal) => boolean | Promise<boolean>;
 }
 
-const defaultExec: ProcessProbeExec = (cmd, args, callback) => {
-  execFile(cmd, args, { timeout: 10_000, maxBuffer: 64 * 1024 * 1024 }, (error, stdout) => {
+const defaultExec: ProcessProbeExec = (cmd, args, callback, signal) => {
+  probeExecFile(cmd, args, { timeout: 10_000, maxBuffer: 64 * 1024 * 1024, signal }, (error, stdout) => {
     callback(error as (Error & { code?: unknown }) | null, stdout ?? "");
   });
 };
@@ -1142,11 +1174,15 @@ export class CodexExecLinker {
   private readonly exec: ProcessProbeExec;
   private readonly now: () => number;
   private readonly intervalMs: number;
-  private readonly summaries = new RolloutSummaryCache();
-  private readonly observer: CodexExecObserver;
-  private readonly statusProbes = new Map<string, { atMs: number; open: boolean | null; size: number; mtimeMs: number }>();
+  private summaries = new RolloutSummaryCache();
+  private observer: CodexExecObserver;
+  private readonly observerFactory: () => CodexExecObserver;
+  private generation = 0;
+  private evaluationAbort: AbortController | null = null;
+  private readonly statusProbes = new Map<string, { nextAtMs: number; open: boolean | null; size: number; mtimeMs: number }>();
   private readonly pathsByNodeId = new Map<string, string>();
-  private lastEvalMs = Number.NEGATIVE_INFINITY;
+  private nextEvalMs = Number.NEGATIVE_INFINITY;
+  private evaluating = false;
   private lastObserveMs = Number.NEGATIVE_INFINITY;
   private liveRolloutPaths = new Set<string>();
 
@@ -1157,11 +1193,17 @@ export class CodexExecLinker {
     this.intervalMs = options.intervalMs ?? OBSERVE_INTERVAL_MS;
     this.index = new ExecRolloutIndex(options.codexHome ?? path.join(this.home, ".codex"), this.home);
     this.links = new CodexExecLinkStore(options.linksPath ?? path.join(this.home, ".tailii", "codex-exec-links.jsonl"), this.now);
-    this.observer = new CodexExecObserver({
+    this.observerFactory = () => new CodexExecObserver({
       exec: this.exec, now: this.now, index: this.index, home: this.home,
       claudeSessionsDir: options.claudeSessionsDir ?? defaultClaudeSessionsDir(),
-      processAlive: options.processAlive ?? claudeProcessAlive,
+      // reaper の生存確認は従来のまま。定期的な対応づけから呼ぶ ps だけ共有枠を使う。
+      // 待ちの置換も ps の失敗と同じく生存扱い。見送っただけの pid を死亡確定にしない。
+      processAlive: options.processAlive ?? ((pid, procStart, signal) => periodicWorkLimiter.run(
+        `claude-pid:${pid}`, "background", () => claudeProcessAlive(pid, procStart),
+        signal,
+      ).catch(() => true)),
     });
+    this.observer = this.observerFactory();
   }
 
   /** `codex-exec:<id>` のノードの記録のパス（評価で見たもののみ）。 */
@@ -1179,13 +1221,23 @@ export class CodexExecLinker {
 
   /** 次の evaluate が間隔の下限を過ぎているか（呼び出し側が Bash の並びを組む前に見る）。 */
   due(): boolean {
-    return this.now() - this.lastEvalMs >= this.intervalMs;
+    return !this.evaluating && this.now() >= this.nextEvalMs;
   }
 
-  /** 見えていたノードの記録パスの対応を捨てる（tail の張り直し）。 */
+  /** tail の世代を切り替え、旧評価を取消す。旧世代の完了でキャッシュや時刻を戻さない。 */
   reset(): void {
+    const previous = this.evaluationAbort;
+    this.evaluationAbort = null;
+    this.generation++;
+    this.evaluating = false;
     this.pathsByNodeId.clear();
-    this.lastEvalMs = Number.NEGATIVE_INFINITY;
+    this.statusProbes.clear();
+    this.summaries = new RolloutSummaryCache();
+    this.observer = this.observerFactory();
+    this.liveRolloutPaths = new Set();
+    this.lastObserveMs = Number.NEGATIVE_INFINITY;
+    this.nextEvalMs = Number.NEGATIVE_INFINITY;
+    previous?.abort();
   }
 
   /**
@@ -1197,10 +1249,45 @@ export class CodexExecLinker {
     calls: readonly BashCall[];
     sessionAlive: boolean | null;
     force?: boolean;
+    signal?: AbortSignal;
   }): Promise<CodexExecRun[] | null> {
     const nowMs = this.now();
-    if (input.force !== true && nowMs - this.lastEvalMs < this.intervalMs) return null;
-    this.lastEvalMs = nowMs;
+    if (input.signal?.aborted || this.evaluating || (input.force !== true && !this.due())) return null;
+    const generation = this.generation;
+    const abort = new AbortController();
+    const signal = input.signal === undefined ? abort.signal : AbortSignal.any([input.signal, abort.signal]);
+    const onAbort = (): void => { if (this.evaluationAbort === abort) this.reset(); };
+    this.evaluationAbort = abort;
+    signal.addEventListener("abort", onAbort, { once: true });
+    this.evaluating = true;
+    try {
+      const runs = await this.evaluateNow(input, nowMs, signal, generation);
+      this.checkGeneration(signal, generation);
+      return runs;
+    } catch (error) {
+      if (signal.aborted || generation !== this.generation) return null;
+      throw error;
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+      if (generation === this.generation && this.evaluationAbort === abort) {
+        this.nextEvalMs = nextStartAtMs(nowMs, this.now(), this.intervalMs, 30_000);
+        this.evaluating = false;
+        this.evaluationAbort = null;
+      }
+    }
+  }
+
+  private checkGeneration(signal: AbortSignal, generation: number): void {
+    signal.throwIfAborted();
+    if (generation !== this.generation) throw new DOMException("古い購読の評価", "AbortError");
+  }
+
+  private async evaluateNow(input: {
+    sessionId: string;
+    calls: readonly BashCall[];
+    sessionAlive: boolean | null;
+  }, nowMs: number, signal: AbortSignal, generation: number): Promise<CodexExecRun[]> {
+    this.checkGeneration(signal, generation);
     const callsById = new Map(input.calls.map((call) => [call.toolUseId, call]));
 
     // 実行中の観測（Bash が動いている間か、追跡中のプロセスがある間だけ）。
@@ -1208,7 +1295,8 @@ export class CodexExecLinker {
       && (input.calls.some((call) => call.endMs === null) || this.observer.hasTracked())) {
       this.lastObserveMs = nowMs;
       const known = new Set(this.links.load().map((link) => link.rolloutId));
-      const observed = await this.observer.observe(input.sessionId, input.calls, known).catch(() => null);
+      const observed = await this.observer.observe(input.sessionId, input.calls, known, signal).catch(() => null);
+      this.checkGeneration(signal, generation);
       if (observed !== null) {
         this.liveRolloutPaths = observed.liveRolloutPaths;
         for (const link of observed.links) {
@@ -1238,12 +1326,14 @@ export class CodexExecLinker {
 
     const runs: CodexExecRun[] = [];
     for (const [id, entry] of assigned) {
+      this.checkGeneration(signal, generation);
       const file = existingRolloutPath(entry.path);
       if (file === null) continue;
       const meta = this.index.meta(file);
-      const summary = this.summaries.summary(file);
-      if (meta === null || summary === null) continue;
-      const status = await this.status(file, summary, nowMs);
+      const initialSummary = this.summaries.summary(file);
+      if (meta === null || initialSummary === null) continue;
+      const { status, summary } = await this.status(file, initialSummary, nowMs, signal, generation);
+      this.checkGeneration(signal, generation);
       const nodeId = `${CODEX_EXEC_NODE_PREFIX}${id}`;
       this.pathsByNodeId.set(nodeId, file);
       runs.push({
@@ -1269,36 +1359,46 @@ export class CodexExecLinker {
    * 完了 = task_complete / 失敗 = turn_aborted、または終わりの行が無いのに記録を開いているプロセスがいない /
    * 実行中 = 終わりの行が無く、記録を開いているプロセスがいる（確認できないときは実行中に倒す）。
    */
-  private async status(file: string, summary: RolloutSummary, nowMs: number): Promise<CodexExecRun["status"]> {
-    if (summary.terminal === "completed") return "completed";
-    if (summary.terminal === "aborted") return "error";
-    if (this.liveRolloutPaths.has(file)) return "running";
-    if (isCompressedRollout(file)) return "error";
+  private async status(file: string, summary: RolloutSummarySnapshot, nowMs: number, signal: AbortSignal, generation: number): Promise<{ status: CodexExecRun["status"]; summary: RolloutSummary }> {
+    if (summary.terminal === "completed") return { status: "completed", summary };
+    if (summary.terminal === "aborted") return { status: "error", summary };
+    if (this.liveRolloutPaths.has(file)) return { status: "running", summary };
+    if (isCompressedRollout(file)) return { status: "error", summary };
     const cached = this.statusProbes.get(file);
-    let size = -1;
-    let mtimeMs = -1;
-    try {
-      const stat = fs.statSync(file);
-      size = stat.size;
-      mtimeMs = stat.mtimeMs;
-    } catch {
-      // 消えたファイルは下のプローブに任せる。
-    }
+    // 要約を作ったときの版を使う。要約後・プローブ開始前に変わった記録も検出する。
+    const size = summary.size, mtimeMs = summary.mtimeMs;
     // 誰も開いていなかった記録は、伸びない限り失敗のまま（中断された実行を lsof で見続けない）。
-    const unchangedClosed = cached !== undefined && cached.open === false && cached.size === size && cached.mtimeMs === mtimeMs;
+    const unchanged = cached !== undefined && cached.size === size && cached.mtimeMs === mtimeMs;
     let open: boolean | null;
-    if (cached !== undefined && (unchangedClosed || nowMs - cached.atMs < STATUS_PROBE_TTL_MS)) {
+    if (cached !== undefined && unchanged && (cached.open === false || nowMs < cached.nextAtMs)) {
       open = cached.open;
     } else {
-      open = await new Promise<boolean | null>((resolve) => {
+      open = await withProbeAbort(() => new Promise<boolean | null>((resolve) => {
         this.exec("lsof", ["-t", "--", file], (error, stdout) => {
           if (error === null) resolve(stdout.trim().length > 0);
           else resolve(error.code === 1 ? false : null);
-        });
+        }, signal);
+      }), signal);
+      this.checkGeneration(signal, generation);
+      let currentSize = -1, currentMtimeMs = -1;
+      try {
+        const stat = fs.statSync(file);
+        currentSize = stat.size; currentMtimeMs = stat.mtimeMs;
+      } catch { /* 消失・差し替えも更新として扱う。 */ }
+      // 枠待ち中に記録が変わったら読み直す。終端行が無ければ古い負の結果は採用しない。
+      if (currentSize !== size || currentMtimeMs !== mtimeMs) {
+        summary = this.summaries.summary(file) ?? summary;
+        open = null;
+      }
+      this.statusProbes.set(file, {
+        nextAtMs: nextStartAtMs(nowMs, this.now(), STATUS_PROBE_TTL_MS, 30_000), open,
+        size: currentSize, mtimeMs: currentMtimeMs,
       });
-      this.statusProbes.set(file, { atMs: nowMs, open, size, mtimeMs });
     }
-    return open === false ? "error" : "running";
+    // 表示する時刻・モデル等も、この判定に用いた要約と揃えて返す。
+    const status = summary.terminal === "completed" ? "completed" : summary.terminal === "aborted" ? "error"
+      : open === false ? "error" : "running";
+    return { status, summary };
   }
 }
 

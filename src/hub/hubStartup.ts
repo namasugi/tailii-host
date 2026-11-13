@@ -18,7 +18,7 @@
 // 同時起動の競合が残る（doctor が警告し、hub の起動ログにも退避した事実を残す）。
 // このファイルは node: の組み込みだけに依存する（別プロセスの起動競合テストが型を外して直接読み込む）。
 
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import * as fs from "node:fs";
@@ -91,6 +91,34 @@ export function readProcessArgs(pid: number): ProcessArgs {
     const failure = error as { status?: unknown; stdout?: unknown };
     return failure.status === 1 && String(failure.stdout ?? "").trim().length === 0 ? { kind: "gone" } : { kind: "unknown" };
   }
+}
+
+/** engine の起動保証用。ps の取得・期限は同期版と同じで、イベントループを止めない。 */
+export async function readProcessArgsAsync(pid: number): Promise<ProcessArgs> {
+  try {
+    const argv = (await fs.promises.readFile(`/proc/${pid}/cmdline`, "utf8")).split("\0").filter((part) => part.length > 0);
+    if (argv.length > 0) return { kind: "argv", argv };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT" && fs.existsSync("/proc/self/cmdline")) return { kind: "gone" };
+  }
+  return new Promise((resolve) => {
+    execFile("ps", ["-o", "command=", "-p", String(pid)], {
+      encoding: "utf8", timeout: 3_000,
+    }, (error, stdout) => {
+      if (error) {
+        resolve(error.code === 1 && stdout.trim().length === 0 ? { kind: "gone" } : { kind: "unknown" });
+      } else {
+        const command = stdout.trim();
+        resolve(command.length > 0 ? { kind: "command", command } : { kind: "unknown" });
+      }
+    });
+  });
+}
+
+/** 判定規則を共有し、取得だけを非同期にする。 */
+export async function classifyHubProcessAsync(pid: number): Promise<ReturnType<typeof classifyHubProcess>> {
+  const args = await readProcessArgsAsync(pid);
+  return classifyHubProcess(pid, () => args);
 }
 
 /** 自分自身の `cli.js`（dist/hub/hubStartup.js から見た dist/cli.js）。 */

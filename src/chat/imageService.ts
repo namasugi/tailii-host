@@ -271,13 +271,16 @@ export class ImageService {
 
   /**
    * pending キューを drain し、各エントリを `image_available` または `error` に変換する。
-   * 処理した pending エントリは（成功・失敗を問わず）キューから除去する。
+   * deliver があれば送出成功後にだけ除去する。送れなかった項目と後続は次の接続へ残す。
+   * 省略時は従来どおり、返すメッセージに対応するエントリを除去する。
    */
-  async drainPending(): Promise<ControlMessage[]> {
+  async drainPending(deliver?: (message: ControlMessage) => Promise<boolean>): Promise<ControlMessage[]> {
     const entries = this.readPendingEntries();
     const results: ControlMessage[] = [];
     for (const entry of entries) {
-      results.push(await this.generate(entry.imageId, entry.path, entry.relatedApprovalId));
+      const message = await this.generate(entry.imageId, entry.path, entry.relatedApprovalId);
+      if (deliver && !await deliver(message)) break;
+      results.push(message);
       try {
         fs.unlinkSync(entry.filePath);
       } catch {

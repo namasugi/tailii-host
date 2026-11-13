@@ -30,6 +30,7 @@ import { claudeProjectSlug, isInsideBase, standardize, expandTilde } from "../sh
 import { resolveSessionBackendKind, type SessionBackendKind } from "../backend/sessionBackend.js";
 import { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
 import { sleep } from "../shared/sleep.js";
+import { agentClampArgv, agentClampShellPrefix, withAgentClampShellCommand } from "../shared/agentPriority.js";
 import { DEFAULT_TMUX_PATH, paneCommandLooksLikeAgent } from "../backend/tmux.js";
 
 /** tmux 内で起動する既定コマンド（claude TUI）。テストでは無害な値に差し替える。 */
@@ -326,7 +327,8 @@ export async function runLaunchCommand(args: string[]): Promise<number> {
     baseDir: null,
     binaryPath: currentBinaryPath(),
     tmuxPath: DEFAULT_TMUX_PATH,
-    innerCommand: DEFAULT_INNER_COMMAND,
+    // エージェント側の優先度の固定（agent-priority）。engine を通らないこの経路でも同じに揃える。
+    innerCommand: `${agentClampShellPrefix()}${DEFAULT_INNER_COMMAND}`,
     path: defaultInjectedPath(),
     store: new SessionMetadataStore(),
     now: () => Math.floor(Date.now() / 1000),
@@ -356,6 +358,12 @@ export function makeSessionLauncher(options: {
   herdrPath?: string | null;
   /** `~/.claude/projects` の場所（deleted-worktree-resume の transcript 移設用）。テスト注入用。 */
   claudeProjectsDir?: string;
+  /**
+   * エージェントの CLI を utility の優先度に固定する argv 接頭辞（agent-priority）。テスト注入用。
+   * 省略時は起動のたびに `agentClampArgv()`（macOS で taskpolicy があり `TAILII_AGENT_CLAMP=off` でなければ
+   * `/usr/sbin/taskpolicy -c utility`、それ以外は空 = 今までと同じコマンド）。
+   */
+  agentClamp?: readonly string[];
 } = {}): EngineLauncher {
   const store = options.store ?? new SessionMetadataStore();
   const agent: LaunchAgent = options.agent ?? "claude";
@@ -393,16 +401,25 @@ export function makeSessionLauncher(options: {
     let effectiveCwd = cwd;
     let effectiveBaseDir = baseDir;
     let recordCwd: string | null = null;
+    // エージェント側の優先度の固定（agent-priority）。pane のサーバではなく、pane で起動するコマンドの側に
+    // 付ける（サーバがどの優先度で動いていても、エージェントとその子だけが utility に留まる）。
+    const agentClamp = options.agentClamp ?? agentClampArgv();
     if (agent === "claude") {
+      // 判定するのは利用者の起動コマンドだけ。host が引用して足すタイトル等はシェル構文ではない。
+      const clampedInner = withAgentClampShellCommand(inner, agentClamp);
       if (resumeSessionId) {
-        effectiveInner = `${inner} --resume ${resumeSessionId}`;
+        effectiveInner = `${clampedInner} --resume ${resumeSessionId}`;
       } else if (newSessionId) {
-        effectiveInner = `${inner} --session-id ${newSessionId}`;
+        effectiveInner = `${clampedInner} --session-id ${newSessionId}`;
         if (title) effectiveInner += ` --name ${shellSingleQuote(title)}`;
       } else {
-        effectiveInner = inner;
+        effectiveInner = clampedInner;
       }
-      effectiveInner = `${CLAUDE_RESUME_THRESHOLD_ENV} ${effectiveInner}`;
+      // カスタム inner が環境変数代入で始まる場合も、接頭辞は代入の後ろ・コマンド名の直前に置く。
+      // taskpolicy は claude を exec するので、pane の前面プロセス・pid・コマンド行は付けないときと同じに
+      // 見える（シェルを 1 段挟む形にはしない: 前面がシェル名になると「エージェント終了」と誤判定される）。
+      effectiveInner =
+        `${CLAUDE_RESUME_THRESHOLD_ENV} ${effectiveInner}`;
       // Task/Todo ツール有効化 env（todo-tools）と、engine 環境の ANTHROPIC_DEFAULT_MODEL の引き継ぎ
       // （default-model。model フラグ付き起動では付けない）。
       const envPrefix = claudeLaunchEnvPrefix({
@@ -456,6 +473,7 @@ export function makeSessionLauncher(options: {
         selectedInner,
         effectiveProviderSessionId,
         codexAppServer.remoteEndpoint,
+        agentClamp,
       );
     }
     const exitCode = await launchCore({
@@ -543,6 +561,8 @@ export function codexRemoteResumeCommand(
   _innerCommand: string,
   sessionId: string,
   remoteEndpoint: string,
+  /** エージェントを utility の優先度に固定する argv 接頭辞（agent-priority）。空なら付けない。 */
+  agentClamp: readonly string[] = agentClampArgv(),
 ): string {
   if (!/^[A-Za-z0-9._-]+$/.test(sessionId)) throw new Error("invalid Codex session ID");
   if (!/^unix:\/\/[A-Za-z0-9_./-]*$/.test(remoteEndpoint)) {
@@ -563,6 +583,8 @@ export function codexRemoteResumeCommand(
   // 記録種別の位置（`"type":"…"`）に固定し、session_meta の指示文など本文中に同じ語が現れても
   // 誤発火しないようにする（rollout は compact JSON。コロン後の空白は許容）。
   // 版によって記録名が変わっても、下の再試行ループが bootstrap 失敗を吸収する。
+  // 再試行するたびに TUI 自体を utility で起動する。rollout 待機と再試行を制御するシェルは包まない。
+  const clamp = agentClampShellPrefix(agentClamp);
   const sessionsRoot = '"${CODEX_HOME:-$HOME/.codex}/sessions"';
   const waitForFirstTurn =
     `while ! find ${sessionsRoot} -type f -name '*${sessionId}*.jsonl'` +
@@ -573,7 +595,7 @@ export function codexRemoteResumeCommand(
   // 変わっても、TUI が一度失敗しただけで pane ごと消える（pane not found 連打・ライブビュー消失）
   // 事態にしない。長時間動いた後の終了（利用者操作・kill）は再試行しない。exec せず shell を
   // 親に残すのはこのループのため。
-  const resume = `codex resume --remote ${remoteEndpoint} --no-alt-screen ${sessionId}`;
+  const resume = `${clamp}codex resume --remote ${remoteEndpoint} --no-alt-screen ${sessionId}`;
   const retryBootstrap =
     `n=0; while :; do s=$(date +%s); ${resume}; rc=$?;` +
     " if [ $rc -ne 0 ] && [ $(( $(date +%s) - s )) -lt 15 ];" +

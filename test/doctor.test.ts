@@ -182,31 +182,45 @@ describe("quicServiceDoctorCheck", () => {
   });
 
   it("登録済みだが一度も起動していない（runs = 0 = launchd が保留）→ 稼働中と区別し kickstart を案内する", () => {
-    const check = quicServiceDoctorCheck({ loaded: true, running: false, pid: null, runs: 0, lastExitCode: null });
+    const check = quicServiceDoctorCheck({ loaded: true, running: false, pid: null, runs: 0, lastExitCode: null, spawnType: null });
     expect(check.ok).toBe(false);
     expect(check.detail).toContain("一度も起動していない");
     expect(check.remediation).toBe("launchctl kickstart gui/$(id -u)/com.tailii.quic-gw");
   });
 
   it("起動したが終了した（runs > 0）→ 保留と区別し、終了コードとログ確認を案内する", () => {
-    const check = quicServiceDoctorCheck({ loaded: true, running: false, pid: null, runs: 3, lastExitCode: 1 });
+    const check = quicServiceDoctorCheck({ loaded: true, running: false, pid: null, runs: 3, lastExitCode: 1, spawnType: null });
     expect(check.ok).toBe(false);
     expect(check.detail).toBe("com.tailii.quic-gw は登録済みだが停止中（起動 3 回、直近の終了コード 1）");
     expect(check.remediation).toBe("tail -n 50 ~/.tailii/quic-gw.log");
   });
 
   it("runs が読めない停止中は保留と断定せずログ確認へ", () => {
-    const check = quicServiceDoctorCheck({ loaded: true, running: false, pid: null, runs: null, lastExitCode: null });
+    const check = quicServiceDoctorCheck({ loaded: true, running: false, pid: null, runs: null, lastExitCode: null, spawnType: null });
     expect(check.ok).toBe(false);
     expect(check.detail).toBe("com.tailii.quic-gw は登録済みだが停止中（起動 ? 回）");
     expect(check.remediation).toBe("tail -n 50 ~/.tailii/quic-gw.log");
   });
 
   it("稼働中 → ok・pid を添える", () => {
-    const check = quicServiceDoctorCheck({ loaded: true, running: true, pid: 12796, runs: 1, lastExitCode: null });
+    const check = quicServiceDoctorCheck({ loaded: true, running: true, pid: 12796, runs: 1, lastExitCode: null, spawnType: null });
     expect(check.ok).toBe(true);
     expect(check.detail).toBe("com.tailii.quic-gw 稼働中 (pid 12796)");
     expect(check.remediation).toBeUndefined();
+  });
+
+  it("interactive の稼働を表示し、それ以外は接続を失敗扱いにせず載せ直しを案内する", () => {
+    const state = { loaded: true, running: true, pid: 123, runs: 1, lastExitCode: null } as const;
+    const interactive = quicServiceDoctorCheck({ ...state, spawnType: "interactive" });
+    expect(interactive.ok).toBe(true);
+    expect(interactive.detail).toContain("優先度 interactive");
+    expect(interactive.remediation).toBeUndefined();
+    for (const spawnType of ["daemon", "noninteractive"]) {
+      const old = quicServiceDoctorCheck({ ...state, spawnType });
+      expect(old.ok).toBe(true);
+      expect(old.detail).toContain(`優先度 ${spawnType}（古い設定のまま`);
+      expect(old.remediation).toBe("tailii setup");
+    }
   });
 });
 

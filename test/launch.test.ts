@@ -441,7 +441,7 @@ describe("launchCore（codex モード）", () => {
       ensureRunning: async () => {},
       startThread: async () => "thread-new",
     };
-    const launcher = makeSessionLauncher({ store, agent: "codex", runner, codexAppServer: appServer });
+    const launcher = makeSessionLauncher({ store, agent: "codex", runner, codexAppServer: appServer, agentClamp: [] });
 
     // 新規threadをApp Serverで作ってから、tmux TUIは同じthreadへremote resumeする。
     const { exitCode, providerSessionId } = await launcher(dir, "cdx2", null, null);
@@ -477,7 +477,7 @@ describe("launchCore（codex モード）", () => {
       ensureRunning: async () => { ensured += 1; },
       startThread: async () => { throw new Error("resumeでは呼ばない"); },
     };
-    const launcher = makeSessionLauncher({ store, agent: "codex", runner, codexAppServer: appServer });
+    const launcher = makeSessionLauncher({ store, agent: "codex", runner, codexAppServer: appServer, agentClamp: [] });
 
     const { exitCode } = await launcher(dir, "cdx3", null, "abc-123");
     expect(exitCode).toBe(0);
@@ -603,8 +603,8 @@ describe("makeSessionLauncher: claude --session-id / --name の合成（lazy-ses
       const dir = makeTempDir("launcher-resume");
       const store = new SessionMetadataStore(makeTempDir("launcher-resume-store"));
       const { runner, recorded } = mockRunner();
-      const launcher = makeSessionLauncher({ store, innerCommand: "claude", runner });
-      // resume 時は title を渡しても付与しない。
+      const launcher = makeSessionLauncher({ store, innerCommand: "claude", runner, agentClamp: [] });
+      // 固定を無効化した場合は従来のコマンド。resume 時は title を渡しても付与しない。
       await launcher(dir, "s-3", null, "resume-id", null, "無視される名前");
       const inner = recorded.find((c) => c.args[0] === "new")?.args[4];
       expect(inner).toMatch(

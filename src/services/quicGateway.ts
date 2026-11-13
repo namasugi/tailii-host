@@ -207,6 +207,12 @@ export interface QuicLaunchAgentConfig {
  * serve が即終了 → KeepAlive 再起動ループに陥る。対策として:
  *   1. `EnvironmentVariables` に HOME を明示（gateway 本体 + exec 子プロセス双方に効く）。
  *   2. `--dir` / `--path` を **絶対パスで明示的に渡し**、HOME 展開へ依存しない（防御多重化）。
+ *
+ * `ProcessType=Interactive`（agent-priority）: 指定が無い LaunchAgent は launchd の既定の種別
+ * （`launchctl print` の `spawn type = daemon`）で動き、ゲートウェイとその子孫（engine・serve・hub・
+ * tmux / herdr のサーバ）がアプリより低い優先度になる。ホストが混むと通信と制御まで遅れるので、
+ * アプリと同じ扱い（`spawn type = interactive`）にする。エージェントの側は起動コマンドの接頭辞で
+ * 今までの水準に留める（shared/agentPriority.ts）。
  */
 export function quicLaunchAgentPlist(config: QuicLaunchAgentConfig): string {
   const args = [
@@ -239,6 +245,8 @@ ${programArguments}
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
   <key>StandardOutPath</key>
   <string>${xmlEscape(config.logPath)}</string>
   <key>StandardErrorPath</key>
@@ -271,6 +279,11 @@ export interface QuicGatewayRunState {
   runs: number | null;
   /** 直近の終了コード（`last exit code = N`）。未終了 `(never exited)` や不明は null。 */
   lastExitCode: number | null;
+  /**
+   * launchd がこのジョブを起動する種別（`spawn type = interactive (4)` の名前の部分。小文字）。
+   * plist の `ProcessType` が載っているジョブに効いているかの確認に使う。行が無い・読めないときは null。
+   */
+  spawnType: string | null;
 }
 
 /** `launchctl print gui/<uid>/<label>` から読んだ常駐ジョブの状態。 */
@@ -280,7 +293,8 @@ export type QuicGatewayServiceState =
 
 /**
  * `launchctl print` の出力から稼働状態を読む。
- * 見るのはトップレベルの `state = running` / `pid = N` / `runs = N` / `last exit code = N` 行だけ
+ * 見るのはトップレベルの `state = running` / `pid = N` / `runs = N` / `last exit code = N` /
+ * `spawn type = 名前 (番号)` 行だけ
  * （`state = not running` や endpoint 配下の `state = active` は一致しない。
  * 他の書式は macOS 版で揺れるため依存せず、読めない項目は null にする）。
  */
@@ -294,6 +308,7 @@ export function parseLaunchctlPrintState(output: string): QuicGatewayRunState {
     pid: num(/^\s*pid = (\d+)\s*$/m),
     runs: num(/^\s*runs = (\d+)\s*$/m),
     lastExitCode: num(/^\s*last exit code = (\d+)\s*$/m),
+    spawnType: /^\s*spawn type = ([A-Za-z][A-Za-z -]*?)(?:\s*\(\d+\))?\s*$/m.exec(output)?.[1]?.toLowerCase() ?? null,
   };
 }
 
@@ -326,7 +341,7 @@ export interface QuicLaunchAgentInstallResult {
 
 /**
  * LaunchAgent を設置して（再）起動する（冪等）。
- * 既存ジョブは bootout してから bootstrap し、plist 更新を確実に反映する。
+ * 既存ジョブは bootout してから bootstrap し、plist 更新（`ProcessType` を含む）を反映する。
  * bootstrap 後に kickstart で起動を確定させ、`launchctl print` で稼働を実確認して返す。
  *
  * gateway バイナリは非 TCC 保護の `~/.tailii/bin` へコピーしてから launchd に渡す
@@ -401,7 +416,7 @@ export async function quicGatewayServiceState(
   }
   // stdout を返さない実行子（テスト注入）は「登録済み・稼働不明」として未起動側に倒す。
   if (typeof output !== "string") {
-    return { loaded: true, running: false, pid: null, runs: null, lastExitCode: null };
+    return { loaded: true, running: false, pid: null, runs: null, lastExitCode: null, spawnType: null };
   }
   return { loaded: true, ...parseLaunchctlPrintState(output) };
 }

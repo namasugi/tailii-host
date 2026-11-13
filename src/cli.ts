@@ -14,37 +14,30 @@
 // 移植は protocol → engine → serve/hook → launch/setup の順に段階的に行う。
 // 未移植サブコマンドは明示エラーで落ちる（黙って別挙動をしない）。
 
-import { runEngineCommand } from "./engine/engine.js";
-import { runLaunchCommand } from "./commands/launch.js";
-import { runServeCommand } from "./approval/broker.js";
-import { runHookCommand } from "./approval/hook.js";
-import { runKickCommand } from "./commands/kick.js";
-import { runPushTokenCommand } from "./commands/pushTokenCommand.js";
-import { runSetupCommand } from "./commands/setup.js";
-import { runDoctorCommand } from "./commands/doctor.js";
-import { runHubCommand } from "./hub/hubDaemon.js";
-import { runQuicInfoCommand } from "./services/quicGateway.js";
-import { runSelfUpdateCommand } from "./commands/selfUpdate.js";
-import { runApiAgentCommand } from "./commands/apiAgentCommand.js";
 import { migrateLegacyHome } from "./commands/legacyHomeMigration.js";
 import { readPackageVersion } from "./shared/version.js";
 
+// hook / serve の短命プロセスでは、使うサブコマンドの依存だけを読み込む。
 const PORTED: Record<string, (args: string[]) => Promise<number>> = {
-  engine: runEngineCommand,
-  launch: runLaunchCommand,
-  serve: runServeCommand,
-  hook: runHookCommand,
-  kick: runKickCommand,
-  "push-token": runPushTokenCommand,
-  setup: runSetupCommand,
-  doctor: runDoctorCommand,
-  hub: runHubCommand,
-  "quic-info": runQuicInfoCommand,
-  "self-update": runSelfUpdateCommand,
-  "api-agent": runApiAgentCommand,
+  "engine": async (args) => (await import("./engine/engine.js")).runEngineCommand(args),
+  "launch": async (args) => (await import("./commands/launch.js")).runLaunchCommand(args),
+  "serve": async (args) => (await import("./approval/broker.js")).runServeCommand(args),
+  "hook": async (args) => (await import("./approval/hook.js")).runHookCommand(args),
+  "kick": async (args) => (await import("./commands/kick.js")).runKickCommand(args),
+  "push-token": async (args) => (await import("./commands/pushTokenCommand.js")).runPushTokenCommand(args),
+  "setup": async (args) => (await import("./commands/setup.js")).runSetupCommand(args),
+  "doctor": async (args) => (await import("./commands/doctor.js")).runDoctorCommand(args),
+  "hub": async (args) => (await import("./hub/hubDaemon.js")).runHubCommand(args),
+  "quic-info": async (args) => (await import("./services/quicGateway.js")).runQuicInfoCommand(args),
+  "self-update": async (args) => (await import("./commands/selfUpdate.js")).runSelfUpdateCommand(args),
+  "api-agent": async (args) => (await import("./commands/apiAgentCommand.js")).runApiAgentCommand(args),
 };
 
 async function main(): Promise<number> {
+  if (process.argv[2] === "standby") {
+    const { runStandbyCommand } = await import("./commands/standby.js");
+    return runStandbyCommand(main);
+  }
   migrateLegacyHome();
   const [subcommand, ...rest] = process.argv.slice(2);
   // `--version` の出力形式（version 文字列 + 改行のみ）は self-update のスモークテストが
@@ -55,7 +48,7 @@ async function main(): Promise<number> {
   }
   if (!subcommand || subcommand === "--help" || subcommand === "-h") {
     process.stderr.write(
-      "usage: tailii <engine|serve|hook|launch|kick|push-token|setup|doctor|hub|self-update|api-agent> [options]\n",
+      "usage: tailii <engine|serve|standby|hook|launch|kick|push-token|setup|doctor|hub|self-update|api-agent> [options]\n",
     );
     return 64;
   }

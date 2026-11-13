@@ -1,10 +1,12 @@
 // panePreviewPump.test.ts — tmux pane 一時進捗 pump テスト
 
 import { Writable } from "node:stream";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { performance } from "node:perf_hooks";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { LineWriter } from "../src/shared/lineWriter.js";
 import { PanePreviewPump } from "../src/hub/panePreviewPump.js";
 import { decodeControlMessage, type ControlMessage } from "../src/protocol.js";
+import { KeyedLimiter } from "../src/shared/loadShed.js";
 
 function memoryWriter(): { writer: LineWriter; messages: () => ControlMessage[] } {
   const chunks: string[] = [];
@@ -29,6 +31,245 @@ async function flushMicrotasks(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
 }
+
+describe("PanePreviewPump 負荷制御", () => {
+  const pumps: PanePreviewPump[] = [];
+  beforeEach(() => {
+    // node:perf_hooks の時計も偽タイマーへ揃え、実際の所要時間を検証する。
+    vi.spyOn(performance, "now").mockImplementation(() => Date.now());
+  });
+  afterEach(async () => {
+    for (const pump of pumps.splice(0)) pump.stop();
+    await vi.advanceTimersByTimeAsync(10_000);
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  test("一覧の遅い取得後の 10 秒休止は、前面購読が付いた直後に打ち切る", async () => {
+    vi.useFakeTimers();
+    let foreground = false;
+    const capture = vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 6000));
+      return "busy";
+    });
+    const pump = new PanePreviewPump({ writer: memoryWriter().writer, capture,
+      pollIntervalMs: () => foreground ? 250 : 1000,
+      priority: () => foreground ? "foreground" : "background" });
+    pumps.push(pump); pump.start("promotion", "codex_terminal");
+    await vi.advanceTimersByTimeAsync(6100);
+    expect(capture).toHaveBeenCalledTimes(1);
+    foreground = true; pump.requestRefresh();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(capture).toHaveBeenCalledTimes(2);
+    pump.stop(); await vi.advanceTimersByTimeAsync(6000);
+  });
+
+  test("取得中の前面昇格でも同じ会話の取得を重ねず、完了後は休まず取得する", async () => {
+    vi.useFakeTimers();
+    let foreground = false, active = 0, maximum = 0;
+    const capture = vi.fn(async () => {
+      maximum = Math.max(maximum, ++active);
+      await new Promise((resolve) => setTimeout(resolve, 6000));
+      active--; return "busy";
+    });
+    const pump = new PanePreviewPump({ writer: memoryWriter().writer, capture,
+      priority: () => foreground ? "foreground" : "background" });
+    pumps.push(pump); pump.start("promotion-inflight", "codex_terminal");
+    await vi.advanceTimersByTimeAsync(100);
+    foreground = true; pump.requestRefresh(); pump.requestRefresh();
+    expect(capture).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(5900);
+    expect(capture).toHaveBeenCalledTimes(2);
+    expect(maximum).toBe(1);
+    pump.stop(); await vi.advanceTimersByTimeAsync(6000);
+  });
+
+  test.each([250, 1000])("取得が 20ms なら基本間隔 %ims は変わらない・初回は待たせない", async (base) => {
+    vi.useFakeTimers();
+    const startedAt = Date.now();
+    const starts: number[] = [];
+    const { writer, messages } = memoryWriter();
+    const pump = new PanePreviewPump({
+      writer, pollIntervalMs: base,
+      priority: () => base === 250 ? "foreground" : "background",
+      capture: async () => {
+        starts.push(Date.now() - startedAt);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return "busy";
+      },
+    });
+    pumps.push(pump);
+    pump.start("normal", "codex_terminal");
+    expect(starts).toEqual([0]);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(messages()).toMatchObject([{ type: "pane_preview", active: true, text: "busy" }]);
+    await vi.advanceTimersByTimeAsync(base - 1);
+    expect(starts).toEqual([0]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(starts).toEqual([0, base + 20]);
+  });
+
+  test.each([
+    { priority: "foreground" as const, duration: 200, rest: 600 },
+    { priority: "foreground" as const, duration: 6000, rest: 5000 },
+    { priority: "background" as const, duration: 6000, rest: 10000 },
+  ])("$priority: 所要 $duration ms の後は $rest ms 休む", async ({ priority, duration, rest }) => {
+    vi.useFakeTimers();
+    const capture = vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, duration));
+      return "busy";
+    });
+    const pump = new PanePreviewPump({
+      writer: memoryWriter().writer, capture,
+      pollIntervalMs: priority === "foreground" ? 250 : 1000, priority: () => priority,
+    });
+    pumps.push(pump);
+    pump.start("slow", "codex_terminal");
+    await vi.advanceTimersByTimeAsync(duration + rest - 1);
+    expect(capture).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(capture).toHaveBeenCalledTimes(2);
+    pump.stop();
+    await vi.advanceTimersByTimeAsync(duration);
+  });
+
+  test("ANSI 取得も作業時間に含め、失敗した取得の後も休む", async () => {
+    vi.useFakeTimers();
+    const capture = vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      return "busy";
+    });
+    const captureSuggestion = vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      throw new Error("ANSI failed");
+    });
+    const pump = new PanePreviewPump({ writer: memoryWriter().writer, capture, captureSuggestion });
+    pumps.push(pump);
+    pump.start("ansi");
+    await vi.advanceTimersByTimeAsync(799);
+    expect(capture).toHaveBeenCalledTimes(1);
+    expect(captureSuggestion).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(capture).toHaveBeenCalledTimes(2);
+    pump.stop();
+    await vi.advanceTimersByTimeAsync(100);
+  });
+
+  test("共有枠の順番待ちを取得時間へ加算しない", async () => {
+    vi.useFakeTimers();
+    const limiter = new KeyedLimiter({ maxConcurrent: 1 });
+    const busy = limiter.run("busy", "background", async () => {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    });
+    const capture = vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return "busy";
+    });
+    const pump = new PanePreviewPump({ writer: memoryWriter().writer, capture, limiter });
+    pumps.push(pump);
+    pump.start("waiting", "codex_terminal");
+    await vi.advanceTimersByTimeAsync(1269);
+    await busy;
+    expect(capture).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(capture).toHaveBeenCalledTimes(2);
+  });
+
+  test("通常 capture が失敗しても所要時間の 3 倍休み、次回は回復できる", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const capture = vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      if (capture.mock.calls.length === 1) throw new Error("capture failed");
+      return "recovered";
+    });
+    const { writer, messages } = memoryWriter();
+    const pump = new PanePreviewPump({ writer, capture });
+    pumps.push(pump);
+    pump.start("failure", "codex_terminal");
+    await vi.advanceTimersByTimeAsync(3999);
+    expect(capture).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1001);
+    expect(messages()).toMatchObject([{ type: "pane_preview", active: true, text: "recovered" }]);
+  });
+
+  test("遷移通知から停止した場合も、その後に active フレームを流さない", async () => {
+    vi.useFakeTimers();
+    const { writer, messages } = memoryWriter();
+    const pump = new PanePreviewPump({
+      writer, capture: async () => "⏸ plan mode on (shift+tab to cycle)",
+      onPermissionMode: () => pump.stop(),
+    });
+    pumps.push(pump);
+    pump.start("callback-stop", "claude_status", { emitInitial: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(messages()).toEqual([]);
+  });
+
+  test("停止後に同じ会話を別 pump で再開しても重ならず、古い結果を送らない", async () => {
+    vi.useFakeTimers();
+    const limiter = new KeyedLimiter({ maxConcurrent: 2 });
+    let active = 0;
+    let maximum = 0;
+    const capture = async () => {
+      maximum = Math.max(maximum, ++active);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      active--;
+      return "busy";
+    };
+    const old = memoryWriter();
+    const current = memoryWriter();
+    const first = new PanePreviewPump({ writer: old.writer, capture, limiter });
+    const second = new PanePreviewPump({ writer: current.writer, capture, limiter });
+    pumps.push(first, second);
+    first.start("same", "codex_terminal");
+    first.stop();
+    second.start("same", "codex_terminal");
+    await vi.advanceTimersByTimeAsync(200);
+    expect(maximum).toBe(1);
+    expect(old.messages()).toEqual([]);
+    expect(current.messages()).toMatchObject([{ type: "pane_preview", active: true }]);
+    second.stop();
+    expect(current.messages().at(-1)).toMatchObject({ type: "pane_preview", active: false });
+  });
+
+  test("会話が増えても取得は同時 2 件、待機中の前面昇格を優先し、停止した待ちは捨てる", async () => {
+    vi.useFakeTimers();
+    const limiter = new KeyedLimiter({ maxConcurrent: 2 });
+    const starts: string[] = [];
+    let promoted = false;
+    let active = 0;
+    let maximum = 0;
+    for (const session of ["a", "b", "back", "front", "cancelled"]) {
+      const pump = new PanePreviewPump({
+        writer: memoryWriter().writer, limiter,
+        priority: () => session === "front" && promoted ? "foreground" : "background",
+        capture: async () => {
+          starts.push(session);
+          maximum = Math.max(maximum, ++active);
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+          active--;
+          return "busy";
+        },
+      });
+      pumps.push(pump);
+      pump.start(session, "codex_terminal");
+      if (session === "cancelled") pump.stop();
+    }
+    promoted = true;
+    pumps[3]!.requestRefresh();
+    expect(starts).toEqual(["a", "front"]);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(starts).toEqual(["a", "front", "b", "front"]);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(starts).toEqual(["a", "front", "b", "front", "back"]);
+    expect(maximum).toBe(2);
+    for (const pump of pumps) pump.stop();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(limiter.waiting).toBe(0);
+    expect(limiter.running).toBe(0);
+  });
+});
 
 describe("PanePreviewPump", () => {
   afterEach(() => {

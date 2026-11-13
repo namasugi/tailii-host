@@ -58,7 +58,7 @@ import {
 } from "../sessions/heartbeat.js";
 import { scheduledFromSessionCrons } from "../sessions/cronSchedule.js";
 import { claudePidOfHook } from "../sessions/claudeLiveStatus.js";
-import { ensureHubDaemon } from "../hub/hubDaemon.js";
+import { ensureHubDaemon } from "../hub/hubDaemonClient.js";
 import { decodeHubServerLine, encodeHubMessage, type HubPushEvent } from "../hub/hubProtocol.js";
 import { ObservationLog, defaultObservationBase } from "../shared/observationLog.js";
 import { parsePermissionMode } from "../shared/permissionMode.js";

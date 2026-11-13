@@ -100,6 +100,8 @@ export interface HubPreviewPump {
   stop(): void;
   /** 前面購読者の参加時に、直近の入力待ちフレームを再送する（任意実装）。 */
   resendLastIfInteractive?(): void;
+  /** 前面購読の追加時、一覧用の休止を打ち切って再取得する（任意実装）。 */
+  requestRefresh?(): void;
   /**
    * iPhone が会話を開いた（前面購読が始まった）ときに 1 回だけ、端末側で上へスクロールされた画面を
    * 最新位置へ戻す準備をする（任意実装, jump-to-latest）。以後は次に開くまで Mac 側のスクロールを尊重する。
@@ -146,6 +148,8 @@ export type HubPreviewPumpFactory = (
   onUsageLimitWait?: (state: UsageLimitWaitState | null) => void,
   /** 会話が待機中（処理中でない）か。入力欄に残った文字の通知（input-residue）の条件。 */
   isIdle?: () => boolean,
+  /** 前面購読の有無（取得の順番待ち中にも評価する）。 */
+  isForeground?: () => boolean,
 ) => HubPreviewPump;
 
 export type SessionHubOptions = Omit<ReaperTickOptions, "now"> & {
@@ -1885,6 +1889,7 @@ export class SessionHub {
         ` existing=${actor.subscribers.has(client)} subscribers=${actor.subscribers.size}${resume}`,
     );
     const existing = actor.subscribers.get(client);
+    const previewWasRunning = actor.previewPump !== null;
     if (existing !== undefined) {
       const wasPreview = existing.preview;
       existing.preview = preview;
@@ -1909,6 +1914,7 @@ export class SessionHub {
       // 会話を開き直したとき（pump は一覧 watch で稼働中）、静止した入力待ちダイアログの
       // フレームは変化しないので再送しないと転写カードが出ない。
       if (preview && !wasPreview) {
+        if (previewWasRunning) actor.previewPump?.requestRefresh?.();
         actor.previewPump?.resendLastIfInteractive?.();
         actor.previewPump?.armJumpToLatest?.();
       }
@@ -1952,6 +1958,7 @@ export class SessionHub {
     // 初回 backfill が同期的に多数の行を生成する前に pane capture を開始する。
     this.syncPreview(session, actor);
     if (preview) {
+      if (previewWasRunning) actor.previewPump?.requestRefresh?.();
       actor.previewPump?.resendLastIfInteractive?.();
       actor.previewPump?.armJumpToLatest?.();
     }
@@ -2820,6 +2827,7 @@ export class SessionHub {
       // 今すぐ送信を打っている最中の入力欄も、残り文字とみなさない。
       () => actor.processingSince === null && !actor.chatDrainRunning && actor.questionAnswerInjections === 0 &&
         !actor.sendNowRunning,
+      () => [...actor.subscribers.values()].some((state) => state.preview),
     );
     actor.previewPump = pump;
     pump.start(

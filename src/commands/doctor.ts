@@ -401,6 +401,7 @@ async function collectDarwinQuicChecks(): Promise<DoctorCheck[]> {
  * 「一度も起動していない（runs = 0。ドメインが on-demand-only モードで自動起動が保留され、
  * `launchctl print` は成功するのに `state = not running` のまま。2026-09-18 実機障害）」と
  * 「起動したが終了した（クラッシュ / 即終了。原因はゲートウェイのログにある）」を分ける。
+ * 稼働中は、ジョブが interactive の優先度で動いているか（`spawn type`）も添える。
  */
 export function quicServiceDoctorCheck(state: QuicGatewayServiceState): DoctorCheck {
   const base = { id: "quic-service", label: "QUIC GW 常駐(launchd)", required: false } as const;
@@ -424,10 +425,20 @@ export function quicServiceDoctorCheck(state: QuicGatewayServiceState): DoctorCh
       remediation: "tail -n 50 ~/.tailii/quic-gw.log",
     };
   }
+  const running = `com.tailii.quic-gw 稼働中${state.pid === null ? "" : ` (pid ${state.pid})`}`;
+  // 優先度の指定（plist の ProcessType=Interactive, agent-priority）が載っているジョブに効いているか。
+  // `launchctl print` の `spawn type` が読めないとき（null）は何も足さない。
+  if (state.spawnType === null) return { ...base, ok: true, detail: running };
+  if (state.spawnType === "interactive") {
+    return { ...base, ok: true, detail: `${running}・優先度 interactive` };
+  }
+  // 接続は使えるので ok のまま。古い定義のジョブが載っている（plist を書き換えただけでは launchd は
+  // 読み直さない）ことと、載せ直す方法だけ伝える。
   return {
     ...base,
     ok: true,
-    detail: `com.tailii.quic-gw 稼働中${state.pid === null ? "" : ` (pid ${state.pid})`}`,
+    detail: `${running}・優先度 ${state.spawnType}（古い設定のまま。混雑時に通信が遅れやすい）`,
+    remediation: "tailii setup",
   };
 }
 

@@ -39,14 +39,14 @@ import {
 import { ClaudeSessionStore } from "../sessions/claudeSessionStore.js";
 import { CodexSessionStore, defaultCodexHome } from "../codex/codexSessionStore.js";
 import { defaultListMemoDir, ListMemoFile } from "../sessions/listMemoFile.js";
-import { ensureHubDaemon } from "../hub/hubDaemon.js";
+import { ensureHubDaemonAsync } from "../hub/hubDaemonClient.js";
 import { connectHubSocket, type HubLink } from "../hub/hubClient.js";
 import type { HubClientMessage, HubServerMessage } from "../hub/hubProtocol.js";
 import { defaultHeartbeatDir } from "../sessions/heartbeat.js";
 import { ImageService } from "../chat/imageService.js";
 import type { QuestionEventMessage, SessionProcessingMessage } from "../hub/engineRelaySocket.js";
 import { makeSessionLauncher, type EngineLauncher } from "../commands/launch.js";
-import { LineWriter } from "../shared/lineWriter.js";
+import { StartupImageWriter } from "./startupImageWriter.js";
 import { fetchClaudeModelList, type ClaudeModelListProvider } from "../services/claudeModelCatalog.js";
 import {
   fetchAccountIdentities,
@@ -215,7 +215,7 @@ export async function runEngineCommand(args: string[]): Promise<number> {
 
   // アイドルライフサイクル: kill 判定は Session Hub の周期 tick が担う。
   // engine は heartbeat（判定権威ファイル）の書き手 + Hub 常駐の保証だけを行う。
-  ensureHubDaemon();
+  void ensureHubDaemonAsync();
   // resume 再起動 launcher（kill 済みセッションを記録 cwd で claude --continue 再起動）。
   const resumeLauncher = makeSessionLauncher({
     store,
@@ -456,7 +456,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
   }
 
   // 出力の直列化（Node の Writable は書込順序を保証する）。
-  const writer = new LineWriter(options.output);
+  const writer = new StartupImageWriter(options.output, imageService !== null);
 
   // 採用版（negotiated version）。相手 hello 受信で min を採る。
   const state: EngineState = {
@@ -645,9 +645,17 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
 
     // ---- 1.5 画像 pending を drain し image_available を送出 ----
     if (imageService !== null) {
-      for (const message of await imageService.drainPending()) {
-        writer.write(message);
-      }
+      background.push((async () => {
+        try {
+          await imageService.drainPending((message) => writer.writePending(message));
+        } catch (error) {
+          process.stderr.write(`[tailii-host engine] pending 画像処理失敗: ${String(error)}\n`);
+        }
+        // 入力 EOF 後も出力が生きていれば送る。切断時の未送信 pending は drain 側で保持する。
+        writer.finishPending([]);
+      })().catch((error) => {
+        process.stderr.write(`[tailii-host engine] pending 画像送出失敗: ${String(error)}\n`);
+      }));
     }
 
     // 設問の解決を iOS へ届ける（前面会話= question_dismiss / 別会話= remote_pending_cleared）。
@@ -1239,9 +1247,9 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     } finally {
       rl.close();
     }
-    engineDiag(`engine readLoop EOF（チャネル断）pid=${process.pid}`);
+    engineDiag(`engine readLoop EOF（入力終了）pid=${process.pid}`);
   } finally {
-    // ---- 3. チャネル断で chat_output tail / reaper を確実に停止する（全経路） ----
+    // ---- 3. 入力終了・切断で chat_output tail / reaper を確実に停止する（全経路） ----
     lifecycleAbort.abort();
     state.sessionSearchAbort?.abort();
     for (const abort of state.apiDelegates?.values() ?? []) abort.abort();

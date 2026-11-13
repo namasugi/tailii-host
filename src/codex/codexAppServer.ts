@@ -9,6 +9,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import WebSocket, { type RawData } from "ws";
 import { ensureDirectory0700 } from "../shared/paths.js";
+import { agentClampArgv, withAgentClamp } from "../shared/agentPriority.js";
 import type { CodexCollaborationMode, CodexGoalInfo, CodexModelInfo } from "../protocol.js";
 import {
   defaultCodexAppServerProcessControl,
@@ -2663,8 +2664,24 @@ function activeTurnIdOfTurns(turns: readonly Record<string, unknown>[]): string 
   return null;
 }
 
-function defaultLaunch(executable: string, args: string[], env: NodeJS.ProcessEnv): void {
-  const child = spawn(executable, args, { detached: true, env, stdio: "ignore" });
+/**
+ * App Server の daemon を切り離して起動する（`CodexAppServerManager` の既定の launch）。
+ * Codex のコマンド実行はこの daemon の子になるので、daemon ごと utility の優先度に固定する
+ * （agent-priority。hub / engine のどちらから起動しても、制御側の優先度を引き継がせない）。
+ * taskpolicy は codex を exec するため、daemon の pid とコマンド行（`isOwnLaunchCommand` が照合する
+ * `… app-server --listen <endpoint>`）は付けないときと同じ。
+ */
+export function defaultLaunch(
+  executable: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+): void {
+  const command = withAgentClamp(executable, args, agentClampArgv());
+  const child = spawn(command.executable, command.args, {
+    detached: true,
+    env,
+    stdio: "ignore",
+  });
   child.once("error", () => {
     // readiness probeが最終的な構造化エラーを返すため、EventEmitterの未処理errorだけ防ぐ。
   });
