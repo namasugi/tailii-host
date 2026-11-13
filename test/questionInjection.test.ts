@@ -1,7 +1,15 @@
 // questionInjection.test.ts
 // AskUserQuestion 回答注入の検証（ダイアログ残存の検知と自己修復トリガ）。
 
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
+
+// 注入の手順はキーの間・再描画の待ち（150〜1500ms）を挟む。このファイルは pane を返すスタブだけで順序と
+// 分岐を確かめるので、待ちは実時間で待たない（待たせると 18 件で 16 秒かかる。2026-11-13 実測）。
+vi.mock("../src/shared/sleep.js", () => ({
+  sleep: async () => {},
+  abortableSleep: async () => true,
+}));
+
 import {
   formatQuestionAnswerText, injectQuestionAnswers, isPreviewQuestionFrame, isQuestionDialogFrame, questionDialogVisible,
 } from "../src/hub/questionInjection.js";

@@ -3,7 +3,26 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, onTestFinished, test, vi } from "vitest";
+
+// 本体の `sleep` を、テストごとに「待たない」へ切り替えられるようにする（既定は本物のまま）。
+// 画面を返すスタブだけで手順を確かめるテストが、本番と同じ待ち（数百 ms × 回数）を実時間で待たないため。
+// 待たないときも setImmediate で 1 回イベントループへ戻す（ポーリングが I/O を止めない）。
+const sleepControl = vi.hoisted(() => ({ fast: false }));
+vi.mock("../src/shared/sleep.js", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../src/shared/sleep.js")>();
+  return {
+    ...real,
+    sleep: (ms: number): Promise<void> =>
+      sleepControl.fast ? new Promise<void>((resolve) => setImmediate(resolve)) : real.sleep(ms),
+  };
+});
+/** このテストの間だけ、本体の `sleep` を待たせない。 */
+function skipHostSleeps(): void {
+  sleepControl.fast = true;
+  onTestFinished(() => { sleepControl.fast = false; });
+}
+
 import { sendSessionProcessingToEngine } from "../src/hub/engineRelaySocket.js";
 import { readHeartbeat, writeHeartbeat, type Heartbeat } from "../src/sessions/heartbeat.js";
 import type { EngineLauncher } from "../src/commands/launch.js";
@@ -799,6 +818,9 @@ describe("Engine — アイドルライフサイクル/ページング", () => {
   // MARK: input_residue_action（入力欄に残った文字の送信 / 消去, input-residue）
 
   test("input_residue_action: いまの入力欄がアプリの見た文字と同じときだけ Enter / C-u を打つ", async () => {
+    // 送信の確かめは Enter ごとに 400ms × 最大 3 回読み直す。画面はスタブが即座に返すので待たない
+    // （実時間で待つとこの 1 件で 7 秒かかる。2026-11-13 実測）。
+    skipHostSleeps();
     const rule = "─".repeat(40);
     const state = { input: "1" };
     const screen = () => ["⏺ 前の応答", rule, `❯ ${state.input}`, rule, "  ⏵⏵ auto mode on"].join("\n");
