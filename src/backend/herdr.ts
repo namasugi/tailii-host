@@ -21,6 +21,7 @@ import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { socketHerdrCommandRunner } from "./herdrSocket.js";
 import { PROTOCOL_V1, type ControlMessage, type SessionInfo } from "../protocol.js";
 import { scrollBottomKeyIsDefault } from "../shared/claudeKeybindings.js";
 import {
@@ -124,7 +125,7 @@ export function herdrInstalled(herdrPath: string = defaultHerdrPath()): boolean 
 }
 
 /** herdr コマンドの上限。無期限待ちが read loop / tick ループを止めるのを防ぐ。 */
-const HERDR_TIMEOUT_MS = 15_000;
+export const HERDR_TIMEOUT_MS = 15_000;
 
 /**
  * 起動直後の生存判定猶予（秒）。`tab create` → pane の初期シェル → `exec zsh -lc` → claude exec
@@ -181,6 +182,18 @@ export function processHerdrCommandRunner(
         },
       );
     });
+}
+
+/** 既定は socket を試し、未対応・不通時だけ従来の CLI へ戻す。偽 runner の注入は通さない。 */
+export function defaultHerdrCommandRunner(
+  herdrPath: string = defaultHerdrPath(),
+  sessionName: string = HERDR_TAILII_SESSION,
+  timeoutMs: number = HERDR_TIMEOUT_MS,
+): HerdrCommandRunner {
+  return socketHerdrCommandRunner(
+    (args, remainingMs) => processHerdrCommandRunner(herdrPath, sessionName, remainingMs)(args),
+    { sessionName, timeoutMs },
+  );
 }
 
 /**
@@ -555,7 +568,7 @@ export class HerdrSessionManager {
     loginSettleMs?: number;
     now?: () => number;
   } = {}) {
-    this.runner = options.runner ?? processHerdrCommandRunner();
+    this.runner = options.runner ?? defaultHerdrCommandRunner();
     this.store = options.store ?? new SessionMetadataStore();
     this.captureLines = options.captureLines ?? 50;
     this.protocolVersion = options.protocolVersion ?? PROTOCOL_V1;

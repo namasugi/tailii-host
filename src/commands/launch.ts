@@ -11,7 +11,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { CodexAppServerManager, type CodexThreadStartOptions } from "../codex/codexAppServer.js";
+import { socketHerdrCommandRunner } from "../backend/herdrSocket.js";
 import {
+  HERDR_TIMEOUT_MS,
+  type HerdrCommandResult,
   HERDR_LAUNCH_GRACE_SECONDS,
   HERDR_RESTART_NEEDED_MESSAGE,
   HERDR_TAILII_SESSION,
@@ -281,13 +284,13 @@ export type ProcessRunner = (
   options: { cwd?: string; env?: NodeJS.ProcessEnv },
 ) => Promise<{ exitCode: number; stdout: string; stderr?: string }>;
 
-function defaultProcessRunner(): ProcessRunner {
-  return (executable, args, options) =>
+function defaultProcessRunner(herdrPath: string = defaultHerdrPath()): ProcessRunner {
+  const cli = (executable: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv }, timeout?: number): Promise<HerdrCommandResult> =>
     new Promise((resolve, reject) => {
       execFile(
         executable,
         args,
-        { cwd: options.cwd, env: options.env, maxBuffer: 16 * 1024 * 1024 },
+        { cwd: options.cwd, env: options.env, maxBuffer: 16 * 1024 * 1024, timeout },
         (error, stdout, stderr) => {
           if (error && typeof (error as NodeJS.ErrnoException).code === "string") {
             reject(error);
@@ -298,6 +301,16 @@ function defaultProcessRunner(): ProcessRunner {
         },
       );
     });
+  return (executable, args, options) => {
+    if (executable !== herdrPath || args[0] !== "--session" || args[1] === undefined) {
+      return cli(executable, args, options);
+    }
+    const sessionName = args[1];
+    return socketHerdrCommandRunner(
+      (commandArgs, remainingMs) => cli(executable, ["--session", sessionName, ...commandArgs], options, remainingMs),
+      { sessionName, timeoutMs: HERDR_TIMEOUT_MS, env: options.env },
+    )(args.slice(2));
+  };
 }
 
 /** launch サブコマンドのエントリポイント（`--dir <path> --session <name>`）。 */
@@ -373,7 +386,7 @@ export function makeSessionLauncher(options: {
   const backendOption = options.backend ?? "tmux";
   const herdr = options.herdrPath ?? defaultHerdrPath();
   const binary = currentBinaryPath();
-  const runner = options.runner ?? defaultProcessRunner();
+  const runner = options.runner ?? defaultProcessRunner(herdr);
   const codexAppServer =
     agent === "codex" ? (options.codexAppServer ?? new CodexAppServerManager()) : null;
   return async (cwd, name, baseDir, resumeSessionId, newSessionId, title, launchOptions) => {
@@ -657,7 +670,7 @@ export async function launchCore(options: {
 }): Promise<number> {
   const { session, binaryPath, tmuxPath, store, now, errorSink } = options;
   const agent: LaunchAgent = options.agent ?? "claude";
-  const runner = options.runner ?? defaultProcessRunner();
+  const runner = options.runner ?? defaultProcessRunner(options.herdrPath ?? defaultHerdrPath());
 
   // --- 1. cwd 解決 + base 配下限定自動作成 ---
   const dir = resolveWorkdir(options.dir, options.baseDir, errorSink);
