@@ -18,6 +18,7 @@ import type { ToolActivity } from "../protocol.js";
 import { rolloutResponseItemToolActivities } from "../codex/codexToolActivity.js";
 import { isCompressedRollout, isRolloutFileName, readCompressedRollout, readRolloutHead } from "../codex/rolloutFile.js";
 import { claudeProcessAlive, defaultClaudeSessionsDir, readClaudeLiveRecords } from "../sessions/claudeLiveStatus.js";
+import { CodexCompanionJobs } from "./codexCompanionJobs.js";
 import type { ProcessProbeExec } from "./subagentTailer.js";
 
 /** 差し替えたプローブが signal を扱わなくても、取消後は巡回を先へ進めない。 */
@@ -77,6 +78,10 @@ export interface BashCall {
   endMs: number | null;
   /** invokesCodex(command) を先に求めてあれば、その値（毎回の字句解析を省く）。 */
   codex?: boolean;
+  /** Codex プラグインの起動 ack に含まれるジョブ ID（状態照会の出力は含めない）。 */
+  companionJobId?: string;
+  /** サブエージェント経由の委任を本会話にも表示するための、祖先 Agent の tool_use ID。 */
+  cardToolUseId?: string;
 }
 
 // MARK: - シェルの字句解析（最小限）
@@ -280,6 +285,19 @@ export function invokesCodex(command: string): boolean {
   return false;
 }
 
+/** プラグインの実行コマンドと起動 ack がそろったときだけジョブ ID を採る。 */
+export function companionJobIdFromAck(command: string, text: string): string | undefined {
+  const match = /^Codex [^\n]+ started in the background as ([A-Za-z0-9_-]+)\./.exec(text.trim());
+  if (match === null) return undefined;
+  for (const words of simpleCommands(lexShell(command))) {
+    const head = words[commandWordIndex(words)];
+    if (head === undefined || NON_LAUNCHING_COMMANDS.has(path.basename(head.value))) continue;
+    if (words.some((word, i) => path.basename(word.value) === "codex-companion.mjs"
+      && ["task", "review", "adversarial-review"].includes(words[i + 1]?.value ?? ""))) return match[1];
+  }
+  return undefined;
+}
+
 /**
  * 作業フォルダの候補: 行の `cwd`、コマンド中の `cd <パス>`（相対はその時点のフォルダから解決。変数を含むものは
  * 以後不明）、`codex` の `-C` / `--cd`。返す値は normalizeDir 済み。
@@ -379,6 +397,7 @@ export class ExecRolloutIndex {
   readonly sessionsRoot: string;
   private readonly home: string;
   private readonly metaByPath = new Map<string, ExecRolloutMeta | null>();
+  private readonly companionMetaByPath = new Map<string, ExecRolloutMeta | null>();
   private readonly dirListing = new Map<string, { mtimeMs: number; names: string[] }>();
 
   constructor(codexHome: string, home: string) {
@@ -421,16 +440,45 @@ export class ExecRolloutIndex {
   }
 
   /** 先頭行の読み取り（`exec` 以外・読めないものは null。結果はパスごとに覚える）。 */
-  meta(file: string): ExecRolloutMeta | null {
-    const hit = this.metaByPath.get(file);
-    if (hit !== undefined) return hit;
-    const meta = readExecMeta(file, this.home);
+  meta(file: string, allowCompanion = false): ExecRolloutMeta | null {
+    const cache = allowCompanion ? this.companionMetaByPath : this.metaByPath;
+    const hit = cache.get(file);
+    // プラグインの記録は起動 ack の後から出現する。書き途中の先頭行で null を固定しない。
+    if (hit !== undefined && !(allowCompanion && hit === null)) return hit;
+    const meta = readExecMeta(file, this.home, allowCompanion);
     // 書き始めの空ファイル（先頭行がまだ無い）は覚えない。
     if (meta !== null || fileSize(file) > 0) {
-      if (this.metaByPath.size > 20_000) this.metaByPath.clear();
-      this.metaByPath.set(file, meta);
+      if (cache.size > 20_000) cache.clear();
+      cache.set(file, meta);
     }
     return meta;
+  }
+
+  /** ジョブが明示した会話 ID だけを探す。再開された古い記録も、本文を総読みせず名前で探す。 */
+  companionRollout(id: string): ExecRolloutMeta | null {
+    if (!/^[A-Za-z0-9_-]+$/.test(id)) return null;
+    let years: string[];
+    try { years = fs.readdirSync(this.sessionsRoot).filter((name) => /^\d{4}$/.test(name)); }
+    catch { return null; }
+    for (const year of years) {
+      let months: string[];
+      try { months = fs.readdirSync(path.join(this.sessionsRoot, year)).filter((name) => /^\d{2}$/.test(name)); }
+      catch { continue; }
+      for (const month of months) {
+        let days: string[];
+        try { days = fs.readdirSync(path.join(this.sessionsRoot, year, month)).filter((name) => /^\d{2}$/.test(name)); }
+        catch { continue; }
+        for (const day of days) {
+          const dir = path.join(this.sessionsRoot, year, month, day);
+          for (const name of this.list(dir)) {
+            if (!name.endsWith(`-${id}.jsonl`) && !name.endsWith(`-${id}.jsonl.zst`)) continue;
+            const meta = this.meta(path.join(dir, name), true);
+            if (meta?.id === id) return meta;
+          }
+        }
+      }
+    }
+    return null;
   }
 
   private list(dir: string): string[] {
@@ -462,7 +510,7 @@ function fileSize(file: string): number {
 }
 
 /** 記録の先頭行から `exec` 由来のメタを読む（それ以外は null）。 */
-export function readExecMeta(file: string, home: string = os.homedir()): ExecRolloutMeta | null {
+export function readExecMeta(file: string, home: string = os.homedir(), allowCompanion = false): ExecRolloutMeta | null {
   try {
     const head = readRolloutHead(file, META_READ_LIMIT_BYTES, (partial) => partial.includes(0x0a));
     const nl = head.indexOf(0x0a);
@@ -470,7 +518,8 @@ export function readExecMeta(file: string, home: string = os.homedir()): ExecRol
     const record = JSON.parse(head.subarray(0, nl).toString("utf8")) as Record<string, unknown>;
     if (record["type"] !== "session_meta") return null;
     const payload = asRecord(record["payload"]);
-    if (payload === null || payload["source"] !== "exec") return null;
+    if (payload === null || (payload["source"] !== "exec"
+      && !(allowCompanion && payload["originator"] === "Claude Code"))) return null;
     const id = payload["id"];
     const cwd = payload["cwd"];
     const timestamp = typeof payload["timestamp"] === "string" ? Date.parse(payload["timestamp"]) : Number.NaN;
@@ -1156,6 +1205,8 @@ export interface CodexExecLinkerOptions {
   intervalMs?: number;
   /** Claude の登録簿（既定 `~/.claude/sessions`。`CLAUDE_CONFIG_DIR` / `TAILII_CLAUDE_SESSIONS_DIR` に従う）。 */
   claudeSessionsDir?: string;
+  /** Codex プラグインの state ディレクトリ（テスト・独自配置用）。 */
+  companionStateDir?: string;
   /** 登録簿の pid の生存と起動時刻の一致（既定 claudeProcessAlive）。 */
   processAlive?: (pid: number, procStart: string | null, signal?: AbortSignal) => boolean | Promise<boolean>;
 }
@@ -1179,6 +1230,7 @@ export class CodexExecLinker {
   private readonly observerFactory: () => CodexExecObserver;
   private generation = 0;
   private evaluationAbort: AbortController | null = null;
+  private readonly companionJobs: CodexCompanionJobs;
   private readonly statusProbes = new Map<string, { nextAtMs: number; open: boolean | null; size: number; mtimeMs: number }>();
   private readonly pathsByNodeId = new Map<string, string>();
   private nextEvalMs = Number.NEGATIVE_INFINITY;
@@ -1203,6 +1255,10 @@ export class CodexExecLinker {
         signal,
       ).catch(() => true)),
     });
+    const claudeDir = options.claudeSessionsDir !== undefined ? path.dirname(options.claudeSessionsDir)
+      : process.env["CLAUDE_CONFIG_DIR"] || path.join(this.home, ".claude");
+    this.companionJobs = new CodexCompanionJobs(options.companionStateDir
+      ?? path.join(claudeDir, "plugins", "data", "codex-openai-codex", "state"));
     this.observer = this.observerFactory();
   }
 
@@ -1306,7 +1362,7 @@ export class CodexExecLinker {
     }
 
     // 控え: この会話の分は規則より優先、別の会話の分は規則でも付けない。
-    const assigned = new Map<string, { path: string; toolUseId: string; owner: string }>();
+    const assigned = new Map<string, { path: string; toolUseId: string; owner: string; companion?: boolean }>();
     const excluded = new Set<string>();
     for (const link of this.links.load()) {
       if (link.claudeSessionId !== input.sessionId) {
@@ -1316,6 +1372,20 @@ export class CodexExecLinker {
       const call = callsById.get(link.toolUseId);
       if (call === undefined) continue;
       assigned.set(link.rolloutId, { path: link.rolloutPath, toolUseId: call.toolUseId, owner: call.owner });
+    }
+    // プラグインは app-server 経由で、Bash が返った後も動く。時間・cwd の推測に混ぜず、
+    // 起動 ack → ジョブ ID → 親会話 ID と threadId → 記録 ID の明示的な対応だけを使う。
+    for (const call of input.calls) {
+      if (call.companionJobId === undefined) continue;
+      const job = this.companionJobs.read(call.companionJobId, input.sessionId);
+      if (job === null || excluded.has(job.threadId)) continue;
+      const knownPath = this.pathsByNodeId.get(`${CODEX_EXEC_NODE_PREFIX}${job.threadId}`);
+      const knownFile = knownPath === undefined ? null : existingRolloutPath(knownPath);
+      const meta = knownFile === null ? this.index.companionRollout(job.threadId) : this.index.meta(knownFile, true);
+      if (meta === null) continue;
+      assigned.set(job.threadId, {
+        path: meta.path, toolUseId: call.cardToolUseId ?? call.toolUseId, owner: call.owner, companion: true,
+      });
     }
     for (const id of assigned.keys()) excluded.add(id);
     for (const match of matchByRules(input.calls, this.index, { nowMs, home: this.home, excludedIds: excluded })) {
@@ -1329,7 +1399,7 @@ export class CodexExecLinker {
       this.checkGeneration(signal, generation);
       const file = existingRolloutPath(entry.path);
       if (file === null) continue;
-      const meta = this.index.meta(file);
+      const meta = this.index.meta(file, entry.companion);
       const initialSummary = this.summaries.summary(file);
       if (meta === null || initialSummary === null) continue;
       const { status, summary } = await this.status(file, initialSummary, nowMs, signal, generation);

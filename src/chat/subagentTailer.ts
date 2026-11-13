@@ -12,7 +12,7 @@ import { injectedReminderBodies } from "../shared/harnessReminder.js";
 import { abortableSleep } from "../shared/sleep.js";
 import { isApiRequestBlobLine } from "../shared/transcriptRecord.js";
 import { processBackgroundStopRecords, type BackgroundStopRecords } from "./backgroundStopRecords.js";
-import { CodexExecLinker, invokesCodex, type BashCall, type CodexExecRun } from "./codexExecLinker.js";
+import { CodexExecLinker, companionJobIdFromAck, invokesCodex, type BashCall, type CodexExecRun } from "./codexExecLinker.js";
 import { extractToolActivities, TranscriptTailer } from "./transcriptTailer.js";
 
 /** 1 回に読む transcript の上限。超えたらイベントループへ譲ってから続きを読む。 */
@@ -182,6 +182,7 @@ interface BashObservation {
   resultMs: number | null;
   /** 背景へ回った Bash の taskId（終わりは完了通知・孤児判定の時刻）。 */
   bgTaskId: string | null;
+  companionJobId?: string;
 }
 
 interface BackgroundCommand {
@@ -446,6 +447,7 @@ export class SubagentTailer {
               const bash = read.state.bashByToolUseId.get(hit.id);
               if (bash !== undefined) {
                 bash.resultMs = hit.ts ?? lineTs;
+                bash.companionJobId = companionJobIdFromAck(bash.command, hit.text);
                 if (launch !== null && spawn !== undefined && (spawn.background || launch.confirmed)) bash.bgTaskId = launch.taskId;
               }
               if (launch !== null && spawn !== undefined && (spawn.background || launch.confirmed)) {
@@ -904,9 +906,26 @@ export class SubagentTailer {
           }
           // 死亡確定のセッションで結果の無い Bash（中断等）は、最後の活動で終わったとみなす。
           if (endMs === null && sessionAlive === false && lastActivityTsMs !== null) endMs = lastActivityTsMs;
+          // プラグインの仲介 Agent は起動直後に完了する。実際の Codex はその子として追い、
+          // 会話内のカードは本会話に存在する祖先 Agent の行に付ける。
+          let cardToolUseId: string | undefined;
+          if (bash.companionJobId !== undefined) {
+            let ancestor = tracked.get(bash.owner);
+            const visited = new Set<string>();
+            while (ancestor !== undefined && !visited.has(ancestor.nodeId)) {
+              visited.add(ancestor.nodeId);
+              const parent = ownerOf(ancestor);
+              if (parent === "root") {
+                cardToolUseId = ancestor.meta.toolUseId ?? undefined;
+                break;
+              }
+              ancestor = parent === undefined ? undefined : tracked.get(parent);
+            }
+          }
           calls.push({
             toolUseId: bash.toolUseId, owner: bash.owner, command: bash.command, codex: bash.codex,
             cwd: bash.cwd, startMs: bash.startMs, endMs,
+            companionJobId: bash.companionJobId, cardToolUseId,
           });
         }
         // この評価にも生存プローブがある。継続配信は待たせず、結果だけ次の巡回で取り込む。
@@ -1198,6 +1217,7 @@ function extractSpawnToolUseIds(line: string): string[] {
 
 interface ToolResultExtract {
   id: string;
+  text: string;
   isError: boolean;
   ts: number | null;
   asyncLaunch: boolean;
@@ -1243,6 +1263,7 @@ function extractToolResults(line: string): ToolResultExtract[] {
     const stopMatch = /Successfully stopped task: ([A-Za-z0-9_-]+)/.exec(text);
     out.push({
       id: rec["tool_use_id"],
+      text,
       isError: rec["is_error"] === true,
       ts,
       asyncLaunch: text.startsWith("Async agent launched successfully"),

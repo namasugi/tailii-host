@@ -1244,6 +1244,17 @@ export function extractToolActivities(content: unknown): ToolActivity[] {
 
 function makeToolActivity(id: string, name: string, input: Record<string, unknown>): ToolActivity {
   switch (name) {
+    case "Agent":
+    case "Task": {
+      const prompt = cap(str(input["prompt"]), MAX_COMMAND_CHARACTERS);
+      const description = cap(str(input["description"]), MAX_DESCRIPTION_CHARACTERS);
+      return {
+        id, name, label: nonEmpty(description.value) ?? `実行済み ${name}`,
+        ...(prompt.value !== null ? { command: prompt.value } : {}),
+        ...(description.value !== null ? { description: description.value } : {}),
+        commandTruncated: prompt.truncated, descriptionTruncated: description.truncated,
+      };
+    }
     case "Bash": {
       const commandCap = cap(str(input["command"]), MAX_COMMAND_CHARACTERS);
       const descriptionCap = cap(str(input["description"]), MAX_DESCRIPTION_CHARACTERS);

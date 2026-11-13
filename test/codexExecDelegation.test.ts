@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, test, vi } from "vitest";
 import {
   candidateWorkDirs,
+  companionJobIdFromAck,
   CodexExecLinker,
   CodexExecLinkStore,
   ExecRolloutIndex,
@@ -21,6 +22,7 @@ import {
   type CodexExecLink,
 } from "../src/chat/codexExecLinker.js";
 import { SubagentTailer, type ProcessProbeExec } from "../src/chat/subagentTailer.js";
+import { extractToolActivities } from "../src/chat/transcriptTailer.js";
 import { parseCodexExecTranscript, readCodexExecTranscript } from "../src/chat/subagentTranscript.js";
 import { CodexSessionStore } from "../src/codex/codexSessionStore.js";
 import { decodeControlMessage, encodeControlMessage, type ControlMessage, type SubagentNode } from "../src/protocol.js";
@@ -46,6 +48,7 @@ interface RolloutSpec {
   cwd: string;
   startMs: number;
   source?: unknown;
+  originator?: string;
   request?: string | null;
   /** 旧形式（event_msg/user_message）で依頼文を書く。 */
   legacyUserMessage?: boolean;
@@ -66,7 +69,7 @@ function rolloutLines(spec: RolloutSpec): Record<string, unknown>[] {
   const lines: Record<string, unknown>[] = [
     {
       timestamp: iso(t + 900), type: "session_meta",
-      payload: { id: spec.id, timestamp: iso(t), cwd: spec.cwd, originator: "codex_exec", cli_version: "0.167.0", source: spec.source ?? "exec" },
+      payload: { id: spec.id, timestamp: iso(t), cwd: spec.cwd, originator: spec.originator ?? "codex_exec", cli_version: "0.167.0", source: spec.source ?? "exec" },
     },
     { timestamp: iso(t + 901), type: "event_msg", payload: { type: "task_started" } },
     { timestamp: iso(t + 1000), type: "response_item", payload: { type: "message", role: "developer", content: [{ type: "input_text", text: "You are Codex" }] } },
@@ -916,6 +919,129 @@ describe("実行中の観測（ps / lsof）", () => {
 });
 
 // MARK: - tailer からノードとして流す
+
+describe("Codex プラグインの委任", () => {
+  const ack = "Codex Task started in the background as task-test-123. Check /codex:status task-test-123 for progress.";
+  const command = 'node "/plugins/codex/1.0.5/scripts/codex-companion.mjs" task --background --write "依頼"';
+
+  test.each(["Agent", "Task"])("%s のカードから元の依頼文を読める", (name) => {
+    const activities = extractToolActivities([{
+      type: "tool_use", id: "launch-agent", name,
+      input: { description: "エフェクト確認", prompt: "実際の属性エフェクトを確認できるようにして" },
+    }]);
+    expect(activities).toEqual([{
+      id: "launch-agent", name, label: "エフェクト確認", description: "エフェクト確認",
+      command: "実際の属性エフェクトを確認できるようにして", commandTruncated: false, descriptionTruncated: false,
+    }]);
+  });
+
+  function setup() {
+    const home = makeTempDir("cx-companion");
+    const codexHome = path.join(home, ".codex");
+    const stateDir = path.join(home, ".claude/plugins/data/codex-openai-codex/state");
+    const jobsDir = path.join(stateDir, "repo-hash/jobs");
+    fs.mkdirSync(jobsDir, { recursive: true });
+    const jobFile = path.join(jobsDir, "task-test-123.json");
+    const writeJob = (patch: Record<string, unknown> = {}) => fs.writeFileSync(jobFile, JSON.stringify({
+      id: "task-test-123", sessionId: "parent-session", threadId: "plugin-run", status: "running", ...patch,
+    }));
+    const { exec, calls: probes } = fakeExec({ lsof: () => null });
+    const linker = new CodexExecLinker({ home, codexHome, exec, intervalMs: 0, now: () => T0 + 3600_000 });
+    const call: BashCall = {
+      toolUseId: "launch-bash", owner: "wrapper", command, cwd: home, startMs: T0, endMs: T0 + 900,
+      companionJobId: "task-test-123", cardToolUseId: "launch-agent",
+    };
+    return { home, codexHome, jobFile, writeJob, linker, call, probes };
+  }
+
+  test("引用されたスクリプトの起動 ack を読むが、status・cat・文中の引用は起動にしない", () => {
+    expect(companionJobIdFromAck(command, ack)).toBe("task-test-123");
+    expect(companionJobIdFromAck(command.replace(" task ", " status "), ack)).toBeUndefined();
+    expect(companionJobIdFromAck(`cat /scripts/codex-companion.mjs task`, ack)).toBeUndefined();
+    expect(companionJobIdFromAck(`echo '${command}'`, ack)).toBeUndefined();
+    expect(companionJobIdFromAck(command, `Log: ${ack}`)).toBeUndefined();
+    expect(companionJobIdFromAck(command, "# Codex Job Status\n- task-test-123 | running")).toBeUndefined();
+  });
+
+  test.each([false, true])("Bash の終了後もプラグインの記録を開き、古い running 状態より記録の完了を優先する（圧縮=%s）", async (compressed) => {
+    const s = setup();
+    s.writeJob();
+    const file = writeRollout(s.codexHome, {
+      id: "plugin-run", cwd: s.home, startMs: T0 + 2_000, source: "vscode", originator: "Claude Code",
+      request: "属性・状態異常のエフェクトを確認", compressed,
+    });
+    // 同じ cwd・同じ時刻の他のプラグイン / 通常の Codex に取り違えない。
+    writeRollout(s.codexHome, { id: "unrelated", cwd: s.home, startMs: T0 + 2_010, source: "vscode", originator: "Claude Code" });
+    const runs = await s.linker.evaluate({ sessionId: "parent-session", calls: [s.call], sessionAlive: false });
+    expect(runs).toMatchObject([{
+      rolloutId: "plugin-run", toolUseId: "launch-agent", owner: "wrapper", status: "completed",
+      label: "属性・状態異常のエフェクトを確認",
+    }]);
+    expect(s.linker.rolloutPath("codex-exec:plugin-run")).toBe(file);
+    expect(readCodexExecTranscript(file).entries.some((entry) => entry.text === "属性・状態異常のエフェクトを確認")).toBe(true);
+    expect(s.linker.index.candidates(T0, T0 + 10_000)).toEqual([]);
+  });
+
+  test("threadId の到着と記録の出現を待ち、再開された古い記録も正確な ID で見つける", async () => {
+    const s = setup();
+    s.writeJob({ threadId: null });
+    const input = { sessionId: "parent-session", calls: [s.call], sessionAlive: false };
+    expect(await s.linker.evaluate(input)).toEqual([]);
+    s.writeJob();
+    expect(await s.linker.evaluate(input)).toEqual([]);
+    const oldStart = T0 - 30 * 86400_000;
+    const file = rolloutLocation(path.join(s.codexHome, "sessions"), oldStart, "plugin-run");
+    fs.writeFileSync(file, '{"type":"session_meta"');
+    expect(await s.linker.evaluate(input)).toEqual([]);
+    writeRollout(s.codexHome, { id: "plugin-run", cwd: s.home, startMs: oldStart, source: "vscode", originator: "Claude Code", terminal: "aborted" });
+    expect(await s.linker.evaluate(input)).toMatchObject([{ rolloutId: "plugin-run", status: "error" }]);
+  });
+
+  test("別会話のジョブ・壊れたジョブ・通常の Desktop の記録は付けない", async () => {
+    const s = setup();
+    writeRollout(s.codexHome, { id: "plugin-run", cwd: s.home, startMs: T0, source: "vscode", originator: "Codex Desktop" });
+    const input = { sessionId: "parent-session", calls: [s.call], sessionAlive: false };
+    s.writeJob({ sessionId: "another-session" });
+    expect(await s.linker.evaluate(input)).toEqual([]);
+    fs.writeFileSync(s.jobFile, "{");
+    expect(await s.linker.evaluate(input)).toEqual([]);
+    s.writeJob();
+    expect(await s.linker.evaluate(input)).toEqual([]);
+  });
+
+  test("仲介 Agent が完了した後も Codex を木に流し、本会話の Agent 行へカードを対応づける", async () => {
+    const s = setup();
+    s.writeJob();
+    writeRollout(s.codexHome, { id: "plugin-run", cwd: s.home, startMs: T0 + 2_000, source: "vscode", originator: "Claude Code", terminal: null });
+    const main = path.join(s.home, "parent-session.jsonl");
+    const subDir = path.join(s.home, "parent-session/subagents");
+    fs.mkdirSync(subDir, { recursive: true });
+    const lines = [
+      { timestamp: iso(T0 - 1000), message: { role: "assistant", content: [{ type: "tool_use", id: "launch-agent", name: "Agent", input: { subagent_type: "codex:codex-rescue", description: "エフェクト確認" } }] } },
+      { timestamp: iso(T0 + 1000), message: { role: "user", content: [{ type: "tool_result", tool_use_id: "launch-agent", content: "Codex へ引き継ぎました" }] } },
+    ];
+    fs.writeFileSync(main, lines.map((line) => JSON.stringify(line)).join("\n") + "\n");
+    fs.writeFileSync(path.join(subDir, "agent-wrapper.meta.json"), JSON.stringify({
+      agentType: "codex:codex-rescue", description: "エフェクト確認", toolUseId: "launch-agent", spawnDepth: 1,
+    }));
+    fs.writeFileSync(path.join(subDir, "agent-wrapper.jsonl"), [
+      ...bashLines({ id: "launch-bash", command, cwd: s.home, startMs: T0 }),
+      { timestamp: iso(T0 + 900), message: { role: "user", content: [{ type: "tool_result", tool_use_id: "launch-bash", content: ack }] } },
+    ].map((line) => JSON.stringify(line)).join("\n") + "\n");
+    // lsof が判定不能なら実行中。親 Claude の死亡や仲介 Agent の完了では終了させない。
+    const unknownExec = fakeExec({}).exec;
+    const makeTailer = () => new SubagentTailer({
+      tailIndefinitely: false, probeSessionAlive: async () => false,
+      codexExecLinker: new CodexExecLinker({ home: s.home, codexHome: s.codexHome, exec: unknownExec, intervalMs: 0 }),
+    });
+    const nodes = await collectNodes(makeTailer(), main);
+    expect(nodes).toMatchObject([{
+      nodeId: "codex-exec:plugin-run", toolUseId: "launch-agent", parentNodeId: "wrapper", depth: 2,
+      agentType: "Codex", kind: "codex_exec", status: "running",
+    }]);
+    expect(await collectNodes(makeTailer(), main)).toEqual(nodes);
+  });
+});
 
 describe("SubagentTailer: Codex の実行をノードとして流す", () => {
   function setup(name: string): { home: string; repo: string; codexHome: string; project: string; linker: () => CodexExecLinker } {
