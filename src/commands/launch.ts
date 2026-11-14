@@ -270,8 +270,21 @@ export type EngineLauncher = (
      * その worktree パスで記録する。inner コマンド自体は起動時に `claudeInnerCommand` で組む。
      */
     worktree?: string | null;
+    /**
+     * 他所で動いている同じ会話を終了させて開き直す（peer-takeover）。`terminate` は起動の直前（herdr なら新しい pane を
+     * 作って名前を付けた後）に呼ぶ。false なら起動しない。相手が herdr のタブなら、その herdr セッション・ワークスペースへ。
+     */
+    takeover?: LaunchTakeover | null;
   },
 ) => Promise<{ exitCode: number; errorText: string; providerSessionId?: string }>;
+
+/** 開き直しの起動先と、相手を終了させる手順（peer-takeover）。 */
+export interface LaunchTakeover {
+  /** 相手が herdr のタブなら、その herdr セッションと pane（同じワークスペースに新しいタブを作る）。 */
+  herdr: { session: string; paneId: string } | null;
+  /** 相手を終了させ、終わったのを確かめる。false なら起動しない。 */
+  terminate: () => Promise<boolean>;
+}
 
 /** makeSessionLauncher が必要とする共有App Serverの最小境界。 */
 export interface CodexAppServerRuntime {
@@ -509,9 +522,18 @@ export function makeSessionLauncher(options: {
       baseDir: effectiveBaseDir,
       binaryPath: binary,
       tmuxPath: tmux,
-      backend: typeof backendOption === "function" ? backendOption() : backendOption,
-      herdrSession:
-        typeof options.herdrSession === "function" ? options.herdrSession() : options.herdrSession ?? HERDR_DEFAULT_SESSION,
+      // 開き直しで相手が herdr のタブなら、設定に関係なくその herdr セッションへ（同じ場所で続ける）。
+      backend: launchOptions?.takeover?.herdr != null
+        ? "herdr"
+        : typeof backendOption === "function" ? backendOption() : backendOption,
+      herdrSession: launchOptions?.takeover?.herdr?.session ??
+        (typeof options.herdrSession === "function" ? options.herdrSession() : options.herdrSession ?? HERDR_DEFAULT_SESSION),
+      ...(launchOptions?.takeover != null
+        ? {
+            beforeRun: launchOptions.takeover.terminate,
+            ...(launchOptions.takeover.herdr !== null ? { herdrPlacementPaneId: launchOptions.takeover.herdr.paneId } : {}),
+          }
+        : {}),
       herdrPath: herdr,
       innerCommand: effectiveInner,
       outputStyle: launchOptions?.outputStyle ?? null,
@@ -653,6 +675,13 @@ export async function launchCore(options: {
   backend?: SessionBackendKind;
   /** 新しい会話を入れる herdr セッション名（backend=herdr のときのみ使用。既定は herdr の `default`）。 */
   herdrSession?: string;
+  /**
+   * 起動の直前に呼ぶ（peer-takeover の相手の終了）。herdr は新しい pane を作って名前を付けた後、tmux は起動の前。
+   * false なら起動しない（作った pane は閉じる）。
+   */
+  beforeRun?: () => Promise<boolean>;
+  /** herdr: この pane と同じワークスペースに新しいタブを作る（peer-takeover の相手のタブ）。 */
+  herdrPlacementPaneId?: string;
   /** herdr 実行ファイルの絶対パス（backend=herdr のときのみ使用）。 */
   herdrPath?: string | null;
   /** detached プロセス起動の注入点（herdr tailii セッションサーバーの ensure 用, テスト注入可）。 */
@@ -744,6 +773,8 @@ export async function launchCore(options: {
       agent,
       herdrPath: options.herdrPath ?? defaultHerdrPath(),
       herdrSession: options.herdrSession ?? HERDR_DEFAULT_SESSION,
+      ...(options.beforeRun !== undefined ? { beforeRun: options.beforeRun } : {}),
+      ...(options.herdrPlacementPaneId !== undefined ? { placementPaneId: options.herdrPlacementPaneId } : {}),
       injectedPath: options.path,
       env,
       runner,
@@ -772,6 +803,11 @@ export async function launchCore(options: {
       return { code: 127, out: "" };
     }
   };
+  // 開き直し（peer-takeover）: tmux は作成と起動が 1 手なので、起動の前に相手を終了させる。
+  if (options.beforeRun !== undefined && !await options.beforeRun()) {
+    errorSink("tailii launch: 他所で動いている同じ会話を終了できませんでした（起動していません）\n");
+    return 1;
+  }
 
   // --- 2.5. 既存の「死んだ」同名セッションを掃除する（同名再利用を可能にする） ---
   // herdr と違い起動直後の猶予は設けない: tmux は `new-session -d -s <name> '<inner>'` で
@@ -931,6 +967,10 @@ async function launchHerdrPane(options: {
   herdrPath: string;
   /** 新しい会話を入れる herdr セッション名（設定値）。前の pane が別のセッションで生きていればそちらを使う。 */
   herdrSession: string;
+  /** 新しい pane を作って名前を付けた後、`pane run` の前に呼ぶ（peer-takeover）。false なら pane を閉じて起動しない。 */
+  beforeRun?: () => Promise<boolean>;
+  /** この pane と同じワークスペースに新しいタブを作る（peer-takeover の相手のタブ）。 */
+  placementPaneId?: string;
   injectedPath: string;
   env: NodeJS.ProcessEnv;
   runner: ProcessRunner;
@@ -1100,7 +1140,10 @@ async function launchHerdrPane(options: {
     // 上の stale 掃除で閉じた pane は数えない（そのワークスペースは消えているかもしれない）。
     const livePanes = panes.filter((pane) => pane.paneId !== closedStalePaneId);
     const realWorkspaceKey = realHerdrWorkspaceKey(options.recordCwd ?? dir);
-    const workspaceId = findHerdrProjectWorkspace(
+    const placementWorkspaceId = options.placementPaneId !== undefined
+      ? livePanes.find((pane) => pane.paneId === options.placementPaneId)?.workspaceId ?? null
+      : null;
+    const workspaceId = placementWorkspaceId ?? findHerdrProjectWorkspace(
       livePanes,
       workspaceKey,
       (label) => {
@@ -1137,6 +1180,14 @@ async function launchHerdrPane(options: {
       await runHerdr(["pane", "close", herdrPaneId]);
       errorSink(`tailii launch: herdr pane rename が非0終了 (${renamed.code})\n`);
       return renamed.code;
+    }
+
+    // --- 4.5 開き直し（peer-takeover）: 失敗しうる準備（server・ワークスペース・pane の作成と命名）を済ませてから、
+    //     他所の同じ会話を終了させる（Fable レビュー A-4）。終了を確かめられなければ作った pane を閉じて起動しない。 ---
+    if (options.beforeRun !== undefined && !await options.beforeRun()) {
+      await runHerdr(["pane", "close", herdrPaneId]);
+      errorSink("tailii launch: 他所で動いている同じ会話を終了できませんでした（起動していません）\n");
+      return 1;
     }
 
     // --- 5. innerCommand を起動。pane run はタイプ注入で argv のクォートを保持しないため

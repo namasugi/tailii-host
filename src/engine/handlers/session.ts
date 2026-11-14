@@ -35,6 +35,17 @@ import { PREWARM_TTL_SECONDS, prewarmExpired, prewarmFingerprint } from "../../s
 import { claudeTranscriptExists } from "../../sessions/claudeTranscriptExists.js";
 import { startApiAgentSession } from "./apiAgent.js";
 import { ApiAgentLedgerStore } from "../../apiAgent/ledger.js";
+import type { LaunchTakeover } from "../../commands/launch.js";
+import {
+  acquireTakeoverLock,
+  checkPeersBeforeResume,
+  peerBlocksAutoRestart,
+  type TakeoverLock,
+} from "./peerCheck.js";
+
+/** 自動の再起動を見送ったときの案内（peer-takeover）。 */
+export const PEER_RUNNING_MESSAGE =
+  "この会話は別の場所で実行中のため、開き直していません。会話一覧から開くと、確かめてから開き直せます。";
 
 /** 会話を開き直せなかった（答えられない backend で動いている可能性がある）ときの文言。backend 名は出さない。 */
 export const RESUME_BLOCKED_BY_UNAVAILABLE_BACKEND =
@@ -217,6 +228,13 @@ export const sessionHandlers: HandlerRegistry = {
               : strictClaudeResume
                 ? ctx.launcher!
                 : ctx.resumeLauncher;
+          // 他所で同じ会話が動いていれば自動では再起動しない（確認なしに 2 つ目を起動しない, peer-takeover / Fable A-3）。
+          if (reAgent === "claude" && providerSessionId !== null &&
+            await peerBlocksAutoRestart(providerSessionId, metadataStore, ctx.peerProbe, message.name)) {
+            engineDiag(`session_reattach 再起動見送り（他所で動いている） name=${message.name} id=${providerSessionId}`);
+            writeError(writer, v, message.id, "peer_running", PEER_RUNNING_MESSAGE);
+            return;
+          }
           const claim = await claimRuntime(ctx, message.name);
           if (claim === "held") {
             const appeared = await waitForLiveSession(sessionManager, (info) => info.name === message.name);
@@ -337,6 +355,21 @@ export const sessionHandlers: HandlerRegistry = {
   },
 
   session_start: async (message, ctx) => {
+    // 開き直し（peer-takeover）の同意付きの要求は、会話ごとに直列にする（iPhone と iPad が同時に OK しても
+    // 2 つ起動しない, Fable A-5）。取れなければ他の端末が開き直しの途中。
+    let takeoverLock: TakeoverLock | null = null;
+    if (message.takeOver !== undefined && message.resumeSessionId !== undefined) {
+      takeoverLock = acquireTakeoverLock(message.resumeSessionId);
+      if (takeoverLock === null) {
+        ctx.writer.write({
+          type: "session_peer_conflict", v: ctx.state.negotiatedVersion, id: message.id,
+          conversationId: message.resumeSessionId, holder: "unknown", busy: false, canTakeOver: false,
+          reason: "別の端末がこの会話を開き直しています。少し待ってから開いてください。",
+        });
+        return;
+      }
+    }
+    try {
     // 端末なしの会話（API 作業, api-agent）。pane は作らず、hub の ApiAgentManager に開かせる。
     if (message.executionRoute === "api") {
       await withLaunchLock(message.name, async () => {
@@ -423,9 +456,31 @@ export const sessionHandlers: HandlerRegistry = {
       writeError(writer, v, message.id, "launch_failed", "launch 機能が構成されていません。");
       return;
     }
+    // 他所で動いている同じ会話を確かめる（peer-takeover）。Claude の再開だけ（Codex は書き込みロックで別に断られる）。
+    let takeover: LaunchTakeover | null = null;
+    if (resumeSessionId !== null && sessionAgent === "claude") {
+      const outcome = await checkPeersBeforeResume({
+        conversationId: resumeSessionId,
+        requestedName: message.name,
+        peerCheck: message.peerCheck === true,
+        takeOver: message.takeOver,
+        allowParallel: message.allowParallel === true,
+        store: metadataStore,
+        ...(ctx.peerProbe !== undefined ? { probe: ctx.peerProbe } : {}),
+        log: engineDiag,
+      });
+      if (outcome.kind === "conflict") {
+        writer.write({ type: "session_peer_conflict", v, id: message.id, ...outcome.conflict });
+        return;
+      }
+      if (outcome.kind === "takeover") takeover = outcome.takeover;
+    }
     await withLaunchLock(message.name, () => startUnderLock(message, ctx, {
-      sessionAgent, chosenLauncher, resumeSessionId, shouldSubscribe,
+      sessionAgent, chosenLauncher, resumeSessionId, shouldSubscribe, takeover,
     }));
+    } finally {
+      takeoverLock?.release();
+    }
   },
 
   session_prewarm: async (message, ctx) => {
@@ -562,11 +617,14 @@ async function startUnderLock(
     chosenLauncher: NonNullable<HandlerContext["launcher"]>;
     resumeSessionId: string | null;
     shouldSubscribe: boolean;
+    /** 他所の同じ会話を終了させて開き直す（peer-takeover）。 */
+    takeover?: LaunchTakeover | null;
   },
 ): Promise<void> {
   const { writer, state, sessionManager, metadataStore } = ctx;
   const v = state.negotiatedVersion;
   const { sessionAgent, chosenLauncher, resumeSessionId, shouldSubscribe } = plan;
+  const takeover = plan.takeover ?? null;
   let runtimeClaim = await claimRuntime(ctx, message.name);
   if (runtimeClaim === "held" && resumeSessionId === null && ctx.prewarmStore?.get(message.name) != null) {
     // 別の接続（再接続前の engine 等）がこの名前を先行起動している最中。現れた会話をそのまま使うと、
@@ -666,13 +724,15 @@ async function startUnderLock(
             codexModel: message.codexModel ?? null,
             codexSandbox: message.codexSandbox ?? null,
           }
-        : message.outputStyle !== undefined || message.todoTools === true || message.worktree !== undefined
+        : message.outputStyle !== undefined || message.todoTools === true || message.worktree !== undefined ||
+            takeover !== null
           ? {
               // 出力スタイル（新規起動の `--settings`）・Task/Todo ツール env（新規 / resume 共通）・
-              // PR/MR worktree（メタデータ cwd の記録先, worktree-from-pr）。
+              // PR/MR worktree（メタデータ cwd の記録先, worktree-from-pr）・開き直し（peer-takeover）。
               outputStyle: message.outputStyle ?? null,
               todoTools: message.todoTools === true,
               worktree: message.worktree ?? null,
+              ...(takeover !== null ? { takeover } : {}),
             }
           : undefined,
     );

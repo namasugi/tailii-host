@@ -1,0 +1,6 @@
+{"cwd":"/Users/alice/work","deferSubscribe":true,"id":"pt1","name":"s-abc123","peerCheck":true,"resumeSessionId":"11111111-2222-3333-4444-555555555555","type":"session_start","v":2}
+{"busy":false,"canTakeOver":true,"conversationId":"11111111-2222-3333-4444-555555555555","herdrSession":"default","holder":"herdr","holderName":"work-1","id":"pt1","token":"eyJwaWQiOjUwMH0.abcdefghijkl","type":"session_peer_conflict","v":2}
+{"cwd":"/Users/alice/work","deferSubscribe":true,"id":"pt2","name":"s-abc123","peerCheck":true,"resumeSessionId":"11111111-2222-3333-4444-555555555555","takeOver":{"interrupt":true,"token":"eyJwaWQiOjUwMH0.abcdefghijkl"},"type":"session_start","v":2}
+{"busy":true,"canTakeOver":false,"conversationId":"11111111-2222-3333-4444-555555555555","holder":"remote","holderName":"work-1","id":"pt3","reason":"公式アプリ（Remote Control）につながっています","type":"session_peer_conflict","v":2}
+{"allowParallel":true,"cwd":"/Users/alice/work","deferSubscribe":true,"id":"pt4","name":"s-abc123","peerCheck":true,"resumeSessionId":"11111111-2222-3333-4444-555555555555","type":"session_start","v":2}
+{"claudeSessions":[],"id":"pt5","liveSessionsResolved":true,"peerCheckOnOpen":true,"type":"claude_session_list_response","v":1}

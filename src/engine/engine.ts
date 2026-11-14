@@ -104,6 +104,7 @@ const HANDLER_FAILED_MESSAGE = "ホスト側で要求を処理できませんで
 import { ENGINE_HANDLERS } from "./handlers/index.js";
 import { isNonBlockingQuestionId } from "../codex/codexAsyncQuestion.js";
 import { questionPendingSummary, remotePendingQuestionSnapshot } from "./remotePendingQuestions.js";
+import type { PeerProbe } from "../services/peerTakeover.js";
 
 // MARK: - エントリポイント（cli から呼ばれる）
 
@@ -318,6 +319,8 @@ export interface RunEngineOptions {
   herdrSessionWriter?: (name: string) => void;
   /** herdr 導入済み判定（テスト注入用。既定は実バイナリの存在検査）。 */
   herdrInstalledProbe?: () => boolean;
+  /** 他所で動いている同じ会話を調べる手段（peer-takeover。テスト注入用。既定は実プロセスを調べる）。 */
+  peerProbe?: PeerProbe;
   /** 画像通知/取得の橋渡し（省略時は画像処理なし = 後方互換）。 */
   imageService?: ImageService | null;
   /** 会話出力キャプチャ（省略時は chat_output なし = 後方互換）。 */
@@ -420,6 +423,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     herdrSessionName = resolveHerdrSessionName,
     herdrSessionWriter = writeHerdrSessionName,
     herdrInstalledProbe = herdrInstalled,
+    peerProbe,
     imageService = null,
     transcriptTailer = null,
     transcriptPath = null,
@@ -1205,6 +1209,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           herdrSessionName,
           herdrSessionWriter,
           herdrInstalledProbe,
+          ...(peerProbe !== undefined ? { peerProbe } : {}),
           imageService,
           launcher,
           codexLauncher,

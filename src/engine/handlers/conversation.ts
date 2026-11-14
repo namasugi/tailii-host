@@ -432,6 +432,8 @@ export const conversationHandlers: HandlerRegistry = {
       writer.write({
         type: "claude_session_list_response", v, id: message.id, claudeSessions: annotated,
         ...(liveResolved ? { liveSessionsResolved: true } : {}),
+        // 既存の会話を開くとき（session_start の peerCheck）に他所の同じ会話を確かめる host（peer-takeover）。
+        peerCheckOnOpen: true,
       });
     } catch (error) {
       process.stderr.write(

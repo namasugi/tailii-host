@@ -76,6 +76,13 @@ describe("golden roundtrip", () => {
     }
   });
 
+  it("peer-takeover v1 golden 全行が byte-exact でラウンドトリップする", () => {
+    for (const line of goldenLines("peer-takeover-v1.ndjson")) {
+      const decoded = decodeControlMessage(line);
+      expect(encodeControlMessage(decoded)).toBe(line);
+    }
+  });
+
   it("pane-choice v1 golden 全行が byte-exact でラウンドトリップする", () => {
     for (const line of goldenLines("pane-choice-v1.ndjson")) {
       const decoded = decodeControlMessage(line);

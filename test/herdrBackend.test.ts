@@ -2794,6 +2794,48 @@ describe("launchCore herdr backend", () => {
     expect(recorded.filter((call) => call.args[1] === "create").map((call) => call.args[0])).toEqual(["workspace"]);
   });
 
+  test("開き直し: pane を作って名前を付けた後、pane run の前に相手を終了させる", async () => {
+    const dir = makeTempDir("herdr-launch-takeover");
+    const store = makeStore();
+    const { runner, recorded } = herdrProcessRunner();
+    const order: string[] = [];
+    const tracking: ProcessRunner = async (exe, args, opts) => {
+      const core = args.slice(2);
+      if (core[1] === "create" || core[1] === "rename" || core[1] === "run") order.push(`${core[0]} ${core[1]}`);
+      return runner(exe, args, opts);
+    };
+    expect(await launchCore({
+      ...launchOptions(dir, store, tracking),
+      beforeRun: async () => { order.push("terminate"); return true; },
+    })).toBe(0);
+    expect(order).toEqual(["workspace create", "pane rename", "terminate", "pane run"]);
+    expect(recorded.some((call) => call.args[1] === "close")).toBe(false);
+  });
+
+  test("開き直し: 相手を終了できなければ作った pane を閉じて起動しない", async () => {
+    const dir = makeTempDir("herdr-launch-takeover-fail");
+    const store = makeStore();
+    const { runner, recorded } = herdrProcessRunner();
+    expect(await launchCore({ ...launchOptions(dir, store, runner), beforeRun: async () => false })).toBe(1);
+    expect(recorded).toContainEqual(expect.objectContaining({ args: ["pane", "close", "w9:p7"] }));
+    expect(recorded.some((call) => call.args[0] === "pane" && call.args[1] === "run")).toBe(false);
+    expect(store.get("s-h")).toBeNull();
+  });
+
+  test("開き直し: 相手のタブと同じワークスペースに新しいタブを作る", async () => {
+    const dir = makeTempDir("herdr-launch-takeover-ws");
+    const store = makeStore();
+    const { runner, recorded } = herdrProcessRunner({
+      panes: [{ pane_id: "w7:p2", workspace_id: "w7" }, sameFolderPane(store, dir)],
+    });
+    expect(await launchCore({
+      ...launchOptions(dir, store, runner),
+      herdrPlacementPaneId: "w7:p2",
+      beforeRun: async () => true,
+    })).toBe(0);
+    expect(recorded.find((call) => call.args[1] === "create")?.args.slice(0, 4)).toEqual(["tab", "create", "--workspace", "w7"]);
+  });
+
   /** 同じフォルダの会話 `s-same` が workspace w3 で生きている状態（メタと pane 一覧）を作る。 */
   function sameFolderPane(store: SessionMetadataStore, cwd: string) {
     store.put({ name: "s-same", cwd, createdAt: 1, backend: "herdr", herdrPaneId: "w3:p1", herdrSession: "default" });

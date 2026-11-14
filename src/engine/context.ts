@@ -39,6 +39,7 @@ import type {
 import { claudeProjectSlug } from "../shared/paths.js";
 import { sleep } from "../shared/sleep.js";
 import type { SessionBackend, SessionBackendKind } from "../backend/sessionBackend.js";
+import type { PeerProbe } from "../services/peerTakeover.js";
 
 export function engineDiag(message: string): void {
   if (process.env["TAILII_DEBUG"] === "1") process.stderr.write(`[tailii-host engine] ${message}\n`);
@@ -97,6 +98,8 @@ export interface HandlerContext {
   herdrSessionWriter: (name: string) => void;
   /** herdr 導入済み判定。 */
   herdrInstalledProbe: () => boolean;
+  /** 他所で動いている同じ会話を調べる手段（peer-takeover。テスト注入用。未指定は実プロセスを調べる）。 */
+  peerProbe?: PeerProbe;
   imageService: ImageService | null;
   launcher: EngineLauncher | null;
   /** codex セッション用 launcher（session_start の agentType=codex 時に使用）。 */

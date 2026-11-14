@@ -340,6 +340,10 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         todoTools: optionalBoolean(raw, "todoTools"),
         // 実行経路（api-agent）。"api" のときは apiAgent（モデル・権限・予算）が必須。未知値は端末（従来）。
         ...decodeSessionStartRoute(raw),
+        // 他所で動いている同じ会話の確かめと開き直し（peer-takeover）。
+        peerCheck: optionalBoolean(raw, "peerCheck"),
+        takeOver: decodeTakeOver(raw["takeOver"]),
+        allowParallel: optionalBoolean(raw, "allowParallel"),
       });
     }
 
@@ -1412,7 +1416,26 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
           });
         }),
         liveSessionsResolved: optionalBoolean(raw, "liveSessionsResolved"),
+        peerCheckOnOpen: optionalBoolean(raw, "peerCheckOnOpen"),
       });
+
+    case "session_peer_conflict": {
+      const rawHolder = optionalString(raw, "holder");
+      const holder = rawHolder === "herdr" || rawHolder === "terminal" || rawHolder === "remote" ||
+        rawHolder === "tailii" || rawHolder === "other" ? rawHolder : "unknown";
+      return compact({
+        type, v,
+        id: requireString(raw, "id"),
+        conversationId: requireString(raw, "conversationId"),
+        holder,
+        holderName: optionalString(raw, "holderName"),
+        busy: requireBoolean(raw, "busy"),
+        canTakeOver: requireBoolean(raw, "canTakeOver"),
+        reason: optionalString(raw, "reason"),
+        token: optionalString(raw, "token"),
+        herdrSession: optionalString(raw, "herdrSession"),
+      });
+    }
 
     case "dir_create_request":
       return {
@@ -2120,3 +2143,12 @@ function decodeFileEntries(raw: Raw): FileEntry[] {
   });
 }
 
+
+/** `session_start.takeOver`（peer-takeover）。形が違えば無視（開き直さない）。 */
+function decodeTakeOver(value: unknown): { token: string; interrupt?: boolean } | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const obj = value as Record<string, unknown>;
+  const token = obj["token"];
+  if (typeof token !== "string" || token.length === 0 || token.length > 2048) return undefined;
+  return obj["interrupt"] === true ? { token, interrupt: true } : { token };
+}

@@ -27,6 +27,15 @@ export interface PeerSessionRecord {
   bridged: boolean;
   messagingSocketPath: string | null;
   startedAt: number | null;
+  /**
+   * プロセスの起動時刻（UTC の `ps -o lstart` と同じ形, 例 `Sat Nov 14 07:36:50 2026`。2.1.3xx で実測）。
+   * pid の再利用で別のプロセスを取り違えないための照合に使う（peer-takeover）。旧版は null。
+   */
+  procStart: string | null;
+  /** pid の名前空間（macOS は `darwin`）。コンテナ等が `~/.claude` を共有して書いた記録を見分ける。旧版は null。 */
+  pidDomain: string | null;
+  /** Claude Code の版（ネイティブ版は実行ファイル名が版番号になる）。旧版は null。 */
+  version: string | null;
 }
 
 /** 既定の登録簿ディレクトリ。 */
@@ -59,6 +68,9 @@ export function parsePeerSessionRecord(raw: unknown): PeerSessionRecord | null {
     bridged: str("bridgeSessionId") !== null,
     messagingSocketPath: str("messagingSocketPath"),
     startedAt: typeof rec["startedAt"] === "number" ? (rec["startedAt"] as number) : null,
+    procStart: str("procStart"),
+    pidDomain: str("pidDomain"),
+    version: str("version"),
   };
 }
 

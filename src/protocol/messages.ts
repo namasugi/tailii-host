@@ -709,7 +709,39 @@ export type ControlMessage =
   | { type: "remote_pending_snapshot"; v: number; kind: RemotePendingKind; items: RemotePendingSnapshotItem[] }
   | { type: "session_list_request"; v: number; id: string; limit?: number; cursor?: string }
   | { type: "session_list_response"; v: number; id: string; sessions: SessionInfo[]; nextCursor?: string; adoptedName?: string; worktreePath?: string; worktreeRemoved?: boolean; worktreeDirty?: boolean; worktreeUncommittedCount?: number; worktreeUnmergedCommitCount?: number }
-  | { type: "session_start"; v: number; id: string; cwd: string; name: string; baseDir?: string; resumeSessionId?: string; title?: string; agentType?: "claude" | "codex"; model?: string; permissionMode?: "default" | "acceptEdits" | "plan" | "auto"; effort?: "low" | "medium" | "high" | "xhigh" | "max"; codexModel?: string; codexSandbox?: "read-only" | "workspace-write" | "danger-full-access"; deferSubscribe?: boolean; outputStyle?: string; worktree?: string; todoTools?: boolean; executionRoute?: "api"; apiAgent?: ApiAgentConfig }
+  | { type: "session_start"; v: number; id: string; cwd: string; name: string; baseDir?: string; resumeSessionId?: string; title?: string; agentType?: "claude" | "codex"; model?: string; permissionMode?: "default" | "acceptEdits" | "plan" | "auto"; effort?: "low" | "medium" | "high" | "xhigh" | "max"; codexModel?: string; codexSandbox?: "read-only" | "workspace-write" | "danger-full-access"; deferSubscribe?: boolean; outputStyle?: string; worktree?: string; todoTools?: boolean; executionRoute?: "api"; apiAgent?: ApiAgentConfig;
+      /**
+       * 既存の会話を開く前に、他所で動いている同じ会話を host が確かめる（peer-takeover）。旧アプリは省略
+       * （確かめずに起動 = 従来の並走）。動いていれば起動せず `session_peer_conflict` を返す。
+       */
+      peerCheck?: boolean;
+      /** 確認の結果「開き直す」: `session_peer_conflict.token` をそのまま返す。処理中を中断してよいなら interrupt。 */
+      takeOver?: { token: string; interrupt?: boolean };
+      /** 確認の結果「それでも開く」（終了させずに並走させる。従来の挙動）。 */
+      allowParallel?: boolean }
+  /**
+   * 既存の会話を開こうとしたが、他所で同じ会話が動いていた（host→iOS, peer-takeover）。`session_start` の応答として
+   * 同じ id で返し、起動はしていない。`canTakeOver` なら `token` を付けて送り直すと、相手を終了させて Tailii で開き直す。
+   * そうでなければ開かないか、`allowParallel` で並走させる。
+   */
+  | {
+      type: "session_peer_conflict";
+      v: number;
+      id: string;
+      conversationId: string;
+      /** 相手の場所: herdr のタブ / 普通のターミナル / 公式アプリ / Tailii の別の会話の中 / その他 / 判別不能。 */
+      holder: "herdr" | "terminal" | "remote" | "tailii" | "other" | "unknown";
+      /** 相手の Claude Code のセッション名（表示用）。 */
+      holderName?: string;
+      /** 相手が処理中か。 */
+      busy: boolean;
+      canTakeOver: boolean;
+      /** 開き直せない・確かめ直しが要る理由（利用者向けの文）。 */
+      reason?: string;
+      token?: string;
+      /** 相手が herdr のタブなら、その herdr セッション名。 */
+      herdrSession?: string;
+    }
   /**
    * API 作業の状態（host→iOS, api-agent）。会話のストリームに載る（後から開いた端末にも最新値が届く）。
    * `restoredTexts` は中断で送らなかった処理中の発話（入力欄へ戻す）。旧アプリは未知 type として捨てる。
@@ -1018,6 +1050,11 @@ export type ControlMessage =
        * 不在のとき iOS は従来の `session_list_request` との join へフォールバックする。
        */
       liveSessionsResolved?: boolean;
+      /**
+       * この host は既存の会話を開くとき（session_start の peerCheck）に他所で動いている同じ会話を確かめる（peer-takeover）。
+       * true ならアプリは一覧の注記による開く前の確認を出さない（確認が二重になる）。旧 host は載せない。
+       */
+      peerCheckOnOpen?: boolean;
     }
   | { type: "dir_create_request"; v: number; id: string; baseDir: string; relative: string }
   | { type: "dir_create_response"; v: number; id: string; path: string; ok: boolean; error?: string }

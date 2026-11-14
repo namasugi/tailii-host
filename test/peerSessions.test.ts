@@ -37,7 +37,13 @@ describe("parsePeerSessionRecord", () => {
       bridged: true,
       messagingSocketPath: "/tmp/cc-socks/23402.sock",
       startedAt: 1789328831023,
+      procStart: null,
+      pidDomain: null,
+      version: "2.1.270",
     });
+    // 2.1.3xx の起動時刻と pid の名前空間（peer-takeover の本人確認）。
+    expect(parsePeerSessionRecord({ ...RECORD, procStart: "Sat Nov 14 07:36:50 2026", pidDomain: "darwin" }))
+      .toMatchObject({ procStart: "Sat Nov 14 07:36:50 2026", pidDomain: "darwin" });
   });
 
   it("必須欠落・不正は null", () => {
