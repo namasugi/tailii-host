@@ -1419,6 +1419,34 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         peerCheckOnOpen: optionalBoolean(raw, "peerCheckOnOpen"),
       });
 
+    case "session_peer_check":
+      return compact({
+        type, v,
+        id: requireString(raw, "id"),
+        conversationId: requireString(raw, "conversationId"),
+        name: optionalString(raw, "name"),
+      });
+
+    case "session_peer_check_response": {
+      const rawCheckHolder = optionalString(raw, "holder");
+      const checkHolder = rawCheckHolder === undefined ? undefined
+        : rawCheckHolder === "herdr" || rawCheckHolder === "terminal" || rawCheckHolder === "remote" ||
+          rawCheckHolder === "tailii" || rawCheckHolder === "other" ? rawCheckHolder : "unknown";
+      return compact({
+        type, v,
+        id: requireString(raw, "id"),
+        conversationId: requireString(raw, "conversationId"),
+        clear: requireBoolean(raw, "clear"),
+        holder: checkHolder,
+        holderName: optionalString(raw, "holderName"),
+        busy: optionalBoolean(raw, "busy"),
+        canTakeOver: optionalBoolean(raw, "canTakeOver"),
+        reason: optionalString(raw, "reason"),
+        token: optionalString(raw, "token"),
+        herdrSession: optionalString(raw, "herdrSession"),
+      });
+    }
+
     case "session_peer_conflict": {
       const rawHolder = optionalString(raw, "holder");
       const holder = rawHolder === "herdr" || rawHolder === "terminal" || rawHolder === "remote" ||

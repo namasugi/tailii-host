@@ -483,6 +483,28 @@ export const sessionHandlers: HandlerRegistry = {
     }
   },
 
+  session_peer_check: async (message, ctx) => {
+    // 会話を開く前の問い合わせ（peer-takeover）。起動はしない。アプリは一覧の上で確認を出す。
+    const v = ctx.state.negotiatedVersion;
+    const outcome = await checkPeersBeforeResume({
+      conversationId: message.conversationId,
+      ...(message.name !== undefined ? { requestedName: message.name } : {}),
+      peerCheck: true,
+      takeOver: undefined,
+      allowParallel: false,
+      store: ctx.metadataStore,
+      ...(ctx.peerProbe !== undefined ? { probe: ctx.peerProbe } : {}),
+      log: engineDiag,
+    });
+    if (outcome.kind === "conflict") {
+      ctx.writer.write({ type: "session_peer_check_response", v, id: message.id, clear: false, ...outcome.conflict });
+      return;
+    }
+    ctx.writer.write({
+      type: "session_peer_check_response", v, id: message.id, conversationId: message.conversationId, clear: true,
+    });
+  },
+
   session_prewarm: async (message, ctx) => {
     // 新規会話（Claude）の先行起動（session-prewarm）。応答は無い（iOS は送りっぱなし）。
     const { sessionManager, metadataStore, prewarmStore } = ctx;

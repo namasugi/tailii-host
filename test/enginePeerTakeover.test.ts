@@ -146,6 +146,32 @@ describe("session_start の peer check", () => {
   }, 15_000);
 });
 
+describe("session_peer_check（開く前の問い合わせ）", () => {
+  test("他所で動いていれば確認の内容を、動いていなければ clear を返し、起動はしない", async () => {
+    const { store, sessionManager } = backends();
+    const launched: string[] = [];
+    let gone = false;
+    const engine = startEngine({
+      sessionManager, metadataStore: store, peerProbe: terminalPeer({ gone: () => gone }),
+      launcher: async (_cwd, name) => { launched.push(name); return { exitCode: 0, errorText: "" }; },
+    });
+    try {
+      await engine.lines.nextOfType("channel_hello");
+      engine.writeLine(JSON.stringify({ type: "session_peer_check", v: 2, id: "C1", conversationId: CONV, name: "s-x" }));
+      expect(decodeControlMessage(await engine.lines.nextOfType("session_peer_check_response"))).toMatchObject({
+        id: "C1", conversationId: CONV, clear: false, holder: "terminal", canTakeOver: true, busy: false,
+      });
+      gone = true;
+      engine.writeLine(JSON.stringify({ type: "session_peer_check", v: 2, id: "C2", conversationId: CONV }));
+      expect(decodeControlMessage(await engine.lines.nextOfType("session_peer_check_response")))
+        .toMatchObject({ id: "C2", clear: true });
+      expect(launched).toEqual([]);
+    } finally {
+      await engine.teardown();
+    }
+  }, 15_000);
+});
+
 describe("この会話の Tailii のセッション自身が掴んでいるとき", () => {
   /** Tailii が起動した Claude（引数のフック設定に s-own）が CONV を掴んでいる。 */
   function ownTailii(): PeerProbe {

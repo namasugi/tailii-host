@@ -724,6 +724,28 @@ export type ControlMessage =
    * 同じ id で返し、起動はしていない。`canTakeOver` なら `token` を付けて送り直すと、相手を終了させて Tailii で開き直す。
    * そうでなければ開かないか、`allowParallel` で並走させる。
    */
+  /**
+   * 会話を開く前の問い合わせ（iOS→host, peer-takeover）。起動はしない。一覧で会話をタップした時点で確認を出すために使う。
+   * `name` は開こうとしている会話名（その名前の Tailii のセッションが掴んでいるなら確認は要らない）。
+   */
+  | { type: "session_peer_check"; v: number; id: string; conversationId: string; name?: string }
+  /**
+   * `session_peer_check` の応答。`clear` なら他所では動いていない。そうでなければ `session_peer_conflict` と同じ欄を載せる。
+   */
+  | {
+      type: "session_peer_check_response";
+      v: number;
+      id: string;
+      conversationId: string;
+      clear: boolean;
+      holder?: "herdr" | "terminal" | "remote" | "tailii" | "other" | "unknown";
+      holderName?: string;
+      busy?: boolean;
+      canTakeOver?: boolean;
+      reason?: string;
+      token?: string;
+      herdrSession?: string;
+    }
   | {
       type: "session_peer_conflict";
       v: number;

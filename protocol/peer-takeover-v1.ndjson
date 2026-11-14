@@ -4,3 +4,6 @@
 {"busy":true,"canTakeOver":false,"conversationId":"11111111-2222-3333-4444-555555555555","holder":"remote","holderName":"work-1","id":"pt3","reason":"公式アプリ（Remote Control）につながっています","type":"session_peer_conflict","v":2}
 {"allowParallel":true,"cwd":"/Users/alice/work","deferSubscribe":true,"id":"pt4","name":"s-abc123","peerCheck":true,"resumeSessionId":"11111111-2222-3333-4444-555555555555","type":"session_start","v":2}
 {"claudeSessions":[],"id":"pt5","liveSessionsResolved":true,"peerCheckOnOpen":true,"type":"claude_session_list_response","v":1}
+{"conversationId":"11111111-2222-3333-4444-555555555555","id":"pt6","name":"s-abc123","type":"session_peer_check","v":2}
+{"busy":false,"canTakeOver":true,"clear":false,"conversationId":"11111111-2222-3333-4444-555555555555","holder":"terminal","holderName":"work-1","id":"pt6","token":"eyJwaWQiOjUwMH0.abcdefghijkl","type":"session_peer_check_response","v":2}
+{"clear":true,"conversationId":"11111111-2222-3333-4444-555555555555","id":"pt7","type":"session_peer_check_response","v":2}
