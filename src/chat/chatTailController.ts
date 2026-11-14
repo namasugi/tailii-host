@@ -105,6 +105,28 @@ export class ChatTailController {
     }
   }
 
+  /** ページ用の本文だけを有限再生する。サムネはページの切り出し後に同梱し、subagent_node の走査は起動しない。 */
+  async readHistory(
+    cwd: string, preferredSessionId: string | null, agent: ChatAgent, signal: AbortSignal,
+  ): Promise<void> {
+    const stream = agent === "codex"
+      ? this.codexTailer.streamHistory(cwd, preferredSessionId, signal)
+      : this.tailer.streamHistory(path.join(this.projectsRoot, claudeProjectSlug(cwd)), preferredSessionId, signal);
+    try {
+      for await (const message of stream) {
+        signal.throwIfAborted();
+        if (message.type === "question_prompt" || message.type === "question_dismiss") continue;
+        // 完了は Promise で知らせる。Hub が完了印で先に stop して fd の close を待たないことを避ける。
+        if (message.type === "chat_output" && message.streamId.startsWith("pc:history-")) continue;
+        this.writer.write(message);
+      }
+    } catch (error) {
+      signal.throwIfAborted();
+      throw error;
+    }
+    signal.throwIfAborted();
+  }
+
   /** 全文取得要求向けに、現在の subagent transcript パスを解決する。 */
   subagentTranscriptPath(nodeId: string): string | null {
     return this.subagentTailer.jsonlPath(nodeId);

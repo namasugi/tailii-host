@@ -17,6 +17,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { PROTOCOL_V1, type ControlMessage } from "../protocol.js";
 import { canonicalPath } from "../shared/paths.js";
+import { createCompressedRolloutReadStream, isCompressedRollout, isRolloutFileName, readRolloutHead } from "./rolloutFile.js";
 import { abortableSleep } from "../shared/sleep.js";
 import {
   codexRolloutImageActivity,
@@ -123,6 +124,19 @@ interface TailState {
   lastGoalCreatedAt: number | null;
 }
 
+function createTailState(): TailState {
+  return {
+    seq: 0,
+    lastModel: null,
+    lastContextTokens: null,
+    lastContextWindow: null,
+    pendingAssistantEvent: null,
+    pendingAssistantEOFStartedAtMs: null,
+    lastGoalNoticeKey: null,
+    lastGoalCreatedAt: null,
+  };
+}
+
 export class CodexRolloutTailer {
   private readonly pollIntervalMs: number;
   private readonly tailDeadlineMs: number | null;
@@ -156,6 +170,56 @@ export class CodexRolloutTailer {
     preferredSessionId: string | null = null,
   ): string | null {
     return CodexRolloutTailer.resolveRollout(cwd, this.sessionsRoot, newerThanMs, preferredSessionId);
+  }
+
+  /** ページ用の有限再生。圧縮済み rollout も、その場で展開しながら同じ変換器へ通す。 */
+  async *streamHistory(
+    cwd: string, preferredSessionId: string | null, signal: AbortSignal,
+  ): AsyncGenerator<ControlMessage, void, void> {
+    signal.throwIfAborted();
+    const resolved = CodexRolloutTailer.resolveRollout(cwd, this.sessionsRoot, null, preferredSessionId, true);
+    if (resolved === null) throw new Error("rollout not found");
+    if (!isCompressedRollout(resolved)) {
+      yield* this.runTail(resolved, null, signal, true);
+      return;
+    }
+    const state = createTailState();
+    const input = createCompressedRolloutReadStream(resolved, signal);
+    let parts: Buffer[] = [];
+    let length = 0;
+    const take = (suffix: Buffer): Buffer => {
+      const line = parts.length === 0 ? suffix : Buffer.concat([...parts, suffix], length + suffix.length);
+      parts = [];
+      length = 0;
+      return line;
+    };
+    try {
+      for await (const chunk of input) {
+        signal.throwIfAborted();
+        const data = chunk as Buffer;
+        let start = 0;
+        let nl = data.indexOf(0x0a);
+        while (nl >= 0 && !signal?.aborted) {
+          signal.throwIfAborted();
+          yield* emitLine(take(data.subarray(start, nl)), state);
+          start = nl + 1;
+          nl = data.indexOf(0x0a, start);
+        }
+        if (start < data.length) {
+          const rest = Buffer.from(data.subarray(start));
+          parts.push(rest);
+          length += rest.length;
+        }
+        // 圧縮がよく効く履歴でも、取消・期限のタイマーに必ず制御を返す。
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      signal.throwIfAborted();
+      // 平文の従来 EOF 処理と同じく、保留本文を確定してから改行の無い最終行を解釈する。
+      yield* flushPendingAssistantEvent(state);
+      if (length > 0) yield* emitLine(take(Buffer.alloc(0)), state);
+    } finally {
+      input.destroy();
+    }
   }
 
   /**
@@ -206,11 +270,12 @@ export class CodexRolloutTailer {
     sessionsRoot: string,
     newerThanMs: number | null = null,
     preferredSessionId: string | null = null,
+    includeCompressed = false,
   ): string | null {
     const target = canonicalPath(cwd);
-    const files = listRolloutFiles(sessionsRoot, preferredSessionId);
+    const files = listRolloutFiles(sessionsRoot, preferredSessionId, includeCompressed);
     // 最新から順に見て、cwd 一致の最初の 1 本を返す（新しい会話を優先）。
-    files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    files.sort((a, b) => b.mtimeMs - a.mtimeMs || Number(isCompressedRollout(a.path)) - Number(isCompressedRollout(b.path)));
     for (const file of files) {
       if (preferredSessionId === null && newerThanMs !== null && file.mtimeMs <= newerThanMs) continue;
       const meta = readRolloutMeta(file.path);
@@ -226,11 +291,13 @@ export class CodexRolloutTailer {
     rolloutPath: string,
     newerThanMs: number | null,
     signal?: AbortSignal,
+    historyOnly = false,
   ): AsyncGenerator<ControlMessage, void, void> {
     let fd: number;
     try {
       fd = fs.openSync(rolloutPath, "r");
-    } catch {
+    } catch (error) {
+      if (historyOnly) throw error;
       return;
     }
     try {
@@ -247,23 +314,14 @@ export class CodexRolloutTailer {
         lineBytes = 0;
         return line;
       };
-      const state: TailState = {
-        seq: 0,
-        lastModel: null,
-        lastContextTokens: null,
-        lastContextWindow: null,
-        pendingAssistantEvent: null,
-        pendingAssistantEOFStartedAtMs: null,
-        lastGoalNoticeKey: null,
-        lastGoalCreatedAt: null,
-      };
+      const state = createTailState();
       const start = Date.now();
       let announcedReplayDone = false;
       let lifecycleCaughtUp = false;
       let latestLifecycle: CodexTurnLifecycleEvent | null = null;
       const chunk = Buffer.alloc(64 * 1024);
       let bytesSinceYield = 0;
-      if (this.emitReplayDoneMarker && newerThanMs === null) {
+      if ((this.emitReplayDoneMarker || historyOnly) && newerThanMs === null) {
         yield marker(HISTORY_BEGIN_STREAM_ID, "");
       }
 
@@ -271,7 +329,8 @@ export class CodexRolloutTailer {
         let bytesRead = 0;
         try {
           bytesRead = fs.readSync(fd, chunk, 0, chunk.length, position);
-        } catch {
+        } catch (error) {
+          if (historyOnly) throw error;
           bytesRead = 0;
         }
 
@@ -305,7 +364,7 @@ export class CodexRolloutTailer {
             if (latestLifecycle !== null) this.notifyTurnLifecycle(latestLifecycle);
           }
           // 初回 EOF = 既存内容の再生完了。マーカー有効時は完了シグナルを 1 通流す。
-          if (this.emitReplayDoneMarker && !announcedReplayDone) {
+          if ((this.emitReplayDoneMarker || historyOnly) && !announcedReplayDone) {
             announcedReplayDone = true;
             yield {
               type: "chat_output",
@@ -318,6 +377,7 @@ export class CodexRolloutTailer {
               eof: true,
             };
           }
+          if (historyOnly) return;
           if (!this.tailIndefinitely) {
             if (this.tailDeadlineMs === null || Date.now() - start >= this.tailDeadlineMs) {
               if (lineBytes > 0) yield* emitLineAfter(takeLine(), state, newerThanMs);
@@ -332,7 +392,7 @@ export class CodexRolloutTailer {
         const data = chunk.subarray(0, bytesRead);
         let offset = 0;
         let nl = data.indexOf(0x0a);
-        while (nl >= 0) {
+        while (nl >= 0 && !signal?.aborted) {
           const suffix = data.subarray(offset, nl);
           const line = lineBytes > 0 ? takeLine(suffix) : suffix;
           const lifecycle = parseTurnLifecycle(line);
@@ -443,7 +503,7 @@ function parseTurnLifecycle(line: Buffer): CodexTurnLifecycleEvent | null {
 // 日付部分の後ろが会話 UUID。日付を決め打ちせず、移動・同一 ID の複数ファイルも毎回照合する。
 const ROLLOUT_SESSION_ID = /^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl(?:\.zst)?$/iu;
 
-function listRolloutFiles(sessionsRoot: string, preferredSessionId: string | null): { path: string; mtimeMs: number }[] {
+function listRolloutFiles(sessionsRoot: string, preferredSessionId: string | null, includeCompressed: boolean): { path: string; mtimeMs: number }[] {
   const out: { path: string; mtimeMs: number }[] = [];
   const walk = (dir: string): void => {
     let entries: fs.Dirent[];
@@ -462,8 +522,8 @@ function listRolloutFiles(sessionsRoot: string, preferredSessionId: string | nul
         // 規則の分かる別 ID は stat / open すらしない。旧形式・改名された名前は従来の先頭解析へ。
         const namedId = ROLLOUT_SESSION_ID.exec(entry.name)?.[1];
         if (preferredSessionId !== null && namedId !== undefined && namedId.toLowerCase() !== preferredSessionId.toLowerCase()) continue;
-        // .jsonl.zst は従来どおり tail 対象外。再開時に Codex が展開した平文を次の走査で拾う。
-        if (compressed) continue;
+        // 継続 tail は平文の出現を待つ。有限のページ再生だけ圧縮済みファイルも読める。
+        if (compressed && (!includeCompressed || !isRolloutFileName(entry.name))) continue;
         let mtimeMs = 0;
         try {
           mtimeMs = fs.statSync(p).mtimeMs;
@@ -480,17 +540,10 @@ function listRolloutFiles(sessionsRoot: string, preferredSessionId: string | nul
 
 /** rollout の先頭 `session_meta` 行から `payload.cwd` を読む。読めなければ null。 */
 function readRolloutMeta(rolloutPath: string): { id: string | null; cwd: string } | null {
-  let fd: number;
   try {
-    fd = fs.openSync(rolloutPath, "r");
-  } catch {
-    return null;
-  }
-  try {
-    const buf = Buffer.alloc(META_READ_LIMIT_BYTES);
-    const bytesRead = fs.readSync(fd, buf, 0, buf.length, 0);
+    const slice = readRolloutHead(rolloutPath, META_READ_LIMIT_BYTES, (head) => head.includes(0x0a));
+    const bytesRead = slice.length;
     if (bytesRead === 0) return null;
-    const slice = buf.subarray(0, bytesRead);
     const nl = slice.indexOf(0x0a);
     const firstLine = (nl >= 0 ? slice.subarray(0, nl) : slice).toString("utf8");
     const parsed = JSON.parse(firstLine) as unknown;
@@ -511,12 +564,6 @@ function readRolloutMeta(rolloutPath: string): { id: string | null; cwd: string 
     return null;
   } catch {
     return null;
-  } finally {
-    try {
-      fs.closeSync(fd);
-    } catch {
-      // 無視。
-    }
   }
 }
 

@@ -32,6 +32,8 @@ import {
 } from "../chat/transcriptTailer.js";
 import type { ChatAgent } from "../chat/chatTailController.js";
 import type { BackgroundCommandStopResult } from "../chat/backgroundCommandStop.js";
+import { HistoryPageImages } from "./historyPageImages.js";
+import { LATEST_HISTORY_PAGE_TIMEOUT_MS, OLDER_HISTORY_PAGE_TIMEOUT_MS } from "./historyPageLimits.js";
 import { sliceHistoryPage, type HistoryPageAnchor } from "./historyPage.js";
 import { readImagePath, type ImageService } from "../chat/imageService.js";
 import type { PanePreviewMode } from "./panePreviewPump.js";
@@ -87,6 +89,8 @@ import {
 export interface HubTail {
   open(cwd: string, preferredSessionId: string | null, newerThanMs?: number | null, agent?: ChatAgent): void;
   stop(): void;
+  /** ページの有限再生。本文だけを出し、fd を閉じてから完了する（画像・子 transcript は読まない）。 */
+  readHistory?(cwd: string, preferredSessionId: string | null, agent: ChatAgent, signal: AbortSignal): Promise<void>;
   subagentTranscript?(nodeId: string, before?: number): {
     entries: SubagentTranscriptEntry[];
     omitted: number;
@@ -260,18 +264,16 @@ interface PendingCodexTurn {
   message: Extract<HubClientMessage, { type: "codex_turn_submit" }>;
   waiters: Array<{ client: object; id: string }>;
 }
+/** 履歴ページ用に全履歴を覚えておく会話の数。 */
+const HISTORY_PAGE_CACHE_LIMIT = 3;
+/** 履歴ページ用に覚えた全履歴を使い回す期間（遡り中の連続要求だけを速くし、メモリに長く残さない）。 */
+const HISTORY_PAGE_CACHE_TTL_MS = 10 * 60_000;
 /**
  * backfilling 中の購読者は publishConversationEvent が丸ごと飛ばす。旗が立ちっぱなしになると
  * 「接続は健全なのに会話だけ永久に更新されない」実障害になるため、履歴が一定時間 1 行も進まな
  * ければ強制的に live へ切り替える。進捗があるうちは延長するので、巨大な transcript の再生を
  * 途中で打ち切ることはない。
  */
-/** 履歴ページ用に transcript を読み切るまでの上限（画像の多い巨大な会話でも返事を返す）。 */
-const HISTORY_PAGE_READ_TIMEOUT_MS = 20_000;
-/** 履歴ページ用に全履歴を覚えておく会話の数。 */
-const HISTORY_PAGE_CACHE_LIMIT = 3;
-/** 履歴ページ用に覚えた全履歴を使い回す期間（遡り中の連続要求だけを速くし、メモリに長く残さない）。 */
-const HISTORY_PAGE_CACHE_TTL_MS = 10 * 60_000;
 const BACKFILL_STALL_TIMEOUT_MS = 15_000;
 const DELIVERED_RECEIPT_TTL_MS = 30 * 24 * 60 * 60 * 1_000;
 const MAX_DELIVERED_RECEIPTS_PER_SESSION = 10_000;
@@ -936,6 +938,7 @@ export class SessionHub {
   registerClient(client: object, write: (line: string) => void): void { this.clients.set(client, write); }
 
   unregisterClient(client: object): void {
+    this.cancelHistoryPageRequests(client);
     this.clients.delete(client);
     this.clientPresence.delete(client);
     this.settlePresencePings(client, false);
@@ -1055,6 +1058,11 @@ export class SessionHub {
     }
     if (message.type === "conversation_subscribe") {
       // preview は後から加わった内部フラグ。省略する旧 engine は従来どおり前面購読として扱う。
+      // iOS がページを諦めて購読へ進んだときも、元の読取を先に取り消す。
+      if (message.preview !== false) this.cancelHistoryPageRequests(client);
+      else if (this.actors.get(message.session)?.subscribers.get(client)?.preview === true) {
+        this.cancelHistoryPageRequests(client, message.session);
+      }
       this.subscribe(client, message.session, message.afterSeq, message.newerThanMs, message.preview ?? true);
       // API 作業の会話は現在の状態（予算・利用額・止めた理由）を添える。replay buffer に無くても
       // （hub の再起動後・状態が変わっていない会話）、開いた端末が最新値を持てるように。
@@ -1705,6 +1713,8 @@ export class SessionHub {
   close(): void {
     // push の受付を止め、予約・保留を解く（終了後にタイマーが発火して通知を送らない）。
     this.closed = true;
+    for (const client of this.historyPageRequests.keys()) this.cancelHistoryPageRequests(client);
+    this.historyPageCache.clear();
     this.pushDispatcher?.dispose();
     for (const client of [...this.clientPresence.keys()]) this.settlePresencePings(client, false);
     for (const recheck of this.staleQuestionRechecks.values()) clearTimeout(recheck.timer);
@@ -1760,6 +1770,9 @@ export class SessionHub {
   }
 
   private retireSession(session: string, reason = "Session was retired"): void {
+    for (const client of this.historyPageRequests.keys()) this.cancelHistoryPageRequests(client, session);
+    this.historyPageCache.delete(session);
+
     // API 作業の会話は actor が無くても作業プロセスを止めて記録を消す（下の early return より前）。
     // heartbeat も消す: pane が無いので reaper は「消滅」として回収しない（reaper.ts）。残すと
     // 終わった会話の heartbeat が溜まり続ける。
@@ -1984,6 +1997,8 @@ export class SessionHub {
   }
 
   private unsubscribe(client: object, session: string, actor: SessionActor): void {
+    this.cancelHistoryPageRequests(client, session);
+
     // 離脱は購読の有無に関わらず計時リセット（旧 touchHeartbeat の chat-leave 相当）。
     // session_idle_hint は同一接続で open していない会話にも届きうる。bump は既存 state を
     // 保持するため、処理中(active)を idle へ降格させない。
@@ -2636,10 +2651,21 @@ export class SessionHub {
 
   // ---- 履歴ページ（history-page） ----
 
-  /** 直近に読んだ会話の全履歴（ページを遡るたびに transcript を頭から読み直さない）。 */
-  private readonly historyPageCache = new Map<string, { events: ControlMessage[]; hostNowMs: number }>();
-  /** 会話ごとの読み取り中の Promise（同じ会話の全履歴を並行して二重に読まない）。 */
-  private readonly historyPageReads = new Map<string, Promise<{ events: ControlMessage[]; hostNowMs: number }>>();
+  private readonly historyPageCache = new Map<string, {
+    events: ControlMessage[]; hostNowMs: number; images: HistoryPageImages;
+  }>();
+  /** 読取は会話単位で共有し、最後の待ち手の取消で fd / tail を止める。 */
+  private readonly historyPageReads = new Map<string, {
+    promise: Promise<{ events: ControlMessage[]; hostNowMs: number; images: HistoryPageImages }>;
+    controller: AbortController; waiters: Set<AbortSignal>;
+  }>();
+  private readonly historyPageRequests = new Map<object, Map<string, Set<AbortController>>>();
+  private cancelHistoryPageRequests(client: object, session?: string): void {
+    for (const [name, controllers] of this.historyPageRequests.get(client) ?? []) {
+      if (session !== undefined && name !== session) continue;
+      for (const controller of controllers) controller.abort(new Error("history page cancelled"));
+    }
+  }
 
   private async answerHistoryPage(
     client: object,
@@ -2650,96 +2676,138 @@ export class SessionHub {
         ? { ...(message.beforeStreamId !== undefined ? { streamId: message.beforeStreamId } : {}),
           ...(message.beforeToolId !== undefined ? { toolId: message.beforeToolId } : {}) }
         : null;
-    let response: Extract<HubServerMessage, { type: "conversation_history_page_response" }>;
+    const controller = new AbortController();
+    const { signal } = controller;
+    const sessions = this.historyPageRequests.get(client) ?? new Map<string, Set<AbortController>>();
+    this.historyPageRequests.set(client, sessions);
+    const requests = sessions.get(message.session) ?? new Set<AbortController>();
+    sessions.set(message.session, requests);
+    requests.add(controller);
+    const timeoutMs = anchor === null ? LATEST_HISTORY_PAGE_TIMEOUT_MS : OLDER_HISTORY_PAGE_TIMEOUT_MS;
+    const deadlineMs = Date.now() + timeoutMs;
+    const checkActive = (): void => {
+      // 巨大な1行の解析等でタイマーが遅れた場合も、期限後のページを成功として返さない。
+      if (Date.now() >= deadlineMs) controller.abort(new Error("history read timed out"));
+      signal.throwIfAborted();
+    };
+    const timer = setTimeout(() => controller.abort(new Error("history read timed out")), timeoutMs);
+    timer.unref();
+    // 画像サービスの注入実装が完了しない場合にも、RPC 自体は期限・取消で解く。
+    const cancelled = new Promise<never>((_, reject) => {
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
     try {
-      // 最新のページは常に読み直す（新しい行が増えている）。遡るページは直近の読み取りを使い、
-      // 終端の行がそこに無いときだけ読み直す。
-      // 期限切れの全履歴は要求のたびに捨てる（常駐 daemon に base64 サムネごと残し続けない）。
-      for (const [session, cached] of this.historyPageCache) {
-        if (Date.now() - cached.hostNowMs > HISTORY_PAGE_CACHE_TTL_MS) this.historyPageCache.delete(session);
-      }
-      let history = anchor === null ? undefined : this.historyPageCache.get(message.session);
-      let slice = history === undefined ? null : sliceHistoryPage(history.events, anchor, message.limit);
-      if (slice === null || !slice.anchorFound) {
-        history = await this.readFullHistory(message.session);
-        slice = sliceHistoryPage(history.events, anchor, message.limit);
-      }
-      response = {
-        type: "conversation_history_page_response", id: message.id, session: message.session,
-        lines: slice.events.map((event) => encodeControlMessage(event)),
-        hasMore: slice.hasMore, hostNowMs: history!.hostNowMs,
-        ...(slice.anchorFound ? {} : { anchorMissing: true }),
+      const work = async (): Promise<void> => {
+        for (const [session, cached] of this.historyPageCache) {
+          if (Date.now() - cached.hostNowMs > HISTORY_PAGE_CACHE_TTL_MS) this.historyPageCache.delete(session);
+        }
+        let history = anchor === null ? undefined : this.historyPageCache.get(message.session);
+        if (history === undefined || !sliceHistoryPage(history.events, anchor, message.limit).anchorFound) {
+          history = await this.readFullHistory(message.session, signal);
+        }
+        checkActive();
+        // 本文と画像を同じ応答で渡す。途中までの成功は返さず、完了前の離脱・期限切れは全体を失敗にする。
+        const slice = await history.images.slice(anchor, message.limit, signal);
+        checkActive();
+        const lines = slice.events.map((event) => encodeControlMessage(event));
+        checkActive();
+        this.sendTo(client, {
+          type: "conversation_history_page_response", id: message.id, session: message.session,
+          lines,
+          hasMore: slice.hasMore, hostNowMs: history!.hostNowMs,
+          ...(slice.anchorFound ? {} : { anchorMissing: true }),
+        });
       };
+      await Promise.race([work(), cancelled]);
     } catch (error) {
       this.options.log?.(`audit history-page-failed session=${message.session} error=${String(error)}`);
-      response = {
+      this.sendTo(client, {
         type: "conversation_history_page_response", id: message.id, session: message.session,
         lines: [], hasMore: false, hostNowMs: Date.now(), failed: true,
-      };
+      });
+    } finally {
+      clearTimeout(timer);
+      requests.delete(controller);
+      if (requests.size === 0) sessions.delete(message.session);
+      if (sessions.size === 0) this.historyPageRequests.delete(client);
     }
-    this.sendTo(client, response);
   }
 
-  /** 全履歴の再送と同じ tail で transcript を最後まで読み、出力を集める（購読者へは流さない）。 */
-  private readFullHistory(session: string): Promise<{ events: ControlMessage[]; hostNowMs: number }> {
-    const inFlight = this.historyPageReads.get(session);
-    if (inFlight !== undefined) return inFlight;
-    const read = new Promise<{ events: ControlMessage[]; hostNowMs: number }>((resolve, reject) => {
+  /** 本文だけの有限再生を共有する。通常購読・reattach-since の tail は変更しない。 */
+  private async readFullHistory(session: string, signal: AbortSignal): Promise<{
+    events: ControlMessage[]; hostNowMs: number; images: HistoryPageImages;
+  }> {
+    signal.throwIfAborted();
+    let task = this.historyPageReads.get(session);
+    if (task === undefined) {
       const factory = this.options.tailFactory;
       const meta = this.options.metadataStore.get(session);
-      if (factory === undefined || meta === null) {
-        reject(new Error(factory === undefined ? "tail unavailable" : "session metadata not found"));
-        return;
-      }
-      const hostNowMs = Date.now();
+      if (factory === undefined || meta === null) throw new Error("history source unavailable");
+      const controller = new AbortController();
       const events: ControlMessage[] = [];
+      const hostNowMs = Date.now();
+      let done!: () => void;
+      let fail!: (error: unknown) => void;
+      const complete = new Promise<void>((resolve, reject) => { done = resolve; fail = reject; });
       let settled = false;
-      let tail: HubTail | null = null;
-      let timer: ReturnType<typeof setTimeout> | null = null;
-      const settle = (error: Error | null): void => {
-        if (settled) return;
-        settled = true;
-        if (timer !== null) clearTimeout(timer);
-        tail?.stop();
-        if (error !== null) {
-          reject(error);
-          return;
-        }
-        const history = { events, hostNowMs };
-        // 直近数件だけ持つ（会話を行き来しても読み直しを減らし、メモリは際限なく持たない）。
-        this.historyPageCache.delete(session);
-        this.historyPageCache.set(session, history);
-        while (this.historyPageCache.size > HISTORY_PAGE_CACHE_LIMIT) {
-          this.historyPageCache.delete(this.historyPageCache.keys().next().value!);
-        }
-        resolve(history);
-      };
-      tail = factory((payload) => {
-        if (settled) return;
+      const tail = factory((payload) => {
+        if (settled || controller.signal.aborted) return;
         if (payload.type === "chat_output" && payload.streamId === HISTORY_DONE_STREAM_ID) {
-          settle(null);
-          return;
-        }
-        events.push(payload);
+          settled = true;
+          done();
+        } else events.push(payload);
       });
-      if (settled) {
-        tail.stop();
-        return;
+      const abort = (): void => { tail.stop(); fail(controller.signal.reason); };
+      controller.signal.addEventListener("abort", abort, { once: true });
+      const promise = (async () => {
+        // 管理表へ登録してから開始する（同期例外・同期完了でも古い task を残さない）。
+        await Promise.resolve();
+        try {
+          controller.signal.throwIfAborted();
+          if (tail.readHistory !== undefined) {
+            await tail.readHistory(meta.cwd, meta.providerSessionId ?? meta.claudeSessionId ?? null,
+              meta.agent ?? "claude", controller.signal);
+          } else {
+            // 旧 factory / テスト注入との互換。done で止めるのはこの経路だけ。
+            tail.open(meta.cwd, meta.providerSessionId ?? meta.claudeSessionId ?? null, null, meta.agent ?? "claude");
+            await complete;
+          }
+          controller.signal.throwIfAborted();
+          const history = { events, hostNowMs, images: new HistoryPageImages(events, this.options.imageService) };
+          this.historyPageCache.delete(session);
+          this.historyPageCache.set(session, history);
+          while (this.historyPageCache.size > HISTORY_PAGE_CACHE_LIMIT) {
+            this.historyPageCache.delete(this.historyPageCache.keys().next().value!);
+          }
+          return history;
+        } finally {
+          settled = true;
+          controller.signal.removeEventListener("abort", abort);
+          tail.stop();
+          if (this.historyPageReads.get(session)?.controller === controller) this.historyPageReads.delete(session);
+        }
+      })();
+      // 有限再生経路では complete を待たないので、取消の reject も必ず回収する。
+      void complete.catch(() => {});
+      task = { promise, controller, waiters: new Set() };
+      this.historyPageReads.set(session, task);
+    }
+    const ownTask = task;
+    ownTask.waiters.add(signal);
+    const release = (): void => {
+      ownTask.waiters.delete(signal);
+      if (ownTask.waiters.size === 0) {
+        if (this.historyPageReads.get(session) === ownTask) this.historyPageReads.delete(session);
+        ownTask.controller.abort(new Error("history page has no readers"));
       }
-      timer = setTimeout(() => settle(new Error("history read timed out")), HISTORY_PAGE_READ_TIMEOUT_MS);
-      timer.unref();
-      try {
-        tail.open(meta.cwd, meta.providerSessionId ?? meta.claudeSessionId ?? null, null, meta.agent ?? "claude");
-      } catch (error) {
-        settle(error instanceof Error ? error : new Error(String(error)));
-      }
-    });
-    this.historyPageReads.set(session, read);
-    const clear = (): void => {
-      if (this.historyPageReads.get(session) === read) this.historyPageReads.delete(session);
     };
-    read.then(clear, clear);
-    return read;
+    signal.addEventListener("abort", release, { once: true });
+    try {
+      return await ownTask.promise;
+    } finally {
+      signal.removeEventListener("abort", release);
+      release();
+    }
   }
 
   private canReplay(actor: SessionActor, afterSeq: number): boolean {

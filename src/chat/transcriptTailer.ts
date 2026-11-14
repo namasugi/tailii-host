@@ -378,6 +378,25 @@ interface TailState {
   onLifecycle: ((event: ClaudeTurnLifecycleEvent) => void) | null;
 }
 
+function createTailState(observer: TailState["onLifecycle"]): TailState {
+  return {
+    seq: 0,
+    lastModel: null,
+    lastContextTokens: null,
+    lastEffort: null,
+    noticeCtx: createSystemNoticeContext(),
+    activeQuestionIds: new Set(),
+    pendingSkillActivities: new Map(),
+    pendingArtifactActivities: new Map(),
+    awaitingResultActivities: new Map(),
+    rateLimitArmed: false,
+    rateLimitArmedAtMs: null,
+    live: false,
+    lastPromptCommandUuid: null,
+    onLifecycle: observer,
+  };
+}
+
 /** claude セッショントランスクリプト（JSONL）の tail 実装。 */
 export class TranscriptTailer {
   private readonly pollIntervalMs: number;
@@ -404,6 +423,16 @@ export class TranscriptTailer {
     signal?: AbortSignal,
   ): AsyncGenerator<ControlMessage, void, void> {
     yield* this.runTail(transcriptPath, null, signal);
+  }
+
+  /** ページ用の有限再生。画像・サブエージェントを起動せず、同じ変換状態で初回 EOF まで読む。 */
+  async *streamHistory(
+    dir: string, preferredSessionId: string | null, signal: AbortSignal,
+  ): AsyncGenerator<ControlMessage, void, void> {
+    signal.throwIfAborted();
+    const resolved = TranscriptTailer.resolveJsonl(dir, preferredSessionId);
+    if (resolved === null) throw new Error("transcript not found");
+    yield* this.runTail(resolved, null, signal, true);
   }
 
   /**
@@ -477,11 +506,13 @@ export class TranscriptTailer {
     transcriptPath: string,
     newerThanMs: number | null,
     signal?: AbortSignal,
+    historyOnly = false,
   ): AsyncGenerator<ControlMessage, void, void> {
     let fd: number;
     try {
       fd = fs.openSync(transcriptPath, "r");
-    } catch {
+    } catch (error) {
+      if (historyOnly) throw error;
       return;
     }
     try {
@@ -500,28 +531,13 @@ export class TranscriptTailer {
         lineBytes = 0;
         return line;
       };
-      const state: TailState = {
-        seq: 0,
-        lastModel: null,
-        lastContextTokens: null,
-        lastEffort: null,
-        noticeCtx: createSystemNoticeContext(),
-        activeQuestionIds: new Set(),
-        pendingSkillActivities: new Map(),
-        pendingArtifactActivities: new Map(),
-        awaitingResultActivities: new Map(),
-        rateLimitArmed: false,
-        rateLimitArmedAtMs: null,
-        live: false,
-        lastPromptCommandUuid: null,
-        onLifecycle: this.lifecycleObserver,
-      };
+      const state = createTailState(historyOnly ? null : this.lifecycleObserver);
       const start = Date.now();
       let announcedReplayDone = false;
       const chunk = Buffer.alloc(TRANSCRIPT_READ_CHUNK_BYTES);
       let bytesSinceYield = 0;
       let lastYieldAtMs = Date.now();
-      if (this.emitReplayDoneMarker && newerThanMs === null) {
+      if ((this.emitReplayDoneMarker || historyOnly) && newerThanMs === null) {
         yield {
           type: "chat_output", v: PROTOCOL_V1, streamId: HISTORY_BEGIN_STREAM_ID,
           role: "system", text: "", eof: true,
@@ -532,14 +548,15 @@ export class TranscriptTailer {
         let bytesRead = 0;
         try {
           bytesRead = fs.readSync(fd, chunk, 0, chunk.length, position);
-        } catch {
+        } catch (error) {
+          if (historyOnly) throw error;
           bytesRead = 0;
         }
 
         if (bytesRead === 0) {
           state.live = true;
           // 初回 EOF = 既存内容の再生完了。マーカー有効時は完了シグナルを 1 通流す。
-          if (this.emitReplayDoneMarker && !announcedReplayDone) {
+          if ((this.emitReplayDoneMarker || historyOnly) && !announcedReplayDone) {
             announcedReplayDone = true;
             // 購読開始が書き込み途中に重なることがある。未完の最終行は後続の追記と結合するため残す。
             // 改行だけが無い完全な JSON は従来どおり履歴に含める。
@@ -563,6 +580,7 @@ export class TranscriptTailer {
               eof: true,
             };
           }
+          if (historyOnly) return;
           if (!this.tailIndefinitely) {
             if (this.tailDeadlineMs === null || Date.now() - start >= this.tailDeadlineMs) {
               if (lineBytes > 0) yield* emitLineAfter(takeLine(), state, newerThanMs);
@@ -578,7 +596,7 @@ export class TranscriptTailer {
         // 改行区切りで完結行を切り出して処理する。行は次の readSync より前に処理し終える。
         let offset = 0;
         let nl = data.indexOf(0x0a);
-        while (nl >= 0) {
+        while (nl >= 0 && !signal?.aborted) {
           const suffix = data.subarray(offset, nl);
           const line = lineBytes > 0 ? takeLine(suffix) : suffix;
           yield* emitLineAfter(line, state, newerThanMs);

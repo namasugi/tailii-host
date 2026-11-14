@@ -2,6 +2,7 @@
 // 会話まわり: 本文送信（chat_send, Claude）・設問回答・サブエージェント履歴・
 // 会話一覧（claude+codex マージ）・本文検索・画像オンデマンド配信。
 
+import { LATEST_HISTORY_PAGE_RPC_TIMEOUT_MS, OLDER_HISTORY_PAGE_RPC_TIMEOUT_MS } from "../../hub/historyPageLimits.js";
 import { ApiAgentLedgerStore } from "../../apiAgent/ledger.js";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
@@ -27,9 +28,6 @@ import {
 } from "../context.js";
 import { killSessionForUser } from "./session.js";
 import { settleWorktreeAfterConversationDelete } from "../worktreeJanitor.js";
-
-/** 履歴ページの Hub 待ち上限。Hub 側の読み切り上限（20 秒）より少し長く待つ（history-page）。 */
-const HISTORY_PAGE_RPC_TIMEOUT_MS = 22_000;
 
 /** chat_send 経路の常時診断ログ（pending 固まり事案の事後解析用）。失敗しても本処理を妨げない。 */
 function chatSendDiag(message: string): void {
@@ -236,7 +234,8 @@ export const conversationHandlers: HandlerRegistry = {
           ...(message.beforeToolId !== undefined ? { beforeToolId: message.beforeToolId } : {}),
         },
         message.id,
-        HISTORY_PAGE_RPC_TIMEOUT_MS,
+        message.beforeStreamId === undefined && message.beforeToolId === undefined
+          ? LATEST_HISTORY_PAGE_RPC_TIMEOUT_MS : OLDER_HISTORY_PAGE_RPC_TIMEOUT_MS,
       );
       if (response.failed === true) {
         writeError(writer, state.negotiatedVersion, message.id, "history_page_failed", "履歴を読み込めませんでした。");
