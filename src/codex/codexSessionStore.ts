@@ -643,10 +643,12 @@ function readSessionMeta(
     const timestamp = typeof p["timestamp"] === "string" ? (p["timestamp"] as string) : null;
     const source = p["source"];
     // `exec` は一回限りの非対話ジョブ、object.subagent は親会話から派生した内部スレッド。
-    // どちらも Codex の再開可能なユーザー会話一覧には出さない。
+    // Claude Code の Codex プラグインは source が `vscode` になるため、originator で委任を見分ける。
+    // 題名（Codex Companion Task 等）は変更・未設定になり得るので判定に使わない。
     const isBackgroundSession =
       source === "exec" ||
       source === "subagent" ||
+      p["originator"] === "Claude Code" ||
       (typeof source === "object" && source !== null && "subagent" in source);
     return { id, cwd, timestamp, isBackgroundSession };
   } catch (error) {

@@ -5,6 +5,7 @@ import * as path from "node:path";
 import * as zlib from "node:zlib";
 import { describe, expect, test } from "vitest";
 import { CodexSessionStore } from "../src/codex/codexSessionStore.js";
+import { searchSessions } from "../src/sessions/sessionSearch.js";
 import { makeTempDir } from "./helpers.js";
 
 /** `<home>/sessions/<relDir>/<file>` に session_meta 先頭行 + 任意行の rollout を書く。 */
@@ -17,6 +18,7 @@ function writeRollout(
   mtime?: Date,
   userMessage?: string,
   source?: unknown,
+  originator?: string,
 ): string {
   const dir = path.join(home, "sessions", relDir);
   fs.mkdirSync(dir, { recursive: true });
@@ -24,7 +26,11 @@ function writeRollout(
   const meta = JSON.stringify({
     timestamp: "2026-07-06T00:00:00.000Z",
     type: "session_meta",
-    payload: { id, cwd, cli_version: "0.142.5", ...(source === undefined ? {} : { source }) },
+    payload: {
+      id, cwd, cli_version: "0.142.5",
+      ...(source === undefined ? {} : { source }),
+      ...(originator === undefined ? {} : { originator }),
+    },
   });
   let content = meta + "\n";
   // codex アプリと同じく、注入込みの環境コンテキスト行（user ロール）を先に置く。発話の無い会話は
@@ -293,6 +299,42 @@ describe("CodexSessionStore.list", () => {
     expect(list.map((session) => session.sessionId)).toEqual(["parent-id"]);
   });
 
+  test("Claude Code プラグインの委任は一覧・検索・件数に出さず、通常の Codex 会話は残す", async () => {
+    const home = makeTempDir("codex-store-companion");
+    const cwd = "/work/project";
+    const delegatedIds = ["delegated", "renamed", "unindexed"];
+    for (const id of delegatedIds) {
+      writeRollout(home, "2026/11/12", `rollout-${id}.jsonl`, id, cwd,
+        new Date("2026-11-12T01:00:00Z"), "needle の作業依頼", "vscode", "Claude Code");
+    }
+    const visible = [
+      { id: "desktop", source: "vscode", originator: "Codex Desktop" },
+      { id: "tailii", source: "vscode", originator: "tailii_host" },
+      { id: "terminal", source: "cli", originator: "codex_cli_rs" },
+      { id: "vscode", source: "vscode", originator: undefined },
+    ];
+    for (const { id, source, originator } of visible) {
+      writeRollout(home, "2026/11/12", `rollout-${id}.jsonl`, id, cwd,
+        new Date("2026-11-12T00:00:00Z"), "needle の通常会話", source, originator);
+    }
+    writeIndex(home, [
+      { id: "delegated", thread_name: "Codex Companion Task: needle の作業依頼" },
+      { id: "renamed", thread_name: "設計レビュー" },
+      // 題名だけでは隠さない。起動元のメタデータで判定する。
+      { id: "vscode", thread_name: "Codex Companion Task: needle の通常会話" },
+    ]);
+    const expectedIds = visible.map(({ id }) => id);
+    const store = new CodexSessionStore(home);
+    expect(store.list().map(({ sessionId }) => sessionId)).toEqual(expectedIds);
+    expect(store.list(cwd).map(({ sessionId }) => sessionId)).toEqual(expectedIds);
+    expect(store.listForSearch().map(({ sessionId }) => sessionId)).toEqual(expectedIds);
+    for (const id of delegatedIds) expect(store.transcriptPath(id)).toBeNull();
+    expect(new CodexSessionStore(home, 1).list().map(({ sessionId }) => sessionId)).toEqual(["desktop"]);
+    const search = await searchSessions([store], "needle");
+    expect(search.results.map(({ sessionId }) => sessionId)).toEqual(expectedIds);
+    expect(search.stats.scannedFiles).toBe(visible.length);
+  });
+
   test("最後の agent_message を lastMessage プレビューとして返す（token_count 等は skip）", () => {
     const home = makeTempDir("codex-store-preview");
     const p = writeRollout(
@@ -507,9 +549,11 @@ describe.skipIf(!ZSTD_AVAILABLE)("CodexSessionStore.list（圧縮された rollo
     expect(store.transcriptPath("old-id")).toBe(compressed);
   });
 
-  test("圧縮された exec・発話の無い会話は平文と同じく除外する", () => {
+  test("圧縮された exec・プラグインの委任・発話の無い会話は平文と同じく除外する", () => {
     const home = makeTempDir("codex-store-zst-hidden");
     compressRollout(writeRollout(home, "2026/06/12", "rollout-exec.jsonl", "exec-id", "/w", undefined, "自動", "exec"));
+    compressRollout(writeRollout(home, "2026/06/12", "rollout-plugin.jsonl", "plugin-id", "/w",
+      undefined, "委任", "vscode", "Claude Code"));
     const silent = path.join(home, "sessions", "2026/06/12", "rollout-silent.jsonl");
     fs.writeFileSync(silent, JSON.stringify({
       type: "session_meta", payload: { id: "silent-id", cwd: "/w", source: "vscode" },
