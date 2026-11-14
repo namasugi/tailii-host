@@ -684,7 +684,9 @@ export type ControlMessage =
    * `updateError` に加え、このホストへ接続した最も新しいアプリビルド `latestClientBuild` を広告する
    * （アプリ側の「より新しいビルドがある」判定に使う, host-auto-update）。
    */
-  | { type: "channel_hello"; v: number; maxVersion: number; serverVersion?: string; hostName?: string; managed?: boolean; updateError?: string; clientVersion?: string; clientBuild?: string; latestClientBuild?: string; push?: number }
+  | { type: "channel_hello"; v: number; maxVersion: number; serverVersion?: string; hostName?: string; managed?: boolean; updateError?: string; clientVersion?: string; clientBuild?: string; latestClientBuild?: string; push?: number;
+      /** 相手の種類（tailii-chat-cli）。"cli" は `tailii-host chat` で、会話の購読・在席の申告をしない。省略はアプリ。 */
+      clientKind?: "cli" }
   | { type: "host_update_request"; v: number; id: string; version: string; integrity?: string }
   | { type: "host_update_response"; v: number; id: string; status: HostUpdateStatus; error?: string | null }
   /**

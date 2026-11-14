@@ -31,6 +31,9 @@ const PORTED: Record<string, (args: string[]) => Promise<number>> = {
   "quic-info": async (args) => (await import("./services/quicGateway.js")).runQuicInfoCommand(args),
   "self-update": async (args) => (await import("./commands/selfUpdate.js")).runSelfUpdateCommand(args),
   "api-agent": async (args) => (await import("./commands/apiAgentCommand.js")).runApiAgentCommand(args),
+  // AI エージェント（Bot）・スクリプトから会話を始める・送る・読む（tailii-chat-cli）。
+  "chat": async (args) => (await import("./commands/chat/chatCommand.js")).runChatCommand(args),
+  "agent-guide": async () => (await import("./commands/chat/chatCommand.js")).runAgentGuideCommand(),
 };
 
 async function main(): Promise<number> {
@@ -48,7 +51,8 @@ async function main(): Promise<number> {
   }
   if (!subcommand || subcommand === "--help" || subcommand === "-h") {
     process.stderr.write(
-      "usage: tailii <engine|serve|standby|hook|launch|kick|push-token|setup|doctor|hub|self-update|api-agent> [options]\n",
+      "AI エージェントは `tailii-host agent-guide` を読んでください（会話を始める・送る・読むのは `tailii-host chat`）。\n" +
+      "usage: tailii <chat|agent-guide|engine|serve|standby|hook|launch|kick|push-token|setup|doctor|hub|self-update|api-agent> [options]\n",
     );
     return 64;
   }

@@ -173,6 +173,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         clientBuild: optionalString(raw, "clientBuild"),
         latestClientBuild: optionalString(raw, "latestClientBuild"),
         push: optionalNumber(raw, "push"),
+        clientKind: optionalString(raw, "clientKind") === "cli" ? "cli" as const : undefined,
       });
 
     case "host_update_request":

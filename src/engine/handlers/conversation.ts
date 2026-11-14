@@ -63,7 +63,8 @@ export const conversationHandlers: HandlerRegistry = {
     // chat_send はチャット画面を前面表示した状態でしか届かない。engine 再生成や Hub 再起動の
     // 狭間で前面購読（preview=true）が失われたままだと、本文は background 購読の押し込みで
     // 進むのにライブビュー（pane_preview）だけ消灯し続ける。ここで前面購読を自己修復する。
-    if (ctx.activeChatSession.name !== message.session) {
+    // `tailii-host chat` は画面を持たないので前面購読しない（購読すると前面表示中として通知が抑えられる）。
+    if (ctx.state.clientKind !== "cli" && ctx.activeChatSession.name !== message.session) {
       chatSendDiag(
         `heal subscribe session=${message.session} previousActive=${ctx.activeChatSession.name ?? "nil"}`,
       );

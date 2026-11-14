@@ -9,7 +9,8 @@ import { readPackageVersion } from "../src/shared/version.js";
 
 const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
 const dist = new URL("../dist/", import.meta.url).href;
-const usage = "usage: tailii <engine|serve|standby|hook|launch|kick|push-token|setup|doctor|hub|self-update|api-agent> [options]\n";
+const usage = "AI エージェントは `tailii-host agent-guide` を読んでください（会話を始める・送る・読むのは `tailii-host chat`）。\n" +
+  "usage: tailii <chat|agent-guide|engine|serve|standby|hook|launch|kick|push-token|setup|doctor|hub|self-update|api-agent> [options]\n";
 function invoke(args: string[], input = "") {
   const home = makeTempDir("cli-process");
   const legacy = path.join(home, ".pocketclaude"); fs.mkdirSync(legacy); fs.writeFileSync(path.join(legacy, "marker"), "legacy");

@@ -47,6 +47,8 @@ export function engineDiag(message: string): void {
 
 export interface EngineState {
   negotiatedVersion: number;
+  /** 相手が `tailii-host chat`（Bot・スクリプト）か。会話の購読（前面表示扱い）をしない（tailii-chat-cli）。 */
+  clientKind?: "cli";
   ownMaxVersion: number;
   modeSetInFlight: Set<string>;
   sessionSearchAbort?: AbortController;
