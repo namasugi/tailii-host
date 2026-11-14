@@ -1064,8 +1064,17 @@ export type ControlMessage =
       backend: TerminalBackendKind;
       /** herdr バイナリが host に導入済みか（切替 UI の可用性表示）。 */
       herdrInstalled: boolean;
+      /** 新しい会話を入れる herdr セッション名（herdr-session-setting。既定 `default`。旧 host は省略）。 */
+      herdrSession?: string;
     }
-  | { type: "backend_set_request"; v: number; id: string; backend: TerminalBackendKind }
+  | {
+      type: "backend_set_request";
+      v: number;
+      id: string;
+      backend: TerminalBackendKind;
+      /** 変えるときだけ載せる herdr セッション名（herdr-session-setting）。省略は変えない。 */
+      herdrSession?: string;
+    }
   | {
       type: "backend_set_response";
       v: number;
@@ -1073,6 +1082,8 @@ export type ControlMessage =
       ok: boolean;
       backend: TerminalBackendKind;
       error: string | null;
+      /** 応答時点の herdr セッション名の設定（herdr-session-setting。旧 host は省略）。 */
+      herdrSession?: string;
     }
   // ---- プッシュ通知（push v1。契約の正本は protocol/push-v1.md §1。名前・形は変えない）----
   /** 端末登録（iOS→host）。接続が成立するたびに送られる（host は冪等に上書き）。 */

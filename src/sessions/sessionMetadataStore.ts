@@ -27,6 +27,16 @@ export interface SessionMeta {
   /** herdr backend のときの pane ID（`w<N>:p<id>`）。herdr への入出力 target。 */
   herdrPaneId?: string;
   /**
+   * herdr backend のとき pane を収容している herdr セッション名（herdr-session-setting）。
+   * 未記録は専用セッション `tailii`（全会話を `tailii` に入れていた頃の会話）。
+   */
+  herdrSession?: string;
+  /**
+   * herdr backend のとき pane の端末 ID（`terminal_id`）。pane ID の振り直しで別の pane（利用者の pane を含む）を
+   * 自分の pane と取り違えないための照合に使う（herdr-session-setting）。
+   */
+  herdrTerminalId?: string;
+  /**
    * hub tick がタブへ自動適用した会話タイトル（session-title）。
    * 「ラベル==この値」のタブは自動命名のままとみなし、ai-title の更新へ追随して
    * 再リネームする。人為リネーム（それ以外のラベル）とを区別する権威。
@@ -88,6 +98,8 @@ export class SessionMetadataStore {
         cwd: meta.cwd,
         ...(meta.executionRoute !== undefined ? { executionRoute: meta.executionRoute } : {}),
         ...(meta.herdrPaneId !== undefined ? { herdrPaneId: meta.herdrPaneId } : {}),
+        ...(meta.herdrSession !== undefined ? { herdrSession: meta.herdrSession } : {}),
+        ...(meta.herdrTerminalId !== undefined ? { herdrTerminalId: meta.herdrTerminalId } : {}),
         name: meta.name,
         ...(meta.providerSessionId !== undefined ? { providerSessionId: meta.providerSessionId } : {}),
         ...(meta.tmuxPaneId !== undefined ? { tmuxPaneId: meta.tmuxPaneId } : {}),
@@ -228,6 +240,14 @@ function decodeMeta(raw: unknown): SessionMeta | null {
     typeof obj["herdrPaneId"] === "string" && HERDR_PANE_ID_PATTERN.test(obj["herdrPaneId"])
       ? obj["herdrPaneId"]
       : undefined;
+  const herdrSession =
+    typeof obj["herdrSession"] === "string" && HERDR_SESSION_NAME_PATTERN.test(obj["herdrSession"])
+      ? obj["herdrSession"]
+      : undefined;
+  const herdrTerminalId =
+    typeof obj["herdrTerminalId"] === "string" && HERDR_TERMINAL_ID_PATTERN.test(obj["herdrTerminalId"])
+      ? obj["herdrTerminalId"]
+      : undefined;
   const autoTabTitle =
     typeof obj["autoTabTitle"] === "string" && obj["autoTabTitle"].length > 0
       ? obj["autoTabTitle"]
@@ -244,9 +264,20 @@ function decodeMeta(raw: unknown): SessionMeta | null {
     ...(tmuxPaneId !== undefined ? { tmuxPaneId } : {}),
     ...(backend !== undefined ? { backend } : {}),
     ...(herdrPaneId !== undefined ? { herdrPaneId } : {}),
+    ...(herdrSession !== undefined ? { herdrSession } : {}),
+    ...(herdrTerminalId !== undefined ? { herdrTerminalId } : {}),
     ...(autoTabTitle !== undefined ? { autoTabTitle } : {}),
   };
 }
+
+/**
+ * 収容先の herdr セッション名として受け付ける形。herdr 自身の規則（ASCII の英数字と `.` `_` `-`）に、
+ * 先頭が `.` `-` でない（フラグ・隠しディレクトリに見えない）・64 文字以内を足す。
+ */
+export const HERDR_SESSION_NAME_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$/;
+
+/** herdr の端末 ID の形式（例 `term_6601e1d072c0c1`。0.9.5 実測）。 */
+export const HERDR_TERMINAL_ID_PATTERN = /^term_[A-Za-z0-9]{1,64}$/;
 
 /** herdr pane ID の形式（例 `w4:p2`。実測で英数字混在の pane 連番あり）。 */
 export const HERDR_PANE_ID_PATTERN = /^w\d+:p[A-Za-z0-9]+$/;

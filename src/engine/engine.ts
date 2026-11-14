@@ -78,7 +78,9 @@ import {
 } from "../chat/transcriptTailer.js";
 import {
   makeSessionBackend,
+  resolveHerdrSessionName,
   resolveSessionBackendKind,
+  writeHerdrSessionName,
   writeSessionBackendKind,
   type SessionBackend,
   type SessionBackendKind,
@@ -222,6 +224,7 @@ export async function runEngineCommand(args: string[]): Promise<number> {
     innerCommand: resumeCommandArg ?? "claude --continue",
     agent: "claude",
     backend: backendKind,
+    herdrSession: resolveHerdrSessionName,
     claudeProjectsDir: claudeProjectsRoot,
   });
   // per-session: agentType=codex のセッション用に codex launcher / resume launcher を用意する。
@@ -246,12 +249,14 @@ export async function runEngineCommand(args: string[]): Promise<number> {
     agent: "codex",
     codexAppServer,
     backend: backendKind,
+    herdrSession: resolveHerdrSessionName,
   });
   const codexResumeLauncher = makeSessionLauncher({
     store,
     agent: "codex",
     codexAppServer,
     backend: backendKind,
+    herdrSession: resolveHerdrSessionName,
   });
 
   try {
@@ -270,6 +275,7 @@ export async function runEngineCommand(args: string[]): Promise<number> {
         innerCommand: innerCommandArg,
         agent: "claude",
         backend: backendKind,
+        herdrSession: resolveHerdrSessionName,
         claudeProjectsDir: claudeProjectsRoot,
       }),
       backendKind,
@@ -306,6 +312,10 @@ export interface RunEngineOptions {
   backendKind?: () => SessionBackendKind;
   /** backend_set の永続化先（テスト注入用。既定は `~/.tailii/backend` への書き込み）。 */
   backendWriter?: (kind: SessionBackendKind) => void;
+  /** 新しい会話を入れる herdr セッション名の解決子（テスト注入用。既定は `~/.tailii/herdr-session` を読む）。 */
+  herdrSessionName?: () => string;
+  /** backend_set の `herdrSession` の永続化先（テスト注入用。既定は `~/.tailii/herdr-session` への書き込み）。 */
+  herdrSessionWriter?: (name: string) => void;
   /** herdr 導入済み判定（テスト注入用。既定は実バイナリの存在検査）。 */
   herdrInstalledProbe?: () => boolean;
   /** 画像通知/取得の橋渡し（省略時は画像処理なし = 後方互換）。 */
@@ -407,6 +417,8 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
     sessionManager,
     backendKind = () => "tmux" as SessionBackendKind,
     backendWriter = writeSessionBackendKind,
+    herdrSessionName = resolveHerdrSessionName,
+    herdrSessionWriter = writeHerdrSessionName,
     herdrInstalledProbe = herdrInstalled,
     imageService = null,
     transcriptTailer = null,
@@ -1190,6 +1202,8 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           sessionManager,
           backendKind,
           backendWriter,
+          herdrSessionName,
+          herdrSessionWriter,
           herdrInstalledProbe,
           imageService,
           launcher,

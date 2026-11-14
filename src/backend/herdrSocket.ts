@@ -89,11 +89,14 @@ function mapCall(args: string[]): Call | null {
     for (let i = 2; i < args.length; i++) {
       const flag = args[i]!;
       if (flag === "--no-focus") { params.focus = false; continue; }
-      if (!["--cwd", "--label", "--env"].includes(flag)) return null;
+      const flags = group === "tab" ? ["--cwd", "--label", "--env", "--workspace"] : ["--cwd", "--label", "--env"];
+      if (!flags.includes(flag)) return null;
       const value = args[++i];
       if (value === undefined || (flag !== "--env" && seen.has(flag))) return null;
       seen.add(flag);
-      if (flag === "--env") {
+      if (flag === "--workspace") {
+        params.workspace_id = value;
+      } else if (flag === "--env") {
         const equal = value.indexOf("=");
         if (equal <= 0 || value.slice(0, equal).includes("\0") || value.slice(equal + 1).includes("\0")) return null;
         env[value.slice(0, equal)] = value.slice(equal + 1);

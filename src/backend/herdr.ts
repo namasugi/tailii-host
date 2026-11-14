@@ -26,6 +26,8 @@ import { PROTOCOL_V1, type ControlMessage, type SessionInfo } from "../protocol.
 import { scrollBottomKeyIsDefault } from "../shared/claudeKeybindings.js";
 import {
   HERDR_PANE_ID_PATTERN,
+  HERDR_SESSION_NAME_PATTERN,
+  HERDR_TERMINAL_ID_PATTERN,
   SessionMetadataStore,
   type SessionMeta,
   validateSessionName,
@@ -113,6 +115,42 @@ export function defaultHerdrPath(): string {
  * まとめて消すときは `herdr session stop tailii` → `herdr session delete tailii`。
  */
 export const HERDR_TAILII_SESSION = "tailii";
+
+/**
+ * herdr の既定セッション（`herdr` を引数なしで開いたときのセッション。`--session default` で指せる）。
+ * 新しい会話の収容先の既定値（herdr-session-setting, 2026-11-14。アプリの設定 / `~/.tailii/herdr-session` で変える）。
+ */
+export const HERDR_DEFAULT_SESSION = "default";
+
+/** 収容先の herdr セッション名として受け付ける形か（`HERDR_SESSION_NAME_PATTERN`）。 */
+export function isValidHerdrSessionName(name: string): boolean {
+  return HERDR_SESSION_NAME_PATTERN.test(name);
+}
+
+/**
+ * 会話を収容している herdr セッション名。メタの `herdrSession`。未記録は、全会話を専用セッションに
+ * 入れていた頃に起動した会話なので `tailii`。
+ */
+export function herdrSessionOfMeta(meta: Pick<SessionMeta, "herdrSession"> | null | undefined): string {
+  return meta?.herdrSession ?? HERDR_TAILII_SESSION;
+}
+
+/** herdr の会話のメタを、収容している herdr セッション名ごとに分ける（herdr 以外は除く）。 */
+export function herdrMetasBySession(metas: readonly SessionMeta[]): Map<string, SessionMeta[]> {
+  const groups = new Map<string, SessionMeta[]>();
+  for (const meta of metas) {
+    if (meta.backend !== "herdr") continue;
+    const herdrSession = herdrSessionOfMeta(meta);
+    const group = groups.get(herdrSession) ?? [];
+    group.push(meta);
+    groups.set(herdrSession, group);
+  }
+  return groups;
+}
+
+function sortSessionInfos(infos: SessionInfo[]): SessionInfo[] {
+  return infos.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
 
 /** herdr が導入済みか（backend_get の可用性表示・backend_set の検証に使う）。 */
 export function herdrInstalled(herdrPath: string = defaultHerdrPath()): boolean {
@@ -222,7 +260,15 @@ export function herdrErrorCode(output: string): string | null {
  * 0.7.5 の保存状態 → 0.9.3 サーバー）。保存状態を消せば会話は開き直したときに Tailii が
  * 自前の起動で resume する。0.7.5 の `pane release-agent` は申告を消さない（実測）。
  */
-export const HERDR_RESTART_COMMAND = "herdr session stop tailii && herdr session delete tailii";
+export function herdrRestartCommand(herdrSession: string = HERDR_TAILII_SESSION): string {
+  // 保存状態の削除（delete）は専用セッションだけ。既定セッション・利用者が名前を付けたセッションの
+  // 保存状態は利用者自身の作業も含むので消させない。
+  return herdrSession === HERDR_TAILII_SESSION
+    ? "herdr session stop tailii && herdr session delete tailii"
+    : `herdr session stop ${herdrSession}`;
+}
+
+export const HERDR_RESTART_COMMAND = herdrRestartCommand();
 
 /**
  * herdr を更新した後、tailii セッションのサーバーが旧版のまま動いている（`protocol_mismatch`）
@@ -230,10 +276,13 @@ export const HERDR_RESTART_COMMAND = "herdr session stop tailii && herdr session
  * 止めるまで Tailii の herdr 操作は全て失敗する（実測 2026-09-30, 0.9.3 CLI × 0.7.5 server）。
  * 止めると pane のプロセス（実行中の会話）は終了するので、自動では止めず利用者に委ねる。
  */
-export const HERDR_RESTART_NEEDED_MESSAGE =
-  "herdr が更新されましたが、Tailii 用の herdr サーバーは古い版のまま動いています。" +
-  `ホストで \`${HERDR_RESTART_COMMAND}\` を実行してから会話を開き直してください` +
-  "（実行中の会話は一度終了し、開き直すと続きから再開します）。";
+export function herdrRestartNeededMessage(herdrSession: string = HERDR_TAILII_SESSION): string {
+  return `herdr が更新されましたが、herdr サーバー（セッション ${herdrSession}）は古い版のまま動いています。` +
+    `ホストで \`${herdrRestartCommand(herdrSession)}\` を実行してから会話を開き直してください` +
+    "（実行中の会話は一度終了し、開き直すと続きから再開します）。";
+}
+
+export const HERDR_RESTART_NEEDED_MESSAGE = herdrRestartNeededMessage();
 
 /** HerdrSessionManager が投げる型付きエラー。 */
 export class HerdrFailedError extends Error {
@@ -241,10 +290,11 @@ export class HerdrFailedError extends Error {
     public readonly args: string[],
     public readonly exitCode: number,
     public readonly stderr: string,
+    herdrSession: string = HERDR_TAILII_SESSION,
   ) {
     super(
       herdrErrorCode(stderr) === "protocol_mismatch"
-        ? HERDR_RESTART_NEEDED_MESSAGE
+        ? herdrRestartNeededMessage(herdrSession)
         : `herdr ${args.join(" ")} failed (exit ${exitCode}): ${stderr}`,
     );
     this.name = "HerdrFailedError";
@@ -345,6 +395,15 @@ export interface HerdrPane {
   label: string | null;
   /** pane を収容するタブ ID（タブラベル書換=session-title に使う。旧形式は null）。 */
   tabId: string | null;
+  /** pane を収容するワークスペース ID（作業フォルダごとのワークスペース分け。旧形式は null）。 */
+  workspaceId: string | null;
+  /**
+   * pane の端末の ID（`term_…`）。pane ID はワークスペースごとの連番で振り直され得るが、これは pane ごとに別。
+   * 記録 pane ID の取り違え防止に使う（herdr-session-setting）。旧形式は null。
+   */
+  terminalId: string | null;
+  /** pane の今の作業フォルダ（herdr が実パスで返す。利用者の pane のワークスペースへの合流に使う）。旧形式は null。 */
+  cwd: string | null;
 }
 
 /** `pane list` stdout をパースする（形式不明は空配列）。 */
@@ -361,6 +420,9 @@ export function parseHerdrPaneList(stdout: string): HerdrPane[] {
       paneId: obj["pane_id"],
       label: typeof obj["label"] === "string" ? obj["label"] : null,
       tabId: typeof obj["tab_id"] === "string" ? obj["tab_id"] : null,
+      workspaceId: typeof obj["workspace_id"] === "string" ? obj["workspace_id"] : null,
+      terminalId: typeof obj["terminal_id"] === "string" ? obj["terminal_id"] : null,
+      cwd: typeof obj["cwd"] === "string" ? obj["cwd"] : null,
     });
   }
   return out;
@@ -433,6 +495,15 @@ export function parseHerdrCreatedTabPaneId(stdout: string): string | null {
   return typeof id === "string" && HERDR_PANE_ID_PATTERN.test(id) ? id : null;
 }
 
+/** `tab create` / `workspace create` stdout から root pane の terminal_id を取り出す（無ければ null）。 */
+export function parseHerdrCreatedTerminalId(stdout: string): string | null {
+  const result = parseHerdrResult(stdout);
+  const rootPane = result?.["root_pane"];
+  if (typeof rootPane !== "object" || rootPane === null) return null;
+  const id = (rootPane as Record<string, unknown>)["terminal_id"];
+  return typeof id === "string" && HERDR_TERMINAL_ID_PATTERN.test(id) ? id : null;
+}
+
 /**
  * `pane get` stdout から agent_status を取り出す（判定不能は null）。
  * 0.7.5 では `agent get <name>` が使えない（agent レジストリは herdr の自動検出のみで
@@ -484,6 +555,11 @@ export function parseHerdrForegroundPids(stdout: string): number[] {
 
 /**
  * セッション名に対応する pane を選ぶ。
+ * 0. 記録済み pane ID の pane は、端末 ID（`terminal_id`）も記録と一致するときだけ候補にする
+ *    （`recorded.terminalId` が無い旧記録は、専用セッション `tailii` に限り従来どおり pane ID だけで見る）。
+ *    pane ID はワークスペースごとの連番で振り直されるので、利用者も pane を作る `default` などでは、
+ *    古い記録 ID が利用者の pane を指し得る（取り違えると利用者の pane を閉じる・別の会話へ送る。
+ *    herdr-session-setting / Fable レビュー B-1）。
  * 1. 記録済み pane ID の pane が同じ label（または label なし）ならそれ。
  * 2. 無ければ label（= セッション名）一致の pane。
  * 3. それも無ければ、記録 ID の pane の label が**他の Tailii セッション名でない**限りそれ
@@ -499,9 +575,19 @@ export function resolveHerdrSessionPane(
   name: string,
   recordedPaneId: string | undefined,
   isTailiiName: (label: string) => boolean,
+  recorded: { terminalId?: string | undefined; herdrSession?: string | undefined } = {},
 ): HerdrPane | null {
-  const byId =
+  const candidate =
     recordedPaneId !== undefined ? panes.find((pane) => pane.paneId === recordedPaneId) : undefined;
+  const herdrSession = recorded.herdrSession ?? HERDR_TAILII_SESSION;
+  const byId =
+    candidate === undefined
+      ? undefined
+      : recorded.terminalId !== undefined
+        ? (candidate.terminalId === recorded.terminalId ? candidate : undefined)
+        : herdrSession === HERDR_TAILII_SESSION
+          ? candidate
+          : undefined;
   if (byId !== undefined && (byId.label === null || byId.label === name)) return byId;
   const byLabel = panes.find((pane) => pane.label === name);
   if (byLabel !== undefined) return byLabel;
@@ -511,7 +597,12 @@ export function resolveHerdrSessionPane(
 
 /** herdr backend のセッション list / reattach / kill / send / read とメタデータ統合。 */
 export class HerdrSessionManager {
-  private readonly runner: HerdrCommandRunner;
+  /**
+   * herdr セッション名 → そのセッションへ向けた runner（herdr-session-setting）。会話ごとの収容先は
+   * メタの `herdrSession`（未記録は `tailii`）で決まる。pane ID はセッションごとに振られるので、
+   * 会話の操作は必ずその会話のセッションの runner で行う。
+   */
+  private readonly runnerFor: (herdrSession: string) => HerdrCommandRunner;
   readonly store: SessionMetadataStore;
   private readonly captureLines: number;
   private readonly protocolVersion: number;
@@ -547,7 +638,10 @@ export class HerdrSessionManager {
   private readonly now: () => number;
 
   constructor(options: {
+    /** 全セッション共通の runner（テスト用。`--session` の前置は runner の側の責務）。 */
     runner?: HerdrCommandRunner;
+    /** herdr セッション名ごとの runner（テスト用。既定は `defaultHerdrCommandRunner` をセッションごとに作って使い回す）。 */
+    runnerFor?: (herdrSession: string) => HerdrCommandRunner;
     store?: SessionMetadataStore;
     captureLines?: number;
     protocolVersion?: number;
@@ -572,7 +666,20 @@ export class HerdrSessionManager {
     loginSettleMs?: number;
     now?: () => number;
   } = {}) {
-    this.runner = options.runner ?? defaultHerdrCommandRunner();
+    const fixedRunner = options.runner;
+    const runners = new Map<string, HerdrCommandRunner>();
+    this.runnerFor =
+      options.runnerFor ??
+      (fixedRunner !== undefined
+        ? () => fixedRunner
+        : (herdrSession) => {
+            let runner = runners.get(herdrSession);
+            if (runner === undefined) {
+              runner = defaultHerdrCommandRunner(defaultHerdrPath(), herdrSession);
+              runners.set(herdrSession, runner);
+            }
+            return runner;
+          });
     this.store = options.store ?? new SessionMetadataStore();
     this.captureLines = options.captureLines ?? 50;
     this.protocolVersion = options.protocolVersion ?? PROTOCOL_V1;
@@ -607,8 +714,15 @@ export class HerdrSessionManager {
   async list(): Promise<SessionInfo[]> {
     // herdr メタが皆無なら CLI を呼ばない（常時 Composite 構成でも純 tmux 環境に副作用ゼロ）。
     const metas = await this.store.allAsync();
-    if (!metas.some((meta) => meta.backend === "herdr")) return [];
-    return this.listFromPanes(await this.livePanes(), metas);
+    const groups = herdrMetasBySession(metas);
+    if (groups.size === 0) return [];
+    const names = new Set(metas.map((meta) => meta.name));
+    const lists = await Promise.all(
+      [...groups].map(async ([herdrSession, group]) =>
+        this.listFromPanes(herdrSession, (await this.livePanesOrNull(herdrSession)) ?? [], group, names),
+      ),
+    );
+    return sortSessionInfos(lists.flat());
   }
 
   /**
@@ -619,26 +733,44 @@ export class HerdrSessionManager {
    */
   async listLive(): Promise<SessionInfo[] | null> {
     const metas = await this.store.allAsync();
-    if (!metas.some((meta) => meta.backend === "herdr")) return [];
-    const panes = await this.livePanesOrNull();
-    if (panes === null) return null;
-    return this.listFromPanes(panes, metas);
+    const groups = herdrMetasBySession(metas);
+    if (groups.size === 0) return [];
+    const names = new Set(metas.map((meta) => meta.name));
+    const paneLists = await Promise.all(
+      [...groups.keys()].map(async (herdrSession) => [herdrSession, await this.livePanesOrNull(herdrSession)] as const),
+    );
+    // どれか 1 つのセッションでも取れなければ「取得不能」（会話を消滅と誤判定しない）。
+    if (paneLists.some(([, panes]) => panes === null)) return null;
+    const lists = await Promise.all(
+      paneLists.map(([herdrSession, panes]) =>
+        this.listFromPanes(herdrSession, panes ?? [], groups.get(herdrSession) ?? [], names),
+      ),
+    );
+    return sortSessionInfos(lists.flat());
   }
 
-  private async listFromPanes(panes: HerdrPane[], metas: SessionMeta[]): Promise<SessionInfo[]> {
+  private async listFromPanes(
+    herdrSession: string,
+    panes: HerdrPane[],
+    metas: SessionMeta[],
+    tailiiNames: ReadonlySet<string>,
+  ): Promise<SessionInfo[]> {
     // タブラベル（Mac 側リネーム含む会話タイトル表示）を name→label で引けるようにする
     // （session-title 逆方向同期: セッション名と異なるラベルを displayTitle として載せる）。
-    const tabLabels = await this.tabLabels();
+    const tabLabels = await this.tabLabels(herdrSession);
 
-    const tailiiNames = new Set(metas.map((meta) => meta.name));
     const infos: SessionInfo[] = [];
     for (const meta of metas) {
       if (meta.backend !== "herdr") continue;
       const agent = meta.agent ?? "claude";
       const providerSessionId =
         meta.providerSessionId ?? (agent === "claude" ? meta.claudeSessionId : undefined);
-      const pane = resolveHerdrSessionPane(panes, meta.name, meta.herdrPaneId, (label) =>
-        tailiiNames.has(label),
+      const pane = resolveHerdrSessionPane(
+        panes,
+        meta.name,
+        meta.herdrPaneId,
+        (label) => tailiiNames.has(label),
+        { terminalId: meta.herdrTerminalId, herdrSession },
       );
       const alive = pane !== null;
       const tabLabel = pane?.tabId != null ? tabLabels.get(pane.tabId) : undefined;
@@ -660,28 +792,36 @@ export class HerdrSessionManager {
         ...(displayTitle !== undefined ? { displayTitle } : {}),
       });
     }
-    return infos.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    return infos;
   }
 
   /**
    * 生存 pane の session 名 → { tabId, tabLabel } を返す（session-title の自動タイトル同期用）。
    * pane label（= セッション解決の権威）が無い pane・タブ不明の pane は含めない。
+   * 会話が使っている herdr セッションを全部見る。同じ label は、その会話を収容しているセッションの pane を採る。
    */
   async tabInfoByName(): Promise<Map<string, { tabId: string; label: string | null }>> {
-    const panes = await this.livePanes();
-    const tabs = await this.tabLabels();
+    const metas = await this.store.allAsync();
+    const groups = herdrMetasBySession(metas);
     const out = new Map<string, { tabId: string; label: string | null }>();
-    for (const pane of panes) {
-      if (pane.label === null || pane.tabId === null) continue;
-      out.set(pane.label, { tabId: pane.tabId, label: tabs.get(pane.tabId) ?? null });
+    for (const [herdrSession, group] of groups) {
+      const own = new Set(group.map((meta) => meta.name));
+      const panes = await this.livePanes(herdrSession);
+      if (panes.length === 0) continue;
+      const tabs = await this.tabLabels(herdrSession);
+      for (const pane of panes) {
+        if (pane.label === null || pane.tabId === null) continue;
+        if (out.has(pane.label) && !own.has(pane.label)) continue;
+        out.set(pane.label, { tabId: pane.tabId, label: tabs.get(pane.tabId) ?? null });
+      }
     }
     return out;
   }
 
   /** `tab list` を tab_id → label で読む（失敗は空マップ = displayTitle 無しに倒す）。 */
-  private async tabLabels(): Promise<Map<string, string>> {
+  private async tabLabels(herdrSession: string): Promise<Map<string, string>> {
     try {
-      const result = await this.runner(["tab", "list"]);
+      const result = await this.runnerFor(herdrSession)(["tab", "list"]);
       if (result.exitCode !== 0) return new Map();
       return parseHerdrTabLabels(result.stdout);
     } catch {
@@ -730,7 +870,7 @@ export class HerdrSessionManager {
     const target = await this.paneTarget(name);
     if (target === null) return true;
     try {
-      const result = await this.runner(["pane", "process-info", "--pane", target]);
+      const result = await this.runnerOf(name)(["pane", "process-info", "--pane", target]);
       if (result.exitCode !== 0) return true;
       const command = parseHerdrForegroundCommand(result.stdout);
       // 空/シェル名のみ死亡候補（空は判定不能なので安全側 true）。
@@ -749,7 +889,7 @@ export class HerdrSessionManager {
     const target = await this.paneTarget(name);
     if (target === null) return null;
     try {
-      const result = await this.runner(["pane", "process-info", "--pane", target]);
+      const result = await this.runnerOf(name)(["pane", "process-info", "--pane", target]);
       if (result.exitCode !== 0) return null;
       // 空は「前面プロセスが無い」ではなく形式変更・一時失敗の疑い → 取得不能として扱う。
       const pids = parseHerdrForegroundPids(result.stdout);
@@ -765,7 +905,7 @@ export class HerdrSessionManager {
     const target = await this.paneTarget(name);
     if (target === null) return null;
     try {
-      const result = await this.runner(["pane", "process-info", "--pane", target]);
+      const result = await this.runnerOf(name)(["pane", "process-info", "--pane", target]);
       if (result.exitCode !== 0) return null;
       const info = parseHerdrResult(result.stdout)?.["process_info"];
       if (typeof info !== "object" || info === null) return null;
@@ -798,7 +938,7 @@ export class HerdrSessionManager {
     validateSessionName(name);
     const pane = await this.findPane(name);
     if (pane === null) {
-      throw await this.missingPaneError(["tab", "rename", name]);
+      throw await this.missingPaneError(name, ["tab", "rename", name]);
     }
     if (pane.tabId === null) {
       throw new HerdrFailedError(["tab", "rename", name], 1, "tab id unavailable");
@@ -806,9 +946,9 @@ export class HerdrSessionManager {
     const trimmed = title?.trim() ?? "";
     const label = trimmed.length > 0 ? trimmed : name;
     const args = ["tab", "rename", pane.tabId, label];
-    const result = await this.runner(args);
+    const result = await this.runnerOf(name)(args);
     if (result.exitCode !== 0) {
-      throw new HerdrFailedError(args, result.exitCode, result.stderr);
+      throw new HerdrFailedError(args, result.exitCode, result.stderr, this.herdrSessionOf(name));
     }
   }
 
@@ -817,12 +957,12 @@ export class HerdrSessionManager {
     validateSessionName(name);
     const target = await this.paneTarget(name);
     if (target === null) {
-      throw await this.missingPaneError(["pane", "close", name]);
+      throw await this.missingPaneError(name, ["pane", "close", name]);
     }
     const args = ["pane", "close", target];
-    const result = await this.runner(args);
+    const result = await this.runnerOf(name)(args);
     if (result.exitCode !== 0) {
-      throw new HerdrFailedError(args, result.exitCode, result.stderr);
+      throw new HerdrFailedError(args, result.exitCode, result.stderr, this.herdrSessionOf(name));
     }
   }
 
@@ -1010,12 +1150,12 @@ export class HerdrSessionManager {
         // 下の反映検証が必ず失敗する（実測 2.1.283: 983 字の送信が 3 回打ち直した末に失敗）。
         const target = await this.paneTarget(name);
         if (target === null) {
-          throw await this.missingPaneError(["pane", "send-text", name]);
+          throw await this.missingPaneError(name, ["pane", "send-text", name]);
         }
         const sendRaw = async (payload: string): Promise<void> => {
           const args = ["pane", "send-text", target, payload];
-          const result = await this.runner(args);
-          if (result.exitCode !== 0) throw new HerdrFailedError(args, result.exitCode, result.stderr);
+          const result = await this.runnerOf(name)(args);
+          if (result.exitCode !== 0) throw new HerdrFailedError(args, result.exitCode, result.stderr, this.herdrSessionOf(name));
         };
         const outcome = await pasteTextInline(text, {
           // 1 つずつ書き込む。まとめて書き込むと、CLI が読み進めるのを待たされる（実測: 8KB を
@@ -1310,7 +1450,7 @@ export class HerdrSessionManager {
       try {
         const target = await this.paneTarget(name);
         if (target === null) return;
-        const result = await this.runner(["pane", "get", target]);
+        const result = await this.runnerOf(name)(["pane", "get", target]);
         if (result.exitCode === 0) {
           const status = parseHerdrPaneAgentStatus(result.stdout);
           if (status !== null && status !== "unknown") return;
@@ -1405,9 +1545,9 @@ export class HerdrSessionManager {
     validateSessionName(name);
     const target = await this.paneTarget(name);
     if (target === null) {
-      throw await this.missingPaneError(["pane", "read", name]);
+      throw await this.missingPaneError(name, ["pane", "read", name]);
     }
-    return this.readPane(target, ["--source", "visible", "--format", "ansi"]);
+    return this.readPane(name, target, ["--source", "visible", "--format", "ansi"]);
   }
 
   /** 判定不能（capture 失敗）を null で返す ANSI キャプチャ（送信確定ループ用）。 */
@@ -1434,7 +1574,7 @@ export class HerdrSessionManager {
     if (keys.length === 0) return;
     const target = await this.paneTarget(name);
     if (target === null) {
-      throw await this.missingPaneError(["pane", "send-keys", name]);
+      throw await this.missingPaneError(name, ["pane", "send-keys", name]);
     }
     for (const key of keys) {
       let args: string[];
@@ -1450,9 +1590,9 @@ export class HerdrSessionManager {
       } else {
         args = ["pane", "send-text", target, key];
       }
-      const result = await this.runner(args);
+      const result = await this.runnerOf(name)(args);
       if (result.exitCode !== 0) {
-        throw new HerdrFailedError(args, result.exitCode, result.stderr);
+        throw new HerdrFailedError(args, result.exitCode, result.stderr, this.herdrSessionOf(name));
       }
     }
   }
@@ -1466,14 +1606,14 @@ export class HerdrSessionManager {
     validateSessionName(name);
     const target = await this.paneTarget(name);
     if (target === null) {
-      throw await this.missingPaneError(["pane", "read", name]);
+      throw await this.missingPaneError(name, ["pane", "read", name]);
     }
     const lines = options.lines ?? this.captureLines;
     if (options.joinWrappedLines ?? false) {
-      const joined = await this.readPane(target, ["--source", "recent-unwrapped", "--lines", `${lines}`]);
+      const joined = await this.readPane(name, target, ["--source", "recent-unwrapped", "--lines", `${lines}`]);
       if (joined.length > 0) return joined;
     }
-    const visible = await this.readPane(target, ["--source", "visible"]);
+    const visible = await this.readPane(name, target, ["--source", "visible"]);
     const all = visible.split("\n");
     return all.slice(Math.max(0, all.length - lines)).join("\n");
   }
@@ -1491,16 +1631,16 @@ export class HerdrSessionManager {
     validateSessionName(name);
     const target = await this.paneTarget(name);
     if (target === null) {
-      throw await this.missingPaneError(["pane", "read", name]);
+      throw await this.missingPaneError(name, ["pane", "read", name]);
     }
-    return this.readPane(target, ["--source", "visible"]);
+    return this.readPane(name, target, ["--source", "visible"]);
   }
 
-  private async readPane(target: string, sourceArgs: string[]): Promise<string> {
+  private async readPane(name: string, target: string, sourceArgs: string[]): Promise<string> {
     const args = ["pane", "read", target, ...sourceArgs];
-    const result = await this.runner(args);
+    const result = await this.runnerOf(name)(args);
     if (result.exitCode !== 0) {
-      throw new HerdrFailedError(args, result.exitCode, result.stderr);
+      throw new HerdrFailedError(args, result.exitCode, result.stderr, this.herdrSessionOf(name));
     }
     const lines = result.stdout.split("\n");
     while (lines.length > 0 && (lines[lines.length - 1] ?? "").trim() === "") {
@@ -1510,17 +1650,20 @@ export class HerdrSessionManager {
   }
 
   /**
-   * tailii セッションの server を pane ゼロのときだけ停止する（reaper の空サーバー回収）。
+   * 専用セッション `tailii` の server を pane ゼロのときだけ停止する（reaper の空サーバー回収）。
    * tmux server の「セッションゼロで自動終了」に対応する挙動。launch 側に ensure（不在なら
    * detached 起動）があるため、停止しても次のセッション起動で自動復帰する。
    * ユーザーが tailii セッション内に手動 pane を作っていた場合は停止しない（pane 総数で判定）。
+   * herdr の既定セッションや利用者が名前を付けたセッションは利用者自身も使うので止めない
+   * （herdr-session-setting）。
    */
   async stopServerIfEmpty(): Promise<void> {
+    const runner = this.runnerFor(HERDR_TAILII_SESSION);
     try {
-      const result = await this.runner(["pane", "list"]);
+      const result = await runner(["pane", "list"]);
       if (result.exitCode !== 0) return; // server 不在/不通 = 何もしない
       if (parseHerdrPaneList(result.stdout).length > 0) return;
-      await this.runner(["server", "stop"]);
+      await runner(["server", "stop"]);
     } catch {
       // ENOENT 等（未導入環境）は無視。
     }
@@ -1532,11 +1675,12 @@ export class HerdrSessionManager {
    * （livePanes は失敗を空集合として握るため、そのままだと送信失敗が `pane not found` に化ける）。
    * 見つからなかった後だけ 1 回追加で問い合わせるので、正常時の経路は増えない。
    */
-  private async missingPaneError(args: string[]): Promise<HerdrFailedError> {
+  private async missingPaneError(name: string, args: string[]): Promise<HerdrFailedError> {
+    const herdrSession = this.herdrSessionOf(name);
     try {
-      const result = await this.runner(["pane", "list"]);
+      const result = await this.runnerFor(herdrSession)(["pane", "list"]);
       if (result.exitCode !== 0 && herdrErrorCode(result.stderr) === "protocol_mismatch") {
-        return new HerdrFailedError(["pane", "list"], result.exitCode, result.stderr);
+        return new HerdrFailedError(["pane", "list"], result.exitCode, result.stderr, herdrSession);
       }
     } catch {
       // 実行ファイル起動失敗などは従来どおり「pane が無い」として扱う。
@@ -1544,11 +1688,18 @@ export class HerdrSessionManager {
     return new HerdrFailedError(args, 1, "pane not found");
   }
 
-  /** 生存 pane の一覧。取得できなかった場合は null（「0 件」と区別する）。 */
-  private async livePanesOrNull(): Promise<HerdrPane[] | null> {
+  /**
+   * 生存 pane の一覧。取得できなかった場合は null（「0 件」と区別する）。
+   * server が動いていない（`server_not_running`）のは「0 件」と確定できる: 会話ごとに herdr セッションが
+   * 分かれたので、使わなくなった `tailii` の server が止まっているだけで全体を取得不能にしない。
+   */
+  private async livePanesOrNull(herdrSession: string): Promise<HerdrPane[] | null> {
     try {
-      const result = await this.runner(["pane", "list"]);
-      if (result.exitCode !== 0) return null;
+      const result = await this.runnerFor(herdrSession)(["pane", "list"]);
+      if (result.exitCode !== 0) {
+        const code = herdrErrorCode(result.stderr) ?? herdrErrorCode(result.stdout);
+        return code === "server_not_running" ? [] : null;
+      }
       return parseHerdrPaneList(result.stdout);
     } catch {
       return null;
@@ -1556,20 +1707,33 @@ export class HerdrSessionManager {
   }
 
   /** 生存 pane の一覧。herdr server 未起動などの失敗は空集合として扱う（tmux `ls` と同じ流儀）。 */
-  private async livePanes(): Promise<HerdrPane[]> {
-    return (await this.livePanesOrNull()) ?? [];
+  private async livePanes(herdrSession: string): Promise<HerdrPane[]> {
+    return (await this.livePanesOrNull(herdrSession)) ?? [];
+  }
+
+  /** 会話を収容している herdr セッション名（メタの `herdrSession`。未記録は `tailii`）。 */
+  private herdrSessionOf(name: string): string {
+    return herdrSessionOfMeta(this.store.get(name));
+  }
+
+  /** 会話を収容している herdr セッションへ向けた runner。 */
+  private runnerOf(name: string): HerdrCommandRunner {
+    return this.runnerFor(this.herdrSessionOf(name));
   }
 
   /** セッション名の現存 pane を解決する（記録済み pane ID 優先、無ければ label 一致）。 */
   private async findPane(name: string): Promise<HerdrPane | null> {
+    const meta = this.store.get(name);
+    const herdrSession = herdrSessionOfMeta(meta);
     return resolveHerdrSessionPane(
-      await this.livePanes(),
+      await this.livePanes(herdrSession),
       name,
-      this.store.get(name)?.herdrPaneId,
+      meta?.herdrPaneId,
       // 3. の判定でだけ該当 1 件を読む（findPane はライブビュー更新で 250ms ごとに呼ばれるので
       // メタ全件は読まない）。名前の一致まで見るのは、大文字小文字を区別しない FS で
       // `S-B` が `s-b.json` を読んでも別名扱いにし、listFromPanes（中身の名前で判定）と揃えるため。
       (label) => this.store.get(label)?.name === label,
+      { terminalId: meta?.herdrTerminalId, herdrSession },
     );
   }
 

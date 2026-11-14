@@ -66,6 +66,53 @@ describe("EngineControl — backend get/set", () => {
     }
   }, 15_000);
 
+  test("backend_set_request の herdrSession は検査して書き、応答と get に載せる（herdr-session-setting）", async () => {
+    const written: string[] = [];
+    let session = "default";
+    const engine = startEngine({
+      sessionManager: makeManager(),
+      backendKind: () => "herdr",
+      backendWriter: () => {},
+      herdrSessionName: () => session,
+      herdrSessionWriter: (name) => {
+        written.push(name);
+        session = name;
+      },
+      herdrInstalledProbe: () => true,
+    });
+    await engine.lines.nextOfType("channel_hello");
+    try {
+      engine.writeLine(JSON.stringify({ type: "backend_get_request", v: 1, id: "g1" }));
+      expect(decodeControlMessage(await engine.lines.nextOfType("backend_get_response"))).toMatchObject({
+        id: "g1", herdrSession: "default",
+      });
+
+      engine.writeLine(JSON.stringify({
+        type: "backend_set_request", v: 1, id: "s1", backend: "herdr", herdrSession: "tailii",
+      }));
+      expect(decodeControlMessage(await engine.lines.nextOfType("backend_set_response"))).toMatchObject({
+        id: "s1", ok: true, backend: "herdr", herdrSession: "tailii",
+      });
+
+      // herdr が受け付けない名前は書かずに ok=false（今の設定を返す）。
+      engine.writeLine(JSON.stringify({
+        type: "backend_set_request", v: 1, id: "s2", backend: "herdr", herdrSession: "my work",
+      }));
+      const rejected = decodeControlMessage(await engine.lines.nextOfType("backend_set_response"));
+      expect(rejected).toMatchObject({ id: "s2", ok: false, herdrSession: "tailii" });
+      expect(written).toEqual(["tailii"]);
+
+      // 省略は変えない（旧アプリの切替）。
+      engine.writeLine(JSON.stringify({ type: "backend_set_request", v: 1, id: "s3", backend: "tmux" }));
+      expect(decodeControlMessage(await engine.lines.nextOfType("backend_set_response"))).toMatchObject({
+        id: "s3", ok: true, herdrSession: "tailii",
+      });
+      expect(written).toEqual(["tailii"]);
+    } finally {
+      await engine.teardown();
+    }
+  }, 15_000);
+
   test("session_title_set は herdr タブを tab rename し ok を返す（session-title）", async () => {
     const store = new SessionMetadataStore(makeTempDir("engine-title-store"));
     store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });

@@ -9,6 +9,7 @@ import {
   HerdrFailedError,
   HerdrSessionManager,
   herdrErrorCode,
+  isValidHerdrSessionName,
   resolveHerdrSessionPane,
   inputBoxTextIncludesProbe,
   parseHerdrCreatedTabPaneId,
@@ -21,12 +22,14 @@ import {
   type HerdrCommandResult,
   type HerdrCommandRunner,
 } from "../src/backend/herdr.js";
-import { launchCore, type ProcessRunner } from "../src/commands/launch.js";
+import { herdrWorkspaceKey, herdrWorkspaceLabel, launchCore, type ProcessRunner } from "../src/commands/launch.js";
 import {
   CompositeSessionBackend,
   makeBackendForSession,
   makeSessionBackend,
+  resolveHerdrSessionName,
   resolveSessionBackendKind,
+  writeHerdrSessionName,
 } from "../src/backend/sessionBackend.js";
 import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
 import {
@@ -61,7 +64,7 @@ function herdrOk(stdout: string): HerdrCommandResult {
 }
 
 /** herdr `pane list` の JSON stdout を組み立てる。 */
-function paneListJson(panes: { pane_id: string; label?: string; tab_id?: string }[]): string {
+function paneListJson(panes: { pane_id: string; label?: string; tab_id?: string; workspace_id?: string }[]): string {
   return JSON.stringify({ id: "cli:pane:list", result: { type: "pane_list", panes } });
 }
 
@@ -123,9 +126,14 @@ describe("herdr JSON パーサ", () => {
         paneListJson([{ pane_id: "w4:p2", label: "s-a", tab_id: "w4:t2" }, { pane_id: "w4:p3" }]),
       ),
     ).toEqual([
-      { paneId: "w4:p2", label: "s-a", tabId: "w4:t2" },
-      { paneId: "w4:p3", label: null, tabId: null },
+      { paneId: "w4:p2", label: "s-a", tabId: "w4:t2", workspaceId: null, terminalId: null, cwd: null },
+      { paneId: "w4:p3", label: null, tabId: null, workspaceId: null, terminalId: null, cwd: null },
     ]);
+    expect(
+      parseHerdrPaneList(JSON.stringify({ result: { panes: [
+        { pane_id: "w4:p2", label: "s-a", tab_id: "w4:t2", workspace_id: "w4", terminal_id: "term_1a" },
+      ] } })),
+    ).toEqual([{ paneId: "w4:p2", label: "s-a", tabId: "w4:t2", workspaceId: "w4", terminalId: "term_1a", cwd: null }]);
     expect(parseHerdrPaneList("not json")).toEqual([]);
     expect(
       parseHerdrStartedPaneId(
@@ -303,6 +311,7 @@ describe("HerdrSessionManager", () => {
 
   test("tabInfoByName は生存 pane の name → タブ情報を返す", async () => {
     const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
     const runner = new MockHerdrRunner((args) => {
       if (args[0] === "pane" && args[1] === "list") {
         return herdrOk(paneListJson([
@@ -1951,9 +1960,26 @@ describe("HerdrSessionManager", () => {
 });
 
 describe("resolveHerdrSessionPane（記録 pane ID の取り違え防止）", () => {
-  const pane = (paneId: string, label: string | null) => ({ paneId, label, tabId: null });
+  const pane = (paneId: string, label: string | null, terminalId: string | null = null) =>
+    ({ paneId, label, tabId: null, workspaceId: null, terminalId, cwd: null });
   const known = new Set(["s-a", "s-other"]);
   const names = (label: string) => known.has(label);
+
+  test("端末 ID を記録していれば、pane ID が同じでも端末が違う pane は採らない（振り直し後の取り違え）", () => {
+    expect(resolveHerdrSessionPane([pane("w1:p1", null, "term_new")], "s-a", "w1:p1", names, { terminalId: "term_old" }))
+      .toBeNull();
+    expect(resolveHerdrSessionPane([pane("w1:p1", "my work", "term_old")], "s-a", "w1:p1", names, { terminalId: "term_old" })
+      ?.paneId).toBe("w1:p1");
+  });
+
+  test("専用セッション以外では、端末 ID の記録が無い pane ID だけの一致は採らない（利用者の pane を指し得る）", () => {
+    expect(resolveHerdrSessionPane([pane("w1:p1", null)], "s-a", "w1:p1", names, { herdrSession: "default" })).toBeNull();
+    // label（= セッション名）が一致すれば採る。
+    expect(resolveHerdrSessionPane([pane("w1:p2", "s-a")], "s-a", "w1:p1", names, { herdrSession: "default" })?.paneId)
+      .toBe("w1:p2");
+    // 専用セッションの旧記録は従来どおり。
+    expect(resolveHerdrSessionPane([pane("w1:p1", null)], "s-a", "w1:p1", names)?.paneId).toBe("w1:p1");
+  });
 
   test("記録 ID の pane が同じ label なら採用する", () => {
     expect(resolveHerdrSessionPane([pane("w1:p1", "s-a")], "s-a", "w1:p1", names)?.paneId).toBe("w1:p1");
@@ -2258,6 +2284,111 @@ describe("TmuxSessionManager と herdr メタの分離", () => {
   });
 });
 
+describe("herdr セッションの振り分け（herdr-session-setting）", () => {
+  /** herdr セッションごとに応答を変える runner。呼び出しは `[セッション, ...args]` で記録する。 */
+  function sessionRunners(handler: (session: string, args: string[]) => HerdrCommandResult) {
+    const recorded: string[][] = [];
+    const runnerFor = (session: string): HerdrCommandRunner => async (args) => {
+      recorded.push([session, ...args]);
+      return handler(session, args);
+    };
+    return { runnerFor, recorded };
+  }
+  const notRunning: HerdrCommandResult = {
+    exitCode: 1,
+    stdout: "",
+    stderr: '{"id":"cli:pane:list","error":{"code":"server_not_running","message":"no herdr server"}}',
+  };
+
+  test("会話ごとに記録した herdr セッションへ送る（同じ pane ID でも取り違えない）", async () => {
+    const store = makeStore();
+    store.put({ name: "s-new", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w1:p1", herdrSession: "default" });
+    store.put({ name: "s-old", cwd: "/b", createdAt: 1, backend: "herdr", herdrPaneId: "w1:p1" });
+    const { runnerFor, recorded } = sessionRunners((session, args) =>
+      args[0] === "pane" && args[1] === "list"
+        ? herdrOk(paneListJson([{ pane_id: "w1:p1", label: session === "default" ? "s-new" : "s-old" }]))
+        : herdrOk(""),
+    );
+    const manager = new HerdrSessionManager({ runnerFor, store });
+
+    await manager.kill("s-new");
+    await manager.kill("s-old");
+    expect(recorded.filter((call) => call[1] === "pane" && call[2] === "close")).toEqual([
+      ["default", "pane", "close", "w1:p1"],
+      ["tailii", "pane", "close", "w1:p1"],
+    ]);
+  });
+
+  test("一覧は使っている herdr セッションをまとめ、server の止まったセッションは 0 件とする", async () => {
+    const store = makeStore();
+    store.put({ name: "s-new", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w1:p1", herdrSession: "default" });
+    store.put({ name: "s-old", cwd: "/b", createdAt: 1, backend: "herdr", herdrPaneId: "w1:p1" });
+    const { runnerFor } = sessionRunners((session, args) => {
+      if (args[0] === "pane" && args[1] === "list") {
+        return session === "default" ? herdrOk(paneListJson([{ pane_id: "w1:p1", label: "s-new" }])) : notRunning;
+      }
+      return herdrOk(tabListJson([]));
+    });
+    const manager = new HerdrSessionManager({ runnerFor, store });
+
+    expect((await manager.listLive())?.map((info) => [info.name, info.alive])).toEqual([
+      ["s-new", true],
+      ["s-old", false],
+    ]);
+    expect((await manager.list()).map((info) => info.name)).toEqual(["s-new", "s-old"]);
+  });
+
+  test("どれかのセッションが答えられなければ listLive は取得不能（null）", async () => {
+    const store = makeStore();
+    store.put({ name: "s-new", cwd: "/a", createdAt: 1, backend: "herdr", herdrSession: "default" });
+    store.put({ name: "s-old", cwd: "/b", createdAt: 1, backend: "herdr" });
+    const { runnerFor } = sessionRunners((session) =>
+      session === "tailii" ? { exitCode: 1, stdout: "", stderr: "timeout" } : herdrOk(paneListJson([])),
+    );
+    expect(await new HerdrSessionManager({ runnerFor, store }).listLive()).toBeNull();
+  });
+
+  test("空 server の停止は専用の tailii だけ（既定・名前付きのセッションは止めない）", async () => {
+    const { runnerFor, recorded } = sessionRunners((_session, args) =>
+      args[0] === "pane" && args[1] === "list" ? herdrOk(paneListJson([])) : herdrOk(""),
+    );
+    await new HerdrSessionManager({ runnerFor, store: makeStore() }).stopServerIfEmpty();
+    expect(recorded).toEqual([["tailii", "pane", "list"], ["tailii", "server", "stop"]]);
+  });
+
+  test("設定ファイル: 不在・空・受け付けない名前は default、default の書き込みはファイルを消す", () => {
+    const file = path.join(makeTempDir("herdr-session-setting"), "herdr-session");
+    expect(resolveHerdrSessionName(file)).toBe("default");
+    writeHerdrSessionName("tailii", file);
+    expect(fs.readFileSync(file, "utf8")).toBe("tailii\n");
+    expect(resolveHerdrSessionName(file)).toBe("tailii");
+    fs.writeFileSync(file, "../x\n");
+    expect(resolveHerdrSessionName(file)).toBe("default");
+    expect(() => writeHerdrSessionName("my work", file)).toThrow();
+    writeHerdrSessionName("default", file);
+    expect(fs.existsSync(file)).toBe(false);
+  });
+
+  test("セッション名の検査は herdr の規則に先頭と長さの制限を足す", () => {
+    for (const ok of ["default", "tailii", "work_2", "a.b-c", "_x"]) expect(isValidHerdrSessionName(ok)).toBe(true);
+    for (const bad of ["", "-x", ".x", "a b", "a/b", "日本語", "x".repeat(65)]) expect(isValidHerdrSessionName(bad)).toBe(false);
+  });
+});
+
+describe("herdr のワークスペース名", () => {
+  test("フォルダ名をラベルにし、ホームは ~ にする", () => {
+    expect(herdrWorkspaceLabel("/Users/x/work/rizm", "/Users/x")).toBe("rizm");
+    expect(herdrWorkspaceLabel("/Users/x", "/Users/x")).toBe("~");
+    expect(herdrWorkspaceLabel("/Users/x/", "/Users/x")).toBe("~");
+    expect(herdrWorkspaceLabel("/", "/Users/x")).toBe("/");
+  });
+
+  test("worktree は本体の repo ルートをキーにする", () => {
+    expect(herdrWorkspaceKey("/r/app/.claude/worktrees/pr-12")).toBe("/r/app");
+    expect(herdrWorkspaceKey("/r/app/sub/")).toBe("/r/app/sub");
+  });
+});
+
 describe("launchCore herdr backend", () => {
   /**
    * herdr 呼び出しを記録するモック ProcessRunner。
@@ -2265,23 +2396,29 @@ describe("launchCore herdr backend", () => {
    * `recorded` にはコア引数（pane/agent/...）だけを積んで各テストの検証を単純に保つ。
    */
   function herdrProcessRunner(overrides?: {
-    panes?: { pane_id: string; label?: string }[];
+    panes?: { pane_id: string; label?: string; workspace_id?: string }[];
     processName?: string;
-  }): { runner: ProcessRunner; recorded: { exe: string; args: string[] }[] } {
-    const recorded: { exe: string; args: string[] }[] = [];
+    /** herdr セッションごとの pane 一覧（指定したセッションは panes より優先）。 */
+    panesBySession?: Record<string, { pane_id: string; label?: string; workspace_id?: string }[]>;
+  }): { runner: ProcessRunner; recorded: { exe: string; args: string[]; session: string }[] } {
+    const recorded: { exe: string; args: string[]; session: string }[] = [];
     const runner: ProcessRunner = async (exe, rawArgs) => {
-      if (rawArgs[0] !== "--session" || rawArgs[1] !== "tailii") {
-        return { exitCode: 9, stdout: "" }; // --session tailii 前置漏れを失敗として顕在化
+      if (rawArgs[0] !== "--session" || rawArgs[1] === undefined) {
+        return { exitCode: 9, stdout: "" }; // --session 前置漏れを失敗として顕在化
       }
+      const session = rawArgs[1];
       const args = rawArgs.slice(2);
-      recorded.push({ exe, args });
+      recorded.push({ exe, args, session });
+      if (args[0] === "pane" && args[1] === "list" && overrides?.panesBySession?.[session] !== undefined) {
+        return { exitCode: 0, stdout: paneListJson(overrides.panesBySession[session]) };
+      }
       if (args[0] === "pane" && args[1] === "list") {
         return { exitCode: 0, stdout: paneListJson(overrides?.panes ?? []) };
       }
       if (args[0] === "pane" && args[1] === "process-info") {
         return { exitCode: 0, stdout: processInfoJson(overrides?.processName ?? "claude") };
       }
-      if (args[0] === "tab" && args[1] === "create") {
+      if ((args[0] === "tab" || args[0] === "workspace") && args[1] === "create") {
         return { exitCode: 0, stdout: tabCreatedJson("w9:p7") };
       }
       return { exitCode: 0, stdout: "" };
@@ -2294,7 +2431,7 @@ describe("launchCore herdr backend", () => {
     return JSON.stringify({
       result: {
         type: "tab_created",
-        root_pane: { pane_id: paneId, tab_id: "w9:t9" },
+        root_pane: { pane_id: paneId, tab_id: "w9:t9", terminal_id: "term_abc123" },
         tab: { tab_id: "w9:t9", label: "8", pane_count: 1 },
       },
     });
@@ -2330,10 +2467,13 @@ describe("launchCore herdr backend", () => {
 
     // tmux は一切呼ばない（すべて herdrPath 宛て）。
     expect(recorded.every((call) => call.exe === "/Users/x/.local/bin/herdr")).toBe(true);
-    // tab create が cwd/PATH を運ぶ（0.7.5: agent start の pane 生成/cwd/env 指定は廃止）。
-    const create = recorded.find((call) => call.args[0] === "tab" && call.args[1] === "create");
-    expect(create?.args.slice(2)).toEqual([
-      "--cwd", dir, "--env", "PATH=/usr/bin:/bin", "--no-focus",
+    // 既定は herdr の既定セッション（herdr-session-setting）。
+    expect(recorded.every((call) => call.session === "default")).toBe(true);
+    // 同じフォルダの会話が無いので、フォルダ名のワークスペースを作る。cwd/PATH を運ぶ
+    // （0.7.5: agent start の pane 生成/cwd/env 指定は廃止）。
+    const create = recorded.find((call) => call.args[1] === "create");
+    expect(create?.args).toEqual([
+      "workspace", "create", "--cwd", dir, "--env", "PATH=/usr/bin:/bin", "--no-focus", "--label", path.basename(dir),
     ]);
     // pane label = session 名（セッション解決の権威）。
     expect(recorded).toContainEqual(expect.objectContaining({
@@ -2354,6 +2494,8 @@ describe("launchCore herdr backend", () => {
       createdAt: 42,
       backend: "herdr",
       herdrPaneId: "w9:p7",
+      herdrTerminalId: "term_abc123",
+      herdrSession: "default",
     });
   });
 
@@ -2365,7 +2507,10 @@ describe("launchCore herdr backend", () => {
     expect(
       await launchCore({ ...launchOptions(dir, store, runner), displayTitle: "認証バグの調査" }),
     ).toBe(0);
-    expect(recorded.some((call) => call.args.includes("--label"))).toBe(false);
+    // タブにはラベルを付けない（ワークスペースのラベルはフォルダ名）。
+    const create = recorded.find((call) => call.args[1] === "create");
+    expect(create?.args.at(-1)).toBe(path.basename(dir));
+    expect(recorded.some((call) => call.args[0] === "tab" && call.args.includes("--label"))).toBe(false);
     // pane label（=セッション解決の権威）は session 名のまま。
     expect(recorded).toContainEqual(expect.objectContaining({
       args: ["pane", "rename", "w9:p7", "s-h"],
@@ -2382,7 +2527,7 @@ describe("launchCore herdr backend", () => {
     });
 
     expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
-    expect(recorded.some((call) => call.args[0] === "tab" && call.args[1] === "create")).toBe(false);
+    expect(recorded.some((call) => call.args[1] === "create")).toBe(false);
     expect(store.get("s-h")?.herdrPaneId).toBe("w9:p7");
   });
 
@@ -2416,7 +2561,7 @@ describe("launchCore herdr backend", () => {
       processName: "claude",
     });
     expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
-    expect(recorded.some((call) => call.args[0] === "tab" && call.args[1] === "create")).toBe(false);
+    expect(recorded.some((call) => call.args[1] === "create")).toBe(false);
     expect(store.get("s-h")?.herdrPaneId).toBe("w9:p7");
   });
 
@@ -2433,7 +2578,7 @@ describe("launchCore herdr backend", () => {
     expect(recorded).toContainEqual(
       expect.objectContaining({ args: ["pane", "close", "w9:p1"] }),
     );
-    expect(recorded.some((call) => call.args[0] === "tab" && call.args[1] === "create")).toBe(true);
+    expect(recorded.some((call) => call.args[1] === "create")).toBe(true);
     expect(store.get("s-h")?.herdrPaneId).toBe("w9:p7");
     // 作り直しでは createdAt（猶予の起点）を起動時刻へ更新する（自己修復の要）。
     expect(store.get("s-h")?.createdAt).toBe(42);
@@ -2469,14 +2614,14 @@ describe("launchCore herdr backend", () => {
 
     expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
     expect(recorded.some((call) => call.args[0] === "pane" && call.args[1] === "close")).toBe(false);
-    expect(recorded.some((call) => call.args[0] === "tab" && call.args[1] === "create")).toBe(false);
+    expect(recorded.some((call) => call.args[1] === "create")).toBe(false);
     expect(store.get("s-h")?.herdrPaneId).toBe("w9:p1");
     // 再利用では createdAt（猶予の起点）を更新しない: 更新すると開き直すたびに窓が延び、
     // 本当にシェル化した pane の自己修復（窓外での掃除→再起動）が永遠に走らない。
     expect(store.get("s-h")?.createdAt).toBe(30);
   });
 
-  test("tailii セッションサーバー不在なら detached 起動して待つ", async () => {
+  test("herdr セッションのサーバー不在なら detached 起動して待つ", async () => {
     const dir = makeTempDir("herdr-launch-ensure");
     const store = makeStore();
     const spawned: { exe: string; args: string[] }[] = [];
@@ -2486,9 +2631,10 @@ describe("launchCore herdr backend", () => {
       if (args[0] === "pane" && args[1] === "list") {
         return serverUp
           ? { exitCode: 0, stdout: paneListJson([]) }
-          : { exitCode: 1, stdout: "" };
+          // 0.9.5 実測: 未作成・停止中・異常終了のどれでも stderr にこのコード。
+          : { exitCode: 1, stdout: "", stderr: '{"id":"cli:pane:list","error":{"code":"server_not_running","message":"no herdr server"}}' };
       }
-      if (args[0] === "tab" && args[1] === "create") {
+      if ((args[0] === "tab" || args[0] === "workspace") && args[1] === "create") {
         return {
           exitCode: 0,
           stdout: JSON.stringify({ result: { root_pane: { pane_id: "w1:p1" } } }),
@@ -2506,74 +2652,310 @@ describe("launchCore herdr backend", () => {
     };
     expect(await launchCore(options)).toBe(0);
     expect(spawned).toEqual([
+      // 設定の default が止まっているので、起こすのは専用の tailii（利用者の default は起こさない）。
       { exe: "/Users/x/.local/bin/herdr", args: ["--session", "tailii", "server"] },
     ]);
     expect(store.get("s-h")?.herdrPaneId).toBe("w1:p1");
   });
 
-  test("tab create 失敗は非0で返しメタを書かない", async () => {
-    const dir = makeTempDir("herdr-launch-fail");
+  test("設定した herdr セッションで起動し、メタに記録する", async () => {
+    const dir = makeTempDir("herdr-launch-configured");
     const store = makeStore();
+    const { runner, recorded } = herdrProcessRunner();
+
+    expect(await launchCore({ ...launchOptions(dir, store, runner), herdrSession: "tailii" })).toBe(0);
+    expect(recorded.every((call) => call.session === "tailii")).toBe(true);
+    expect(store.get("s-h")?.herdrSession).toBe("tailii");
+  });
+
+  test("前の pane が別の herdr セッション（未記録は tailii）で生きていれば、そのセッションで続ける", async () => {
+    const dir = makeTempDir("herdr-launch-old-session");
+    const store = makeStore();
+    store.put({ name: "s-h", cwd: dir, createdAt: 1, backend: "herdr", herdrPaneId: "w9:p7" });
+    const { runner, recorded } = herdrProcessRunner({
+      panesBySession: { tailii: [{ pane_id: "w9:p7", label: "s-h" }], default: [] },
+    });
+
+    expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
+    expect(recorded.some((call) => call.args[1] === "create")).toBe(false);
+    expect(recorded.some((call) => call.session === "default")).toBe(false);
+    expect(store.get("s-h")).toMatchObject({ herdrPaneId: "w9:p7", herdrSession: "tailii" });
+  });
+
+  test("前の pane が無ければ、設定の herdr セッションで作り直す", async () => {
+    const dir = makeTempDir("herdr-launch-old-gone");
+    const store = makeStore();
+    store.put({ name: "s-h", cwd: dir, createdAt: 1, backend: "herdr", herdrPaneId: "w9:p1" });
+    const { runner, recorded } = herdrProcessRunner({ panesBySession: { tailii: [], default: [] } });
+
+    expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
+    expect(recorded.find((call) => call.args[1] === "create")?.session).toBe("default");
+    expect(store.get("s-h")).toMatchObject({ herdrPaneId: "w9:p7", herdrSession: "default" });
+  });
+
+  test("別の herdr セッションの同じ pane ID を自分の pane と取り違えない", async () => {
+    // pane ID はセッションごとに w1:p1 から振られる。tailii で記録した ID が default にもある。
+    const dir = makeTempDir("herdr-launch-same-id");
+    const store = makeStore();
+    store.put({ name: "s-h", cwd: dir, createdAt: 1, backend: "herdr", herdrPaneId: "w9:p1", herdrSession: "tailii" });
+    store.put({ name: "s-other", cwd: dir, createdAt: 1, backend: "herdr", herdrPaneId: "w9:p1", herdrSession: "default" });
+    const { runner, recorded } = herdrProcessRunner({
+      panesBySession: { tailii: [], default: [{ pane_id: "w9:p1", label: "s-other", workspace_id: "w9" }] },
+      processName: "zsh",
+    });
+
+    expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
+    expect(recorded.some((call) => call.args[0] === "pane" && call.args[1] === "close")).toBe(false);
+    expect(recorded.some((call) => call.args[1] === "create")).toBe(true);
+    expect(store.get("s-h")).toMatchObject({ herdrPaneId: "w9:p7", herdrSession: "default" });
+  });
+
+  test("サーバーが動いていると確定できない失敗では、サーバーを起動し直さない（同名セッションを二重に起こさない）", async () => {
+    const dir = makeTempDir("herdr-launch-busy");
+    const store = makeStore();
+    const spawned: string[][] = [];
+    const errors: string[] = [];
     const runner: ProcessRunner = async (_exe, rawArgs) => {
-      const args = rawArgs[0] === "--session" ? rawArgs.slice(2) : rawArgs;
-      if (args[0] === "pane" && args[1] === "list") return { exitCode: 0, stdout: paneListJson([]) };
-      if (args[0] === "tab" && args[1] === "create") return { exitCode: 1, stdout: "" };
+      const args = rawArgs.slice(2);
+      if (args[0] === "pane" && args[1] === "list") return { exitCode: 1, stdout: "", stderr: "timed out" };
       return { exitCode: 0, stdout: "{}" };
     };
-    expect(await launchCore(launchOptions(dir, store, runner))).toBe(1);
+    expect(await launchCore({
+      ...launchOptions(dir, store, runner),
+      errorSink: (message: string) => errors.push(message),
+      spawnDetached: (_exe: string, args: string[]) => spawned.push(args),
+    })).toBe(1);
+    expect(spawned).toEqual([]);
+    expect(errors.join("")).toContain("timed out");
     expect(store.get("s-h")).toBeNull();
   });
 
-  test("workspace が無いサーバーでは workspace create の root pane で起動する（workspace_not_found）", async () => {
-    const dir = makeTempDir("herdr-launch-empty");
+  test("設定の herdr セッション（default）が動いていなければ起こさず、専用の tailii に入れる", async () => {
+    const dir = makeTempDir("herdr-launch-default-stopped");
     const store = makeStore();
+    const spawned: string[][] = [];
+    const sessions: string[] = [];
+    let tailiiUp = false;
+    const notRunning = '{"id":"cli:pane:list","error":{"code":"server_not_running","message":"x"}}';
+    const runner: ProcessRunner = async (_exe, rawArgs) => {
+      const session = rawArgs[1]!;
+      const args = rawArgs.slice(2);
+      sessions.push(session);
+      if (args[0] === "pane" && args[1] === "list") {
+        if (session === "default" || !tailiiUp) return { exitCode: 1, stdout: "", stderr: notRunning };
+        return { exitCode: 0, stdout: paneListJson([]) };
+      }
+      if (args[1] === "create") {
+        return { exitCode: 0, stdout: JSON.stringify({ result: { root_pane: { pane_id: "w1:p1", tab_id: "w1:t1" } } }) };
+      }
+      return { exitCode: 0, stdout: "{}" };
+    };
+    expect(await launchCore({
+      ...launchOptions(dir, store, runner),
+      spawnDetached: (_exe: string, args: string[]) => {
+        spawned.push(args);
+        tailiiUp = true;
+      },
+    })).toBe(0);
+    // 利用者の default は起こさない。専用の tailii のサーバーだけ起こす。
+    expect(spawned).toEqual([["--session", "tailii", "server"]]);
+    expect(sessions.filter((session) => session === "default")).toHaveLength(1);
+    expect(store.get("s-h")?.herdrSession).toBe("tailii");
+  });
+
+  test("同じフォルダで利用者が開いているワークスペースに合流する（Tailii の pane が無くても）", async () => {
+    const dir = makeTempDir("herdr-launch-user-ws");
+    const real = fs.realpathSync(dir);
+    const store = makeStore();
+    const { runner, recorded } = herdrProcessRunner({
+      panes: [
+        { pane_id: "w5:p1", workspace_id: "w5", cwd: real } as { pane_id: string; workspace_id: string },
+        { pane_id: "w6:p1", workspace_id: "w6", cwd: "/elsewhere" } as { pane_id: string; workspace_id: string },
+      ],
+    });
+    expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
+    expect(recorded.find((call) => call.args[1] === "create")?.args.slice(0, 4)).toEqual(["tab", "create", "--workspace", "w5"]);
+  });
+
+  test("利用者のワークスペースでも、別のフォルダの Tailii の会話が居れば合流しない", async () => {
+    const dir = makeTempDir("herdr-launch-user-ws-mixed");
+    const store = makeStore();
+    store.put({
+      name: "s-other", cwd: makeTempDir("herdr-launch-other-folder"), createdAt: 1, backend: "herdr",
+      herdrPaneId: "w5:p2", herdrSession: "default",
+    });
+    const { runner, recorded } = herdrProcessRunner({
+      panes: [
+        { pane_id: "w5:p1", workspace_id: "w5", cwd: fs.realpathSync(dir) } as { pane_id: string; workspace_id: string },
+        { pane_id: "w5:p2", label: "s-other", workspace_id: "w5" },
+      ],
+    });
+    expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
+    expect(recorded.filter((call) => call.args[1] === "create").map((call) => call.args[0])).toEqual(["workspace"]);
+  });
+
+  /** 同じフォルダの会話 `s-same` が workspace w3 で生きている状態（メタと pane 一覧）を作る。 */
+  function sameFolderPane(store: SessionMetadataStore, cwd: string) {
+    store.put({ name: "s-same", cwd, createdAt: 1, backend: "herdr", herdrPaneId: "w3:p1", herdrSession: "default" });
+    return { pane_id: "w3:p1", label: "s-same", workspace_id: "w3" };
+  }
+
+  /** 失敗を返す herdr を組み立てる。`fail` に当たった呼び出しだけ stderr 付きで非 0 にする。 */
+  function failingRunner(options: {
+    panes: { pane_id: string; label?: string; workspace_id?: string }[];
+    fail: (args: string[]) => string | null;
+  }): { runner: ProcessRunner; recorded: string[][] } {
     const recorded: string[][] = [];
     const runner: ProcessRunner = async (_exe, rawArgs) => {
       const args = rawArgs[0] === "--session" ? rawArgs.slice(2) : rawArgs;
       recorded.push(args);
-      if (args[0] === "pane" && args[1] === "list") return { exitCode: 0, stdout: paneListJson([]) };
-      if (args[0] === "tab" && args[1] === "create") {
-        // 0.7.5 / 0.9.3 実測: エラー JSON は stderr、stdout は空。
-        return {
-          exitCode: 1,
-          stdout: "",
-          stderr: '{"error":{"code":"workspace_not_found","message":"no active workspace"},"id":"cli:tab:create"}\n',
-        };
+      if (args[0] === "pane" && args[1] === "list") return { exitCode: 0, stdout: paneListJson(options.panes) };
+      const code = options.fail(args);
+      // 0.7.5 / 0.9.3 実測: エラー JSON は stderr、stdout は空。
+      if (code !== null) {
+        return { exitCode: 1, stdout: "", stderr: `{"error":{"code":"${code}","message":"x"},"id":"cli:${args[0]}:create"}\n` };
       }
-      if (args[0] === "workspace" && args[1] === "create") {
-        return {
-          exitCode: 0,
-          stdout: JSON.stringify({
-            result: { type: "workspace_created", root_pane: { pane_id: "w1:p1", tab_id: "w1:t1" } },
-          }),
-        };
+      if (args[1] === "create") {
+        return { exitCode: 0, stdout: JSON.stringify({ result: { root_pane: { pane_id: "w1:p1", tab_id: "w1:t1" } } }) };
       }
       return { exitCode: 0, stdout: "{}" };
     };
+    return { runner, recorded };
+  }
+
+  test("同じフォルダの会話が生きているワークスペースにタブを足す", async () => {
+    const dir = makeTempDir("herdr-launch-same");
+    const store = makeStore();
+    const { runner, recorded } = herdrProcessRunner({ panes: [sameFolderPane(store, dir)] });
+
+    expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
+    const creates = recorded.filter((call) => call.args[1] === "create");
+    expect(creates.map((call) => call.args)).toEqual([
+      ["tab", "create", "--workspace", "w3", "--cwd", dir, "--env", "PATH=/usr/bin:/bin", "--no-focus"],
+    ]);
+  });
+
+  test("別のフォルダの会話しかないワークスペースには入れず、フォルダ名で新しく作る", async () => {
+    const dir = makeTempDir("herdr-launch-other");
+    const store = makeStore();
+    const { runner, recorded } = herdrProcessRunner({ panes: [sameFolderPane(store, makeTempDir("herdr-launch-elsewhere"))] });
+
+    expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
+    const creates = recorded.filter((call) => call.args[1] === "create");
+    expect(creates.map((call) => call.args.slice(0, 2))).toEqual([["workspace", "create"]]);
+    expect(creates[0]?.args.slice(-2)).toEqual(["--label", path.basename(dir)]);
+  });
+
+  test("全会話を 1 つに入れていた頃のワークスペース（フォルダが混ざっている）には足さない", async () => {
+    const dir = makeTempDir("herdr-launch-legacy");
+    const store = makeStore();
+    const same = sameFolderPane(store, dir);
+    store.put({
+      name: "s-mixed", cwd: makeTempDir("herdr-launch-mixed"), createdAt: 1, backend: "herdr", herdrPaneId: "w3:p2",
+      herdrSession: "default",
+    });
+    const { runner, recorded } = herdrProcessRunner({
+      panes: [same, { pane_id: "w3:p2", label: "s-mixed", workspace_id: "w3" }],
+    });
+
+    expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
+    expect(recorded.filter((call) => call.args[1] === "create").map((call) => call.args[0])).toEqual(["workspace"]);
+  });
+
+  test("利用者が自分で開いた pane（メタの無い label）は数えない", async () => {
+    const dir = makeTempDir("herdr-launch-manual");
+    const store = makeStore();
+    const { runner, recorded } = herdrProcessRunner({
+      panes: [
+        sameFolderPane(store, dir),
+        { pane_id: "w3:p9", workspace_id: "w3" },
+        { pane_id: "w3:p8", label: "my shell", workspace_id: "w3" },
+      ],
+    });
+
+    expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
+    expect(recorded.find((call) => call.args[1] === "create")?.args.slice(0, 4)).toEqual(["tab", "create", "--workspace", "w3"]);
+  });
+
+  test("別の herdr セッションで起動した会話の pane は数えない", async () => {
+    const dir = makeTempDir("herdr-launch-other-session");
+    const store = makeStore();
+    store.put({ name: "s-same", cwd: dir, createdAt: 1, backend: "herdr", herdrPaneId: "w3:p1", herdrSession: "tailii" });
+    const { runner, recorded } = herdrProcessRunner({ panes: [{ pane_id: "w3:p1", label: "s-same", workspace_id: "w3" }] });
+
+    expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
+    expect(recorded.filter((call) => call.args[1] === "create").map((call) => call.args[0])).toEqual(["workspace"]);
+  });
+
+  test("worktree の会話は本体のフォルダのワークスペースへまとめる", async () => {
+    const repo = makeTempDir("herdr-launch-repo");
+    const worktree = path.join(repo, ".claude", "worktrees", "fix-bug");
+    fs.mkdirSync(worktree, { recursive: true });
+    const store = makeStore();
+    // 本体で開いた会話が w3 にある → worktree の会話も w3 へ。
+    const { runner, recorded } = herdrProcessRunner({ panes: [sameFolderPane(store, repo)] });
+    expect(await launchCore(launchOptions(worktree, store, runner))).toBe(0);
+    expect(recorded.find((call) => call.args[1] === "create")?.args.slice(0, 4)).toEqual(["tab", "create", "--workspace", "w3"]);
+
+    // 本体の会話が無ければ、本体のフォルダ名でワークスペースを作る（pane の cwd は worktree のまま）。
+    const fresh = herdrProcessRunner();
+    expect(await launchCore({ ...launchOptions(worktree, makeStore(), fresh.runner), session: "s-wt" })).toBe(0);
+    expect(fresh.recorded.find((call) => call.args[1] === "create")?.args).toEqual([
+      "workspace", "create", "--cwd", worktree, "--env", "PATH=/usr/bin:/bin", "--no-focus", "--label", path.basename(repo),
+    ]);
+  });
+
+  test("閉じた stale pane だけが居たワークスペースは使わない", async () => {
+    const dir = makeTempDir("herdr-launch-stale-ws");
+    const store = makeStore();
+    store.put({ name: "s-h", cwd: dir, createdAt: 1, backend: "herdr", herdrPaneId: "w3:p1", herdrSession: "default" });
+    const { runner, recorded } = herdrProcessRunner({
+      panes: [{ pane_id: "w3:p1", label: "s-h", workspace_id: "w3" }],
+      processName: "zsh",
+    });
+
+    expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
+    expect(recorded).toContainEqual(expect.objectContaining({ args: ["pane", "close", "w3:p1"] }));
+    expect(recorded.filter((call) => call.args[1] === "create").map((call) => call.args[0])).toEqual(["workspace"]);
+  });
+
+  test("タブの作成に失敗したら非0で返しメタを書かない", async () => {
+    const dir = makeTempDir("herdr-launch-fail");
+    const store = makeStore();
+    const { runner, recorded } = failingRunner({
+      panes: [sameFolderPane(store, dir)],
+      fail: (args) => (args[0] === "tab" && args[1] === "create" ? "invalid_cwd" : null),
+    });
+    expect(await launchCore(launchOptions(dir, store, runner))).toBe(1);
+    // workspace_not_found 以外の失敗では workspace を作らない。
+    expect(recorded.some((args) => args[0] === "workspace")).toBe(false);
+    expect(store.get("s-h")).toBeNull();
+  });
+
+  test("ワークスペースの作成に失敗したら非0で返しメタを書かない", async () => {
+    const dir = makeTempDir("herdr-launch-ws-fail");
+    const store = makeStore();
+    const { runner } = failingRunner({
+      panes: [],
+      fail: (args) => (args[0] === "workspace" && args[1] === "create" ? "invalid_cwd" : null),
+    });
+    expect(await launchCore(launchOptions(dir, store, runner))).toBe(1);
+    expect(store.get("s-h")).toBeNull();
+  });
+
+  test("一覧の後にワークスペースが消えていたら（workspace_not_found）フォルダ名で作り直す", async () => {
+    const dir = makeTempDir("herdr-launch-vanished");
+    const store = makeStore();
+    const { runner, recorded } = failingRunner({
+      panes: [sameFolderPane(store, dir)],
+      fail: (args) => (args[0] === "tab" && args[1] === "create" ? "workspace_not_found" : null),
+    });
     expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
     expect(recorded).toContainEqual([
-      "workspace", "create", "--cwd", dir, "--env", "PATH=/usr/bin:/bin", "--no-focus", "--label", "tailii",
+      "workspace", "create", "--cwd", dir, "--env", "PATH=/usr/bin:/bin", "--no-focus", "--label", path.basename(dir),
     ]);
     expect(recorded).toContainEqual(["pane", "rename", "w1:p1", "s-h"]);
     expect(store.get("s-h")?.herdrPaneId).toBe("w1:p1");
-  });
-
-  test("tab create の workspace_not_found 以外の失敗では workspace を作らない", async () => {
-    const dir = makeTempDir("herdr-launch-other-fail");
-    const store = makeStore();
-    const recorded: string[][] = [];
-    const runner: ProcessRunner = async (_exe, rawArgs) => {
-      const args = rawArgs[0] === "--session" ? rawArgs.slice(2) : rawArgs;
-      recorded.push(args);
-      if (args[0] === "pane" && args[1] === "list") return { exitCode: 0, stdout: paneListJson([]) };
-      if (args[0] === "tab" && args[1] === "create") {
-        return { exitCode: 1, stdout: "", stderr: '{"error":{"code":"invalid_cwd","message":"x"}}' };
-      }
-      return { exitCode: 0, stdout: "{}" };
-    };
-    expect(await launchCore(launchOptions(dir, store, runner))).toBe(1);
-    expect(recorded.some((args) => args[0] === "workspace")).toBe(false);
-    expect(store.get("s-h")).toBeNull();
   });
 
   test("herdr 更新後に旧サーバーが残っている（protocol_mismatch）なら server を起動し直さず原因を伝える", async () => {
@@ -2602,7 +2984,9 @@ describe("launchCore herdr backend", () => {
     };
     expect(await launchCore(options)).toBe(1);
     expect(spawned).toEqual([]);
-    expect(errors.join("")).toContain("herdr session stop tailii");
+    // 既定セッションの保存状態は利用者の作業も含むので、消す（delete）案内は出さない。
+    expect(errors.join("")).toContain("herdr session stop default");
+    expect(errors.join("")).not.toContain("delete");
     expect(store.get("s-h")).toBeNull();
   });
 
@@ -2633,7 +3017,7 @@ describe("launchCore herdr backend", () => {
     const runner: ProcessRunner = async (_exe, rawArgs) => {
       const args = rawArgs.slice(2);
       if (args[0] === "pane" && args[1] === "list") return { exitCode: 0, stdout: paneListJson([]) };
-      if (args[0] === "tab" && args[1] === "create") {
+      if ((args[0] === "tab" || args[0] === "workspace") && args[1] === "create") {
         return { exitCode: 0, stdout: JSON.stringify({ result: { root_pane: { pane_id: "w9:p7" } } }) };
       }
       if (args[0] === "pane" && args[1] === "run") {
@@ -2668,7 +3052,7 @@ describe("launchCore herdr backend", () => {
       const args = rawArgs[0] === "--session" ? rawArgs.slice(2) : rawArgs;
       recorded.push(args);
       if (args[0] === "pane" && args[1] === "list") return { exitCode: 0, stdout: paneListJson([]) };
-      if (args[0] === "tab" && args[1] === "create") {
+      if ((args[0] === "tab" || args[0] === "workspace") && args[1] === "create") {
         return {
           exitCode: 0,
           stdout: JSON.stringify({ result: { root_pane: { pane_id: "w9:p7" } } }),

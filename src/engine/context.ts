@@ -91,6 +91,10 @@ export interface HandlerContext {
   backendKind: () => SessionBackendKind;
   /** backend_set の永続化先。 */
   backendWriter: (kind: SessionBackendKind) => void;
+  /** 新しい会話を入れる herdr セッション名の解決子（launch 毎に読む, herdr-session-setting）。 */
+  herdrSessionName: () => string;
+  /** backend_set の `herdrSession` の永続化先。 */
+  herdrSessionWriter: (name: string) => void;
   /** herdr 導入済み判定。 */
   herdrInstalledProbe: () => boolean;
   imageService: ImageService | null;

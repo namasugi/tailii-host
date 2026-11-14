@@ -910,7 +910,7 @@ describe("reaperTick herdr backend", () => {
     expect(readHeartbeat(dir, "s-halive")).not.toBeNull();
   });
 
-  test("生存 herdr セッション 0 なら空 server を回収し、生存中は停止しない", async () => {
+  test("空 server の回収は生存判定が取れた tick ごとに頼む（tailii の pane 数での判定は ops 側）", async () => {
     const dir = makeTempDir("reaper-herdr-server");
     const tmux = runnerWithSessions([]);
     let stopped = 0;
@@ -931,11 +931,13 @@ describe("reaperTick herdr backend", () => {
       now: NOW,
     };
 
+    // 会話ごとに herdr セッションが分かれたので、ほかのセッションで会話が生きていても専用の
+    // tailii は空でありうる（herdr-session-setting）。
     await reaperTick({ ...base, herdrOps: makeOps(["s-h1"]) });
-    expect(stopped).toBe(0);
+    expect(stopped).toBe(1);
 
     await reaperTick({ ...base, herdrOps: makeOps([]) });
-    expect(stopped).toBe(1);
+    expect(stopped).toBe(2);
   });
 
   test("herdr メタ皆無の既定では herdr 巡回を行わない（純 tmux 環境）", async () => {

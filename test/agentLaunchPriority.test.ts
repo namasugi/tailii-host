@@ -73,7 +73,7 @@ function terminal(backend: "tmux" | "herdr", stale = false) {
         process_info: { foreground_processes: [{ name: "zsh", pid: 100 }] },
       } });
       if (a[1] === "close") existing = false;
-      if (a[0] === "tab" && a[1] === "create") stdout = JSON.stringify({ result: {
+      if ((a[0] === "tab" || a[0] === "workspace") && a[1] === "create") stdout = JSON.stringify({ result: {
         root_pane: { pane_id: "w1:p2" },
       } });
     }
@@ -313,11 +313,14 @@ test("herdr サーバーの起動には接頭辞を付けない", async () => {
   const child = { unref: vi.fn() };
   vi.mocked(spawn).mockReturnValue(child as unknown as ReturnType<typeof spawn>);
   const runner: ProcessRunner = async (exe, args, options) => {
-    if (first && args[3] === "list") { first = false; return { exitCode: 1, stdout: "" }; }
+    if (first && args[3] === "list") {
+      first = false;
+      return { exitCode: 1, stdout: "", stderr: '{"id":"cli:pane:list","error":{"code":"server_not_running","message":"no herdr server"}}' };
+    }
     return t.runner(exe, args, options);
   };
   const launcher = makeSessionLauncher({
-    backend: "herdr", herdrPath: "/fake/herdr", runner, store: new SessionMetadataStore(tempDir()),
+    backend: "herdr", herdrSession: "tailii", herdrPath: "/fake/herdr", runner, store: new SessionMetadataStore(tempDir()),
   });
   expect((await launcher(tempDir(), "s-priority", null, null)).exitCode).toBe(0);
   expect(spawn).toHaveBeenCalledExactlyOnceWith("/fake/herdr", ["--session", "tailii", "server"], {

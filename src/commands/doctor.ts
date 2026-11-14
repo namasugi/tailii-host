@@ -18,8 +18,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { defaultInjectedPath } from "./launch.js";
-import { resolveSessionBackendKind } from "../backend/sessionBackend.js";
-import { HERDR_RESTART_COMMAND } from "../backend/herdr.js";
+import { resolveHerdrSessionName, resolveSessionBackendKind } from "../backend/sessionBackend.js";
+import { herdrRestartCommand } from "../backend/herdr.js";
 // 型だけ。実体は quicGateway が doctor の findCommand を import する循環を避けるため動的 import。
 import type { QuicGatewayServiceState } from "../services/quicGateway.js";
 import { ApnsConfigStore } from "../push/apnsConfigStore.js";
@@ -170,7 +170,11 @@ export function herdrStatusRestartNeeded(output: string): boolean | null {
  * herdr の更新後に旧サーバーが残ると、新しい CLI は全コマンドを `protocol_mismatch` で拒否する。
  * サーバーが動いていない・読めないときは null（検査項目を出さない）。
  */
-function probeHerdrServerRestartNeeded(herdr: string | null, envPath: string): Promise<boolean | null> {
+function probeHerdrServerRestartNeeded(
+  herdr: string | null,
+  envPath: string,
+  herdrSession: string,
+): Promise<boolean | null> {
   if (herdr === null) return Promise.resolve(null);
   return new Promise((resolve) => {
     // herdr pane 内から doctor を叩いたときに外側のソケットを向かないよう HERDR_* を外す。
@@ -179,7 +183,7 @@ function probeHerdrServerRestartNeeded(herdr: string | null, envPath: string): P
     env["PATH"] = [envPath, process.env["PATH"] ?? ""].filter(Boolean).join(":");
     execFile(
       herdr,
-      ["--session", "tailii", "status"],
+      ["--session", herdrSession, "status"],
       { cwd: os.homedir(), timeout: 3_000, maxBuffer: 64 * 1024, env },
       (error, stdout) => {
         if (error) {
@@ -457,7 +461,9 @@ export async function collectDoctorChecks(envPath: string = defaultInjectedPath(
     ? collectDarwinQuicChecks().catch(() => [])
     : Promise.resolve([]);
   // herdr サーバーの版照合も並行して始める（直列だと最大 3 秒上乗せされ、アプリ向け診断の上限を圧迫する）。
-  const herdrRestartNeededPromise = probeHerdrServerRestartNeeded(herdr, envPath);
+  // 新しい会話を入れる herdr セッション（設定値, herdr-session-setting）のサーバーを見る。
+  const herdrSession = resolveHerdrSessionName();
+  const herdrRestartNeededPromise = probeHerdrServerRestartNeeded(herdr, envPath, herdrSession);
   const [tmuxVersion, herdrVersion, claudeVersion, codexVersion] = await Promise.all([
     probeVersion(tmux, ["-V"], envPath),
     probeVersion(herdr, ["--version"], envPath),
@@ -499,14 +505,14 @@ export async function collectDoctorChecks(envPath: string = defaultInjectedPath(
     if (restartNeeded !== null) {
       checks.push({
         id: "herdr-server",
-        label: "herdr サーバー(tailii)",
+        label: `herdr サーバー(${herdrSession})`,
         ok: !restartNeeded,
         required: backendKind === "herdr",
         detail: restartNeeded
           ? "herdr の更新前の版のまま動いています（herdr 会話の操作がすべて失敗します）"
           : "herdr と同じ版で稼働中",
         ...(restartNeeded
-          ? { remediation: `${HERDR_RESTART_COMMAND}（実行中の herdr 会話は終了し、開き直すと再開します）` }
+          ? { remediation: `${herdrRestartCommand(herdrSession)}（実行中の herdr 会話は終了し、開き直すと再開します）` }
           : {}),
       });
     }

@@ -1580,28 +1580,31 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
       return { type, v, id: requireString(raw, "id") };
 
     case "backend_get_response":
-      return {
+      return compact({
         type, v,
         id: requireString(raw, "id"),
         backend: requireBackendKind(raw),
         herdrInstalled: requireBoolean(raw, "herdrInstalled"),
-      };
+        herdrSession: optionalString(raw, "herdrSession"),
+      });
 
     case "backend_set_request":
-      return {
+      return compact({
         type, v,
         id: requireString(raw, "id"),
         backend: requireBackendKind(raw),
-      };
+        herdrSession: optionalString(raw, "herdrSession"),
+      });
 
     case "backend_set_response":
-      return {
+      return compact({
         type, v,
         id: requireString(raw, "id"),
         ok: requireBoolean(raw, "ok"),
         backend: requireBackendKind(raw),
         error: optionalNullableString(raw, "error") ?? null,
-      };
+        herdrSession: optionalString(raw, "herdrSession"),
+      });
 
     // ---- プッシュ通知（push v1, protocol/push-v1.md §1）----
     case "push_register":
@@ -2116,3 +2119,4 @@ function decodeFileEntries(raw: Raw): FileEntry[] {
     });
   });
 }
+

@@ -84,7 +84,8 @@ describe("herdr socket の選択と CLI fallback", () => {
 
   test.each([["server", "stop"], ["server"], ["status"], ["--version"], ["pane", "list", "--unknown"],
     ["pane", "read", "w1:p1", "--lines", "-1"], ["pane", "read", "w1:p1", "--lines", "4294967296"],
-    ["pane", "send-text", "w1:p1", "\0"], ["tab", "create", "--env", "wrong"]])("未対応の引数はそのまま CLI へ: %j", async (...args) => {
+    ["pane", "send-text", "w1:p1", "\0"], ["tab", "create", "--env", "wrong"], ["workspace", "create", "--workspace", "w1"],
+    ["tab", "create", "--workspace", "w1", "--workspace", "w2"]])("未対応の引数はそのまま CLI へ: %j", async (...args) => {
     const cli = vi.fn(async () => CLI);
     const run = socketHerdrCommandRunner(cli, { sessionName: "tailii", timeoutMs: 15_000,
       env: { TAILII_HERDR_TRANSPORT: "socket" }, socketPath: "/does/not/exist" });
@@ -145,6 +146,8 @@ const cases = [
   { args: ["pane", "run", "w1:p1", "printf 'test'"], method: "pane.send_input", params: { pane_id: "w1:p1", text: "printf 'test'", keys: ["Enter"] }, id: "cli:request", result: { type: "ok" }, empty: true },
   { args: ["tab", "create", "--cwd", "/tmp/日本語", "--env", "PATH=/bin:a=b", "--no-focus"], method: "tab.create",
     params: { workspace_id: null, cwd: "/tmp/日本語", label: null, focus: false, env: { PATH: "/bin:a=b" } }, id: "cli:tab:create", result: { type: "tab_created", tab: TAB, root_pane: PANE } },
+  { args: ["tab", "create", "--workspace", "w3", "--cwd", "/tmp", "--env", "PATH=/bin", "--no-focus"], method: "tab.create",
+    params: { workspace_id: "w3", cwd: "/tmp", label: null, focus: false, env: { PATH: "/bin" } }, id: "cli:tab:create", result: { type: "tab_created", tab: TAB, root_pane: PANE } },
   { args: ["workspace", "create", "--cwd", "/tmp", "--env", "PATH=/bin", "--no-focus", "--label", "tailii"], method: "workspace.create",
     params: { source_workspace_id: null, cwd: "/tmp", label: "tailii", focus: false, env: { PATH: "/bin" } }, id: "cli:workspace:create",
     result: { type: "workspace_created", workspace: WORKSPACE, tab: TAB, root_pane: PANE } },
@@ -340,7 +343,7 @@ describe("偽 Unix socket との結合", () => {
     const f = await fakeServer((req, socket) => {
       const result = req.method === "pane.list" ? { type: "pane_list", panes: [] }
         : req.method === "tab.list" ? { type: "tab_list", tabs: [] }
-        : req.method === "tab.create" ? { type: "tab_created", tab: TAB, root_pane: PANE }
+        : req.method === "workspace.create" ? { type: "workspace_created", workspace: WORKSPACE, tab: TAB, root_pane: PANE }
         : req.method === "pane.rename" ? { type: "pane_info", pane: { ...PANE, label: req.params.label } } : { type: "ok" };
       send(socket, req, result);
     }, { socketPath });
@@ -351,6 +354,7 @@ describe("偽 Unix socket との結合", () => {
     const errors: string[] = [];
     expect(await launchCore({ dir, session: "s-new", baseDir: null, binaryPath: "/fake/tailii", tmuxPath: "/fake/tmux",
       herdrPath: "/nonexistent/herdr", backend: "herdr", innerCommand: "printf test", path: "/usr/bin:/bin", store,
+      herdrSession: "tailii",
       now: () => 42, errorSink: (message) => errors.push(message), claudeJsonPath: path.join(dir, "claude.json"),
       hookGlobalMarkerPath: path.join(dir, "marker"), herdrLaunchScriptDir: path.join(dir, "run"),
       spawnDetached: () => { throw new Error("サーバーは起動しない"); }, claudeVersion: () => null,
@@ -358,6 +362,6 @@ describe("偽 Unix socket との結合", () => {
     expect(errors).toEqual([]);
     expect(store.get("s-new")?.herdrPaneId).toBe("w1:p1");
     expect(f.requests.filter((r) => r.method !== "ping").map((r) => r.method))
-      .toEqual(["pane.list", "pane.list", "tab.list", "pane.list", "tab.create", "pane.rename", "pane.send_input"]);
+      .toEqual(["pane.list", "pane.list", "tab.list", "pane.list", "workspace.create", "pane.rename", "pane.send_input"]);
   });
 });

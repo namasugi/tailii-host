@@ -95,6 +95,7 @@ function claudeLauncherFor(
     ...(ctx.metadataStore !== null && { store: ctx.metadataStore }),
     agent: "claude",
     backend: ctx.backendKind,
+    herdrSession: ctx.herdrSessionName,
     innerCommand: claudeInnerCommand({
       model: flags.model ?? null,
       permissionMode: flags.permissionMode ?? null,

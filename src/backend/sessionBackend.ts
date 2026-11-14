@@ -9,7 +9,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { HerdrSessionManager } from "./herdr.js";
+import { HERDR_DEFAULT_SESSION, HerdrSessionManager, isValidHerdrSessionName } from "./herdr.js";
 import { ApiAgentSessionBackend, isApiAgentMeta } from "./apiAgentBackend.js";
 import type { SessionInfo, TerminalBackendKind } from "../protocol.js";
 import { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
@@ -114,6 +114,41 @@ export function writeSessionBackendKind(
   const tmp = backendFilePath + ".tmp";
   fs.writeFileSync(tmp, `${kind}\n`);
   fs.renameSync(tmp, backendFilePath);
+}
+
+/** 新しい会話を入れる herdr セッション名の設定ファイル（`~/.tailii/herdr-session`, herdr-session-setting）。 */
+export function defaultHerdrSessionFilePath(): string {
+  return path.join(os.homedir(), ".tailii", "herdr-session");
+}
+
+/**
+ * 新しい会話を入れる herdr セッション名を設定から解決する。不在・空・herdr が受け付けない名前は
+ * herdr の既定セッション `default`。launch 毎に呼び直すので、アプリからの変更は再起動なしで次の起動から効く。
+ */
+export function resolveHerdrSessionName(filePath: string = defaultHerdrSessionFilePath()): string {
+  try {
+    const value = fs.readFileSync(filePath, "utf8").trim();
+    if (isValidHerdrSessionName(value)) return value;
+  } catch {
+    // 不在/読取失敗は既定。
+  }
+  return HERDR_DEFAULT_SESSION;
+}
+
+/**
+ * herdr セッション名の設定を永続化する（backend_set の `herdrSession`）。tmp+rename の atomic 書き込み。
+ * 既定（`default`）はファイルを消して表す。受け付けない名前は書かずに throw する。
+ */
+export function writeHerdrSessionName(name: string, filePath: string = defaultHerdrSessionFilePath()): void {
+  if (!isValidHerdrSessionName(name)) throw new Error(`invalid herdr session name: ${name}`);
+  if (name === HERDR_DEFAULT_SESSION) {
+    fs.rmSync(filePath, { force: true });
+    return;
+  }
+  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  const tmp = filePath + ".tmp";
+  fs.writeFileSync(tmp, `${name}\n`);
+  fs.renameSync(tmp, filePath);
 }
 
 /** tmux と herdr の一覧を名前順にまとめる。名前空間はメタの backend 欄で分割済み。万一の重複は tmux 優先。 */

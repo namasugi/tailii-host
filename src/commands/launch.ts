@@ -16,21 +16,29 @@ import {
   HERDR_TIMEOUT_MS,
   type HerdrCommandResult,
   HERDR_LAUNCH_GRACE_SECONDS,
-  HERDR_RESTART_NEEDED_MESSAGE,
+  HERDR_DEFAULT_SESSION,
   HERDR_TAILII_SESSION,
+  type HerdrPane,
+  herdrRestartNeededMessage,
+  herdrSessionOfMeta,
   defaultHerdrPath,
   envWithoutTmux,
   herdrErrorCode,
   parseHerdrForegroundCommand,
   parseHerdrPaneList,
   parseHerdrCreatedTabPaneId,
+  parseHerdrCreatedTerminalId,
   resolveHerdrSessionPane,
 } from "../backend/herdr.js";
 import { claudeHookLaunchSettings, removeCodexHookSettings } from "./hookSettings.js";
 import { tailiiWorktreeRepoRoot } from "../services/gitService.js";
 import { ClaudeSessionStore } from "../sessions/claudeSessionStore.js";
 import { claudeProjectSlug, isInsideBase, standardize, expandTilde } from "../shared/paths.js";
-import { resolveSessionBackendKind, type SessionBackendKind } from "../backend/sessionBackend.js";
+import {
+  resolveHerdrSessionName,
+  resolveSessionBackendKind,
+  type SessionBackendKind,
+} from "../backend/sessionBackend.js";
 import { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
 import { sleep } from "../shared/sleep.js";
 import { agentClampArgv, agentClampShellPrefix, withAgentClampShellCommand } from "../shared/agentPriority.js";
@@ -347,6 +355,7 @@ export async function runLaunchCommand(args: string[]): Promise<number> {
     now: () => Math.floor(Date.now() / 1000),
     errorSink: (message) => process.stderr.write(message),
     backend: resolveSessionBackendKind(),
+    herdrSession: resolveHerdrSessionName(),
   });
 }
 
@@ -368,6 +377,11 @@ export function makeSessionLauncher(options: {
    * アプリの backend_set が engine 再起動なしで次の起動から反映される）。
    */
   backend?: SessionBackendKind | (() => SessionBackendKind);
+  /**
+   * herdr backend で新しい会話を入れる herdr セッション名（herdr-session-setting。既定は herdr の `default`）。
+   * 関数を渡すと launch 毎に解決する（engine は resolveHerdrSessionName を渡す）。
+   */
+  herdrSession?: string | (() => string);
   herdrPath?: string | null;
   /** `~/.claude/projects` の場所（deleted-worktree-resume の transcript 移設用）。テスト注入用。 */
   claudeProjectsDir?: string;
@@ -496,6 +510,8 @@ export function makeSessionLauncher(options: {
       binaryPath: binary,
       tmuxPath: tmux,
       backend: typeof backendOption === "function" ? backendOption() : backendOption,
+      herdrSession:
+        typeof options.herdrSession === "function" ? options.herdrSession() : options.herdrSession ?? HERDR_DEFAULT_SESSION,
       herdrPath: herdr,
       innerCommand: effectiveInner,
       outputStyle: launchOptions?.outputStyle ?? null,
@@ -635,6 +651,8 @@ export async function launchCore(options: {
   runner?: ProcessRunner;
   /** 新規セッションの端末バックエンド（既定 tmux）。 */
   backend?: SessionBackendKind;
+  /** 新しい会話を入れる herdr セッション名（backend=herdr のときのみ使用。既定は herdr の `default`）。 */
+  herdrSession?: string;
   /** herdr 実行ファイルの絶対パス（backend=herdr のときのみ使用）。 */
   herdrPath?: string | null;
   /** detached プロセス起動の注入点（herdr tailii セッションサーバーの ensure 用, テスト注入可）。 */
@@ -725,6 +743,7 @@ export async function launchCore(options: {
       innerCommand,
       agent,
       herdrPath: options.herdrPath ?? defaultHerdrPath(),
+      herdrSession: options.herdrSession ?? HERDR_DEFAULT_SESSION,
       injectedPath: options.path,
       env,
       runner,
@@ -827,6 +846,74 @@ export async function launchCore(options: {
 }
 
 /**
+ * herdr のワークスペースを分ける単位（herdr-project-workspace）。会話の作業フォルダそのもの。
+ * ただし `.claude/worktrees/` 配下の worktree は本体の repo ルートへまとめる（worktree ごとに
+ * ワークスペースが増えてサイドバーが埋まらないように）。
+ */
+export function herdrWorkspaceKey(dir: string): string {
+  const resolved = path.resolve(dir);
+  return tailiiWorktreeRepoRoot(resolved) ?? resolved;
+}
+
+/** ワークスペースの表示名。キーの末尾のフォルダ名（ホームは `~`）。 */
+export function herdrWorkspaceLabel(key: string, home: string = os.homedir()): string {
+  if (path.resolve(key) === path.resolve(home)) return "~";
+  return path.basename(key) || key;
+}
+
+/**
+ * キー `key` の会話を入れるワークスペースを、生存 pane から探す（不在は null）。
+ * 1. Tailii が起動した pane（label がメタのあるセッション名）が 1 つ以上あり、その全部が同じキーのワークスペース。
+ *    全会話を 1 つに入れていた頃のワークスペース（キーが混ざっている）は採らず、新しい会話からフォルダごとに分かれる。
+ * 2. 無ければ、利用者が自分で開いた pane（メタの無い label）の今の作業フォルダが同じキーのワークスペース
+ *    （利用者が同じフォルダで開いているワークスペースへ合流する。`default` など利用者も使うセッション向け）。
+ *    ほかのキーの Tailii の pane が居るワークスペースは採らない。複数あれば同じキーの pane が多い方。
+ *    pane の `cwd` は herdr が実パス（`/tmp` → `/private/tmp`）で返すので、`keyOfPanePath` で揃えて比べる。
+ * ID ではなく生存 pane から毎回引くので、サーバーの状態削除で ID が振り直されても取り違えない。
+ */
+export function findHerdrProjectWorkspace(
+  panes: readonly HerdrPane[],
+  key: string,
+  keyOfSession: (label: string) => string | null,
+  keyOfPanePath: (cwd: string) => string | null = () => null,
+): string | null {
+  const tailiiKeys = new Map<string, Set<string>>();
+  const userMatches = new Map<string, number>();
+  for (const pane of panes) {
+    if (pane.workspaceId === null) continue;
+    const sessionKey = pane.label !== null ? keyOfSession(pane.label) : null;
+    if (sessionKey !== null) {
+      const keys = tailiiKeys.get(pane.workspaceId) ?? new Set<string>();
+      keys.add(sessionKey);
+      tailiiKeys.set(pane.workspaceId, keys);
+      continue;
+    }
+    if (pane.cwd !== null && keyOfPanePath(pane.cwd) === key) {
+      userMatches.set(pane.workspaceId, (userMatches.get(pane.workspaceId) ?? 0) + 1);
+    }
+  }
+  for (const [workspaceId, keys] of tailiiKeys) {
+    if (keys.size === 1 && keys.has(key)) return workspaceId;
+  }
+  let best: { workspaceId: string; count: number } | null = null;
+  for (const [workspaceId, count] of userMatches) {
+    const keys = tailiiKeys.get(workspaceId);
+    if (keys !== undefined && [...keys].some((other) => other !== key)) continue;
+    if (best === null || count > best.count) best = { workspaceId, count };
+  }
+  return best?.workspaceId ?? null;
+}
+
+/** pane の作業フォルダ（herdr が返す実パス）を、`key`（実パスに直したもの）と比べられる形にする。 */
+function realHerdrWorkspaceKey(dir: string): string {
+  try {
+    return herdrWorkspaceKey(fs.realpathSync(dir));
+  } catch {
+    return herdrWorkspaceKey(dir);
+  }
+}
+
+/**
  * herdr backend の起動実体。tmux の「死んだ同名セッション掃除 → デタッチ起動 → pane ID 記録」に
  * 対応する herdr 版。ユーザーの default セッションを汚さないよう、専用 named session
  * `tailii`（`--session` を全コマンドに前置）へ収容する:
@@ -842,6 +929,8 @@ async function launchHerdrPane(options: {
   innerCommand: string;
   agent: LaunchAgent;
   herdrPath: string;
+  /** 新しい会話を入れる herdr セッション名（設定値）。前の pane が別のセッションで生きていればそちらを使う。 */
+  herdrSession: string;
   injectedPath: string;
   env: NodeJS.ProcessEnv;
   runner: ProcessRunner;
@@ -862,11 +951,14 @@ async function launchHerdrPane(options: {
   launchScriptDir?: string;
 }): Promise<number> {
   const { session, dir, agent, store, now, errorSink } = options;
-  const runHerdr = async (args: string[]): Promise<{ code: number; out: string; err: string }> => {
+  const runHerdrIn = async (
+    herdrSession: string,
+    args: string[],
+  ): Promise<{ code: number; out: string; err: string }> => {
     try {
       const result = await options.runner(
         options.herdrPath,
-        ["--session", HERDR_TAILII_SESSION, ...args],
+        ["--session", herdrSession, ...args],
         // herdr server の起動元になり得るので TMUX を持ち込まない（envWithoutTmux）。
         { env: envWithoutTmux(options.env) },
       );
@@ -876,6 +968,27 @@ async function launchHerdrPane(options: {
       return { code: 127, out: "", err: "" };
     }
   };
+  const isTailiiName = (label: string) => store.get(label)?.name === label;
+
+  // --- 0. 入れる herdr セッションを決める（herdr-session-setting）。前に起動した pane が別のセッション
+  //     （設定を変える前のセッション・未記録なら専用の `tailii`）で生きていれば、そのセッションで続ける:
+  //     設定の変更は「次に起動する会話」から効き、動いている会話を動かさない（同じ会話 id の二重起動を作らない）。 ---
+  const recordedMeta = store.get(session);
+  let herdrSession = options.herdrSession;
+  if (recordedMeta?.backend === "herdr" && herdrSessionOfMeta(recordedMeta) !== herdrSession) {
+    const recordedSession = herdrSessionOfMeta(recordedMeta);
+    const listed = await runHerdrIn(recordedSession, ["pane", "list"]);
+    if (
+      listed.code === 0 &&
+      resolveHerdrSessionPane(parseHerdrPaneList(listed.out), session, recordedMeta.herdrPaneId, isTailiiName, {
+        terminalId: recordedMeta.herdrTerminalId,
+        herdrSession: recordedSession,
+      }) !== null
+    ) {
+      herdrSession = recordedSession;
+    }
+  }
+  const runHerdr = (args: string[]) => runHerdrIn(herdrSession, args);
   const spawnDetached =
     options.spawnDetached ??
     ((executable: string, args: string[]) => {
@@ -883,17 +996,48 @@ async function launchHerdrPane(options: {
       child.unref();
     });
 
-  // --- 1. tailii セッションサーバーの ensure（`pane list` が通れば稼働中） ---
+  // --- 1. herdr セッションのサーバーの ensure（`pane list` が通れば稼働中） ---
   let paneList = await runHerdr(["pane", "list"]);
   if (paneList.code !== 0 && herdrErrorCode(paneList.err) === "protocol_mismatch") {
     // herdr 更新後、旧版サーバーが動いたまま（新しい CLI は全コマンドを拒否する）。
     // ここで server を起動し直そうとしても既存ソケットに阻まれ「起動できません」と誤案内に
     // なるので、原因をそのまま伝える。止めると実行中の会話が終わるため自動では止めない。
-    errorSink(`tailii launch: ${HERDR_RESTART_NEEDED_MESSAGE}\n`);
+    errorSink(`tailii launch: ${herdrRestartNeededMessage(herdrSession)}\n`);
     return 1;
   }
+  if (paneList.code !== 0 && (herdrErrorCode(paneList.err) ?? herdrErrorCode(paneList.out)) !== "server_not_running") {
+    // サーバーが動いていないと確定したときだけ起動する（herdr-session-setting）。同じ名前のセッションが
+    // 動いているのに応答が遅れただけ（時間切れ・一時的な失敗）で 2 つ目のサーバーを起こさない。
+    // `server_not_running` は、名前が未作成・止まっている・異常終了でソケットだけ残った、のどれでも返る
+    // （0.9.5 実測）。止まっている既存のセッションは、起動すると保存状態から復元される（作り直さない）。
+    const detail = (paneList.err || paneList.out).trim().slice(0, 200);
+    errorSink(
+      `tailii launch: herdr セッション '${herdrSession}' に問い合わせできませんでした` +
+        `${detail.length > 0 ? `: ${detail}` : ` (${paneList.code})`}\n`,
+    );
+    return 1;
+  }
+  if (paneList.code !== 0 && herdrSession !== HERDR_TAILII_SESSION) {
+    // 専用セッション以外（herdr の既定 `default`・利用者が名前を付けたセッション）は利用者自身のもの。
+    // 動いていなければ Tailii は代わりに起こさず、専用の `tailii` に入れる（Fable レビュー B-2）。起こすと、
+    // 利用者の保存状態が裏で復元されて claude が自動再開したり、hub の環境がその後の pane へ引き継がれたりする。
+    herdrSession = HERDR_TAILII_SESSION;
+    paneList = await runHerdr(["pane", "list"]);
+    if (paneList.code !== 0 && herdrErrorCode(paneList.err) === "protocol_mismatch") {
+      errorSink(`tailii launch: ${herdrRestartNeededMessage(herdrSession)}\n`);
+      return 1;
+    }
+    if (paneList.code !== 0 && (herdrErrorCode(paneList.err) ?? herdrErrorCode(paneList.out)) !== "server_not_running") {
+      const detail = (paneList.err || paneList.out).trim().slice(0, 200);
+      errorSink(
+        `tailii launch: herdr セッション '${herdrSession}' に問い合わせできませんでした` +
+          `${detail.length > 0 ? `: ${detail}` : ` (${paneList.code})`}\n`,
+      );
+      return 1;
+    }
+  }
   if (paneList.code !== 0) {
-    spawnDetached(options.herdrPath, ["--session", HERDR_TAILII_SESSION, "server"]);
+    spawnDetached(options.herdrPath, ["--session", herdrSession, "server"]);
     const deadline = Date.now() + 5000;
     const pollMs = options.ensurePollMs ?? 150;
     while (Date.now() <= deadline) {
@@ -902,21 +1046,23 @@ async function launchHerdrPane(options: {
       if (paneList.code === 0) break;
     }
     if (paneList.code !== 0) {
-      errorSink(`tailii launch: herdr セッション '${HERDR_TAILII_SESSION}' を起動できませんでした\n`);
+      errorSink(`tailii launch: herdr セッション '${herdrSession}' を起動できませんでした\n`);
       return 1;
     }
   }
 
   // --- 2. 既存 pane の解決と stale 掃除（tmux の dead-session 掃除に対応） ---
   const panes = parseHerdrPaneList(paneList.out);
-  const recordedMeta = store.get(session);
-  const recordedPaneId = recordedMeta?.herdrPaneId;
-  let existing = resolveHerdrSessionPane(
-    panes,
-    session,
-    recordedPaneId,
-    (label) => store.get(label)?.name === label,
-  );
+  // 記録 pane ID は、記録したのと同じ herdr セッションのときだけ使う（pane ID はセッションごとに振られる）。
+  const recordedPaneId =
+    recordedMeta?.backend === "herdr" && herdrSessionOfMeta(recordedMeta) === herdrSession
+      ? recordedMeta.herdrPaneId
+      : undefined;
+  let existing = resolveHerdrSessionPane(panes, session, recordedPaneId, isTailiiName, {
+    terminalId: recordedMeta?.herdrTerminalId,
+    herdrSession,
+  });
+  let closedStalePaneId: string | null = null;
   if (existing !== null && agent === "claude") {
     // Claude が終了してシェルだけ残った pane は入力先として無効なので閉じて作り直す。
     // ただし launch 直後の猶予窓（HERDR_LAUNCH_GRACE_SECONDS, メタ createdAt 起点）は
@@ -931,33 +1077,57 @@ async function launchHerdrPane(options: {
         info.code !== 0 || paneCommandLooksLikeAgent(parseHerdrForegroundCommand(info.out));
       if (!hasAgent) {
         await runHerdr(["pane", "close", existing.paneId]);
+        closedStalePaneId = existing.paneId;
         existing = null;
       }
     }
   }
 
   let herdrPaneId: string | null = existing?.paneId ?? null;
+  let herdrTerminalId: string | null = existing?.terminalId ?? null;
   if (existing === null) {
-    // --- 3. tab create で新タブ+pane を生成（0.7.5 で agent start の pane 生成/cwd/env 指定が
-    //     廃止されたため）。タブラベルは付けず herdr 既定表示（連番）に任せる
-    //     （session-title のタブ反映は 2026-07-30 撤去）。
-    //     workspace がゼロのサーバー（初回起動・全 pane を閉じた後の復元）では tab create が
-    //     `workspace_not_found` になる（0.7.5 / 0.9.3 とも実測）ので、workspace create で
-    //     workspace ごと作り、その root pane を使う（出力の root_pane 形は tab create と同じ）。 ---
+    // --- 3. 会話の作業フォルダのワークスペースに新タブ+pane を生成（herdr-project-workspace,
+    //     2026-11-14）。同じフォルダの会話が生きているワークスペースがあれば `tab create --workspace`
+    //     でそこへ足し、無ければフォルダ名のラベルで `workspace create` する（root pane を使う。
+    //     出力の root_pane 形は tab create と同じ）。最後の pane を閉じるとワークスペースも消えるので
+    //     空のワークスペースは残らない。タブラベルは付けず herdr 既定表示（連番）に任せる
+    //     （会話タイトルは hub tick が書く）。0.7.5 で agent start の pane 生成/cwd/env 指定が
+    //     廃止されたため tab / workspace create で作る。 ---
     const placement = ["--cwd", dir, "--env", `PATH=${options.injectedPath}`, "--no-focus"];
-    let created = await runHerdr(["tab", "create", ...placement]);
-    if (created.code !== 0 && herdrErrorCode(created.err) === "workspace_not_found") {
-      created = await runHerdr([
-        "workspace", "create", ...placement, "--label", HERDR_TAILII_SESSION,
-      ]);
+    const workspaceKey = herdrWorkspaceKey(options.recordCwd ?? dir);
+    const createWorkspace = () =>
+      runHerdr(["workspace", "create", ...placement, "--label", herdrWorkspaceLabel(workspaceKey)]);
+    // 上の stale 掃除で閉じた pane は数えない（そのワークスペースは消えているかもしれない）。
+    const livePanes = panes.filter((pane) => pane.paneId !== closedStalePaneId);
+    const realWorkspaceKey = realHerdrWorkspaceKey(options.recordCwd ?? dir);
+    const workspaceId = findHerdrProjectWorkspace(
+      livePanes,
+      workspaceKey,
+      (label) => {
+        const meta = store.get(label);
+        return meta !== null && meta.name === label && meta.backend === "herdr" && herdrSessionOfMeta(meta) === herdrSession
+          ? herdrWorkspaceKey(meta.cwd)
+          : null;
+      },
+      // 利用者の pane の作業フォルダは実パスで返るので、実パスどうしで比べて一致したら `workspaceKey` として数える。
+      (cwd) => (herdrWorkspaceKey(cwd) === realWorkspaceKey ? workspaceKey : null),
+    );
+    let created =
+      workspaceId !== null
+        ? await runHerdr(["tab", "create", "--workspace", workspaceId, ...placement])
+        : await createWorkspace();
+    if (workspaceId !== null && created.code !== 0 && herdrErrorCode(created.err) === "workspace_not_found") {
+      // 一覧を読んだ後に最後の pane が閉じてワークスペースが消えた。
+      created = await createWorkspace();
     }
     if (created.code !== 0) {
       errorSink(`tailii launch: herdr が非0終了 (${created.code})\n`);
       return created.code === 0 ? 1 : created.code;
     }
     herdrPaneId = parseHerdrCreatedTabPaneId(created.out);
+    herdrTerminalId = parseHerdrCreatedTerminalId(created.out);
     if (herdrPaneId === null) {
-      errorSink("tailii launch: herdr tab create の pane_id を解決できませんでした\n");
+      errorSink("tailii launch: herdr が作った pane の pane_id を解決できませんでした\n");
       return 1;
     }
 
@@ -1016,6 +1186,7 @@ async function launchHerdrPane(options: {
       (agent === "claude" ? options.claudeSessionId ?? undefined : undefined);
     const autoTabTitle = existing !== null && currentMeta !== null &&
       currentMeta.backend === "herdr" && currentMeta.herdrPaneId === herdrPaneId &&
+      herdrSessionOfMeta(currentMeta) === herdrSession &&
       (currentMeta.agent ?? "claude") === agent && currentSessionId === nextSessionId
       ? currentMeta.autoTabTitle : undefined;
     store.put({
@@ -1030,6 +1201,8 @@ async function launchHerdrPane(options: {
         : {}),
       ...(options.providerSessionId ? { providerSessionId: options.providerSessionId } : {}),
       ...(herdrPaneId !== null ? { herdrPaneId } : {}),
+      ...(herdrTerminalId !== null ? { herdrTerminalId } : {}),
+      herdrSession,
     });
   } catch (error) {
     errorSink(`tailii launch: メタデータ保存失敗: ${String(error)}\n`);

@@ -545,10 +545,11 @@ export async function reaperTick(options: ReaperTickOptions): Promise<ReaperTick
         },
       );
     }
-    // 生存 Tailii セッションが 0 なら空 server を回収する（tmux server の自動終了に対応）。
-    // 判定は ops 側で pane 総数 0 のときだけ停止する（手動 pane があれば停止しない）。
-    // 生存判定に失敗した tick は「0 件」ではないので停止を試みない。
-    if (herdrLive.length === 0 && !herdrUnavailable) {
+    // 専用セッション `tailii` が空なら server を回収する（tmux server の自動終了に対応）。
+    // 判定は ops 側で `tailii` の pane 総数 0 のときだけ停止する（手動 pane があれば停止しない）。
+    // 会話ごとに herdr セッションが分かれたので（herdr-session-setting）、ほかのセッションで会話が
+    // 生きていても見る。生存判定に失敗した tick は「0 件」と確かめられないので停止を試みない。
+    if (!herdrUnavailable) {
       await herdrOps.stopServerIfEmpty?.();
     }
 
