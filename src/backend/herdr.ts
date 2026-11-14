@@ -184,7 +184,11 @@ export function processHerdrCommandRunner(
     });
 }
 
-/** 既定は socket を試し、未対応・不通時だけ従来の CLI へ戻す。偽 runner の注入は通さない。 */
+/**
+ * 既定は CLI。TAILII_HERDR_TRANSPORT=socket の明示時だけ socket を試し、未対応・不通時は CLI へ戻す。
+ * herdr 0.9.5 と Node の接続後の書き込みでは最大 250 ms の待ちが頻発し、送信が最大約 11 秒かかった。
+ * CLI は起動込み約 4 ms/操作。偽 runner の注入は通さない。
+ */
 export function defaultHerdrCommandRunner(
   herdrPath: string = defaultHerdrPath(),
   sessionName: string = HERDR_TAILII_SESSION,

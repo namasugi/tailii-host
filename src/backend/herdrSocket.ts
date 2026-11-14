@@ -1,4 +1,6 @@
-// herdrSocket.ts — herdr 0.9.5（protocol 22）の CLI と同じ結果を返す socket ランナー。
+// herdrSocket.ts — TAILII_HERDR_TRANSPORT=socket の明示時だけ使う、CLI 互換の socket ランナー。
+// herdr 0.9.5 は接続直後に要求がないと最大 250 ms 待つ。Node の接続後の書き込みではこの待ちが頻発し、
+// ping と本体の 2 接続で送信が最大約 11 秒かかったため、起動込み約 4 ms/操作の CLI を既定にする。
 // 対応表と出力変換の根拠: 同版の src/cli{,/pane,/runtime,/tab,/workspace}.rs と API schema。
 import { randomUUID } from "node:crypto";
 import { createConnection } from "node:net";
@@ -211,7 +213,11 @@ function cliJson(value: unknown): string {
 }
 const failed = (): HerdrCommandResult => ({ exitCode: 1, stdout: "", stderr: "" });
 
-/** CLI へ渡す残り時間も同じ操作の上限に含める（0ms = execFile の無期限指定を渡さない）。 */
+/**
+ * 既定は CLI。TAILII_HERDR_TRANSPORT=socket の明示時だけ接続する。
+ * herdr 0.9.5 と Node では 2 接続の待ちが積み上がり、送信が最大約 11 秒かかった。
+ * CLI へ渡す残り時間も同じ操作の上限に含める（0ms = execFile の無期限指定を渡さない）。
+ */
 export function socketHerdrCommandRunner(
   cli: (args: string[], timeoutMs: number) => Promise<HerdrCommandResult>,
   options: { sessionName: string; timeoutMs: number; env?: NodeJS.ProcessEnv; socketPath?: string },
@@ -226,7 +232,7 @@ export function socketHerdrCommandRunner(
     const env = options.env ?? process.env;
     const call = mapCall(args);
     const socketPath = options.socketPath ?? herdrSessionSocketPath(options.sessionName, env);
-    if (env.TAILII_HERDR_TRANSPORT === "cli" || !call || socketPath === null) return fallback();
+    if (env.TAILII_HERDR_TRANSPORT !== "socket" || !call || socketPath === null) return fallback();
     try {
       // 版はキャッシュしない。サーバーを再起動・更新しても次の操作で必ず再確認する。
       const response = await request(socketPath, "ping", {}, Math.min(PROBE_TIMEOUT_MS, remaining()));

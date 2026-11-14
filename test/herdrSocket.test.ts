@@ -86,21 +86,28 @@ describe("herdr socket の選択と CLI fallback", () => {
     ["pane", "read", "w1:p1", "--lines", "-1"], ["pane", "read", "w1:p1", "--lines", "4294967296"],
     ["pane", "send-text", "w1:p1", "\0"], ["tab", "create", "--env", "wrong"]])("未対応の引数はそのまま CLI へ: %j", async (...args) => {
     const cli = vi.fn(async () => CLI);
-    const run = socketHerdrCommandRunner(cli, { sessionName: "tailii", timeoutMs: 15_000, socketPath: "/does/not/exist" });
+    const run = socketHerdrCommandRunner(cli, { sessionName: "tailii", timeoutMs: 15_000,
+      env: { TAILII_HERDR_TRANSPORT: "socket" }, socketPath: "/does/not/exist" });
     expect(await run(args)).toEqual(CLI);
     expect(cli).toHaveBeenCalledWith(args, expect.any(Number));
   });
 
-  test("cli 指定は socket を一切必要とせず、非0終了もそのまま返す", async () => {
-    const cli = vi.fn(async () => CLI);
-    const run = socketHerdrCommandRunner(cli, { sessionName: "tailii", timeoutMs: 100,
-      env: { TAILII_HERDR_TRANSPORT: "cli" }, socketPath: "/does/not/exist" });
-    expect(await run(["pane", "list"])).toEqual(CLI);
-    expect(cli).toHaveBeenCalledOnce();
+  test.each([undefined, "cli", "", "other"])("socket を明示しない設定（%s）は実在する socket に接続せず CLI の結果を返す", async (transport) => {
+    vi.stubEnv("TAILII_HERDR_TRANSPORT", transport);
+    const f = await fakeServer((req, socket) => send(socket, req, { type: "pane_list", panes: [] }));
+    const connected = vi.fn();
+    f.server.on("connection", connected);
+    expect(fs.statSync(f.socketPath).isSocket()).toBe(true);
+    const args = ["pane", "list"];
+    expect(await f.runner(args)).toEqual(CLI);
+    expect(f.cli).toHaveBeenCalledOnce();
+    expect(f.cli).toHaveBeenCalledWith(args, expect.any(Number));
+    expect(connected).not.toHaveBeenCalled();
+    expect(f.requests).toEqual([]);
   });
 
-  test("既定 runner の cli 指定も実行ファイルへ session と引数をそのまま渡す", async () => {
-    vi.stubEnv("TAILII_HERDR_TRANSPORT", "cli");
+  test.each([undefined, "cli", "", "other"])("既定 runner も socket を明示しない設定（%s）では実行ファイルへ session と引数をそのまま渡す", async (transport) => {
+    vi.stubEnv("TAILII_HERDR_TRANSPORT", transport);
     const executable = path.join(temp(), "fake-herdr.mjs");
     fs.writeFileSync(executable, `#!${process.execPath}\nprocess.stdout.write(JSON.stringify(process.argv.slice(2)));\n`, { mode: 0o755 });
     const args = ["pane", "send-text", "w1:p1", "日本語\r\n"];
@@ -111,6 +118,7 @@ describe("herdr socket の選択と CLI fallback", () => {
   });
 
   test("socket 不在・接続拒否は元の CLI へ渡し、起動自体の例外は従来どおり伝える", async () => {
+    vi.stubEnv("TAILII_HERDR_TRANSPORT", "socket");
     const cli = vi.fn(async () => CLI);
     const run = socketHerdrCommandRunner(cli, { sessionName: "tailii", timeoutMs: 300, socketPath: path.join(temp(), "missing") });
     expect(await run(["pane", "send-text", "w1:p1", "text"])).toEqual(CLI);
@@ -325,10 +333,9 @@ describe("偽 Unix socket との結合", () => {
     expect(f.cli).toHaveBeenCalledOnce();
   });
 
-  test("既定 manager と launch は socket を使い、herdr 実行ファイルを必要としない", async () => {
+  test("socket 指定時は既定 manager と launch が herdr 実行ファイルなしで動く", async () => {
     const dir = temp();
     vi.stubEnv("XDG_CONFIG_HOME", dir);
-    vi.stubEnv("TAILII_HERDR_TRANSPORT", "socket");
     const socketPath = herdrSessionSocketPath("tailii")!;
     const f = await fakeServer((req, socket) => {
       const result = req.method === "pane.list" ? { type: "pane_list", panes: [] }
