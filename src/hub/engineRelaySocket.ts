@@ -247,7 +247,11 @@ export async function sendRemotePendingToEngine(
   );
 }
 
-/** 1 行を engine relay socket へ書き込む共通部（timeLimit 内で connect リトライ）。 */
+/**
+ * 1 行を engine relay socket へ書き込む共通部（timeLimit 内で connect リトライ）。
+ * timeLimit は厳密な上限: 各試行の connect / end の完了待ちも残り時間で打ち切り、socket を破棄して戻る
+ * （relay が詰まっても hook の出力・終了を遅らせない。最善努力の送信なので、打ち切りは送れなかったのと同じ扱い）。
+ */
 async function sendLineToEngine(line: string, socketPath: string, timeLimitMs: number): Promise<void> {
   const deadline = Date.now() + timeLimitMs;
   while (Date.now() <= deadline) {
@@ -257,9 +261,11 @@ async function sendLineToEngine(line: string, socketPath: string, timeLimitMs: n
       const finish = (ok: boolean): void => {
         if (settled) return;
         settled = true;
+        clearTimeout(timer);
         socket.destroy();
         resolve(ok);
       };
+      const timer = setTimeout(() => finish(false), Math.max(0, deadline - Date.now()));
       socket.once("connect", () => {
         socket.end(line + "\n", () => finish(true));
       });

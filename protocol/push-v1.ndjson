@@ -10,3 +10,5 @@
 {"id":"pp-1","type":"presence_ping","v":1}
 {"id":"pp-1","type":"presence_pong","v":1}
 {"hostName":"Alice's Mac mini","maxVersion":2,"push":1,"serverVersion":"0.21.0","type":"channel_hello","v":2}
+{"id":"appr-1","status":"applied","type":"approval_decision_result","v":1}
+{"id":"appr-2","status":"stale","type":"approval_decision_result","v":1}

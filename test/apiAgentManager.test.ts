@@ -228,6 +228,17 @@ describe("ApiAgentManager", () => {
     expect(t.workers).toHaveLength(0);
   });
 
+  test("承認: API 作業の承認の依頼には「許可してよい形の要約」を載せない（通知の上で許可させない, push v1.1 §6）", async () => {
+    const t = setup({ summarizeTool: () => ({ summary: "ls -la" }) });
+    t.manager.open("cs-a", { conversationId: CONV, cwd: "/tmp/w", config: CONFIG, resume: true });
+    await t.manager.submit("cs-a", "x");
+    const worker = t.workers[0]!;
+    worker.emit({ t: "permission_request", requestId: "r1", toolName: "Bash", input: { command: "ls -la" } });
+    await vi.waitFor(() => expect(t.approvals).toHaveLength(1));
+    expect(t.approvals[0]).not.toHaveProperty("allowSummary");
+    worker.succeed(0.01);
+  });
+
   test("承認: Write は既存の承認カードへ（要約付き）。答えを作業プロセスへ返す", async () => {
     const t = setup();
     t.manager.open("cs-a", { conversationId: CONV, cwd: "/tmp/w", config: CONFIG, resume: true });

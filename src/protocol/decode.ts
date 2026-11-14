@@ -203,6 +203,12 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         agentType: optionalString(raw, "agentType"),
       });
 
+    case "approval_decision_result": {
+      const status = raw["status"];
+      if (status !== "applied" && status !== "stale") throw new ProtocolDecodeError("missing-field", "status");
+      return { type, v, id: requireString(raw, "id"), status };
+    }
+
     case "approval_decision": {
       const decision = requireString(raw, "decision");
       if (decision !== "allow" && decision !== "deny") {

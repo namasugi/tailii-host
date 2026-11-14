@@ -42,6 +42,8 @@ export interface PushPlaintext {
   title: string;
   body: string;
   id?: string;
+  /** 承認の本文が操作の全体を省略なく含む（通知の上で許可してよい, push v1.1 §6）。true のときだけ平文に出す。 */
+  allow?: boolean;
   /** epoch 秒。 */
   ts: number;
 }
@@ -82,6 +84,7 @@ export function encodePushPlaintext(plaintext: PushPlaintext): string {
     title: plaintext.title,
     body: plaintext.body,
     ...(plaintext.id !== undefined ? { id: plaintext.id } : {}),
+    ...(plaintext.allow === true ? { allow: true } : {}),
     ts: plaintext.ts,
   });
 }
@@ -128,6 +131,11 @@ export function fitPushPlaintext(plaintext: PushPlaintext, maxCipherBytes = PUSH
   const fits = (candidate: PushPlaintext): boolean =>
     sealedB64uLength(Buffer.byteLength(encodePushPlaintext(candidate), "utf8")) <= maxCipherBytes;
   if (fits(plaintext)) return plaintext;
+  // ここから先は本文を切り詰める = 操作の全体を含まなくなるので、通知の上での許可（allow）は外す。
+  const withoutAllow: PushPlaintext = { ...plaintext };
+  delete withoutAllow.allow;
+  if (fits(withoutAllow)) return withoutAllow;
+  plaintext = withoutAllow;
   const bodyCut = truncateFieldToFit(plaintext, "body", fits);
   if (bodyCut !== null) return bodyCut;
   // 本文を空にしても溢れる = 題名が長すぎる。本文は定型の省略記号だけ残し、題名を切る。

@@ -116,6 +116,11 @@ export interface PushEventInput {
    * false なら送らない（在席確認の待ち最大 2 秒の間に状況が変わった通知を出さない）。
    */
   stillValid?: () => boolean;
+  /**
+   * 承認の本文が操作の全体を省略なく含む（hook・API 作業の橋渡しが要約を作った時点で決めた印）。true で、かつ端末が
+   * 本文を出し、送る本文が 1 文字も切られていないときだけ、平文に `allow: true` を付ける（push v1.1 §6）。
+   */
+  bodyComplete?: boolean;
 }
 
 export type PresenceState = "foreground" | "background";
@@ -365,9 +370,12 @@ export class PushDispatcher {
 
       const title = this.resolveTitle(event);
       const body = targets.some((device) => device.prefs.showBody) ? this.resolveBody(event) : null;
+      // 通知の上で許可してよい本文か（承認・作った時点の印・dispatcher の整形で 1 文字も変わっていない）。
+      const bodyAllowsApproval = event.kind === "approval" && event.bodyComplete === true &&
+        typeof event.body === "string" && body !== null && body === event.body;
       const config = this.safeLoadApnsConfig();
       const sent = await Promise.all(targets.map((device) =>
-        this.sendToDevice(device, event, title, body, config, nowSeconds)));
+        this.sendToDevice(device, event, title, body, config, nowSeconds, bodyAllowsApproval)));
       deviceOutcomes.push(...sent);
       if (sent.some((result) => result.status === "sent")) {
         this.options.sendLog?.record(event.kind, event.session, Math.floor(this.nowMs() / 1000));
@@ -434,6 +442,7 @@ export class PushDispatcher {
     body: string | null,
     config: ApnsConfig | null,
     nowSeconds: number,
+    bodyAllowsApproval = false,
   ): Promise<PushDeviceOutcome> {
     // 在席確認の待ち（最大 2 秒）の間に登録解除・設定変更・鍵の更新があったかもしれない。送る直前の最新の記録で
     // 組み立て直す（登録が無い・その種別を切った → 送らない。本文を切った → 定型文。鍵・capability → 新しい値）。
@@ -459,6 +468,8 @@ export class PushDispatcher {
       title,
       body: device.prefs.showBody && body !== null ? body : PUSH_FALLBACK_BODY[event.kind],
       ...(event.id !== undefined ? { id: event.id } : {}),
+      // 本文を出さない端末には定型文を送るので許可させない。暗号化の前の切り詰めでも外れる（pushEnvelope）。
+      ...(bodyAllowsApproval && device.prefs.showBody && body !== null ? { allow: true } : {}),
       ts: nowSeconds,
     };
     let result: PushSendResult;

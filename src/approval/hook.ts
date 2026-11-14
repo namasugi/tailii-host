@@ -60,6 +60,7 @@ import { scheduledFromSessionCrons } from "../sessions/cronSchedule.js";
 import { claudePidOfHook } from "../sessions/claudeLiveStatus.js";
 import { ensureHubDaemon } from "../hub/hubDaemonClient.js";
 import { decodeHubServerLine, encodeHubMessage, type HubPushEvent } from "../hub/hubProtocol.js";
+import { closeAfterReply, replyDecisionApplied } from "./decisionResult.js";
 import { ObservationLog, defaultObservationBase } from "../shared/observationLog.js";
 import { parsePermissionMode } from "../shared/permissionMode.js";
 import { resolveHubSocketPath, resolveSocketPath } from "../shared/socketPath.js";
@@ -106,6 +107,12 @@ export interface ApprovalPushRequest {
   session: string;
   /** 承認内容の要約（通知本文 `ツール名 · 要約` に使う。暗号化して送るのでリレーには見えない）。 */
   summary?: string;
+  /**
+   * 通知の上で「許可」してよい形の本文の要約（`<作業ディレクトリ> $ <コマンド>`。`describeToolForApproval` が入力を
+   * 見たその場で、条件をすべて満たすときだけ作る。文字列から後で推測しない）。省略は「許可させない」。
+   * 通知ではこれを本文にし、平文に `allow: true` を付ける（push v1.1 §6）。
+   */
+  allowSummary?: string;
 }
 
 /**
@@ -151,6 +158,8 @@ export interface RunHookOptions {
   presenceProbe?: PresenceProbe;
   /** presence により push を抑制した場合の観測先。 */
   pushObserver?: Pick<PushObserving, "recordSkipped">;
+  /** 内部用（runHookCore が作る）: 承認をアプリへ知らせたかの記録。終わりの remote_pending_cleared の判断に使う。 */
+  approvalTracker?: ApprovalTracker;
   /** connect 不能時に engine relay へ通知する socket path。省略時は既定パス。null なら送らない。 */
   engineRelaySocketPath?: string | null;
   /** connect 不能ブランチでの retry-connect ポーリング間隔（秒）。既定 1.0。 */
@@ -317,23 +326,42 @@ export async function runHookCore(options: RunHookOptions): Promise<HookRunResul
     return deny("iPhone unavailable (no socket path)");
   }
 
-  const socket = await connectUnixSocket(options.socketPath);
-  if (socket) {
-    // 接続済み（アプリ前面）。従来経路をそのまま実行する（push しない, 7.1）。
-    return sendRequestAndReflect(socket, parsed, summary, diff, options, deadlineAtMs);
-  }
+  // 承認の待ちが終わるすべての出口（許可・拒否・時間切れ・つなぎ直しの期限切れ・エラー）で、アプリへ知らせた承認
+  // （承認チャネルへ要求を書いた・一覧へ remote_pending を出した）なら必ず remote_pending_cleared を出す（ここ 1 か所）。
+  // 送信は最善努力で、hook の結果は変えない。受け手は id で照合するので、重ねて出しても害は無い。
+  const tracker: ApprovalTracker = { id: null, announced: false };
+  const flowOptions: RunHookOptions = { ...options, approvalTracker: tracker };
+  const socketPath = options.socketPath;
+  try {
+    const socket = await connectUnixSocket(socketPath);
+    if (socket) {
+      // 接続済み（アプリ前面）。従来経路をそのまま実行する（push しない, 7.1）。
+      return await sendRequestAndReflect(socket, parsed, summary, diff, flowOptions, deadlineAtMs);
+    }
 
-  // === connect 不能ブランチ（Req 2.1 / 8.1〜8.3） ===
-  return publishPendingAndAwaitReconnect(
-    options.socketPath,
-    parsed,
-    summary,
-    diff,
-    options,
-    deadlineAtMs,
-    randomUUID(),
-    false,
-  );
+    // === connect 不能ブランチ（Req 2.1 / 8.1〜8.3） ===
+    return await publishPendingAndAwaitReconnect(
+      socketPath,
+      parsed,
+      summary,
+      diff,
+      flowOptions,
+      deadlineAtMs,
+      randomUUID(),
+      false,
+    );
+  } finally {
+    if (tracker.announced && tracker.id !== null) {
+      // 片付けの失敗（例外を含む）で hook の結果を変えない。送信は engine relay の短い上限（250ms）で打ち切られる。
+      try { await clearRemotePendingIfNeeded(tracker.id, options); } catch { /* 最善努力。 */ }
+    }
+  }
+}
+
+/** 承認をアプリへ知らせたか（runHookCore が終わりに 1 回だけ remote_pending_cleared を出すための記録）。 */
+interface ApprovalTracker {
+  id: string | null;
+  announced: boolean;
 }
 
 // MARK: - 処理中/処理完了ライフサイクル通知
@@ -523,6 +551,11 @@ async function publishPendingAndAwaitReconnect(
 ): Promise<HookRunResult> {
   const session = options.session ?? "default";
   if (options.engineRelaySocketPath !== null) {
+    // 送信の成否に関わらず「知らせた」とみなす（届いていれば終わりに必ず片付ける。重ねても害は無い）。
+    if (options.approvalTracker !== undefined) {
+      options.approvalTracker.id = requestId;
+      options.approvalTracker.announced = true;
+    }
     await sendRemotePendingToEngine({
       type: "remote_pending",
       v: PROTOCOL_V1,
@@ -540,7 +573,13 @@ async function publishPendingAndAwaitReconnect(
     } else {
       await sendBackgroundPush(
         options.notifier,
-        { approvalId: requestId, tool: parsed.toolName, session, summary },
+        {
+          approvalId: requestId, tool: parsed.toolName, session, summary,
+          ...(() => {
+            const allowSummary = describeToolForApproval(parsed.toolName, parsed.toolInput, parsed.cwd).allowSummary;
+            return allowSummary !== null ? { allowSummary } : {};
+          })(),
+        },
         options.notifierTimeLimitMs ?? 5000,
       );
     }
@@ -601,6 +640,10 @@ async function sendRequestAndReflect(
     });
     try {
       socket.write(encoded + "\n");
+      if (options.approvalTracker !== undefined) {
+        options.approvalTracker.id = requestId;
+        options.approvalTracker.announced = true;
+      }
     } catch {
       // 送出直前に serve チャネルが落ちた（chat 離脱/開き直しレース）。切断と同じ扱い。
       if (options.socketPath === null) return deny("iPhone disconnected (write failed)");
@@ -611,15 +654,13 @@ async function sendRequestAndReflect(
 
     // 残りデッドライン内で approval_decision を待つ（自 id のみ受理, 5.4）。
     const outcome = await waitForDecision(socket, requestId, deadlineAtMs);
+    // remote_pending_cleared は runHookCore の終わりで 1 回だけ出す（すべての出口を 1 か所で）。
     switch (outcome.kind) {
       case "allow":
-        await clearRemotePendingIfNeeded(requestId, options);
         return allow(outcome.reason ?? "Approved on iPhone");
       case "deny":
-        await clearRemotePendingIfNeeded(requestId, options);
         return deny(outcome.reason ?? "Denied on iPhone");
       case "timeout":
-        await clearRemotePendingIfNeeded(requestId, options);
         return deny(`No response within ${Math.round(options.deadlineSeconds)}s`);
       case "disconnected":
         // 決定待ち中の切断 = iOS の chat 離脱（serve チャネル close）や SSH 断。
@@ -631,7 +672,7 @@ async function sendRequestAndReflect(
         );
     }
   } finally {
-    socket.destroy();
+    closeAfterReply(socket);
   }
 }
 
@@ -690,6 +731,8 @@ function waitForDecision(
         buf = buf.subarray(idx + 1);
         const outcome = evaluateLine(line, expectedId);
         if (outcome !== null) {
+          // 決定の反映結果をアプリへ返す（push v1.1 §6。最善努力・確定を遅らせない）。
+          replyDecisionApplied(socket, expectedId);
           settle(outcome);
           return;
         }
@@ -899,10 +942,31 @@ export function requestHubPush(
   });
 }
 
+/** 承認の通知本文の要約の上限（字）。これを超える要約は省略するので、通知の上では許可させない。 */
+const APPROVAL_SUMMARY_MAX_CHARS = 280;
+
+/**
+ * 承認の通知本文と、本文が操作の全体を省略なく含むか（`complete`。平文の `allow` の元, push v1.1 §6）。
+ * - 許可してよい形の要約（`allowSummary` = `<作業ディレクトリ> $ <コマンド>`）があり、280 字以内で、通知用の整形
+ *   （空白の畳み込み）で 1 文字も変わらないとき: 本文は `Bash · <作業ディレクトリ> $ <コマンド>`、complete。
+ * - それ以外: 従来の `ツール名 · 要約`（280 字で省略）、complete ではない。
+ * 利用者に見える本文と、判定に使った本文は同じ文字列。
+ */
+export function approvalNotification(request: ApprovalPushRequest): { body: string; complete: boolean } {
+  const allow = request.allowSummary;
+  if (request.tool === "Bash" && allow !== undefined &&
+    summarizeForNotification(allow, APPROVAL_SUMMARY_MAX_CHARS) === allow) {
+    // 長さは完成した本文（`Bash · ` を含む）で確かめる。
+    const body = `${request.tool} · ${allow}`;
+    if ([...body].length <= APPROVAL_SUMMARY_MAX_CHARS) return { body, complete: true };
+  }
+  const summary = summarizeForNotification(request.summary, APPROVAL_SUMMARY_MAX_CHARS);
+  return { body: summary === null ? request.tool : `${request.tool} · ${summary}`, complete: false };
+}
+
 /** 承認の通知本文（`ツール名 · 要約`）。 */
 export function approvalNotificationBody(request: ApprovalPushRequest): string {
-  const summary = summarizeForNotification(request.summary, 280);
-  return summary === null ? request.tool : `${request.tool} · ${summary}`;
+  return approvalNotification(request).body;
 }
 
 /**
@@ -916,12 +980,15 @@ export function makeHookPushNotifier(options: {
   localDispatcher?: () => PushDispatcher;
 } = {}): ApprovalPushNotifier {
   return async (request) => {
+    const notification = approvalNotification(request);
     const event: HubPushEvent = {
       kind: "approval",
       session: request.session,
       id: request.approvalId,
       tool: request.tool,
-      body: approvalNotificationBody(request),
+      body: notification.body,
+      // 本文が操作の全体を省略なく含むときだけ（通知の上で許可できる。端末ごとの段は dispatcher が判定する）。
+      ...(notification.complete ? { bodyComplete: true } : {}),
     };
     const socketPath = options.hubSocketPath ?? resolveHubSocketPath();
     // hub へ渡せたら、その後は決して自分では送らない（hub の応答が遅くても二重に送らない）。
@@ -1016,6 +1083,61 @@ function imagePaths(toolInput: Record<string, unknown>): string[] {
 
 /** tool_input から1行の summary を生成する。 */
 export function buildSummary(toolName: string, toolInput: Record<string, unknown>): string {
+  return describeToolForApproval(toolName, toolInput).summary;
+}
+
+/** 許可してよい Bash の入力で知っている欄（`description` / `timeout` は表示しないが操作の内容を変えないので許す）。 */
+const ALLOWABLE_BASH_INPUT_KEYS = new Set(["command", "description", "timeout", "run_in_background", "dangerouslyDisableSandbox"]);
+/** 表示できる ASCII（0x20〜0x7E）だけ・前後の空白なし・連続空白なし（通知用の整形で 1 文字も変わらない）。 */
+const PRINTABLE_ASCII_LINE = /^[\x21-\x7E]+(?: [\x21-\x7E]+)*$/u;
+
+/** 作業ディレクトリの表示（ホームは `~`）。絶対パスでない・ASCII 以外・`$` を含む（本文の区切りと紛れる）なら null。 */
+export function displayWorkingDirectory(cwd: string | undefined, home: string = os.homedir()): string | null {
+  if (typeof cwd !== "string" || !cwd.startsWith("/")) return null;
+  const display = cwd === home ? "~" : home.length > 1 && cwd.startsWith(`${home}/`) ? `~${cwd.slice(home.length)}` : cwd;
+  return PRINTABLE_ASCII_LINE.test(display) && !display.includes("$") ? display : null;
+}
+
+/**
+ * 承認の要約（承認カードに出す従来の文）と、通知の上で「許可」してよい形の要約（`allowSummary`）。入力を見たその場で
+ * 決める（push v1.1 §6）。allowSummary は次のすべてを満たす Bash だけ（それ以外は null = 拒否だけ）:
+ * - 入力の欄が知っているものだけで、`run_in_background` / `dangerouslyDisableSandbox` は無いか false。
+ * - コマンドが 1 行・表示できる ASCII だけ・前後や連続の空白なし。
+ * - 作業ディレクトリ（hook の入力のトップレベルの `cwd` / API 作業の作業ディレクトリ）が分かり、表示が同じ条件を満たす。
+ * 形は `<作業ディレクトリ> $ <コマンド>`。280 字の上限は通知本文を作るとき（approvalNotification）に確かめる。
+ * Write / Edit（パスだけ）・SendUserFile（名前だけ）・その他のツール・既定の文は allowSummary を作らない。
+ */
+export function describeToolForApproval(
+  toolName: string,
+  toolInput: Record<string, unknown>,
+  cwd?: string,
+  home: string = os.homedir(),
+): { summary: string; allowSummary: string | null } {
+  if (toolName === "Bash") {
+    const command = toolInput["command"];
+    if (typeof command === "string" && command.length > 0) {
+      return { summary: oneLine(command), allowSummary: bashAllowSummary(toolInput, command, cwd, home) };
+    }
+    return { summary: "Run a Bash command", allowSummary: null };
+  }
+  return { summary: buildSummaryText(toolName, toolInput), allowSummary: null };
+}
+
+function bashAllowSummary(toolInput: Record<string, unknown>, command: string, cwd: string | undefined, home: string): string | null {
+  for (const key of Object.keys(toolInput)) {
+    if (!ALLOWABLE_BASH_INPUT_KEYS.has(key)) return null;
+  }
+  for (const flag of ["run_in_background", "dangerouslyDisableSandbox"]) {
+    if (flag in toolInput && toolInput[flag] !== false) return null;
+  }
+  if ("timeout" in toolInput && typeof toolInput["timeout"] !== "number") return null;
+  if ("description" in toolInput && typeof toolInput["description"] !== "string") return null;
+  if (!PRINTABLE_ASCII_LINE.test(command)) return null;
+  const directory = displayWorkingDirectory(cwd, home);
+  return directory === null ? null : `${directory} $ ${command}`;
+}
+
+function buildSummaryText(toolName: string, toolInput: Record<string, unknown>): string {
   switch (toolName) {
     case "Bash": {
       const command = toolInput["command"];

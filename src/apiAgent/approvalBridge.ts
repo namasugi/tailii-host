@@ -13,6 +13,7 @@ import * as net from "node:net";
 import { decodeControlMessage, encodeControlMessage, PROTOCOL_V1, type Decision, type ToolDiff } from "../protocol.js";
 import type { RemotePendingMessage } from "../hub/engineRelaySocket.js";
 import { resolveSocketPath } from "../shared/socketPath.js";
+import { closeAfterReply, replyDecisionApplied } from "../approval/decisionResult.js";
 
 export interface ApiAgentApprovalRequestLike {
   id: string;
@@ -59,7 +60,9 @@ function connectOnce(socketPath: string, timeoutMs: number): Promise<net.Socket 
   });
 }
 
-function sendAndWait(socket: net.Socket, request: ApiAgentApprovalRequestLike, deadlineAt: number, now: () => number): Promise<Outcome> {
+function sendAndWait(
+  socket: net.Socket, request: ApiAgentApprovalRequestLike, deadlineAt: number, now: () => number, onDelivered: () => void,
+): Promise<Outcome> {
   return new Promise((resolve) => {
     let settled = false;
     let buffer = "";
@@ -68,7 +71,7 @@ function sendAndWait(socket: net.Socket, request: ApiAgentApprovalRequestLike, d
       settled = true;
       clearTimeout(timer);
       request.signal?.removeEventListener("abort", onAbort);
-      socket.destroy();
+      closeAfterReply(socket);
       resolve(outcome);
     };
     const onAbort = (): void => finish("aborted");
@@ -84,7 +87,12 @@ function sendAndWait(socket: net.Socket, request: ApiAgentApprovalRequestLike, d
         if (!line) continue;
         try {
           const message = decodeControlMessage(line);
-          if (message.type === "approval_decision" && message.id === request.id) { finish(message.decision); return; }
+          if (message.type === "approval_decision" && message.id === request.id) {
+            // 決定の反映結果をアプリへ返す（push v1.1 §6。hook と同じ。最善努力）。
+            replyDecisionApplied(socket, request.id);
+            finish(message.decision);
+            return;
+          }
         } catch { /* channel_hello 以外の壊れた行も無視する。 */ }
       }
     });
@@ -95,6 +103,7 @@ function sendAndWait(socket: net.Socket, request: ApiAgentApprovalRequestLike, d
         type: "approval_request", v: PROTOCOL_V1, id: request.id, tool: request.tool, summary: request.summary, cwd: request.cwd,
         ...(request.diff !== undefined ? { diff: request.diff } : {}),
       }) + "\n");
+      onDelivered();
     } catch {
       finish("disconnected");
     }
@@ -115,18 +124,30 @@ export async function requestApiAgentApproval(request: ApiAgentApprovalRequestLi
   const deadlineAt = now() + (deps.deadlineMs ?? 60 * 60_000);
   const socketPath = (deps.socketPathFor ?? resolveSocketPath)(request.session);
   let published = false;
-  const clear = (): void => {
-    if (!published) return;
-    deps.publishPending?.({ type: "remote_pending_cleared", v: PROTOCOL_V1, id: request.id, session: request.session, kind: "approval" });
-  };
+  /** 承認チャネルへ approval_request を書けたか（アプリへ直接届けた承認）。 */
+  let delivered = false;
+  // 承認の待ちが終わるすべての出口（許可・拒否・中止・期限・エラー）で、アプリへ知らせた承認（承認チャネルへ要求を
+  // 書いた・一覧へ remote_pending を出した）なら必ず remote_pending_cleared を出す（下の finally の 1 か所。hook と同じ。
+  // iPhone は通知から答えて反映を確認できなかった承認のカードをこれで片付ける。受け手は id で照合するので重ねても害は無い）。
+  try {
+    return await waitForApiAgentDecision();
+  } finally {
+    if (published || delivered) {
+      try {
+        deps.publishPending?.({ type: "remote_pending_cleared", v: PROTOCOL_V1, id: request.id, session: request.session, kind: "approval" });
+      } catch { /* 片付けの失敗は承認の結果を変えない。 */ }
+    }
+  }
+
+  async function waitForApiAgentDecision(): Promise<Decision> {
   while (true) {
-    if (request.signal?.aborted) { clear(); return "deny"; }
-    if (now() >= deadlineAt) { clear(); return "deny"; }
+    if (request.signal?.aborted) return "deny";
+    if (now() >= deadlineAt) return "deny";
     const socket = await connectOnce(socketPath, deps.connectTimeoutMs ?? 2_000);
     if (socket !== null) {
-      const outcome = await sendAndWait(socket, request, deadlineAt, now);
-      if (outcome === "allow" || outcome === "deny") { clear(); return outcome; }
-      if (outcome !== "disconnected") { clear(); return "deny"; }
+      const outcome = await sendAndWait(socket, request, deadlineAt, now, () => { delivered = true; });
+      if (outcome === "allow" || outcome === "deny") return outcome;
+      if (outcome !== "disconnected") return "deny";
     }
     if (!published) {
       published = true;
@@ -139,5 +160,6 @@ export async function requestApiAgentApproval(request: ApiAgentApprovalRequestLi
       } catch { /* push の失敗は承認の待機を止めない。 */ }
     }
     await abortableSleep(deps.retryIntervalMs ?? 1_000, request.signal);
+  }
   }
 }

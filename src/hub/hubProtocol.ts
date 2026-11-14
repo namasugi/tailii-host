@@ -134,6 +134,11 @@ export interface HubPushEvent {
   id?: string;
   body?: string;
   tool?: string;
+  /**
+   * 承認の本文が操作の全体を省略なく含む（通知の上で許可してよい, push v1.1 §6）。true のときだけ付ける。
+   * 欄の無い古い hook からの依頼は false（拒否だけ）として扱う。
+   */
+  bodyComplete?: boolean;
 }
 
 /** hub へ渡す要約の上限（字）。dispatcher がさらに切り詰める。 */
@@ -493,6 +498,8 @@ function parseHubPushEvent(value: unknown): HubPushEvent | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const raw = value as Record<string, unknown>;
   const kind = raw["kind"], session = raw["session"], id = raw["id"], body = raw["body"], tool = raw["tool"];
+  // 上限で切った本文は全体を含まないので、bodyComplete を落とす。
+  const bodyClipped = typeof body === "string" && [...body].length > HUB_PUSH_BODY_MAX_CHARS;
   if (!PUSH_KINDS.includes(kind as PushKind) || typeof session !== "string" || session.length === 0) return null;
   if ((id !== undefined && typeof id !== "string") || (body !== undefined && typeof body !== "string") ||
     (tool !== undefined && typeof tool !== "string")) return null;
@@ -502,6 +509,7 @@ function parseHubPushEvent(value: unknown): HubPushEvent | null {
     ...(typeof id === "string" ? { id } : {}),
     ...(typeof body === "string" ? { body: [...body].slice(0, HUB_PUSH_BODY_MAX_CHARS).join("") } : {}),
     ...(typeof tool === "string" ? { tool } : {}),
+    ...(raw["bodyComplete"] === true && kind === "approval" && typeof body === "string" && !bodyClipped ? { bodyComplete: true } : {}),
   };
 }
 

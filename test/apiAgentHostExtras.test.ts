@@ -58,7 +58,8 @@ describe("承認の保留（端末がつながっていないとき）", () => {
     );
     expect(decision).toBe("allow");
     expect(serve.received).toEqual(["a1"]);
-    expect(published).toEqual([]);
+    // 一覧の待ち（remote_pending）は出さない。決着の知らせ（remote_pending_cleared）だけは hook と同じく出す。
+    expect(published).toEqual([{ type: "remote_pending_cleared", v: 1, id: "a1", session: "cs-a", kind: "approval" }]);
     await serve.close();
   });
 

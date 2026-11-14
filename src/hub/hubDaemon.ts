@@ -49,7 +49,7 @@ import { makeSessionTitleResolver } from "../push/pushContent.js";
 import { PushDeviceStore } from "../push/pushDeviceStore.js";
 import { ClaudeVersionRecorder } from "../shared/claudeVersionRecord.js";
 import { requestApiAgentApproval } from "../apiAgent/approvalBridge.js";
-import { approvalNotificationBody } from "../approval/hook.js";
+import { approvalNotification } from "../approval/hook.js";
 import { parseUsageLimitWait } from "../shared/usageLimitWait.js";
 import { makeSessionBackend } from "../backend/sessionBackend.js";
 import { Writable } from "node:stream";
@@ -468,6 +468,27 @@ export async function shutdownHub(options: {
   }
 }
 
+/**
+ * API 作業の承認の push の依頼を hub の dispatcher へ渡す（hook の承認と同じ本文）。
+ * **API 作業の承認は通知の上で許可させない（bodyComplete を付けない = 拒否だけ）**: 作業の Bash は `cd` が後続の
+ * コマンドへ持続するのに、承認の要求には実行時点の作業ディレクトリが無く、開始時の場所を「実行する場所」として
+ * 見せてしまうため（push v1.1 §6）。実際の実行場所を要求ごとに確実に取れるようになるまで、許可は Claude の hook の
+ * 経路だけに限る。依頼に許可の要約が紛れ込んでも使わない。
+ */
+export function apiAgentApprovalPushNotifier(
+  hub: Pick<SessionHub, "requestPush">,
+): (pushRequest: { approvalId: string; tool: string; session: string; summary: string }) => void {
+  return (pushRequest) => {
+    const notification = approvalNotification({
+      approvalId: pushRequest.approvalId, tool: pushRequest.tool, session: pushRequest.session, summary: pushRequest.summary,
+    });
+    hub.requestPush({
+      kind: "approval", session: pushRequest.session, id: pushRequest.approvalId, tool: pushRequest.tool,
+      body: notification.body,
+    });
+  };
+}
+
 /** `tailii hub` エントリ。 */
 export async function runHubCommand(args: string[]): Promise<number> {
   const viaGateway = process.env["TAILII_HUB_VIA_GATEWAY"] === "1";
@@ -645,12 +666,7 @@ export async function runHubCommand(args: string[]): Promise<number> {
       // push_request と同じく hub の dispatcher が在席判定・決着済みの照合をして送る（push v1）。
       approval: (request) => requestApiAgentApproval(request, {
         publishPending: (message) => hub.handleRelayMessage(message),
-        notifier: (pushRequest) => {
-          hub.requestPush({
-            kind: "approval", session: pushRequest.session, id: pushRequest.approvalId, tool: pushRequest.tool,
-            body: approvalNotificationBody(pushRequest),
-          });
-        },
+        notifier: apiAgentApprovalPushNotifier(hub),
       }),
     }),
     chatInjector: async (text, session, context) => {

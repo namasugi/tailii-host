@@ -693,6 +693,11 @@ export type ControlMessage =
    */
   | { type: "approval_request"; v: number; id: string; tool: string; summary: string; cwd: string; diff?: ToolDiff; agentId?: string; agentType?: string }
   | { type: "approval_decision"; v: number; id: string; decision: Decision; reason?: string }
+  /**
+   * 決定の反映結果（hook → iOS。承認チャネル, push v1.1 §6）。`applied` = この決定で承認が確定した。
+   * `stale` = その id の承認を待っていない（契約上の値。hook は現状 applied だけを返す。理由は decisionResult.ts）。
+   */
+  | { type: "approval_decision_result"; v: number; id: string; status: "applied" | "stale" }
   | { type: "remote_pending"; v: number; id: string; session: string; kind: RemotePendingKind; tool?: string; summary: string }
   | { type: "remote_pending_cleared"; v: number; id: string; session: string; kind: RemotePendingKind }
   /**
