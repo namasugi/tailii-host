@@ -10,6 +10,7 @@ import {
   ChatInjectionRejectedError,
   SEND_NOW_BLOCKED_BY_SHUTDOWN,
 } from "../src/backend/tmux.js";
+import { CodexTurnNotStartedError } from "../src/codex/codexNativeTurnController.js";
 import { SessionHub, type HubTail } from "../src/hub/sessionHub.js";
 import { HISTORY_DONE_STREAM_ID } from "../src/chat/transcriptTailer.js";
 import { ImageService } from "../src/chat/imageService.js";
@@ -4608,4 +4609,103 @@ describe("SessionHub codex collaboration mode（pc:collab の配信）", () => {
     hub.handleClientMessage(second, JSON.stringify({ type: "conversation_subscribe", session: "work" }));
     await vi.waitFor(() => expect(collab(secondReceived)).toContain("plan"));
   });
+});
+
+describe("chat_receipt_query の Codex の turn（tailii-host chat の Codex 対応）", () => {
+  test("Codex の turn の配送状態（届いた・届いたか分からない）と、先頭の不明な turn の後ろの blocked を答える", async () => {
+    const startTurn = vi.fn()
+      .mockRejectedValueOnce(new Error("boom"))
+      .mockResolvedValue("turn-2");
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-codex-receipt"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800,
+      codexAppServerFactory: () => ({ openThread: async () => { throw new Error("unused"); } }),
+      codexTurnControllerFactory: () => ({ startTurn, closeSession: vi.fn(), close: vi.fn() }) as never });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    const submit = (id: string, clientUserMessageId: string) => hub.handleClientMessage(client, JSON.stringify({
+      type: "codex_turn_submit", id, session: "work", text: id, clientUserMessageId, effort: null, sandbox: null,
+      threadId: "thread-1", cwd: "/tmp/work",
+    }));
+    const query = (id: string, clientMessageId: string) => hub.handleClientMessage(client,
+      JSON.stringify({ type: "chat_receipt_query", id, session: "work", clientMessageId }));
+    submit("one", "cli-one");
+    await vi.waitFor(() => expect(received).toContainEqual(expect.objectContaining({ type: "codex_turn_result", id: "one", status: "failed" })));
+    submit("two", "cli-two");
+    query("q-one", "cli-one");
+    query("q-two", "cli-two");
+    expect(received).toContainEqual({ type: "chat_receipt_query_result", id: "q-one", status: "uncertain" });
+    expect(received).toContainEqual({ type: "chat_receipt_query_result", id: "q-two", status: "pending", blocked: true });
+  });
+});
+
+test("Codex の turn を始める途中の会話は、購読者が居なくても目標の読み取りなどで畳まない（tailii-host chat の送信）", async () => {
+  const closeSession = vi.fn();
+  let options: { onGoal?: (session: string, goal: null) => void } | null = null;
+  let release!: () => void;
+  const startTurn = vi.fn(() => new Promise<string>((resolve) => {
+    // 開く途中で目標の読み取り（goal なし）が届く。
+    options?.onGoal?.("work", null);
+    release = () => resolve("turn-1");
+  }));
+  const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-codex-starting-close"),
+    metadataStore: makeTempStore(), timeoutSeconds: 1800,
+    codexAppServerFactory: () => ({ openThread: async () => { throw new Error("unused"); } }),
+    codexTurnControllerFactory: (controllerOptions) => {
+      options = controllerOptions as never;
+      return { startTurn, closeSession, close: vi.fn() } as never;
+    } });
+  const client = {}, received: unknown[] = [];
+  hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+  hub.handleClientMessage(client, JSON.stringify({
+    type: "codex_turn_submit", id: "one", session: "work", text: "run", clientUserMessageId: "cli-1",
+    effort: null, sandbox: null, threadId: "thread-1", cwd: "/tmp/work",
+  }));
+  await vi.waitFor(() => expect(startTurn).toHaveBeenCalledOnce());
+  expect(closeSession).not.toHaveBeenCalled();
+  release();
+  await vi.waitFor(() => expect(received).toContainEqual({ type: "codex_turn_result", id: "one", status: "started" }));
+});
+
+test("Codex の turn を始める前の失敗は配送不明にせず順番から外す（後ろの送信を止めない・同じ ID で打ち直せる）", async () => {
+  const startTurn = vi.fn()
+    .mockRejectedValueOnce(new CodexTurnNotStartedError("接続できない"))
+    .mockResolvedValue("turn-2");
+  const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-codex-not-started"),
+    metadataStore: makeTempStore(), timeoutSeconds: 1800,
+    codexAppServerFactory: () => ({ openThread: async () => { throw new Error("unused"); } }),
+    codexTurnControllerFactory: () => ({ startTurn, closeSession: vi.fn(), close: vi.fn() }) as never });
+  const client = {}, received: unknown[] = [];
+  hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+  const submit = (id: string, clientUserMessageId: string) => hub.handleClientMessage(client, JSON.stringify({
+    type: "codex_turn_submit", id, session: "work", text: "run", clientUserMessageId, effort: null, sandbox: null,
+    threadId: "thread-1", cwd: "/tmp/work",
+  }));
+  submit("one", "cli-a");
+  await vi.waitFor(() => expect(received).toContainEqual(expect.objectContaining({ type: "codex_turn_result", id: "one", status: "failed" })));
+  hub.handleClientMessage(client, JSON.stringify({ type: "chat_receipt_query", id: "q", session: "work", clientMessageId: "cli-a" }));
+  expect(received).toContainEqual({ type: "chat_receipt_query_result", id: "q", status: "unknown" });
+  submit("two", "cli-a");
+  await vi.waitFor(() => expect(received).toContainEqual({ type: "codex_turn_result", id: "two", status: "started" }));
+});
+
+test("明示の再送が turn を始める前に失敗したら、配送不明のまま残す（確かめのない新規として通さない）", async () => {
+  const startTurn = vi.fn()
+    .mockRejectedValueOnce(new Error("boom"))
+    .mockRejectedValueOnce(new CodexTurnNotStartedError("接続できない"));
+  const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-codex-retry-not-started"),
+    metadataStore: makeTempStore(), timeoutSeconds: 1800,
+    codexAppServerFactory: () => ({ openThread: async () => { throw new Error("unused"); } }),
+    codexTurnControllerFactory: () => ({ startTurn, closeSession: vi.fn(), close: vi.fn() }) as never });
+  const client = {}, received: unknown[] = [];
+  hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+  const submit = (id: string, explicitRetry: boolean) => hub.handleClientMessage(client, JSON.stringify({
+    type: "codex_turn_submit", id, session: "work", text: "run", clientUserMessageId: "c-x", effort: null, sandbox: null,
+    threadId: "thread-1", cwd: "/tmp/work", ...(explicitRetry ? { explicitRetry: true } : {}),
+  }));
+  submit("one", false);
+  await vi.waitFor(() => expect(received).toContainEqual(expect.objectContaining({ type: "codex_turn_result", id: "one", status: "failed" })));
+  submit("two", true);
+  await vi.waitFor(() => expect(received).toContainEqual(expect.objectContaining({ type: "codex_turn_result", id: "two", status: "failed" })));
+  hub.handleClientMessage(client, JSON.stringify({ type: "chat_receipt_query", id: "q", session: "work", clientMessageId: "c-x" }));
+  expect(received).toContainEqual({ type: "chat_receipt_query_result", id: "q", status: "uncertain" });
 });

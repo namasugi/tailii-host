@@ -6,7 +6,10 @@ import { describe, expect, test } from "vitest";
 import { EXIT, runChat, type ChatDeps } from "../src/commands/chat/chatCommand.js";
 import {
   acquireRequestLock,
+  codexRolloutBusy,
+  findCodexRollout,
   folderAllowed,
+  readCodexRolloutLines,
   loadBotConfig,
   readReply,
   readTranscriptLines,
@@ -78,13 +81,10 @@ const defaultHandler: Handler = (message) => {
   if (message["type"] === "chat_send") return { type: "chat_send_result", v: 2, id, status: "accepted" } as ControlMessage;
   // 受領の照会の既定は保留中（hub がまだ送信を持っている）。
   if (message["type"] === "chat_receipt_query") return { type: "chat_receipt_query_result", v: 2, id, status: "pending" } as ControlMessage;
-  if (message["type"] === "session_list_request") {
-    // 動いている会話名: s-live と、テストの依頼 r-retry で始めた会話。s-dead は止まっている。
-    return { type: "session_list_response", v: 2, id, sessions: [
-      { name: "s-live", cwd: "/tmp", alive: true },
-      { name: "s-dead", cwd: "/tmp", alive: false },
-      { name: `s-cli${requestDigest("r-retry").slice(0, 16)}`, cwd: "/tmp", alive: true },
-    ] } as ControlMessage;
+  if (message["type"] === "session_alive_query") {
+    // 止まっている会話名は s-dead だけ。ほかは動いている。
+    return { type: "session_alive_query_result", v: 2, id, name: String(message["name"]),
+      alive: message["name"] !== "s-dead" } as ControlMessage;
   }
   if (message["type"] === "claude_session_list_request") {
     return {
@@ -1025,4 +1025,272 @@ test("明示した herdr セッションが動いていない起動失敗は、�
   });
   expect(await runChat(["new", "--cwd", root, "--request-id", "r-down", "--herdr-session", "w", "--json"], h.deps)).toBe(EXIT.policy);
   expect(h.json()).toMatchObject({ error: { code: "placement_unavailable" } });
+});
+
+describe("Codex の会話（tailii-host chat の Codex 対応）", () => {
+  const THREAD = "01a1d3d3-c29e-7ac0-801f-3ac8e55bd2c7";
+  const at = (ms: number): string => new Date(ms).toISOString();
+  const event = (ms: number, payload: Record<string, unknown>) => ({ timestamp: at(ms), type: "event_msg", payload });
+  const rollout = (rows: object[]): string => {
+    const dir = path.join(makeTempDir("codex-home"), "sessions", "2026", "11", "15");
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `rollout-2026-11-15T00-00-00-${THREAD}.jsonl`);
+    fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join("\n"));
+    return file;
+  };
+  const userItem = (ms: number, text: string, clientId?: string) => event(ms, { type: "item_completed",
+    item: { type: "UserMessage", content: [{ type: "text", text }], ...(clientId !== undefined ? { client_id: clientId } : {}) } });
+  const agentItem = (ms: number, text: string, phase = "final_answer") => event(ms, { type: "item_completed",
+    item: { type: "AgentMessage", content: [{ type: "Text", text }], phase } });
+
+  test("rollout の発話（新旧の形）と処理中を読み、送った id（client_id）で依頼の発話を探す", () => {
+    const file = rollout([
+      event(1_000, { type: "user_message", message: "旧形式の発話" }),
+      event(1_100, { type: "agent_message", message: "旧形式の返答" }),
+      event(2_000, { type: "task_started" }),
+      userItem(2_100, "同じ本文", "cli-other"),
+      agentItem(2_200, "別の返答"),
+      event(2_300, { type: "task_complete" }),
+      event(3_000, { type: "task_started" }),
+      userItem(3_100, "同じ本文", "cli-mine"),
+      agentItem(3_150, "考え中", "analysis"),
+      agentItem(3_200, "返答です", "commentary"),
+    ]);
+    const lines = readCodexRolloutLines(file);
+    expect(lines.map((line) => `${line.role}:${line.text}`)).toEqual([
+      "user:旧形式の発話", "assistant:旧形式の返答", "user:同じ本文", "assistant:別の返答", "user:同じ本文", "assistant:返答です",
+    ]);
+    expect(readReply(lines, { sentAtMs: 0, text: "同じ本文", clientId: "cli-mine" })).toEqual({ found: true, reply: "返答です" });
+    expect(codexRolloutBusy(file)).toBe(true);
+    expect(findCodexRollout(THREAD, path.dirname(path.dirname(path.dirname(path.dirname(path.dirname(file))))))).toBe(file);
+  });
+
+  test("new --agent codex: Codex で起動し、Bot の許可モードを sandbox と承認の方針にして codex_turn_start で送る", async () => {
+    const root = makeTempDir("chat-codex-new");
+    const h = harness({
+      stdin: "テストを直して", roots: [root],
+      handler: (message) => message["type"] === "codex_turn_start"
+        ? { type: "codex_turn_start_result", v: 2, id: String(message["id"]), status: "started" } as ControlMessage
+        : defaultHandler(message),
+    });
+    expect(await runChat(["new", "--cwd", root, "--request-id", "r-cx", "--agent", "codex", "--json"], h.deps)).toBe(EXIT.ok);
+    const start = h.sent.find((m) => m["type"] === "session_start")!;
+    expect(start).toMatchObject({ agentType: "codex", codexSandbox: "workspace-write" });
+    expect(start).not.toHaveProperty("permissionMode");
+    expect(h.sent.find((m) => m["type"] === "codex_turn_start")).toMatchObject({
+      session: start["name"], text: "テストを直して", clientUserMessageId: `cli-${requestDigest("r-cx").slice(0, 24)}`,
+      approvalPolicy: "on-request", sandbox: "workspace-write",
+    });
+    expect(h.sent.some((m) => m["type"] === "chat_send")).toBe(false);
+    expect(h.records.get("r-cx")).toMatchObject({ agent: "codex", state: "sent",
+      codexTurn: { approvalPolicy: "on-request", sandbox: "workspace-write" } });
+    expect(h.json()).toMatchObject({ agent: "codex", conversationId: "conv-new" });
+  });
+
+  test("send は Codex の会話に codex_turn_start で送り、hub の失敗は受領の照会で分ける", async () => {
+    const codexList = (id: string) => ({ type: "claude_session_list_response", v: 2, id,
+      claudeSessions: [{ sessionId: THREAD, agent: "codex", cwd: "/tmp", title: "Codex", liveSessionName: "s-codex" }] }) as ControlMessage;
+    const ok = harness({
+      stdin: "続けて",
+      handler: (message) => {
+        const id = String(message["id"]);
+        if (message["type"] === "claude_session_list_request") return codexList(id);
+        if (message["type"] === "codex_turn_start") return { type: "codex_turn_start_result", v: 2, id, status: "duplicate" } as ControlMessage;
+        return defaultHandler(message);
+      },
+    });
+    expect(await runChat(["send", THREAD, "--request-id", "s-cx", "--json"], ok.deps)).toBe(EXIT.ok);
+    expect(ok.sent.find((m) => m["type"] === "codex_turn_start")).toMatchObject({ session: "s-codex", approvalPolicy: "on-request" });
+    const failed = harness({
+      stdin: "続けて",
+      handler: (message) => {
+        const id = String(message["id"]);
+        if (message["type"] === "claude_session_list_request") return codexList(id);
+        if (message["type"] === "codex_turn_start") {
+          return { type: "codex_turn_start_result", v: 2, id, status: "failed",
+            error: "Previous Codex turn/start outcome is uncertain; explicit retry is required" } as ControlMessage;
+        }
+        return defaultHandler(message);
+      },
+    });
+    expect(await runChat(["send", THREAD, "--request-id", "s-cx2", "--json"], failed.deps)).toBe(EXIT.policy);
+    expect(failed.json()).toMatchObject({ error: { code: "needs_human" } });
+  });
+
+  test("status は Codex の rollout で処理中と返答を読み、処理中の設問は hub に聞いて waiting_answer", async () => {
+    const store = makeTempStore();
+    store.put({ name: "s-codex", cwd: "/tmp", createdAt: 1, agent: "codex", providerSessionId: THREAD });
+    const done = rollout([
+      event(1_000_100, { type: "task_started" }),
+      userItem(1_000_200, "続けて", `cli-${requestDigest("s-cx3").slice(0, 24)}`),
+      agentItem(1_000_300, "終わりました"),
+      event(1_000_400, { type: "task_complete" }),
+    ]);
+    const h = harness();
+    h.deps.store = () => store;
+    h.deps.codexRollout = () => done;
+    h.records.set("s-cx3", { requestId: "s-cx3", kind: "send", conversationId: THREAD, session: "s-codex", cwd: "/tmp",
+      sentAtMs: 1_000_000, text: "書き換わった本文", state: "sent", agent: "codex" });
+    expect(await runChat(["status", THREAD, "--after", "s-cx3", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.json()).toMatchObject({ agent: "codex", state: "idle", complete: true, received: true, reply: "終わりました" });
+
+    const busy = rollout([event(1_000_100, { type: "task_started" })]);
+    const q = harness({
+      handler: (message) => message["type"] === "chat_pending_query"
+        ? { type: "chat_pending_query_result", v: 2, id: String(message["id"]), session: "s-codex", processing: true,
+            question: { id: "codex-question:t:1", questions: [{ header: "h", question: "どれ？", multiSelect: false,
+              options: [{ label: "A", description: "" }] }] } } as ControlMessage
+        : defaultHandler(message),
+    });
+    q.deps.store = () => store;
+    q.deps.codexRollout = () => busy;
+    expect(await runChat(["status", THREAD, "--json"], q.deps)).toBe(EXIT.ok);
+    expect(q.json()).toMatchObject({ agent: "codex", state: "waiting_answer",
+      waiting: { question: { questionId: "codex-question:t:1" } } });
+  });
+
+  test("--agent の誤りは 2", async () => {
+    const root = makeTempDir("chat-codex-bad");
+    const h = harness({ stdin: "x", roots: [root] });
+    expect(await runChat(["new", "--cwd", root, "--request-id", "r-ag", "--agent", "gemini", "--json"], h.deps)).toBe(EXIT.usage);
+    expect(h.json()).toMatchObject({ error: { code: "bad_agent" } });
+  });
+});
+
+test("Codex の new の送信の打ち直し: 記録（rollout）がまだ無くても会話名が動いていれば、その会話名へ送る", async () => {
+  const root = makeTempDir("chat-codex-retry");
+  const h = harness({
+    stdin: "x", roots: [root],
+    handler: (message) => {
+      const id = String(message["id"]);
+      if (message["type"] === "chat_receipt_query") return { type: "chat_receipt_query_result", v: 2, id, status: "unknown" } as ControlMessage;
+      if (message["type"] === "codex_turn_start") return { type: "codex_turn_start_result", v: 2, id, status: "started" } as ControlMessage;
+      return defaultHandler(message);
+    },
+  });
+  h.deps.codexRollout = () => null;
+  const session = `s-cli${requestDigest("r-cxr").slice(0, 16)}`;
+  h.records.set("r-cxr", { requestId: "r-cxr", kind: "new", conversationId: "thread-fresh-1", session, cwd: fs.realpathSync(root),
+    sentAtMs: 1, text: "x", state: "started", agent: "codex", codexTurn: { approvalPolicy: "on-request", sandbox: "workspace-write" } });
+  expect(await runChat(["new", "--cwd", root, "--request-id", "r-cxr", "--agent", "codex", "--json"], h.deps)).toBe(EXIT.ok);
+  expect(h.sent.map((m) => m["type"])).toEqual(["chat_receipt_query", "claude_session_list_request", "session_alive_query", "codex_turn_start"]);
+  expect(h.sent.find((m) => m["type"] === "codex_turn_start")).toMatchObject({ session, approvalPolicy: "on-request" });
+});
+
+describe("Fable レビューの再発防止（Codex）", () => {
+  const THREAD = "01a1d3d3-c29e-7ac0-801f-3ac8e55bd2c8";
+  const codexList = (id: string) => ({ type: "claude_session_list_response", v: 2, id,
+    claudeSessions: [{ sessionId: THREAD, agent: "codex", cwd: "/tmp", title: "Codex", liveSessionName: "s-codex" }] }) as ControlMessage;
+  const codexHandler: Handler = (message) => {
+    const id = String(message["id"]);
+    if (message["type"] === "claude_session_list_request") return codexList(id);
+    if (message["type"] === "codex_turn_start") return { type: "codex_turn_start_result", v: 2, id, status: "started" } as ControlMessage;
+    return defaultHandler(message);
+  };
+
+  test("Codex の send は、その会話を始めた new の方針を引き継ぐ（bot.json の既定で緩めない。中2）", async () => {
+    const dir = makeTempDir("p-requests");
+    fs.writeFileSync(path.join(dir, `${requestDigest("r-orig").slice(0, 32)}.json`), JSON.stringify({
+      requestId: "r-orig", kind: "new", conversationId: THREAD, session: "s-codex", cwd: "/tmp", sentAtMs: 1, text: "x",
+      state: "sent", agent: "codex", codexTurn: { approvalPolicy: "untrusted", sandbox: "workspace-write", collaborationMode: "default" },
+    }));
+    const h = harness({ stdin: "続けて", handler: codexHandler });
+    h.deps.requestsDir = dir;
+    expect(await runChat(["send", THREAD, "--request-id", "s-inh", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.sent.find((m) => m["type"] === "codex_turn_start")).toMatchObject({ approvalPolicy: "untrusted", collaborationMode: "default" });
+  });
+
+  test("Codex の send は --permission-mode でモードを変えられ（プランから戻す）、Claude の send は受け取らない（中2）", async () => {
+    const h = harness({ stdin: "実装して", handler: codexHandler });
+    h.deps.requestsDir = makeTempDir("p-requests-empty");
+    expect(await runChat(["send", THREAD, "--request-id", "s-pm", "--permission-mode", "acceptEdits", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.sent.find((m) => m["type"] === "codex_turn_start")).toMatchObject({ approvalPolicy: "on-request", collaborationMode: "default" });
+    const c = harness({ stdin: "x" });
+    expect(await runChat(["send", "conv-live-1", "--request-id", "s-pmc", "--permission-mode", "plan", "--json"], c.deps)).toBe(EXIT.usage);
+    expect(c.json()).toMatchObject({ error: { code: "unexpected_permission_mode" } });
+  });
+
+  test("返答の照合で、送信 id で見つからないときの本文の照合は、別の送信 id の発話を拾わない（低3）", () => {
+    const lines = [
+      { role: "user" as const, text: "続けて", atMs: 2_000, clientId: "cli-other" },
+      { role: "assistant" as const, text: "別の返答", atMs: 2_100 },
+    ];
+    expect(readReply(lines, { sentAtMs: 1_000, text: "続けて", clientId: "cli-mine" })).toEqual({ found: false, reply: null });
+  });
+
+  test("Codex の status は、会話名が止まっていれば not_running（低1）", async () => {
+    const store = makeTempStore();
+    store.put({ name: "s-dead", cwd: "/tmp", createdAt: 1, agent: "codex", providerSessionId: THREAD });
+    const dir = path.join(makeTempDir("codex-home2"), "sessions", "2026", "11", "15");
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `rollout-x-${THREAD}.jsonl`);
+    fs.writeFileSync(file, JSON.stringify({ timestamp: new Date(5).toISOString(), type: "event_msg",
+      payload: { type: "item_completed", item: { type: "AgentMessage", content: [{ type: "Text", text: "済" }], phase: "final_answer" } } }));
+    const h = harness();
+    h.deps.store = () => store;
+    h.deps.codexRollout = () => file;
+    expect(await runChat(["status", THREAD, "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.json()).toMatchObject({ agent: "codex", state: "not_running" });
+  });
+});
+
+describe("Fable 確かめの再発防止（Codex）", () => {
+  const THREAD = "01a1d3d3-c29e-7ac0-801f-3ac8e55bd2c9";
+  const handler: Handler = (message) => {
+    const id = String(message["id"]);
+    if (message["type"] === "claude_session_list_request") {
+      return { type: "claude_session_list_response", v: 2, id,
+        claudeSessions: [{ sessionId: THREAD, agent: "codex", cwd: "/tmp", title: "Codex", liveSessionName: "s-codex" }] } as ControlMessage;
+    }
+    if (message["type"] === "codex_turn_start") return { type: "codex_turn_start_result", v: 2, id, status: "started" } as ControlMessage;
+    return defaultHandler(message);
+  };
+  const record = (requestId: string, kind: "new" | "send", sentAtMs: number, codexTurn: object) => ({
+    requestId, kind, conversationId: THREAD, session: "s-codex", cwd: "/tmp", sentAtMs, text: "x", state: "sent", agent: "codex", codexTurn,
+  });
+
+  test("send の方針は直近の依頼から引き継ぐ（プランから戻した後にまたプランへ戻らない。低3）", async () => {
+    const dir = makeTempDir("p-req-latest");
+    const write = (r: { requestId: string }) =>
+      fs.writeFileSync(path.join(dir, `${requestDigest(r.requestId).slice(0, 32)}.json`), JSON.stringify(r));
+    write(record("r-a", "new", 1, { approvalPolicy: "on-request", sandbox: "workspace-write", collaborationMode: "plan" }));
+    write(record("r-b", "send", 2, { approvalPolicy: "on-request", sandbox: "workspace-write", collaborationMode: "default" }));
+    const h = harness({ stdin: "続けて", handler });
+    h.deps.requestsDir = dir;
+    expect(await runChat(["send", THREAD, "--request-id", "r-c", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.sent.find((m) => m["type"] === "codex_turn_start")).toMatchObject({ collaborationMode: "default" });
+  });
+
+  test("引き継いだ方針が auto（never）でも、Bot に allowAuto が無ければ使わない（低4）", async () => {
+    const dir = makeTempDir("p-req-auto");
+    fs.writeFileSync(path.join(dir, `${requestDigest("r-auto").slice(0, 32)}.json`),
+      JSON.stringify(record("r-auto", "new", 1, { approvalPolicy: "never", sandbox: "workspace-write", collaborationMode: "default" })));
+    const h = harness({ stdin: "続けて", handler });
+    h.deps.requestsDir = dir;
+    expect(await runChat(["send", THREAD, "--request-id", "r-d", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.sent.find((m) => m["type"] === "codex_turn_start")).toMatchObject({ approvalPolicy: "on-request" });
+  });
+});
+
+test("Codex の最初の送信の打ち直しで thread が失われていたら、新しい依頼 ID での new を案内する（3）", async () => {
+  const THREAD = "01a1d3d3-c29e-7ac0-801f-3ac8e55bd2ca";
+  const h = harness({
+    stdin: "x",
+    handler: (message) => {
+      const id = String(message["id"]);
+      if (message["type"] === "claude_session_list_request") {
+        return { type: "claude_session_list_response", v: 2, id,
+          claudeSessions: [{ sessionId: THREAD, agent: "codex", cwd: "/tmp", title: "Codex", liveSessionName: "s-codex" }] } as ControlMessage;
+      }
+      if (message["type"] === "codex_turn_start") {
+        return { type: "codex_turn_start_result", v: 2, id, status: "failed",
+          error: `CodexTurnNotStartedError: no rollout found for thread id ${THREAD}` } as ControlMessage;
+      }
+      if (message["type"] === "chat_receipt_query") return { type: "chat_receipt_query_result", v: 2, id, status: "unknown" } as ControlMessage;
+      return defaultHandler(message);
+    },
+  });
+  h.deps.requestsDir = makeTempDir("p-req-lost");
+  expect(await runChat(["send", THREAD, "--request-id", "s-lost", "--json"], h.deps)).toBe(EXIT.notFound);
+  expect(h.json()).toMatchObject({ error: { code: "conversation_ended_before_start" } });
 });

@@ -989,6 +989,12 @@ export type ControlMessage =
    * `question` は未回答の設問（無ければ省略）、`processing` は hub の処理中の判定。
    */
   | { type: "chat_pending_query"; v: number; id: string; session: string }
+  /**
+   * Tailii の会話名がいま動いているか（`tailii-host chat` の打ち直しの判断。アプリは使わない）。`alive` 省略は、答えられない
+   * 端末の置き場があって分からない。一覧（session_list_request）は止まった会話の記録まで全部たどるので使わない。
+   */
+  | { type: "session_alive_query"; v: number; id: string; name: string }
+  | { type: "session_alive_query_result"; v: number; id: string; name: string; alive?: boolean }
   | { type: "chat_pending_query_result"; v: number; id: string; session: string; processing: boolean;
       question?: { id: string; questions: QuestionPromptQuestion[] } }
   | { type: "question_dismiss"; v: number; id: string }

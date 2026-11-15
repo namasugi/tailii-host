@@ -1393,6 +1393,20 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
+  test("session_alive_query は動いている会話名だけを見て答える（chat の打ち直し）", async () => {
+    const engine = startEngine({ sessionManager: makeManager(new MockTmuxRunner((args) =>
+      args[0] === "ls" ? ok("live-1\n") : ok(""))) });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine('{"id":"a-1","name":"live-1","type":"session_alive_query","v":2}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("session_alive_query_result")))
+      .toMatchObject({ id: "a-1", name: "live-1", alive: true });
+    engine.writeLine('{"id":"a-2","name":"gone-1","type":"session_alive_query","v":2}');
+    const gone = decodeControlMessage(await engine.lines.nextOfType("session_alive_query_result"));
+    expect(gone).toMatchObject({ id: "a-2", name: "gone-1" });
+    expect((gone as { alive?: boolean }).alive).not.toBe(true);
+    await engine.teardown();
+  });
+
   test("chat_send_now を Hub へ転送し結果を中継する", async () => {
     const sent: unknown[] = [];
     const hubLink: HubLink = {

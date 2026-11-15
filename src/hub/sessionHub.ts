@@ -56,6 +56,7 @@ import { ApiAgentRejectedError } from "../apiAgent/config.js";
 import type { ApiAgentConfig } from "../protocol.js";
 import {
   CodexNativeTurnController,
+  CodexTurnNotStartedError,
   chatContentKey,
   type CodexAppServerThreadRuntime,
   type CodexNativeTurnControllerOptions,
@@ -836,6 +837,10 @@ export class SessionHub {
         // 配送済みの事実（UUID の clientMessageId）だけは照会用の台帳へ残す。
         adoptRetiredChatDeliveries(this.retiredChatDeliveries, new Map(
           state.delivered.map((id) => [id, state.deliveredAtMs?.[id] ?? restoredLedgerAt] as const),
+        ), restoredLedgerAt);
+        // Codex の配送済みも（片付けの経路とそろえる。Fable レビュー 低7）。
+        adoptRetiredChatDeliveries(this.retiredChatDeliveries, new Map(
+          (state.deliveredCodex ?? []).map((id) => [id, state.deliveredCodexAtMs?.[id] ?? restoredLedgerAt] as const),
         ), restoredLedgerAt);
         discardedStaleSession = true;
         this.options.log?.(`stale chat receipt 破棄 session=${session}`);
@@ -1852,6 +1857,8 @@ export class SessionHub {
     // drain が injector / App Server の await 中でも、復帰後に同じ actor 参照から次の旧入力へ
     // 進めないよう durable queue の実体も空にする。現在実行中の1件は復帰時のidentity検査で捨てる。
     adoptRetiredChatDeliveries(this.retiredChatDeliveries, actor.deliveredChatMessageIds);
+    // Codex の配送済みも台帳へ（`tailii-host chat` の受領の照会が、片付けた会話の Codex の送信も答えられるように）。
+    adoptRetiredChatDeliveries(this.retiredChatDeliveries, actor.deliveredCodexMessageIds);
     actor.chatQueue.length = 0;
     actor.chatOrder.length = 0;
     actor.pendingChatMessages.clear();
@@ -2027,8 +2034,13 @@ export class SessionHub {
    * 目標が active な間は購読者がいなくても保持する（継続 turn を観測するため, codex-goal）。
    */
   private maybeCloseIdleCodexSession(session: string): void {
-    if ((this.actors.get(session)?.subscribers.size ?? 0) > 0) return;
+    const actor = this.actors.get(session);
+    if ((actor?.subscribers.size ?? 0) > 0) return;
     if (this.activeCodexTurns.has(session)) return;
+    // turn を始める途中・待っている turn がある会話は畳まない。始めるための接続（startTurn → threadFor）を開く途中で
+    // 目標の読み取り（onGoal null）がここへ来て畳むと、threadFor が開き直し、また畳まれるのを際限なく繰り返して turn が
+    // 始まらない（購読しない `tailii-host chat` の送信で再現。アプリは購読者が居るので当たらなかった）。
+    if ((actor?.startingCodexMessageIds.size ?? 0) > 0 || (actor?.pendingCodexTurns.size ?? 0) > 0) return;
     if (this.codexTurnController?.hasActiveGoal?.(session) === true) return;
     this.codexTurnController?.closeSession(session);
   }
@@ -3485,7 +3497,14 @@ export class SessionHub {
       if (actor === undefined || actor !== expectedActor) return;
       actor.startingCodexMessageIds.delete(message.clientUserMessageId);
       actor.pendingCodexTurns.delete(message.clientUserMessageId);
-      actor.uncertainCodexMessages.set(message.clientUserMessageId, message);
+      // turn を始める前（thread 接続を開く段階）の失敗は届いていないと確か。配送不明にすると明示の再送でしか解けず、
+      // この会話の後ろの送信が全部止まる。順番から外して失敗を返す（同じ送信 ID で打ち直せる。Fable レビュー 中3）。
+      // 明示の再送（元の試行が届いたか不明なもの）は、再送が始める前に失敗しても不明のまま残す（Fable 確かめ 低1）。
+      if (error instanceof CodexTurnNotStartedError && message.explicitRetry !== true) {
+        removeOrderedID(actor.codexOrder, message.clientUserMessageId);
+      } else {
+        actor.uncertainCodexMessages.set(message.clientUserMessageId, message);
+      }
       this.persistChatReceipts();
       for (const waiter of entry.waiters) {
         this.sendTo(waiter.client, {
@@ -3498,6 +3517,8 @@ export class SessionHub {
         `⚠️ Codex turn 開始失敗: ${String(error)}`,
       );
       this.options.log?.(`codex turn 開始失敗 session=${message.session}: ${String(error)}`);
+      // 始める途中は畳まなかったので、失敗の後に購読者も turn も無ければここで畳む（Fable レビュー 低4）。
+      this.maybeCloseIdleCodexSession(message.session);
     }
   }
 
@@ -4316,9 +4337,17 @@ export class SessionHub {
    */
   private chatReceiptBlocked(session: string, clientMessageId: string): boolean {
     const actor = this.actors.get(session);
-    if (actor === undefined || !actor.pendingChatMessages.has(clientMessageId)) return false;
-    const head = actor.chatOrder[0];
-    return head !== undefined && head !== clientMessageId && actor.uncertainChatMessages.has(head);
+    if (actor === undefined) return false;
+    if (actor.pendingChatMessages.has(clientMessageId)) {
+      const head = actor.chatOrder[0];
+      return head !== undefined && head !== clientMessageId && actor.uncertainChatMessages.has(head);
+    }
+    // Codex の turn も同じ（送信順の先頭の uncertain は明示の再送か片付けでしか解けない）。
+    if (actor.pendingCodexTurns.has(clientMessageId)) {
+      const head = actor.codexOrder[0];
+      return head !== undefined && head !== clientMessageId && actor.uncertainCodexMessages.has(head);
+    }
+    return false;
   }
 
   private chatReceiptStatus(session: string, clientMessageId: string): ChatReceiptStatus {
@@ -4328,6 +4357,12 @@ export class SessionHub {
       if (hasDeliveredReceipt(actor.deliveredChatMessageIds, clientMessageId)) return "delivered";
       if (actor.uncertainChatMessages.has(clientMessageId)) return "uncertain";
       if (actor.pendingChatMessages.has(clientMessageId)) return "pending";
+      // Codex の turn（`codex_turn_submit` の clientUserMessageId。`tailii-host chat` が Codex の送信を確かめる）。
+      // アプリは Codex の送信をこの照会に使わない。id は Claude の送信と重ならない。
+      if (hasDeliveredReceipt(actor.deletedCodexMessageIds, clientMessageId)) return "deleted";
+      if (hasDeliveredReceipt(actor.deliveredCodexMessageIds, clientMessageId)) return "delivered";
+      if (actor.uncertainCodexMessages.has(clientMessageId)) return "uncertain";
+      if (actor.pendingCodexTurns.has(clientMessageId) || actor.startingCodexMessageIds.has(clientMessageId)) return "pending";
     }
     if (hasDeliveredReceipt(this.retiredChatDeliveries, clientMessageId)) return "delivered";
     return "unknown";

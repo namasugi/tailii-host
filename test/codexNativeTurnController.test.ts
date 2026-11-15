@@ -7,6 +7,7 @@ import type {
 } from "../src/codex/codexAppServer.js";
 import {
   CodexNativeTurnController,
+  CodexTurnNotStartedError,
   chatContentKey,
   type CodexNativeApproval,
   type CodexThreadClient,
@@ -1978,5 +1979,25 @@ describe("CodexNativeTurnController threadFor（4 周目 should-fix）", () => {
     expect(threads[0]!.closed).toBe(1);
     expect(threads[1]!.starts.map((start) => start.text)).toEqual(["run"]);
     expect(threads[1]!.closed).toBe(0);
+  });
+
+  test("開くたびに閉じられ続けたら、際限なく開き直さずに失敗を返す（tailii-host chat の Codex 送信で再現）", async () => {
+    let opens = 0;
+    let controller: CodexNativeTurnController;
+    controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => {
+        opens += 1;
+        // 開き終わる前に閉じる要求が来る（目標の読み取りから hub が idle と見て畳む状況の再現）。
+        queueMicrotask(() => controller.closeSession("work"));
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        return new FakeThread();
+      } },
+    });
+    await expect(controller.startTurn({ session: "work", threadId: "thread-1", cwd: "/tmp/work", text: "run" }))
+      .rejects.toThrow(/直後に閉じられました/);
+    // turn を始める前の失敗は「届いていないと確か」の型で返す（hub が配送不明にしない）。
+    await expect(controller.startTurn({ session: "work", threadId: "thread-1", cwd: "/tmp/work", text: "run" }))
+      .rejects.toBeInstanceOf(CodexTurnNotStartedError);
+    expect(opens).toBe(8);
   });
 });

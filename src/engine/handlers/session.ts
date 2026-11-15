@@ -196,6 +196,23 @@ export const sessionHandlers: HandlerRegistry = {
     }
   },
 
+  session_alive_query: async (message, ctx) => {
+    const { writer, state, sessionManager } = ctx;
+    const v = state.negotiatedVersion;
+    try {
+      const listed = sessionManager.listAvailable !== undefined
+        ? await sessionManager.listAvailable()
+        : { sessions: await sessionManager.list(), unavailable: [] };
+      const found = listed.sessions.find((info) => info.name === message.name);
+      // 見つからなくても、答えられなかった端末の置き場があれば「分からない」（alive を載せない）。
+      const alive = found !== undefined ? found.alive : listed.unavailable.length > 0 ? undefined : false;
+      writer.write({ type: "session_alive_query_result", v, id: message.id, name: message.name,
+        ...(alive !== undefined ? { alive } : {}) });
+    } catch (error) {
+      writeError(writer, v, message.id, "session_alive_query_failed", String(error));
+    }
+  },
+
   session_reattach: async (message, ctx) => {
     // iPhone の時計が host より進んでいると、起点が未来になり共有 tail が新着まで捨て続ける（全購読者）。
     // host の現在時刻で頭打ちにする（reattach-since）。

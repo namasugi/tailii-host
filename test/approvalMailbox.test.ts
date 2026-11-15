@@ -20,6 +20,8 @@ import {
   writePendingApproval,
 } from "../src/approval/approvalMailbox.js";
 import { decodeControlMessage } from "../src/protocol.js";
+import { requestCodexApprovalViaBroker } from "../src/codex/codexNativeTurnController.js";
+import { resolveSocketPath } from "../src/shared/socketPath.js";
 import { SocketLineReader, startListener, tempSocketPath, type FakeListener } from "./socketHelpers.js";
 
 const tempBase = (): string => fs.mkdtempSync(path.join(os.tmpdir(), "approvals-"));
@@ -157,6 +159,81 @@ describe("承認フックと受け渡し口", () => {
       expect(pending).toHaveLength(1);
       writeApprovalDecision(session, pending[0]!.id, { decision: "allow", atMs: 1 }, base);
       expect(decisionOf((await run).stdout).decision).toBe("allow");
+    }
+  });
+});
+
+describe("Codex の承認と受け渡し口", () => {
+  const approval = (session: string) => ({
+    id: "codex:thread-1:7", session, tool: "Bash", summary: "rm -rf build", cwd: "/w",
+  });
+
+  it("アプリにつながれず Bot の承認も許されていなければ、従来どおりすぐ拒否する", async () => {
+    const base = tempBase();
+    const decision = await requestCodexApprovalViaBroker(approval("s-codex-a"), {
+      connectTimeoutMs: 50, approvalsBase: base, botMayApprove: () => false, approvalsPollMs: 20,
+    });
+    expect(decision).toBe("deny");
+    expect(listPendingApprovals("s-codex-a", base)).toEqual([]);
+  });
+
+  it("CLI の会話では、アプリにつながれなくても Bot の承認が許されていれば、受け渡し口の決定を待って使う", async () => {
+    const base = tempBase();
+    const session = "s-cli00112233445566aa";
+    const run = requestCodexApprovalViaBroker(approval(session), {
+      connectTimeoutMs: 50, decisionTimeoutMs: 5_000, approvalsBase: base, botMayApprove: () => true, approvalsPollMs: 20,
+    });
+    // アプリの接続の 10 秒（ここでは 50 ms）を過ぎてから決める。
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(listPendingApprovals(session, base).map((r) => r.id)).toEqual(["codex:thread-1:7"]);
+    writeApprovalDecision(session, "codex:thread-1:7", { decision: "allow", atMs: 1 }, base);
+    expect(await run).toBe("allow");
+    expect(takeApprovalResult(session, "codex:thread-1:7", base)).toEqual({ decision: "allow", by: "cli" });
+  });
+
+  it("CLI の会話で Bot を待つとき、アプリが一度つながって切れても拒否にせず、受け渡し口の決定を使う", async () => {
+    const base = tempBase();
+    const session = "s-cli00112233445566bb";
+    const app = await startListener(resolveSocketPath(session));
+    try {
+      const run = requestCodexApprovalViaBroker(approval(session), {
+        decisionTimeoutMs: 5_000, approvalsBase: base, botMayApprove: () => true, approvalsPollMs: 20,
+      });
+      const socket = await app.nextConnection();
+      await new SocketLineReader(socket).nextLine();
+      socket.destroy(); // アプリが切れる。
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      writeApprovalDecision(session, "codex:thread-1:7", { decision: "allow", atMs: 1 }, base);
+      expect(await run).toBe("allow");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("アプリの会話（s-<8 桁>）は Bot の承認が許されていても延ばさず、従来どおりつながらなければ拒否する", async () => {
+    const base = tempBase();
+    const started = Date.now();
+    const decision = await requestCodexApprovalViaBroker(approval("s-1234abcd"), {
+      connectTimeoutMs: 50, decisionTimeoutMs: 5_000, approvalsBase: base, botMayApprove: () => true, approvalsPollMs: 20,
+    });
+    expect(decision).toBe("deny");
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it("アプリがつながっていても、受け渡し口の決定が先ならそれで決める", async () => {
+    const base = tempBase();
+    const session = "s-codex-c";
+    const socketPath = resolveSocketPath(session);
+    const app = await startListener(socketPath);
+    try {
+      const run = requestCodexApprovalViaBroker(approval(session), { approvalsBase: base, approvalsPollMs: 20 });
+      const socket = await app.nextConnection();
+      const message = decodeControlMessage(await new SocketLineReader(socket).nextLine());
+      expect(message).toMatchObject({ type: "approval_request", id: "codex:thread-1:7" });
+      writeApprovalDecision(session, "codex:thread-1:7", { decision: "deny", atMs: 1 }, base);
+      expect(await run).toBe("deny");
+    } finally {
+      await app.close();
     }
   });
 });

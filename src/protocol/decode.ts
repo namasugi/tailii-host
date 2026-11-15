@@ -1054,6 +1054,12 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
     case "chat_pending_query":
       return { type, v, id: requireString(raw, "id"), session: requireString(raw, "session") };
 
+    case "session_alive_query":
+      return { type, v, id: requireString(raw, "id"), name: requireString(raw, "name") };
+
+    case "session_alive_query_result":
+      return compact({ type, v, id: requireString(raw, "id"), name: requireString(raw, "name"), alive: optionalBoolean(raw, "alive") });
+
     case "chat_pending_query_result": {
       const question = raw["question"];
       return {

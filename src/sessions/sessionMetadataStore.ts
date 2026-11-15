@@ -279,5 +279,8 @@ export const HERDR_SESSION_NAME_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$/;
 /** herdr の端末 ID の形式（例 `term_6601e1d072c0c1`。0.9.5 実測）。 */
 export const HERDR_TERMINAL_ID_PATTERN = /^term_[A-Za-z0-9]{1,64}$/;
 
-/** herdr pane ID の形式（例 `w4:p2`。実測で英数字混在の pane 連番あり）。 */
-export const HERDR_PANE_ID_PATTERN = /^w\d+:p[A-Za-z0-9]+$/;
+/**
+ * herdr の pane id（`w<ワークスペース>:p<pane>`。例 `w4:p2`）。どちらの連番も英数字: ワークスペースは 9 の次が `wA`
+ * （0.9.5 実測。作業フォルダごとにワークスペースを分けると 10 個を超える）。数字だけに絞ると作った pane を解決できない。
+ */
+export const HERDR_PANE_ID_PATTERN = /^w[A-Za-z0-9]+:p[A-Za-z0-9]+$/;

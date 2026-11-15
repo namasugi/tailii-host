@@ -19,7 +19,13 @@ export const AGENT_GUIDE = `# tailii-host chat — AI エージェント向け�
 - chat new --cwd <フォルダ> --request-id <ID> [--title <名前>] [--permission-mode default|acceptEdits|plan] --json  < 指示文
     新しい Claude の会話を始めて最初の指示を送る。指示が Claude に受け付けられた時点で返る（返答の完了は待たない）。
 - chat send <conversationId> --request-id <ID> --json  < 指示文
-    続きを送る。止まっていれば Tailii で続きから起動してから送る。他所（利用者の端末など）で動いていれば送らずに終了コード 4。
+    続きを送る。止まっていれば Tailii で続きから起動してから送る。Claude の会話が他所（利用者の端末など）で動いていれば
+    送らずに終了コード 4。Codex の会話は --permission-mode でその送信の方針を変えられる（省略は直前にこのコマンドで送った
+    ときと同じ。プランモードから戻すときは一度 acceptEdits などを指定する。auto は allowAuto が無ければ使わない）。
+- chat new … --agent codex
+    Claude の代わりに Codex で始める（省略は Claude）。以降の send / status / answer / approve は会話 ID だけで同じように使える。
+    Codex は sandbox が作業フォルダの中だけ書ける workspace-write で、許可モードを承認の方針に当てる（default=untrusted /
+    acceptEdits=on-request / plan=on-request＋プランモード / auto=never）。take-over は Codex では使えない。
 - chat new … [--backend herdr|tmux] [--herdr-session <名前>]
     起動先の明示（省略はアプリの設定）。明示した herdr セッションが動いていなければ、振り替えずに失敗する。
 - chat status <conversationId> [--after <依頼ID>] [--wait <秒>] --json
@@ -42,7 +48,7 @@ export const AGENT_GUIDE = `# tailii-host chat — AI エージェント向け�
 - chat approve <conversationId> <承認ID> allow|deny [--reason <理由>] --json
     ツールの承認に答える。deny はいつでもできる。allow は利用者が ~/.tailii/bot.json の allowApprove を true にしたときだけで、
     作業フォルダが allowedRoots の中の承認だけ。applied=true ならこの決定で決まった（false で decidedBy があれば、先に
-    利用者が答えた。decision がその決定）。--reason は Claude に伝わる理由。
+    利用者が答えた。decision がその決定）。--reason は Claude に伝わる理由（Codex には許可か拒否だけが伝わる）。
 - chat take-over <conversationId> --json
     Tailii の外（利用者の端末など）で動いている会話を終了させて Tailii で開き直す。bot.json の allowTakeOver が true で、
     相手が待機中のときだけ（処理中は終了コード 4）。

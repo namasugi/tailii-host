@@ -27,6 +27,14 @@ import type { ControlMessage } from "../protocol.js";
 import { isVisibleCodexMessagePhase } from "./codexMessagePhase.js";
 import { codexPlanChatOutput } from "./codexPlanItem.js";
 import { resolveSocketPath } from "../shared/socketPath.js";
+import {
+  botMayApprove,
+  defaultApprovalsBase,
+  isCliSession,
+  removePendingApproval,
+  waitForMailboxDecision,
+  writePendingApproval,
+} from "../approval/approvalMailbox.js";
 import { sleep } from "../shared/sleep.js";
 import {
   codexItemToolActivities,
@@ -73,6 +81,21 @@ export interface CodexNativeApproval {
   agentId?: string;
   /** 子 thread の種類（agentRole / nickname）。分からなければ省略。 */
   agentType?: string;
+}
+
+/** 操作のために開いた接続が直後に閉じられたとき、開き直す上限（際限なく繰り返して turn が始まらないのを防ぐ）。 */
+const MAX_OPERATE_REOPENS = 3;
+
+/**
+ * turn を始める前（App Server の thread 接続を開く段階）で失敗した: turn/start も turn/steer も送っていないので、
+ * 届いていないと確かである。hub はこれを「届いたか分からない」にせず、順番から外して失敗を返す（同じ送信 ID で
+ * 打ち直せる。Fable レビュー 中3）。
+ */
+export class CodexTurnNotStartedError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "CodexTurnNotStartedError";
+  }
 }
 
 export type CodexApprovalBroker = (approval: CodexNativeApproval) => Promise<Decision>;
@@ -493,7 +516,12 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     approvalPolicy?: CodexAppServerApprovalPolicy | null;
     collaborationMode?: CodexCollaborationMode | null;
   }): Promise<string> {
-    const opened = await this.threadFor(options.session, options.threadId, options.cwd);
+    let opened: OpenThread;
+    try {
+      opened = await this.threadFor(options.session, options.threadId, options.cwd);
+    } catch (error) {
+      throw new CodexTurnNotStartedError(error instanceof Error ? error.message : String(error), { cause: error });
+    }
     this.onProcessing(options.session, "active");
     try {
       // 未materialize fallback 接続は、別 client の実行中 turn を初期 snapshot で
@@ -1030,6 +1058,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     threadId: string,
     cwd: string,
     intent: "subscribe" | "operate" = "operate",
+    reopenAttempt = 0,
   ): Promise<OpenThread> {
     // 開始中（openThread → 目標読み取り → サブエージェント復元）の同じ session は完了を共有する。
     // 会話オープンでは hub の購読と iOS の目標 get がほぼ同時に届くため、共有しないと openThread が
@@ -1061,7 +1090,11 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     const opened = await task;
     if (intent === "operate" && this.open.get(session) !== opened) {
       // 開いている途中に close 要求（購読者が去った等）で畳まれた。操作の相手が要るので開き直す。
-      return this.threadFor(session, threadId, cwd, intent);
+      // 開くたびに畳まれ続ける（畳む側の判定の取りこぼし）と際限なく繰り返して turn が始まらないので、回数を切る。
+      if (reopenAttempt >= MAX_OPERATE_REOPENS) {
+        throw new Error(`Codex thread の接続を開いても直後に閉じられました（${MAX_OPERATE_REOPENS} 回）。少し待って再送してください。`);
+      }
+      return this.threadFor(session, threadId, cwd, intent, reopenAttempt + 1);
     }
     return opened;
   }
@@ -1693,21 +1726,97 @@ export function chatContentKey(payload: ControlMessage): string | null {
   return `${payload.role}\u0000${payload.text}`;
 }
 
-/** App Server approval を既存 iPhone serve channel へ流し、同じ id の決定だけを待つ。 */
+/**
+ * App Server approval を既存 iPhone serve channel へ流し、同じ id の決定だけを待つ。承認の受け渡し口
+ * （`approvalMailbox.ts`。`tailii-host chat approve`）にも同じ承認を置き、早い方で決める（tailii-chat-cli 第 2 段）。
+ * アプリにつながれなければ従来どおり拒否する。ただし Bot に承認が許されていれば、期限まで受け渡し口の決定を待つ。
+ */
 export async function requestCodexApprovalViaBroker(
   approval: CodexNativeApproval,
-  options: { connectTimeoutMs?: number; decisionTimeoutMs?: number } = {},
+  options: {
+    connectTimeoutMs?: number;
+    decisionTimeoutMs?: number;
+    /** 受け渡し口のベース（null で使わない。既定 `~/.tailii/approvals`）。 */
+    approvalsBase?: string | null;
+    /** Bot に承認が許されているか（既定は `~/.tailii/bot.json` の allowApprove）。 */
+    botMayApprove?: () => boolean;
+    approvalsPollMs?: number;
+  } = {},
 ): Promise<Decision> {
-  const socketPath = resolveSocketPath(approval.session);
-  const connectDeadline = Date.now() + (options.connectTimeoutMs ?? 10_000);
+  const deadline = Date.now() + (options.decisionTimeoutMs ?? 540_000);
+  const base = options.approvalsBase === undefined ? defaultApprovalsBase() : options.approvalsBase;
+  const stop = new AbortController();
   let socket: net.Socket | null = null;
-  do {
-    socket = await connectSocket(socketPath);
-    if (socket !== null) break;
-    await sleep(200);
-  } while (Date.now() <= connectDeadline);
-  if (socket === null) return "deny";
+  let decidedBy: "cli" | "app" | "timeout" = "timeout";
+  let decision: Decision = "deny";
+  if (base !== null) {
+    writePendingApproval({
+      id: approval.id, session: approval.session, tool: approval.tool, summary: approval.summary, cwd: approval.cwd,
+      atMs: Date.now(), pid: process.pid,
+      ...(approval.agentId !== undefined ? { agentId: approval.agentId } : {}),
+      ...(approval.agentType !== undefined ? { agentType: approval.agentType } : {}),
+    }, base);
+  }
+  const fromMailbox: Promise<Decision | null> = base === null
+    ? new Promise<null>(() => {})
+    : waitForMailboxDecision(approval.session, approval.id, deadline, stop.signal, {
+      base, ...(options.approvalsPollMs !== undefined ? { intervalMs: options.approvalsPollMs } : {}),
+    }).then((record) => record?.decision ?? null);
+  // アプリへの要求。つながれなければ null（決めていない）。
+  // Bot が答えられる CLI の会話（`s-cli…`）だけ、アプリへのつなぎ直しも期限まで試し続ける（受け渡し口と早い方で決める）。
+  // アプリの会話は従来どおり 10 秒でつながらなければ拒否する（Bot が関わらない会話を延ばさない。Fable レビュー 中1）。
+  const waitsForBot = base !== null && isCliSession(approval.session) && (options.botMayApprove ?? botMayApprove)();
+  const fromApp = (async (): Promise<Decision | null> => {
+    const socketPath = resolveSocketPath(approval.session);
+    const connectDeadline = waitsForBot ? deadline : Date.now() + (options.connectTimeoutMs ?? 10_000);
+    for (;;) {
+      do {
+        if (stop.signal.aborted) return null;
+        const connected = await connectSocket(socketPath);
+        // 待っている間に決まった（受け渡し口）なら、決まった後の承認をアプリへ送らない。
+        if (connected !== null && stop.signal.aborted) {
+          connected.destroy();
+          return null;
+        }
+        socket = connected;
+        if (socket !== null) break;
+        await sleep(200);
+      } while (Date.now() <= connectDeadline);
+      if (socket === null) return null;
+      const decided = await waitAppDecision(socket, approval, deadline, waitsForBot);
+      // Bot を待つ会話では、アプリが切れても拒否にせず、期限まで受け渡し口とつなぎ直しを待つ（Fable 確かめ 低2）。
+      if (decided !== null) return decided;
+      socket = null;
+      if (Date.now() > deadline) return null;
+      await sleep(200);
+    }
+  })();
+  try {
+    const first = await Promise.race([
+      fromMailbox.then((value) => ({ by: "cli" as const, value })),
+      fromApp.then((value) => ({ by: "app" as const, value })),
+    ]);
+    if (first.value !== null) {
+      decidedBy = first.by;
+      decision = first.value;
+    }
+    return decision;
+  } finally {
+    stop.abort();
+    const opened = socket as net.Socket | null;
+    opened?.destroy();
+    if (base !== null) removePendingApproval(approval.session, approval.id, base, { decision, by: decidedBy });
+  }
+}
 
+/** アプリの承認チャネルで同じ id の決定を待つ（切断・期限は拒否）。 */
+function waitAppDecision(
+  socket: net.Socket,
+  approval: CodexNativeApproval,
+  deadline: number,
+  /** 切断を「決めていない（null）」として返す（Bot を待つ会話。従来は拒否）。 */
+  disconnectIsUndecided = false,
+): Promise<Decision | null> {
   const request = encodeControlMessage({
     type: "approval_request",
     v: PROTOCOL_V1,
@@ -1718,17 +1827,17 @@ export async function requestCodexApprovalViaBroker(
     ...(approval.agentId !== undefined ? { agentId: approval.agentId } : {}),
     ...(approval.agentType !== undefined ? { agentType: approval.agentType } : {}),
   });
-  return new Promise<Decision>((resolve) => {
+  return new Promise<Decision | null>((resolve) => {
     let settled = false;
     let buffer = "";
-    const finish = (decision: Decision): void => {
+    const finish = (decision: Decision | null): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       socket.destroy();
       resolve(decision);
     };
-    const timer = setTimeout(() => finish("deny"), options.decisionTimeoutMs ?? 540_000);
+    const timer = setTimeout(() => finish("deny"), Math.max(0, deadline - Date.now()));
     socket.on("data", (chunk) => {
       buffer += chunk.toString("utf8");
       while (true) {
@@ -1748,8 +1857,8 @@ export async function requestCodexApprovalViaBroker(
         }
       }
     });
-    socket.once("error", () => finish("deny"));
-    socket.once("close", () => finish("deny"));
+    socket.once("error", () => finish(disconnectIsUndecided ? null : "deny"));
+    socket.once("close", () => finish(disconnectIsUndecided ? null : "deny"));
     socket.write(request + "\n");
   });
 }

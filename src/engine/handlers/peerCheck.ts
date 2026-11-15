@@ -23,7 +23,7 @@ import {
 } from "../../backend/herdr.js";
 import type { LaunchTakeover } from "../../commands/launch.js";
 import type { ControlMessage } from "../../protocol.js";
-import type { SessionMetadataStore } from "../../sessions/sessionMetadataStore.js";
+import { HERDR_PANE_ID_PATTERN, type SessionMetadataStore } from "../../sessions/sessionMetadataStore.js";
 
 type PeerConflict = Extract<ControlMessage, { type: "session_peer_conflict" }>;
 
@@ -34,7 +34,7 @@ export type PeerCheckOutcome =
 
 /** herdr の pane の前面にその pid が居るか（環境変数の手がかりの検証。配置にだけ使う, Fable A-14）。 */
 export async function herdrPaneHasPid(session: string, paneId: string, pid: number): Promise<boolean> {
-  if (!isValidHerdrSessionName(session) || !/^w\d+:p[A-Za-z0-9]+$/.test(paneId)) return false;
+  if (!isValidHerdrSessionName(session) || !HERDR_PANE_ID_PATTERN.test(paneId)) return false;
   try {
     const result = await processHerdrCommandRunner(defaultHerdrPath(), session, 3_000)(
       ["pane", "process-info", "--pane", paneId],

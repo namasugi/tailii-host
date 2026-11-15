@@ -32,7 +32,8 @@ export interface ApprovalDecisionRecord {
   atMs: number;
 }
 
-const ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+/** 承認 id（Claude はフックの UUID、Codex は `codex:<thread>:<要求 id>`）。先頭は英数字（`.` 始まりの名前を作らない）。 */
+const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$/;
 
 export function defaultApprovalsBase(home: string = os.homedir()): string {
   return path.join(home, ".tailii", "approvals");

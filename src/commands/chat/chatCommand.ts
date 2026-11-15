@@ -29,19 +29,26 @@ import { connectEngine, EngineTimeoutError, type EngineConnection } from "./engi
 import {
   acquireRequestLock,
   conversationState,
+  findCodexRollout,
+  findLatestCodexTurnRecord,
   findTranscript,
   folderAllowed,
   isBotStartedConversation,
   isPermissionMode,
   loadBotConfig,
+  readCodexRollout,
+  readCodexRolloutLines,
   readReply,
   readRequest,
   readTranscriptLines,
   requestDigest,
   writeRequest,
   type BotConfig,
+  type CodexTurnOptions,
   type ConversationState,
+  type PermissionMode,
   type RequestRecord,
+  type TranscriptLine,
 } from "./chatState.js";
 
 /** 終了コード（agent-guide に書いた表と同じ）。 */
@@ -85,6 +92,10 @@ export interface ChatDeps {
   botStarted?: (conversationId: string) => boolean;
   /** 人に確かめる（端末で y/N。テスト用）。 */
   confirm?: (question: string) => boolean;
+  /** Codex の会話の rollout を探す（テスト用。既定は `~/.codex/sessions`）。 */
+  codexRollout?: (threadId: string) => string | null;
+  /** 依頼の記録の置き場（テスト用。既定 `~/.tailii/bot/requests`）。 */
+  requestsDir?: string;
 }
 
 interface ParsedArgs {
@@ -94,7 +105,7 @@ interface ParsedArgs {
 
 const VALUE_FLAGS = new Set([
   "--cwd", "--request-id", "--title", "--permission-mode", "--after", "--wait",
-  "--choice", "--other", "--reason", "--backend", "--herdr-session",
+  "--choice", "--other", "--reason", "--backend", "--herdr-session", "--agent",
 ]);
 const BOOL_FLAGS = new Set(["--json", "--live", "--no-attach", "--interrupt", "--yes"]);
 
@@ -275,6 +286,45 @@ async function sendText(engine: EngineConnection, session: string, clientMessage
   }
   if (reply.type !== "chat_send_result") throw engineFailure(reply, "送信");
   if (reply.status !== "failed") return reply.status;
+  return classifySendFailure(engine, session, clientMessageId, reply.error);
+}
+
+/**
+ * Codex への送信（codex_turn_start。hub が turn/start の確定まで行い、同じ clientUserMessageId の二重送信は弾く）。
+ * 送った id は rollout の UserMessage の client_id に残る（返答の照合に使う）。失敗の分け方は Claude と同じ。
+ */
+async function sendCodexTurn(
+  engine: EngineConnection,
+  session: string,
+  clientUserMessageId: string,
+  text: string,
+  turn: CodexTurnOptions | undefined,
+): Promise<"accepted" | "duplicate"> {
+  const id = newId();
+  let reply: ControlMessage;
+  try {
+    reply = await engine.request({ type: "codex_turn_start", v: 2, id, session, text, clientUserMessageId, ...(turn ?? {}) },
+      isType("codex_turn_start_result", id), 100_000);
+  } catch (error) {
+    if (error instanceof EngineTimeoutError && await receiptOn(engine, session, clientUserMessageId).catch(() => "unknown") === "blocked") {
+      throw needsHuman("この会話の前の送信");
+    }
+    throw error;
+  }
+  if (reply.type !== "codex_turn_start_result") throw engineFailure(reply, "送信");
+  if (reply.status === "started") return "accepted";
+  if (reply.status === "duplicate") return "duplicate";
+  return classifySendFailure(engine, session, clientUserMessageId, reply.error);
+}
+
+/** hub の送信の失敗を、受領の照会で分ける（届いていた → duplicate。それ以外は投げる）。 */
+async function classifySendFailure(
+  engine: EngineConnection,
+  session: string,
+  clientMessageId: string,
+  error: string | undefined,
+): Promise<"duplicate"> {
+  const reply = { error };
   if (reply.error !== undefined && /explicit retry is required/i.test(reply.error)) throw needsHuman();
   if (reply.error === "pending_message_deleted") throw deletedByUser();
   // 失敗の中身は hub の受領の照会で分ける（打つ前に断った失敗は記録から外れ unknown になる。そこへ「同じ ID で
@@ -292,11 +342,17 @@ async function sendText(engine: EngineConnection, session: string, clientMessage
       throw needsHuman(reply.error);
     case "deleted": throw deletedByUser();
     case "unknown":
-      if (reply.error !== undefined && /before delivery completed/.test(reply.error)) {
+      if (reply.error !== undefined && /before (?:delivery|turn start) completed/.test(reply.error)) {
         // 届ける前に会話が終わった（利用者の終了・片付け）。打ち直しは会話を続きから起動して送る（4 周目 中1）。
         // 打ち込みの途中で終わった場合は Claude が受け付けていることもある。打ち直しは会話の記録を見てから送る。
         throw new ChatError(EXIT.retryLater, "conversation_ended", `届ける途中で会話が終わりました（届いていない可能性が高い）: ${reply.error}`,
           "同じ依頼 ID で打ち直す（届いていれば送り直さず、届いていなければ会話を続きから起動して送る）");
+      }
+      if (reply.error !== undefined && /no rollout found for thread id/.test(reply.error)) {
+        // Codex の新しい thread は最初の発話まで App Server のメモリにしか無く、作った接続（`new` の engine）が終わると消える。
+        // 最初の送信が失敗した後の打ち直しでは、もう始められない（同じ ID で打ち直しても同じ）。会話はまだ空なので作り直す。
+        throw new ChatError(EXIT.notFound, "conversation_ended_before_start", "最初の指示が届く前に Codex の会話が失われました",
+          "新しい依頼 ID で chat new をやり直す");
       }
       // 記録に無い = 1 キーも打たずに断った（/login 中・ダイアログの表示中・入力欄の残りを消せない など）。届いていない。
       throw new ChatError(EXIT.retryLater, "not_delivered",
@@ -345,24 +401,28 @@ async function listConversationsResolved(engine: EngineConnection): Promise<{ ro
   })) };
 }
 
-/** Tailii の会話名がいま動いているか（`session_list_request` の alive。ページをたどる）。 */
+/**
+ * Tailii の会話名がいま動いているか（`session_alive_query`）。分からないとき（答えられない端末の置き場がある）は
+ * 動いている扱い（止まったと決めつけて新しい依頼 ID を案内しない）。`session_list_request` は止まった会話の記録まで
+ * 全部たどる（千件を超える）ので使わない。
+ */
 async function sessionAlive(engine: EngineConnection, session: string): Promise<boolean> {
-  let cursor: string | undefined;
-  for (let page = 0; page < 50; page++) {
-    const id = newId();
-    const reply = await engine.request({ type: "session_list_request", v: 2, id, ...(cursor !== undefined ? { cursor } : {}) },
-      isType("session_list_response", id), 30_000);
-    if (reply.type !== "session_list_response") throw engineFailure(reply, "会話の確認");
-    const found = reply.sessions.find((entry) => entry.name === session);
-    if (found !== undefined) return found.alive;
-    if (reply.nextCursor === undefined) return false;
-    cursor = reply.nextCursor;
-  }
-  return false;
+  const id = newId();
+  const reply = await engine.request({ type: "session_alive_query", v: 2, id, name: session },
+    isType("session_alive_query_result", id), 30_000);
+  if (reply.type !== "session_alive_query_result") throw engineFailure(reply, "会話の確認");
+  return reply.alive !== false;
 }
 
 /** 依頼の発話が会話の記録に残っているか（届いていたか）。 */
 function utteranceRecorded(deps: ChatDeps, record: RequestRecord): boolean {
+  if (record.agent === "codex") {
+    const rollout = record.conversationId === "" ? null : codexRolloutOf(deps, record.conversationId);
+    if (rollout === null) return false;
+    return readReply(readCodexRolloutLines(rollout), {
+      sentAtMs: record.sentAtMs, text: record.text, clientId: clientMessageIdFor(record.requestId),
+    }).found;
+  }
   const transcriptOf = deps.transcript ?? ((id: string, cwdHint?: string) =>
     findTranscript(id, { store: deps.store(), ...(cwdHint !== undefined ? { cwdHint } : {}) }));
   const transcript = record.conversationId === "" ? null : transcriptOf(record.conversationId, record.cwd);
@@ -503,9 +563,10 @@ async function reviveIfEnded(
     if (!folderAllowed(row.cwd, deps.config().allowedRoots)) {
       throw new ChatError(EXIT.policy, "folder_not_allowed", `この会話の作業フォルダは許可されていません: ${row.cwd}`);
     }
+    const agent = record.agent ?? "claude";
     session = (await startSession(engine, {
       cwd: row.cwd, name: sessionNameFor(`${record.requestId}:${record.conversationId}`), resumeSessionId: record.conversationId,
-      agentType: "claude", peerCheck: true,
+      agentType: agent, ...(agent === "claude" ? { peerCheck: true } : {}),
     })).session;
   }
   const next: RequestRecord = { ...record, session, state: "started" };
@@ -545,7 +606,9 @@ async function sendRecorded(
   write({ ...record, state: "started" });
   let status: "accepted" | "duplicate";
   try {
-    status = await sendText(engine, record.session, clientMessageIdFor(record.requestId), record.text);
+    status = record.agent === "codex"
+      ? await sendCodexTurn(engine, record.session, clientMessageIdFor(record.requestId), record.text, record.codexTurn)
+      : await sendText(engine, record.session, clientMessageIdFor(record.requestId), record.text);
   } catch (error) {
     // 人に回した依頼は記録に印を残す（打ち直しで届いたか分からない送信を送り直さない。5 周目レビュー 1）。
     if (error instanceof ChatError && error.code === "needs_human") write({ ...record, state: "started", needsHuman: true });
@@ -576,6 +639,11 @@ async function cmdNew(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<R
       "利用者が ~/.tailii/bot.json の allowAuto を true にしたときだけ使える");
   }
   const permissionMode = requestedMode ?? (bot ? config.permissionMode : undefined);
+  const agentRaw = flagString(args, "--agent") ?? "claude";
+  if (agentRaw !== "claude" && agentRaw !== "codex") {
+    throw new ChatError(EXIT.usage, "bad_agent", `--agent は claude か codex: ${agentRaw}`);
+  }
+  const agent: "claude" | "codex" = agentRaw;
   const placement = placementOf(args);
   const attach = !bot && !args.flags.has("--no-attach");
   const prompt = readPrompt(deps, !attach);
@@ -584,7 +652,7 @@ async function cmdNew(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<R
   const textHash = prompt === null ? null : hashText(prompt);
   return withRequestLock(deps, requestId, () =>
     newLocked({ deps, requestId, resolvedCwd, textHash, prompt, attach, permissionMode, title: flagString(args, "--title"),
-      placement }));
+      placement, agent }));
 }
 
 /**
@@ -613,10 +681,15 @@ async function newLocked(input: {
   deps: ChatDeps; requestId: string; resolvedCwd: string; textHash: string | null; prompt: string | null; attach: boolean;
   permissionMode: string | undefined; title: string | undefined;
   placement: { backend?: "tmux" | "herdr"; herdrSession?: string };
+  agent: "claude" | "codex";
 }): Promise<Record<string, unknown> & { attach?: string }> {
-  const { deps, requestId, resolvedCwd, textHash, prompt, attach, permissionMode, title, placement } = input;
+  const { deps, requestId, resolvedCwd, textHash, prompt, attach, permissionMode, title, placement, agent } = input;
+  const codexTurn = agent === "codex" ? codexTurnOptions(permissionMode as PermissionMode | undefined) : undefined;
   const previous = (deps.readRequest ?? readRequest)(requestId);
   if (previous !== null) assertSameRequest(previous, { kind: "new", cwd: resolvedCwd, textHash });
+  if (previous !== null && (previous.agent ?? "claude") !== agent) {
+    throw new ChatError(EXIT.usage, "request_id_reused", "この依頼 ID は別の依頼で使われています（依頼ごとに新しい ID を使う）");
+  }
   // state の無い記録は 31f97bc の旧形式で、送信済み（3 周目レビュー 6）。
   if (previous !== null && (previous.state === undefined || previous.state === "sent")) {
     return { duplicate: true, requestId, conversationId: previous.conversationId, session: previous.session, cwd: previous.cwd,
@@ -640,12 +713,14 @@ async function newLocked(input: {
     } else {
       writeReq({
         requestId, kind: "new", conversationId: "", session: name, cwd: resolvedCwd, sentAtMs: deps.now(), text: "",
-        ...(textHash !== null ? { textHash } : {}), state: "starting",
+        ...(textHash !== null ? { textHash } : {}), state: "starting", ...(agent === "codex" ? { agent } : {}),
       });
       try {
         started = await startSession(engine, {
-          cwd: resolvedCwd, name, agentType: "claude",
-          ...(permissionMode !== undefined ? { permissionMode } : {}),
+          cwd: resolvedCwd, name, agentType: agent,
+          // Codex は許可モードではなく sandbox（起動時）と承認の方針（turn ごと）で決める。
+          ...(agent === "claude" && permissionMode !== undefined ? { permissionMode } : {}),
+          ...(codexTurn?.sandbox !== undefined ? { codexSandbox: codexTurn.sandbox } : {}),
           ...(title !== undefined ? { title } : {}),
           ...placement,
         });
@@ -662,6 +737,7 @@ async function newLocked(input: {
       requestId, kind: "new", conversationId: started.conversationId, session: started.session, cwd: resolvedCwd,
       sentAtMs: deps.now(), text: prompt === null ? "" : deliverableText(prompt, requestId, deps),
       ...(textHash !== null ? { textHash } : {}),
+      ...(agent === "codex" ? { agent, ...(codexTurn !== undefined ? { codexTurn } : {}) } : {}),
     };
     // 送信が未確定の記録は、指示文なしで打ち直されても送信済みにしない（記録の本文で打ち直す。6 周目 補足）。
     if (prompt === null && !(previous !== null && previous.state === "started")) {
@@ -681,7 +757,7 @@ async function newLocked(input: {
     return { session: toSend.session, conversationId: started.conversationId };
   });
   return {
-    requestId, conversationId: result.conversationId, session: result.session, cwd: resolvedCwd,
+    requestId, conversationId: result.conversationId, session: result.session, cwd: resolvedCwd, agent,
     ...(permissionMode !== undefined ? { permissionMode } : {}),
     ...(attach ? { attach: result.session } : {}),
   };
@@ -693,13 +769,26 @@ async function cmdSend(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<
   const prompt = readPrompt(deps, true)!;
   const requestId = requestIdOf(args, bot);
   const textHash = hashText(prompt);
-  return withRequestLock(deps, requestId, () => sendLocked({ deps, requestId, conversationId, textHash, prompt }));
+  // Codex の会話だけ、送るたびに許可モードを変えられる（プランから戻すなど）。Claude は起動時のモードのまま。
+  const requestedMode = flagString(args, "--permission-mode");
+  if (requestedMode !== undefined && !isPermissionMode(requestedMode)) {
+    throw new ChatError(EXIT.usage, "bad_permission_mode", `許可モードは default / acceptEdits / plan / auto: ${requestedMode}`);
+  }
+  if (bot && requestedMode === "auto" && !deps.config().allowAuto) {
+    throw new ChatError(EXIT.policy, "auto_not_allowed", "auto（何でも許可）は Bot に許されていません",
+      "利用者が ~/.tailii/bot.json の allowAuto を true にしたときだけ使える");
+  }
+  return withRequestLock(deps, requestId, () => sendLocked({
+    deps, requestId, conversationId, textHash, prompt, bot,
+    ...(requestedMode !== undefined ? { permissionMode: requestedMode as PermissionMode } : {}),
+  }));
 }
 
 async function sendLocked(input: {
-  deps: ChatDeps; requestId: string; conversationId: string; textHash: string; prompt: string;
+  deps: ChatDeps; requestId: string; conversationId: string; textHash: string; prompt: string; bot: boolean;
+  permissionMode?: PermissionMode;
 }): Promise<Record<string, unknown>> {
-  const { deps, requestId, conversationId, textHash, prompt } = input;
+  const { deps, requestId, conversationId, textHash, prompt, bot, permissionMode } = input;
   const previous = (deps.readRequest ?? readRequest)(requestId);
   if (previous !== null) assertSameRequest(previous, { kind: "send", conversationId, textHash });
   if (previous !== null && previous.state !== "started" && previous.state !== "starting") {
@@ -712,19 +801,36 @@ async function sendLocked(input: {
       const rows = await listConversations(engine);
       const row = rows.find((entry) => entry.conversationId === conversationId);
       if (row === undefined) throw new ChatError(EXIT.notFound, "not_found", "会話が見つかりません", "tailii-host chat list --json で確かめる");
-      if (row.agent !== "claude") throw new ChatError(EXIT.policy, "unsupported_agent", "Codex の会話への送信は未対応です");
+      if (row.agent !== "claude" && row.agent !== "codex") {
+        throw new ChatError(EXIT.policy, "unsupported_agent", `この種類の会話への送信は未対応です: ${row.agent}`);
+      }
+      const agent: "claude" | "codex" = row.agent;
       // 送る先の会話も、許可された作業フォルダの中だけ（止まっていればそのフォルダで起動するため。レビュー指摘 A7）。
       if (!folderAllowed(row.cwd, config.allowedRoots)) {
         throw new ChatError(EXIT.policy, "folder_not_allowed", `この会話の作業フォルダは許可されていません: ${row.cwd}`,
           "~/.tailii/bot.json の allowedRoots に入っている会話だけ送れる");
       }
+      if (agent === "claude" && permissionMode !== undefined) {
+        throw new ChatError(EXIT.usage, "unexpected_permission_mode", "Claude の会話の send は --permission-mode を受け取りません（起動時のモードのまま）");
+      }
+      // Codex の turn の承認の方針と sandbox: 明示の --permission-mode → この会話を始めた new の設定 → Bot なら bot.json
+      // の許可モード（人は会話の設定のまま）。new で厳しくした方針が 2 通目から緩まないように（Fable レビュー 中2）。
+      const inherited = agent === "codex" && permissionMode === undefined
+        ? findLatestCodexTurnRecord(conversationId, deps.requestsDir)?.codexTurn : undefined;
+      // 引き継いだ方針が auto（never）でも、Bot に auto が許されていなければ使わない（Fable 確かめ 低4）。
+      const inheritedAllowed = inherited !== undefined && !(bot && inherited.approvalPolicy === "never" && !config.allowAuto)
+        ? inherited : undefined;
+      const codexTurn = agent !== "codex" ? undefined
+        : permissionMode !== undefined ? codexTurnOptions(permissionMode)
+          : inheritedAllowed ?? (bot ? codexTurnOptions(config.permissionMode) : undefined);
       const live = row.liveSession ?? (await startSession(engine, {
         cwd: row.cwd, name: sessionNameFor(`${requestId}:${conversationId}`), resumeSessionId: conversationId,
-        agentType: "claude", peerCheck: true,
+        agentType: agent, ...(agent === "claude" ? { peerCheck: true } : {}),
       })).session;
       record = {
         requestId, kind: "send", conversationId, session: live, cwd: row.cwd, sentAtMs: deps.now(),
         text: deliverableText(prompt, requestId, deps), textHash,
+        ...(agent === "codex" ? { agent, ...(codexTurn !== undefined ? { codexTurn } : {}) } : {}),
       };
     } else {
       const revived = await retryStarted(engine, deps, record);
@@ -766,9 +872,48 @@ async function cmdStatus(args: ParsedArgs, deps: ChatDeps): Promise<Record<strin
   if (afterId !== undefined && (after === null || after.conversationId !== conversationId)) {
     throw new ChatError(EXIT.notFound, "request_not_found", "この会話への依頼 ID の記録がありません（送る前に失敗した依頼は記録されない）");
   }
-  const stateOf = deps.state ?? ((id: string) => conversationState(id));
+  const agent = after?.agent ?? conversationAgent(deps, conversationId);
+  const claudeStateOf = deps.state ?? ((id: string) => conversationState(id));
   const transcriptOf = deps.transcript ?? ((id: string, cwdHint?: string) =>
     findTranscript(id, { store: deps.store(), ...(cwdHint !== undefined ? { cwdHint } : {}) }));
+  // Codex は rollout（返答と処理中の判定）。engine は 1 本だけ遅延で開いて使い回す（会話名の生存と設問の問い合わせ。
+  // Fable レビュー 低1・低2）。rollout がまだ無ければ（new の直後）ループの中で探し直す（低5）。
+  let codexRollout = agent === "codex" ? codexRolloutOf(deps, conversationId) : null;
+  let codexEngine: EngineConnection | null | undefined;
+  const codexEngineConn = async (): Promise<EngineConnection | null> => {
+    if (codexEngine === undefined) {
+      try { codexEngine = await deps.connect(); } catch { codexEngine = null; }
+    }
+    return codexEngine;
+  };
+  let codexAlive: boolean | undefined;
+  const codexIsAlive = async (): Promise<boolean> => {
+    if (codexAlive !== undefined) return codexAlive;
+    const sessions = conversationSessionNames(deps, conversationId);
+    if (sessions.length === 0) return (codexAlive = false);
+    const engine = await codexEngineConn();
+    if (engine === null) return (codexAlive = true); // 確かめられないときは止まったと決めつけない。
+    for (const session of sessions) {
+      try {
+        if (await sessionAlive(engine, session)) return (codexAlive = true);
+      } catch {
+        return (codexAlive = true);
+      }
+    }
+    return (codexAlive = false);
+  };
+  const readNow = async (): Promise<{ state: ConversationState; lines: TranscriptLine[] | null }> => {
+    if (agent !== "codex") {
+      const transcript = transcriptOf(conversationId, after?.cwd);
+      return { state: claudeStateOf(conversationId), lines: transcript === null ? null : readTranscriptLines(transcript.file) };
+    }
+    if (codexRollout === null) codexRollout = codexRolloutOf(deps, conversationId);
+    const snapshot = codexRollout === null ? null : readCodexRollout(codexRollout);
+    const state: ConversationState = snapshot?.busy === true ? "busy" : (await codexIsAlive()) ? "idle" : "not_running";
+    return { state, lines: snapshot?.lines ?? null };
+  };
+  // Codex の設問は登録簿に出ないので、処理中のあいだ hub に聞く（数秒おき）。
+  let codexQuestionCheckedAtMs = Number.NEGATIVE_INFINITY;
   const deadline = deps.now() + Math.min(waitSec, 100) * 1000;
   // 送信が未確定（started）の依頼は、届いたかを hub の受領の照会で確かめる（会話の記録だけでは、設問の表示中に保留された
   // 送信を「届いていない」と取り違える。2 周目レビュー 1）。sent は hub が注入の完了を返したもの。
@@ -776,24 +921,37 @@ async function cmdStatus(args: ParsedArgs, deps: ChatDeps): Promise<Record<strin
   if (after !== null) {
     delivery = after.state === "started" ? await queryDelivery(deps, after) : "delivered";
   }
+  try {
   for (;;) {
-    const state = stateOf(conversationId);
-    const transcript = transcriptOf(conversationId, after?.cwd);
-    if (transcript === null && after === null) {
+    const now = await readNow();
+    let state = now.state;
+    const transcriptLines = now.lines;
+    if (transcriptLines === null && after === null) {
       throw new ChatError(EXIT.notFound, "not_found", "会話が見つかりません", "tailii-host chat list --json で確かめる");
     }
-    const lines = transcript === null ? [] : readTranscriptLines(transcript.file);
-    const read = readReply(lines, after !== null ? { sentAtMs: after.sentAtMs, text: after.text } : undefined);
+    const lines = transcriptLines ?? [];
+    const read = readReply(lines, after !== null ? {
+      sentAtMs: after.sentAtMs, text: after.text,
+      ...(after.agent === "codex" ? { clientId: clientMessageIdFor(after.requestId) } : {}),
+    } : undefined);
+    if (agent === "codex" && state === "busy" && deps.now() - codexQuestionCheckedAtMs >= 3_000) {
+      codexQuestionCheckedAtMs = deps.now();
+      const engine = await codexEngineConn();
+      if (engine !== null && await hasPendingQuestionOn(engine, deps, conversationId)) state = "waiting";
+    }
     // 完了は待機（idle）か止まっている（not_running）で返答があるとき。承認・設問の入力待ち（waiting）と処理中は終わって
     // いない（レビュー指摘 A6・2 周目レビュー 3）。
     const complete = (state === "idle" || state === "not_running") && read.found && read.reply !== null;
     // 承認・設問の答え待ちは待っても進まない（人か Bot が答えるまで）ので、すぐ返して中身を見せる（第 2 段）。
     const approvals = state === "not_running" ? [] : pendingApprovalsOf(deps, conversationId);
     if (complete || deps.now() >= deadline || state === "waiting" || approvals.length > 0) {
-      const waiting = await waitingDetails(deps, conversationId, state, approvals);
+      // engine は設問を聞くとき（waiting）だけ開く（Fable 確かめ 低5）。
+      const waiting = await waitingDetails(deps, conversationId, state, approvals,
+        agent === "codex" && state === "waiting" ? (await codexEngineConn()) ?? undefined : undefined);
       return {
         conversationId, state: waiting.state, complete,
         ...(waiting.detail !== undefined ? { waiting: waiting.detail } : {}),
+        ...(agent === "codex" ? { agent } : {}),
         ...(afterId !== undefined ? { after: afterId, received: read.found || delivery === "delivered", delivery } : {}),
         // 届いたか分からない送信で、この会話の後ろの送信が止まっている（記録に発話があっても hub は解かない）。
         // Bot には解けない（3 周目レビュー 2）。
@@ -803,10 +961,54 @@ async function cmdStatus(args: ParsedArgs, deps: ChatDeps): Promise<Record<strin
     }
     await deps.sleep(1_000);
   }
+  } finally {
+    if (codexEngine) await codexEngine.close();
+  }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
 // 第 2 段: 承認・設問・開き直し・画面
+
+/**
+ * Bot の許可モードを Codex の承認の方針と sandbox にする（sandbox は常に作業フォルダの中だけ書ける workspace-write。
+ * 何でもできる danger-full-access は使わない）。人が指定しなければ会話の設定のまま（undefined）。
+ */
+export function codexTurnOptions(mode: PermissionMode | undefined): CodexTurnOptions | undefined {
+  switch (mode) {
+    case undefined: return undefined;
+    // プラン以外は通常のモードを明示する（App Server は thread にモードを残すので、プランで始めた会話を戻せるように。
+    // アプリも毎 turn 明示している。Fable レビュー 中2）。
+    case "default": return { approvalPolicy: "untrusted", sandbox: "workspace-write", collaborationMode: "default" };
+    case "acceptEdits": return { approvalPolicy: "on-request", sandbox: "workspace-write", collaborationMode: "default" };
+    case "plan": return { approvalPolicy: "on-request", sandbox: "workspace-write", collaborationMode: "plan" };
+    case "auto": return { approvalPolicy: "never", sandbox: "workspace-write", collaborationMode: "default" };
+  }
+}
+
+function codexRolloutOf(deps: ChatDeps, threadId: string): string | null {
+  return (deps.codexRollout ?? ((id: string) => findCodexRollout(id)))(threadId);
+}
+
+/** 会話のエージェント（メタ → Claude の記録 → Codex の rollout の順に見る）。 */
+function conversationAgent(deps: ChatDeps, conversationId: string): "claude" | "codex" {
+  const meta = deps.store().all().find((entry) =>
+    entry.providerSessionId === conversationId || entry.claudeSessionId === conversationId);
+  if (meta !== undefined) return meta.agent === "codex" ? "codex" : "claude";
+  if (deps.transcript !== undefined || findTranscript(conversationId, { store: deps.store() }) !== null) return "claude";
+  return codexRolloutOf(deps, conversationId) !== null ? "codex" : "claude";
+}
+
+/** hub に、会話がいま設問で待っているかを聞く（聞けなければ false）。 */
+async function hasPendingQuestionOn(engine: EngineConnection, deps: ChatDeps, conversationId: string): Promise<boolean> {
+  try {
+    for (const session of conversationSessionNames(deps, conversationId)) {
+      if (await pendingQuestionOn(engine, session) !== null) return true;
+    }
+  } catch {
+    // 聞けなければ設問なし扱い（状態は busy のまま）。
+  }
+  return false;
+}
 
 /** 会話 id を収容している Tailii の会話名（メタから）。 */
 function conversationSessionNames(deps: ChatDeps, conversationId: string): string[] {
@@ -852,6 +1054,7 @@ async function waitingDetails(
   conversationId: string,
   state: ConversationState,
   approvals: PendingApprovalRecord[],
+  openEngine?: EngineConnection,
 ): Promise<{ state: string; detail?: Record<string, unknown> }> {
   if (approvals.length > 0) {
     return {
@@ -868,13 +1071,14 @@ async function waitingDetails(
   const sessions = conversationSessionNames(deps, conversationId);
   if (sessions.length === 0) return { state };
   try {
-    const question = await withEngine(deps, async (engine) => {
+    const find = async (engine: EngineConnection): Promise<PendingQuestion | null> => {
       for (const session of sessions) {
         const found = await pendingQuestionOn(engine, session);
         if (found !== null) return found;
       }
       return null;
-    });
+    };
+    const question = openEngine !== undefined ? await find(openEngine) : await withEngine(deps, find);
     return question !== null ? { state: "waiting_answer", detail: { question: questionView(question) } } : { state };
   } catch {
     return { state }; // 聞けなくても状態は返す。
@@ -1083,10 +1287,13 @@ async function cmdAttach(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promis
     const row = rows.find((entry) => entry.conversationId === conversationId);
     if (row === undefined) throw new ChatError(EXIT.notFound, "not_found", "会話が見つかりません", "tailii-host chat list で確かめる");
     if (row.liveSession !== undefined) return row.liveSession;
-    if (row.agent !== "claude") throw new ChatError(EXIT.policy, "unsupported_agent", "Codex の会話は未対応です");
-    // 止まっていれば Tailii で続きから起動して開く（他所で動いていれば起動しない）。
+    if (row.agent !== "claude" && row.agent !== "codex") {
+      throw new ChatError(EXIT.policy, "unsupported_agent", `この種類の会話は未対応です: ${row.agent}`);
+    }
+    // 止まっていれば Tailii で続きから起動して開く（Claude は他所で動いていれば起動しない）。
     return (await startSession(engine, {
-      cwd: row.cwd, name: freshSessionName(), resumeSessionId: conversationId, agentType: "claude", peerCheck: true,
+      cwd: row.cwd, name: freshSessionName(), resumeSessionId: conversationId, agentType: row.agent,
+      ...(row.agent === "claude" ? { peerCheck: true } : {}),
     })).session;
   });
   return { attach: session };
@@ -1105,7 +1312,7 @@ const USAGE = `usage: tailii-host chat <list|new|send|status|answer|approve|take
   approve <conversationId> <承認ID> allow|deny [--reason <理由>] [--json]
   take-over <conversationId> [--interrupt] [--yes] [--no-attach] [--json]
   attach <conversationId>
-  new … [--backend herdr|tmux] [--herdr-session <名前>]
+  new … [--agent claude|codex] [--backend herdr|tmux] [--herdr-session <名前>]
 `;
 
 function render(deps: ChatDeps, json: boolean, payload: Record<string, unknown>, human: string): void {

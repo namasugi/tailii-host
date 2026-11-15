@@ -12,6 +12,9 @@ import { SessionMetadataStore } from "../../sessions/sessionMetadataStore.js";
 import { normalizeForTextMatch } from "../../shared/invisibleText.js";
 import { unwrapPastedContent } from "../../shared/pastedContent.js";
 import { normalizeTextForPaste } from "../../backend/tmux.js";
+import { defaultCodexHome } from "../../codex/codexSessionStore.js";
+import { isCompressedRollout, isRolloutFileName, readCompressedRollout } from "../../codex/rolloutFile.js";
+import { isVisibleCodexMessagePhase } from "../../codex/codexMessagePhase.js";
 
 export type PermissionMode = "default" | "acceptEdits" | "plan" | "auto";
 const PERMISSION_MODES: readonly PermissionMode[] = ["default", "acceptEdits", "plan", "auto"];
@@ -116,6 +119,17 @@ export interface RequestRecord {
   state?: "starting" | "started" | "sent";
   /** 届いたか分からないまま人に回した（needs_human）。打ち直しでは送り直さない（5 周目レビュー 1）。 */
   needsHuman?: boolean;
+  /** 会話のエージェント（省略は claude。Codex は codex_turn_start で送り、記録は rollout）。 */
+  agent?: "claude" | "codex";
+  /** Codex の turn の承認の方針と sandbox（打ち直しでも同じ値で送る: hub は明示の再送で中身の一致を見る）。 */
+  codexTurn?: CodexTurnOptions;
+}
+
+/** Codex の turn の設定（`codex_turn_start` の approvalPolicy / sandbox / collaborationMode）。 */
+export interface CodexTurnOptions {
+  approvalPolicy: "untrusted" | "on-request" | "never";
+  sandbox: "read-only" | "workspace-write" | "danger-full-access";
+  collaborationMode?: "plan" | "default";
 }
 
 export function requestsDir(home: string = os.homedir()): string {
@@ -267,10 +281,12 @@ export function findTranscript(
   return null;
 }
 
-interface TranscriptLine {
+export interface TranscriptLine {
   role: "user" | "assistant";
   text: string;
   atMs: number;
+  /** 送った側の発話 id（Codex の `client_id` = `codex_turn_start.clientUserMessageId`）。照合は本文より先にこれで。 */
+  clientId?: string;
 }
 
 function textOf(content: unknown): string {
@@ -334,11 +350,143 @@ export function normalizeForReplyMatch(text: string): string {
   return normalizeForTextMatch(unwrapPastedContent(normalizeTextForPaste(text)).normalize("NFC"));
 }
 
+// ---- Codex（rollout） ----
+
+/** Codex の会話（thread id）の rollout を探す（`~/.codex/sessions/YYYY/MM/DD/rollout-…-<id>.jsonl[.zst]`）。新しい日付から。 */
+export function findCodexRollout(threadId: string, codexHome: string = defaultCodexHome()): string | null {
+  if (!/^[A-Za-z0-9-]{8,128}$/.test(threadId)) return null;
+  const root = path.join(codexHome, "sessions");
+  const sorted = (dir: string): string[] => {
+    try {
+      return fs.readdirSync(dir).filter((name) => /^\d+$/.test(name)).sort().reverse();
+    } catch {
+      return [];
+    }
+  };
+  for (const year of sorted(root)) {
+    for (const month of sorted(path.join(root, year))) {
+      for (const day of sorted(path.join(root, year, month))) {
+        const dir = path.join(root, year, month, day);
+        let names: string[];
+        try {
+          names = fs.readdirSync(dir);
+        } catch {
+          continue;
+        }
+        const hit = names.find((name) => isRolloutFileName(name) && name.includes(threadId));
+        if (hit !== undefined) return path.join(dir, hit);
+      }
+    }
+  }
+  return null;
+}
+
+function readRolloutText(file: string): string | null {
+  try {
+    if (!isCompressedRollout(file)) return fs.readFileSync(file, "utf8");
+    return readCompressedRollout(file, 256 * 1024 * 1024)?.toString("utf8") ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function itemText(content: unknown, textType: string): string {
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((part): part is { type: string; text: string } =>
+      typeof part === "object" && part !== null && (part as { type?: unknown }).type === textType &&
+      typeof (part as { text?: unknown }).text === "string")
+    .map((part) => part.text)
+    .join("\n");
+}
+
+/** Codex の rollout から、人の発話と Codex の文章を古い順に読む（思考・ツール・内部の区分は除く）。 */
+export function readCodexRolloutLines(file: string): TranscriptLine[] {
+  return readCodexRollout(file).lines;
+}
+
+/**
+ * Codex の rollout を 1 回読んで、発話と処理中か（最後の turn が始まったまま終わっていない）を返す
+ * （status の待ちで毎秒 2 回全体を読まない。Fable レビュー 低2）。
+ */
+export function readCodexRollout(file: string): { lines: TranscriptLine[]; busy: boolean } {
+  const raw = readRolloutText(file);
+  if (raw === null) return { lines: [], busy: false };
+  const out: TranscriptLine[] = [];
+  let busy = false;
+  for (const line of raw.split("\n")) {
+    if (line.length === 0) continue;
+    let obj: Record<string, unknown>;
+    try {
+      obj = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (obj["type"] !== "event_msg") continue;
+    const payload = obj["payload"] as Record<string, unknown> | undefined;
+    if (payload === undefined) continue;
+    if (payload["type"] === "task_started") { busy = true; continue; }
+    if (payload["type"] === "task_complete" || payload["type"] === "turn_aborted") { busy = false; continue; }
+    const ts = typeof obj["timestamp"] === "string" ? Date.parse(obj["timestamp"]) : Number.NaN;
+    const atMs = Number.isFinite(ts) ? ts : 0;
+    // 0.16x: item_completed（UserMessage / AgentMessage）。旧版: user_message / agent_message。
+    if (payload["type"] === "item_completed") {
+      const item = payload["item"] as Record<string, unknown> | undefined;
+      if (item?.["type"] === "UserMessage") {
+        const text = itemText(item["content"], "text").trim();
+        const clientId = typeof item["client_id"] === "string" ? item["client_id"] : undefined;
+        if (text.length > 0) out.push({ role: "user", text, atMs, ...(clientId !== undefined ? { clientId } : {}) });
+      } else if (item?.["type"] === "AgentMessage" && isVisibleCodexMessagePhase(item["phase"])) {
+        const text = itemText(item["content"], "Text").trim();
+        if (text.length > 0) out.push({ role: "assistant", text, atMs });
+      }
+    } else if (payload["type"] === "user_message" && typeof payload["message"] === "string") {
+      const text = payload["message"].trim();
+      if (text.length > 0) out.push({ role: "user", text, atMs });
+    } else if (payload["type"] === "agent_message" && typeof payload["message"] === "string" &&
+      isVisibleCodexMessagePhase(payload["phase"])) {
+      const text = payload["message"].trim();
+      if (text.length > 0) out.push({ role: "assistant", text, atMs });
+    }
+  }
+  return { lines: out, busy };
+}
+
+/** Codex の会話が処理中か（rollout の最後の turn が始まったまま終わっていない）。 */
+export function codexRolloutBusy(file: string): boolean {
+  return readCodexRollout(file).busy;
+}
+
+/**
+ * その会話へ Codex の turn の設定（`codexTurn`）を付けて送った最新の依頼の記録（new でも send でも）。Codex の send が
+ * 前の方針を引き継ぐ（new で厳しくした方針が緩まない・プランから戻した後にまたプランへ戻らない。Fable レビュー 中2・確かめ 低3）。
+ */
+export function findLatestCodexTurnRecord(conversationId: string, dir: string = requestsDir()): RequestRecord | null {
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return null;
+  }
+  let latest: RequestRecord | null = null;
+  for (const name of names) {
+    if (!/^[0-9a-f]{32}\.json$/.test(name)) continue;
+    try {
+      const raw = JSON.parse(fs.readFileSync(path.join(dir, name), "utf8")) as RequestRecord;
+      if (raw.conversationId !== conversationId || raw.codexTurn === undefined) continue;
+      if (latest === null || raw.sentAtMs > latest.sentAtMs) latest = raw;
+    } catch {
+      // 壊れた記録は飛ばす。
+    }
+  }
+  return latest;
+}
+
 /**
  * 返答を読む。`after` があれば、その依頼の発話（送った時刻以降で本文が一致する最初の人の発話）の後の Claude の文章を、
  * 次の人の発話の手前まで。無ければ最後の人の発話の後の文章。依頼の発話がまだ記録に無ければ `found: false`。
  */
-export function readReply(lines: readonly TranscriptLine[], after?: { sentAtMs: number; text: string }): {
+export function readReply(lines: readonly TranscriptLine[], after?: { sentAtMs: number; text: string; clientId?: string }): {
   found: boolean;
   reply: string | null;
 } {
@@ -348,8 +496,16 @@ export function readReply(lines: readonly TranscriptLine[], after?: { sentAtMs: 
     // 末尾だけの照合は、定型の締め文で終わる別の発話を取り違える（2 周目レビュー 9）。正規化した本文の完全一致で探す。
     // 起点は送る前の時刻（同じホストの時計なので、記録の時刻がそれより前になることはない。遡ると直前の同じ短文を
     // 取り違える。3 周目レビュー 7）。
-    start = lines.findIndex((line) => line.role === "user" && line.atMs >= after.sentAtMs &&
-      normalizeForReplyMatch(line.text) === want);
+    // 送った発話の id が記録に残る（Codex の client_id）なら、それで照合する（本文の書き換えに左右されない）。
+    start = after.clientId !== undefined
+      ? lines.findIndex((line) => line.role === "user" && line.clientId === after.clientId)
+      : -1;
+    if (start < 0) {
+      // 本文で探すときも、別の送信 id が付いた発話（同じ本文の別の依頼）は拾わない（Fable レビュー 低3）。
+      start = lines.findIndex((line) => line.role === "user" && line.atMs >= after.sentAtMs &&
+        (after.clientId === undefined || line.clientId === undefined || line.clientId === after.clientId) &&
+        normalizeForReplyMatch(line.text) === want);
+    }
     if (start < 0) return { found: false, reply: null };
   } else {
     for (let i = lines.length - 1; i >= 0; i--) {

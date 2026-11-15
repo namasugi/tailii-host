@@ -152,6 +152,10 @@ describe("herdr JSON パーサ", () => {
         }),
       ),
     ).toBe("w4:p9");
+    // 10 個目からのワークスペースは英字（`wA`。0.9.5 実測）。数字だけに絞ると作った pane を解決できない。
+    expect(parseHerdrCreatedTabPaneId(JSON.stringify({
+      result: { type: "tab_created", root_pane: { pane_id: "wA:p1", tab_id: "wA:t1" } },
+    }))).toBe("wA:p1");
     expect(parseHerdrCreatedTabPaneId(JSON.stringify({ result: { type: "tab_created" } }))).toBeNull();
     expect(parseHerdrCreatedTabPaneId("not json")).toBeNull();
     expect(parseHerdrForegroundCommand(processInfoJson("claude"))).toBe("claude");
