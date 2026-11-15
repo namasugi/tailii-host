@@ -241,6 +241,24 @@ describe("golden roundtrip", () => {
     }
   });
 
+  it("chat_pending_query / _result と session_start の起動先の明示を読み書きできる（chat 第 2 段）", () => {
+    const result = decodeControlMessage(JSON.stringify({
+      type: "chat_pending_query_result", v: 2, id: "q", session: "s-1", processing: true,
+      question: { id: "toolu_1", questions: [{ header: "h", question: "q", multiSelect: false, options: [{ label: "A", description: "" }] }] },
+    }));
+    expect(result).toMatchObject({ type: "chat_pending_query_result", question: { id: "toolu_1", questions: [{ options: [{ label: "A" }] }] } });
+    expect(decodeControlMessage(encodeControlMessage(result))).toEqual(result);
+    expect(decodeControlMessage('{"type":"chat_pending_query","v":2,"id":"q","session":"s-1"}'))
+      .toEqual({ type: "chat_pending_query", v: 2, id: "q", session: "s-1" });
+    const start = decodeControlMessage(JSON.stringify({ type: "session_start", v: 2, id: "x", cwd: "/w", name: "s",
+      backend: "herdr", herdrSession: "work" }));
+    expect(start).toMatchObject({ backend: "herdr", herdrSession: "work" });
+    const bad = decodeControlMessage(JSON.stringify({ type: "session_start", v: 2, id: "x", cwd: "/w", name: "s",
+      backend: "screen", herdrSession: "../x" }));
+    expect(bad).not.toHaveProperty("backend");
+    expect(bad).not.toHaveProperty("herdrSession");
+  });
+
   it("chat_receipt_query_result は未知の status を decode で拒否する", () => {
     expect(() => decodeControlMessage(
       '{"id":"x","status":"accepted","type":"chat_receipt_query_result","v":1}',

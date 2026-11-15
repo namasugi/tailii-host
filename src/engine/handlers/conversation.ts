@@ -130,6 +130,25 @@ export const conversationHandlers: HandlerRegistry = {
     })();
   },
 
+  chat_pending_query: (message, ctx) => {
+    const { writer, state } = ctx;
+    const v = state.negotiatedVersion;
+    void (async () => {
+      try {
+        const id = randomUUID();
+        const result = await ctx.hubRpc<Extract<HubServerMessage, { type: "hub_state_response" }>>(
+          { type: "hub_state_request", id, session: message.session }, id, 5_000,
+        );
+        writer.write({
+          type: "chat_pending_query_result", v, id: message.id, session: message.session, processing: result.processing,
+          ...(result.pendingQuestion !== null ? { question: result.pendingQuestion } : {}),
+        });
+      } catch (error) {
+        writeError(writer, v, message.id, "chat_pending_query_failed", String(error));
+      }
+    })();
+  },
+
   chat_receipt_query: (message, ctx) => {
     const { writer, state } = ctx;
     const v = state.negotiatedVersion;

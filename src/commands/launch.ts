@@ -277,6 +277,11 @@ export type EngineLauncher = (
      * 作って名前を付けた後）に呼ぶ。false なら起動しない。相手が herdr のタブなら、その herdr セッション・ワークスペースへ。
      */
     takeover?: LaunchTakeover | null;
+    /**
+     * 起動先の明示（`tailii-host chat new --backend / --herdr-session`。tailii-chat-cli 第 2 段）。設定より優先し、
+     * herdr セッションを明示したときは、動いていなくても `tailii` へ振り替えずに起動失敗にする。開き直しの起動先が先。
+     */
+    placement?: { backend?: SessionBackendKind; herdrSession?: string } | null;
   },
 ) => Promise<{ exitCode: number; errorText: string; providerSessionId?: string }>;
 
@@ -526,9 +531,12 @@ export function makeSessionLauncher(options: {
       // 開き直しで相手が herdr のタブなら、設定に関係なくその herdr セッションへ（同じ場所で続ける）。
       backend: launchOptions?.takeover?.herdr != null
         ? "herdr"
-        : typeof backendOption === "function" ? backendOption() : backendOption,
-      herdrSession: launchOptions?.takeover?.herdr?.session ??
+        : launchOptions?.placement?.backend ??
+          (typeof backendOption === "function" ? backendOption() : backendOption),
+      herdrSession: launchOptions?.takeover?.herdr?.session ?? launchOptions?.placement?.herdrSession ??
         (typeof options.herdrSession === "function" ? options.herdrSession() : options.herdrSession ?? HERDR_DEFAULT_SESSION),
+      ...(launchOptions?.takeover?.herdr == null && launchOptions?.placement?.herdrSession !== undefined
+        ? { herdrSessionStrict: true } : {}),
       ...(launchOptions?.takeover != null
         ? {
             beforeRun: launchOptions.takeover.terminate,
@@ -683,6 +691,11 @@ export async function launchCore(options: {
   beforeRun?: () => Promise<boolean>;
   /** herdr: この pane と同じワークスペースに新しいタブを作る（peer-takeover の相手のタブ）。 */
   herdrPlacementPaneId?: string;
+  /**
+   * herdr セッションが明示された（`tailii-host chat new --herdr-session`）。動いていなくても `tailii` へ振り替えず、
+   * 理由を返して起動しない（tailii-chat-cli 第 2 段）。`tailii` 自身は Tailii のものなので従来どおり起動する。
+   */
+  herdrSessionStrict?: boolean;
   /** herdr セッションのソケットのファイルがあるか（テスト注入用。既定は実ファイル）。 */
   herdrSocketExists?: (herdrSession: string) => boolean;
   /** herdr 実行ファイルの絶対パス（backend=herdr のときのみ使用）。 */
@@ -778,6 +791,7 @@ export async function launchCore(options: {
       herdrSession: options.herdrSession ?? HERDR_DEFAULT_SESSION,
       ...(options.beforeRun !== undefined ? { beforeRun: options.beforeRun } : {}),
       ...(options.herdrPlacementPaneId !== undefined ? { placementPaneId: options.herdrPlacementPaneId } : {}),
+      ...(options.herdrSessionStrict === true ? { herdrSessionStrict: true } : {}),
       ...(options.herdrSocketExists !== undefined ? { herdrSocketExists: options.herdrSocketExists } : {}),
       injectedPath: options.path,
       env,
@@ -982,6 +996,8 @@ async function launchHerdrPane(options: {
   beforeRun?: () => Promise<boolean>;
   /** この pane と同じワークスペースに新しいタブを作る（peer-takeover の相手のタブ）。 */
   placementPaneId?: string;
+  /** herdr セッションの明示（動いていなければ振り替えずに起動失敗。tailii-chat-cli 第 2 段）。 */
+  herdrSessionStrict?: boolean;
   /** herdr セッションのソケットのファイルがあるか（テスト注入用。既定は実ファイル）。 */
   herdrSocketExists?: (herdrSession: string) => boolean;
   injectedPath: string;
@@ -1096,6 +1112,13 @@ async function launchHerdrPane(options: {
     errorSink(
       `tailii launch: herdr セッション '${herdrSession}' に問い合わせできませんでした` +
         `${detail.length > 0 ? `: ${detail}` : ` (${paneList.code})`}\n`,
+    );
+    return 1;
+  }
+  if (paneList.code !== 0 && herdrSession !== HERDR_TAILII_SESSION && options.herdrSessionStrict === true) {
+    errorSink(
+      `tailii launch: herdr セッション '${herdrSession}' が動いていません。指定どおりに入れられないので起動していません` +
+        `（herdr --session ${herdrSession} で起動するか、指定を外してください）\n`,
     );
     return 1;
   }

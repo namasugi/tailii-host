@@ -61,6 +61,15 @@ import { claudePidOfHook } from "../sessions/claudeLiveStatus.js";
 import { ensureHubDaemon } from "../hub/hubDaemonClient.js";
 import { decodeHubServerLine, encodeHubMessage, type HubPushEvent } from "../hub/hubProtocol.js";
 import { closeAfterReply, replyDecisionApplied } from "./decisionResult.js";
+import {
+  botMayApprove,
+  defaultApprovalsBase,
+  isCliSession,
+  removePendingApproval,
+  waitForMailboxDecision,
+  writePendingApproval,
+} from "./approvalMailbox.js";
+import { PushDeviceStore } from "../push/pushDeviceStore.js";
 import { ObservationLog, defaultObservationBase } from "../shared/observationLog.js";
 import { parsePermissionMode } from "../shared/permissionMode.js";
 import { resolveHubSocketPath, resolveSocketPath } from "../shared/socketPath.js";
@@ -179,6 +188,19 @@ export interface RunHookOptions {
   resolveClaudePid?: () => number | undefined;
   /** Session Hub daemon の常駐保証（注入）。省略時は何もしない。UserPromptSubmit でのみ呼ぶ。 */
   ensureHub?: () => void;
+  /**
+   * 承認の受け渡し口（`approvalMailbox.ts`）のベース。待っている承認を書き出し、`tailii-host chat approve` の決定を
+   * アプリの返事と並べて待つ。省略時は使わない（テスト密閉）。runHookCommand が既定パスを渡す。
+   */
+  approvalsBase?: string;
+  /** 受け渡し口の決定ファイルを見る間隔（ms。既定 500）。 */
+  approvalsPollMs?: number;
+  /**
+   * 承認できる人が居るか（`tailii-host chat` が起動した会話でだけ聞く）: 通知を受ける端末が登録されている、または
+   * Bot に承認が許されている。false なら、アプリがつながっていないとき 540 秒待たずに拒否する（tailii-chat-cli 第 2 段）。
+   * 省略時は「居る」とみなす（従来どおり待つ）。
+   */
+  approverAvailable?: () => boolean;
 }
 
 export interface HookRunResult {
@@ -332,31 +354,76 @@ export async function runHookCore(options: RunHookOptions): Promise<HookRunResul
   const tracker: ApprovalTracker = { id: null, announced: false };
   const flowOptions: RunHookOptions = { ...options, approvalTracker: tracker };
   const socketPath = options.socketPath;
+  // 承認 id はここで 1 つに決める（アプリへの要求・受け渡し口の記録・つなぎ直しの送り直しで同じ id）。
+  const requestId = randomUUID();
+  const mailbox = options.approvalsBase;
+  const stopMailbox = new AbortController();
+  let decidedBy: "cli" | undefined;
+  let finalResult: HookRunResult | null = null;
+  if (mailbox !== undefined) {
+    writePendingApproval({
+      id: requestId, session, tool: parsed.toolName, summary, cwd: parsed.cwd, atMs: Date.now(), pid: process.pid,
+      ...(parsed.agentId !== undefined && parsed.agentType !== undefined
+        ? { agentId: parsed.agentId, agentType: parsed.agentType } : {}),
+    }, mailbox);
+  }
   try {
     const socket = await connectUnixSocket(socketPath);
-    if (socket) {
-      // 接続済み（アプリ前面）。従来経路をそのまま実行する（push しない, 7.1）。
-      return await sendRequestAndReflect(socket, parsed, summary, diff, flowOptions, deadlineAtMs);
+    // `tailii-host chat` が起動した会話で、アプリがつながっておらず承認できる人も居なければ、540 秒待たずに拒否する
+    // （Bot は待つだけで、誰にも知らされない。tailii-chat-cli 第 2 段）。
+    if (socket === null && isCliSession(session) && options.approverAvailable !== undefined && !options.approverAvailable()) {
+      return deny(NO_APPROVER_REASON);
     }
-
-    // === connect 不能ブランチ（Req 2.1 / 8.1〜8.3） ===
-    return await publishPendingAndAwaitReconnect(
-      socketPath,
-      parsed,
-      summary,
-      diff,
-      flowOptions,
-      deadlineAtMs,
-      randomUUID(),
-      false,
-    );
+    const flow = socket
+      // 接続済み（アプリ前面）。従来経路をそのまま実行する（push しない, 7.1）。
+      ? sendRequestAndReflect(socket, parsed, summary, diff, flowOptions, deadlineAtMs, requestId)
+      // === connect 不能ブランチ（Req 2.1 / 8.1〜8.3） ===
+      : publishPendingAndAwaitReconnect(socketPath, parsed, summary, diff, flowOptions, deadlineAtMs, requestId, false);
+    if (mailbox === undefined) return await flow;
+    // アプリの返事と、受け渡し口の決定（`tailii-host chat approve`）の早い方で決める。受け渡し口が先なら、アプリへの
+    // 要求は待たずに終える（hook はこの後すぐ終了する）。
+    const fromMailbox = waitForMailboxDecision(session, requestId, deadlineAtMs, stopMailbox.signal, {
+      base: mailbox, ...(options.approvalsPollMs !== undefined ? { intervalMs: options.approvalsPollMs } : {}),
+    }).then((decision): HookRunResult | null => {
+      if (decision === null) return null;
+      decidedBy = "cli";
+      return decision.decision === "allow"
+        ? allow(decision.reason ?? "Approved via tailii-host chat")
+        : deny(decision.reason ?? "Denied via tailii-host chat");
+    });
+    const first = await Promise.race([flow, fromMailbox.then((result) => result ?? flow)]);
+    finalResult = first;
+    return first;
   } finally {
+    stopMailbox.abort();
+    if (mailbox !== undefined) {
+      // CLI が決定を置いていれば、決めた側と決定を残す（CLI の applied の判断に使う）。
+      const decision = finalResult !== null ? permissionDecisionOf(finalResult.stdout) : null;
+      removePendingApproval(session, requestId, mailbox,
+        decision !== null ? { decision, by: decidedBy ?? (finalResult?.stdout.includes("No response within") ? "timeout" : "app") } : undefined);
+    }
     if (tracker.announced && tracker.id !== null) {
       // 片付けの失敗（例外を含む）で hook の結果を変えない。送信は engine relay の短い上限（250ms）で打ち切られる。
       try { await clearRemotePendingIfNeeded(tracker.id, options); } catch { /* 最善努力。 */ }
     }
   }
 }
+
+/** hook の出力から allow / deny を読む（読めなければ null）。 */
+function permissionDecisionOf(stdout: string): "allow" | "deny" | null {
+  try {
+    const value = (JSON.parse(stdout) as { hookSpecificOutput?: { permissionDecision?: unknown } }).hookSpecificOutput?.permissionDecision;
+    return value === "allow" || value === "deny" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 承認できる人が居ないときの拒否の理由（Claude に読ませる）。 */
+export const NO_APPROVER_REASON =
+  "No one can approve this right now (the Tailii app is not connected, no device is registered for notifications, " +
+  "and approvals by the bot are not enabled). Continue in a way that does not need this tool, or stop and report " +
+  "what you need to the user.";
 
 /** 承認をアプリへ知らせたか（runHookCore が終わりに 1 回だけ remote_pending_cleared を出すための記録）。 */
 interface ApprovalTracker {
@@ -1396,6 +1463,18 @@ export async function runHookCommand(args: string[]): Promise<number> {
     retryConnectIntervalSeconds: retryIntervalSeconds,
     heartbeatDir: defaultHeartbeatDir(),
     ensureHub: ensureHubDaemon,
+    approvalsBase: defaultApprovalsBase(),
+    // 承認できる人: 通知を受ける端末（承認の通知を切っていない）か、Bot の承認の許可（tailii-chat-cli 第 2 段）。
+    approverAvailable: () => {
+      if (botMayApprove()) return true;
+      try {
+        return new PushDeviceStore().list().some((device) => device.prefs.approval);
+      } catch {
+        // 例外になったときだけ従来どおり待つ。list() は読めないファイルを黙って飛ばすので、読めない端末は「居ない」扱い
+        // （拒否側）になる。
+        return true;
+      }
+    },
     // 現行 Claude は hook 入力の permission_mode を使う。tmux provider は旧版互換の
     // 欠落時フォールバックとしてだけ呼ばれる。
     ...(effectiveSession !== null

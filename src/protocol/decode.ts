@@ -28,6 +28,7 @@ import {
   isSubagentControlStatus,
   type OfficialAppProvider,
   type QuestionAnswer,
+  type QuestionPromptQuestion,
   type QuestionOption,
   type RemotePendingKind,
   type ServeProcessInfo,
@@ -345,6 +346,16 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         peerCheck: optionalBoolean(raw, "peerCheck"),
         takeOver: decodeTakeOver(raw["takeOver"]),
         allowParallel: optionalBoolean(raw, "allowParallel"),
+        // 起動先の明示（tailii-chat-cli 第 2 段）。既知の値・正しい名前だけ採る。
+        backend: (() => {
+          const value = optionalString(raw, "backend");
+          return value === "tmux" || value === "herdr" ? value : undefined;
+        })(),
+        herdrSession: (() => {
+          const value = optionalString(raw, "herdrSession");
+          // sessionMetadataStore の HERDR_SESSION_NAME_PATTERN と同じ（protocol から sessions を読み込まない）。
+          return value !== undefined && /^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$/.test(value) ? value : undefined;
+        })(),
       });
     }
 
@@ -1040,27 +1051,28 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
       };
     }
 
+    case "chat_pending_query":
+      return { type, v, id: requireString(raw, "id"), session: requireString(raw, "session") };
+
+    case "chat_pending_query_result": {
+      const question = raw["question"];
+      return {
+        type, v,
+        id: requireString(raw, "id"),
+        session: requireString(raw, "session"),
+        processing: requireBoolean(raw, "processing"),
+        ...(question !== undefined && question !== null ? (() => {
+          const obj = requireObject(question, "question");
+          return { question: { id: requireString(obj, "id"), questions: decodeQuestionPromptQuestions(obj) } };
+        })() : {}),
+      };
+    }
+
     case "question_prompt":
       return {
         type, v,
         id: requireString(raw, "id"),
-        questions: requireArray(raw, "questions").map((element) => {
-          const obj = requireObject(element, "questions");
-          return {
-            header: requireString(obj, "header"),
-            question: requireString(obj, "question"),
-            multiSelect: requireBoolean(obj, "multiSelect"),
-            options: requireArray(obj, "options").map((option) => {
-              const optionObj = requireObject(option, "options");
-              // preview は additive フィールド（旧形式は欠落）。
-              return compact<QuestionOption>({
-                label: requireString(optionObj, "label"),
-                description: requireString(optionObj, "description"),
-                preview: optionalString(optionObj, "preview"),
-              });
-            }),
-          };
-        }),
+        questions: decodeQuestionPromptQuestions(raw),
       };
 
     case "question_answer":
@@ -2180,4 +2192,25 @@ function decodeTakeOver(value: unknown): { token: string; interrupt?: boolean } 
   const token = obj["token"];
   if (typeof token !== "string" || token.length === 0 || token.length > 2048) return undefined;
   return obj["interrupt"] === true ? { token, interrupt: true } : { token };
+}
+
+/** 設問の配列（`question_prompt.questions` / `chat_pending_query_result.question.questions`）。 */
+function decodeQuestionPromptQuestions(raw: Record<string, unknown>): QuestionPromptQuestion[] {
+  return requireArray(raw, "questions").map((element) => {
+    const obj = requireObject(element, "questions");
+    return {
+      header: requireString(obj, "header"),
+      question: requireString(obj, "question"),
+      multiSelect: requireBoolean(obj, "multiSelect"),
+      options: requireArray(obj, "options").map((option) => {
+        const optionObj = requireObject(option, "options");
+        // preview は additive フィールド（旧形式は欠落）。
+        return compact<QuestionOption>({
+          label: requireString(optionObj, "label"),
+          description: requireString(optionObj, "description"),
+          preview: optionalString(optionObj, "preview"),
+        });
+      }),
+    };
+  });
 }

@@ -24,6 +24,10 @@ export interface BotConfig {
   permissionMode: PermissionMode;
   /** `auto`（何でも許可）を Bot に許すか。既定は不可。 */
   allowAuto: boolean;
+  /** Bot に承認の「許可」を許すか（`chat approve … allow`）。既定は不可（拒否はいつでもできる）。第 2 段。 */
+  allowApprove: boolean;
+  /** Bot に他所で動いている会話の開き直し（`chat take-over`）を許すか。既定は不可。第 2 段。 */
+  allowTakeOver: boolean;
 }
 
 export function botConfigPath(home: string = os.homedir()): string {
@@ -31,7 +35,9 @@ export function botConfigPath(home: string = os.homedir()): string {
 }
 
 export function loadBotConfig(file: string = botConfigPath()): BotConfig {
-  const config: BotConfig = { allowedRoots: [os.homedir()], permissionMode: "acceptEdits", allowAuto: false };
+  const config: BotConfig = {
+    allowedRoots: [os.homedir()], permissionMode: "acceptEdits", allowAuto: false, allowApprove: false, allowTakeOver: false,
+  };
   let raw: unknown;
   try {
     raw = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -46,6 +52,8 @@ export function loadBotConfig(file: string = botConfigPath()): BotConfig {
     config.allowedRoots = roots;
   }
   if (typeof obj["allowAuto"] === "boolean") config.allowAuto = obj["allowAuto"];
+  if (typeof obj["allowApprove"] === "boolean") config.allowApprove = obj["allowApprove"];
+  if (typeof obj["allowTakeOver"] === "boolean") config.allowTakeOver = obj["allowTakeOver"];
   const mode = obj["permissionMode"];
   if (typeof mode === "string" && (PERMISSION_MODES as readonly string[]).includes(mode)) {
     config.permissionMode = mode as PermissionMode;
@@ -175,6 +183,26 @@ export function acquireRequestLock(requestId: string, dir: string = requestsDir(
     } catch { /* 他が先に消した */ }
   }
   return null;
+}
+
+/** `tailii-host chat new` で始めた会話か（依頼の記録に、この会話 id の new がある）。設問に答えてよい条件（第 2 段）。 */
+export function isBotStartedConversation(conversationId: string, dir: string = requestsDir()): boolean {
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return false;
+  }
+  for (const name of names) {
+    if (!/^[0-9a-f]{32}\.json$/.test(name)) continue;
+    try {
+      const raw = JSON.parse(fs.readFileSync(path.join(dir, name), "utf8")) as Partial<RequestRecord>;
+      if (raw.kind === "new" && raw.conversationId === conversationId) return true;
+    } catch {
+      // 壊れた記録は飛ばす。
+    }
+  }
+  return false;
 }
 
 /** busy = 処理中 / waiting = 利用者の入力待ち（承認・設問など） / idle = 待機 / not_running = 止まっている。 */

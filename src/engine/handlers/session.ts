@@ -747,14 +747,21 @@ async function startUnderLock(
             codexSandbox: message.codexSandbox ?? null,
           }
         : message.outputStyle !== undefined || message.todoTools === true || message.worktree !== undefined ||
-            takeover !== null
+            takeover !== null || message.backend !== undefined || message.herdrSession !== undefined
           ? {
               // 出力スタイル（新規起動の `--settings`）・Task/Todo ツール env（新規 / resume 共通）・
-              // PR/MR worktree（メタデータ cwd の記録先, worktree-from-pr）・開き直し（peer-takeover）。
+              // PR/MR worktree（メタデータ cwd の記録先, worktree-from-pr）・開き直し（peer-takeover）・
+              // 起動先の明示（tailii-chat-cli 第 2 段）。
               outputStyle: message.outputStyle ?? null,
               todoTools: message.todoTools === true,
               worktree: message.worktree ?? null,
               ...(takeover !== null ? { takeover } : {}),
+              ...(message.backend !== undefined || message.herdrSession !== undefined
+                ? { placement: {
+                  ...(message.backend !== undefined ? { backend: message.backend } : {}),
+                  ...(message.herdrSession !== undefined ? { herdrSession: message.herdrSession } : {}),
+                } }
+                : {}),
             }
           : undefined,
     );

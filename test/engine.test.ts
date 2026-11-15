@@ -1368,6 +1368,31 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
+  test("chat_pending_query は Hub の状態（未回答の設問）を返す（chat 第 2 段）", async () => {
+    const hubLink: HubLink = {
+      onMessage: null, onReconnect: null,
+      send(message) {
+        if (message.type === "hub_state_request") {
+          queueMicrotask(() => hubLink.onMessage?.({
+            type: "hub_state_response", id: message.id, session: message.session, processing: true,
+            pendingQuestion: { id: "toolu_1", questions: [{ header: "h", question: "q", multiSelect: false,
+              options: [{ label: "A", description: "" }] }] },
+          }));
+        }
+        return true;
+      },
+      close: vi.fn(),
+    };
+    const engine = startEngine({ sessionManager: makeManager(new MockTmuxRunner(() => ok(""))), hubLink });
+    await engine.lines.nextOfType("channel_hello");
+    engine.writeLine('{"id":"pq-1","session":"work","type":"chat_pending_query","v":2}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("chat_pending_query_result"))).toMatchObject({
+      type: "chat_pending_query_result", id: "pq-1", session: "work", processing: true,
+      question: { id: "toolu_1", questions: [{ question: "q" }] },
+    });
+    await engine.teardown();
+  });
+
   test("chat_send_now を Hub へ転送し結果を中継する", async () => {
     const sent: unknown[] = [];
     const hubLink: HubLink = {

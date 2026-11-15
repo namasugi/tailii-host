@@ -720,7 +720,13 @@ export type ControlMessage =
       /** 確認の結果「開き直す」: `session_peer_conflict.token` をそのまま返す。処理中を中断してよいなら interrupt。 */
       takeOver?: { token: string; interrupt?: boolean };
       /** 確認の結果「それでも開く」（終了させずに並走させる。従来の挙動）。 */
-      allowParallel?: boolean }
+      allowParallel?: boolean;
+      /**
+       * 起動先の明示（`tailii-host chat new --backend / --herdr-session`。tailii-chat-cli 第 2 段）。省略はアプリの設定。
+       * 明示したときは振り替えない（herdr セッションが動いていなければ `tailii` へ入れずに起動失敗を返す）。アプリは使わない。
+       */
+      backend?: "tmux" | "herdr";
+      herdrSession?: string }
   /**
    * 既存の会話を開こうとしたが、他所で同じ会話が動いていた（host→iOS, peer-takeover）。`session_start` の応答として
    * 同じ id で返し、起動はしていない。`canTakeOver` なら `token` を付けて送り直すと、相手を終了させて Tailii で開き直す。
@@ -978,6 +984,13 @@ export type ControlMessage =
   | { type: "conversation_delete_result"; v: number; id: string; ok: boolean; error: string | null; worktreePath?: string; worktreeRemoved?: boolean; worktreeDirty?: boolean; worktreeUncommittedCount?: number; worktreeUnmergedCommitCount?: number }
   | { type: "question_prompt"; v: number; id: string; questions: QuestionPromptQuestion[] }
   | { type: "question_answer"; v: number; id: string; session: string; answers: QuestionAnswer[] }
+  /**
+   * 会話がいま待っている設問を hub に聞く（`tailii-host chat` の status / answer。tailii-chat-cli 第 2 段）。アプリは使わない。
+   * `question` は未回答の設問（無ければ省略）、`processing` は hub の処理中の判定。
+   */
+  | { type: "chat_pending_query"; v: number; id: string; session: string }
+  | { type: "chat_pending_query_result"; v: number; id: string; session: string; processing: boolean;
+      question?: { id: string; questions: QuestionPromptQuestion[] } }
   | { type: "question_dismiss"; v: number; id: string }
   | {
       type: "usage_request"; v: number; id: string;

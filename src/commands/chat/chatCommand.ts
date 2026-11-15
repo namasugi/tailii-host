@@ -16,12 +16,22 @@ import {
   parseHerdrPaneList,
 } from "../../backend/herdr.js";
 import { AGENT_GUIDE } from "./agentGuide.js";
+import {
+  defaultApprovalsBase,
+  findPendingApproval,
+  listPendingApprovals,
+  takeApprovalResult,
+  writeApprovalDecision,
+  type PendingApprovalRecord,
+} from "../../approval/approvalMailbox.js";
+import type { QuestionAnswer, QuestionPromptQuestion } from "../../protocol.js";
 import { connectEngine, EngineTimeoutError, type EngineConnection } from "./engineClient.js";
 import {
   acquireRequestLock,
   conversationState,
   findTranscript,
   folderAllowed,
+  isBotStartedConversation,
   isPermissionMode,
   loadBotConfig,
   readReply,
@@ -69,6 +79,12 @@ export interface ChatDeps {
   receipt?: (session: string, clientMessageId: string) => Promise<string>;
   /** 依頼 ID ごとの排他（テスト用。既定は `~/.tailii/bot/requests/<digest>.lock`）。取れなければ null。 */
   lockRequest?: (requestId: string) => (() => void) | null;
+  /** 承認の受け渡し口のベース（テスト用。既定 `~/.tailii/approvals`）。第 2 段。 */
+  approvalsBase?: string;
+  /** `tailii-host chat new` で始めた会話か（テスト用。既定は依頼の記録から）。 */
+  botStarted?: (conversationId: string) => boolean;
+  /** 人に確かめる（端末で y/N。テスト用）。 */
+  confirm?: (question: string) => boolean;
 }
 
 interface ParsedArgs {
@@ -76,8 +92,11 @@ interface ParsedArgs {
   flags: Map<string, string | true>;
 }
 
-const VALUE_FLAGS = new Set(["--cwd", "--request-id", "--title", "--permission-mode", "--after", "--wait"]);
-const BOOL_FLAGS = new Set(["--json", "--live", "--no-attach"]);
+const VALUE_FLAGS = new Set([
+  "--cwd", "--request-id", "--title", "--permission-mode", "--after", "--wait",
+  "--choice", "--other", "--reason", "--backend", "--herdr-session",
+]);
+const BOOL_FLAGS = new Set(["--json", "--live", "--no-attach", "--interrupt", "--yes"]);
 
 function parseArgs(args: string[]): ParsedArgs {
   const positional: string[] = [];
@@ -146,6 +165,11 @@ function engineFailure(reply: ControlMessage, what: string): ChatError {
   if (reply.type === "error" && reply.code === "chat_send_failed") {
     return unknownDelivery(reply.message);
   }
+  if (reply.type === "error" && /指定どおりに入れられない/.test(reply.message)) {
+    // 起動先を明示した herdr セッションが動いていない（打ち直しても同じ。第 2 段）。
+    return new ChatError(EXIT.policy, "placement_unavailable", reply.message.trim(),
+      "--herdr-session を外す（アプリの設定に入れる）か、人に herdr セッションを起動してもらう");
+  }
   if (reply.type === "error") {
     const retry = /launch_failed|tmux_error|claim|起動中/.test(`${reply.code} ${reply.message}`);
     return new ChatError(retry ? EXIT.retryLater : EXIT.internal, reply.code, reply.message,
@@ -211,7 +235,7 @@ async function startSession(
   if (reply.type === "session_peer_conflict") {
     throw new ChatError(EXIT.elsewhere, "running_elsewhere",
       `この会話は Tailii の外（${reply.holder}${reply.holderName ? `「${reply.holderName}」` : ""}）で動いています。送っていません`,
-      reply.canTakeOver ? "人に伝える（利用者がアプリで開き直せる）" : "人に伝える",
+      reply.canTakeOver ? "人に伝える（利用者がアプリで開き直せる。bot.json で許されていれば chat take-over）" : "人に伝える",
       { where: reply.holder, busy: reply.busy, canTakeOver: reply.canTakeOver });
   }
   if (reply.type !== "session_list_response") throw engineFailure(reply, "起動");
@@ -552,20 +576,45 @@ async function cmdNew(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<R
       "利用者が ~/.tailii/bot.json の allowAuto を true にしたときだけ使える");
   }
   const permissionMode = requestedMode ?? (bot ? config.permissionMode : undefined);
+  const placement = placementOf(args);
   const attach = !bot && !args.flags.has("--no-attach");
   const prompt = readPrompt(deps, !attach);
   const requestId = requestIdOf(args, bot);
   const resolvedCwd = fs.realpathSync(cwd);
   const textHash = prompt === null ? null : hashText(prompt);
   return withRequestLock(deps, requestId, () =>
-    newLocked({ deps, requestId, resolvedCwd, textHash, prompt, attach, permissionMode, title: flagString(args, "--title") }));
+    newLocked({ deps, requestId, resolvedCwd, textHash, prompt, attach, permissionMode, title: flagString(args, "--title"),
+      placement }));
+}
+
+/**
+ * 起動先の明示（`--backend herdr|tmux` / `--herdr-session <名前>`）。省略はアプリの設定。`--herdr-session` だけなら herdr。
+ * 明示したときは振り替えない（動いていない herdr セッションなら起動せずに理由を返す。第 2 段）。
+ */
+function placementOf(args: ParsedArgs): { backend?: "tmux" | "herdr"; herdrSession?: string } {
+  const backend = flagString(args, "--backend");
+  const herdrSession = flagString(args, "--herdr-session");
+  if (backend !== undefined && backend !== "tmux" && backend !== "herdr") {
+    throw new ChatError(EXIT.usage, "bad_backend", `--backend は herdr か tmux: ${backend}`);
+  }
+  if (herdrSession !== undefined && !/^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$/.test(herdrSession)) {
+    throw new ChatError(EXIT.usage, "bad_herdr_session", `herdr セッション名は英数字と _ . - で 64 文字まで: ${herdrSession}`);
+  }
+  if (herdrSession !== undefined && backend === "tmux") {
+    throw new ChatError(EXIT.usage, "conflicting_placement", "--herdr-session は --backend tmux と一緒に使えません");
+  }
+  return {
+    ...(backend !== undefined ? { backend } : herdrSession !== undefined ? { backend: "herdr" as const } : {}),
+    ...(herdrSession !== undefined ? { herdrSession } : {}),
+  };
 }
 
 async function newLocked(input: {
   deps: ChatDeps; requestId: string; resolvedCwd: string; textHash: string | null; prompt: string | null; attach: boolean;
   permissionMode: string | undefined; title: string | undefined;
+  placement: { backend?: "tmux" | "herdr"; herdrSession?: string };
 }): Promise<Record<string, unknown> & { attach?: string }> {
-  const { deps, requestId, resolvedCwd, textHash, prompt, attach, permissionMode, title } = input;
+  const { deps, requestId, resolvedCwd, textHash, prompt, attach, permissionMode, title, placement } = input;
   const previous = (deps.readRequest ?? readRequest)(requestId);
   if (previous !== null) assertSameRequest(previous, { kind: "new", cwd: resolvedCwd, textHash });
   // state の無い記録は 31f97bc の旧形式で、送信済み（3 周目レビュー 6）。
@@ -598,6 +647,7 @@ async function newLocked(input: {
           cwd: resolvedCwd, name, agentType: "claude",
           ...(permissionMode !== undefined ? { permissionMode } : {}),
           ...(title !== undefined ? { title } : {}),
+          ...placement,
         });
       } catch (error) {
         if (!(error instanceof EngineTimeoutError)) throw error;
@@ -737,9 +787,13 @@ async function cmdStatus(args: ParsedArgs, deps: ChatDeps): Promise<Record<strin
     // 完了は待機（idle）か止まっている（not_running）で返答があるとき。承認・設問の入力待ち（waiting）と処理中は終わって
     // いない（レビュー指摘 A6・2 周目レビュー 3）。
     const complete = (state === "idle" || state === "not_running") && read.found && read.reply !== null;
-    if (complete || deps.now() >= deadline) {
+    // 承認・設問の答え待ちは待っても進まない（人か Bot が答えるまで）ので、すぐ返して中身を見せる（第 2 段）。
+    const approvals = state === "not_running" ? [] : pendingApprovalsOf(deps, conversationId);
+    if (complete || deps.now() >= deadline || state === "waiting" || approvals.length > 0) {
+      const waiting = await waitingDetails(deps, conversationId, state, approvals);
       return {
-        conversationId, state, complete,
+        conversationId, state: waiting.state, complete,
+        ...(waiting.detail !== undefined ? { waiting: waiting.detail } : {}),
         ...(afterId !== undefined ? { after: afterId, received: read.found || delivery === "delivered", delivery } : {}),
         // 届いたか分からない送信で、この会話の後ろの送信が止まっている（記録に発話があっても hub は解かない）。
         // Bot には解けない（3 周目レビュー 2）。
@@ -752,14 +806,306 @@ async function cmdStatus(args: ParsedArgs, deps: ChatDeps): Promise<Record<strin
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// 第 2 段: 承認・設問・開き直し・画面
 
-const USAGE = `usage: tailii-host chat <list|new|send|status> [options]
+/** 会話 id を収容している Tailii の会話名（メタから）。 */
+function conversationSessionNames(deps: ChatDeps, conversationId: string): string[] {
+  return deps.store().all()
+    .filter((meta) => meta.providerSessionId === conversationId || meta.claudeSessionId === conversationId)
+    .map((meta) => meta.name);
+}
+
+function pendingApprovalsOf(deps: ChatDeps, conversationId: string): PendingApprovalRecord[] {
+  const base = deps.approvalsBase ?? defaultApprovalsBase();
+  return conversationSessionNames(deps, conversationId).flatMap((session) => listPendingApprovals(session, base));
+}
+
+interface PendingQuestion { session: string; id: string; questions: QuestionPromptQuestion[] }
+
+/** hub に、会話名がいま待っている設問を聞く。 */
+async function pendingQuestionOn(engine: EngineConnection, session: string): Promise<PendingQuestion | null> {
+  const id = newId();
+  const reply = await engine.request({ type: "chat_pending_query", v: 2, id, session },
+    isType("chat_pending_query_result", id), 10_000);
+  if (reply.type !== "chat_pending_query_result") throw engineFailure(reply, "設問の確認");
+  return reply.question !== undefined ? { session, ...reply.question } : null;
+}
+
+function questionView(question: PendingQuestion): Record<string, unknown> {
+  return {
+    questionId: question.id,
+    questions: question.questions.map((entry, index) => ({
+      number: index + 1, header: entry.header, question: entry.question, multiSelect: entry.multiSelect,
+      options: entry.options.map((option, optionIndex) => ({
+        choice: optionIndex + 1, label: option.label, ...(option.description.length > 0 ? { description: option.description } : {}),
+      })),
+    })),
+  };
+}
+
+/**
+ * 待っているものの中身。承認があれば `waiting_approval`（承認 ID・ツール・要約）、設問の答え待ちなら `waiting_answer`
+ * （設問 ID と選択肢）。設問は hub に聞く（engine を起こすので、答え待ち＝waiting のときだけ）。
+ */
+async function waitingDetails(
+  deps: ChatDeps,
+  conversationId: string,
+  state: ConversationState,
+  approvals: PendingApprovalRecord[],
+): Promise<{ state: string; detail?: Record<string, unknown> }> {
+  if (approvals.length > 0) {
+    return {
+      state: "waiting_approval",
+      detail: {
+        approvals: approvals.map((approval) => ({
+          approvalId: approval.id, tool: approval.tool, summary: approval.summary,
+          ...(approval.agentType !== undefined ? { agentType: approval.agentType } : {}),
+        })),
+      },
+    };
+  }
+  if (state !== "waiting") return { state };
+  const sessions = conversationSessionNames(deps, conversationId);
+  if (sessions.length === 0) return { state };
+  try {
+    const question = await withEngine(deps, async (engine) => {
+      for (const session of sessions) {
+        const found = await pendingQuestionOn(engine, session);
+        if (found !== null) return found;
+      }
+      return null;
+    });
+    return question !== null ? { state: "waiting_answer", detail: { question: questionView(question) } } : { state };
+  } catch {
+    return { state }; // 聞けなくても状態は返す。
+  }
+}
+
+/**
+ * `--choice` を回答にする。設問ごとに `;` で区切り、複数選択は `,`（例 `2` / `1;3,4`）。番号は 1 から。`--other` は
+ * 設問が 1 つのときの自由記述（「その他」の行）。アプリと同じ形で送る: その他の行の番号（選択肢の数）を
+ * `selectedOptionIndexes` に足す（hub は otherText があると最大の番号をその他の行とみなして、その番号キーを押してから
+ * 本文を打つ。足さないと普通の選択肢をその他の行と取り違え、本文が入力欄へ落ちて発言になる）。1 つだけ選ぶ設問では
+ * その他と選択肢は両立しない（アプリも、その他を選ぶと選択はその他だけになる）。
+ */
+function buildAnswers(questions: QuestionPromptQuestion[], choiceRaw: string | undefined, other: string | undefined): QuestionAnswer[] {
+  const parts = choiceRaw === undefined ? [] : choiceRaw.split(";");
+  if (other !== undefined && questions.length !== 1) {
+    throw new ChatError(EXIT.usage, "other_needs_single_question", "--other は設問が 1 つのときだけ使えます");
+  }
+  if (choiceRaw !== undefined && parts.length !== questions.length) {
+    throw new ChatError(EXIT.usage, "choice_count", `設問は ${questions.length} つです。--choice は設問ごとに ; で区切る（例 1;2）`);
+  }
+  return questions.map((question, index) => {
+    const raw = parts[index]?.trim() ?? "";
+    const numbers = raw.length === 0 ? [] : raw.split(",").map((part) => Number(part.trim()));
+    for (const number of numbers) {
+      if (!Number.isInteger(number) || number < 1 || number > question.options.length) {
+        throw new ChatError(EXIT.usage, "bad_choice", `設問 ${index + 1} の選択肢は 1〜${question.options.length}: ${raw}`);
+      }
+    }
+    if (!question.multiSelect && numbers.length > 1) {
+      throw new ChatError(EXIT.usage, "single_choice", `設問 ${index + 1} は 1 つだけ選べます`);
+    }
+    const otherText = index === 0 && other !== undefined && other.trim().length > 0 ? other.trim() : undefined;
+    if (numbers.length === 0 && otherText === undefined) {
+      throw new ChatError(EXIT.usage, "missing_choice", `設問 ${index + 1} の答えがありません（--choice か --other）`);
+    }
+    if (!question.multiSelect && numbers.length > 0 && otherText !== undefined) {
+      throw new ChatError(EXIT.usage, "choice_with_other",
+        `設問 ${index + 1} は 1 つだけ選べます（--choice か --other のどちらか）`);
+    }
+    const selected = [...new Set(numbers)].map((number) => number - 1);
+    // その他の行（選択肢の数 = 0 始まりで最後の次）。
+    if (otherText !== undefined) selected.push(question.options.length);
+    return {
+      questionIndex: index,
+      selectedOptionIndexes: selected.sort((a, b) => a - b),
+      multiSelect: question.multiSelect,
+      ...(otherText !== undefined ? { otherText } : {}),
+    };
+  });
+}
+
+const QUESTION_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
+
+async function cmdAnswer(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<Record<string, unknown>> {
+  const conversationId = args.positional[0];
+  const questionId = args.positional[1];
+  if (conversationId === undefined || !CONVERSATION_ID.test(conversationId) || questionId === undefined ||
+    !QUESTION_ID.test(questionId) || args.positional.length > 2) {
+    throw new ChatError(EXIT.usage, "usage", "chat answer <会話ID> <設問ID> --choice <番号>",
+      "設問 ID と選択肢は chat status の waiting.question で分かる");
+  }
+  // Bot が答えてよいのは Bot が始めた会話だけ（利用者の会話の設問は利用者が答える。第 2 段）。
+  if (bot && !(deps.botStarted ?? ((id: string) => isBotStartedConversation(id)))(conversationId)) {
+    throw new ChatError(EXIT.policy, "answer_not_allowed", "この会話は Bot が始めた会話ではないので、設問に答えられません", "人に伝える");
+  }
+  const choiceRaw = flagString(args, "--choice");
+  const other = flagString(args, "--other");
+  if (choiceRaw === undefined && other === undefined) {
+    throw new ChatError(EXIT.usage, "missing_choice", "--choice（選択肢の番号）か --other（自由記述）が要ります");
+  }
+  const sessions = conversationSessionNames(deps, conversationId);
+  if (sessions.length === 0) throw new ChatError(EXIT.notFound, "not_found", "Tailii で動いている会話が見つかりません");
+  return withEngine(deps, async (engine) => {
+    let target: PendingQuestion | null = null;
+    for (const session of sessions) {
+      const found = await pendingQuestionOn(engine, session);
+      if (found !== null && found.id === questionId) { target = found; break; }
+    }
+    if (target === null) {
+      throw new ChatError(EXIT.notFound, "question_not_found", "この設問は待っていません（答え済みか、取り下げられた）",
+        "chat status で今待っているものを確かめる");
+    }
+    const answers = buildAnswers(target.questions, choiceRaw, other);
+    const reply = await engine.request({ type: "question_answer", v: 2, id: questionId, session: target.session, answers },
+      (message) => message.type === "remote_pending_cleared" && message.id === questionId, 20_000);
+    if (reply.type === "error") {
+      if (reply.code === "question_already_answered") {
+        throw new ChatError(EXIT.notFound, "question_already_answered", "この設問は既に答えられています");
+      }
+      if (reply.code === "question_stale") {
+        throw new ChatError(EXIT.retryLater, "question_not_shown", "設問が画面に出ていないので、答えを送っていません",
+          "少し待って chat status で確かめてから打ち直す");
+      }
+      throw new ChatError(EXIT.retryLater, reply.code, reply.message, "少し待って打ち直す");
+    }
+    return { conversationId, questionId, answered: true };
+  });
+}
+
+async function cmdApprove(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<Record<string, unknown>> {
+  const [conversationId, approvalId, decision] = args.positional;
+  if (conversationId === undefined || !CONVERSATION_ID.test(conversationId) || approvalId === undefined ||
+    (decision !== "allow" && decision !== "deny") || args.positional.length > 3) {
+    throw new ChatError(EXIT.usage, "usage", "chat approve <会話ID> <承認ID> allow|deny [--reason <理由>]",
+      "承認 ID は chat status の waiting.approvals で分かる");
+  }
+  // 拒否はいつでもできる。許可は、Bot には利用者が許したときだけ（第 2 段）。
+  if (decision === "allow" && bot && !deps.config().allowApprove) {
+    throw new ChatError(EXIT.policy, "approve_not_allowed", "Bot は承認を許可できません（拒否はできます）",
+      "人に伝える（利用者が iPhone で答える）。許可させるなら利用者が ~/.tailii/bot.json の allowApprove を true にする");
+  }
+  const base = deps.approvalsBase ?? defaultApprovalsBase();
+  const record = findPendingApproval(approvalId, base);
+  if (record === null || !conversationSessionNames(deps, conversationId).includes(record.session)) {
+    throw new ChatError(EXIT.notFound, "approval_not_found", "この承認は待っていません（決まったか、取り下げられた）",
+      "chat status で今待っているものを確かめる");
+  }
+  // Bot の許可は、許可された作業フォルダの中の承認だけ（ほかの Bot の制限と同じ。拒否はどこでもできる）。
+  if (decision === "allow" && bot && !folderAllowed(record.cwd, deps.config().allowedRoots)) {
+    throw new ChatError(EXIT.policy, "folder_not_allowed", `この承認の作業フォルダは許可されていません: ${record.cwd}`,
+      "人に伝える（利用者が iPhone で答える）");
+  }
+  const reason = flagString(args, "--reason");
+  const written = writeApprovalDecision(record.session, approvalId, {
+    decision, by: "cli", atMs: deps.now(), ...(reason !== undefined ? { reason } : {}),
+  }, base);
+  if (written.status === "invalid") throw new ChatError(EXIT.usage, "bad_approval_id", "承認 ID が正しくありません");
+  if (written.status === "exists") {
+    return { conversationId, approvalId, decision: written.existing?.decision ?? null, alreadyDecided: true };
+  }
+  // 承認フックが決めて記録を片付けるまで少し待つ（最大約 5 秒 = 200 ms × 25 回）。フックは決めた側と決定を
+  // `<id>.result` に残すので、アプリが先に逆の答えを返した場合もそれを返す（applied は CLI の決定で決まったか）。
+  for (let attempt = 0; attempt <= 25; attempt++) {
+    const result = takeApprovalResult(record.session, approvalId, base);
+    if (result !== null) {
+      return { conversationId, approvalId, decision: result.decision, applied: result.by === "cli",
+        ...(result.by !== "cli" ? { decidedBy: result.by } : {}) };
+    }
+    if (!listPendingApprovals(record.session, base).some((entry) => entry.id === approvalId)) {
+      return { conversationId, approvalId, decision: null, applied: false, decidedBy: "unknown" };
+    }
+    if (attempt < 25) await deps.sleep(200);
+  }
+  return { conversationId, approvalId, decision, applied: false };
+}
+
+/** 一意の会話名（`tailii-host chat` の会話。承認できる人が居ないときの即拒否の対象になる）。 */
+function freshSessionName(): string {
+  return `s-cli${randomUUID().replace(/-/g, "").slice(0, 16)}`;
+}
+
+async function cmdTakeOver(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<Record<string, unknown> & { attach?: string }> {
+  const conversationId = requireConversationId(args);
+  const interrupt = args.flags.has("--interrupt");
+  const config = deps.config();
+  if (bot && !config.allowTakeOver) {
+    throw new ChatError(EXIT.policy, "take_over_not_allowed", "Bot は他所で動いている会話を開き直せません",
+      "人に伝える（利用者がアプリで開き直せる）。許すなら利用者が ~/.tailii/bot.json の allowTakeOver を true にする");
+  }
+  // Bot は処理中の相手を中断させない（相手が待機中のときだけ。第 2 段）。
+  if (bot && interrupt) throw new ChatError(EXIT.policy, "interrupt_not_allowed", "Bot は処理中の会話を中断させられません");
+  const attach = !bot && !args.flags.has("--no-attach");
+  const result = await withEngine(deps, async (engine) => {
+    const rows = await listConversations(engine);
+    const row = rows.find((entry) => entry.conversationId === conversationId);
+    if (row === undefined) throw new ChatError(EXIT.notFound, "not_found", "会話が見つかりません", "tailii-host chat list --json で確かめる");
+    if (row.agent !== "claude") throw new ChatError(EXIT.policy, "unsupported_agent", "Codex の会話の開き直しは未対応です");
+    if (row.liveSession !== undefined) return { tookOver: false, alreadyInTailii: true, session: row.liveSession };
+    if (bot && !folderAllowed(row.cwd, config.allowedRoots)) {
+      throw new ChatError(EXIT.policy, "folder_not_allowed", `この会話の作業フォルダは許可されていません: ${row.cwd}`);
+    }
+    const id = newId();
+    const check = await engine.request({ type: "session_peer_check", v: 2, id, conversationId },
+      isType("session_peer_check_response", id), 30_000);
+    if (check.type !== "session_peer_check_response") throw engineFailure(check, "確認");
+    if (check.clear) return { tookOver: false, notRunningElsewhere: true };
+    if (check.canTakeOver !== true || check.token === undefined) {
+      throw new ChatError(EXIT.elsewhere, "cannot_take_over",
+        `この会話は開き直せない場所で動いています（${check.holder ?? "不明"}${check.reason ? `: ${check.reason}` : ""}）`, "人に伝える",
+        { where: check.holder });
+    }
+    if (check.busy === true && !interrupt) {
+      throw new ChatError(EXIT.elsewhere, "busy_elsewhere", "相手は処理中です。終わってから開き直す",
+        bot ? "少し待って打ち直す" : "処理を中断してよいなら --interrupt", { where: check.holder });
+    }
+    if (!bot && !args.flags.has("--yes")) {
+      const ok = deps.confirm?.(`${check.holderName ?? check.holder ?? "他所"}で動いているこの会話を終了させて、Tailii で開き直しますか？`) ?? false;
+      if (!ok) return { tookOver: false, cancelled: true };
+    }
+    const started = await startSession(engine, {
+      cwd: row.cwd, name: freshSessionName(), resumeSessionId: conversationId, agentType: "claude", peerCheck: true,
+      takeOver: { token: check.token, ...(interrupt ? { interrupt: true } : {}) },
+    });
+    return { tookOver: true, session: started.session };
+  });
+  const session = typeof result["session"] === "string" ? result["session"] : undefined;
+  return { conversationId, ...result, ...(attach && session !== undefined && result["cancelled"] !== true ? { attach: session } : {}) };
+}
+
+async function cmdAttach(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<{ attach: string }> {
+  if (bot) throw new ChatError(EXIT.usage, "attach_needs_terminal", "attach は人が端末で使うコマンドです（--json・端末なしでは使えない）");
+  const conversationId = requireConversationId(args);
+  const session = await withEngine(deps, async (engine) => {
+    const rows = await listConversations(engine);
+    const row = rows.find((entry) => entry.conversationId === conversationId);
+    if (row === undefined) throw new ChatError(EXIT.notFound, "not_found", "会話が見つかりません", "tailii-host chat list で確かめる");
+    if (row.liveSession !== undefined) return row.liveSession;
+    if (row.agent !== "claude") throw new ChatError(EXIT.policy, "unsupported_agent", "Codex の会話は未対応です");
+    // 止まっていれば Tailii で続きから起動して開く（他所で動いていれば起動しない）。
+    return (await startSession(engine, {
+      cwd: row.cwd, name: freshSessionName(), resumeSessionId: conversationId, agentType: "claude", peerCheck: true,
+    })).session;
+  });
+  return { attach: session };
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+
+const USAGE = `usage: tailii-host chat <list|new|send|status|answer|approve|take-over|attach> [options]
   AI エージェント（Bot）は tailii-host agent-guide を読んで、必ず --json を付ける。
   端末が無い（パイプで指示を渡すなど）ときは Bot として扱い、--request-id が要る。
   list [--live] [--json]
   new --cwd <フォルダ> [--request-id <ID>] [--title <名前>] [--permission-mode <mode>] [--no-attach] [--json]  < 指示文
   send <conversationId> [--request-id <ID>] [--json]  < 指示文
   status <conversationId> [--after <依頼ID>] [--wait <秒>] [--json]
+  answer <conversationId> <設問ID> --choice <番号> [--other <文>] [--json]
+  approve <conversationId> <承認ID> allow|deny [--reason <理由>] [--json]
+  take-over <conversationId> [--interrupt] [--yes] [--no-attach] [--json]
+  attach <conversationId>
+  new … [--backend herdr|tmux] [--herdr-session <名前>]
 `;
 
 function render(deps: ChatDeps, json: boolean, payload: Record<string, unknown>, human: string): void {
@@ -807,6 +1153,33 @@ export async function runChat(argv: string[], deps: ChatDeps): Promise<number> {
         const payload = await cmdStatus(args, deps);
         render(deps, json, payload, `${payload["state"]}${payload["complete"] ? "（完了）" : ""}\n${payload["reply"] ?? ""}`);
         return EXIT.ok;
+      }
+      case "answer": {
+        const payload = await cmdAnswer(args, deps, bot);
+        render(deps, json, payload, `答えました: ${payload["questionId"]}`);
+        return EXIT.ok;
+      }
+      case "approve": {
+        const payload = await cmdApprove(args, deps, bot);
+        render(deps, json, payload, payload["alreadyDecided"] === true
+          ? `既に決まっています: ${payload["decision"]}` : `${payload["decision"] === "allow" ? "許可" : "拒否"}しました`);
+        return EXIT.ok;
+      }
+      case "take-over": {
+        const payload = await cmdTakeOver(args, deps, bot);
+        const { attach, ...rest2 } = payload;
+        if (attach !== undefined) {
+          deps.write(`Tailii で開き直しました（画面を閉じても会話は続きます）\n`);
+          return deps.attach(attach);
+        }
+        render(deps, json, rest2, rest2["tookOver"] === true ? "Tailii で開き直しました"
+          : rest2["alreadyInTailii"] === true ? "既に Tailii で動いています"
+            : rest2["cancelled"] === true ? "開き直しませんでした" : "他所では動いていません");
+        return EXIT.ok;
+      }
+      case "attach": {
+        const payload = await cmdAttach(args, deps, bot);
+        return deps.attach(payload.attach);
       }
       default:
         throw new ChatError(EXIT.usage, "unknown_verb", `知らない動詞です: ${verb}`, "tailii-host agent-guide を読んでください");
@@ -869,6 +1242,7 @@ export async function runChatCommand(argv: string[]): Promise<number> {
     write: (text) => { buffered += text; },
     now: () => Date.now(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    confirm: (question) => confirmOnTty(question),
     attach: (session) => {
       // 画面を開く前に案内を出し切る。
       const pending = buffered;
@@ -879,6 +1253,26 @@ export async function runChatCommand(argv: string[]): Promise<number> {
   });
   await flush();
   return code;
+}
+
+/** 端末で y/N を聞く（端末が無ければ「いいえ」）。 */
+function confirmOnTty(question: string): boolean {
+  let fd: number;
+  try {
+    fd = fs.openSync("/dev/tty", "r+");
+  } catch {
+    return false;
+  }
+  try {
+    fs.writeSync(fd, `${question} [y/N] `);
+    const buffer = Buffer.alloc(64);
+    const read = fs.readSync(fd, buffer, 0, buffer.length, null);
+    return /^\s*y(es)?\s*$/i.test(buffer.subarray(0, read).toString("utf8"));
+  } catch {
+    return false;
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 export async function runAgentGuideCommand(): Promise<number> {

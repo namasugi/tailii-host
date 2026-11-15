@@ -14,6 +14,7 @@ import {
   type RequestRecord,
 } from "../src/commands/chat/chatState.js";
 import { EngineTimeoutError, type EngineConnection } from "../src/commands/chat/engineClient.js";
+import { readApprovalDecision, removePendingApproval, writePendingApproval } from "../src/approval/approvalMailbox.js";
 import type { ControlMessage } from "../src/protocol.js";
 import { makeTempDir, makeTempStore } from "./helpers.js";
 
@@ -25,6 +26,8 @@ function harness(options: {
   isTty?: boolean;
   roots?: string[];
   allowAuto?: boolean;
+  allowApprove?: boolean;
+  allowTakeOver?: boolean;
   state?: ChatDeps["state"];
   transcript?: ChatDeps["transcript"];
 } = {}) {
@@ -44,7 +47,8 @@ function harness(options: {
     connect: async () => engine,
     readStdin: () => options.stdin ?? null,
     isTty: options.isTty ?? false,
-    config: () => ({ allowedRoots: options.roots ?? ["/"], permissionMode: "acceptEdits", allowAuto: options.allowAuto ?? false }),
+    config: () => ({ allowedRoots: options.roots ?? ["/"], permissionMode: "acceptEdits", allowAuto: options.allowAuto ?? false,
+      allowApprove: options.allowApprove ?? false, allowTakeOver: options.allowTakeOver ?? false }),
     store: () => makeTempStore(),
     write: (text) => { output += text; },
     now: () => 1_000_000,
@@ -235,7 +239,9 @@ describe("chatState", () => {
     const file = path.join(makeTempDir("bot-config"), "bot.json");
     expect(loadBotConfig(file)).toMatchObject({ permissionMode: "acceptEdits", allowAuto: false });
     fs.writeFileSync(file, JSON.stringify({ allowedRoots: ["/srv/work"], permissionMode: "auto" }));
-    expect(loadBotConfig(file)).toEqual({ allowedRoots: ["/srv/work"], permissionMode: "acceptEdits", allowAuto: false });
+    expect(loadBotConfig(file)).toEqual({
+      allowedRoots: ["/srv/work"], permissionMode: "acceptEdits", allowAuto: false, allowApprove: false, allowTakeOver: false,
+    });
   });
 
   test("作業フォルダは実パスで許可範囲の中だけ（../ で外へ出られない）", () => {
@@ -770,4 +776,253 @@ describe("6 周目レビューの再発防止", () => {
     expect(await runChat(["send", "conv-stop-1", "--request-id", "r6u", "--json"], h.deps)).toBe(EXIT.policy);
     expect(h.records.get("r6u")).toMatchObject({ needsHuman: true, state: "started" });
   });
+});
+
+describe("第 2 段: 承認・設問・開き直し・画面・起動先", () => {
+  const CONV = "conv-p2-0001";
+  const SESSION = "s-cli0123456789abcdef";
+  const questionReply = (id: string, session: string, questionId = "toolu_q1", multiSelect = false) => ({
+    type: "chat_pending_query_result", v: 2, id, session, processing: true,
+    question: { id: questionId, questions: [{ header: "方針", question: "どちらにしますか", multiSelect,
+      options: [{ label: "A", description: "前者" }, { label: "B", description: "" }, { label: "C", description: "" }] }] },
+  }) as ControlMessage;
+
+  function p2Harness(options: { handler?: Handler; state?: ChatDeps["state"]; allowApprove?: boolean; allowTakeOver?: boolean;
+    isTty?: boolean } = {}) {
+    const store = makeTempStore();
+    store.put({ name: SESSION, cwd: "/tmp", createdAt: 1, backend: "herdr", claudeSessionId: CONV, providerSessionId: CONV });
+    const file = path.join(makeTempDir("p2-transcript"), "c.jsonl");
+    fs.writeFileSync(file, "");
+    const h = harness({
+      handler: options.handler ?? defaultHandler, state: options.state ?? (() => "waiting"),
+      transcript: () => ({ file, cwd: "/tmp" }),
+      ...(options.allowApprove !== undefined ? { allowApprove: options.allowApprove } : {}),
+      ...(options.allowTakeOver !== undefined ? { allowTakeOver: options.allowTakeOver } : {}),
+      ...(options.isTty !== undefined ? { isTty: options.isTty } : {}),
+    });
+    h.deps.store = () => store;
+    h.deps.approvalsBase = makeTempDir("p2-approvals");
+    h.deps.botStarted = (id) => id === CONV;
+    return { ...h, store };
+  }
+
+  test("status は待っている承認を waiting_approval で返し、--wait でも待たずに返す", async () => {
+    const h = p2Harness({ state: () => "busy" });
+    writePendingApproval({ id: "ap-1", session: SESSION, tool: "Bash", summary: "rm -rf build", cwd: "/tmp", atMs: 1,
+      pid: process.pid }, h.deps.approvalsBase!);
+    expect(await runChat(["status", CONV, "--wait", "60", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.json()).toMatchObject({ state: "waiting_approval", complete: false,
+      waiting: { approvals: [{ approvalId: "ap-1", tool: "Bash", summary: "rm -rf build" }] } });
+  });
+
+  test("status は答え待ちの設問を waiting_answer で、番号付きの選択肢と一緒に返す", async () => {
+    const h = p2Harness({
+      handler: (message) => message["type"] === "chat_pending_query"
+        ? questionReply(String(message["id"]), String(message["session"])) : defaultHandler(message),
+    });
+    expect(await runChat(["status", CONV, "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.json()).toMatchObject({ state: "waiting_answer", waiting: { question: { questionId: "toolu_q1",
+      questions: [{ number: 1, multiSelect: false, options: [{ choice: 1, label: "A", description: "前者" }, { choice: 2, label: "B" }, { choice: 3 }] }] } } });
+  });
+
+  test("answer は番号を 0 始まりの回答にして送り、受理（remote_pending_cleared）で成功", async () => {
+    const h = p2Harness({
+      handler: (message) => {
+        if (message["type"] === "chat_pending_query") return questionReply(String(message["id"]), String(message["session"]), "toolu_q1", true);
+        if (message["type"] === "question_answer") {
+          return { type: "remote_pending_cleared", v: 2, id: "toolu_q1", session: SESSION, kind: "question" } as ControlMessage;
+        }
+        return defaultHandler(message);
+      },
+    });
+    expect(await runChat(["answer", CONV, "toolu_q1", "--choice", "1,3", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.sent.find((m) => m["type"] === "question_answer")).toMatchObject({
+      id: "toolu_q1", session: SESSION,
+      answers: [{ questionIndex: 0, selectedOptionIndexes: [0, 2], multiSelect: true }],
+    });
+    expect(h.json()).toMatchObject({ ok: true, answered: true });
+  });
+
+  test.each([
+    { label: "範囲外の番号", args: ["--choice", "4"], err: "bad_choice" },
+    { label: "1 つしか選べない設問に 2 つ", args: ["--choice", "1,2"], err: "single_choice" },
+    { label: "答えが無い", args: [], err: "missing_choice" },
+  ])("answer の誤った選択は送らない: $label", async ({ args, err }) => {
+    const h = p2Harness({
+      handler: (message) => message["type"] === "chat_pending_query"
+        ? questionReply(String(message["id"]), String(message["session"])) : defaultHandler(message),
+    });
+    expect(await runChat(["answer", CONV, "toolu_q1", ...args, "--json"], h.deps)).toBe(EXIT.usage);
+    expect(h.json()).toMatchObject({ error: { code: err } });
+    expect(h.sent.some((m) => m["type"] === "question_answer")).toBe(false);
+  });
+
+  test.each([
+    { label: "1 つだけ選ぶ設問のその他", multi: false, args: ["--other", "紫"], selected: [3] },
+    { label: "複数選べる設問の選択とその他", multi: true, args: ["--choice", "1,3", "--other", "紫"], selected: [0, 2, 3] },
+  ])("answer の --other はアプリと同じく、その他の行の番号を足して送る: $label", async ({ multi, args, selected }) => {
+    const h = p2Harness({
+      handler: (message) => {
+        if (message["type"] === "chat_pending_query") return questionReply(String(message["id"]), String(message["session"]), "toolu_q1", multi);
+        if (message["type"] === "question_answer") {
+          return { type: "remote_pending_cleared", v: 2, id: "toolu_q1", session: SESSION, kind: "question" } as ControlMessage;
+        }
+        return defaultHandler(message);
+      },
+    });
+    expect(await runChat(["answer", CONV, "toolu_q1", ...args, "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.sent.find((m) => m["type"] === "question_answer")).toMatchObject({
+      answers: [{ questionIndex: 0, selectedOptionIndexes: selected, otherText: "紫", multiSelect: multi }],
+    });
+  });
+
+  test("1 つだけ選ぶ設問で選択とその他を一緒に送らない", async () => {
+    const h = p2Harness({
+      handler: (message) => message["type"] === "chat_pending_query"
+        ? questionReply(String(message["id"]), String(message["session"])) : defaultHandler(message),
+    });
+    expect(await runChat(["answer", CONV, "toolu_q1", "--choice", "2", "--other", "紫", "--json"], h.deps)).toBe(EXIT.usage);
+    expect(h.json()).toMatchObject({ error: { code: "choice_with_other" } });
+    expect(h.sent.some((m) => m["type"] === "question_answer")).toBe(false);
+  });
+
+  test("Bot の許可は許可された作業フォルダの中の承認だけ", async () => {
+    const h = p2Harness({ allowApprove: true });
+    h.deps.config = () => ({ allowedRoots: [makeTempDir("p2-root")], permissionMode: "acceptEdits", allowAuto: false,
+      allowApprove: true, allowTakeOver: false });
+    writePendingApproval({ id: "ap-6", session: SESSION, tool: "Bash", summary: "x", cwd: "/tmp", atMs: 1, pid: process.pid },
+      h.deps.approvalsBase!);
+    expect(await runChat(["approve", CONV, "ap-6", "allow", "--json"], h.deps)).toBe(EXIT.policy);
+    expect(h.json()).toMatchObject({ error: { code: "folder_not_allowed" } });
+  });
+
+  test("Bot は自分が始めていない会話の設問に答えられない・待っていない設問は 3", async () => {
+    const h = p2Harness();
+    h.deps.botStarted = () => false;
+    expect(await runChat(["answer", CONV, "toolu_q1", "--choice", "1", "--json"], h.deps)).toBe(EXIT.policy);
+    expect(h.json()).toMatchObject({ error: { code: "answer_not_allowed" } });
+    const g = p2Harness({
+      handler: (message) => message["type"] === "chat_pending_query"
+        ? { type: "chat_pending_query_result", v: 2, id: String(message["id"]), session: SESSION, processing: false } as ControlMessage
+        : defaultHandler(message),
+    });
+    expect(await runChat(["answer", CONV, "toolu_q1", "--choice", "1", "--json"], g.deps)).toBe(EXIT.notFound);
+    expect(g.json()).toMatchObject({ error: { code: "question_not_found" } });
+  });
+
+  test("approve: Bot の許可は bot.json で許したときだけ。拒否はいつでも置ける", async () => {
+    const h = p2Harness();
+    writePendingApproval({ id: "ap-2", session: SESSION, tool: "Bash", summary: "x", cwd: "/tmp", atMs: 1, pid: process.pid },
+      h.deps.approvalsBase!);
+    expect(await runChat(["approve", CONV, "ap-2", "allow", "--json"], h.deps)).toBe(EXIT.policy);
+    expect(h.json()).toMatchObject({ error: { code: "approve_not_allowed" } });
+    expect(readApprovalDecision(SESSION, "ap-2", h.deps.approvalsBase!)).toBeNull();
+    const d = p2Harness();
+    d.deps.approvalsBase = h.deps.approvalsBase!;
+    expect(await runChat(["approve", CONV, "ap-2", "deny", "--reason", "危ない", "--json"], d.deps)).toBe(EXIT.ok);
+    expect(readApprovalDecision(SESSION, "ap-2", d.deps.approvalsBase)).toMatchObject({ decision: "deny", reason: "危ない", by: "cli" });
+    expect(d.json()).toMatchObject({ approvalId: "ap-2", decision: "deny", applied: false });
+  });
+
+  test("approve: 許されていれば許可を置き、フックが片付けたら applied。別の会話の承認・無い承認は 3", async () => {
+    const h = p2Harness({ allowApprove: true });
+    const base = h.deps.approvalsBase!;
+    writePendingApproval({ id: "ap-3", session: SESSION, tool: "Bash", summary: "x", cwd: "/tmp", atMs: 1, pid: process.pid }, base);
+    h.deps.sleep = async () => { removePendingApproval(SESSION, "ap-3", base, { decision: "allow", by: "cli" }); };
+    expect(await runChat(["approve", CONV, "ap-3", "allow", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.json()).toMatchObject({ decision: "allow", applied: true });
+    // アプリが先に逆の答えを返したら、その決定を返す。
+    const raced = p2Harness({ allowApprove: true });
+    const racedBase = raced.deps.approvalsBase!;
+    writePendingApproval({ id: "ap-5", session: SESSION, tool: "Bash", summary: "x", cwd: "/tmp", atMs: 1, pid: process.pid }, racedBase);
+    raced.deps.sleep = async () => { removePendingApproval(SESSION, "ap-5", racedBase, { decision: "deny", by: "app" }); };
+    expect(await runChat(["approve", CONV, "ap-5", "allow", "--json"], raced.deps)).toBe(EXIT.ok);
+    expect(raced.json()).toMatchObject({ decision: "deny", applied: false, decidedBy: "app" });
+    const other = p2Harness({ allowApprove: true });
+    writePendingApproval({ id: "ap-4", session: "s-other-1", tool: "Bash", summary: "x", cwd: "/tmp", atMs: 1, pid: process.pid },
+      other.deps.approvalsBase!);
+    expect(await runChat(["approve", CONV, "ap-4", "allow", "--json"], other.deps)).toBe(EXIT.notFound);
+    expect(await runChat(["approve", CONV, "nope", "deny", "--json"], other.deps)).toBe(EXIT.notFound);
+  });
+
+  const peerHandler = (check: Record<string, unknown>): Handler => (message) => {
+    const id = String(message["id"]);
+    if (message["type"] === "session_peer_check") {
+      return { type: "session_peer_check_response", v: 2, id, conversationId: CONV, ...check } as ControlMessage;
+    }
+    if (message["type"] === "claude_session_list_request") {
+      return { type: "claude_session_list_response", v: 2, id,
+        claudeSessions: [{ sessionId: CONV, cwd: "/tmp", title: "端末の会話", peerSessionName: "term-1" }] } as ControlMessage;
+    }
+    if (message["type"] === "session_start") {
+      return { type: "session_list_response", v: 2, id, adoptedName: String(message["name"]),
+        sessions: [{ name: String(message["name"]), cwd: "/tmp", alive: true, providerSessionId: CONV }] } as ControlMessage;
+    }
+    return defaultHandler(message);
+  };
+
+  test("take-over: Bot は bot.json で許したときだけ・中断はさせない", async () => {
+    const h = p2Harness({ handler: peerHandler({ clear: false, holder: "terminal", busy: false, canTakeOver: true, token: "tok" }) });
+    expect(await runChat(["take-over", CONV, "--json"], h.deps)).toBe(EXIT.policy);
+    expect(h.json()).toMatchObject({ error: { code: "take_over_not_allowed" } });
+    const i = p2Harness({ allowTakeOver: true, handler: peerHandler({ clear: false, holder: "terminal", busy: true, canTakeOver: true, token: "tok" }) });
+    expect(await runChat(["take-over", CONV, "--interrupt", "--json"], i.deps)).toBe(EXIT.policy);
+    const b = p2Harness({ allowTakeOver: true, handler: peerHandler({ clear: false, holder: "terminal", busy: true, canTakeOver: true, token: "tok" }) });
+    expect(await runChat(["take-over", CONV, "--json"], b.deps)).toBe(EXIT.elsewhere);
+    expect(b.json()).toMatchObject({ error: { code: "busy_elsewhere" } });
+    expect(b.sent.some((m) => m["type"] === "session_start")).toBe(false);
+  });
+
+  test("take-over: 許されていて相手が待機中なら、確認のトークンで開き直す", async () => {
+    const h = p2Harness({ allowTakeOver: true,
+      handler: peerHandler({ clear: false, holder: "terminal", busy: false, canTakeOver: true, token: "tok-1" }) });
+    expect(await runChat(["take-over", CONV, "--json"], h.deps)).toBe(EXIT.ok);
+    const start = h.sent.find((m) => m["type"] === "session_start")!;
+    expect(start).toMatchObject({ resumeSessionId: CONV, peerCheck: true, takeOver: { token: "tok-1" } });
+    expect(String(start["name"])).toMatch(/^s-cli[0-9a-f]{16}$/);
+    expect(h.json()).toMatchObject({ tookOver: true, session: start["name"] });
+  });
+
+  test("take-over: 人は確かめてから（いいえなら開き直さない）。開き直せない相手は 4", async () => {
+    const h = p2Harness({ isTty: true, handler: peerHandler({ clear: false, holder: "terminal", busy: false, canTakeOver: true, token: "t" }) });
+    h.deps.confirm = () => false;
+    expect(await runChat(["take-over", CONV], h.deps)).toBe(EXIT.ok);
+    expect(h.sent.some((m) => m["type"] === "session_start")).toBe(false);
+    const r = p2Harness({ allowTakeOver: true, handler: peerHandler({ clear: false, holder: "remote", busy: false, canTakeOver: false }) });
+    expect(await runChat(["take-over", CONV, "--json"], r.deps)).toBe(EXIT.elsewhere);
+    expect(r.json()).toMatchObject({ error: { code: "cannot_take_over" }, where: "remote" });
+  });
+
+  test("attach は人向け（Bot は使えない）。動いている会話はその画面を開く", async () => {
+    const h = p2Harness();
+    expect(await runChat(["attach", "conv-live-1", "--json"], h.deps)).toBe(EXIT.usage);
+    const t = harness({ isTty: true });
+    expect(await runChat(["attach", "conv-live-1"], t.deps)).toBe(0);
+    expect(t.attached).toEqual(["s-live"]);
+  });
+
+  test("new の起動先の明示を session_start に載せる（--herdr-session だけなら herdr）。食い違う指定は 2", async () => {
+    const root = makeTempDir("chat-placement");
+    const h = harness({ stdin: "x", roots: [root] });
+    expect(await runChat(["new", "--cwd", root, "--request-id", "r-pl", "--herdr-session", "work", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.sent.find((m) => m["type"] === "session_start")).toMatchObject({ backend: "herdr", herdrSession: "work" });
+    const bad = harness({ stdin: "x", roots: [root] });
+    expect(await runChat(["new", "--cwd", root, "--request-id", "r-pl2", "--backend", "tmux", "--herdr-session", "w", "--json"],
+      bad.deps)).toBe(EXIT.usage);
+    expect(bad.json()).toMatchObject({ error: { code: "conflicting_placement" } });
+    expect(await runChat(["new", "--cwd", root, "--request-id", "r-pl3", "--backend", "screen", "--json"], bad.deps)).toBe(EXIT.usage);
+  });
+});
+
+test("明示した herdr セッションが動いていない起動失敗は、打ち直しを促さずに 5（第 2 段）", async () => {
+  const root = makeTempDir("chat-placement-down");
+  const h = harness({
+    stdin: "x", roots: [root],
+    handler: (message) => message["type"] === "session_start"
+      ? { type: "error", v: 2, id: String(message["id"]), code: "launch_failed",
+          message: "tailii launch: herdr セッション 'w' が動いていません。指定どおりに入れられないので起動していません\n" } as ControlMessage
+      : defaultHandler(message),
+  });
+  expect(await runChat(["new", "--cwd", root, "--request-id", "r-down", "--herdr-session", "w", "--json"], h.deps)).toBe(EXIT.policy);
+  expect(h.json()).toMatchObject({ error: { code: "placement_unavailable" } });
 });

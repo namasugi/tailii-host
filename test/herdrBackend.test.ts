@@ -2784,6 +2784,28 @@ describe("launchCore herdr backend", () => {
     expect(herdrExitCode(Object.assign(new Error("x"), { code: null, killed: false, signal: null }))).toBe(1);
   });
 
+  test("明示した herdr セッションが動いていなければ、tailii へ振り替えずに理由を返して起動しない（chat 第 2 段）", async () => {
+    const dir = makeTempDir("herdr-launch-strict");
+    const store = makeStore();
+    const spawned: string[][] = [];
+    const sessions: string[] = [];
+    const errors: string[] = [];
+    const notRunning = '{"id":"cli:pane:list","error":{"code":"server_not_running","message":"x"}}';
+    const runner: ProcessRunner = async (_exe, rawArgs) => {
+      sessions.push(rawArgs[1]!);
+      return { exitCode: 1, stdout: "", stderr: notRunning };
+    };
+    expect(await launchCore({
+      ...launchOptions(dir, store, runner), herdrSession: "work", herdrSessionStrict: true,
+      errorSink: (message: string) => errors.push(message),
+      spawnDetached: (_exe: string, args: string[]) => spawned.push(args),
+    })).toBe(1);
+    expect(spawned).toEqual([]);
+    expect(new Set(sessions)).toEqual(new Set(["work"]));
+    expect(errors.join("")).toContain("'work' が動いていません");
+    expect(store.get("s-h")).toBeNull();
+  });
+
   test("設定の herdr セッション（default）が動いていなければ起こさず、専用の tailii に入れる", async () => {
     const dir = makeTempDir("herdr-launch-default-stopped");
     const store = makeStore();
