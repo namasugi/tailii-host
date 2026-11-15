@@ -3,8 +3,6 @@
 // handleLine のドメイン別ハンドラ（handlers/）は全てここ経由で状態に触る。
 
 import { randomUUID } from "node:crypto";
-import * as os from "node:os";
-import * as path from "node:path";
 import type { ChatAgent } from "../chat/chatTailController.js";
 import type { CodexAccountUsageProvider } from "../codex/codexAccountUsage.js";
 import type { CodexAppServerManager } from "../codex/codexAppServer.js";
@@ -36,7 +34,7 @@ import type {
   OfficialAppRuntimeContext,
   OfficialAppsService,
 } from "../services/officialApps.js";
-import { claudeProjectSlug } from "../shared/paths.js";
+import { claudeTranscriptPathFor } from "../sessions/transcriptPath.js";
 import { sleep } from "../shared/sleep.js";
 import type { SessionBackend, SessionBackendKind } from "../backend/sessionBackend.js";
 import type { PeerProbe } from "../services/peerTakeover.js";
@@ -49,6 +47,11 @@ export interface EngineState {
   negotiatedVersion: number;
   /** 相手が `tailii-host chat`（Bot・スクリプト）か。会話の購読（前面表示扱い）をしない（tailii-chat-cli）。 */
   clientKind?: "cli";
+  /**
+   * 相手のアプリが `pc:cwd` を理解すると名乗った（channel_hello の `workdirChange`, session-workdir-change）。名乗らない
+   * 接続へは `pc:cwd` を送らない（古いアプリは知らない `pc:*` を通常の行として表示する）。
+   */
+  workdirChange?: boolean;
   ownMaxVersion: number;
   modeSetInFlight: Set<string>;
   sessionSearchAbort?: AbortController;
@@ -351,13 +354,7 @@ export async function officialAppRuntimeContext(
     meta !== null &&
     typeof claudeSessionId === "string" &&
     /^[A-Za-z0-9-]+$/u.test(claudeSessionId)
-      ? path.join(
-          os.homedir(),
-          ".claude",
-          "projects",
-          claudeProjectSlug(meta.cwd),
-          `${claudeSessionId}.jsonl`,
-        )
+      ? claudeTranscriptPathFor({ ...meta, providerSessionId: claudeSessionId })
       : null;
   return {
     context: {

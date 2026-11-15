@@ -29,6 +29,7 @@ import { narrationText } from "../shared/narration.js";
 import { isInjectedSkillContent } from "../shared/skillInjection.js";
 import { isPromptCommandText, isTurnCompanionRecord } from "../shared/commandExpansion.js";
 import { abortableSleep } from "../shared/sleep.js";
+import { findTranscriptElsewhere, relocatedCwdOf } from "../sessions/claudeTranscriptLocator.js";
 import { isNonMessageRecordType } from "../shared/transcriptRecord.js";
 import {
   createSystemNoticeContext,
@@ -56,6 +57,12 @@ export const CONTEXT_STREAM_ID = "pc:context";
 export const EFFORT_STREAM_ID = "pc:effort";
 /** claude の effort 既知値（未知値は通知しない）。 */
 const EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
+
+/**
+ * 会話ログの出現を待つ間に、記録どおりの slug 以外を探す間隔（全 slug の一覧を読むので毎周期はやらない,
+ * session-workdir-change）。
+ */
+export const ELSEWHERE_CHECK_INTERVAL_MS = 1_000;
 
 /** transcript の 1 回の読み取り量。 */
 const TRANSCRIPT_READ_CHUNK_BYTES = 64 * 1024;
@@ -279,7 +286,7 @@ export interface ClaudeTurnLifecycleEvent {
    * `turn_start` は「終端マーカーより後に新しい発話が transcript に現れたか」の観測用で、hub の
    * 処理中状態を直接は動かさない（権威は hook）。
    */
-  kind: "interrupted" | "api_error" | "turn_start";
+  kind: "interrupted" | "api_error" | "turn_start" | "relocated";
   /**
    * `api_error` のエラー種別（合成 assistant 行の `error`。実測: `rate_limit` = 使用量制限 429 /
    * `server_error` 529 / `authentication_failed` 403）。hub は `rate_limit` のとき、Claude Code の
@@ -288,6 +295,13 @@ export interface ClaudeTurnLifecycleEvent {
   errorKind?: string | null;
   /** transcript 行の timestamp（Unix ms）。履歴再生で流れる過去ターンのマーカーを除外する根拠。 */
   atMs: number;
+  /**
+   * `relocated` = 会話中の `/cd`・EnterWorktree / ExitWorktree で作業フォルダが移った行（`{"type":"relocated",
+   * "relocatedCwd":…}`, session-workdir-change）。行に時刻が無いので `atMs` は観測時刻、移った先は `cwd`。
+   */
+  cwd?: string;
+  /** 既存内容の再生を終えた後（追尾中）に書かれた行か（`relocated` だけが付ける）。 */
+  live?: boolean;
 }
 
 const MAX_COMMAND_CHARACTERS = 8_000;
@@ -448,9 +462,17 @@ export class TranscriptTailer {
   ): AsyncGenerator<ControlMessage, void, void> {
     const start = Date.now();
     let resolved: string | null = null;
+    let lastElsewhereCheckMs = start;
     while (!signal?.aborted) {
       resolved = TranscriptTailer.resolveJsonl(dir, preferredSessionId, newerThanMs);
       if (resolved !== null) break;
+      // 1 回も発話していない会話で作業フォルダを変えると、会話ログは移動先の slug に初めて作られる
+      // （session-workdir-change）。記録どおりの slug だけを待つと永遠に現れないので、間引いてほかの slug も探す。
+      if (preferredSessionId !== null && Date.now() - lastElsewhereCheckMs >= ELSEWHERE_CHECK_INTERVAL_MS) {
+        lastElsewhereCheckMs = Date.now();
+        resolved = findTranscriptElsewhere(dir, preferredSessionId);
+        if (resolved !== null) break;
+      }
       if (!this.tailIndefinitely) {
         if (this.tailDeadlineMs === null || Date.now() - start >= this.tailDeadlineMs) return;
       }
@@ -791,6 +813,14 @@ function* emitLine(line: Buffer, state: TailState): Generator<ControlMessage, vo
     state.rateLimitArmedAtMs = state.rateLimitArmed && Number.isFinite(errorAtMs) ? errorAtMs : null;
     if (state.onLifecycle !== null && Number.isFinite(errorAtMs)) {
       state.onLifecycle({ kind: "api_error", atMs: errorAtMs, errorKind: apiErrorKind });
+    }
+  }
+  // 作業フォルダの移動（session-workdir-change）。表示する行ではないので観測者へだけ知らせる。
+  if (state.onLifecycle !== null && text.includes('"relocated"')) {
+    const relocatedCwd = relocatedCwdOf(text);
+    if (relocatedCwd !== null) {
+      state.onLifecycle({ kind: "relocated", atMs: Date.now(), cwd: relocatedCwd, live: state.live });
+      return;
     }
   }
   const turn = extractTurn(text, state.noticeCtx);

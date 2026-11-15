@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { bumpHeartbeat, listHeartbeatSessions, readHeartbeat, removeHeartbeat, writeHeartbeat } from "../sessions/heartbeat.js";
-import { claudeProjectSlug, ensureDirectory0700 } from "../shared/paths.js";
+import { canonicalPath, claudeProjectSlug, ensureDirectory0700 } from "../shared/paths.js";
 import type { EngineRelayMessage } from "./engineRelaySocket.js";
 import { encodeControlMessage } from "../protocol.js";
 import {
@@ -17,6 +17,7 @@ import {
   type HubPushEvent,
   type HubServerMessage,
   type PendingQuestionSnapshotEntry,
+  WORKDIR_CHANGE_LEASE_MS,
 } from "./hubProtocol.js";
 import type {
   ControlMessage,
@@ -50,8 +51,8 @@ import {
   SEND_NOW_EXPIRED_IN_QUEUE,
   type SendQueuedNowOutcome,
 } from "../backend/tmux.js";
-import { CodexAppServerManager } from "../codex/codexAppServer.js";
-import type { ApiAgentManagerOptions, ApiAgentStatusMessage } from "../apiAgent/manager.js";
+import { CodexAppServerManager, CodexCwdChangeError } from "../codex/codexAppServer.js";
+import type { ApiAgentManagerOptions, ApiAgentRelocateOutcome, ApiAgentStatusMessage } from "../apiAgent/manager.js";
 import { ApiAgentRejectedError } from "../apiAgent/config.js";
 import type { ApiAgentConfig } from "../protocol.js";
 import {
@@ -72,6 +73,8 @@ import {
 } from "../codex/codexRolloutTailer.js";
 import type { SessionMeta } from "../sessions/sessionMetadataStore.js";
 import { claudeTranscriptPathFor } from "../sessions/transcriptPath.js";
+import { ensureClaudeMetaCwd, locateClaudeTranscript } from "../sessions/claudeTranscriptLocator.js";
+import { cwdMarker } from "../shared/cwdMarker.js";
 import { isNonBlockingQuestionId } from "../codex/codexAsyncQuestion.js";
 import { randomUUID } from "node:crypto";
 import { describeUsageLimitWait } from "../shared/usageLimitWait.js";
@@ -252,8 +255,13 @@ export interface ApiAgentHubRuntime {
   has(session: string): boolean;
   status(session: string): ApiAgentStatusMessage | null;
   readonly hasTurnsInFlight: boolean;
+  /** 作業フォルダの変更（session-workdir-change）。無い実装は変更を断る。 */
+  relocate?(session: string, request: { conversationId: string; fromCwd: string; toCwd: string }): ApiAgentRelocateOutcome;
+  /** 記録の cwd が別の経路で変わったのに合わせる（会話ログは動かさない）。 */
+  followCwd?(session: string, cwd: string): boolean;
 }
-export type ApiAgentHubCallbacks = Required<Pick<ApiAgentManagerOptions, "onProcessing" | "onStatus" | "onQuestion" | "onQuestionDismiss">>;
+export type ApiAgentHubCallbacks = Required<Pick<ApiAgentManagerOptions,
+  "onProcessing" | "onStatus" | "onQuestion" | "onQuestionDismiss" | "onCwdChange">>;
 
 interface SubscriberState { preview: boolean; backfilling: boolean }
 interface ReplayEvent { serverSeq: number; payload: ControlMessage }
@@ -361,6 +369,11 @@ interface SessionActor {
    * dequeue）として採用する（transcript を権威にして生きたターンを idle に固定しない）。
    */
   lastTurnStartMs: number | null;
+  /**
+   * この会話の購読者へ最後に配った作業フォルダ（`pc:cwd`, session-workdir-change）。同じ値を続けて配らない。
+   * 購読の開始時（履歴の後）は値に関わらず配る。
+   */
+  lastPublishedCwd: string | null;
   focusedBy: Set<object>;
   subscribers: Map<object, SubscriberState>;
   nextServerSeq: number;
@@ -446,6 +459,12 @@ interface SessionActor {
   codexOrder: string[];
   codexDrainRunning: boolean;
   codexDrainBlocked: boolean;
+  /**
+   * 作業フォルダの変更でこの会話を押さえている（session-workdir-change）。押さえている間は送信の注入・今すぐ送信・
+   * Codex のターンの開始を待たせる（Claude 端末では `/cd` と発話が入力欄で混ざる、Codex では始まりかけのターンが
+   * 古いフォルダで動く）。期限（lease）か、押さえた接続の切断で放す。
+   */
+  workdirChange: { token: string; client: object; timer: ReturnType<typeof setTimeout> } | null;
 }
 
 /**
@@ -492,6 +511,7 @@ interface RunningAgent {
 const RUNNING_AGENT_STALE_MS = 6 * 60 * 60 * 1000;
 
 const STOP_BLOCKED_BY_SHUTDOWN = "ホスト側の再起動中のため止められませんでした。少し待ってもう一度試してください。";
+const CWD_BLOCKED_BY_SHUTDOWN = "ホスト側の再起動中のため作業フォルダを変更できませんでした。少し待ってもう一度試してください。";
 const GOAL_BLOCKED_BY_SHUTDOWN = "ホスト側の再起動中のため目標を変更できませんでした。少し待ってもう一度試してください。";
 
 class StaleQuestionError extends Error {
@@ -656,6 +676,8 @@ export class SessionHub {
         this.broadcast({ type: "question_event", session, event: "dismiss", id });
         void this.drainChatQueue(session, actor);
       },
+      // ターンの前に会話ログの今の場所へ合わせた（前のターンで Claude がワークツリーへ移った等, session-workdir-change）。
+      onCwdChange: (session, cwd) => { this.applyConversationCwd(session, cwd, "api-agent-transcript"); },
     });
     return this.apiAgentRuntime;
   }
@@ -951,6 +973,8 @@ export class SessionHub {
     for (const [session, actor] of this.actors) {
       actor.focusedBy.delete(client);
       if (actor.runtimeClaim?.client === client) actor.runtimeClaim = null;
+      // 作業フォルダの変更の途中で切れた engine の押さえは放す（送信待ちを止めたままにしない）。
+      if (actor.workdirChange?.client === client) this.endWorkdirChange(session, actor);
       if (actor.subscribers.has(client)) this.unsubscribe(client, session, actor);
     }
     // 最後の watcher の切断で、watch 起因の pump を止める。
@@ -1134,7 +1158,8 @@ export class SessionHub {
       this.sendTo(client, { type: "hub_state_response", id: message.id, session: message.session,
         pendingQuestion: actor.pendingQuestion === null ? null : {
           id: actor.pendingQuestion.id, questions: actor.pendingQuestion.questions,
-        }, processing: actor.processingSince !== null });
+        }, processing: actor.processingSince !== null,
+        ...(actor.workdirChange !== null ? { workdirChangeHeld: true } : {}) });
       return;
     }
     if (message.type === "presence_request") {
@@ -1411,6 +1436,10 @@ export class SessionHub {
       void this.drainCodexQueue(message.session, actor);
       return;
     }
+    if (message.type === "codex_cwd_submit") {
+      this.handleCodexCwdSubmit(client, message);
+      return;
+    }
     if (message.type === "codex_goal_submit") {
       // 終了の準備中は始めない（App Server の接続を新しく開いても、閉じる hub が RPC の途中で畳む）。
       if (this.shuttingDown) {
@@ -1456,6 +1485,10 @@ export class SessionHub {
     if (message.type === "api_agent_open" || message.type === "api_agent_configure" || message.type === "api_agent_interrupt" ||
       message.type === "api_agent_close") {
       this.handleApiAgentMessage(client, message);
+      return;
+    }
+    if (message.type === "api_agent_relocate") {
+      this.handleApiAgentRelocate(client, message);
       return;
     }
     if (message.type === "codex_turn_interrupt") {
@@ -1670,6 +1703,24 @@ export class SessionHub {
       if (actor?.runtimeClaim?.client === client) actor.runtimeClaim = null;
       return;
     }
+    if (message.type === "workdir_change_begin") {
+      this.sendTo(client, {
+        type: "workdir_change_begin_result", id: message.id, ...this.beginWorkdirChange(client, message.session, message.token),
+      });
+      return;
+    }
+    if (message.type === "workdir_change_end") {
+      const actor = this.actors.get(message.session);
+      if (actor?.workdirChange?.token === message.token) this.endWorkdirChange(message.session, actor);
+      // まだ与えていない token の end（engine 側で begin が時間切れになった）。後から begin が届いても与えない。
+      else this.rememberEndedWorkdirToken(message.token);
+      return;
+    }
+    if (message.type === "session_cwd_set") {
+      const applied = this.applyConversationCwd(message.session, message.cwd, "workdir-change");
+      this.sendTo(client, { type: "session_cwd_set_result", id: message.id, status: applied ? "ok" : "not_found" });
+      return;
+    }
     if (!this.applyProcessing(message.session, message.state, message.event, message.atMs, message.error)) return;
     this.broadcast(message);
   }
@@ -1690,6 +1741,16 @@ export class SessionHub {
       // 放置すると reaper が 30 分で pane ごと kill して自動再開が永久に起きないため、見張り中は
       // 利用中とみなして heartbeat を進める。
       if (actor.usageLimitWatch !== null) this.bumpSafe(session, "hub-usage-limit-wait");
+    }
+    // 端末で打たれた `/cd`・EnterWorktree / ExitWorktree で、tail していない会話の会話ログが別の slug へ移っていたら
+    // 記録を直す（session-workdir-change。tail 中の会話は relocated 行を追尾で拾う）。
+    for (const [session, actor] of this.actors) {
+      if (actor.tail !== null) continue;
+      try {
+        this.reconciledMeta(session);
+      } catch (error) {
+        this.options.log?.(`作業フォルダの照合に失敗 session=${session}: ${String(error)}`);
+      }
     }
     const result = await reaperTick({ ...this.options, now: this.now() });
     // reaper の判定と actor の処理中フラグを同期する。demote(プロセス死亡)や kill 後も
@@ -1772,6 +1833,40 @@ export class SessionHub {
         type: "api_agent_result", id: message.id, status: "failed",
         error: error instanceof ApiAgentRejectedError ? error.code : "worker_failed",
       });
+    }
+  }
+
+  /**
+   * API 作業の作業フォルダの変更（session-workdir-change）。hub の 1 回の処理の中で、ターンの実行中・設問の保留・送信待ち
+   * （hub の chat queue と注入中）を確かめてから会話ログを移す（ターンの開始と入れ違わない）。記録と `pc:cwd` は engine が
+   * 成功の後に session_cwd_set で頼む。
+   */
+  private handleApiAgentRelocate(client: object, message: Extract<HubClientMessage, { type: "api_agent_relocate" }>): void {
+    const reply = (status: Extract<HubServerMessage, { type: "api_agent_relocate_result" }>["status"], cwd?: string): void => {
+      this.sendTo(client, { type: "api_agent_relocate_result", id: message.id, status, ...(cwd !== undefined ? { cwd } : {}) });
+    };
+    const runtime = this.ensureApiAgent();
+    if (runtime?.relocate === undefined) {
+      reply("failed");
+      return;
+    }
+    const actor = this.actors.get(message.session);
+    // 枠の押さえ（workdir_change_begin）の間に届いた送信は queue で待たせているだけ（押さえを放した後、新しいフォルダの
+    // 会話へ流れる）なので断らない。押さえの無い呼び出しだけ、送信待ち・注入中も確かめる。
+    const held = actor?.workdirChange != null;
+    if (actor !== undefined && (actor.processingSince !== null || actor.pendingQuestion !== null ||
+      (!held && (actor.chatQueue.length > 0 || actor.injectingChatMessageIds.size > 0)))) {
+      reply("busy");
+      return;
+    }
+    try {
+      const outcome = runtime.relocate(message.session, {
+        conversationId: message.conversationId, fromCwd: message.fromCwd, toCwd: message.cwd,
+      });
+      reply(outcome.status, outcome.status === "ok" ? outcome.cwd : undefined);
+    } catch (error) {
+      this.options.log?.(`api-agent 作業フォルダの変更に失敗 session=${message.session}: ${String(error)}`);
+      reply("failed");
     }
   }
 
@@ -2046,7 +2141,7 @@ export class SessionHub {
   }
 
   private startSharedTail(session: string, actor: SessionActor, newerThanMs: number | null): void {
-    const meta = this.options.metadataStore.get(session);
+    const meta = this.reconciledMeta(session);
     if (meta === null) {
       // VS Code 等の外部クライアント由来会話を初めて resume すると、Hub 購読が
       // launchCore の metadata 永続化よりわずかに先行し得る。購読を保持したまま
@@ -2080,6 +2175,8 @@ export class SessionHub {
         if (current !== null && actor.tail === current &&
           payload.type === "chat_output" && payload.streamId === HISTORY_DONE_STREAM_ID) {
           actor.sharedTailCaughtUp = true;
+          // 履歴の後に今の作業フォルダを 1 回配る（session-workdir-change）。
+          this.publishCurrentCwd(session, actor);
         }
       },
       undefined,
@@ -2200,6 +2297,8 @@ export class SessionHub {
       // 処理中状態を自己修復できない。
     }
     this.publishCodexModelMarker(session, actor, state, subscribedModel);
+    // 履歴の後に今の作業フォルダを 1 回配る（session-workdir-change）。
+    this.publishCurrentCwd(session, actor);
     // thread の現在の collaboration mode（controller が把握している場合）。履歴（task_started）由来の値は
     // iOS が採用しないので、実体はここで 1 回配る（codex-plan-mode）。
     const subscribedCollaborationMode = state.subscribedCollaborationMode;
@@ -2434,6 +2533,196 @@ export class SessionHub {
     }).catch((error) => this.options.log?.(`Codex 画像サムネ生成失敗 session=${session}: ${String(error)}`));
   }
 
+  /** 作業フォルダの変更の押さえの期限（WORKDIR_CHANGE_LEASE_MS の説明を参照）。 */
+  private static readonly WORKDIR_CHANGE_LEASE_MS = WORKDIR_CHANGE_LEASE_MS;
+  /** end が先に届いた token を覚えておく時間（begin の依頼が hub で詰まっていた分の遅れを吸う）。 */
+  private static readonly ENDED_WORKDIR_TOKEN_TTL_MS = 120_000;
+  /** end が先に届いた token（→ 覚えた時刻 ms）。 */
+  private readonly endedWorkdirTokens = new Map<string, number>();
+
+  private rememberEndedWorkdirToken(token: string): void {
+    const now = this.nowMs();
+    for (const [old, at] of this.endedWorkdirTokens) {
+      if (now - at > SessionHub.ENDED_WORKDIR_TOKEN_TTL_MS) this.endedWorkdirTokens.delete(old);
+    }
+    this.endedWorkdirTokens.set(token, now);
+  }
+
+  /**
+   * 作業フォルダの変更のために会話を押さえる（session-workdir-change）。同期の 1 回の処理で確かめて押さえるので、
+   * 確かめた後に送信・ターンの開始が割り込まない。
+   */
+  private beginWorkdirChange(
+    client: object, session: string, token: string,
+  ): { status: "granted"; token: string } | { status: "busy" | "in_flight" } {
+    // engine が既に諦めた依頼（end が先に届いた）には与えない。与えると誰も放さない押さえが残る。
+    if (this.endedWorkdirTokens.delete(token)) return { status: "busy" };
+    if (this.shuttingDown) return { status: "busy" };
+    const actor = this.actor(session);
+    if (actor.workdirChange !== null) return { status: "in_flight" };
+    if (this.conversationOccupied(session, actor)) return { status: "busy" };
+    const timer = setTimeout(() => {
+      if (actor.workdirChange?.token !== token) return;
+      this.options.log?.(`作業フォルダの変更の押さえが期限切れ session=${session}`);
+      this.endWorkdirChange(session, actor);
+    }, SessionHub.WORKDIR_CHANGE_LEASE_MS);
+    timer.unref?.();
+    actor.workdirChange = { token, client, timer };
+    return { status: "granted", token };
+  }
+
+  /** 押さえを放し、待たせていた送信・今すぐ送信・Codex のターンを流す。 */
+  private endWorkdirChange(session: string, actor: SessionActor): void {
+    if (actor.workdirChange === null) return;
+    clearTimeout(actor.workdirChange.timer);
+    actor.workdirChange = null;
+    void this.drainChatQueue(session, actor);
+    void this.runSendNow(session, actor);
+    void this.drainCodexQueue(session, actor);
+  }
+
+  /**
+   * 会話が今、作業フォルダを変えてはいけない状態か: ターンの実行中・設問の保留・設問の回答キーの注入中・送信待ち・
+   * 打ち込み中・今すぐ送信の途中・始まりかけ / 実行中の Codex のターン（3 種類の会話に共通）。
+   */
+  private conversationOccupied(session: string, actor: SessionActor): boolean {
+    return actor.processingSince !== null || actor.pendingQuestion !== null || actor.questionAnswerInjections > 0 ||
+      actor.chatQueue.length > 0 || actor.injectingChatMessageIds.size > 0 || actor.chatDrainRunning ||
+      actor.sendNowRunning || actor.sendNowWaiters.length > 0 ||
+      actor.codexQueue.length > 0 || actor.startingCodexMessageIds.size > 0 || actor.pendingCodexTurns.size > 0 ||
+      this.activeCodexTurns.has(session);
+  }
+
+  /**
+   * 会話の作業フォルダが変わった（session-workdir-change）: 記録（metadata）の cwd を合わせ、購読者へ `pc:cwd` を
+   * 配る（同じ値を続けて配らない）。記録が無ければ false。
+   */
+  private applyConversationCwd(session: string, cwd: string, reason: string): boolean {
+    const meta = this.options.metadataStore.get(session);
+    if (meta === null) return false;
+    if (meta.cwd !== cwd) {
+      try {
+        this.options.metadataStore.put({ ...meta, cwd });
+        this.options.log?.(`作業フォルダの記録を更新 session=${session} reason=${reason} ${meta.cwd} → ${cwd}`);
+      } catch (error) {
+        this.options.log?.(`作業フォルダの記録を更新できません session=${session}: ${String(error)}`);
+      }
+    }
+    // API 作業は次のターンの起動フォルダとして同じ値を持つ（記録の照合・relocated 行・利用者の変更の確定に追従する）。
+    if (meta.executionRoute === "api") this.apiAgentRuntime?.followCwd?.(session, cwd);
+    const actor = this.actors.get(session);
+    if (actor !== undefined && actor.lastPublishedCwd !== cwd) {
+      actor.lastPublishedCwd = cwd;
+      this.publishConversationEvent(session, actor, cwdMarker(cwd));
+    }
+    return true;
+  }
+
+  /**
+   * Codex の thread の作業フォルダ（resume 応答・`thread/settings/updated`。ほかのクライアントでの変更を含む）を記録へ
+   * 合わせる（session-workdir-change）。消えたフォルダ（worktree を片付けた後の古い値等）は採らない: 記録を起動できない
+   * フォルダへ戻さない（その会話の次のターンは Codex 側で失敗するので、利用者が作業フォルダを選び直す）。
+   */
+  private applyCodexThreadCwd(session: string, cwd: string): void {
+    const meta = this.options.metadataStore.get(session);
+    if (meta === null || meta.agent !== "codex") return;
+    let resolved: string;
+    try {
+      if (!fs.statSync(cwd).isDirectory()) throw new Error("not a directory");
+      resolved = canonicalPath(cwd);
+    } catch {
+      this.options.log?.(`Codex thread の作業フォルダが見つからないため記録を変えない session=${session} cwd=${cwd}`);
+      return;
+    }
+    if (canonicalPath(meta.cwd) === resolved) return;
+    this.applyConversationCwd(session, resolved, "codex-thread");
+  }
+
+  /** codex_cwd_submit（session-workdir-change）: hub 所有の thread 接続で作業フォルダを変える。 */
+  private handleCodexCwdSubmit(client: object, message: Extract<HubClientMessage, { type: "codex_cwd_submit" }>): void {
+    if (this.shuttingDown) {
+      this.sendTo(client, { type: "codex_cwd_result", id: message.id, status: "failed", error: CWD_BLOCKED_BY_SHUTDOWN });
+      return;
+    }
+    // 始まりかけのターン（hub の待ち行列・開始中・結果待ち）が古いフォルダで動いたまま成功を返さない。controller は
+    // 実行中のターン（activeTurnId）しか知らないので、hub の側で確かめる。
+    // 枠の押さえ（workdir_change_begin）の間に届いた送信は、待ち行列で待たせているだけ（押さえを確かめた時点で行列は
+    // 空で、押さえの間は始めない。放した後に新しいフォルダの会話で始まる）なので断らない（API 作業と同じ扱い）。
+    const codexActor = this.actors.get(message.session);
+    const held = codexActor?.workdirChange != null;
+    if (this.activeCodexTurns.has(message.session) || (codexActor !== undefined && (
+      codexActor.startingCodexMessageIds.size > 0 ||
+      (!held && (codexActor.codexQueue.length > 0 || codexActor.pendingCodexTurns.size > 0))))) {
+      this.sendTo(client, { type: "codex_cwd_result", id: message.id, status: "busy" });
+      return;
+    }
+    const controller = this.ensureCodexTurnController();
+    const setCwd = controller.setCwd;
+    if (setCwd === undefined) {
+      this.sendTo(client, { type: "codex_cwd_result", id: message.id, status: "unsupported" });
+      return;
+    }
+    void this.trackOp(setCwd.call(controller, {
+      session: message.session, threadId: message.threadId, cwd: message.cwd, targetCwd: message.targetCwd,
+    })).then(
+      (cwd) => {
+        this.sendTo(client, { type: "codex_cwd_result", id: message.id, status: "ok", cwd });
+        // この操作のためだけに開いた thread 接続（購読者も turn も無い）は残さない。
+        this.maybeCloseIdleCodexSession(message.session);
+      },
+      (error) => {
+        const status = error instanceof CodexCwdChangeError ? error.kind : "failed";
+        this.options.log?.(`Codex 作業フォルダの変更に失敗 session=${message.session} status=${status}: ${String(error)}`);
+        this.sendTo(client, { type: "codex_cwd_result", id: message.id, status, error: String(error) });
+        this.maybeCloseIdleCodexSession(message.session);
+      },
+    );
+  }
+
+  /**
+   * 今の作業フォルダを購読者へ添える（購読の開始時の履歴の後。値が同じでも送る）。状態の添え物なので serverSeq 0 で
+   * 送り、replay buffer には積まない（後から加わる client には backfill の終わりで別に添える）。
+   */
+  private publishCurrentCwd(session: string, actor: SessionActor): void {
+    // 会話ログの置き場所で記録を確かめてから配る（1 回も発話していない会話を `/cd` で移すと、会話ログは移動先に
+    // 初めて作られ、記録の書き換えより先に履歴の読み込みが終わる。古い値を先に配らない）。照合で記録が変われば、
+    // そこで新しい値を配り済みなので重ねて送らない。
+    const before = this.options.metadataStore.get(session)?.cwd;
+    const meta = this.reconciledMeta(session);
+    const cwd = meta?.cwd;
+    if (meta === null || cwd === undefined) return;
+    if (cwd !== before && actor.lastPublishedCwd === cwd) return;
+    // 会話ログが記録と違う場所にあるのに今のフォルダを決められない（移った直後で、`cwd` を持つ行がまだ書かれていない）
+    // ときは、古いと分かっている記録の値を配らない（記録が直ったとき・変更の確定のときに配られる）。
+    if ((meta.agent ?? "claude") === "claude") {
+      const conversationId = meta.providerSessionId ?? meta.claudeSessionId;
+      const located = conversationId === undefined ? null : locateClaudeTranscript(conversationId, cwd);
+      if (located !== null && located.moved && located.cwd === null) {
+        this.options.log?.(`作業フォルダを決められないため履歴の後の pc:cwd を見送り session=${session}`);
+        return;
+      }
+    }
+    actor.lastPublishedCwd = cwd;
+    for (const [subscriber, subscriberState] of actor.subscribers) {
+      if (subscriberState.backfilling) continue;
+      this.sendTo(subscriber, { type: "conversation_event", session, serverSeq: 0, payload: cwdMarker(cwd) });
+    }
+  }
+
+  /**
+   * 会話を読む前の記録（metadata）。Claude の会話ログが記録上の cwd の slug に無く別の slug へ移っていれば
+   * （hub が見ていない間の `/cd` 等, session-workdir-change）、記録を直して購読者へ知らせてから返す。
+   */
+  private reconciledMeta(session: string): SessionMeta | null {
+    const meta = this.options.metadataStore.get(session);
+    if (meta === null || (meta.agent ?? "claude") !== "claude") return meta;
+    const fixed = ensureClaudeMetaCwd(this.options.metadataStore, meta, {
+      log: (message) => this.options.log?.(message),
+    });
+    if (fixed.cwd !== meta.cwd) this.applyConversationCwd(session, fixed.cwd, "transcript-moved");
+    return fixed;
+  }
+
   private publishConversationEvent(session: string, actor: SessionActor, payload: ControlMessage): void {
     if (payload.type === "image_available" && payload.id.startsWith("att-")) {
       actor.codexLive?.attachedImagePaths.add(payload.path);
@@ -2526,7 +2815,7 @@ export class SessionHub {
 
   private startBackfill(client: object, session: string, actor: SessionActor, newerThanMs: number | null): void {
     if (this.options.tailFactory === undefined) return;
-    const meta = this.options.metadataStore.get(session);
+    const meta = this.reconciledMeta(session);
     if (meta === null) return;
     // 離脱→再購読で同じ client オブジェクトが**別の** SubscriberState / tail を持つ。古い
     // backfill の後始末が新しい購読を壊さないよう、自分が始めた分だけを識別して触る。
@@ -2599,6 +2888,11 @@ export class SessionHub {
           if (event.serverSeq <= boundarySeq) continue;
           this.sendTo(client, { type: "conversation_event", session, ...event });
         }
+      }
+      // 後から加わった client にも、履歴の後に今の作業フォルダを 1 回添える（session-workdir-change）。
+      const currentCwd = this.options.metadataStore.get(session)?.cwd ?? null;
+      if (currentCwd !== null) {
+        this.sendTo(client, { type: "conversation_event", session, serverSeq: 0, payload: cwdMarker(currentCwd) });
       }
       // 後から加わった client の履歴には、turn を伴わない設定変更（境界前に配信済みの
       // thread/settings/updated）が含まれない。会話の現在モデルを最後に 1 回添えて揃える。
@@ -2754,7 +3048,7 @@ export class SessionHub {
     let task = this.historyPageReads.get(session);
     if (task === undefined) {
       const factory = this.options.tailFactory;
-      const meta = this.options.metadataStore.get(session);
+      const meta = this.reconciledMeta(session);
       if (factory === undefined || meta === null) throw new Error("history source unavailable");
       const controller = new AbortController();
       const events: ControlMessage[] = [];
@@ -2924,7 +3218,7 @@ export class SessionHub {
     let actor = this.actors.get(session);
     if (actor === undefined) {
       actor = { pendingQuestion: null, processingSince: null, processingSinceMs: null, lastInterruptDoneMs: null,
-        lastTurnEndMs: null, turnStartFiredAtMs: null, lastTurnStartMs: null,
+        lastTurnEndMs: null, turnStartFiredAtMs: null, lastTurnStartMs: null, lastPublishedCwd: null,
         focusedBy: new Set(), subscribers: new Map(),
         nextServerSeq: 1, replayBuffer: [], latestSubagentNodes: new Map(), runningAgents: new Map(), tail: null,
         sharedTailCaughtUp: false,
@@ -2940,7 +3234,7 @@ export class SessionHub {
         chatQueue: [], chatOrder: [], chatDrainRunning: false, chatDrainBlocked: false,
         questionAnswerInjections: 0, cancellingQuestionId: null, choiceCancelFailed: null,
         sendNowRunning: false, sendNowWaiters: [],
-        codexQueue: [], codexOrder: [], codexDrainRunning: false, codexDrainBlocked: false };
+        codexQueue: [], codexOrder: [], codexDrainRunning: false, codexDrainBlocked: false, workdirChange: null };
       this.actors.set(session, actor);
     }
     return actor;
@@ -3140,7 +3434,8 @@ export class SessionHub {
       }
       return;
     }
-    if (actor.sendNowRunning || actor.chatDrainRunning || actor.sendNowWaiters.length === 0) return;
+    if (actor.sendNowRunning || actor.chatDrainRunning || actor.workdirChange !== null ||
+      actor.sendNowWaiters.length === 0) return;
     // 待ちすぎた要求には chord を送らない（1 キーも送らずに失敗で返す）。
     const expired = actor.sendNowWaiters.filter(
       (waiter) => this.nowMs() - waiter.receivedAtMs > SEND_NOW_QUEUE_WAIT_LIMIT_MS);
@@ -3189,7 +3484,7 @@ export class SessionHub {
 
   private async drainChatQueue(session: string, actor: SessionActor): Promise<void> {
     if (this.shuttingDown || actor.chatDrainRunning || actor.chatDrainBlocked || actor.sendNowRunning ||
-      this.chatDrainHeldByQuestion(actor)) return;
+      actor.workdirChange !== null || this.chatDrainHeldByQuestion(actor)) return;
     actor.chatDrainRunning = true;
     try {
       // 終了の準備に入ったら次の発話へ進まない（queued のまま残し、次の hub に届けさせる）。
@@ -3371,6 +3666,7 @@ export class SessionHub {
         this.publishCodexMarker(session, CODEX_COLLABORATION_MODE_STREAM_ID, mode);
       },
       onModel: (session, model) => this.publishCodexMarker(session, CODEX_MODEL_STREAM_ID, model),
+      onCwd: (session, cwd) => this.applyCodexThreadCwd(session, cwd),
       onTokenUsage: (session, totalTokens, contextWindow) => {
         this.publishCodexMarker(session, CODEX_CONTEXT_STREAM_ID, String(totalTokens));
         if (contextWindow !== null) {
@@ -3421,7 +3717,7 @@ export class SessionHub {
   }
 
   private async drainCodexQueue(session: string, actor: SessionActor): Promise<void> {
-    if (this.shuttingDown || actor.codexDrainRunning || actor.codexDrainBlocked) return;
+    if (this.shuttingDown || actor.codexDrainRunning || actor.codexDrainBlocked || actor.workdirChange !== null) return;
     actor.codexDrainRunning = true;
     try {
       // 終了の準備に入ったら次の turn を始めない（queued のまま残し、次の hub に始めさせる）。
@@ -3467,7 +3763,10 @@ export class SessionHub {
     const { message } = entry;
     try {
       await this.ensureCodexTurnController().startTurn({
-        session: message.session, threadId: message.threadId, cwd: message.cwd,
+        // 作業フォルダは始める時点の記録で（送信の時点の値だと、作業フォルダの変更の押さえの間に待たせた送信が
+        // 変更前のフォルダで thread を開き直し得る, session-workdir-change）。
+        session: message.session, threadId: message.threadId,
+        cwd: this.options.metadataStore.get(message.session)?.cwd ?? message.cwd,
         text: message.text, clientUserMessageId: message.clientUserMessageId,
         effort: message.effort,
         approvalPolicy: message.approvalPolicy,
@@ -3631,6 +3930,12 @@ export class SessionHub {
     // 会話が停止ボタン点灯のまま固まり、開き直しても履歴再生が走らず送信が queued で止まった）。
     if (this.actors.get(session) !== actor) return;
     if (this.options.metadataStore.get(session)?.agent === "codex") return;
+    if (event.kind === "relocated") {
+      // 会話中の `/cd`・EnterWorktree / ExitWorktree で作業フォルダが移った（session-workdir-change）。追尾中に
+      // 書かれた行だけを今の値として採る（履歴の再生で流れる過去の移動は、開くときの照合 reconciledMeta が拾う）。
+      if (event.live === true && event.cwd !== undefined) this.applyConversationCwd(session, event.cwd, "relocated");
+      return;
+    }
     if (event.kind === "turn_start") {
       // 発話の観測（履歴再生も含めて最新値を保つ）。処理中状態は動かさない（権威は hook）。
       actor.lastTurnStartMs = Math.max(actor.lastTurnStartMs ?? 0, event.atMs);

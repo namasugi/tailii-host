@@ -27,6 +27,8 @@ import type {
 } from "../protocol/messages.js";
 import { PROTOCOL_V2 } from "../protocol/messages.js";
 import { claudeProjectSlug } from "../shared/paths.js";
+import { locateClaudeTranscript, moveClaudeTranscript } from "../sessions/claudeTranscriptLocator.js";
+import { conversationWorktreeBinding, resolveConversationPlacement } from "./transcriptPlacement.js";
 import { ApiAgentRejectedError, validApiAgentConfig } from "./config.js";
 import type { ApiAgentKeyError, ApiAgentKeyResolution } from "./keyEnvironment.js";
 import {
@@ -74,6 +76,14 @@ export interface ApiAgentManagerOptions {
   /** 設問カードを出せないとき（未設定）は AskUserQuestion を断る。 */
   onQuestion?: (event: { session: string; id: string; questions: QuestionPromptQuestion[] }) => void;
   onQuestionDismiss?: (session: string, id: string) => void;
+  /**
+   * 会話の作業フォルダを会話ログの今の場所に合わせて変えた（ターンの中で Claude がワークツリーへ移った等。
+   * session-workdir-change）。hub は記録を直して購読者へ `pc:cwd` を配る。利用者の変更（relocate）・hub からの
+   * 追従（followCwd）では呼ばない（記録と配信は呼び手が持つ）。
+   */
+  onCwdChange?: (session: string, cwd: string) => void;
+  /** `~/.claude/projects`（会話ログを探す・移す場所。テスト注入用）。 */
+  claudeProjectsDir?: string;
   ledgerStore?: ApiAgentLedgerStore;
   sessionStore?: ApiAgentSessionStore;
   /** 会話の JSONL（既定 `~/.claude/projects/<slug>/<id>.jsonl`）。 */
@@ -115,6 +125,8 @@ interface Conversation {
   started: boolean;
   queue: string[];
   running: RunningTurn | null;
+  /** ターンを始める途中（キーの取得を待っている間）の数。作業フォルダの変更はこの間も断る。 */
+  startsInFlight: number;
   disposed: boolean;
   lastOutcome?: ApiAgentTurnOutcome;
   lastError?: ApiAgentErrorCode;
@@ -129,6 +141,14 @@ interface PendingQuestion {
 }
 
 const QUESTION_ID_PREFIX = "api-agent-question-";
+
+/**
+ * 作業フォルダの変更（relocate）の結果。`busy` = ターンの実行中・始める途中・送信待ち・設問の保留・会話を掴んでいる
+ * claude がある。`worktree` = Claude 自身がワークツリーに入っている。`conflict` = 移動先に同じ会話の記録が既にある。
+ */
+export type ApiAgentRelocateOutcome =
+  | { status: "ok"; cwd: string }
+  | { status: "busy" | "worktree" | "conflict" | "failed" };
 
 export class ApiAgentManager {
   private readonly conversations = new Map<string, Conversation>();
@@ -152,7 +172,7 @@ export class ApiAgentManager {
       if (this.ledgerStore.settleOrphans(ledger, this.now())) this.saveLedger(ledger);
       this.conversations.set(record.name, {
         session: record.name, conversationId: record.conversationId, cwd: record.cwd, config: record.config,
-        ledger, started: true, queue: [], running: null, disposed: false,
+        ledger, started: true, queue: [], running: null, startsInFlight: 0, disposed: false,
       });
       restored.push(record.name);
     }
@@ -185,7 +205,7 @@ export class ApiAgentManager {
     const conversation: Conversation = {
       session, conversationId: request.conversationId, cwd: request.cwd, config: request.config,
       ledger, started: request.resume || ledger.turns.length > 0 || ledger.foldedTurns > 0,
-      queue: [], running: null, disposed: false,
+      queue: [], running: null, startsInFlight: 0, disposed: false,
     };
     this.conversations.set(session, conversation);
     this.persistSession(conversation);
@@ -227,6 +247,61 @@ export class ApiAgentManager {
     return false;
   }
   conversationIdFor(session: string): string | null { return this.conversations.get(session)?.conversationId ?? null; }
+
+  /**
+   * 利用者が会話の作業フォルダを変える（session-workdir-change）。ターンが動いていないときだけ、会話ログ（と付帯フォルダ）を
+   * 移動先の slug へ移し（`relocated` 行を書き足す）、この会話が持つ cwd と開いている記録を新しい値にする。次のターンの
+   * 作業プロセスは新しいフォルダで `resume` する。まだ 1 回も発話していない会話は値を変えるだけ。
+   * 同期で済ませる（hub の 1 回の処理の中で、ターンの開始と入れ違わない）。記録（metadata）と `pc:cwd` は呼び手が持つ。
+   * 開いていない会話（hub の再起動前・閉じた後）も、会話ログと記録があれば移す。
+   */
+  relocate(session: string, request: { conversationId: string; fromCwd: string; toCwd: string }): ApiAgentRelocateOutcome {
+    if (!isConversationUuid(request.conversationId) || !path.isAbsolute(request.toCwd)) return { status: "failed" };
+    const conversation = this.conversations.get(session);
+    if (conversation !== undefined) {
+      if (conversation.conversationId !== request.conversationId) return { status: "failed" };
+      // 実行中・始める途中・送信待ち（次のターンへ持ち越した発話）があれば断る。承認・設問の保留はターンの途中。
+      if (conversation.running !== null || conversation.startsInFlight > 0 || conversation.queue.length > 0) {
+        return { status: "busy" };
+      }
+    }
+    for (const pending of this.pendingQuestions.values()) if (pending.session === session) return { status: "busy" };
+    // 会話を掴んでいる claude（Tailii の端末・Tailii 外・終わりきっていない SDK の子）があれば動かさない。
+    if (this.options.conversationHolders(request.conversationId).length > 0) return { status: "busy" };
+    const fromCwd = conversation?.cwd ?? request.fromCwd;
+    const projects = this.projectsOption();
+    // Claude 自身がワークツリーに入っている会話は、resume のたびに Claude がワークツリーへ入り直す（ワークツリーの外の
+    // 元のリポジトリから起動しても入り直すのを実測。transcriptPlacement.ts）。会話ログだけを移しても利用者の変更が効かない
+    // 見込みが高いので断る。
+    if (conversationWorktreeBinding(request.conversationId, fromCwd, projects) !== null) return { status: "worktree" };
+    const moved = moveClaudeTranscript({ conversationId: request.conversationId, toCwd: request.toCwd, fromCwd, ...projects });
+    if (moved.status === "conflict") return { status: "conflict" };
+    if (moved.status === "failed") {
+      this.options.log?.(`api-agent 会話ログを移せません session=${session}: ${moved.error}`);
+      return { status: "failed" };
+    }
+    if (conversation !== undefined) {
+      conversation.cwd = request.toCwd;
+      this.persistSession(conversation);
+    } else {
+      this.followRecord(session, request.conversationId, request.toCwd);
+    }
+    this.options.log?.(`api-agent 作業フォルダを変更 session=${session} (${moved.status})`);
+    return { status: "ok", cwd: request.toCwd };
+  }
+
+  /**
+   * 会話の作業フォルダが別の経路で変わった（hub の記録の照合・会話ログの relocated 行・利用者の変更の確定）のに合わせて、
+   * この会話が持つ cwd と開いている記録を揃える。会話ログは動かさない。変えたら true。
+   */
+  followCwd(session: string, cwd: string): boolean {
+    if (!path.isAbsolute(cwd)) return false;
+    const conversation = this.conversations.get(session);
+    if (conversation === undefined || conversation.disposed || conversation.cwd === cwd) return false;
+    conversation.cwd = cwd;
+    this.persistSession(conversation);
+    return true;
+  }
 
   status(session: string): ApiAgentStatusMessage | null {
     const conversation = this.conversations.get(session);
@@ -331,7 +406,14 @@ export class ApiAgentManager {
       this.emitStatus(conversation);
       throw new ApiAgentRejectedError("budget_exhausted");
     }
-    const key = await this.options.resolveKey(config);
+    // キーの取得を待つ間も「始める途中」として作業フォルダの変更を断る（この後はターンの開始まで同期）。
+    conversation.startsInFlight += 1;
+    let key: Awaited<ReturnType<ApiAgentManagerOptions["resolveKey"]>>;
+    try {
+      key = await this.options.resolveKey(config);
+    } finally {
+      conversation.startsInFlight -= 1;
+    }
     if (typeof key === "string") {
       conversation.lastError = key;
       this.emitStatus(conversation);
@@ -345,7 +427,9 @@ export class ApiAgentManager {
       this.emitStatus(conversation);
       throw new ApiAgentRejectedError("conversation_in_use");
     }
-    const transcript = (this.options.transcriptPath ?? defaultTranscriptPath)(conversation.cwd, conversation.conversationId);
+    // 前のターンの中で会話ログが移っていれば（Claude の EnterWorktree 等）、今の場所から起動フォルダを決める。
+    const placement = this.followTranscript(conversation);
+    const transcript = this.transcriptOf(conversation);
     const baselineUsd = conversation.started ? readTranscriptCostBaseline(transcript) : 0;
     let worker: ApiAgentWorkerHandle;
     try {
@@ -372,7 +456,7 @@ export class ApiAgentManager {
     try {
       worker.send({
         t: "start", conversationId: conversation.conversationId, resume: conversation.started,
-        cwd: conversation.cwd, prompt: texts.join("\n\n"), model: config.model,
+        cwd: placement.launchCwd, prompt: texts.join("\n\n"), model: config.model,
         permissionMode: config.permissionMode, maxTurns: config.budget.maxTurns,
         maxBudgetUsd: Math.min(config.budget.turnUsd, remaining),
         settingSources: this.options.settingSources ?? ["user", "project", "local"],
@@ -470,7 +554,7 @@ export class ApiAgentManager {
     // 2 ターン目以降を resume にするのは、SDK が会話の JSONL を書き始めた後だけ（新規の 1 ターン目が
     // モデルを呼ぶ前に失敗した会話を resume すると、会話が見つからず失敗する）。
     if (!conversation.started) {
-      const transcript = (this.options.transcriptPath ?? defaultTranscriptPath)(conversation.cwd, conversation.conversationId);
+      const transcript = this.transcriptOf(conversation);
       conversation.started = (this.options.transcriptExists ?? fs.existsSync)(transcript);
     }
     conversation.lastOutcome = outcomeOf(result, running);
@@ -519,6 +603,42 @@ export class ApiAgentManager {
   private emitStatus(conversation: Conversation, restoredTexts?: string[]): void {
     if (conversation.disposed) return;
     this.options.onStatus?.(conversation.session, this.statusOf(conversation, restoredTexts));
+  }
+
+  /**
+   * 会話ログの今の場所に cwd を合わせ、次のターンの起動フォルダを返す（transcriptPlacement.ts）。変えたら開いている
+   * 記録を書き直し、hub へ知らせる（記録の metadata と `pc:cwd`）。
+   */
+  private followTranscript(conversation: Conversation): ReturnType<typeof resolveConversationPlacement> {
+    const placement = resolveConversationPlacement(conversation.conversationId, conversation.cwd, this.projectsOption());
+    if (placement.cwd !== conversation.cwd) {
+      this.options.log?.(`api-agent 会話ログの場所に合わせて作業フォルダを変更 session=${conversation.session}`);
+      conversation.cwd = placement.cwd;
+      this.persistSession(conversation);
+      this.options.onCwdChange?.(conversation.session, placement.cwd);
+    }
+    return placement;
+  }
+
+  /** 開いていない会話の記録（hub の再起動前に残ったもの）の cwd を揃える。 */
+  private followRecord(session: string, conversationId: string, cwd: string): void {
+    const record = this.sessionStore.get(session);
+    if (record === null || record.conversationId !== conversationId || record.cwd === cwd) return;
+    try {
+      this.sessionStore.put({ ...record, cwd });
+    } catch (error) {
+      this.options.log?.(`api-agent 会話の記録に失敗 session=${session}: ${(error as NodeJS.ErrnoException).code ?? "error"}`);
+    }
+  }
+
+  /** 会話の JSONL（利用額の基準・書き始めの判定）。 */
+  private transcriptOf(conversation: Conversation): string {
+    return this.options.transcriptPath?.(conversation.cwd, conversation.conversationId) ??
+      defaultTranscriptPath(conversation.cwd, conversation.conversationId, this.options.claudeProjectsDir);
+  }
+
+  private projectsOption(): { projectsDir?: string } {
+    return this.options.claudeProjectsDir !== undefined ? { projectsDir: this.options.claudeProjectsDir } : {};
   }
 
   private persistSession(conversation: Conversation): void {
@@ -576,6 +696,8 @@ function defaultSummary(toolName: string): { summary: string; diff?: ToolDiff } 
   return { summary: `Run tool: ${toolName}` };
 }
 
-function defaultTranscriptPath(cwd: string, conversationId: string): string {
-  return path.join(os.homedir(), ".claude", "projects", claudeProjectSlug(cwd), `${conversationId}.jsonl`);
+function defaultTranscriptPath(cwd: string, conversationId: string, projectsDir?: string): string {
+  // 会話中の `/cd` 等で移った会話は、会話ログが今ある slug を見る（session-workdir-change）。
+  return locateClaudeTranscript(conversationId, cwd, projectsDir !== undefined ? { projectsDir } : {})?.path ??
+    path.join(projectsDir ?? path.join(os.homedir(), ".claude", "projects"), claudeProjectSlug(cwd), `${conversationId}.jsonl`);
 }

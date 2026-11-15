@@ -30,7 +30,8 @@ import {
   CodexRolloutTailer,
   type CodexTurnLifecycleEvent,
 } from "../codex/codexRolloutTailer.js";
-import { canonicalPath, claudeProjectSlug } from "../shared/paths.js";
+import { canonicalPath } from "../shared/paths.js";
+import { claudeTranscriptDir, locateClaudeTranscript } from "../sessions/claudeTranscriptLocator.js";
 
 /** tail 対象エージェント種別（claude=既定 / codex=Codex CLI）。 */
 export type ChatAgent = "claude" | "codex";
@@ -111,7 +112,9 @@ export class ChatTailController {
   ): Promise<void> {
     const stream = agent === "codex"
       ? this.codexTailer.streamHistory(cwd, preferredSessionId, signal)
-      : this.tailer.streamHistory(path.join(this.projectsRoot, claudeProjectSlug(cwd)), preferredSessionId, signal);
+      : this.tailer.streamHistory(
+        claudeTranscriptDir(preferredSessionId, cwd, { projectsDir: this.projectsRoot }), preferredSessionId, signal,
+      );
     try {
       for await (const message of stream) {
         signal.throwIfAborted();
@@ -193,8 +196,9 @@ export class ChatTailController {
     // claude はシンボリックリンクを解決した canonical パスで project slug を作る
     //（例 /tmp → /private/tmp）。tail も同じく解決してから slug 化する。
     const canonicalCwd = canonicalPath(cwd);
-    const slug = claudeProjectSlug(cwd);
-    const dir = path.join(this.projectsRoot, slug);
+    // 記録上の cwd の slug に会話ログが無ければ、全 slug から会話 id で探す（会話中の `/cd` 等で移った会話,
+    // session-workdir-change）。見つからなければ記録どおりの slug で出現を待つ。
+    const dir = claudeTranscriptDir(preferredSessionId, cwd, { projectsDir: this.projectsRoot });
     const dirExists = fs.existsSync(dir);
     ChatTailController.diag(
       `open cwd=${cwd} preferred=${preferredSessionId ?? "nil"} dir=${dir} dirExists=${dirExists}`,
@@ -412,11 +416,10 @@ export class ChatTailController {
     if (this.currentDir === null) return null;
     // codex の usage 集計は claude 用パーサと非互換のため対象外（null）。open 中の agent で判定。
     if (this.openAgent === "codex") return null;
-    return TranscriptTailer.resolveJsonl(
-      this.currentDir,
-      this.currentPreferred,
-      this.currentNewerThanMs,
-    );
+    const resolved = TranscriptTailer.resolveJsonl(this.currentDir, this.currentPreferred, this.currentNewerThanMs);
+    if (resolved !== null || this.currentPreferred === null) return resolved;
+    // 開いた後に会話ログが別の slug へ移った（`/cd` 等, session-workdir-change）。会話 id で探し直す。
+    return locateClaudeTranscript(this.currentPreferred, null, { projectsDir: this.projectsRoot })?.path ?? null;
   }
 
   /**

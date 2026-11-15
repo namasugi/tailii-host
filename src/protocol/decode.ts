@@ -5,6 +5,8 @@
 import {
   BACKGROUND_SYNC_HINTS_MAX,
   REMOTE_PENDING_SNAPSHOT_MAX,
+  SESSION_WORKDIR_CHANGE_ERRORS,
+  type SessionWorkdirChangeError,
   PROTOCOL_LEGACY,
   PROTOCOL_MAX_SUPPORTED,
   type ClaudeAccountUsage,
@@ -174,6 +176,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         clientBuild: optionalString(raw, "clientBuild"),
         latestClientBuild: optionalString(raw, "latestClientBuild"),
         push: optionalNumber(raw, "push"),
+        workdirChange: optionalNumber(raw, "workdirChange"),
         clientKind: optionalString(raw, "clientKind") === "cli" ? "cli" as const : undefined,
       });
 
@@ -1806,6 +1809,21 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         type, v, id: requireString(raw, "id"), state,
         phase: optionalString(raw, "phase"), version: optionalString(raw, "version"),
         startedAtMs: optionalNumber(raw, "startedAtMs"), error: optionalString(raw, "error"), message: optionalString(raw, "message"),
+      });
+    }
+
+    case "session_workdir_change":
+      return { type, v, id: requireString(raw, "id"), session: requireString(raw, "session"), cwd: requireString(raw, "cwd") };
+
+    case "session_workdir_change_result": {
+      const error = optionalString(raw, "error");
+      return compact({
+        type, v, id: requireString(raw, "id"), ok: requireBoolean(raw, "ok"),
+        cwd: optionalString(raw, "cwd"),
+        // 未知の理由は failed として読む（将来の host が理由を足しても応答を捨てない）。
+        error: error === undefined ? undefined
+          : (SESSION_WORKDIR_CHANGE_ERRORS as readonly string[]).includes(error) ? error as SessionWorkdirChangeError : "failed",
+        message: optionalString(raw, "message"),
       });
     }
 

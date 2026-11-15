@@ -2888,6 +2888,8 @@ describe("SessionHub conversation stream", () => {
         { payload: { streamId: "historical-narration" } },
         { payload: { streamId: "pc:history-cancelled" } },
         { payload: { streamId: "live-narration" } },
+        // 履歴の後に今の作業フォルダ（session-workdir-change）。
+        { payload: { streamId: "pc:cwd", text: "/tmp/work" } },
       ]);
     } finally {
       vi.useRealTimers();
@@ -3120,7 +3122,8 @@ describe("SessionHub conversation stream", () => {
     expect(br).toEqual([]);
     writes[1]!(output("history"));
     writes[1]!(output(HISTORY_DONE_STREAM_ID));
-    expect(br).toMatchObject([{ serverSeq: 0 }, { serverSeq: 0 }]);
+    // 履歴・完了印・今の作業フォルダ（session-workdir-change）。
+    expect(br).toMatchObject([{ serverSeq: 0 }, { serverSeq: 0 }, { serverSeq: 0, payload: { streamId: "pc:cwd" } }]);
     expect(tails[1]!.stopped).toBe(true);
     writes[0]!(output("live"));
     expect(br.at(-1)).toMatchObject({ serverSeq: 4 });
@@ -3156,7 +3159,9 @@ describe("SessionHub conversation stream", () => {
     // 最新状態は履歴の完了印より前（後に送ると engine が「読み直し途中」と取り違えて再接続ごとに全履歴を取り直す）。
     const payloads = br.map((event) => (event as { payload: ControlMessage }).payload);
     expect(payloads.slice(1, 3)).toEqual([node("agent-1", "completed"), node("agent-2", "running")]);
-    expect(payloads.at(-1)).toMatchObject({ type: "chat_output", streamId: HISTORY_DONE_STREAM_ID });
+    expect(payloads.at(-2)).toMatchObject({ type: "chat_output", streamId: HISTORY_DONE_STREAM_ID });
+    // 完了印の後に今の作業フォルダ（session-workdir-change）。
+    expect(payloads.at(-1)).toMatchObject({ type: "chat_output", streamId: "pc:cwd" });
   });
 
   test("背景購読中の開き直し（newerThanMs, reattach-since）はその時刻以降を読み直し履歴完了まで届ける", () => {

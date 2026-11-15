@@ -339,6 +339,17 @@ export interface SendTextSubmitOptions {
    * 終了を遅らせない）。
    */
   mayStartTyping?: () => boolean;
+  /**
+   * 呼び出し側が送信の成立を自分で確かめられるとき（作業フォルダの変更の `/cd`: 会話ログに移動や失敗の行が書かれた,
+   * session-workdir-change）。送信確定ループは、これが真になったら画面の判定を待たずに成立として抜け、それ以上
+   * Enter を撃たない。偽の間は従来どおり（画面で確かめ、取りこぼしは撃ち直す）。普通の発話の送信では渡さない。
+   */
+  confirmSubmitted?: () => boolean;
+  /**
+   * 送信確定ループで Enter を 2 回以上撃った・確定できなかったときに、各 Enter の後の画面の判定を知らせる
+   * （事後解析用。hub は `chat-submit-verdicts` として 1 行残す）。
+   */
+  onSubmitVerdicts?: (verdicts: readonly string[]) => void;
 }
 
 /**
@@ -1617,7 +1628,9 @@ function isComposerBarLine(line: string): boolean {
 /**
  * ダイアログのフッター行が**画面下部に**出ているか（＝積極的なダイアログ判定）。
  * 実測 2.1.278 の 2 形: 設問/選択は `Enter to select · ↑/↓ to navigate · Esc to cancel`、
- * ツール承認は `Esc to cancel · Tab to amend`。どちらも行頭から始まる。
+ * ツール承認は `Esc to cancel · Tab to amend`。どちらも行頭から始まる。確認系ダイアログの
+ * `Enter to confirm · Esc to cancel` はここに含めない（Enter の後に出たときは「判別できない画面」のまま扱い、
+ * 次の Enter を撃たない）。打ち始める前の門番は `screenShowsConfirmDialogFooter` で別に断る。
  *
  * バー非検出（`claudeComposerBarVisible === false`）を「ダイアログ」と見なして送信を拒む
  * 設計は、未知のフレーム（起動直後・制限待ち等）で送信が丸ごと不能になるため採らない。
@@ -1627,11 +1640,12 @@ function isComposerBarLine(line: string): boolean {
  * （`screenHasSelectionFooter` と同じ硬化）。
  */
 export function screenShowsDialogFooter(screen: string): boolean {
-  return screen
+  const bottom = screen
     .split("\n")
     .map((line) => stripSgr(line).trimEnd())
     .filter((line) => line.trim() !== "")
-    .slice(-DIALOG_FOOTER_WINDOW_LINES)
+    .slice(-DIALOG_FOOTER_WINDOW_LINES);
+  return bottom
     .some((line) => {
       const trimmed = line.trim();
       if (trimmed.startsWith("Enter to select") || trimmed.startsWith("Esc to cancel")) return true;
@@ -1645,6 +1659,59 @@ export function screenShowsDialogFooter(screen: string): boolean {
         || (lower.includes("login successful") && lower.includes("to continue"));
     });
 }
+
+/**
+ * 確認系ダイアログ（Dialog 部品の既定フッター `Enter to confirm · Esc to cancel`。`/cd` の移動先の確認・MCP の承認・
+ * フォルダ信頼・`/model` 等）が画面下部に出ているか（session-workdir-change, TESTABLE）。送信の門番は、打ち始める前
+ * （と送信確定ループの Enter の前）にこれが見えたら本文を打たずに断る: 入力欄へ落ちた本文は画面に飲まれ、Enter で
+ * カーソルのある選択肢が確定する（「移動しない」で移動が取り消される・MCP を勝手に有効にする）。末尾数行・行頭一致に
+ * 加え、この形はボトムバーを消して描かれる（実測 2.1.325）ので、バーが見えている画面（入力欄の下書きの行など）では
+ * 数えない。herdr の `screenHasConfirmFooter`（開き直しの転写カード用。位置を問わない）より狭い。
+ */
+export function screenShowsConfirmDialogFooter(screen: string): boolean {
+  return confirmDialogFooterLines(screen).length > 0;
+}
+
+/**
+ * 確認系ダイアログのフッターに見える行（`screenShowsConfirmDialogFooter` の中身）。行頭が `Enter to confirm` の行に加え、
+ * 選択式の形（例 `Space to select · Enter to confirm · Esc to cancel`）のように `Enter to confirm` と `Esc to` を両方含む
+ * 行と、既存の判定に無い `· Esc to …` のフッター（実物: `Space to select · Esc to reject all`）も数える。
+ */
+export function confirmDialogFooterLines(screen: string): string[] {
+  if (claudeComposerBarVisible(screen)) return [];
+  return screen
+    .split("\n")
+    .map((line) => stripSgr(line).trim())
+    .filter((line) => line !== "")
+    .slice(-DIALOG_FOOTER_WINDOW_LINES)
+    .filter((line) => line.startsWith("Enter to confirm") || (line.includes("Enter to confirm") && line.includes("Esc to")) ||
+      otherDialogFooter(line));
+}
+
+/**
+ * 既存の判定（`screenShowsDialogFooter` の `Enter to select` / `Esc to cancel`）に無いフッターで、`· Esc to …` を含む行
+ * （実物 2.1.325: MCP が 2 つ以上のときの承認 `Space to select · Esc to reject all`）。既存の 2 形は除く（設問を Esc で
+ * 閉じて送る経路をここで断らない）。処理中の `esc to interrupt`（小文字）には当たらない。
+ */
+function otherDialogFooter(line: string): boolean {
+  if (line.startsWith("Enter to select") || line.startsWith("Esc to cancel")) return false;
+  return line.startsWith("Esc to ") || / · Esc to \S/u.test(line);
+}
+
+/**
+ * 送信確定ループの Enter の前に、確認系ダイアログが新しく出たか。打った本文に含まれる行は数えない（ボトムバーが
+ * 崩れた画面では、本文の最終行が `Enter to confirm` で始まるとフッターに見える。打つ前の門番が確認の画面の表示中は
+ * 打たないので、ここで本文以外のフッターが見えたら打った後に出たもの）。
+ */
+export function confirmDialogAppeared(screen: string, typedText: string | null): boolean {
+  const squash = (text: string): string => text.replace(/\s+/gu, "");
+  const typed = typedText === null ? "" : squash(typedText);
+  return confirmDialogFooterLines(screen).some((line) => typed === "" || !typed.includes(squash(line)));
+}
+
+/** ダイアログの表示中に送信を断るときの文言（tmux / herdr 共通）。 */
+export const CHAT_BLOCKED_BY_DIALOG =
+  "ダイアログの表示中はメッセージを送信できません（アプリで選択肢に答えてから送り直してください）";
 
 /** ダイアログのフッターを探す viewport 末尾の行数（フッターは最下段に出る）。 */
 const DIALOG_FOOTER_WINDOW_LINES = 4;
@@ -2234,12 +2301,15 @@ export async function settleSubmitVerdict(io: {
   windowMs: number;
   firstDelayMs?: number;
   pollMs?: number;
+  /** 呼び出し側が成立を確かめられたら真（`SendTextSubmitOptions.confirmSubmitted`）。真なら画面を待たずに `submitted`。 */
+  confirmed?: () => boolean;
 }): Promise<SubmitFrameVerdict> {
   const deadline = Date.now() + io.windowMs;
   const pollMs = io.pollMs ?? SUBMIT_VERIFY_POLL_MS;
   await sleepMs(Math.min(io.firstDelayMs ?? SUBMIT_VERIFY_FIRST_MS, io.windowMs));
   let submittedOnce = false;
   for (;;) {
+    if (io.confirmed?.() === true) return "submitted";
     const verdict = classifySubmitFrame(await io.capture());
     const remaining = deadline - Date.now();
     if (remaining <= 0) return verdict;
@@ -2541,6 +2611,12 @@ export class TmuxSessionManager {
       pollMs: this.choiceCancelPollMs,
       maxPolls: hiddenDialogCancelled ? CHOICE_CANCEL_MAX_POLLS : 0,
     });
+    // 確認系ダイアログ（`Enter to confirm`）の表示中は 1 キーも打たない（session-workdir-change）。`classifySubmitFrame`
+    // は判別できない画面（unknown）とみなして打ち込みへ進めるので、ここで別に断る。設問を閉じる指定の送信でも Esc は
+    // 打たない（フォルダ信頼の確認の Esc は Claude を終了させる）。
+    if (ansiScreen !== null && screenShowsConfirmDialogFooter(ansiScreen)) {
+      throw new ChatInjectionRejectedError(CHAT_BLOCKED_BY_DIALOG);
+    }
     if (hiddenDialogCancelled && frame === "unknown") {
       throw new ChatInjectionRejectedError(CHAT_BLOCKED_AFTER_CHOICE_CANCELLED);
     }
@@ -2583,9 +2659,7 @@ export class TmuxSessionManager {
       // 本文を 1 キーも打たずに諦める（ダイアログへ打ち込むより確実に安全）。
       // 非配達が確定しているので、hub は uncertain に積まず失敗として片付ける。
       // 見逃し側（未知フレーム）は従来どおり注入へ進む＝送信が丸ごと不能にはならない。
-      throw new ChatInjectionRejectedError(
-        "ダイアログの表示中はメッセージを送信できません（アプリで選択肢に答えてから送り直してください）",
-      );
+      throw new ChatInjectionRejectedError(CHAT_BLOCKED_BY_DIALOG);
     }
     // ここから入力欄を触る（残り物を消す / 送り出す・本文を打つ）。hub が終了の準備に入っていたら、
     // 1 キーも打たずに見送る（次の hub が届ける）。ダイアログを閉じた事実は上で伝え済み。
@@ -2616,7 +2690,7 @@ export class TmuxSessionManager {
         // ので送り出す。消したことを知らせる手段の無い呼び出し（hub 以外: 公式アプリ連携・kick）も、
         // 黙って消さないよう従来どおり送り出す。2.1.277+ は不可視文字入りを 1 回の Enter で流さないので、
         // 送信確定ループで流す。流し切れなければ本文を打たずに失敗させる（連結送信の防止）。
-        if ((await this.submitTypedText(name)) !== "submitted") {
+        if ((await this.submitTypedText(name, pending)) !== "submitted") {
           throw new ChatInjectionRejectedError(CHAT_BLOCKED_BY_UNSENT_OWN_TEXT);
         }
         this.ownUnsubmittedText.delete(name);
@@ -2655,7 +2729,7 @@ export class TmuxSessionManager {
       } else {
         await this.sendKeys(name, [text], true);
       }
-      outcome = await this.submitTypedText(name);
+      outcome = await this.submitTypedText(name, text, options);
     } catch (error) {
       // 打った後に例外で抜けた（配送不明。打つ途中・Enter の送出の失敗）。覚えを残すと、アプリの明示再送で
       // 残りを「自分の本文」として送り出し、続けて打ち直す本文と同じ発話が 2 回届く。覚えを消し、残りは
@@ -2733,12 +2807,25 @@ export class TmuxSessionManager {
    *   （呼び出し側が `onUnconfirmedSubmit` で監査ログへ残す。throw はしない — 実際には
    *   送信済みかもしれない本文を明示再送へ倒すと二重送信になるため）。
    */
-  private async submitTypedText(name: string): Promise<SubmitOutcome> {
+  private async submitTypedText(
+    name: string, typedText: string | null = null, options: SendTextSubmitOptions = {},
+  ): Promise<SubmitOutcome> {
+    const verdicts: string[] = [];
+    const report = (outcome: SubmitOutcome): SubmitOutcome => {
+      if (verdicts.length > 1 || outcome !== "submitted") options.onSubmitVerdicts?.(verdicts);
+      return outcome;
+    };
     for (let attempt = 0; attempt < SUBMIT_ATTEMPT_LIMIT; attempt += 1) {
+      // 呼び出し側が成立を確かめた（`/cd` の完了行など）。それ以上 Enter を撃たない。
+      if (attempt > 0 && options.confirmSubmitted?.() === true) return report("submitted");
       // **撃つ前に必ずフレームを見る**。ダイアログ表示中・判定不能のまま Enter を撃つと
       // 選択肢を誤操作する（承認ダイアログならファイル書き込みを勝手に承認する）。
-      const before = classifySubmitFrame(await this.captureVisibleScreenAnsiOrNull(name));
-      if (before === "dialog") return "blocked";
+      const beforeScreen = await this.captureVisibleScreenAnsiOrNull(name);
+      const before = classifySubmitFrame(beforeScreen);
+      if (before === "dialog") return report("blocked");
+      // 打った後に新しく出た確認系ダイアログ（`Enter to confirm`）へも Enter を撃たない（選択肢が確定する,
+      // session-workdir-change）。打った本文が崩れた画面でフッターに見えるだけなら撃つ。
+      if (beforeScreen !== null && confirmDialogAppeared(beforeScreen, typedText)) return report("blocked");
       // 「撃つ前に入力欄が空」は送信成立の証拠にならない（本文を打った直後にこれなら、
       // 打鍵が入力欄へ届いていない＝ RC limbo 等）。打ち切らずに Enter は必ず 1 回撃つ
       // （空 composer への Enter は no-op。薄字の提案は実テキストに数えないので送らない）。
@@ -2747,15 +2834,17 @@ export class TmuxSessionManager {
       const after = await settleSubmitVerdict({
         capture: () => this.captureVisibleScreenAnsiOrNull(name),
         windowMs: this.submitVerifyDelayMs,
+        ...(options.confirmSubmitted !== undefined ? { confirmed: options.confirmSubmitted } : {}),
       });
-      if (after === "submitted") return "submitted";
+      verdicts.push(after);
+      if (after === "submitted") return report("submitted");
       // 撃った**後**にダイアログが出たのは、本文が送られてそれが開いた場合
       // （`/remote-control` など）。送信は成立しているので打ち切る。
-      if (after === "dialog") return "submitted";
+      if (after === "dialog") return report("submitted");
       // 未知のフレームでは撃ち続けない（従来どおり Enter 1 発で止め、未確定として報告する）。
-      if (before === "unknown" || after === "unknown") return "unconfirmed";
+      if (before === "unknown" || after === "unknown") return report("unconfirmed");
     }
-    return "unconfirmed";
+    return report("unconfirmed");
   }
 
   /**

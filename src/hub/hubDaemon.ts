@@ -33,6 +33,7 @@ import {
   screenBusyButScrolledAway,
   screenInLoginFlow,
   screenShowsApprovalDialog,
+  screenShowsConfirmDialogFooter,
 } from "../backend/tmux.js";
 import { screenHasConfirmFooter, screenHasSelectionFooter } from "../backend/herdr.js";
 import { readPackageVersion } from "../shared/version.js";
@@ -625,7 +626,7 @@ export async function runHubCommand(args: string[]): Promise<number> {
       // （scroll-pill）。
       emitInitialIf: (text) =>
         screenHasSelectionFooter(text) || screenHasConfirmFooter(text) || screenInLoginFlow(text)
-        || screenShowsApprovalDialog(text)
+        || screenShowsApprovalDialog(text) || screenShowsConfirmDialogFooter(text)
         || parseUsageLimitWait(text) !== null || screenBusyButScrolledAway(text),
       // 上へスクロールされた処理中の Claude は画面が動かない。静止を処理の終わりと読まない。
       holdActiveIf: screenBusyButScrolledAway,
@@ -709,6 +710,9 @@ export async function runHubCommand(args: string[]): Promise<number> {
           // 送信確定を確認できないまま配送済みレシートを返す唯一の経路。無言だと
           // 「送ったのに届かない」の再発に誰も気づけないので 1 行残す（事後解析用）。
           onUnconfirmedSubmit: () => log(`audit chat-submit-unconfirmed session=${session}`),
+          // Enter を撃ち直した・確定できなかったときの各 Enter の後の画面の判定（`chat-inject-slow` の内訳の事後解析用）。
+          onSubmitVerdicts: (verdicts) =>
+            log(`audit chat-submit-verdicts session=${session} verdicts=${verdicts.join(",") || "-"}`),
           // 終了の準備に入ったら、打ち始める前の発話は見送る（graceful shutdown）。
           mayStartTyping: context.mayStartTyping,
         });

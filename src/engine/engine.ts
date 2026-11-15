@@ -37,6 +37,7 @@ import {
   type CodexTurnControllerRuntime,
 } from "../codex/codexNativeTurnController.js";
 import { ClaudeSessionStore } from "../sessions/claudeSessionStore.js";
+import { CWD_STREAM_ID } from "../shared/cwdMarker.js";
 import { CodexSessionStore, defaultCodexHome } from "../codex/codexSessionStore.js";
 import { defaultListMemoDir, ListMemoFile } from "../sessions/listMemoFile.js";
 import { ensureHubDaemonAsync } from "../hub/hubDaemonClient.js";
@@ -856,15 +857,18 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
         }
         if (payload === null) return;
         try {
-          writer.write(payload);
           const markerStreamId = payload.type === "chat_output" || payload.type === "session_chat_output"
             ? payload.streamId : null;
+          // `pc:cwd` は理解すると名乗ったアプリにだけ送る（古いアプリは通常の行として表示する, session-workdir-change）。
+          // 送らなくても受信の記録（serverSeq）は下で同じように進める。
+          if (markerStreamId !== CWD_STREAM_ID || state.workdirChange === true) writer.write(payload);
           if (message.serverSeq === 0) {
             // 状態の添え物（hub が backfill の前後に送るサブエージェントの最新状態・codex のモデル / モードの印）は
             // 履歴の読み直しではない。数えると history-done の後に届いたとき「読み直し途中」の印が外れず、
             // 再接続のたびに全履歴を取り直す（reconnect-full-replay の再発）。
             const isStateSnapshot = payload.type === "subagent_node" || payload.type === "api_agent_status"
-              || markerStreamId === CODEX_MODEL_STREAM_ID || markerStreamId === CODEX_COLLABORATION_MODE_STREAM_ID;
+              || markerStreamId === CODEX_MODEL_STREAM_ID || markerStreamId === CODEX_COLLABORATION_MODE_STREAM_ID
+              || markerStreamId === CWD_STREAM_ID;
             if (!isStateSnapshot) historyBackfillSessions.add(message.session);
             if (markerStreamId === HISTORY_DONE_STREAM_ID || markerStreamId === HISTORY_CANCELLED_STREAM_ID) {
               historyBackfillSessions.delete(message.session);
@@ -955,7 +959,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
       if (message.type === "hub_state_response" || message.type === "question_answer_result" ||
         message.type === "input_claim_result" || message.type === "runtime_claim_result" ||
         message.type === "codex_turn_result" || message.type === "chat_send_result" ||
-        message.type === "codex_goal_result" || message.type === "api_agent_result" ||
+        message.type === "codex_goal_result" || message.type === "codex_cwd_result" || message.type === "api_agent_result" ||
         message.type === "pending_message_delete_result" ||
         message.type === "chat_receipt_query_result" ||
         message.type === "chat_send_now_result" ||
@@ -965,7 +969,9 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
         message.type === "push_device_register_result" ||
         message.type === "push_device_unregister_result" ||
         message.type === "conversation_subagent_transcript_response" ||
-        message.type === "conversation_history_page_response") {
+        message.type === "conversation_history_page_response" ||
+        message.type === "session_cwd_set_result" || message.type === "api_agent_relocate_result" ||
+        message.type === "workdir_change_begin_result") {
         rpcWaiters.get(message.id)?.(message);
         rpcWaiters.delete(message.id);
         rpcDisconnectFailures.delete(message.id);

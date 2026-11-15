@@ -139,6 +139,27 @@ describe("golden roundtrip", () => {
     }
   });
 
+  it("session-workdir-change v1 golden 全行が byte-exact でラウンドトリップする", () => {
+    const lines = goldenLines("session-workdir-change-v1.ndjson");
+    expect(lines).toHaveLength(5);
+    for (const line of lines) {
+      expect(encodeControlMessage(decodeControlMessage(line))).toBe(line);
+    }
+    expect(decodeControlMessage(lines[0]!)).toEqual({
+      type: "session_workdir_change", v: 1, id: "req-wd-1", session: "tailii-abc", cwd: "/Users/u/other",
+    });
+    expect(decodeControlMessage(lines[2]!)).toMatchObject({ ok: false, error: "busy" });
+    // アプリの名乗り（`pc:cwd` と session_workdir_change を理解する）。
+    expect(decodeControlMessage(lines[4]!)).toMatchObject({ type: "channel_hello", workdirChange: 1 });
+  });
+
+  it("session_workdir_change_result の未知の理由は failed として読む", () => {
+    const decoded = decodeControlMessage(
+      '{"error":"future_reason","id":"x","ok":false,"type":"session_workdir_change_result","v":1}',
+    );
+    expect(decoded).toMatchObject({ type: "session_workdir_change_result", ok: false, error: "failed" });
+  });
+
   it("session-title v1 golden 全行が byte-exact でラウンドトリップする", () => {
     for (const line of goldenLines("session-title-v1.ndjson")) {
       const decoded = decodeControlMessage(line);

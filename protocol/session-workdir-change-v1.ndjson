@@ -1,0 +1,5 @@
+{"cwd":"/Users/u/other","id":"req-wd-1","session":"tailii-abc","type":"session_workdir_change","v":1}
+{"cwd":"/Users/u/other","id":"req-wd-1","ok":true,"type":"session_workdir_change_result","v":1}
+{"error":"busy","id":"req-wd-2","message":"処理が終わってから変更できます","ok":false,"type":"session_workdir_change_result","v":1}
+{"eof":true,"role":"system","streamId":"pc:cwd","text":"/Users/u/other","type":"chat_output","v":1}
+{"clientBuild":"27","clientVersion":"1.0.0","maxVersion":2,"type":"channel_hello","v":2,"workdirChange":1}

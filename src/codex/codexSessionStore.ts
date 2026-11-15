@@ -12,6 +12,9 @@
 // メッセージ（event_msg/user_message の message）から導出する（codex アプリのスレッドタイトルと
 // 同じ源。session_index は生成が遅延/欠落することがあり、id 先頭 8 字だとアプリと食い違うため）。
 // どちらも取れなければ id 先頭 8 字へフォールバックする。cwd は rollout 側にのみ在る。
+// 作業フォルダは今の値（session-workdir-change）: 先頭の session_meta.cwd は会話を始めたフォルダのまま変わらないので、
+// 末尾側の `thread_settings_applied` / `turn_context` から読む（rolloutCwd.ts）。先頭行のメモとは別に、ファイルの
+// 大きさと更新時刻で覚え、伸びた会話は追記された分だけ遡る。圧縮ファイルは最終メッセージと同じ解凍で 1 回だけ読む。
 // 更新時刻は rollout ファイルの mtime（Codex App Server の updatedAt と同じ値。取れなければ session_index の
 // updated_at）を Unix 秒で用いる。
 
@@ -26,6 +29,7 @@ import { noteReadFailure, readFailureCount } from "../shared/readFailures.js";
 import type { ListMemoFile } from "../sessions/listMemoFile.js";
 import { isVisibleCodexMessagePhase } from "./codexMessagePhase.js";
 import { isCompressedRollout, isRolloutFileName, readCompressedRollout, readRolloutHead } from "./rolloutFile.js";
+import { lastLineBoundary, scanRolloutCwdBackward, scanRolloutCwdInBuffer } from "./rolloutCwd.js";
 
 /** session_meta 先頭行を読む最大バイト数（先頭 1 行のみ使用。base_instructions を含み得るため広め）。 */
 const META_READ_LIMIT_BYTES = 512 * 1024;
@@ -86,6 +90,13 @@ interface RolloutMemo {
   lastMessage?: string | null;
   /** ユーザーの発話行が 1 行でもあるか（無い会話は App Server の一覧にも出ない）。 */
   hasUserTurn?: boolean;
+  /**
+   * 途中で変えた今の作業フォルダ（session-workdir-change）。null は変更・ターンの記録が無い（session_meta.cwd のまま）。
+   * undefined はまだ読んでいない。
+   */
+  currentCwd?: string | null;
+  /** 平文の `currentCwd` を読み終えた位置（行の先頭）。伸びた会話はここから先だけ遡る。 */
+  cwdOffset?: number;
 }
 
 /** 保存ファイルから読んだ値がメモとして使えるか（壊れた・古い形の値は読み直させる）。 */
@@ -97,6 +108,8 @@ function isRolloutMemo(value: unknown): value is RolloutMemo {
     field === undefined || field === null || typeof field === "string";
   if (!isOptionalText(memo["firstUserMessage"]) || !isOptionalText(memo["lastMessage"])) return false;
   if (memo["hasUserTurn"] !== undefined && typeof memo["hasUserTurn"] !== "boolean") return false;
+  if (!isOptionalText(memo["currentCwd"])) return false;
+  if (memo["cwdOffset"] !== undefined && typeof memo["cwdOffset"] !== "number") return false;
   const meta = memo["meta"];
   if (meta === undefined || meta === null) return true;
   if (typeof meta !== "object") return false;
@@ -127,6 +140,10 @@ export class CodexSessionStore {
   /** ディレクトリの内容だけ再利用する。対象ファイルの mtime は要求ごとに必ず読み直す。 */
   private readonly rolloutDirectories = new Map<string, RolloutDirectory>();
   private readingActivity: { cwds: Set<string>; started: boolean; promise: Promise<ActivityRow[]> } | null = null;
+  /** 伸びる前のメモの今の作業フォルダ（key = パス）。伸びた分だけ遡るときの起点。 */
+  private readonly cwdCarry = new Map<string, { cwd: string | null; offset: number }>();
+  /** 直前の列挙で、今の作業フォルダが始めたときと違う会話の始めたときのフォルダ（id → session_meta.cwd）。 */
+  private readonly startedCwds = new Map<string, string>();
 
   /**
    * @param home codex ホーム（既定 `~/.codex`）。テストは一時 dir を注入する。
@@ -153,6 +170,14 @@ export class CodexSessionStore {
   /** 直前の列挙で解決したパス（検索側は非同期読取の前にパスを取得する）。 */
   transcriptPath(sessionId: string): string | null {
     return this.transcriptPaths.get(sessionId) ?? null;
+  }
+
+  /**
+   * 直前の列挙で、作業フォルダを途中で変えた会話の始めたときのフォルダ（変えていなければ null）。一覧の `cwd` は今の値。
+   * worktree の片付けは、始めたフォルダもまだ会話が使うものとして数える（session-workdir-change）。
+   */
+  startedCwd(sessionId: string): string | null {
+    return this.startedCwds.get(sessionId) ?? null;
   }
 
   /**
@@ -208,15 +233,19 @@ export class CodexSessionStore {
         const paths = pathsById.get(meta.id) ?? [];
         paths.push(file);
         pathsById.set(meta.id, paths);
-        if (meta.cwd !== null && [...cwds].some((cwd) => isInsideBase(meta.cwd!, cwd))) relevantIds.add(meta.id);
+        const effective = memo.currentCwd ?? meta.cwd;
+        if (effective !== null && [...cwds].some((cwd) => isInsideBase(effective, cwd))) relevantIds.add(meta.id);
       }
     }
     const selected = (file: string): boolean => {
-      const meta = this.rolloutMemo.get(file)?.meta;
+      const memo = this.rolloutMemo.get(file);
+      const meta = memo?.meta;
       if (meta?.isBackgroundSession) return false;
-      return meta == null || meta.cwd === null
+      // 今の作業フォルダ（途中で変えた会話は移った先）で絞る。メモが古くても、伸びたファイルは下で読み直す。
+      const effective = memo?.currentCwd ?? meta?.cwd ?? null;
+      return meta == null || effective === null
         || (meta.id !== null && relevantIds.has(meta.id))
-        || [...cwds].some((cwd) => isInsideBase(meta.cwd!, cwd));
+        || [...cwds].some((cwd) => isInsideBase(effective, cwd));
     };
     const { files, paths } = await this.listRolloutsAsync(selected);
     const order = new Map(paths.map((file, index) => [file, index]));
@@ -247,7 +276,7 @@ export class CodexSessionStore {
       seen.add(id);
       if (file.mtimeMs <= 0) index ??= this.readIndex();
       rows.push({
-        cwd: meta.cwd,
+        cwd: this.currentCwd(file) ?? meta.cwd,
         updatedAt: file.mtimeMs > 0 ? Math.floor(file.mtimeMs / 1000) : index?.get(id)?.updatedAt ?? undefined,
       });
     }
@@ -261,6 +290,7 @@ export class CodexSessionStore {
    */
   list(baseDir?: string, limit: number = this.maxSessions): ClaudeSessionInfo[] {
     this.transcriptPaths.clear();
+    this.startedCwds.clear();
     const index = this.readIndex();
     const files = this.listRollouts().sort((a, b) => b.mtimeMs - a.mtimeMs);
 
@@ -291,16 +321,22 @@ export class CodexSessionStore {
       const updatedAt =
         file.mtimeMs > 0 ? Math.floor(file.mtimeMs / 1000) : idx?.updatedAt ?? undefined;
 
+      // 作業フォルダは今の値（途中で変えた会話は移った先, session-workdir-change）。圧縮ファイルの今の値は最終メッセージと
+      // 同じ解凍でだけ読む（currentCwd は圧縮ファイルを解凍しない）。範囲内の会話は最終メッセージを読んだ後に読み直す。
+      let cwd = this.currentCwd(file) ?? meta.cwd;
+      if (baseDir && !isInsideBase(cwd, baseDir)) continue;
+      const lastMessage = this.lastMessage(file);
+      cwd = this.currentCwd(file) ?? meta.cwd;
+      if (baseDir && !isInsideBase(cwd, baseDir)) continue;
+      if (cwd !== meta.cwd) this.startedCwds.set(sessionId, meta.cwd);
       const info: ClaudeSessionInfo = {
         sessionId,
-        cwd: meta.cwd,
+        cwd,
         title,
         agent: "codex",
         hasProviderTitle: idx?.title !== null && idx?.title !== undefined,
       };
       if (updatedAt !== undefined) info.updatedAt = updatedAt;
-      if (baseDir && !isInsideBase(info.cwd, baseDir)) continue;
-      const lastMessage = this.lastMessage(file);
       if (lastMessage !== null) info.lastMessage = lastMessage;
       result.push(info);
     }
@@ -479,6 +515,12 @@ export class CodexSessionStore {
     // rollout は追記だけなので、伸びただけのファイルで一度見つけた発話は消えない（処理中の会話を
     // 一覧のたびに頭から読み直さない）。
     if (hit?.hasUserTurn === true && file.size >= hit.size) memo.hasUserTurn = true;
+    // 今の作業フォルダも、伸びただけのファイルは前回の位置から先だけ遡る（session-workdir-change）。
+    if (hit?.currentCwd !== undefined && hit.cwdOffset !== undefined && file.size >= hit.size) {
+      this.cwdCarry.set(file.path, { cwd: hit.currentCwd, offset: hit.cwdOffset });
+    } else {
+      this.cwdCarry.delete(file.path);
+    }
     if (file.size >= 0) {
       this.rolloutMemo.set(file.path, memo);
       this.memoDirty = true;
@@ -508,7 +550,75 @@ export class CodexSessionStore {
   private lastMessage(file: RolloutFile): string | null {
     const memo = this.memoFor(file);
     if (memo.lastMessage !== undefined) return memo.lastMessage;
+    if (isCompressedRollout(file.path)) {
+      this.readCompressedTail(file.path, memo);
+      return memo.lastMessage ?? null;
+    }
     return this.remember(memo, "lastMessage", () => readLastRolloutMessage(file.path));
+  }
+
+  /**
+   * 今の作業フォルダ（session-workdir-change）。途中で変えていなければ null（呼び出し側は session_meta.cwd を使う）。
+   * 平文は末尾から上限付きで遡る（伸びた会話は追記分だけ）。圧縮ファイルは最終メッセージと同じ解凍で覚えた値だけ。
+   */
+  private currentCwd(file: RolloutFile): string | null {
+    const memo = this.memoFor(file);
+    if (memo.currentCwd !== undefined) return memo.currentCwd;
+    if (file.size < 0) return null;
+    // 圧縮ファイル（しばらく触られていない古い会話）は、ここでは解凍しない。最終メッセージのために解凍したとき
+    // （readCompressedTail）に一緒に覚えた値だけを使い、まだ無ければ始めたときの値として扱う（覚えない）。範囲外の会話の
+    // 判定（baseDir の一覧・稼働一覧の近似）のためだけに古い会話を解凍すると、一覧の初回が遅くなる。
+    if (isCompressedRollout(file.path)) return null;
+    const carry = this.cwdCarry.get(file.path);
+    this.cwdCarry.delete(file.path);
+    let cwd: string | null;
+    let offset: number;
+    try {
+      offset = lastLineBoundary(file.path, file.size);
+      if (carry !== undefined && carry.offset <= offset) {
+        const appended = scanRolloutCwdBackward(file.path, { start: carry.offset, end: offset });
+        if (appended.decisive) cwd = appended.cwd;
+        // 追記分にターンの始まりが無い turn_context だけがある: 前回の値と合わせて決められないので遡り直す。
+        else if (appended.cwd !== null) cwd = scanRolloutCwdBackward(file.path, { end: offset }).cwd;
+        else cwd = carry.cwd;
+      } else {
+        cwd = scanRolloutCwdBackward(file.path, { end: offset }).cwd;
+      }
+    } catch (error) {
+      // 読めなければ覚えない（直ったら次の一覧で読み直す）。
+      noteReadFailure(error);
+      return carry?.cwd ?? null;
+    }
+    // 変更の記録が始めたときの値と同じなら、変えていない会話として扱う（一覧の綴りを session_meta に揃える）。
+    const meta = memo.meta;
+    memo.currentCwd = cwd !== null && meta != null && cwd === meta.cwd ? null : cwd;
+    memo.cwdOffset = offset;
+    this.memoDirty = true;
+    return memo.currentCwd;
+  }
+
+  /** 圧縮ファイルを 1 回だけ解凍して、最終メッセージと今の作業フォルダの両方を覚える（読めなければ覚えない）。 */
+  private readCompressedTail(filePath: string, memo: RolloutMemo): void {
+    let content: Buffer | null;
+    try {
+      content = readCompressedRollout(filePath, COMPRESSED_TAIL_DECOMPRESS_LIMIT_BYTES);
+    } catch (error) {
+      noteReadFailure(error);
+      return;
+    }
+    if (content === null) {
+      // 大きすぎる会話は最終メッセージを出さず、作業フォルダは始めたときの値で扱う。
+      memo.lastMessage ??= null;
+      memo.currentCwd ??= null;
+    } else {
+      const whole = content;
+      memo.lastMessage ??= lastRolloutMessageFromTail(whole.length, (span) => whole.subarray(whole.length - span));
+      if (memo.currentCwd === undefined) {
+        const cwd = scanRolloutCwdInBuffer(whole).cwd;
+        memo.currentCwd = cwd !== null && memo.meta != null && cwd === memo.meta.cwd ? null : cwd;
+      }
+    }
+    this.memoDirty = true;
   }
 
   /** 読み取り結果をメモへ入れる。I/O エラーで失敗した劣化結果は覚えない（直ったら次の一覧で読み直す）。 */

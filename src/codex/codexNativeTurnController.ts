@@ -10,7 +10,8 @@ import type {
   CodexThreadTitleGenerationResult,
   CodexThreadTitleSource,
 } from "./codexAppServer.js";
-import { codexGoalFromWire, codexItemTurnId } from "./codexAppServer.js";
+import { CodexCwdChangeError, codexGoalFromWire, codexItemTurnId } from "./codexAppServer.js";
+import { canonicalPath } from "../shared/paths.js";
 import {
   decodeControlMessage,
   encodeControlMessage,
@@ -138,6 +139,12 @@ export interface CodexNativeTurnControllerOptions {
   onGoal?: (session: string, goal: CodexGoalInfo | null) => void;
   /** thread の collaboration mode（`thread/settings/updated`）。Hub は `pc:collab` マーカーで iOS へ配る。 */
   onCollaborationMode?: (session: string, mode: CodexCollaborationMode) => void;
+  /**
+   * thread の作業フォルダが、Tailii が開いたときに渡した値（会話の記録）と違う / 変わった（session-workdir-change）。
+   * resume 応答の `cwd` と、この thread の `thread/settings/updated`（ほかのクライアントでの変更を含む）から届く。
+   * サブエージェント（子 thread）の設定変更は渡さない。Hub は記録を合わせて `pc:cwd` を配る。
+   */
+  onCwd?: (session: string, cwd: string) => void;
   onDisconnect?: (session: string, error: Error) => void;
   onThreadTitle?: (event: {
     session: string;
@@ -177,6 +184,11 @@ export interface CodexTurnControllerRuntime {
   sendToSubagent?(session: string, threadId: string, text: string): Promise<void>;
   /** 目標の読み取り / 設定 / 解除（codex-goal）。thread を開いていなければ開いてから実行する。 */
   goal?(options: CodexGoalOperation): Promise<CodexGoalOperationResult>;
+  /**
+   * thread の作業フォルダを変える（session-workdir-change）。thread を開いていなければ開いてから実行し、App Server が
+   * 適用を通知した値を返す。失敗は CodexCwdChangeError（kind = unsupported / busy / failed）か、その他のエラー。
+   */
+  setCwd?(options: CodexCwdOperation): Promise<string>;
   /** 目標が active な会話か（Hub が購読者ゼロでも thread 購読を保持する判定）。 */
   hasActiveGoal?(session: string): boolean;
   /**
@@ -198,6 +210,10 @@ export interface CodexThreadClient {
   readonly liveSubscriptionError?: string | null;
   /** 購読時点の thread のモデル（thread/resume / thread/start 応答）。不明なら null。 */
   readonly model?: string | null;
+  /** thread の今の作業フォルダ（resume 応答と thread/settings/updated で追従, session-workdir-change）。不明なら null。 */
+  readonly cwd?: string | null;
+  /** 作業フォルダを変え、App Server が適用を通知した値を返す（session-workdir-change）。旧 fake では未提供。 */
+  setCwd?(cwd: string): Promise<string>;
   /**
    * 保存済み thread から現在の turn ID を読み直す。
    * undefined は rollout 未生成で、App Server からまだ確認できない状態を表す。
@@ -262,6 +278,16 @@ export interface CodexGoalOperation {
   tokenBudget?: number;
 }
 
+/** 作業フォルダの変更（session-workdir-change）の入力。 */
+export interface CodexCwdOperation {
+  session: string;
+  threadId: string;
+  /** 会話の記録の作業フォルダ（thread を開くときだけ使う）。 */
+  cwd: string;
+  /** 移す先（呼び出し側が実在するフォルダの実体パスか確かめ済み）。 */
+  targetCwd: string;
+}
+
 export interface CodexGoalOperationResult {
   /** 操作後の現在値（clear 後や未設定は null）。 */
   goal: CodexGoalInfo | null;
@@ -319,6 +345,11 @@ function activeTurnIdFromMismatch(error: unknown): string | null {
     /expected active turn id [A-Za-z0-9_-]+ but found ([A-Za-z0-9_-]+)/i,
   );
   return match?.[1] ?? null;
+}
+
+/** 同じフォルダか（実体パスで比べる。消えたフォルダは字句で, session-workdir-change）。 */
+function sameDirectory(lhs: string, rhs: string): boolean {
+  return lhs === rhs || canonicalPath(lhs) === canonicalPath(rhs);
 }
 
 /** Codex thread ID はUUIDv7。先頭48bitのUnixミリ秒を履歴snapshotの安定時刻に使う。 */
@@ -419,6 +450,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
   private readonly onCollaborationMode: NonNullable<
     CodexNativeTurnControllerOptions["onCollaborationMode"]
   >;
+  private readonly onCwd: NonNullable<CodexNativeTurnControllerOptions["onCwd"]>;
   private readonly onDisconnect: NonNullable<CodexNativeTurnControllerOptions["onDisconnect"]>;
   private readonly onThreadTitle: NonNullable<CodexNativeTurnControllerOptions["onThreadTitle"]>;
   private readonly log: (message: string) => void;
@@ -464,6 +496,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     this.onChatItem = options.onChatItem ?? (() => {});
     this.onGoal = options.onGoal ?? (() => {});
     this.onCollaborationMode = options.onCollaborationMode ?? (() => {});
+    this.onCwd = options.onCwd ?? (() => {});
     this.onDisconnect = options.onDisconnect ?? (() => {});
     this.onThreadTitle = options.onThreadTitle ?? (() => {});
     this.log = options.log ?? (() => {});
@@ -624,6 +657,32 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     });
     this.applyGoal(options.session, opened, goal, { publishState: true });
     return { goal };
+  }
+
+  /**
+   * thread の作業フォルダを変える（session-workdir-change）。turn と同じ hub 所有の接続で `thread/settings/update` を
+   * 送る（開いていなければ resume で開く。読み込まれていない thread もこれで読み込まれる）。ターンの実行中は断る
+   * （受け付けはされるが、効くのは次のターンからで、実行中のターンは前のフォルダのまま動く）。
+   */
+  async setCwd(options: CodexCwdOperation): Promise<string> {
+    const opened = await this.threadFor(options.session, options.threadId, options.cwd);
+    if (opened.activeTurnId !== null) {
+      throw new CodexCwdChangeError("busy", "ターンの実行中は作業フォルダを変更できません");
+    }
+    if (opened.thread.setCwd === undefined) {
+      throw new CodexCwdChangeError("unsupported", "この Codex 連携は作業フォルダの変更に対応していません");
+    }
+    const applied = await opened.thread.setCwd(options.targetCwd);
+    // 通知（handleNotification）で既に取り込んでいれば何もしない。
+    this.noteThreadCwd(options.session, opened, applied);
+    return applied;
+  }
+
+  /** 開いている thread の作業フォルダを更新し、変わっていれば Hub へ知らせる。 */
+  private noteThreadCwd(session: string, opened: OpenThread, cwd: string): void {
+    if (this.open.get(session) !== opened || sameDirectory(opened.cwd, cwd)) return;
+    opened.cwd = cwd;
+    this.onCwd(session, cwd);
   }
 
   hasActiveGoal(session: string): boolean {
@@ -1113,7 +1172,11 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
         }
         this.handleNotification(session, threadId, items, notification);
       },
-      onServerRequest: (request) => this.handleServerRequest(session, cwd, items, request),
+      // 承認要求に cwd が無いときの既定は、今の作業フォルダ（開いた後に変わっていればその値）。
+      onServerRequest: (request) => {
+        const current = this.open.get(session);
+        return this.handleServerRequest(session, current?.items === items ? current.cwd : cwd, items, request);
+      },
       onDisconnect: (error) => {
         const current = this.open.get(session);
         if (current?.threadId !== threadId || current.items !== items) return;
@@ -1133,7 +1196,8 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     }
     const opened = {
       threadId,
-      cwd,
+      // resume 応答の今の作業フォルダ（開いていない間に別クライアントが変えていればその値）。
+      cwd: thread.cwd ?? cwd,
       thread,
       items,
       activeTurnId: thread.initialActiveTurnId ?? null,
@@ -1148,6 +1212,8 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       budgetLimitedTurnIds: new Set<string>(),
     };
     this.open.set(session, opened);
+    // 会話の記録（開いた側が渡した値）と thread の今の作業フォルダが違えば、記録を合わせさせる（session-workdir-change）。
+    if (!sameDirectory(opened.cwd, cwd)) this.onCwd(session, opened.cwd);
     // 開いている間に close が要求されていた（購読者が去った等）なら、開き終わった接続を残さず畳む。
     if (this.closeRequestedWhileOpening.delete(session)) {
       this.closeSession(session);
@@ -1382,6 +1448,10 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
         current.thread.noteThreadSettings?.(settings);
         const mode = asRecord(settings["collaborationMode"])?.["mode"];
         if (mode === "plan" || mode === "default") this.onCollaborationMode(session, mode);
+        // 作業フォルダ（session-workdir-change）。Tailii の変更もほかのクライアントの変更もここで記録へ合わせる。
+        // 子 thread の設定変更（ownThread=false）は親の作業フォルダに混ぜない。
+        const cwd = settings["cwd"];
+        if (typeof cwd === "string" && cwd.length > 0) this.noteThreadCwd(session, current, cwd);
       }
     }
     if (notification.method === "model/rerouted") {

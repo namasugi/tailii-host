@@ -89,8 +89,9 @@ describe("rescueMissingWorktreeCwd（deleted-worktree-resume）", () => {
 
     expect(rescued).toBe(root);
     const destDir = path.join(projects, claudeProjectSlug(root));
+    // 元の行はそのまま、Claude の `/cd` と同じ relocated 行を書き足す（session-workdir-change と共通の移し替え）。
     expect(fs.readFileSync(path.join(destDir, `${SESSION_ID}.jsonl`), "utf8")).toBe(
-      '{"cwd":"/x"}\n',
+      `{"cwd":"/x"}\n${JSON.stringify({ type: "relocated", sessionId: SESSION_ID, relocatedCwd: fs.realpathSync(root) })}\n`,
     );
     expect(fs.readFileSync(path.join(destDir, SESSION_ID, "snapshot.txt"), "utf8")).toBe("snap");
     expect(fs.existsSync(src)).toBe(false);

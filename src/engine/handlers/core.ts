@@ -12,6 +12,8 @@ export const coreHandlers: HandlerRegistry = {
     // 採用版 = min(自分の maxVersion, 相手の maxVersion)（4.3）。
     state.negotiatedVersion = Math.min(state.ownMaxVersion, message.maxVersion);
     if (message.clientKind === "cli") state.clientKind = "cli";
+    // `pc:cwd` を理解するアプリか（session-workdir-change）。名乗らない接続へは送らない。
+    state.workdirChange = (message.workdirChange ?? 0) >= 1;
     // アプリが名乗ったバージョン/ビルド番号を記録する（host-auto-update）。旧アプリは省略する。
     const client =
       message.clientBuild !== undefined

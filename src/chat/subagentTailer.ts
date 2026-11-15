@@ -13,7 +13,8 @@ import { abortableSleep } from "../shared/sleep.js";
 import { isApiRequestBlobLine } from "../shared/transcriptRecord.js";
 import { processBackgroundStopRecords, type BackgroundStopRecords } from "./backgroundStopRecords.js";
 import { CodexExecLinker, companionJobIdFromAck, invokesCodex, type BashCall, type CodexExecRun } from "./codexExecLinker.js";
-import { extractToolActivities, TranscriptTailer } from "./transcriptTailer.js";
+import { ELSEWHERE_CHECK_INTERVAL_MS, extractToolActivities, TranscriptTailer } from "./transcriptTailer.js";
+import { findTranscriptElsewhere, followMovedTranscript } from "../sessions/claudeTranscriptLocator.js";
 
 /** 1 回に読む transcript の上限。超えたらイベントループへ譲ってから続きを読む。 */
 const SUBAGENT_READ_SLICE_BYTES = 1024 * 1024;
@@ -289,9 +290,16 @@ export class SubagentTailer {
     this.codexExec?.reset();
     const start = Date.now();
     let mainTranscript: string | null = null;
+    let lastElsewhereCheckMs = start;
     while (!signal?.aborted) {
       mainTranscript = TranscriptTailer.resolveJsonl(projectDir, preferredSessionId, newerThanMs);
       if (mainTranscript !== null) break;
+      // 1 回も発話していない会話で作業フォルダを変えると、会話ログは移動先の slug に作られる（session-workdir-change）。
+      if (preferredSessionId !== null && Date.now() - lastElsewhereCheckMs >= ELSEWHERE_CHECK_INTERVAL_MS) {
+        lastElsewhereCheckMs = Date.now();
+        mainTranscript = findTranscriptElsewhere(projectDir, preferredSessionId);
+        if (mainTranscript !== null) break;
+      }
       if (!this.tailIndefinitely) return;
       await abortableSleep(this.pollIntervalMs, signal);
       if (!this.tailIndefinitely && Date.now() - start > this.pollIntervalMs) return;
@@ -313,11 +321,13 @@ export class SubagentTailer {
   }
 
   private async *streamSessionCore(
-    mainTranscript: string,
+    initialTranscript: string,
     signal: AbortSignal,
   ): AsyncGenerator<ControlMessage, void, void> {
+    let mainTranscript = initialTranscript;
     const sessionId = path.basename(mainTranscript, ".jsonl");
-    const subagentsDir = path.join(path.dirname(mainTranscript), sessionId, "subagents");
+    let subagentsDir = path.join(path.dirname(mainTranscript), sessionId, "subagents");
+    let lastMoveCheckMs = 0;
     const tracked = new Map<string, TrackedNode>();
     const fileStates = new Map<string, FileTailState>();
     const ownerByToolUseId = new Map<string, string>();
@@ -351,6 +361,21 @@ export class SubagentTailer {
 
     let lastMetaRefreshMs = 0;
     while (!signal?.aborted) {
+      // 追尾中に会話ログと付帯フォルダ（`<slug>/<id>/subagents`）が別の slug へ移った（`/cd`・EnterWorktree /
+      // ExitWorktree, session-workdir-change）。パスで読み直す作りなので、会話 id で新しい場所を探し、読み進めた位置と
+      // ノードごと付け替える（付け替えずに見失うと、サブエージェント・背景コマンド・Codex への依頼の表示が止まる）。
+      if (!fs.existsSync(mainTranscript) && Date.now() - lastMoveCheckMs >= ELSEWHERE_CHECK_INTERVAL_MS) {
+        lastMoveCheckMs = Date.now();
+        const moved = followMovedTranscript(mainTranscript);
+        if (moved !== null && moved !== mainTranscript) {
+          const oldBase = path.join(path.dirname(mainTranscript), sessionId);
+          const newBase = path.join(path.dirname(moved), sessionId);
+          relocateTailPaths(fileStates, tracked, mainTranscript, moved, oldBase, newBase);
+          mainTranscript = moved;
+          subagentsDir = path.join(newBase, "subagents");
+          aggregateDirty = true;
+        }
+      }
       // meta の stat/再読込は毎 tick やると重い（ノード数×50ms）。1秒ごとに間引く。
       const refreshMetas = Date.now() - lastMetaRefreshMs >= 1_000;
       if (refreshMetas) lastMetaRefreshMs = Date.now();
@@ -982,6 +1007,34 @@ function lineCwd(line: string): string | null {
     return typeof cwd === "string" && cwd.length > 0 ? cwd : null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * 会話ログの移動に合わせて、読み進めた位置（ファイルごとの状態）とノードのパスを新しい場所へ付け替える
+ * （中身は rename で同じなので、位置はそのまま使える）。
+ */
+function relocateTailPaths(
+  fileStates: Map<string, FileTailState>,
+  tracked: Map<string, TrackedNode>,
+  oldMain: string,
+  newMain: string,
+  oldBase: string,
+  newBase: string,
+): void {
+  const rebase = (file: string): string => {
+    if (file === oldMain) return newMain;
+    return file.startsWith(`${oldBase}${path.sep}`) ? newBase + file.slice(oldBase.length) : file;
+  };
+  for (const [file, state] of [...fileStates]) {
+    const next = rebase(file);
+    if (next === file) continue;
+    fileStates.delete(file);
+    fileStates.set(next, state);
+  }
+  for (const node of tracked.values()) {
+    node.metaPath = rebase(node.metaPath);
+    if (node.jsonlPath !== null) node.jsonlPath = rebase(node.jsonlPath);
   }
 }
 

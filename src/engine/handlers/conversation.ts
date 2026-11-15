@@ -533,7 +533,7 @@ export const conversationHandlers: HandlerRegistry = {
     ctx.trackBackground((async () => {
       let error: string | null;
       // 会話の作業フォルダ（worktree の後片付け用）。消す前に控える（消した後は一覧から引けない）。
-      const conversationCwd = conversationCwdOf(ctx, message.agent, message.sessionId);
+      const conversationCwds = conversationCwdsOf(ctx, message.agent, message.sessionId);
       const killedWorktrees: WorktreeResponseFields[] = [];
       try {
         error = await deleteConversation({
@@ -564,7 +564,7 @@ export const conversationHandlers: HandlerRegistry = {
       let worktree: WorktreeResponseFields | null = null;
       if (error === null) {
         try {
-          worktree = await settleConversationWorktree(ctx, conversationCwd, killedWorktrees);
+          worktree = await settleConversationWorktree(ctx, conversationCwds, killedWorktrees);
         } catch (thrown) {
           // 後片付けは fail-open。削除の成功を覆さない。
           engineDiag(`conversation_delete worktree 後片付け失敗 id=${message.id}: ${String(thrown)}`);
@@ -649,16 +649,23 @@ export const conversationHandlers: HandlerRegistry = {
   },
 };
 
-/** 会話一覧から会話の作業フォルダを引く（見つからなければ null）。 */
-function conversationCwdOf(ctx: HandlerContext, agent: "claude" | "codex", sessionId: string): string | null {
+/**
+ * 会話一覧から会話の作業フォルダを引く（見つからなければ空）。途中で作業フォルダを変えた会話は、始めたフォルダも添える
+ * （session-workdir-change。Tailii のワークツリーで始めて出た会話を消したら、元のワークツリーも片付けの対象にする）。
+ */
+function conversationCwdsOf(ctx: HandlerContext, agent: "claude" | "codex", sessionId: string): string[] {
   try {
     const sessions = agent === "codex"
       ? ctx.codexSessionStore?.list(undefined, Number.MAX_SAFE_INTEGER) ?? []
       : ctx.claudeSessionStore?.list() ?? [];
     const cwd = sessions.find((info) => info.sessionId === sessionId)?.cwd ?? null;
-    return cwd !== null && cwd.length > 0 ? cwd : null;
+    const started = agent === "codex"
+      ? [ctx.codexSessionStore?.startedCwd(sessionId) ?? null]
+      : ctx.claudeSessionStore?.startedCwds(sessionId) ?? [];
+    const cwds = [cwd, ...started].filter((value): value is string => value !== null && value.length > 0);
+    return [...new Set(cwds)];
   } catch {
-    return null;
+    return [];
   }
 }
 
@@ -668,12 +675,24 @@ function conversationCwdOf(ctx: HandlerContext, agent: "claude" | "codex", sessi
  */
 async function settleConversationWorktree(
   ctx: HandlerContext,
-  conversationCwd: string | null,
+  conversationCwds: readonly string[],
   killed: readonly WorktreeResponseFields[],
 ): Promise<WorktreeResponseFields | null> {
-  const removed = killed.find((fields) => fields.worktreeRemoved === true);
-  if (removed !== undefined) return { worktreePath: removed.worktreePath, worktreeRemoved: true };
-  const cwd = conversationCwd ?? killed[0]?.worktreePath ?? null;
-  if (cwd === null) return null;
-  return settleWorktreeAfterConversationDelete(ctx, cwd);
+  const removedOnKill = killed.find((fields) => fields.worktreeRemoved === true);
+  const cwds = conversationCwds.length > 0 ? conversationCwds : (killed[0]?.worktreePath !== undefined ? [killed[0].worktreePath] : []);
+  // 今のフォルダと始めたフォルダを順に判定する（終了時に消せたものは除く）。応答に載せられる worktree は 1 つなので、
+  // 利用者の判断が要るもの（変更あり）を優先し、無ければ消したもの。
+  const settled: WorktreeResponseFields[] = removedOnKill !== undefined
+    ? [{ worktreePath: removedOnKill.worktreePath, worktreeRemoved: true }] : [];
+  for (const cwd of cwds) {
+    if (removedOnKill !== undefined && isSameOrInsidePath(cwd, removedOnKill.worktreePath)) continue;
+    const result = await settleWorktreeAfterConversationDelete(ctx, cwd);
+    if (result !== null) settled.push(result);
+  }
+  return settled.find((fields) => fields.worktreeDirty === true) ?? settled[0] ?? null;
+}
+
+function isSameOrInsidePath(cwd: string, base: string | undefined): boolean {
+  if (base === undefined) return false;
+  return cwd === base || cwd.startsWith(`${base}/`);
 }

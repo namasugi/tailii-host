@@ -600,6 +600,14 @@ export type ApiAgentState = "idle" | "running" | "stopping";
 export type ApiAgentTurnOutcome =
   | "success" | "turn_budget_reached" | "max_turns_reached" | "interrupted" | "failed" | "result_unknown";
 /** 止めた理由（固定値。API のエラー本文・キーは返さない）。 */
+/**
+ * 作業フォルダの変更の失敗理由（session-workdir-change）。`not_found` = 会話が無い / `invalid_cwd` = 絶対パスでない・
+ * 存在しない・フォルダでない・会話を始められない場所 / `busy` = ターンの実行中・設問や承認の待ち / `unsupported` =
+ * この会話の種類や版では変えられない / `failed` = それ以外。
+ */
+export const SESSION_WORKDIR_CHANGE_ERRORS = ["not_found", "invalid_cwd", "busy", "unsupported", "failed"] as const;
+export type SessionWorkdirChangeError = (typeof SESSION_WORKDIR_CHANGE_ERRORS)[number];
+
 export type ApiAgentErrorCode =
   | "no_api_key" | "unsupported_key_source" | "unexpected_auth" | "budget_exhausted"
   | "conversation_in_use" | "sdk_unavailable" | "sdk_version_mismatch" | "worker_failed" | "not_open" | "invalid_config"
@@ -685,6 +693,11 @@ export type ControlMessage =
    * （アプリ側の「より新しいビルドがある」判定に使う, host-auto-update）。
    */
   | { type: "channel_hello"; v: number; maxVersion: number; serverVersion?: string; hostName?: string; managed?: boolean; updateError?: string; clientVersion?: string; clientBuild?: string; latestClientBuild?: string; push?: number;
+      /**
+       * アプリが `pc:cwd` マーカーと `session_workdir_change` を理解する（session-workdir-change。今は 1）。アプリ → host
+       * だけに載る。名乗らない（古い）アプリは知らない `pc:*` を通常の行として表示するので、host は `pc:cwd` を送らない。
+       */
+      workdirChange?: number;
       /** 相手の種類（tailii-chat-cli）。"cli" は `tailii-host chat` で、会話の購読・在席の申告をしない。省略はアプリ。 */
       clientKind?: "cli" }
   | { type: "host_update_request"; v: number; id: string; version: string; integrity?: string }
@@ -804,6 +817,13 @@ export type ControlMessage =
   /** API 作業を閉じて、Subscription（端末）へ戻す。実行中のターンがあれば turn_running で断る。 */
   | { type: "api_agent_return"; v: number; id: string; session: string }
   | { type: "api_agent_return_result"; v: number; id: string; ok: boolean; error?: ApiAgentErrorCode }
+  /**
+   * 開いている会話の作業フォルダを途中で変える（session-workdir-change, アプリ→host）。`cwd` は絶対パス。
+   * 結果の `cwd` は実際に有効になった絶対パス（実体パス）。`error` は SessionWorkdirChangeError、`message` は任意の
+   * 日本語の補足。変わった作業フォルダは購読者へ `pc:cwd` マーカー（chat_output, text = 絶対パス）で配る。
+   */
+  | { type: "session_workdir_change"; v: number; id: string; session: string; cwd: string }
+  | { type: "session_workdir_change_result"; v: number; id: string; ok: boolean; cwd?: string; error?: SessionWorkdirChangeError; message?: string }
   /**
    * 会話の開き直し（iOS→host）。`newerThanMs` はキャッシュ済みログが追いついていた時刻（epoch ms,
    * reattach-since）。指定時は全履歴を頭から再送せず、この時刻より後の行だけを送る（古い順）。

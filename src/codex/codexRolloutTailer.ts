@@ -6,7 +6,8 @@
 //
 // claude との差:
 //   - 解決キーが「claude projects slug」ではなく「session_meta.payload.cwd == 実 cwd」。
-//     rollout は日付ディレクトリに散らばるため、cwd 一致の最新 rollout を走査で選ぶ。
+//     rollout は日付ディレクトリに散らばるため、cwd 一致の最新 rollout を走査で選ぶ。会話 id を指名したときは、
+//     作業フォルダを途中で変えた会話（session_meta は始めたときの値のまま）も、rollout に記録された cwd で照合する。
 //   - 本文は event_msg から、tool 実行（コマンド/ファイル変更/プラン）は response_item と
 //     patch_apply_end から tool_activity カードへ写像する（codex-tool-cards）。
 //   - reasoning / 承認は扱わない。
@@ -17,7 +18,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { PROTOCOL_V1, type ControlMessage } from "../protocol.js";
 import { canonicalPath } from "../shared/paths.js";
-import { createCompressedRolloutReadStream, isCompressedRollout, isRolloutFileName, readRolloutHead } from "./rolloutFile.js";
+import {
+  createCompressedRolloutReadStream,
+  isCompressedRollout,
+  isRolloutFileName,
+  readCompressedRollout,
+  readRolloutHead,
+} from "./rolloutFile.js";
+import { rolloutCwdHistory, rolloutCwdHistoryInBuffer } from "./rolloutCwd.js";
 import { abortableSleep } from "../shared/sleep.js";
 import {
   codexRolloutImageActivity,
@@ -282,6 +290,12 @@ export class CodexRolloutTailer {
       if (meta === null) continue;
       if (preferredSessionId !== null && meta.id !== preferredSessionId) continue;
       if (canonicalPath(meta.cwd) === target) return file.path;
+      // 作業フォルダを途中で変えた会話（session-workdir-change）: 会話の記録の cwd は今の値で、session_meta は始めた
+      // ときの値のまま。会話 id で指名したときだけ、この rollout にその cwd が記録されていれば（変更・ターンの記録）
+      // この会話のものとして採る。記録に無い cwd の同じ id のコピー（別の会話の写し）は従来どおり採らない。
+      if (preferredSessionId !== null && recordedCwds(file.path).some((cwd) => canonicalPath(cwd) === target)) {
+        return file.path;
+      }
     }
     return null;
   }
@@ -536,6 +550,20 @@ function listRolloutFiles(sessionsRoot: string, preferredSessionId: string | nul
   };
   walk(sessionsRoot);
   return out;
+}
+
+/** 圧縮 rollout の作業フォルダの履歴を読むために解凍する上限（解凍後）。超える会話は先頭の cwd だけで照合する。 */
+const COMPRESSED_CWD_HISTORY_LIMIT_BYTES = 64 * 1024 * 1024;
+
+/** rollout に記録された作業フォルダ（読めなければ空）。平文は伸びた分だけ読み足すメモ付き。 */
+function recordedCwds(rolloutPath: string): string[] {
+  try {
+    if (!isCompressedRollout(rolloutPath)) return [...rolloutCwdHistory(rolloutPath)];
+    const content = readCompressedRollout(rolloutPath, COMPRESSED_CWD_HISTORY_LIMIT_BYTES);
+    return content === null ? [] : [...rolloutCwdHistoryInBuffer(content)];
+  } catch {
+    return [];
+  }
 }
 
 /** rollout の先頭 `session_meta` 行から `payload.cwd` を読む。読めなければ null。 */

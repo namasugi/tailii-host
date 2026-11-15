@@ -28,6 +28,7 @@ import type { ApiAgentErrorCode, ControlMessage, SessionInfo } from "../../proto
 import { stopConversationHolders } from "../../sessions/conversationDelete.js";
 import { defaultPeerSessionsDir } from "../../services/peerSessions.js";
 import { claudeProjectSlug } from "../../shared/paths.js";
+import { locateClaudeTranscript } from "../../sessions/claudeTranscriptLocator.js";
 import { engineDiag, type HandlerContext, type HandlerRegistry } from "../context.js";
 import { openApiAgentRuntime } from "./apiAgent.js";
 import { killSessionForUser } from "./session.js";
@@ -51,7 +52,8 @@ export interface HandoffDeps {
 
 export function defaultHandoffDeps(): HandoffDeps {
   return {
-    transcriptPath: (cwd, id) => path.join(os.homedir(), ".claude", "projects", claudeProjectSlug(cwd), `${id}.jsonl`),
+    transcriptPath: (cwd, id) => locateClaudeTranscript(id, cwd)?.path ??
+      path.join(os.homedir(), ".claude", "projects", claudeProjectSlug(cwd), `${id}.jsonl`),
     ledger: new ApiAgentLedgerStore(),
     claudeSessionsDir: defaultPeerSessionsDir(),
     holders: (id) => conversationHolders(id),

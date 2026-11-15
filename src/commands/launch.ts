@@ -34,7 +34,7 @@ import {
 } from "../backend/herdr.js";
 import { claudeHookLaunchSettings, removeCodexHookSettings } from "./hookSettings.js";
 import { tailiiWorktreeRepoRoot } from "../services/gitService.js";
-import { ClaudeSessionStore } from "../sessions/claudeSessionStore.js";
+import { locateClaudeTranscript, moveClaudeTranscript } from "../sessions/claudeTranscriptLocator.js";
 import { claudeProjectSlug, isInsideBase, standardize, expandTilde } from "../shared/paths.js";
 import {
   resolveHerdrSessionName,
@@ -435,6 +435,15 @@ export function makeSessionLauncher(options: {
           : {}),
       });
       if (rescued !== null) cwd = rescued;
+      // 会話中に作業フォルダが移った会話は、会話ログが今いるフォルダで resume する（session-workdir-change）。
+      if (agent === "claude") {
+        const relocated = relocatedResumeCwd({
+          cwd,
+          claudeSessionId: resumeSessionId,
+          ...(options.claudeProjectsDir !== undefined ? { projectsDir: options.claudeProjectsDir } : {}),
+        });
+        if (relocated !== null) cwd = relocated;
+      }
     }
     // resume: claude は `<inner> --resume <id>`。resume でない新規起動は
     // `<inner> --session-id <uuid>` で会話 id を固定し、host が tail 対象 jsonl を
@@ -1509,32 +1518,49 @@ export function rescueMissingWorktreeCwd(options: {
   if (!rootStat.isDirectory()) return null;
 
   if (claudeSessionId !== null) {
+    // 会話ログと付帯ディレクトリ（`<slug>/<id>/`、/rewind のファイルスナップショット等）を repo ルート側 slug へ移す
+    // （session-workdir-change と共通。移設失敗は claude の resume エラーに委ねる。上のコメント参照）。
+    // 移設先に同名の会話ログが既にあれば触らない（上書きも行の書き足しもしない）。
     const projectsDir = options.projectsDir ?? path.join(os.homedir(), ".claude", "projects");
-    const destDir = path.join(projectsDir, claudeProjectSlug(root));
-    const dest = path.join(destDir, `${claudeSessionId}.jsonl`);
-    if (!fs.existsSync(dest)) {
-      const src = new ClaudeSessionStore(projectsDir).transcriptPath(claudeSessionId);
-      if (src !== null && src !== dest) {
-        try {
-          fs.mkdirSync(destDir, { recursive: true });
-          fs.renameSync(src, dest);
-        } catch {
-          // 移設失敗は claude の resume エラーに委ねる（上のコメント参照）。
-        }
-        // セッション付帯ディレクトリ（`<slug>/<id>/`、/rewind のファイルスナップショット等）も同居させる。
-        const srcAssets = src.slice(0, -".jsonl".length);
-        const destAssets = path.join(destDir, claudeSessionId);
-        try {
-          if (fs.existsSync(srcAssets) && !fs.existsSync(destAssets)) {
-            fs.renameSync(srcAssets, destAssets);
-          }
-        } catch {
-          // 付帯ディレクトリの移設失敗は無視する（transcript 本体が正）。
-        }
-      }
+    if (!fs.existsSync(path.join(projectsDir, claudeProjectSlug(root), `${claudeSessionId}.jsonl`))) {
+      moveClaudeTranscript({ conversationId: claudeSessionId, toCwd: root, fromCwd: resolved, projectsDir });
     }
   }
   return root;
+}
+
+/**
+ * resume する会話の会話ログが、渡された cwd の slug に無く別の slug にある（会話中の `/cd`・`EnterWorktree` /
+ * `ExitWorktree` で移った、session-workdir-change）なら、会話ログが指す今のフォルダを返す。claude の
+ * `--resume <id>` は今のフォルダの slug の中しか探さないため、古い cwd で起動すると会話が見つからない。
+ * 今のフォルダが分からない・消えているときは、会話ログを渡された cwd の slug へ移してそのまま使う（null）。
+ * 振り替え不要（記録どおり・会話ログが無い）も null。
+ */
+export function relocatedResumeCwd(options: {
+  cwd: string;
+  claudeSessionId: string;
+  projectsDir?: string;
+}): string | null {
+  const { cwd, claudeSessionId } = options;
+  if (!cwd.startsWith("/") && !cwd.startsWith("~")) return null;
+  const resolved = standardize(cwd);
+  const projects = options.projectsDir !== undefined ? { projectsDir: options.projectsDir } : {};
+  const located = locateClaudeTranscript(claudeSessionId, resolved, projects);
+  if (located === null || !located.moved) return null;
+  if (located.cwd !== null) {
+    try {
+      if (fs.statSync(located.cwd).isDirectory()) return located.cwd;
+    } catch {
+      // 移った先のフォルダが消えている。下で渡された cwd へ戻す。
+    }
+  }
+  try {
+    if (!fs.statSync(resolved).isDirectory()) return null;
+  } catch {
+    return null;
+  }
+  moveClaudeTranscript({ conversationId: claudeSessionId, toCwd: resolved, fromCwd: null, ...projects });
+  return null;
 }
 
 /** THIS 実行中エントリスクリプトの絶対パスを解決する（フック command 埋め込み用）。 */

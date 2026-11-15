@@ -2,11 +2,9 @@
 // 使用量応答: tail 中会話のエージェント種別で分岐する。codex は rollout 集計
 // （rate_limits 含む）、claude は transcript 合算 + OAuth プラン使用量 API。
 
-import * as os from "node:os";
-import * as path from "node:path";
 import { CodexRolloutTailer } from "../../codex/codexRolloutTailer.js";
 import { aggregateCodexUsage, type CodexUsage } from "../../codex/codexUsage.js";
-import { claudeProjectSlug } from "../../shared/paths.js";
+import { claudeTranscriptDir } from "../../sessions/claudeTranscriptLocator.js";
 import { isPlanUsageFailure } from "../../services/planUsageFetcher.js";
 import { aggregateUsage, emptyUsageTotals } from "../../services/usageAggregator.js";
 import { TranscriptTailer } from "../../chat/transcriptTailer.js";
@@ -68,9 +66,11 @@ export const usageHandlers: HandlerRegistry = {
     }
     // 使用量（claude）: プラン使用率（OAuth 使用量 API, ベストエフォート）+ tail 中会話の usage 合算。
     const currentMeta = ctx.activeChatSession.name === null ? null : metadataStore?.get(ctx.activeChatSession.name) ?? null;
+    const conversationId = currentMeta?.providerSessionId ?? currentMeta?.claudeSessionId ?? null;
     const transcript = currentMeta === null ? null : TranscriptTailer.resolveJsonl(
-      path.join(os.homedir(), ".claude", "projects", claudeProjectSlug(currentMeta.cwd)),
-      currentMeta.providerSessionId ?? currentMeta.claudeSessionId ?? null,
+      // 会話中の `/cd` 等で移った会話は、会話ログが今ある slug を見る（session-workdir-change）。
+      claudeTranscriptDir(conversationId, currentMeta.cwd),
+      conversationId,
       null,
     );
     const totals = transcript !== null ? aggregateUsage(transcript) : emptyUsageTotals();

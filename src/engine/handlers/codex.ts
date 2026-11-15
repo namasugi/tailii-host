@@ -1,8 +1,21 @@
 // engine/handlers/codex.ts
 // Codex App Server 連携: モデル一覧・turn 開始（Hub 所有 turn への submit）・turn 中断。
 
-import type { HubServerMessage } from "../../hub/hubProtocol.js";
-import { writeError, type HandlerRegistry } from "../context.js";
+import { randomUUID } from "node:crypto";
+import { WORKDIR_CHANGE_LEASE_MS, type HubClientMessage, type HubServerMessage } from "../../hub/hubProtocol.js";
+import { writeError, type HandlerContext, type HandlerRegistry } from "../context.js";
+
+/** hub がこの会話を作業フォルダの変更で押さえているか（聞けなければ false）。 */
+async function workdirChangeHeld(ctx: HandlerContext, session: string): Promise<boolean> {
+  try {
+    const id = randomUUID();
+    const state = await ctx.hubRpc<Extract<HubServerMessage, { type: "hub_state_response" }>>(
+      { type: "hub_state_request", id, session }, id, Math.min(ctx.codexHubRpcTimeoutMs, 1_500));
+    return state.workdirChangeHeld === true;
+  } catch {
+    return false;
+  }
+}
 
 export const codexHandlers: HandlerRegistry = {
   codex_model_list_request: async (message, ctx) => {
@@ -80,18 +93,26 @@ export const codexHandlers: HandlerRegistry = {
     }
     try {
       try {
-        const result = await ctx.hubRpc<Extract<HubServerMessage, { type: "codex_turn_result" }>>(
-          { type: "codex_turn_submit", id: message.id, session: message.session,
-            text: message.text, clientUserMessageId: message.clientUserMessageId ?? message.id,
-            effort: message.effort ?? null,
-            approvalPolicy: message.approvalPolicy ?? null,
-            sandbox: message.sandbox ?? null,
-            threadId: providerSessionId, cwd: meta.cwd,
-            ...(message.explicitRetry === true ? { explicitRetry: true } : {}),
-            // collaboration mode（プランモード, codex-plan-mode）。未指定は従来どおり hub に渡さない。
-            ...(message.collaborationMode !== undefined ? { collaborationMode: message.collaborationMode } : {}) },
-          message.id, ctx.codexHubRpcTimeoutMs,
-        );
+        const submit: HubClientMessage = { type: "codex_turn_submit", id: message.id, session: message.session,
+          text: message.text, clientUserMessageId: message.clientUserMessageId ?? message.id,
+          effort: message.effort ?? null,
+          approvalPolicy: message.approvalPolicy ?? null,
+          sandbox: message.sandbox ?? null,
+          threadId: providerSessionId, cwd: meta.cwd,
+          ...(message.explicitRetry === true ? { explicitRetry: true } : {}),
+          // collaboration mode（プランモード, codex-plan-mode）。未指定は従来どおり hub に渡さない。
+          ...(message.collaborationMode !== undefined ? { collaborationMode: message.collaborationMode } : {}) };
+        type TurnResult = Extract<HubServerMessage, { type: "codex_turn_result" }>;
+        let result: TurnResult;
+        try {
+          result = await ctx.hubRpc<TurnResult>(submit, message.id, ctx.codexHubRpcTimeoutMs);
+        } catch (error) {
+          // 作業フォルダの変更（session-workdir-change）の押さえの間に届いた送信は、hub が放すまで始めない。普通に
+          // 成功する変更の間に待たされた送信を時間切れの失敗にしないよう、押さえ中だったときだけ同じ送信
+          // （同じ clientUserMessageId。hub は待ち手を足すだけで二重に始めない）で押さえの期限ぶん待ち直す。
+          if (!(await workdirChangeHeld(ctx, message.session))) throw error;
+          result = await ctx.hubRpc<TurnResult>(submit, message.id, WORKDIR_CHANGE_LEASE_MS);
+        }
         writer.write({
           type: "codex_turn_start_result",
           v,

@@ -1,9 +1,8 @@
 // remoteQuestionMonitor.ts
 // tailii (TS host) — foreground connected 中に別 conversation の AskUserQuestion を検知する軽量 monitor。
 
-import * as path from "node:path";
 import type { LineWriter } from "../shared/lineWriter.js";
-import { claudeProjectSlug } from "../shared/paths.js";
+import { claudeTranscriptDir } from "../sessions/claudeTranscriptLocator.js";
 import { PROTOCOL_V1 } from "../protocol.js";
 import type { SessionMetadataStore, SessionMeta } from "../sessions/sessionMetadataStore.js";
 import { abortableSleep } from "../shared/sleep.js";
@@ -92,7 +91,8 @@ export class RemoteQuestionMonitor {
   private startPump(meta: SessionMeta, parentSignal: AbortSignal): void {
     const ac = new AbortController();
     this.pumps.set(meta.name, ac);
-    const dir = path.join(this.projectsRoot, claudeProjectSlug(meta.cwd));
+    // 会話中の `/cd` 等で移った会話は、会話ログが今ある slug を見る（session-workdir-change）。
+    const dir = claudeTranscriptDir(meta.claudeSessionId ?? null, meta.cwd, { projectsDir: this.projectsRoot });
     const tailer = new TranscriptTailer({ tailIndefinitely: true, emitReplayDoneMarker: true });
     (async () => {
       let replayDone = false;

@@ -120,10 +120,18 @@ export async function collectWorktreeUsage(
       liveCwds.push(peer.cwd);
     }
     liveCwds.push(...launchesInFlight.keys());
+    const codexStore = ctx.codexSessionStore;
     const conversationCwds = [
-      ...(ctx.claudeSessionStore?.list() ?? []),
-      ...(ctx.codexSessionStore?.list(undefined, Number.MAX_SAFE_INTEGER) ?? []),
-    ].map((info) => info.cwd);
+      ...(ctx.claudeSessionStore?.list() ?? []).map((info) => info.cwd),
+      // Claude も同じく、途中で `/cd` 等で出た会話の始めたフォルダ（会話ログの先頭の cwd）を数える（list の後に読む）。
+      ...(ctx.claudeSessionStore?.startedCwds() ?? []),
+      // Codex の一覧の cwd は今の作業フォルダ。途中で変えた会話は、始めたフォルダ（worktree のことがある）も
+      // まだ使うものとして数える（session-workdir-change）。
+      ...(codexStore?.list(undefined, Number.MAX_SAFE_INTEGER) ?? []).flatMap((info) => {
+        const started = codexStore?.startedCwd(info.sessionId) ?? null;
+        return started === null ? [info.cwd] : [info.cwd, started];
+      }),
+    ];
     const normalizedLive = liveCwds.filter((cwd) => cwd.length > 0).map(normalized);
     const normalizedConversations = conversationCwds.filter((cwd) => cwd.length > 0).map(normalized);
     return {

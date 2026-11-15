@@ -124,6 +124,25 @@ export async function stopConversationHolders(
   return { ok: true };
 }
 
+/**
+ * Claude の会話を掴んでいる生存プロセスを、Tailii のセッション内（`tailii` の pid）と Tailii 外（`external` の名前）に
+ * 分ける（何も終了しない）。作業フォルダの変更（session-workdir-change）が「誰も掴んでいないか」を確かめるのに使う。
+ */
+export async function classifyClaudeConversationHolders(
+  deps: Pick<ConversationDeleteDeps, "sessionId" | "listSessions" | "paneProcessIds" | "claudeSessionsDir" | "peerPidAlive">,
+): Promise<{ tailii: number[]; external: string[] }> {
+  const holders = (await deps.listSessions()).filter((info) => holdsConversation(info, deps.sessionId, "claude"));
+  const processes = claudeHolderProcesses(deps.claudeSessionsDir, deps.sessionId, deps.peerPidAlive ?? pidAlive);
+  const tailii: number[] = [];
+  const external: string[] = [];
+  const paneCache = new Map<string, readonly number[] | null>();
+  for (const proc of processes) {
+    if (await ownedByTailii(proc, holders, deps, paneCache)) tailii.push(proc.pid);
+    else external.push(proc.name);
+  }
+  return { tailii, external };
+}
+
 /** 成功（対象が既に無い場合を含む）は null、拒否・失敗は利用者向けの理由。想定外の例外は throw する。 */
 export async function deleteConversation(deps: ConversationDeleteDeps): Promise<string | null> {
   const { sessionId, agent } = deps;

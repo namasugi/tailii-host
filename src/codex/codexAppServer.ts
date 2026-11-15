@@ -8,7 +8,7 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import WebSocket, { type RawData } from "ws";
-import { ensureDirectory0700 } from "../shared/paths.js";
+import { canonicalPath, ensureDirectory0700 } from "../shared/paths.js";
 import { agentClampArgv, withAgentClamp } from "../shared/agentPriority.js";
 import type { CodexCollaborationMode, CodexGoalInfo, CodexModelInfo } from "../protocol.js";
 import {
@@ -42,6 +42,15 @@ const THREAD_START_TIMEOUT_MS = 20_000;
  * iOS の削除待ち（60 秒。セッションの終了待ちを含む）に収まる値にする。
  */
 const THREAD_DELETE_TIMEOUT_MS = 30_000;
+/**
+ * 作業フォルダの変更（`thread/settings/update` の `cwd`）の適用を確かめるまでの上限（session-workdir-change）。
+ * 応答は適用より先に返る（0.167.2 実測: 応答直後の thread/read が古い値を返した）。この間に新しい値にならなければ
+ * unsupported（その版の App Server が `cwd` を黙って無視した）とみなす。
+ */
+const THREAD_CWD_CONFIRM_TIMEOUT_MS = 8_000;
+/** 適用を thread/read で読み直す間隔（最初と上限。倍々に広げる）。通知の届かない接続でも待たせない。 */
+const THREAD_CWD_POLL_FIRST_MS = 50;
+const THREAD_CWD_POLL_MAX_MS = 500;
 const THREAD_TITLE_OUTPUT_SCHEMA = {
   type: "object",
   properties: {
@@ -397,6 +406,16 @@ export class CodexAppServerThread {
   }
   /** `collaborationMode/list` の preset（mode ごとの model / effort 上書き）。接続ごとに 1 回だけ読む。 */
   private collaborationPresetsPromise: Promise<CodexCollaborationPresets> | null = null;
+  /**
+   * thread の今の作業フォルダ（session-workdir-change）。購読時は thread/resume 応答の `cwd`（無ければ開いた側が
+   * 渡した値）、以後は `thread/settings/updated` で追従する。config/read（承認・サンドボックスの既定）はこの値で読む。
+   */
+  private currentCwd: string | null;
+
+  /** thread の今の作業フォルダ。不明なら null。 */
+  get cwd(): string | null {
+    return this.currentCwd;
+  }
 
   constructor(
     readonly threadId: string,
@@ -410,7 +429,7 @@ export class CodexAppServerThread {
      */
     readonly liveSubscriptionReady: boolean,
     private readonly connection: CodexAppServerConnection,
-    private readonly cwd: string | null,
+    cwd: string | null,
     /** liveSubscriptionReady=false の理由（履歴読み取りの失敗文言）。ログ診断用。 */
     readonly liveSubscriptionError: string | null = null,
     /**
@@ -427,6 +446,84 @@ export class CodexAppServerThread {
     this.currentModel = model;
     this.currentEffort = reasoningEffort;
     this.lastCollaborationMode = initialCollaborationMode;
+    this.currentCwd = cwd;
+  }
+
+  /**
+   * thread の作業フォルダを変える（session-workdir-change）。`thread/settings/update` の `cwd` を送り、新しい値が
+   * 適用されたのを確かめて確定とする（応答は適用より先に返る: 応答直後の thread/read が古い値を返すことがある）。
+   * 0.167.2 の実測:
+   *   - 待機中・ターン前・ターン中のどれでも通り、次のターンから新しいフォルダで動く（実行中のターンは前のまま）。
+   *     書き込み先（workspace roots）・AGENTS.md も追従し、rollout に `thread_settings_applied` として残る
+   *   - `thread/settings/updated` は thread を購読している接続にだけ届く。最初のターンの前に開いた接続（resume が
+   *     `no rollout found` で成立せず、購読していない。hub の会話を最初の発話より前に開いたとき）には届かない。
+   *     今と同じ値では通知が来ない（呼び出し側が先に比べる）
+   *   - 存在しないフォルダやファイルのパスも検証せずに受け付ける（呼び出し側が実体パスを確かめてから渡す）
+   * そこで確かめは、通知（届けば即時）と `thread/read` の読み直し（購読していない接続でも、適用の数十 ms 後には新しい
+   * 値を返す）の早い方で行う。server が報告した綴りを返す。期限まで新しい値にならなければ、その版の App Server が
+   * `cwd` を受け付けていない（黙って無視した）とみて unsupported。
+   */
+  async setCwd(cwd: string, timeoutMs = THREAD_CWD_CONFIRM_TIMEOUT_MS): Promise<string> {
+    if (this.currentCwd !== null && sameDirectory(this.currentCwd, cwd)) return this.currentCwd;
+    let confirm!: (cwd: string) => void;
+    const confirmed = new Promise<string>((resolve) => { confirm = resolve; });
+    let notified: string | null = null;
+    const removeListener = this.connection.onNotification((notification) => {
+      if (notification.method !== "thread/settings/updated") return;
+      const params = objectRecord(notification.params);
+      const threadId = params?.["threadId"];
+      if (typeof threadId === "string" && threadId !== this.threadId) return;
+      const reported = stringValue(objectRecord(params?.["threadSettings"])?.["cwd"]);
+      if (reported !== null && sameDirectory(reported, cwd)) {
+        notified = reported;
+        confirm(reported);
+      }
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const pause = (ms: number): Promise<null> =>
+      new Promise((resolve) => { timer = setTimeout(() => resolve(null), ms); });
+    try {
+      try {
+        await this.connection.request("thread/settings/update", { threadId: this.threadId, cwd });
+      } catch (error) {
+        if (isUnsupportedParamsError(error)) {
+          throw new CodexCwdChangeError("unsupported", `この Codex は作業フォルダの変更に対応していません: ${String(error)}`);
+        }
+        throw error;
+      }
+      const deadline = Date.now() + timeoutMs;
+      let interval = THREAD_CWD_POLL_FIRST_MS;
+      let applied: string | null = notified;
+      while (applied === null) {
+        const remaining = deadline - Date.now();
+        // 最後の 1 回は期限ちょうどに読む（期限を過ぎてから読んで、遅れて適用された値を採り損ねない）。
+        applied = await Promise.race([confirmed, pause(Math.max(0, Math.min(interval, remaining)))]);
+        clearTimeout(timer);
+        if (applied !== null) break;
+        const read = objectRecord(await this.connection.request("thread/read", { threadId: this.threadId, includeTurns: false }));
+        if (notified !== null) {
+          applied = notified;
+          break;
+        }
+        const readCwd = stringValue(objectRecord(read?.["thread"])?.["cwd"]);
+        if (readCwd !== null && sameDirectory(readCwd, cwd)) {
+          applied = readCwd;
+          break;
+        }
+        if (remaining <= interval) {
+          throw new CodexCwdChangeError(
+            "unsupported",
+            "Codex が作業フォルダの変更を反映しませんでした（この版の Codex は対応していない可能性があります）",
+          );
+        }
+        interval = Math.min(interval * 2, THREAD_CWD_POLL_MAX_MS);
+      }
+      this.currentCwd = applied;
+      return applied;
+    } finally {
+      clearTimeout(timer);
+      removeListener();
+    }
   }
 
   async startTurn(
@@ -440,7 +537,7 @@ export class CodexAppServerThread {
     if (text.length === 0) throw new Error("Codex turn text must not be empty");
     const inherited =
       sandbox === null || approvalPolicy === null
-        ? await readCodexSecurityDefaults(this.connection, this.cwd)
+        ? await readCodexSecurityDefaults(this.connection, this.currentCwd)
         : null;
     const effectiveSandbox = sandbox === null ? inherited?.sandbox ?? null : sandbox;
     const effectiveApprovalPolicy =
@@ -533,10 +630,12 @@ export class CodexAppServerThread {
   }
 
   /**
-   * `thread/settings/updated` の threadSettings を取り込む（モデル / effort / collaboration mode）。
+   * `thread/settings/updated` の threadSettings を取り込む（モデル / effort / collaboration mode / 作業フォルダ）。
    * 別クライアント（remote TUI）の変更もこの経路で追従する。
    */
   noteThreadSettings(settings: Record<string, unknown>): void {
+    const cwd = stringValue(settings["cwd"]);
+    if (cwd !== null) this.currentCwd = cwd;
     const mode = objectRecord(settings["collaborationMode"])?.["mode"];
     // TUI の `/plan` など別クライアントで plan に入った場合も、preset が上書きする前の値を退避する
     // （自分の turn/start 経由なら resolveCollaborationMode が先に退避済みで `??=` は何もしない）。
@@ -1726,6 +1825,8 @@ export class CodexAppServerManager {
       bootstrap !== null ? this.bootstrapThreadEfforts.get(options.threadId) ?? null : null;
     this.bootstrapThreadEfforts.delete(options.threadId);
     let initialCollaborationMode: CodexCollaborationMode | null = null;
+    /** thread/resume 応答の今の作業フォルダ（session-workdir-change。作成元 bootstrap は開いた側の値）。 */
+    let resumedCwd: string | null = null;
     const connection = bootstrap ?? (await this.connect(this.socketPath));
     const removeNotification = connection.onNotification((notification) => {
       options.onNotification?.(notification);
@@ -1767,6 +1868,8 @@ export class CodexAppServerManager {
           model = threadModel(resumed) ?? model;
           reasoningEffort = threadReasoningEffort(resumed) ?? reasoningEffort;
           initialCollaborationMode = threadCollaborationMode(resumed);
+          // 作業フォルダも resume 応答が権威（開いていない間に別クライアントが変えていても揃う）。
+          resumedCwd = threadCwd(resumed);
           if (historyTimeout === null) {
             const snapshot = await readThreadHistorySnapshotWithRetry(
               connection,
@@ -1828,7 +1931,7 @@ export class CodexAppServerManager {
         initialActiveTurnId,
         liveSubscriptionReady,
         connection,
-        options.cwd ?? null,
+        resumedCwd ?? options.cwd ?? null,
         liveSubscriptionError,
         model,
         reasoningEffort,
@@ -2707,6 +2810,34 @@ function threadReasoningEffort(response: unknown): string | null {
   const thread = objectRecord(record?.["thread"]);
   // 応答 top-level の `reasoningEffort`（thread/start・resume の schema に併記）も代替として読む。
   return stringValue(thread?.["reasoningEffort"]) ?? stringValue(record?.["reasoningEffort"]);
+}
+
+/**
+ * thread/start / thread/resume 応答の今の作業フォルダ（top-level の `cwd`、無ければ `thread.cwd`）。0.167.2 では
+ * どちらも `thread/settings/update` で変えた後の値を返す（`thread/list` と rollout 先頭の session_meta は始めた時の値のまま）。
+ */
+function threadCwd(response: unknown): string | null {
+  const record = objectRecord(response);
+  return stringValue(record?.["cwd"]) ?? stringValue(objectRecord(record?.["thread"])?.["cwd"]);
+}
+
+/** 同じフォルダか（実体パスで比べる。消えたフォルダは字句で）。 */
+function sameDirectory(lhs: string, rhs: string): boolean {
+  return lhs === rhs || canonicalPath(lhs) === canonicalPath(rhs);
+}
+
+/** 要求の形を App Server が受け付けなかった（その版に無い引数・メソッド）か。 */
+function isUnsupportedParamsError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /unknown field|unknown variant|method not found|invalid params|not supported/i.test(message);
+}
+
+/** 作業フォルダの変更の失敗（session-workdir-change）。`kind` は利用者へ返す種類。 */
+export class CodexCwdChangeError extends Error {
+  constructor(readonly kind: "unsupported" | "busy" | "failed", message: string) {
+    super(message);
+    this.name = "CodexCwdChangeError";
+  }
 }
 
 function extractThreadId(response: unknown): string | null {

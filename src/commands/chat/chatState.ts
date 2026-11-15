@@ -7,6 +7,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { claudeProjectSlug } from "../../shared/paths.js";
+import { locateClaudeTranscript } from "../../sessions/claudeTranscriptLocator.js";
 import { defaultPeerSessionsDir, parsePeerSessionRecord } from "../../services/peerSessions.js";
 import { SessionMetadataStore } from "../../sessions/sessionMetadataStore.js";
 import { normalizeForTextMatch } from "../../shared/invisibleText.js";
@@ -270,15 +271,9 @@ export function findTranscript(
     const file = path.join(projectsDir, claudeProjectSlug(cwd), `${conversationId}.jsonl`);
     if (fs.existsSync(file)) return { file, cwd };
   }
-  try {
-    for (const slug of fs.readdirSync(projectsDir)) {
-      const file = path.join(projectsDir, slug, `${conversationId}.jsonl`);
-      if (fs.existsSync(file)) return { file, cwd: null };
-    }
-  } catch {
-    // projects が無い。
-  }
-  return null;
+  // 会話中の `/cd` 等で移った会話（session-workdir-change）: 全 slug から会話 id で探し、会話ログが指す今のフォルダを添える。
+  const located = locateClaudeTranscript(conversationId, null, { projectsDir });
+  return located === null ? null : { file: located.path, cwd: located.cwd };
 }
 
 export interface TranscriptLine {

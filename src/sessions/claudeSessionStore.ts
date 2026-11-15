@@ -18,6 +18,7 @@ import { isInjectedSkillContent } from "../shared/skillInjection.js";
 import { isTurnCompanionRecord } from "../shared/commandExpansion.js";
 import { noteReadFailure, readFailureCount } from "../shared/readFailures.js";
 import type { ListMemoFile } from "./listMemoFile.js";
+import { claudeTranscriptCwd } from "./claudeTranscriptLocator.js";
 import { mapConcurrent } from "./mapConcurrent.js";
 
 /** タイトル抽出の最大長（先頭 ~60 字）。 */
@@ -332,15 +333,31 @@ export class ClaudeSessionStore {
     const hit = this.infoMemo.get(filePath);
     if (hit !== undefined && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size) return { ...hit.info };
     const failuresBefore = readFailureCount();
-    const info = deriveInfo(filePath, sessionId, slug);
+    const { info, startedCwd } = deriveInfoAndStart(filePath, sessionId, slug);
     if (readFailureCount() !== failuresBefore) {
       // 読み取りに失敗した劣化結果は覚えない（直ったら次の一覧で読み直す）。
       if (this.infoMemo.delete(filePath)) this.memoDirty = true;
       return info;
     }
-    this.infoMemo.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, info: { ...info } });
+    this.infoMemo.set(filePath, {
+      mtimeMs: stat.mtimeMs, size: stat.size, info: { ...info }, ...(startedCwd !== null ? { startedCwd } : {}),
+    });
     this.memoDirty = true;
     return info;
+  }
+
+  /**
+   * 会話を始めたフォルダのうち、今のフォルダと違うもの（`list()` で読んだ会話の分。session-workdir-change）。
+   * ワークツリーの片付けが「まだ使う」と数える。`sessionId` を渡すとその会話の分だけ。
+   */
+  startedCwds(sessionId?: string): string[] {
+    const out: string[] = [];
+    for (const [filePath, entry] of this.infoMemo) {
+      if (entry.startedCwd === undefined) continue;
+      if (sessionId !== undefined && path.basename(filePath, ".jsonl") !== sessionId) continue;
+      out.push(entry.startedCwd);
+    }
+    return out;
   }
 
   /** 最初の一覧の前に、前の engine が書き出したメモを読み戻す。 */
@@ -365,6 +382,8 @@ interface InfoMemoEntry {
   mtimeMs: number;
   size: number;
   info: ClaudeSessionInfo;
+  /** 会話を始めたフォルダ（今のフォルダと違うときだけ, session-workdir-change）。 */
+  startedCwd?: string;
 }
 
 /** 保存ファイルから読んだ値がメモとして使えるか（壊れた・古い形の値は読み直させる）。 */
@@ -382,7 +401,8 @@ function isInfoMemoEntry(value: unknown): value is InfoMemoEntry {
     && typeof fields["title"] === "string"
     && isOptional(fields["updatedAt"], "number")
     && isOptional(fields["lastMessage"], "string")
-    && isOptional(fields["hasProviderTitle"], "boolean");
+    && isOptional(fields["hasProviderTitle"], "boolean")
+    && isOptional(entry["startedCwd"], "string");
 }
 
 /**
@@ -417,6 +437,11 @@ export interface TranscriptTitleEntries {
 export interface TranscriptTailSummary extends TranscriptTitleEntries {
   updatedAt: number | null;
   lastMessage: string | null;
+  /**
+   * 読んだ範囲で最新の `relocated` 行の `relocatedCwd`（会話中の `/cd`・EnterWorktree / ExitWorktree で作業フォルダが
+   * 移った先, session-workdir-change）。読んだ範囲に無ければ undefined。
+   */
+  relocatedCwd?: string;
 }
 
 /**
@@ -438,7 +463,10 @@ export function scanTranscriptTail(filePath: string, timestampOnly = false): Tra
   let updatedAt: number | null = null;
   let lastMessage: string | null = null;
   const titles: TranscriptTitleEntries = {};
-  const summary = (): TranscriptTailSummary => ({ updatedAt, lastMessage, ...titles });
+  let relocatedCwd: string | undefined;
+  const summary = (): TranscriptTailSummary => ({
+    updatedAt, lastMessage, ...titles, ...(relocatedCwd !== undefined ? { relocatedCwd } : {}),
+  });
   try {
     const size = fs.fstatSync(fd).size;
     const maxSpan = Math.min(size, TAIL_BYTES_CAP);
@@ -461,6 +489,10 @@ export function scanTranscriptTail(filePath: string, timestampOnly = false): Tra
         }
         if (!timestampOnly && titles.aiTitle === undefined && rec["type"] === "ai-title") {
           titles.aiTitle = normalizeExplicitTitle(rec["aiTitle"]);
+        }
+        if (!timestampOnly && relocatedCwd === undefined && rec["type"] === "relocated" &&
+          typeof rec["relocatedCwd"] === "string" && rec["relocatedCwd"].startsWith("/")) {
+          relocatedCwd = rec["relocatedCwd"];
         }
         const isConversationEntry = rec["type"] === "user" || rec["type"] === "assistant";
         if (updatedAt === null && isConversationEntry) updatedAt = entryTimestamp(rec);
@@ -633,6 +665,14 @@ function richerInfo(lhs: ClaudeSessionInfo, rhs: ClaudeSessionInfo): ClaudeSessi
 
 /** 1 つの jsonl から ClaudeSessionInfo を導出する（先頭 + 末尾チャンクのみ読む）。 */
 function deriveInfo(filePath: string, sessionId: string, slug: string): ClaudeSessionInfo {
+  return deriveInfoAndStart(filePath, sessionId, slug).info;
+}
+
+/**
+ * 一覧の 1 行と、会話を始めたフォルダ（先頭の cwd。今のフォルダと違うときだけ, session-workdir-change）。始めたフォルダは
+ * ワークツリーの片付けで「まだ使う」と数える（Tailii のワークツリーで始めて `/cd` で出た会話の元のワークツリーを消さない）。
+ */
+function deriveInfoAndStart(filePath: string, sessionId: string, slug: string): { info: ClaudeSessionInfo; startedCwd: string | null } {
   const tail = scanTranscriptTail(filePath);
   const updatedAt = tail.updatedAt ?? undefined;
   const head = scanTranscriptHead(filePath);
@@ -642,15 +682,22 @@ function deriveInfo(filePath: string, sessionId: string, slug: string): ClaudeSe
   // このフラグが立つまでタイトルを取り直す（立たないまま打ち切ると発話そのままの仮タイトルで
   // 固定され、一覧へ戻って開き直すまで AI タイトルへ更新されない）。
   const explicitTitle = resolveExplicitTitle(head, tail);
+  // 今の作業フォルダ（session-workdir-change）: Claude Code 本体と同じく最新の relocated 行 → 先頭の cwd。
+  // 末尾の窓で relocated を見なかったのに先頭の cwd が置き場所（slug）と合わないときだけ、会話ログを読み直す
+  // （移った会話の一覧行が古いフォルダを指すと、開き直しが古いフォルダで resume して会話を見失う）。
+  let cwd = tail.relocatedCwd ?? head.cwd;
+  if (tail.relocatedCwd === undefined && head.cwd !== null && claudeProjectSlug(head.cwd) !== slug) {
+    cwd = claudeTranscriptCwd(filePath) ?? head.cwd;
+  }
   const info: ClaudeSessionInfo = {
     sessionId,
-    cwd: head.cwd ?? cwdFromSlug(slug),
+    cwd: cwd ?? cwdFromSlug(slug),
     title: explicitTitle ?? head.title ?? sessionId.slice(0, 8),
     hasProviderTitle: explicitTitle !== null,
   };
   if (updatedAt !== undefined) info.updatedAt = updatedAt;
   if (tail.lastMessage !== null) info.lastMessage = tail.lastMessage;
-  return info;
+  return { info, startedCwd: head.cwd !== null && head.cwd !== info.cwd ? head.cwd : null };
 }
 
 /**

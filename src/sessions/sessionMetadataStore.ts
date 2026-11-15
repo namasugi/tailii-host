@@ -3,6 +3,7 @@
 // Swift 版 SessionMetadataStore.swift の移植。
 // セッション名 → 作業ディレクトリ / 作成時刻を <base>/<name>.json に put/get/all で読み書きする。
 
+import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -107,9 +108,16 @@ export class SessionMetadataStore {
     );
     const target = this.fileFor(meta.name);
     this.readMemo.delete(target);
-    const tmp = target + ".tmp";
-    fs.writeFileSync(tmp, payload);
-    fs.renameSync(tmp, target); // atomic 相当
+    // 一時ファイル名は書き手ごとに分ける（engine と hub がほぼ同時に同じ会話の記録を書くと、共有の `.tmp` を互いに
+    // 上書き・rename し合って中身の切れた記録ができ得る, session-workdir-change）。
+    const tmp = `${target}.${process.pid}-${randomBytes(4).toString("hex")}.tmp`;
+    try {
+      fs.writeFileSync(tmp, payload);
+      fs.renameSync(tmp, target); // atomic 相当
+    } catch (error) {
+      try { fs.rmSync(tmp, { force: true }); } catch { /* 片付けられなくても元の失敗を返す。 */ }
+      throw error;
+    }
   }
 
   /** 指定 name のメタデータ。存在しない / 読めない場合は null（throw しない設計）。 */

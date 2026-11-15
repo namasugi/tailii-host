@@ -23,6 +23,14 @@ import {
 } from "../protocol.js";
 import { API_AGENT_ERROR_MESSAGES, parseApiAgentConfig } from "../apiAgent/config.js";
 
+/**
+ * 作業フォルダの変更の押さえ（workdir_change_begin）の期限（session-workdir-change）。最後の手当て: engine は成功・失敗・
+ * 時間切れのどれでも end を送り、engine が切れれば hub は切断で放すので、期限に頼るのは engine が end を送れずに接続
+ * だけ残ったときだけ。engine が押さえる最長（押さえの依頼 3 秒 + Codex の変更の依頼 30 秒 + 記録の通知 3 秒）を少し
+ * 超える長さ。押さえの間に届いた送信はこの間待たされるので、待つ側の期限はこれを足した長さにする。
+ */
+export const WORKDIR_CHANGE_LEASE_MS = 40_000;
+
 export type HubClientMessage =
   | { type: "hub_hello" }
   | { type: "conversation_subscribe"; session: string; afterSeq?: number; newerThanMs?: number; preview?: boolean }
@@ -85,6 +93,12 @@ export type HubClientMessage =
   | { type: "api_agent_interrupt"; id: string; session: string }
   /** 元へ戻すために閉じる（実行中なら閉じない）。結果は api_agent_result（error: turn_running / not_open）。 */
   | { type: "api_agent_close"; id: string; session: string }
+  /**
+   * 作業フォルダの変更（engine→hub, session-workdir-change）。hub はターンが動いていないときだけ会話ログを移し、
+   * API 作業が持つ cwd を新しい値にする。記録（metadata）と `pc:cwd` は engine が成功の後に session_cwd_set で頼む。
+   * 結果は api_agent_relocate_result。`fromCwd` は記録上の cwd（会話ログを探す手がかり）。
+   */
+  | { type: "api_agent_relocate"; id: string; session: string; conversationId: string; fromCwd: string; cwd: string }
   /** Codex thread の目標操作（engine→hub, codex-goal）。hub 所有の App Server 接続で `thread/goal/*` を実行する。 */
   | {
       type: "codex_goal_submit";
@@ -97,6 +111,12 @@ export type HubClientMessage =
       status?: string;
       tokenBudget?: number;
     }
+  /**
+   * Codex thread の作業フォルダの変更（engine→hub, session-workdir-change）。hub 所有の App Server 接続で
+   * `thread/settings/update` の `cwd` を送り、適用の通知を待つ。`cwd` は記録上の作業フォルダ（thread を開くときに使う）、
+   * `targetCwd` は移す先（engine が実在するフォルダの実体パスか確かめ済み）。結果は codex_cwd_result。
+   */
+  | { type: "codex_cwd_submit"; id: string; session: string; threadId: string; cwd: string; targetCwd: string }
   | {
       type: "chat_send"; id: string; session: string; clientMessageId: string; text: string;
       explicitRetry?: boolean;
@@ -114,6 +134,21 @@ export type HubClientMessage =
   | { type: "runtime_claim"; id: string; session: string }
   | { type: "runtime_claim_release"; session: string }
   | { type: "session_preview_watch"; enabled: boolean }
+  /**
+   * 会話の作業フォルダが変わった（engine→hub, session-workdir-change）。hub は記録（metadata）を合わせ、
+   * 購読者へ `pc:cwd` を配る（同じ値を続けて配らない）。結果は session_cwd_set_result。
+   */
+  | { type: "session_cwd_set"; id: string; session: string; cwd: string }
+  /**
+   * 作業フォルダの変更の排他（engine→hub, session-workdir-change）。hub は 1 回の処理の中で、同じ会話の変更の進行中・
+   * ターンの実行中・設問や承認の待ち・送信待ち・打ち込み中・始まりかけの Codex のターンを確かめ、どれも無ければ
+   * 会話を押さえる（押さえている間は送信・今すぐ送信・Codex のターンの開始を待たせる）。結果は
+   * workdir_change_begin_result。終わったら workdir_change_end で放す（放さずに切れても期限か切断で放す）。
+   * `token` は engine が作る。依頼が engine 側で時間切れになっても engine はこの token で end を送るので、hub は
+   * 「end が先に届いた token の begin」には与えない（押さえが宙に浮いて送信を止め続けない）。
+   */
+  | { type: "workdir_change_begin"; id: string; session: string; token: string }
+  | { type: "workdir_change_end"; session: string; token: string }
   | SessionProcessingMessage;
 
 /**
@@ -162,6 +197,8 @@ export type HubServerMessage =
       session: string;
       pendingQuestion: { id: string; questions: QuestionPromptQuestion[] } | null;
       processing: boolean;
+      /** 作業フォルダの変更の押さえ中（session-workdir-change）。旧 hub は載せない。 */
+      workdirChangeHeld?: boolean;
     }
   | { type: "presence_response"; id: string; session: string; subscriberCount: number }
   /** 送る直前の生存確認（hub→engine）。engine は iOS へ `presence_ping` として渡す。 */
@@ -216,7 +253,18 @@ export type HubServerMessage =
   | { type: "codex_turn_result"; id: string; status: "started" | "duplicate" | "failed"; error?: string }
   /** api_agent_open / configure / interrupt の結果。interrupt の `interrupted=false` は処理中のターンが無かった。 */
   | { type: "api_agent_result"; id: string; status: "ok" | "failed"; error?: ApiAgentErrorCode; interrupted?: boolean }
+  /**
+   * api_agent_relocate の結果。`ok` は移した後の作業フォルダを `cwd` に載せる。`busy` = ターンの実行中・送信待ち・
+   * 設問の保留・会話を掴んでいる claude がある。`worktree` = Claude 自身がワークツリーに入っている。`conflict` = 移動先に
+   * 同じ会話の記録が既にある。
+   */
+  | { type: "api_agent_relocate_result"; id: string; status: "ok" | "busy" | "worktree" | "conflict" | "failed"; cwd?: string }
   | { type: "codex_goal_result"; id: string; status: "ok" | "failed"; goal?: CodexGoalInfo; cleared?: boolean; error?: string }
+  /**
+   * codex_cwd_submit の結果。`ok` は App Server が報告した作業フォルダを `cwd` に載せる。`busy` = ターンの実行中、
+   * `unsupported` = この版の Codex（または hub）は作業フォルダの変更に対応していない。
+   */
+  | { type: "codex_cwd_result"; id: string; status: "ok" | "busy" | "unsupported" | "failed"; cwd?: string; error?: string }
   | { type: "chat_send_result"; id: string; status: "accepted" | "duplicate" | "failed"; error?: string }
   | { type: "pending_message_delete_result"; id: string; status: "deleted" | "not_found" | "processing" | "failed"; error?: string }
   | { type: "chat_receipt_query_result"; id: string; status: "delivered" | "deleted" | "uncertain" | "pending" | "unknown";
@@ -229,6 +277,10 @@ export type HubServerMessage =
   | { type: "background_command_stop_result"; id: string; status: BackgroundCommandStopStatus; error?: string }
   | { type: "subagent_control_result"; id: string; status: SubagentControlStatus; error?: string }
   | { type: "runtime_claim_result"; id: string; status: "granted" | "held" }
+  /** session_cwd_set の結果（`not_found` = 記録が無い）。 */
+  | { type: "session_cwd_set_result"; id: string; status: "ok" | "not_found" }
+  /** workdir_change_begin の結果（`in_flight` = 同じ会話の変更が進行中 / `busy` = 処理中・送信待ち等）。 */
+  | { type: "workdir_change_begin_result"; id: string; status: "granted" | "busy" | "in_flight"; token?: string }
   /** 会話で動いているエージェントの数（session-agent-count）。`replace` は接続直後の全件（載っていない会話は 0）。 */
   | { type: "session_agents"; items: { session: string; running: number }[]; replace?: boolean }
   | EngineRelayMessage;
@@ -381,6 +433,14 @@ export function decodeHubClientLine(line: string): HubClientMessage | null {
           ...(collaborationMode !== null ? { collaborationMode: collaborationMode as CodexCollaborationMode } : {}) }
       : null;
   }
+  if (record["type"] === "codex_cwd_submit") {
+    const id = record["id"], session = record["session"], threadId = record["threadId"], cwd = record["cwd"];
+    const targetCwd = record["targetCwd"];
+    return typeof id === "string" && id.length > 0 && typeof session === "string" && session.length > 0 &&
+      typeof threadId === "string" && threadId.length > 0 && typeof cwd === "string" && cwd.length > 0 &&
+      typeof targetCwd === "string" && targetCwd.startsWith("/")
+      ? { type: "codex_cwd_submit", id, session, threadId, cwd, targetCwd } : null;
+  }
   if (record["type"] === "codex_goal_submit") {
     const id = record["id"], session = record["session"], threadId = record["threadId"], cwd = record["cwd"];
     const action = record["action"], objective = record["objective"], status = record["status"];
@@ -418,6 +478,15 @@ export function decodeHubClientLine(line: string): HubClientMessage | null {
     const id = record["id"], session = record["session"];
     return typeof id === "string" && id.length > 0 && typeof session === "string" && session.length > 0
       ? { type: record["type"], id, session }
+      : null;
+  }
+  if (record["type"] === "api_agent_relocate") {
+    const id = record["id"], session = record["session"], conversationId = record["conversationId"];
+    const fromCwd = record["fromCwd"], cwd = record["cwd"];
+    return typeof id === "string" && id.length > 0 && typeof session === "string" && session.length > 0 &&
+      typeof conversationId === "string" && conversationId.length > 0 &&
+      typeof fromCwd === "string" && fromCwd.startsWith("/") && typeof cwd === "string" && cwd.startsWith("/")
+      ? { type: "api_agent_relocate", id, session, conversationId, fromCwd, cwd }
       : null;
   }
   if (record["type"] === "codex_turn_interrupt") {
@@ -494,6 +563,23 @@ export function decodeHubClientLine(line: string): HubClientMessage | null {
   if (record["type"] === "session_preview_watch") {
     const enabled = record["enabled"];
     return typeof enabled === "boolean" ? { type: "session_preview_watch", enabled } : null;
+  }
+  if (record["type"] === "workdir_change_begin") {
+    const id = record["id"], session = record["session"], token = record["token"];
+    return typeof id === "string" && id.length > 0 && typeof session === "string" && session.length > 0 &&
+      typeof token === "string" && token.length > 0
+      ? { type: "workdir_change_begin", id, session, token } : null;
+  }
+  if (record["type"] === "workdir_change_end") {
+    const session = record["session"], token = record["token"];
+    return typeof session === "string" && session.length > 0 && typeof token === "string" && token.length > 0
+      ? { type: "workdir_change_end", session, token } : null;
+  }
+  if (record["type"] === "session_cwd_set") {
+    const id = record["id"], session = record["session"], cwd = record["cwd"];
+    return typeof id === "string" && id.length > 0 && typeof session === "string" && session.length > 0 &&
+      typeof cwd === "string" && cwd.startsWith("/")
+      ? { type: "session_cwd_set", id, session, cwd } : null;
   }
   return decodeProcessing(record);
 }
@@ -584,11 +670,23 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
     const pending = record["pendingQuestion"];
     if (typeof id !== "string" || typeof session !== "string" || typeof record["processing"] !== "boolean") return null;
     if (pending !== null && !isPendingQuestion(pending)) return null;
-    return { type: "hub_state_response", id, session, pendingQuestion: pending, processing: record["processing"] };
+    return { type: "hub_state_response", id, session, pendingQuestion: pending, processing: record["processing"],
+      ...(record["workdirChangeHeld"] === true ? { workdirChangeHeld: true } : {}) };
   }
   if (record["type"] === "presence_ping") {
     const id = record["id"];
     return typeof id === "string" && id.length > 0 ? { type: "presence_ping", id } : null;
+  }
+  if (record["type"] === "workdir_change_begin_result") {
+    const id = record["id"], status = record["status"], token = record["token"];
+    if (typeof id !== "string" || (status !== "granted" && status !== "busy" && status !== "in_flight")) return null;
+    if (status === "granted" && (typeof token !== "string" || token.length === 0)) return null;
+    return { type: "workdir_change_begin_result", id, status, ...(typeof token === "string" ? { token } : {}) };
+  }
+  if (record["type"] === "session_cwd_set_result") {
+    const id = record["id"], status = record["status"];
+    return typeof id === "string" && (status === "ok" || status === "not_found")
+      ? { type: "session_cwd_set_result", id, status } : null;
   }
   if (record["type"] === "push_device_register_result") {
     const id = record["id"], status = record["status"], transport = record["transport"];
@@ -640,11 +738,26 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
       ...(typeof error === "string" ? { error: error as ApiAgentErrorCode } : {}),
       ...(typeof interrupted === "boolean" ? { interrupted } : {}) };
   }
+  if (record["type"] === "api_agent_relocate_result") {
+    const id = record["id"], status = record["status"], cwd = record["cwd"];
+    if (typeof id !== "string" || (status !== "ok" && status !== "busy" && status !== "worktree" && status !== "conflict" &&
+      status !== "failed") || (cwd !== undefined && (typeof cwd !== "string" || !cwd.startsWith("/")))) return null;
+    return { type: "api_agent_relocate_result", id, status, ...(typeof cwd === "string" ? { cwd } : {}) };
+  }
   if (record["type"] === "codex_turn_result") {
     const id = record["id"], status = record["status"], error = record["error"];
     if (typeof id !== "string" || (status !== "started" && status !== "duplicate" && status !== "failed") ||
       (error !== undefined && typeof error !== "string")) return null;
     return { type: "codex_turn_result", id, status, ...(typeof error === "string" ? { error } : {}) };
+  }
+  if (record["type"] === "codex_cwd_result") {
+    const id = record["id"], status = record["status"], cwd = record["cwd"], error = record["error"];
+    if (typeof id !== "string" ||
+      (status !== "ok" && status !== "busy" && status !== "unsupported" && status !== "failed") ||
+      (cwd !== undefined && typeof cwd !== "string") || (error !== undefined && typeof error !== "string")) return null;
+    return { type: "codex_cwd_result", id, status,
+      ...(typeof cwd === "string" ? { cwd } : {}),
+      ...(typeof error === "string" ? { error } : {}) };
   }
   if (record["type"] === "codex_goal_result") {
     const id = record["id"], status = record["status"], error = record["error"], cleared = record["cleared"];

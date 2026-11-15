@@ -35,6 +35,7 @@ import {
 import {
   cancelChoiceDialog,
   CHAT_BLOCKED_BY_LOGIN_PROMPT,
+  CHAT_BLOCKED_BY_DIALOG,
   CHAT_BLOCKED_AFTER_CHOICE_CANCELLED,
   CHAT_BLOCKED_BY_STUCK_CHOICE,
   CHAT_BLOCKED_BY_UNREADABLE_CHOICE,
@@ -57,6 +58,8 @@ import {
   JUMP_SETTLE_READS,
   revealHiddenBottom,
   screenScrolledAwayHidingBottom,
+  screenShowsConfirmDialogFooter,
+  confirmDialogAppeared,
   LoginCodeError,
   paneCommandLooksLikeAgent,
   screenInLoginFlow,
@@ -1085,11 +1088,15 @@ export class HerdrSessionManager {
     // 見逃し側（未知フレーム）は従来どおり注入へ進む＝送信が丸ごと不能にはならない。
     // 閉じた直後は描画途中でボトムバーが欠けることがある。設問を閉じる指定の送信だけ、
     // 入力欄が描画されるまで短く撮り直す（指定の無い送信は read 回数を増やさない）。
-    const { frame: injectFrame } = await settleFrameAfterChoiceCancel({
+    const { frame: injectFrame, screen: injectScreen } = await settleFrameAfterChoiceCancel({
       capture: () => this.captureVisibleScreenAnsiOrNull(name),
       pollMs: this.choiceCancelPollMs,
       maxPolls: choiceCancelled && options.cancelChoiceDialog === true ? CHOICE_CANCEL_MAX_POLLS : 0,
     });
+    // 確認系ダイアログ（`Enter to confirm`）の表示中は 1 キーも打たない（tmux と同じ, session-workdir-change）。
+    if (injectScreen !== null && screenShowsConfirmDialogFooter(injectScreen)) {
+      throw new ChatInjectionRejectedError(CHAT_BLOCKED_BY_DIALOG);
+    }
     if (choiceCancelled && options.cancelChoiceDialog === true && injectFrame === "unknown") {
       throw new ChatInjectionRejectedError(CHAT_BLOCKED_AFTER_CHOICE_CANCELLED);
     }
@@ -1101,9 +1108,7 @@ export class HerdrSessionManager {
     if (injectFrame === "dialog") {
       // Esc は打ったが閉じない。ここで本文を打つとダイアログへ落ちるので、何も打たずに諦める。
       if (choiceStuck) throw new ChatInjectionRejectedError(CHAT_BLOCKED_BY_STUCK_CHOICE);
-      throw new ChatInjectionRejectedError(
-        "ダイアログの表示中はメッセージを送信できません（アプリで選択肢に答えてから送り直してください）",
-      );
+      throw new ChatInjectionRejectedError(CHAT_BLOCKED_BY_DIALOG);
     }
     // ここから入力欄を触る（残り物を消す / 送り出す・シェルモードを抜ける・本文を打つ）。hub が終了の準備に
     // 入っていたら、1 キーも打たずに見送る（次の hub が届ける）。ダイアログを閉じた事実は上で伝え済み。
@@ -1134,7 +1139,7 @@ export class HerdrSessionManager {
         // ので送り出す。消したことを知らせる手段の無い呼び出し（hub 以外: 公式アプリ連携・kick）も、
         // 黙って消さないよう従来どおり送り出す。2.1.277+ は不可視文字入りを 1 回の Enter で流さないので、
         // 送信確定ループで流す。流し切れなければ本文を打たずに失敗させる（連結送信の防止）。
-        if ((await this.submitTypedText(name)) !== "submitted") {
+        if ((await this.submitTypedText(name, {}, pending)) !== "submitted") {
           throw new ChatInjectionRejectedError(CHAT_BLOCKED_BY_UNSENT_OWN_TEXT);
         }
         this.ownUnsubmittedText.delete(name);
@@ -1246,7 +1251,7 @@ export class HerdrSessionManager {
       const firstEnterGapMs = inputBox.waited || this.launchedRecently(name)
         ? this.submitDelayMs
         : Math.min(this.submitDelayMs, IDLE_SUBMIT_GAP_MS);
-      const submitted = await this.submitTypedText(name, { typedAtMs, firstEnterGapMs });
+      const submitted = await this.submitTypedText(name, { typedAtMs, firstEnterGapMs }, text, options);
       if (submitted !== "submitted") options.onUnconfirmedSubmit?.();
       else this.ownUnsubmittedText.delete(name);
     } catch (error) {
@@ -1290,12 +1295,24 @@ export class HerdrSessionManager {
   private async submitTypedText(
     name: string,
     timing: { typedAtMs?: number; firstEnterGapMs?: number } = {},
+    typedText: string | null = null,
+    options: SendTextSubmitOptions = {},
   ): Promise<SubmitOutcome> {
+    const verdicts: string[] = [];
+    const report = (outcome: SubmitOutcome): SubmitOutcome => {
+      if (verdicts.length > 1 || outcome !== "submitted") options.onSubmitVerdicts?.(verdicts);
+      return outcome;
+    };
     for (let attempt = 0; attempt < SUBMIT_ATTEMPT_LIMIT; attempt += 1) {
+      // 呼び出し側が成立を確かめた（`/cd` の完了行など）。それ以上 Enter を撃たない（tmux と同じ）。
+      if (attempt > 0 && options.confirmSubmitted?.() === true) return report("submitted");
       // **撃つ前に必ずフレームを見る**。ダイアログ表示中・判定不能のまま Enter を撃つと
       // 選択肢を誤操作する（承認ダイアログならファイル書き込みを勝手に承認する）。
-      const before = classifySubmitFrame(await this.captureVisibleScreenAnsiOrNull(name));
-      if (before === "dialog") return "blocked";
+      const beforeScreen = await this.captureVisibleScreenAnsiOrNull(name);
+      const before = classifySubmitFrame(beforeScreen);
+      if (before === "dialog") return report("blocked");
+      // 打った後に新しく出た確認系ダイアログへも Enter を撃たない（tmux と同じ, session-workdir-change）。
+      if (beforeScreen !== null && confirmDialogAppeared(beforeScreen, typedText)) return report("blocked");
       // 「撃つ前に入力欄が空」は送信成立の証拠にならない（本文を打った直後にこれなら、
       // 打鍵が入力欄へ届いていない＝ RC limbo 等）。打ち切らずに Enter は必ず 1 回撃つ
       // （空 composer への Enter は no-op。薄字の提案は実テキストに数えないので送らない）。
@@ -1309,16 +1326,18 @@ export class HerdrSessionManager {
       const after = await settleSubmitVerdict({
         capture: () => this.captureVisibleScreenAnsiOrNull(name),
         windowMs: this.submitVerifyDelayMs,
+        ...(options.confirmSubmitted !== undefined ? { confirmed: options.confirmSubmitted } : {}),
       });
-      if (after === "submitted") return "submitted";
+      verdicts.push(after);
+      if (after === "submitted") return report("submitted");
       // 撃った**後**にバーが消えたのは、本文が送られてダイアログが開いた場合
       // （RC active 中の `/remote-control` など。実障害 2026-07-28 の誤 Continue はここ）。
       // 送信は成立しているので打ち切る。capture 不能は配送を主張しない。
-      if (after === "dialog") return "submitted";
+      if (after === "dialog") return report("submitted");
       // 未知のフレームでは撃ち続けない（従来どおり Enter 1 発で止め、未確定として報告する）。
-      if (before === "unknown" || after === "unknown") return "unconfirmed";
+      if (before === "unknown" || after === "unknown") return report("unconfirmed");
     }
-    return "unconfirmed";
+    return report("unconfirmed");
   }
 
   /**
@@ -1538,7 +1557,11 @@ export class HerdrSessionManager {
         continue;
       }
       if (claudeInputBoxRendered(window)) return { state: "ready", hiddenDialogCancelled, waited };
-      if (screenInLoginFlow(window) || screenHasSelectionFooter(window)) return { state: "ready", hiddenDialogCancelled, waited };
+      // 確認系ダイアログ（`Enter to confirm`）も入力欄を待たずに次の判定へ進め、本文を打たずに断る（tmux と同じ扱い,
+      // session-workdir-change。待つと 20 秒後に「入力欄が出ない」で失敗し、その間ほかの送信も詰まる）。
+      if (screenInLoginFlow(window) || screenHasSelectionFooter(window) || screenShowsConfirmDialogFooter(window)) {
+        return { state: "ready", hiddenDialogCancelled, waited };
+      }
       if (Date.now() >= deadline) return { state: "timeout", hiddenDialogCancelled, waited };
       waited = true;
       await new Promise((resolve) => setTimeout(resolve, this.readyPollMs));
