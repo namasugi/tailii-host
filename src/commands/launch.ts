@@ -11,7 +11,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { CodexAppServerManager, type CodexThreadStartOptions } from "../codex/codexAppServer.js";
-import { socketHerdrCommandRunner } from "../backend/herdrSocket.js";
+import { herdrSessionSocketPath, socketHerdrCommandRunner } from "../backend/herdrSocket.js";
 import {
   HERDR_TIMEOUT_MS,
   type HerdrCommandResult,
@@ -24,6 +24,8 @@ import {
   defaultHerdrPath,
   envWithoutTmux,
   herdrErrorCode,
+  herdrExitCode,
+  HERDR_TIMEOUT_EXIT_CODE,
   parseHerdrForegroundCommand,
   parseHerdrPaneList,
   parseHerdrCreatedTabPaneId,
@@ -317,8 +319,7 @@ function defaultProcessRunner(herdrPath: string = defaultHerdrPath()): ProcessRu
             reject(error);
             return;
           }
-          const exitCode = error && typeof error.code === "number" ? error.code : error ? 1 : 0;
-          resolve({ exitCode, stdout: String(stdout), stderr: String(stderr) });
+          resolve({ exitCode: herdrExitCode(error), stdout: String(stdout), stderr: String(stderr) });
         },
       );
     });
@@ -682,6 +683,8 @@ export async function launchCore(options: {
   beforeRun?: () => Promise<boolean>;
   /** herdr: この pane と同じワークスペースに新しいタブを作る（peer-takeover の相手のタブ）。 */
   herdrPlacementPaneId?: string;
+  /** herdr セッションのソケットのファイルがあるか（テスト注入用。既定は実ファイル）。 */
+  herdrSocketExists?: (herdrSession: string) => boolean;
   /** herdr 実行ファイルの絶対パス（backend=herdr のときのみ使用）。 */
   herdrPath?: string | null;
   /** detached プロセス起動の注入点（herdr tailii セッションサーバーの ensure 用, テスト注入可）。 */
@@ -775,6 +778,7 @@ export async function launchCore(options: {
       herdrSession: options.herdrSession ?? HERDR_DEFAULT_SESSION,
       ...(options.beforeRun !== undefined ? { beforeRun: options.beforeRun } : {}),
       ...(options.herdrPlacementPaneId !== undefined ? { placementPaneId: options.herdrPlacementPaneId } : {}),
+      ...(options.herdrSocketExists !== undefined ? { herdrSocketExists: options.herdrSocketExists } : {}),
       injectedPath: options.path,
       env,
       runner,
@@ -803,11 +807,6 @@ export async function launchCore(options: {
       return { code: 127, out: "" };
     }
   };
-  // 開き直し（peer-takeover）: tmux は作成と起動が 1 手なので、起動の前に相手を終了させる。
-  if (options.beforeRun !== undefined && !await options.beforeRun()) {
-    errorSink("tailii launch: 他所で動いている同じ会話を終了できませんでした（起動していません）\n");
-    return 1;
-  }
 
   // --- 2.5. 既存の「死んだ」同名セッションを掃除する（同名再利用を可能にする） ---
   // herdr と違い起動直後の猶予は設けない: tmux は `new-session -d -s <name> '<inner>'` で
@@ -830,6 +829,18 @@ export async function launchCore(options: {
     if (!hasLive || !hasAgent) {
       await runTmux(["kill-session", "-t", session]);
     }
+  }
+
+  // 開き直し（peer-takeover）: tmux は作成と起動が 1 手なので、起動の前に相手を終了させる。シェルだけの残骸は上で掃除した
+  // 後で判定する（2 周目レビュー 6）。同じ名前の tmux セッションがまだ生きていれば、相手を終了させても新しく起動しない
+  // （使い回す）ことになるので、何もせずに確認からやり直させる（レビュー指摘 5）。
+  if (options.beforeRun !== undefined && (await runTmux(["has-session", "-t", session])).code === 0) {
+    errorSink("tailii launch: 同じ名前の会話がまだ動いているため開き直していません。もう一度開いてください\n");
+    return 1;
+  }
+  if (options.beforeRun !== undefined && !await options.beforeRun()) {
+    errorSink("tailii launch: 他所で動いている同じ会話を終了できませんでした（起動していません）\n");
+    return 1;
   }
 
   // --- 3. tmux で claude をデタッチ起動 ---
@@ -971,6 +982,8 @@ async function launchHerdrPane(options: {
   beforeRun?: () => Promise<boolean>;
   /** この pane と同じワークスペースに新しいタブを作る（peer-takeover の相手のタブ）。 */
   placementPaneId?: string;
+  /** herdr セッションのソケットのファイルがあるか（テスト注入用。既定は実ファイル）。 */
+  herdrSocketExists?: (herdrSession: string) => boolean;
   injectedPath: string;
   env: NodeJS.ProcessEnv;
   runner: ProcessRunner;
@@ -1009,6 +1022,24 @@ async function launchHerdrPane(options: {
     }
   };
   const isTailiiName = (label: string) => store.get(label)?.name === label;
+  const herdrSocketMissing = (name: string): boolean => {
+    if (options.herdrSocketExists !== undefined) return !options.herdrSocketExists(name);
+    const socket = herdrSessionSocketPath(name);
+    return socket !== null && !fs.existsSync(socket);
+  };
+  // サーバーが動いていないと確定できるか: `server_not_running`（0.9.5 実測）か、そのセッションのソケットのファイルが無い
+  // （旧版はエラーコードの形が違いうる。レビュー指摘 4）。
+  // 時間切れ・強制終了に見える失敗では、ソケットの不在を根拠にしない（場所の食い違いで止まっていると誤認しない。2 周目レビュー 8）。
+  // 時間切れは runner が 124 にして返す（execFile の打ち切り・socket の残り時間切れ。3 周目レビュー 4）。
+  const looksLikeTimeout = (result: { code: number; out: string; err: string }): boolean =>
+    result.code === HERDR_TIMEOUT_EXIT_CODE || result.code === 137 || result.code === 143 || /timed? ?out|timeout|ETIMEDOUT/i.test(`${result.err} ${result.out}`);
+  // エラーコードが読めたときはそれだけで判定する（`protocol_mismatch` などはサーバーが動いている証拠。ソケットの場所の
+  // 食い違いで上書きしない。4 周目レビュー 低1）。ソケットの有無は、コードが読めないときだけの手がかり。
+  const serverNotRunning = (result: { code: number; out: string; err: string }, name: string): boolean => {
+    const code = herdrErrorCode(result.err) ?? herdrErrorCode(result.out);
+    if (code !== null) return code === "server_not_running";
+    return herdrSocketMissing(name) && !looksLikeTimeout(result);
+  };
 
   // --- 0. 入れる herdr セッションを決める（herdr-session-setting）。前に起動した pane が別のセッション
   //     （設定を変える前のセッション・未記録なら専用の `tailii`）で生きていれば、そのセッションで続ける:
@@ -1018,6 +1049,17 @@ async function launchHerdrPane(options: {
   if (recordedMeta?.backend === "herdr" && herdrSessionOfMeta(recordedMeta) !== herdrSession) {
     const recordedSession = herdrSessionOfMeta(recordedMeta);
     const listed = await runHerdrIn(recordedSession, ["pane", "list"]);
+    // 記録したセッションが答えられない（時間切れ・旧版のまま = protocol_mismatch など）なら、そこで会話が動いているかを
+    // 確かめられない。設定のセッションへ黙って切り替えると同じ会話 id の 2 つ目を起動しうるので、起動しない（レビュー指摘 2）。
+    // 止まっている（server_not_running）だけなら、そこには居ないと確定できるので設定のセッションへ進む。
+    if (listed.code !== 0 && !serverNotRunning(listed, recordedSession)) {
+      errorSink(
+        herdrErrorCode(listed.err) === "protocol_mismatch"
+          ? `tailii launch: ${herdrRestartNeededMessage(recordedSession)}\n`
+          : `tailii launch: herdr セッション '${recordedSession}' に問い合わせできませんでした（前の起動先。同じ会話を二重に起動しないため起動していません）\n`,
+      );
+      return 1;
+    }
     if (
       listed.code === 0 &&
       resolveHerdrSessionPane(parseHerdrPaneList(listed.out), session, recordedMeta.herdrPaneId, isTailiiName, {
@@ -1045,7 +1087,7 @@ async function launchHerdrPane(options: {
     errorSink(`tailii launch: ${herdrRestartNeededMessage(herdrSession)}\n`);
     return 1;
   }
-  if (paneList.code !== 0 && (herdrErrorCode(paneList.err) ?? herdrErrorCode(paneList.out)) !== "server_not_running") {
+  if (paneList.code !== 0 && !serverNotRunning(paneList, herdrSession)) {
     // サーバーが動いていないと確定したときだけ起動する（herdr-session-setting）。同じ名前のセッションが
     // 動いているのに応答が遅れただけ（時間切れ・一時的な失敗）で 2 つ目のサーバーを起こさない。
     // `server_not_running` は、名前が未作成・止まっている・異常終了でソケットだけ残った、のどれでも返る
@@ -1067,7 +1109,7 @@ async function launchHerdrPane(options: {
       errorSink(`tailii launch: ${herdrRestartNeededMessage(herdrSession)}\n`);
       return 1;
     }
-    if (paneList.code !== 0 && (herdrErrorCode(paneList.err) ?? herdrErrorCode(paneList.out)) !== "server_not_running") {
+    if (paneList.code !== 0 && !serverNotRunning(paneList, herdrSession)) {
       const detail = (paneList.err || paneList.out).trim().slice(0, 200);
       errorSink(
         `tailii launch: herdr セッション '${herdrSession}' に問い合わせできませんでした` +
@@ -1123,6 +1165,12 @@ async function launchHerdrPane(options: {
     }
   }
 
+  // 開き直し（peer-takeover）で同じ名前の pane が残っていたら、使い回すと相手を終了させずに「開き直した」ことになる。
+  // 何もせずに確認からやり直させる（レビュー指摘 5）。
+  if (existing !== null && options.beforeRun !== undefined) {
+    errorSink("tailii launch: 同じ名前のタブが残っているため開き直していません。もう一度開いてください\n");
+    return 1;
+  }
   let herdrPaneId: string | null = existing?.paneId ?? null;
   let herdrTerminalId: string | null = existing?.terminalId ?? null;
   if (existing === null) {
@@ -1182,6 +1230,19 @@ async function launchHerdrPane(options: {
       return renamed.code;
     }
 
+    // 起動スクリプトの書き出しも失敗しうる準備なので、相手を終了させる前に済ませる（レビュー指摘 6）。
+    let runCommand: string;
+    try {
+      runCommand = herdrPaneRunCommand(
+        options.innerCommand,
+        session,
+        options.launchScriptDir ?? path.join(os.homedir(), ".tailii", "run"),
+      );
+    } catch (error) {
+      await runHerdr(["pane", "close", herdrPaneId]);
+      errorSink(`tailii launch: 起動スクリプトを書き出せませんでした: ${String(error)}\n`);
+      return 1;
+    }
     // --- 4.5 開き直し（peer-takeover）: 失敗しうる準備（server・ワークスペース・pane の作成と命名）を済ませてから、
     //     他所の同じ会話を終了させる（Fable レビュー A-4）。終了を確かめられなければ作った pane を閉じて起動しない。 ---
     if (options.beforeRun !== undefined && !await options.beforeRun()) {
@@ -1200,18 +1261,6 @@ async function launchHerdrPane(options: {
     //     復元され、次に開いたとき Tailii が stale 掃除 → 自前の起動で resume する（0.7.5 と同じ）。
     //     フックは HERDR_ENV=1 を必須条件にしている（連携 v7 / v10 とも）。herdr の状態検出
     //     （agent_status）と HERDR_PANE_ID / HERDR_SOCKET_PATH はそのまま残る。 ---
-    let runCommand: string;
-    try {
-      runCommand = herdrPaneRunCommand(
-        options.innerCommand,
-        session,
-        options.launchScriptDir ?? path.join(os.homedir(), ".tailii", "run"),
-      );
-    } catch (error) {
-      await runHerdr(["pane", "close", herdrPaneId]);
-      errorSink(`tailii launch: 起動スクリプトを書き出せませんでした: ${String(error)}\n`);
-      return 1;
-    }
     const ran = await runHerdr(["pane", "run", herdrPaneId, runCommand]);
     if (ran.code !== 0) {
       // 書き出した起動スクリプト（`--settings` 入り）は実行されないので消す。

@@ -1295,6 +1295,8 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
  * 状態を変える要求・開いている会話や一覧の状態に順序で効く要求は載せない（従来どおり直列）。
  */
 export const CONCURRENT_MESSAGE_TYPES: ReadonlySet<ControlMessage["type"]> = new Set<ControlMessage["type"]>([
+  // 開く前の問い合わせ（peer-takeover）。ps と herdr を数本待つので、読み取りループを塞がない。
+  "session_peer_check",
   // API 委譲中も通常会話・キャンセルを受理する。要求の重複と同時実行は handler が抑止する。
   "api_delegate_request",
   // 環境キーの確認・Models APIのGET（最大12秒）が画像取得や会話操作を待たせない。

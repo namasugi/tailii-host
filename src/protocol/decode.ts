@@ -657,7 +657,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         status !== "pending" && status !== "unknown") {
         throw new ProtocolDecodeError("missing-field", "status");
       }
-      return { type, v, id: requireString(raw, "id"), status };
+      return { type, v, id: requireString(raw, "id"), status, ...(raw["blocked"] === true ? { blocked: true } : {}) };
     }
 
     case "chat_send_now":

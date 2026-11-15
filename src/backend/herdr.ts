@@ -215,11 +215,24 @@ export function processHerdrCommandRunner(
             reject(error);
             return;
           }
-          const exitCode = error && typeof error.code === "number" ? error.code : error ? 1 : 0;
-          resolve({ exitCode, stdout: String(stdout), stderr: String(stderr) });
+          resolve({ exitCode: herdrExitCode(error), stdout: String(stdout), stderr: String(stderr) });
         },
       );
     });
+}
+
+/** 時間切れの印の終了コード（`timeout(1)` と同じ）。呼び出し側が「止まっている」と取り違えないための目印。 */
+export const HERDR_TIMEOUT_EXIT_CODE = 124;
+
+/**
+ * execFile の結果の終了コード。上限時間で打ち切られた（`killed` / シグナルで終わった）ときは 124 にする
+ * （`error.code` は null になり、従来は 1 = 通常の失敗と見分けられなかった。3 周目レビュー 4）。
+ */
+export function herdrExitCode(error: (Error & { code?: unknown; killed?: boolean; signal?: unknown }) | null): number {
+  if (error === null) return 0;
+  if (typeof error.code === "number") return error.code;
+  if (error.killed === true || (typeof error.signal === "string" && error.signal.length > 0)) return HERDR_TIMEOUT_EXIT_CODE;
+  return 1;
 }
 
 /**
@@ -589,7 +602,13 @@ export function resolveHerdrSessionPane(
           ? candidate
           : undefined;
   if (byId !== undefined && (byId.label === null || byId.label === name)) return byId;
-  const byLabel = panes.find((pane) => pane.label === name);
+  // 利用者も使うセッション（`tailii` 以外）では、端末 ID を記録していれば label が一致しても端末が違う pane は採らない:
+  // herdr の再起動で利用者のワークスペースに素のシェルとして復元された Tailii のタブを、利用者が使い始めた後に
+  // 自分の pane と取り違えて閉じない（レビュー指摘 3）。
+  const labelOk = (pane: HerdrPane): boolean =>
+    herdrSession === HERDR_TAILII_SESSION || recorded.terminalId === undefined || pane.terminalId === null ||
+    pane.terminalId === recorded.terminalId;
+  const byLabel = panes.find((pane) => pane.label === name && labelOk(pane));
   if (byLabel !== undefined) return byLabel;
   if (byId !== undefined && byId.label !== null && !isTailiiName(byId.label)) return byId;
   return null;

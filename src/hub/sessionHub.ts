@@ -1627,6 +1627,7 @@ export class SessionHub {
       this.sendTo(client, {
         type: "chat_receipt_query_result", id: message.id,
         status: this.chatReceiptStatus(message.session, message.clientMessageId),
+        ...(this.chatReceiptBlocked(message.session, message.clientMessageId) ? { blocked: true } : {}),
       });
       return;
     }
@@ -4309,6 +4310,17 @@ export class SessionHub {
    * `chat_send` と違い、どの記録にも無い ID を新規として受け付けない（unknown を返すだけ）。
    * 会話が片付いた後も配送済みは台帳から答える。actor が無ければ作らない。
    */
+  /**
+   * 保留中の送信が、送信順の先頭に残った「届いたか分からない」別の送信の後ろで止まっているか（4 周目レビュー 中2）。
+   * 先頭の uncertain は同じ送信 ID の明示の再送か会話の片付けでしか解けないので、この送信は放っておいても流れない。
+   */
+  private chatReceiptBlocked(session: string, clientMessageId: string): boolean {
+    const actor = this.actors.get(session);
+    if (actor === undefined || !actor.pendingChatMessages.has(clientMessageId)) return false;
+    const head = actor.chatOrder[0];
+    return head !== undefined && head !== clientMessageId && actor.uncertainChatMessages.has(head);
+  }
+
   private chatReceiptStatus(session: string, clientMessageId: string): ChatReceiptStatus {
     const actor = this.actors.get(session);
     if (actor !== undefined) {

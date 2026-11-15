@@ -147,7 +147,10 @@ export const conversationHandlers: HandlerRegistry = {
           message.id,
           5_000,
         );
-        writer.write({ type: "chat_receipt_query_result", v, id: result.id, status: result.status });
+        writer.write({
+          type: "chat_receipt_query_result", v, id: result.id, status: result.status,
+          ...(result.blocked === true ? { blocked: true } : {}),
+        });
       } catch (error) {
         writeError(writer, v, message.id, "chat_receipt_query_failed", String(error));
       }

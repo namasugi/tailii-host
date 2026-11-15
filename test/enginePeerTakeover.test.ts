@@ -6,10 +6,13 @@ import { HerdrSessionManager } from "../src/backend/herdr.js";
 import { TmuxSessionManager } from "../src/backend/tmux.js";
 import type { EngineLauncher } from "../src/engine/engine.js";
 import { PEER_RUNNING_MESSAGE } from "../src/engine/handlers/session.js";
+import { acquireTakeoverLock } from "../src/engine/handlers/peerCheck.js";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { decodeControlMessage } from "../src/protocol.js";
 import type { PeerProbe, PeerProcess, TakeoverTarget } from "../src/services/peerTakeover.js";
 import type { PeerSessionRecord } from "../src/services/peerSessions.js";
-import { MockTmuxRunner, makeTempStore, startEngine } from "./helpers.js";
+import { MockTmuxRunner, makeTempDir, makeTempStore, startEngine } from "./helpers.js";
 
 const CONV = "conv-peer-1";
 const START = "Sat Nov 14 07:36:50 2026";
@@ -237,4 +240,17 @@ describe("session_reattach の自動再起動", () => {
       await engine.teardown();
     }
   }, 15_000);
+});
+
+describe("開き直しのロック", () => {
+  test("持ち主の pid が生きていても、古いロックは残骸として取り直す（pid の再利用で永久に取れなくならない）", () => {
+    const dir = makeTempDir("takeover-lock");
+    const first = acquireTakeoverLock(CONV, dir);
+    expect(first).not.toBeNull();
+    expect(acquireTakeoverLock(CONV, dir)).toBeNull();
+    const file = path.join(dir, `takeover-${CONV}.lock`);
+    const old = new Date(Date.now() - 10 * 60 * 1000);
+    fs.utimesSync(file, old, old);
+    expect(acquireTakeoverLock(CONV, dir)).not.toBeNull();
+  });
 });

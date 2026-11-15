@@ -1557,6 +1557,27 @@ describe("SessionHub actor", () => {
     });
   });
 
+  test("先頭の uncertain の後ろで止まっている送信は、受領の照会で blocked を付けて答える（4 周目レビュー 中2）", async () => {
+    const chatInjector = vi.fn().mockRejectedValueOnce(new Error("boom")).mockResolvedValue(undefined);
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("hub-chat-blocked"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, chatInjector });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "first", session: "work",
+      clientMessageId: "c-first", text: "first" }));
+    await vi.waitFor(() => expect(received).toContainEqual(expect.objectContaining({
+      type: "chat_send_result", id: "first", status: "failed" })));
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "second", session: "work",
+      clientMessageId: "c-second", text: "second" }));
+    const query = (id: string, clientMessageId: string) => hub.handleClientMessage(client,
+      JSON.stringify({ type: "chat_receipt_query", id, session: "work", clientMessageId }));
+    query("q-second", "c-second");
+    query("q-first", "c-first");
+    expect(received).toContainEqual({ type: "chat_receipt_query_result", id: "q-second", status: "pending", blocked: true });
+    expect(received).toContainEqual({ type: "chat_receipt_query_result", id: "q-first", status: "uncertain" });
+    expect(chatInjector).toHaveBeenCalledOnce();
+  });
+
   test("1 キーも打たずに拒否された chat_send は uncertain に積まず、後続の送信を止めない", async () => {
     // ダイアログ表示中・残存を流し切れない等の拒否は**非配達が確定**している。
     // uncertain（配送不明）へ積むと削除不能・後続ブロックのゾンビになり、

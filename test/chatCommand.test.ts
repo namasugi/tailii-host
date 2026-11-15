@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { describe, expect, test } from "vitest";
 import { EXIT, runChat, type ChatDeps } from "../src/commands/chat/chatCommand.js";
 import {
+  acquireRequestLock,
   folderAllowed,
   loadBotConfig,
   readReply,
@@ -12,7 +13,7 @@ import {
   requestDigest,
   type RequestRecord,
 } from "../src/commands/chat/chatState.js";
-import type { EngineConnection } from "../src/commands/chat/engineClient.js";
+import { EngineTimeoutError, type EngineConnection } from "../src/commands/chat/engineClient.js";
 import type { ControlMessage } from "../src/protocol.js";
 import { makeTempDir, makeTempStore } from "./helpers.js";
 
@@ -29,6 +30,7 @@ function harness(options: {
 } = {}) {
   const sent: Array<Record<string, unknown>> = [];
   const records = new Map<string, RequestRecord>();
+  const locks = new Set<string>();
   let output = "";
   const attached: string[] = [];
   const engine: EngineConnection = {
@@ -42,7 +44,7 @@ function harness(options: {
     connect: async () => engine,
     readStdin: () => options.stdin ?? null,
     isTty: options.isTty ?? false,
-    config: () => ({ allowedRoots: options.roots ?? [makeTempDir("chat-root")], permissionMode: "acceptEdits", allowAuto: options.allowAuto ?? false }),
+    config: () => ({ allowedRoots: options.roots ?? ["/"], permissionMode: "acceptEdits", allowAuto: options.allowAuto ?? false }),
     store: () => makeTempStore(),
     write: (text) => { output += text; },
     now: () => 1_000_000,
@@ -50,10 +52,15 @@ function harness(options: {
     attach: (session) => { attached.push(session); return 0; },
     readRequest: (id) => records.get(id) ?? null,
     writeRequest: (record) => { records.set(record.requestId, record); },
+    lockRequest: (id) => {
+      if (locks.has(id)) return null;
+      locks.add(id);
+      return () => { locks.delete(id); };
+    },
     ...(options.state !== undefined ? { state: options.state } : {}),
     ...(options.transcript !== undefined ? { transcript: options.transcript } : {}),
   };
-  return { deps, sent, records, attached, output: () => output, json: () => JSON.parse(output.trim()) as Record<string, unknown> };
+  return { deps, sent, records, locks, attached, output: () => output, json: () => JSON.parse(output.trim()) as Record<string, unknown> };
 }
 
 const defaultHandler: Handler = (message) => {
@@ -65,13 +72,23 @@ const defaultHandler: Handler = (message) => {
     } as ControlMessage;
   }
   if (message["type"] === "chat_send") return { type: "chat_send_result", v: 2, id, status: "accepted" } as ControlMessage;
+  // 受領の照会の既定は保留中（hub がまだ送信を持っている）。
+  if (message["type"] === "chat_receipt_query") return { type: "chat_receipt_query_result", v: 2, id, status: "pending" } as ControlMessage;
+  if (message["type"] === "session_list_request") {
+    // 動いている会話名: s-live と、テストの依頼 r-retry で始めた会話。s-dead は止まっている。
+    return { type: "session_list_response", v: 2, id, sessions: [
+      { name: "s-live", cwd: "/tmp", alive: true },
+      { name: "s-dead", cwd: "/tmp", alive: false },
+      { name: `s-cli${requestDigest("r-retry").slice(0, 16)}`, cwd: "/tmp", alive: true },
+    ] } as ControlMessage;
+  }
   if (message["type"] === "claude_session_list_request") {
     return {
       type: "claude_session_list_response", v: 2, id,
       claudeSessions: [
-        { sessionId: "conv-live-1", cwd: "/w", title: "動いている会話", liveSessionName: "s-live" },
-        { sessionId: "conv-stop-1", cwd: "/w", title: "止まっている会話" },
-        { sessionId: "conv-else-1", cwd: "/w", title: "他所の会話", peerSessionName: "term-1" },
+        { sessionId: "conv-live-1", cwd: "/tmp", title: "動いている会話", liveSessionName: "s-live" },
+        { sessionId: "conv-stop-1", cwd: "/tmp", title: "止まっている会話" },
+        { sessionId: "conv-else-1", cwd: "/tmp", title: "他所の会話", peerSessionName: "term-1" },
       ],
     } as ControlMessage;
   }
@@ -86,14 +103,14 @@ describe("chat new", () => {
     expect(code).toBe(EXIT.ok);
     const start = h.sent.find((m) => m["type"] === "session_start")!;
     expect(start).toMatchObject({
-      cwd: fs.realpathSync(root), name: `s-${requestDigest("r-1").slice(0, 8)}`, agentType: "claude",
+      cwd: fs.realpathSync(root), name: `s-cli${requestDigest("r-1").slice(0, 16)}`, agentType: "claude",
       permissionMode: "acceptEdits", deferSubscribe: true,
     });
     expect(h.sent.find((m) => m["type"] === "chat_send")).toMatchObject({
       session: start["name"], text: "テストを直して", clientMessageId: `cli-${requestDigest("r-1").slice(0, 24)}`,
     });
     expect(h.json()).toMatchObject({ v: 1, ok: true, requestId: "r-1", conversationId: "conv-new" });
-    expect(h.records.get("r-1")).toMatchObject({ conversationId: "conv-new", text: "テストを直して", sentAtMs: 1_000_000 });
+    expect(h.records.get("r-1")).toMatchObject({ conversationId: "conv-new", text: "テストを直して", sentAtMs: 1_000_000, state: "sent" });
   });
 
   test("同じ依頼 ID の打ち直しは起動も送信もしない", async () => {
@@ -176,8 +193,9 @@ describe("chat send", () => {
         ? { type: "chat_send_result", v: 2, id: String(message["id"]), status: "failed", error: "busy" } as ControlMessage
         : defaultHandler(message),
     });
-    expect(await runChat(["send", "conv-live-1", "--request-id", "s-5", "--json"], failing.deps)).toBe(EXIT.retryLater);
-    expect(failing.records.has("s-5")).toBe(false);
+    // 届いたか分からないので状態不明（7）。記録は送信未確定（started）で残し、status --after で確かめられる（指摘 A3・A4）。
+    expect(await runChat(["send", "conv-live-1", "--request-id", "s-5", "--json"], failing.deps)).toBe(EXIT.timeout);
+    expect(failing.records.get("s-5")?.state).toBe("started");
   });
 });
 
@@ -237,5 +255,519 @@ describe("chatState", () => {
     ].map((line) => JSON.stringify(line)).join("\n"));
     expect(readTranscriptLines(file).map((line) => line.text)).toEqual(["本当の発話"]);
     expect(readReply([], { sentAtMs: 0, text: "x" })).toEqual({ found: false, reply: null });
+  });
+});
+
+describe("レビュー指摘の再発防止", () => {
+  test("送信に失敗した new を同じ依頼 ID で打ち直すと、起動し直さず同じ会話・同じ送信 ID・最初の時刻で送る（A1・A3）", async () => {
+    const root = makeTempDir("chat-retry");
+    let fail = true;
+    let now = 1_000_000;
+    const h = harness({
+      stdin: "x", roots: [root],
+      handler: (message) => message["type"] === "chat_send" && fail
+        ? { type: "chat_send_result", v: 2, id: String(message["id"]), status: "failed" } as ControlMessage
+        : defaultHandler(message),
+    });
+    h.deps.now = () => now;
+    expect(await runChat(["new", "--cwd", root, "--request-id", "r-retry", "--json"], h.deps)).toBe(EXIT.timeout);
+    fail = false;
+    now = 1_060_000;
+    h.sent.length = 0;
+    expect(await runChat(["new", "--cwd", root, "--request-id", "r-retry", "--json"], h.deps)).toBe(EXIT.ok);
+    // 打ち直しの前に受領の照会を引き、hub がまだ持っていれば（pending）一覧を引かずに同じ会話名へ送る（4 周目 中1・6 周目 低4）。
+    expect(h.sent.map((m) => m["type"])).toEqual(["chat_receipt_query", "chat_send"]);
+    expect(h.records.get("r-retry")).toMatchObject({ state: "sent", sentAtMs: 1_000_000, conversationId: "conv-new" });
+  });
+
+  test("依頼 ID の使い回し（別の種類・別のフォルダ・別の本文）は送らずに使い方の誤り（A5）", async () => {
+    const root = makeTempDir("chat-reuse");
+    const h = harness({ stdin: "x", roots: [root] });
+    await runChat(["new", "--cwd", root, "--request-id", "r-same", "--json"], h.deps);
+    h.sent.length = 0;
+    expect(await runChat(["send", "conv-live-1", "--request-id", "r-same", "--json"], h.deps)).toBe(EXIT.usage);
+    const other = harness({ stdin: "y", roots: [root] });
+    other.records.set("r-same", h.records.get("r-same")!);
+    expect(await runChat(["new", "--cwd", root, "--request-id", "r-same", "--json"], other.deps)).toBe(EXIT.usage);
+    expect(h.sent).toEqual([]);
+  });
+
+  test("承認・設問の入力待ち（waiting）は完了にしない（A6）", async () => {
+    const dir = makeTempDir("chat-waiting");
+    const file = path.join(dir, "c.jsonl");
+    fs.writeFileSync(file, [
+      { type: "user", timestamp: new Date(1_000_500).toISOString(), message: { role: "user", content: "x" } },
+      { type: "assistant", timestamp: new Date(1_000_600).toISOString(), message: { role: "assistant", content: [{ type: "text", text: "途中" }] } },
+    ].map((line) => JSON.stringify(line)).join("\n"));
+    const h = harness({ state: () => "waiting", transcript: () => ({ file, cwd: "/w" }) });
+    expect(await runChat(["status", "conv-0009", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.json()).toMatchObject({ state: "waiting", complete: false });
+  });
+
+  test("端末が無ければ --json が無くても Bot として扱う（auto の制限・依頼 ID 必須。A7）", async () => {
+    const root = makeTempDir("chat-no-tty");
+    const h = harness({ stdin: "x", roots: [root], isTty: false });
+    expect(await runChat(["new", "--cwd", root, "--permission-mode", "auto", "--request-id", "r"], h.deps)).toBe(EXIT.policy);
+    expect(await runChat(["new", "--cwd", root], h.deps)).toBe(EXIT.usage);
+    expect(h.sent).toEqual([]);
+  });
+
+  test("send も許可外の作業フォルダの会話には送らない（A7）", async () => {
+    const h = harness({ stdin: "x", roots: [makeTempDir("chat-elsewhere-root")] });
+    expect(await runChat(["send", "conv-live-1", "--request-id", "s-root", "--json"], h.deps)).toBe(EXIT.policy);
+    expect(h.sent.some((m) => m["type"] === "chat_send")).toBe(false);
+  });
+
+  test("長い指示文はファイルに書き出して参照を送る（A8）", async () => {
+    const root = makeTempDir("chat-long");
+    const longDir = makeTempDir("chat-long-dir");
+    const prompt = Array.from({ length: 60 }, (_, i) => `行 ${i}`).join("\n");
+    const h = harness({ stdin: prompt, roots: [root] });
+    h.deps.longTextDir = longDir;
+    expect(await runChat(["new", "--cwd", root, "--request-id", "r-long", "--json"], h.deps)).toBe(EXIT.ok);
+    const text = String(h.sent.find((m) => m["type"] === "chat_send")?.["text"]);
+    const file = text.slice(text.lastIndexOf(": ") + 2);
+    expect(file.startsWith(longDir)).toBe(true);
+    expect(fs.readFileSync(file, "utf8")).toBe(prompt);
+  });
+
+  test("起動の応答に採用した名前の行が無ければ、別の会話の ID を返さずにエラー（A11）", async () => {
+    const root = makeTempDir("chat-no-row");
+    const h = harness({
+      stdin: "x", roots: [root],
+      handler: (message) => message["type"] === "session_start"
+        ? { type: "session_list_response", v: 2, id: String(message["id"]), adoptedName: String(message["name"]),
+            sessions: [{ name: "s-other", cwd: "/w", alive: true, providerSessionId: "conv-other" }] } as ControlMessage
+        : defaultHandler(message),
+    });
+    expect(await runChat(["new", "--cwd", root, "--request-id", "r-row", "--json"], h.deps)).toBe(EXIT.internal);
+    expect(h.sent.some((m) => m["type"] === "chat_send")).toBe(false);
+  });
+});
+
+describe("2 周目レビューの再発防止", () => {
+  test("届いたか分からない new の失敗にも会話 ID と会話名を載せ、案内は同じ依頼 ID の打ち直し（1・2）", async () => {
+    const root = makeTempDir("chat-unknown");
+    const h = harness({
+      stdin: "x", roots: [root],
+      handler: (message) => message["type"] === "chat_send"
+        ? { type: "error", v: 2, id: String(message["id"]), code: "chat_send_failed", message: "hub timeout" } as ControlMessage
+        : defaultHandler(message),
+    });
+    expect(await runChat(["new", "--cwd", root, "--request-id", "r-u", "--json"], h.deps)).toBe(EXIT.timeout);
+    const out = h.json() as { error: { code: string; hint: string }; conversationId: string; session: string };
+    expect(out.error.code).toBe("delivery_unknown");
+    expect(out.conversationId).toBe("conv-new");
+    expect(out.error.hint).toContain("同じ依頼 ID");
+    expect(out.error.hint).not.toContain("新しい依頼 ID で送る");
+  });
+
+  test("hub が明示の再送を求めたら人に回す（新しい ID を送らせない。5）", async () => {
+    const h = harness({
+      stdin: "x",
+      handler: (message) => message["type"] === "chat_send"
+        ? { type: "chat_send_result", v: 2, id: String(message["id"]), status: "failed",
+            error: "Previous tmux injection outcome is uncertain; explicit retry is required" } as ControlMessage
+        : defaultHandler(message),
+    });
+    expect(await runChat(["send", "conv-live-1", "--request-id", "s-h", "--json"], h.deps)).toBe(EXIT.policy);
+    expect(h.json()).toMatchObject({ error: { code: "needs_human" } });
+  });
+
+  test("送信未確定の依頼は hub の受領照会で配送状態を返す（保留中は received=false・delivery=pending。1）", async () => {
+    const dir = makeTempDir("chat-pending");
+    const file = path.join(dir, "c.jsonl");
+    fs.writeFileSync(file, "");
+    const h = harness({ state: () => "waiting", transcript: () => ({ file, cwd: "/w" }) });
+    h.deps.receipt = async () => "pending";
+    h.records.set("r-p", { requestId: "r-p", kind: "send", conversationId: "conv-0009", session: "s", cwd: "/w",
+      sentAtMs: 1_000_000, text: "x", state: "started" });
+    expect(await runChat(["status", "conv-0009", "--after", "r-p", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.json()).toMatchObject({ received: false, delivery: "pending", complete: false });
+  });
+
+  test("止まっている会話でも返答が出そろっていれば complete（3）", async () => {
+    const dir = makeTempDir("chat-stopped");
+    const file = path.join(dir, "c.jsonl");
+    fs.writeFileSync(file, [
+      { type: "user", timestamp: new Date(1_000_500).toISOString(), message: { role: "user", content: "x" } },
+      { type: "assistant", timestamp: new Date(1_000_600).toISOString(), message: { role: "assistant", content: [{ type: "text", text: "済み" }] } },
+    ].map((line) => JSON.stringify(line)).join("\n"));
+    const h = harness({ state: () => "not_running", transcript: () => ({ file, cwd: "/w" }) });
+    expect(await runChat(["status", "conv-0009", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.json()).toMatchObject({ complete: true, reply: "済み" });
+  });
+
+  test("起動を頼んだだけの記録（starting）の打ち直しは、起動済みの会話 id があれば起動し直さない（4）", async () => {
+    const root = makeTempDir("chat-starting");
+    const store = makeTempStore();
+    const h = harness({ stdin: "x", roots: [root] });
+    h.deps.store = () => store;
+    const name = `s-cli${requestDigest("r-s").slice(0, 16)}`;
+    store.put({ name, cwd: root, createdAt: 1, backend: "herdr", claudeSessionId: "conv-launched", providerSessionId: "conv-launched" });
+    h.records.set("r-s", { requestId: "r-s", kind: "new", conversationId: "", session: name, cwd: fs.realpathSync(root),
+      sentAtMs: 1, text: "", state: "starting" });
+    expect(await runChat(["new", "--cwd", root, "--request-id", "r-s", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.sent.map((m) => m["type"])).toEqual(["chat_send"]);
+    expect(h.json()).toMatchObject({ conversationId: "conv-launched" });
+  });
+});
+
+describe("3 周目レビューの再発防止", () => {
+  const lines = (...rows: object[]): string => {
+    const file = path.join(makeTempDir("chat-r3"), "c.jsonl");
+    fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join("\n"));
+    return file;
+  };
+  const at = (ms: number): string => new Date(ms).toISOString();
+
+  test.each([
+    { label: "不可視文字（記録では除かれる）", sent: "テストを\u200b直して\u00ad", recorded: "テストを直して" },
+    { label: "制御文字（貼り付けで除かれる）", sent: "ログ\u001b[31m赤\u001b[0m", recorded: "ログ[31m赤[0m" },
+    { label: "本文中の貼り付けタグ（記録では書き換えられる）", sent: "<pasted_content>は使わない", recorded: "<\\pasted_content>は使わない" },
+    { label: "合成済みと分解の違い", sent: "が", recorded: "\u304b\u3099" },
+  ])("返答の照合は hub と Claude Code が変えた本文とも一致する: $label（1）", ({ sent, recorded }) => {
+    const file = lines(
+      { type: "user", timestamp: at(1_000_100), message: { role: "user", content: recorded } },
+      { type: "assistant", timestamp: at(1_000_200), message: { role: "assistant", content: [{ type: "text", text: "はい" }] } },
+    );
+    expect(readReply(readTranscriptLines(file), { sentAtMs: 1_000_000, text: sent })).toEqual({ found: true, reply: "はい" });
+  });
+
+  test("処理中に送った発話（attachment の queued_command 行）も依頼の発話として読む（1b）", () => {
+    const file = lines(
+      { type: "user", timestamp: at(999_000), message: { role: "user", content: "最初" } },
+      { type: "attachment", timestamp: at(1_000_100), attachment: { type: "queued_command", prompt: "続けて" } },
+      { type: "assistant", timestamp: at(1_000_200), message: { role: "assistant", content: [{ type: "text", text: "続けます" }] } },
+    );
+    expect(readReply(readTranscriptLines(file), { sentAtMs: 1_000_000, text: "続けて" })).toEqual({ found: true, reply: "続けます" });
+  });
+
+  test("送る前の時刻より前の同じ短文は取り違えない（遡らない。7）", () => {
+    const file = lines(
+      { type: "user", timestamp: at(999_000), message: { role: "user", content: "続けて" } },
+      { type: "assistant", timestamp: at(999_500), message: { role: "assistant", content: [{ type: "text", text: "前の返答" }] } },
+    );
+    expect(readReply(readTranscriptLines(file), { sentAtMs: 1_000_000, text: "続けて" })).toEqual({ found: false, reply: null });
+  });
+
+  const failWith = (error: string | undefined, receipt: string): ReturnType<typeof harness> => {
+    const h = harness({
+      stdin: "x",
+      handler: (message) => {
+        const id = String(message["id"]);
+        if (message["type"] === "chat_send") {
+          return { type: "chat_send_result", v: 2, id, status: "failed", ...(error !== undefined ? { error } : {}) } as ControlMessage;
+        }
+        if (message["type"] === "chat_receipt_query") {
+          return { type: "chat_receipt_query_result", v: 2, id, status: receipt } as ControlMessage;
+        }
+        return defaultHandler(message);
+      },
+    });
+    return h;
+  };
+
+  test.each([
+    { receipt: "unknown", code: EXIT.retryLater, err: "not_delivered" },
+    { receipt: "uncertain", code: EXIT.policy, err: "needs_human" },
+    { receipt: "deleted", code: EXIT.policy, err: "message_deleted" },
+    { receipt: "pending", code: EXIT.timeout, err: "delivery_unknown" },
+  ])("hub の送信の失敗は受領の照会で分ける: $receipt（5）", async ({ receipt, code, err }) => {
+    const h = failWith("dialog is open", receipt);
+    expect(await runChat(["send", "conv-live-1", "--request-id", `s-${receipt}`, "--json"], h.deps)).toBe(code);
+    expect(h.json()).toMatchObject({ ok: false, error: { code: err }, conversationId: "conv-live-1" });
+  });
+
+  test("needs_human の案内は実際に解ける操作（会話の終了と開き直し）を示す（2）", async () => {
+    const h = failWith("Previous tmux injection outcome is uncertain; explicit retry is required", "uncertain");
+    expect(await runChat(["send", "conv-live-1", "--request-id", "s-hh", "--json"], h.deps)).toBe(EXIT.policy);
+    const hint = (h.json() as { error: { hint: string } }).error.hint;
+    expect(hint).toContain("終了");
+    expect(hint).not.toContain("再送するか取り消す");
+  });
+
+  test("status は届いたか分からない送信で止まっていることを needsHuman で返す（2）", async () => {
+    const file = lines();
+    const h = harness({ state: () => "idle", transcript: () => ({ file, cwd: "/w" }) });
+    h.deps.receipt = async () => "uncertain";
+    h.records.set("r-un", { requestId: "r-un", kind: "send", conversationId: "conv-0009", session: "s", cwd: "/w",
+      sentAtMs: 1_000_000, text: "x", state: "started" });
+    expect(await runChat(["status", "conv-0009", "--after", "r-un", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.json()).toMatchObject({ delivery: "uncertain", needsHuman: true });
+  });
+
+  test("同じ依頼 ID のコマンドが実行中なら、起動も送信もせずに終了コード 6（3）", async () => {
+    const root = makeTempDir("chat-locked");
+    const h = harness({ stdin: "x", roots: [root] });
+    h.locks.add("r-lock");
+    expect(await runChat(["new", "--cwd", root, "--request-id", "r-lock", "--json"], h.deps)).toBe(EXIT.retryLater);
+    expect(h.json()).toMatchObject({ error: { code: "request_in_progress" } });
+    expect(h.sent).toEqual([]);
+    expect(await runChat(["send", "conv-live-1", "--request-id", "r-lock", "--json"], h.deps)).toBe(EXIT.retryLater);
+    expect(h.sent).toEqual([]);
+    h.locks.clear();
+    expect(await runChat(["new", "--cwd", root, "--request-id", "r-lock", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.locks.size).toBe(0);
+  });
+
+  test("依頼の排他: 2 本目は取れず、持ち主の居ない錠は取り直せる（3）", () => {
+    const dir = makeTempDir("chat-lockfile");
+    const release = acquireRequestLock("r-x", dir);
+    expect(release).not.toBeNull();
+    expect(acquireRequestLock("r-x", dir)).toBeNull();
+    release!();
+    expect(acquireRequestLock("r-x", dir)).not.toBeNull();
+    const stale = path.join(dir, `${requestDigest("r-y").slice(0, 32)}.lock`);
+    fs.writeFileSync(stale, JSON.stringify({ pid: 2_147_483_000, atMs: Date.now() }));
+    expect(acquireRequestLock("r-y", dir)).not.toBeNull();
+  });
+
+  test("state の無い旧形式の記録は送信済みとして扱い、new を打ち直しても起動も送信もしない（6）", async () => {
+    const root = makeTempDir("chat-legacy");
+    const h = harness({ stdin: "x", roots: [root] });
+    h.records.set("r-old", { requestId: "r-old", kind: "new", conversationId: "conv-old-1", session: "s-cliold",
+      cwd: fs.realpathSync(root), sentAtMs: 1, text: "x" });
+    expect(await runChat(["new", "--cwd", root, "--request-id", "r-old", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.sent).toEqual([]);
+    expect(h.json()).toMatchObject({ duplicate: true, conversationId: "conv-old-1" });
+  });
+
+  test("起動の時間切れは会話名を返し、起動途中の依頼の status は打ち直しを案内する（小）", async () => {
+    const root = makeTempDir("chat-start-timeout");
+    const h = harness({
+      stdin: "x", roots: [root],
+      handler: (message) => {
+        if (message["type"] === "session_start") throw new EngineTimeoutError("session_start");
+        return defaultHandler(message);
+      },
+    });
+    expect(await runChat(["new", "--cwd", root, "--request-id", "r-st", "--json"], h.deps)).toBe(EXIT.timeout);
+    expect(h.json()).toMatchObject({ error: { code: "start_timeout" }, requestId: "r-st",
+      session: `s-cli${requestDigest("r-st").slice(0, 16)}` });
+    const s = harness();
+    s.records.set("r-st", h.records.get("r-st")!);
+    expect(await runChat(["status", "conv-0009", "--after", "r-st", "--json"], s.deps)).toBe(EXIT.notFound);
+    expect(s.json()).toMatchObject({ error: { code: "request_not_started" } });
+  });
+});
+
+describe("4 周目レビューの再発防止", () => {
+  const startedRecord = (session: string): RequestRecord => ({
+    requestId: "r-rev", kind: "send", conversationId: "conv-stop-1", session, cwd: "/tmp", sentAtMs: 1, text: "x",
+    textHash: undefined, state: "started",
+  });
+
+  const reviveHarness = (receipt: string) => harness({
+    stdin: "x",
+    handler: (message) => {
+      const id = String(message["id"]);
+      if (message["type"] === "chat_receipt_query") {
+        return { type: "chat_receipt_query_result", v: 2, id, status: receipt } as ControlMessage;
+      }
+      if (message["type"] === "session_start") {
+        return { type: "session_list_response", v: 2, id, adoptedName: String(message["name"]),
+          sessions: [{ name: String(message["name"]), cwd: "/tmp", alive: true, providerSessionId: "conv-stop-1" }] } as ControlMessage;
+      }
+      return defaultHandler(message);
+    },
+  });
+
+  test("送信未確定の打ち直しで記録の会話が終わっていたら、続きから起動してその会話名へ送る（中1）", async () => {
+    const h = reviveHarness("unknown");
+    const record = startedRecord("s-dead");
+    delete record.textHash;
+    h.records.set("r-rev", record);
+    expect(await runChat(["send", "conv-stop-1", "--request-id", "r-rev", "--json"], h.deps)).toBe(EXIT.ok);
+    const start = h.sent.find((m) => m["type"] === "session_start")!;
+    expect(start).toMatchObject({ resumeSessionId: "conv-stop-1", peerCheck: true });
+    expect(h.sent.find((m) => m["type"] === "chat_send")).toMatchObject({ session: start["name"] });
+    expect(h.records.get("r-rev")).toMatchObject({ session: start["name"], state: "sent", sentAtMs: 1 });
+  });
+
+  test("終わった会話への前の送信が届いていたら、起動も送信もせずに送信済みにする（中1）", async () => {
+    const h = reviveHarness("delivered");
+    const record = startedRecord("s-dead");
+    delete record.textHash;
+    h.records.set("r-rev", record);
+    expect(await runChat(["send", "conv-stop-1", "--request-id", "r-rev", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.sent.map((m) => m["type"])).toEqual(["chat_receipt_query"]);
+    expect(h.records.get("r-rev")?.state).toBe("sent");
+  });
+
+  test("記録の会話がまだ動いていれば、そのまま送る（中1）", async () => {
+    const h = reviveHarness("unknown");
+    const record = { ...startedRecord("s-live"), conversationId: "conv-live-1" };
+    delete record.textHash;
+    h.records.set("r-rev", record);
+    expect(await runChat(["send", "conv-live-1", "--request-id", "r-rev", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.sent.map((m) => m["type"])).toEqual(["chat_receipt_query", "claude_session_list_request", "chat_send"]);
+  });
+
+  test("届ける前に会話が終わった失敗は 6・conversation_ended（中1）", async () => {
+    const h = harness({
+      stdin: "x",
+      handler: (message) => {
+        const id = String(message["id"]);
+        if (message["type"] === "chat_send") {
+          return { type: "chat_send_result", v: 2, id, status: "failed", error: "session retired before delivery completed" } as ControlMessage;
+        }
+        if (message["type"] === "chat_receipt_query") return { type: "chat_receipt_query_result", v: 2, id, status: "unknown" } as ControlMessage;
+        return defaultHandler(message);
+      },
+    });
+    expect(await runChat(["send", "conv-live-1", "--request-id", "s-end", "--json"], h.deps)).toBe(EXIT.retryLater);
+    expect(h.json()).toMatchObject({ error: { code: "conversation_ended" } });
+  });
+
+  test("前の送信の後ろで止まっている送信は、時間切れの後に人に回す（中2）", async () => {
+    const h = harness({
+      stdin: "x",
+      handler: (message) => {
+        const id = String(message["id"]);
+        if (message["type"] === "chat_send") throw new EngineTimeoutError("chat_send");
+        if (message["type"] === "chat_receipt_query") {
+          return { type: "chat_receipt_query_result", v: 2, id, status: "pending", blocked: true } as ControlMessage;
+        }
+        return defaultHandler(message);
+      },
+    });
+    expect(await runChat(["send", "conv-live-1", "--request-id", "s-blk", "--json"], h.deps)).toBe(EXIT.policy);
+    expect(h.json()).toMatchObject({ error: { code: "needs_human" }, conversationId: "conv-live-1" });
+  });
+
+  test("status は blocked を needsHuman で返す（中2）", async () => {
+    const file = path.join(makeTempDir("chat-blocked"), "c.jsonl");
+    fs.writeFileSync(file, "");
+    const h = harness({ state: () => "idle", transcript: () => ({ file, cwd: "/w" }) });
+    h.deps.receipt = async () => "blocked";
+    h.records.set("r-b", { requestId: "r-b", kind: "send", conversationId: "conv-0009", session: "s", cwd: "/w",
+      sentAtMs: 1_000_000, text: "x", state: "started" });
+    expect(await runChat(["status", "conv-0009", "--after", "r-b", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.json()).toMatchObject({ delivery: "blocked", needsHuman: true });
+  });
+});
+
+describe("5 周目レビューの再発防止", () => {
+  const transcriptWith = (text: string | null): ChatDeps["transcript"] => {
+    const file = path.join(makeTempDir("chat-r5"), "c.jsonl");
+    fs.writeFileSync(file, text === null ? "" : JSON.stringify(
+      { type: "user", timestamp: new Date(5_000).toISOString(), message: { role: "user", content: text } }));
+    return () => ({ file, cwd: "/tmp" });
+  };
+  const deadRecord = (extra: Partial<RequestRecord> = {}): RequestRecord => ({
+    requestId: "r5", kind: "send", conversationId: "conv-stop-1", session: "s-dead", cwd: "/tmp", sentAtMs: 1_000, text: "やって",
+    state: "started", ...extra,
+  });
+  const withReceipt = (receipt: string | "throw", transcript: ChatDeps["transcript"]) => harness({
+    stdin: "やって", transcript,
+    handler: (message) => {
+      const id = String(message["id"]);
+      if (message["type"] === "chat_receipt_query") {
+        if (receipt === "throw") throw new EngineTimeoutError("chat_receipt_query");
+        return { type: "chat_receipt_query_result", v: 2, id, status: receipt } as ControlMessage;
+      }
+      return defaultHandler(message);
+    },
+  });
+
+  test("会話が終わって照会が unknown でも、会話の記録に発話があれば届いた扱いで送り直さない（1）", async () => {
+    const h = withReceipt("unknown", transcriptWith("やって"));
+    h.records.set("r5", deadRecord());
+    expect(await runChat(["send", "conv-stop-1", "--request-id", "r5", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.sent.some((m) => m["type"] === "chat_send" || m["type"] === "session_start")).toBe(false);
+    expect(h.records.get("r5")?.state).toBe("sent");
+  });
+
+  test("人に回した依頼の打ち直しは、記録に無ければ人に回したまま・送らない（1）", async () => {
+    const h = withReceipt("unknown", transcriptWith(null));
+    h.records.set("r5", deadRecord({ needsHuman: true }));
+    expect(await runChat(["send", "conv-stop-1", "--request-id", "r5", "--json"], h.deps)).toBe(EXIT.policy);
+    expect(h.json()).toMatchObject({ error: { code: "needs_human" } });
+    expect(h.sent.some((m) => m["type"] === "chat_send" || m["type"] === "session_start")).toBe(false);
+  });
+
+  test("needs_human を返した依頼は記録に印を残し、status も人に回す（1）", async () => {
+    const h = harness({
+      stdin: "x",
+      handler: (message) => message["type"] === "chat_send"
+        ? { type: "chat_send_result", v: 2, id: String(message["id"]), status: "failed",
+            error: "Previous tmux injection outcome is uncertain; explicit retry is required" } as ControlMessage
+        : defaultHandler(message),
+    });
+    expect(await runChat(["send", "conv-live-1", "--request-id", "r5h", "--json"], h.deps)).toBe(EXIT.policy);
+    expect(h.records.get("r5h")).toMatchObject({ state: "started", needsHuman: true });
+  });
+
+  test.each([
+    { receipt: "throw", code: EXIT.timeout, err: "delivery_unknown" },
+    { receipt: "uncertain", code: EXIT.policy, err: "needs_human" },
+    { receipt: "blocked", code: EXIT.policy, err: "needs_human" },
+  ])("会話が終わっていても照会が $receipt なら起動し直して送らない（2）", async ({ receipt, code, err }) => {
+    const h = withReceipt(receipt === "blocked" ? "pending" : receipt, transcriptWith(null));
+    if (receipt === "blocked") {
+      h.deps.connect = async () => ({
+        async request(message) {
+          h.sent.push(message);
+          if (message["type"] === "chat_receipt_query") {
+            return { type: "chat_receipt_query_result", v: 2, id: String(message["id"]), status: "pending", blocked: true } as ControlMessage;
+          }
+          return defaultHandler(message);
+        },
+        async close() {},
+      });
+    }
+    h.records.set("r5", deadRecord());
+    expect(await runChat(["send", "conv-stop-1", "--request-id", "r5", "--json"], h.deps)).toBe(code);
+    expect(h.json()).toMatchObject({ error: { code: err } });
+    expect(h.sent.some((m) => m["type"] === "chat_send" || m["type"] === "session_start")).toBe(false);
+  });
+
+  test("照会が pending なら起動し直さず、記録の会話名へ送って合流する（2）", async () => {
+    const h = withReceipt("pending", transcriptWith(null));
+    h.records.set("r5", deadRecord());
+    expect(await runChat(["send", "conv-stop-1", "--request-id", "r5", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.sent.some((m) => m["type"] === "session_start")).toBe(false);
+    expect(h.sent.find((m) => m["type"] === "chat_send")).toMatchObject({ session: "s-dead" });
+  });
+
+  test("new の最初の指示が届く前に会話が終わったら、新しい依頼 ID でのやり直しを案内する（3）", async () => {
+    const root = makeTempDir("chat-r5-new");
+    const h = withReceipt("unknown", () => null);
+    h.records.set("r5n", { requestId: "r5n", kind: "new", conversationId: "conv-gone-1", session: "s-dead",
+      cwd: fs.realpathSync(root), sentAtMs: 1_000, text: "x", state: "started" });
+    h.deps.readStdin = () => "x";
+    expect(await runChat(["new", "--cwd", root, "--request-id", "r5n", "--json"], h.deps)).toBe(EXIT.notFound);
+    expect(h.json()).toMatchObject({ error: { code: "conversation_ended_before_start" } });
+    expect(h.sent.some((m) => m["type"] === "chat_send" || m["type"] === "session_start")).toBe(false);
+  });
+});
+
+describe("6 周目レビューの再発防止", () => {
+  test("照会が engine の error 応答なら照会できなかった扱い（7）で、送り直さない（低2）", async () => {
+    const h = harness({
+      stdin: "x",
+      handler: (message) => message["type"] === "chat_receipt_query"
+        ? { type: "error", v: 2, id: String(message["id"]), code: "chat_receipt_query_failed", message: "hub down" } as ControlMessage
+        : defaultHandler(message),
+    });
+    h.records.set("r6", { requestId: "r6", kind: "send", conversationId: "conv-stop-1", session: "s-dead", cwd: "/tmp",
+      sentAtMs: 1, text: "x", state: "started" });
+    expect(await runChat(["send", "conv-stop-1", "--request-id", "r6", "--json"], h.deps)).toBe(EXIT.timeout);
+    expect(h.json()).toMatchObject({ error: { code: "delivery_unknown" }, conversationId: "conv-stop-1" });
+    expect(h.sent.some((m) => m["type"] === "chat_send" || m["type"] === "session_start")).toBe(false);
+  });
+
+  test("打ち直しで照会が uncertain なら記録に人に回した印を残す（低3）", async () => {
+    const h = harness({
+      stdin: "x",
+      handler: (message) => message["type"] === "chat_receipt_query"
+        ? { type: "chat_receipt_query_result", v: 2, id: String(message["id"]), status: "uncertain" } as ControlMessage
+        : defaultHandler(message),
+    });
+    h.records.set("r6u", { requestId: "r6u", kind: "send", conversationId: "conv-stop-1", session: "s-dead", cwd: "/tmp",
+      sentAtMs: 1, text: "x", state: "started" });
+    expect(await runChat(["send", "conv-stop-1", "--request-id", "r6u", "--json"], h.deps)).toBe(EXIT.policy);
+    expect(h.records.get("r6u")).toMatchObject({ needsHuman: true, state: "started" });
   });
 });

@@ -861,7 +861,12 @@ export type ControlMessage =
    * 取りこぼしたまま復元された配送不明の Outbox を、delivered / deleted のときだけ解決する。
    */
   | { type: "chat_receipt_query"; v: number; id: string; session: string; clientMessageId: string }
-  | { type: "chat_receipt_query_result"; v: number; id: string; status: "delivered" | "deleted" | "uncertain" | "pending" | "unknown" }
+  | { type: "chat_receipt_query_result"; v: number; id: string; status: "delivered" | "deleted" | "uncertain" | "pending" | "unknown";
+    /**
+     * pending のとき、送信順の先頭に「届いたか分からない」別の送信が残っていて、それが解けるまで流れない（任意。CLI の
+     * `tailii-host chat` が人に回す判断に使う。iOS は読まない）。
+     */
+    blocked?: boolean; }
   /**
    * 処理中の Claude が CLI 側のキューに溜めている発話を、今すぐ届ける（iOS→host, chat-send-now）。
    * CLI の `chat:sendNow`（ctrl+enter / ctrl+x ctrl+s）と同じ操作。実行中のツールは背景へ回り、

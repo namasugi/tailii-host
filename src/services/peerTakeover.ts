@@ -143,7 +143,30 @@ export async function classifyPeers(
     const proc = table.get(record.pid);
     return proc !== undefined && record.procStart !== null && normalizeStart(record.procStart) === proc.startedUtc;
   });
-  if (live.length === 0) return { kind: "none" };
+  if (live.length === 0) {
+    // 起動時刻で本人確認できないが、その pid で Claude が動いている（procStart を書かない旧版・書式の違い）。
+    // 「誰も動いていない」にすると確認なしで並走するので、終了させずに並走の確認を出す側へ倒す（レビュー指摘 1）。
+    const unverified = records.find((record) => {
+      const proc = table.get(record.pid);
+      return proc !== undefined && isClaudeComm(proc.comm, record);
+    });
+    if (unverified !== undefined) {
+      // Tailii 自身の会話なら、確認なしで開けるよう Tailii の名前で返す（2 周目レビュー 7）。
+      const unverifiedArgs = await probe.args(unverified.pid);
+      const ownName = unverifiedArgs !== null ? tailiiSessionFromArgs(unverifiedArgs) : null;
+      if (ownName !== null && isTailiiSession(ownName)) {
+        return {
+          kind: "parallel", holder: "tailii", name: unverified.name, busy: unverified.status === "busy", tailiiSession: ownName,
+          reason: "Tailii の別の会話の中で開かれています",
+        };
+      }
+      return {
+        kind: "parallel", holder: "other", name: unverified.name, busy: unverified.status === "busy",
+        reason: "動いている Claude を確かめきれませんでした（終了させずに開くかを選んでください）",
+      };
+    }
+    return { kind: "none" };
+  }
   if (live.length > 1) {
     return { kind: "unknown", reason: "同じ会話が 2 か所以上で動いています" };
   }
@@ -180,7 +203,8 @@ export async function classifyPeers(
   }
   for (let ancestor = table.get(parent.ppid), hops = 0; ancestor !== undefined && ancestor.pid > 1 && hops < 64;
     ancestor = table.get(ancestor.ppid), hops++) {
-    if (isClaudeComm(ancestor.comm)) return notTarget("別の Claude の中で動いています");
+    // 祖先はネイティブ版（版番号の名前）も Claude とみなす（終了させない側。レビュー指摘 7）。
+    if (isClaudeComm(ancestor.comm) || VERSION_NAME.test(ancestor.comm)) return notTarget("別の Claude の中で動いています");
   }
   let herdr: TakeoverTarget["herdr"] = null;
   const env = await probe.herdrEnv(record.pid);

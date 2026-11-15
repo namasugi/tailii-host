@@ -60,10 +60,28 @@ describe("classifyPeers", () => {
     expect(await classifyPeers(CONV, probe({ records: [] }), noTailii)).toEqual({ kind: "none" });
   });
 
-  test("登録簿の残骸（pid が無い・起動時刻が違う = pid の再利用）は数えない", async () => {
+  test("登録簿の残骸（pid が無い・別のプロセスに再利用されている）は数えない", async () => {
     expect(await classifyPeers(CONV, probe({ records: [record({ pid: 999 })] }), noTailii)).toEqual({ kind: "none" });
-    expect(await classifyPeers(CONV, probe({ records: [record({ procStart: "Fri Nov 13 01:00:00 2026" })] }), noTailii))
-      .toEqual({ kind: "none" });
+    const reused = [proc(400, 1, "zsh"), proc(500, 400, "vim", { startedUtc: "Sat Nov 14 09:00:00 2026" })];
+    expect(await classifyPeers(CONV, probe({ procs: reused, records: [record()] }), noTailii)).toEqual({ kind: "none" });
+  });
+
+  test("Claude が動いているのに起動時刻で確かめられない（procStart なし・不一致）なら、終了させず並走の確認へ（レビュー指摘 1）", async () => {
+    for (const procStart of [null, "Fri Nov 13 01:00:00 2026"]) {
+      expect(await classifyPeers(CONV, probe({ records: [record({ procStart })] }), noTailii))
+        .toMatchObject({ kind: "parallel", holder: "other" });
+    }
+  });
+
+  test("起動時刻で確かめられなくても、Tailii 自身の Claude なら Tailii の名前で返す（2 周目 7）", async () => {
+    const args = { 500: 'claude --settings {"command":"cli.js hook --session s-own"}' };
+    expect(await classifyPeers(CONV, probe({ args, records: [record({ procStart: null })] }), (n) => n === "s-own"))
+      .toMatchObject({ kind: "parallel", holder: "tailii", tailiiSession: "s-own" });
+  });
+
+  test("祖先がネイティブ版の Claude（版番号の名前）でも入れ子とみなす（レビュー指摘 7）", async () => {
+    const procs = [proc(300, 1, "2.1.325"), proc(400, 300, "zsh"), proc(500, 400, "claude")];
+    expect(await classifyPeers(CONV, probe({ procs }), noTailii)).toMatchObject({ kind: "parallel" });
   });
 
   test("普通のターミナルの対話シェルから起動した Claude は開き直しの対象", async () => {

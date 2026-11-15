@@ -10,7 +10,8 @@ import { decodeControlMessage, type ControlMessage } from "../../protocol.js";
 export interface EngineConnection {
   /** 要求を送り、`match` に当たる応答（または同じ id の error）を待つ。 */
   request(message: Record<string, unknown>, match: (reply: ControlMessage) => boolean, timeoutMs: number): Promise<ControlMessage>;
-  close(): void;
+  /** stdin を閉じて engine が自分で終わるのを待つ（最大 2 秒。終わらなければ SIGTERM）。 */
+  close(): Promise<void>;
 }
 
 export class EngineTimeoutError extends Error {
@@ -25,8 +26,19 @@ export async function connectEngine(options: { argv?: string[]; helloTimeoutMs?:
   const argv = options.argv ?? [process.argv[1] ?? "", "engine"];
   const child: ChildProcess = spawn(process.execPath, argv, { stdio: ["pipe", "pipe", "ignore"] });
   const listeners = new Set<(message: ControlMessage) => void>();
+  const exitWaiters = new Set<() => void>();
   let exited = false;
-  child.on("exit", () => { exited = true; });
+  const markExited = (): void => {
+    if (exited) return;
+    exited = true;
+    // 待っている要求は時間切れまで待たせずに終わらせる（レビュー指摘 A10）。
+    for (const waiter of [...exitWaiters]) waiter();
+  };
+  // 出力を読み切ってから終わりとみなす（`exit` は標準出力の最後の行より先に来ることがあり、届いた結果を捨てうる）。
+  child.on("close", markExited);
+  // 起動の失敗・終わった後の書き込み（EPIPE）で未捕捉の例外にしない。
+  child.on("error", markExited);
+  child.stdin?.on("error", () => {});
   const rl = readline.createInterface({ input: child.stdout!, crlfDelay: Number.POSITIVE_INFINITY });
   rl.on("line", (line) => {
     let message: ControlMessage;
@@ -40,21 +52,24 @@ export async function connectEngine(options: { argv?: string[]; helloTimeoutMs?:
 
   const waitFor = (match: (message: ControlMessage) => boolean, timeoutMs: number, what: string): Promise<ControlMessage> =>
     new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { listeners.delete(listener); reject(new EngineTimeoutError(what)); }, timeoutMs);
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        listeners.delete(listener);
+        exitWaiters.delete(onExit);
+      };
+      const timer = setTimeout(() => { cleanup(); reject(new EngineTimeoutError(what)); }, timeoutMs);
       const listener = (message: ControlMessage): void => {
         if (!match(message)) return;
-        clearTimeout(timer);
-        listeners.delete(listener);
+        cleanup();
         resolve(message);
       };
+      const onExit = (): void => { cleanup(); reject(new EngineTimeoutError(`${what}（engine が終了しました）`)); };
       listeners.add(listener);
-      if (exited) {
-        clearTimeout(timer);
-        listeners.delete(listener);
-        reject(new EngineTimeoutError(`${what}（engine が終了しました）`));
-      }
+      exitWaiters.add(onExit);
+      if (exited) onExit();
     });
   const write = (message: Record<string, unknown>): void => {
+    if (exited) return;
     child.stdin!.write(`${JSON.stringify(message)}\n`);
   };
 
@@ -73,10 +88,15 @@ export async function connectEngine(options: { argv?: string[]; helloTimeoutMs?:
       write(message);
       return reply;
     },
-    close() {
-      rl.close();
+    async close() {
       try { child.stdin!.end(); } catch { /* 既に閉じている */ }
-      setTimeout(() => { if (!exited) child.kill("SIGTERM"); }, 2_000).unref();
+      if (!exited) {
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(() => { if (!exited) child.kill("SIGTERM"); resolve(); }, 2_000);
+          exitWaiters.add(() => { clearTimeout(timer); resolve(); });
+        });
+      }
+      rl.close();
     },
   };
 }

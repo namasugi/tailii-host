@@ -219,7 +219,12 @@ export type HubServerMessage =
   | { type: "codex_goal_result"; id: string; status: "ok" | "failed"; goal?: CodexGoalInfo; cleared?: boolean; error?: string }
   | { type: "chat_send_result"; id: string; status: "accepted" | "duplicate" | "failed"; error?: string }
   | { type: "pending_message_delete_result"; id: string; status: "deleted" | "not_found" | "processing" | "failed"; error?: string }
-  | { type: "chat_receipt_query_result"; id: string; status: "delivered" | "deleted" | "uncertain" | "pending" | "unknown" }
+  | { type: "chat_receipt_query_result"; id: string; status: "delivered" | "deleted" | "uncertain" | "pending" | "unknown";
+  /**
+   * pending のとき、送信順の先頭に「届いたか分からない」別の送信が残っていて、それが解けるまで流れない（任意。CLI の
+   * `tailii-host chat` が人に回す判断に使う。iOS は読まない）。
+   */
+  blocked?: boolean; }
   | { type: "chat_send_now_result"; id: string; status: "sent" | "nothing_queued" | "blocked" | "failed"; error?: string }
   | { type: "background_command_stop_result"; id: string; status: BackgroundCommandStopStatus; error?: string }
   | { type: "subagent_control_result"; id: string; status: SubagentControlStatus; error?: string }
@@ -677,7 +682,7 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
     if (typeof id !== "string" ||
       (status !== "delivered" && status !== "deleted" && status !== "uncertain" &&
         status !== "pending" && status !== "unknown")) return null;
-    return { type: "chat_receipt_query_result", id, status };
+    return { type: "chat_receipt_query_result", id, status, ...(record["blocked"] === true ? { blocked: true } : {}) };
   }
   if (record["type"] === "subagent_control_result") {
     const id = record["id"], status = record["status"], error = record["error"];

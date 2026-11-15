@@ -75,9 +75,18 @@ export const coreHandlers: HandlerRegistry = {
       fail("herdr が見つかりません（~/.local/bin/herdr）。導入後に切り替えてください。");
       return;
     }
+    const previousHerdrSession = ctx.herdrSessionName();
     try {
       if (message.herdrSession !== undefined) ctx.herdrSessionWriter(message.herdrSession);
-      ctx.backendWriter(message.backend);
+      try {
+        ctx.backendWriter(message.backend);
+      } catch (error) {
+        // 端末の設定が書けなければ herdr セッションの設定も元に戻す（片方だけ変わらない。レビュー指摘 8）。
+        if (message.herdrSession !== undefined) {
+          try { ctx.herdrSessionWriter(previousHerdrSession); } catch { /* 戻せなければ応答で今の値を返す */ }
+        }
+        throw error;
+      }
       writer.write({
         type: "backend_set_response",
         v,

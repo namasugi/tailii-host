@@ -9,6 +9,7 @@ import {
   HerdrFailedError,
   HerdrSessionManager,
   herdrErrorCode,
+  herdrExitCode,
   isValidHerdrSessionName,
   resolveHerdrSessionPane,
   inputBoxTextIncludesProbe,
@@ -1972,6 +1973,14 @@ describe("resolveHerdrSessionPane（記録 pane ID の取り違え防止）", ()
       ?.paneId).toBe("w1:p1");
   });
 
+  test("専用セッション以外では、端末 ID が記録と違う pane は label が一致しても採らない（復元されたタブ, レビュー指摘 3）", () => {
+    expect(resolveHerdrSessionPane([pane("w1:p9", "s-a", "term_restored")], "s-a", "w1:p1", names,
+      { terminalId: "term_mine", herdrSession: "default" })).toBeNull();
+    // 専用セッションは従来どおり label で採る（stale 掃除 → 自前の起動で resume）。
+    expect(resolveHerdrSessionPane([pane("w1:p9", "s-a", "term_restored")], "s-a", "w1:p1", names,
+      { terminalId: "term_mine" })?.paneId).toBe("w1:p9");
+  });
+
   test("専用セッション以外では、端末 ID の記録が無い pane ID だけの一致は採らない（利用者の pane を指し得る）", () => {
     expect(resolveHerdrSessionPane([pane("w1:p1", null)], "s-a", "w1:p1", names, { herdrSession: "default" })).toBeNull();
     // label（= セッション名）が一致すれば採る。
@@ -2724,10 +2733,55 @@ describe("launchCore herdr backend", () => {
       ...launchOptions(dir, store, runner),
       errorSink: (message: string) => errors.push(message),
       spawnDetached: (_exe: string, args: string[]) => spawned.push(args),
+      herdrSocketExists: () => true,
     })).toBe(1);
     expect(spawned).toEqual([]);
     expect(errors.join("")).toContain("timed out");
     expect(store.get("s-h")).toBeNull();
+  });
+
+  test("時間切れ（runner の 124・stderr は空）はソケットのファイルが無くても止まっているとみなさない（3 周目レビュー 4）", async () => {
+    const dir = makeTempDir("herdr-launch-timeout-nosocket");
+    const store = makeStore();
+    store.put({ name: "s-h", cwd: dir, createdAt: 1, backend: "herdr", herdrPaneId: "w9:p7", herdrSession: "tailii" });
+    const recorded: string[] = [];
+    const spawned: string[][] = [];
+    const runner: ProcessRunner = async (_exe, rawArgs) => {
+      recorded.push(`${rawArgs[1]} ${rawArgs.slice(2).join(" ")}`);
+      if (rawArgs[1] === "tailii") return { exitCode: 124, stdout: "", stderr: "" };
+      return { exitCode: 0, stdout: paneListJson([]) };
+    };
+    expect(await launchCore({
+      ...launchOptions(dir, store, runner), errorSink: () => {}, herdrSocketExists: () => false,
+      spawnDetached: (_exe: string, args: string[]) => spawned.push(args),
+    })).toBe(1);
+    expect(recorded.some((call) => call.includes("create"))).toBe(false);
+    expect(spawned).toEqual([]);
+  });
+
+  test("エラーコードが読めた失敗（protocol_mismatch）はソケットのファイルが無くても止まっているとみなさない（4 周目 低1）", async () => {
+    const dir = makeTempDir("herdr-launch-mismatch-nosocket");
+    const store = makeStore();
+    store.put({ name: "s-h", cwd: dir, createdAt: 1, backend: "herdr", herdrPaneId: "w9:p7", herdrSession: "tailii" });
+    const recorded: string[] = [];
+    const runner: ProcessRunner = async (_exe, rawArgs) => {
+      recorded.push(`${rawArgs[1]} ${rawArgs.slice(2).join(" ")}`);
+      if (rawArgs[1] === "tailii") {
+        return { exitCode: 1, stdout: "", stderr: JSON.stringify({ error: { code: "protocol_mismatch", message: "old" } }) };
+      }
+      return { exitCode: 0, stdout: paneListJson([]) };
+    };
+    expect(await launchCore({
+      ...launchOptions(dir, store, runner), errorSink: () => {}, herdrSocketExists: () => false,
+    })).toBe(1);
+    expect(recorded.some((call) => call.includes("create"))).toBe(false);
+  });
+
+  test("execFile の打ち切り（killed / シグナル）は終了コード 124 にする（3 周目レビュー 4）", () => {
+    expect(herdrExitCode(null)).toBe(0);
+    expect(herdrExitCode(Object.assign(new Error("x"), { code: 2 }))).toBe(2);
+    expect(herdrExitCode(Object.assign(new Error("x"), { code: null, killed: true, signal: "SIGTERM" }))).toBe(124);
+    expect(herdrExitCode(Object.assign(new Error("x"), { code: null, killed: false, signal: null }))).toBe(1);
   });
 
   test("設定の herdr セッション（default）が動いていなければ起こさず、専用の tailii に入れる", async () => {
@@ -2834,6 +2888,37 @@ describe("launchCore herdr backend", () => {
       beforeRun: async () => true,
     })).toBe(0);
     expect(recorded.find((call) => call.args[1] === "create")?.args.slice(0, 4)).toEqual(["tab", "create", "--workspace", "w7"]);
+  });
+
+  test("前の起動先の herdr セッションが答えられない（時間切れ）なら、設定のセッションへ切り替えず起動しない（レビュー指摘 2）", async () => {
+    const dir = makeTempDir("herdr-launch-old-unreachable");
+    const store = makeStore();
+    store.put({ name: "s-h", cwd: dir, createdAt: 1, backend: "herdr", herdrPaneId: "w9:p7", herdrSession: "tailii" });
+    const recorded: string[] = [];
+    const errors: string[] = [];
+    const runner: ProcessRunner = async (_exe, rawArgs) => {
+      recorded.push(`${rawArgs[1]} ${rawArgs.slice(2).join(" ")}`);
+      if (rawArgs[1] === "tailii") return { exitCode: 1, stdout: "", stderr: "timed out" };
+      return { exitCode: 0, stdout: paneListJson([]) };
+    };
+    expect(await launchCore({
+      ...launchOptions(dir, store, runner), errorSink: (m: string) => errors.push(m), herdrSocketExists: () => true,
+    })).toBe(1);
+    expect(recorded.some((call) => call.includes("create"))).toBe(false);
+    expect(errors.join("")).toContain("二重");
+  });
+
+  test("開き直しで同じ名前のタブが残っていたら、相手を終了させず起動もしない（レビュー指摘 5）", async () => {
+    const dir = makeTempDir("herdr-launch-takeover-existing");
+    const store = makeStore();
+    store.put({ name: "s-h", cwd: dir, createdAt: 1, backend: "herdr", herdrPaneId: "w9:p7", herdrSession: "default" });
+    const { runner, recorded } = herdrProcessRunner({ panes: [{ pane_id: "w9:p7", label: "s-h" }] });
+    let terminated = false;
+    expect(await launchCore({
+      ...launchOptions(dir, store, runner), beforeRun: async () => { terminated = true; return true; },
+    })).toBe(1);
+    expect(terminated).toBe(false);
+    expect(recorded.some((call) => call.args[1] === "run")).toBe(false);
   });
 
   /** 同じフォルダの会話 `s-same` が workspace w3 で生きている状態（メタと pane 一覧）を作る。 */

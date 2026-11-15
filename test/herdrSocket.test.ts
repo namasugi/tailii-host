@@ -273,7 +273,8 @@ describe("偽 Unix socket との結合", () => {
     });
     const run = socketHerdrCommandRunner(f.cli, { sessionName: "test", timeoutMs: 100, socketPath: f.socketPath });
     const started = Date.now();
-    expect((await run(["pane", "list"])).exitCode).toBe(1);
+    // 時間切れは 124 で返す（呼び出し側が「サーバーが止まっている」と取り違えない。3 周目レビュー 4）。
+    expect((await run(["pane", "list"])).exitCode).toBe(124);
     expect(Date.now() - started).toBeGreaterThanOrEqual(85);
     expect(Date.now() - started).toBeLessThan(1000);
     expect(f.cli).not.toHaveBeenCalled();

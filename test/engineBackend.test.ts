@@ -113,6 +113,26 @@ describe("EngineControl — backend get/set", () => {
     }
   }, 15_000);
 
+  test("端末の設定が書けなければ herdr セッションの設定も元に戻す（レビュー指摘 8）", async () => {
+    let session = "default";
+    const engine = startEngine({
+      sessionManager: makeManager(),
+      backendKind: () => "tmux",
+      backendWriter: () => { throw new Error("disk full"); },
+      herdrSessionName: () => session,
+      herdrSessionWriter: (name) => { session = name; },
+      herdrInstalledProbe: () => true,
+    });
+    await engine.lines.nextOfType("channel_hello");
+    try {
+      engine.writeLine(JSON.stringify({ type: "backend_set_request", v: 1, id: "s1", backend: "herdr", herdrSession: "tailii" }));
+      expect(decodeControlMessage(await engine.lines.nextOfType("backend_set_response"))).toMatchObject({ id: "s1", ok: false });
+      expect(session).toBe("default");
+    } finally {
+      await engine.teardown();
+    }
+  }, 15_000);
+
   test("session_title_set は herdr タブを tab rename し ok を返す（session-title）", async () => {
     const store = new SessionMetadataStore(makeTempDir("engine-title-store"));
     store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });

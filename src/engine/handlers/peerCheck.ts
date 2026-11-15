@@ -182,11 +182,10 @@ export async function peerBlocksAutoRestart(
   probe: PeerProbe = defaultPeerProbe(),
   requestedName?: string,
 ): Promise<boolean> {
-  const classification = await classify(conversationId, probe, store);
-  if (classification.kind === "none") return false;
-  // 再起動しようとしている名前そのものの Claude なら塞がない（pane の解決が一時的に外れただけ）。
-  return !(classification.kind === "parallel" && classification.holder === "tailii" &&
-    classification.tailiiSession === requestedName);
+  void requestedName;
+  // 再起動しようとしている名前そのものの Claude が生きていても塞ぐ: pane の解決が外れただけなら、ここで再起動すると
+  // 同じ会話 id の 2 つ目になる（レビュー指摘 2）。アプリには peer_running を返し、開き直しは一覧から確かめて行う。
+  return (await classify(conversationId, probe, store)).kind !== "none";
 }
 
 /** 会話ごとの開き直しの排他（端末が違えば engine も別プロセスなのでファイルで取る, Fable A-5）。 */
@@ -194,9 +193,13 @@ export interface TakeoverLock {
   release(): void;
 }
 
+/** これより古いロックは、持ち主の pid が生きていても残骸とみなす（pid の再利用で永久に取れなくなるのを防ぐ）。 */
+const TAKEOVER_LOCK_MAX_AGE_MS = 5 * 60 * 1000;
+
 export function acquireTakeoverLock(
   conversationId: string,
   dir: string = path.join(os.homedir(), ".tailii", "run"),
+  nowMs: number = Date.now(),
 ): TakeoverLock | null {
   const safeId = conversationId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 128);
   const file = path.join(dir, `takeover-${safeId}.lock`);
@@ -225,7 +228,9 @@ export function acquireTakeoverLock(
           alive = (killError as NodeJS.ErrnoException).code === "EPERM";
         }
       }
-      if (alive) return null;
+      let stale = false;
+      try { stale = nowMs - fs.statSync(file).mtimeMs > TAKEOVER_LOCK_MAX_AGE_MS; } catch { /* 消えていれば取り直す */ }
+      if (alive && !stale) return null;
       try { fs.rmSync(file, { force: true }); } catch { return null; }
     }
   }

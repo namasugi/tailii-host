@@ -215,6 +215,8 @@ function cliJson(value: unknown): string {
   return JSON.stringify(sorted(value)) + "\n";
 }
 const failed = (): HerdrCommandResult => ({ exitCode: 1, stdout: "", stderr: "" });
+/** 残り時間が尽きた（時間切れの印 124。呼び出し側が「サーバーが止まっている」と取り違えない。3 周目レビュー 4）。 */
+const timedOut = (): HerdrCommandResult => ({ exitCode: 124, stdout: "", stderr: "" });
 
 /**
  * 既定は CLI。TAILII_HERDR_TRANSPORT=socket の明示時だけ接続する。
@@ -230,7 +232,7 @@ export function socketHerdrCommandRunner(
     const remaining = () => Math.ceil(options.timeoutMs - (performance.now() - started));
     const fallback = () => {
       const budget = remaining();
-      return budget > 0 ? cli(args, budget) : Promise.resolve(failed());
+      return budget > 0 ? cli(args, budget) : Promise.resolve(timedOut());
     };
     const env = options.env ?? process.env;
     const call = mapCall(args);
@@ -242,7 +244,7 @@ export function socketHerdrCommandRunner(
       if (!object(response.result) || response.result.type !== "pong" || response.result.protocol !== SUPPORTED_PROTOCOL
         || typeof response.result.version !== "string") return fallback();
     } catch { return fallback(); }
-    if (remaining() <= 0) return failed();
+    if (remaining() <= 0) return timedOut();
     let response: ObjectValue;
     try {
       response = await request(socketPath, call.method, call.params, remaining());
