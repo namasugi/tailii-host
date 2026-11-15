@@ -53,6 +53,10 @@ import {
   tmuxServerAbsent,
   classifySubmitFrame,
   loginCodeScreenState,
+  loginCodeEchoed,
+  loginCodeFieldText,
+  LOGIN_CODE_FIELD_NOT_EMPTY,
+  LOGIN_CODE_NOT_ECHOED,
   loginStorageFailure,
   loginStorageFailureMessage,
   LoginCodeError,
@@ -3092,6 +3096,134 @@ describe("login-code 画面判定 / submitLoginCode（仮想時計）", () => {
     const back = makeOps([pendingScreen, methodScreen]);
     await expect(submitLoginCode("AbC#123", back.ops)).rejects.toThrow(/方式選択に戻りました/);
     expect(back.sent.filter((entry) => entry === "enter")).toHaveLength(1);
+  });
+});
+
+describe("login-code コード欄の反映確認（幅で切られた欄・打つ前に残った入力）", () => {
+  // claude 2.1.325 の実機フレームの形（herdr の pane 幅 119 桁）。コードが長く、コード欄の行は幅で切られて
+  // 末尾が `…` になり、末尾 6 文字は見えない（URL は短く省略）。
+  const PANE_WIDTH = 119;
+  const markerLine = "   Paste code here if prompted >";
+  const frame = (field: string, extra: string[] = []) => [
+    "   Login",
+    "",
+    "   Browser didn't open? Use the url below to sign in (c to copy)",
+    "",
+    "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&r",
+    "edirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback",
+    "",
+    "   Hold Shift (Option in iTerm2, Fn in Terminal.app) while selecting to use your terminal's native copy",
+    "",
+    "",
+    `${markerLine}${field}`,
+    ...extra,
+    "",
+    "",
+    "   Esc to cancel",
+  ].join("\n");
+  /** 幅いっぱいまで `*` が並び、最後の 1 桁が `…`（実物の形）。 */
+  const truncatedField = "*".repeat(PANE_WIDTH - markerLine.length - 1) + "…";
+  const longCode = `${"a1B2c3D4e5".repeat(10)}#StAtE_xyz`; // 110 字
+  const acceptedScreen = "  ⎿  Login successful\n────────\n❯ \n────────\n  ⏸ manual mode on";
+
+  test("幅で切られて `…` で終わるコード欄（実物の形）を反映ありと判定する", () => {
+    const screen = frame(truncatedField);
+    expect(screen.split("\n").find((line) => line.startsWith(markerLine))?.length).toBe(PANE_WIDTH);
+    expect(loginCodeScreenState(screen)).toBe("prompt");
+    expect(loginCodeFieldText(screen)).toBe(truncatedField);
+    expect(loginCodeEchoed(screen, longCode)).toBe(true);
+  });
+
+  test("切られた形でも、見えている `*` がコードの長さ以上・`*` 以外が混じる・`…` が無い は反映ありにしない", () => {
+    const visible = PANE_WIDTH - markerLine.length - 1;
+    // 見えている `*` よりコードが短い = 欄に今回のコード以外も入っている。
+    expect(loginCodeEchoed(frame(truncatedField), "x".repeat(visible))).toBe(false);
+    expect(loginCodeEchoed(frame("*".repeat(visible - 1) + "z…"), longCode)).toBe(false);
+    expect(loginCodeEchoed(frame("*".repeat(40)), longCode)).toBe(false);
+    expect(loginCodeEchoed(frame("…"), longCode)).toBe(false);
+  });
+
+  test("末尾 6 文字が見える従来の形は今までどおり末尾で照合する", () => {
+    expect(loginCodeEchoed(frame(` ${"*".repeat(4)}${"AbC#123".slice(-6)}`), "AbC#123")).toBe(true);
+    expect(loginCodeEchoed(frame(`${"*".repeat(30)}${longCode.slice(-6)}`), longCode)).toBe(true);
+    // 末尾が違う（取りこぼし）は断る。
+    expect(loginCodeEchoed(frame(`${"*".repeat(30)}zzzzzz`), longCode)).toBe(false);
+  });
+
+  test("欄が空（打鍵が届いていない）は反映なし", () => {
+    expect(loginCodeFieldText(frame(""))).toBe("");
+    expect(loginCodeFieldText(frame("   "))).toBe("");
+    expect(loginCodeEchoed(frame(""), longCode)).toBe(false);
+    expect(loginCodeFieldText("  Login\n  Signing in…\n  Esc to cancel")).toBeNull();
+  });
+
+  test("コード欄が次の行へ折り返す形でも、続きの行を足して末尾 6 文字で照合する", () => {
+    // 末尾 6 文字が行の境目で割れても拾う（折り返しの形は未実測。外さないための備え）。
+    const head = "*".repeat(PANE_WIDTH - markerLine.length);
+    const tail = `${"*".repeat(longCode.length - head.length - 6)}${longCode.slice(-6, -2)}`;
+    const screen = frame(head, [tail, longCode.slice(-2)]);
+    expect(loginCodeFieldText(screen)).toBe(`${head}${tail}${longCode.slice(-2)}`);
+    expect(loginCodeEchoed(screen, longCode)).toBe(true);
+  });
+
+  /** 打つ前の欄の中身 `prefill` から始め、C-u で空になるか（`clearWorks`）を選べる仮想の画面。 */
+  function makeOps(options: { prefill?: string; clearWorks?: boolean; withClear?: boolean; echo?: (typed: string) => string }) {
+    let clock = 0;
+    let field = options.prefill ?? "";
+    let typed = "";
+    let entered = false;
+    const sent: string[] = [];
+    const echo = options.echo ?? ((value: string) => (value.length > 0 ? truncatedField : ""));
+    const ops = {
+      capture: async () => {
+        if (entered) return acceptedScreen;
+        return frame(typed.length > 0 ? echo(typed) : field);
+      },
+      sendLiteral: async (text: string) => { typed += text; sent.push(`literal:${text}`); },
+      sendEnter: async () => { sent.push("enter"); entered = true; },
+      ...(options.withClear === false ? {} : {
+        sendClear: async () => {
+          sent.push("clear");
+          if (options.clearWorks !== false) field = "";
+        },
+      }),
+      delayMs: 0,
+      pollMs: 0,
+      settleMs: 1_000,
+      now: () => { clock += 400; return clock; },
+    };
+    return { ops, sent };
+  }
+
+  test("submitLoginCode: 幅で切られた欄でも反映を確かめて Enter を撃ち、受理で終える", async () => {
+    const { ops, sent } = makeOps({});
+    await submitLoginCode(longCode, ops);
+    expect(sent).toEqual([`literal:${longCode}`, "enter"]);
+  });
+
+  test("submitLoginCode: 打った後も欄が空なら Enter を撃たずに断る（従来どおり）", async () => {
+    const { ops, sent } = makeOps({ echo: () => "" });
+    await expect(submitLoginCode(longCode, ops)).rejects.toThrow(LOGIN_CODE_NOT_ECHOED);
+    expect(sent).toEqual([`literal:${longCode}`]);
+  });
+
+  test("submitLoginCode: 打つ前の欄に前の入力が残っていれば、C-u で空にしてから打つ", async () => {
+    const { ops, sent } = makeOps({ prefill: truncatedField });
+    await submitLoginCode(longCode, ops);
+    expect(sent).toEqual(["clear", `literal:${longCode}`, "enter"]);
+  });
+
+  test("submitLoginCode: 残った入力が消えない・消す手段が無いときは、何も打たずに断る", async () => {
+    const stuck = makeOps({ prefill: truncatedField, clearWorks: false });
+    const error = await submitLoginCode(longCode, stuck.ops).then(() => null, (caught: unknown) => caught);
+    expect(error).toBeInstanceOf(LoginCodeError);
+    expect((error as Error).message).toBe(LOGIN_CODE_FIELD_NOT_EMPTY);
+    expect(stuck.sent.every((entry) => entry === "clear")).toBe(true);
+    expect(stuck.sent.length).toBeGreaterThan(0);
+
+    const noClear = makeOps({ prefill: truncatedField, withClear: false });
+    await expect(submitLoginCode(longCode, noClear.ops)).rejects.toThrow(LOGIN_CODE_FIELD_NOT_EMPTY);
+    expect(noClear.sent).toEqual([]);
   });
 });
 

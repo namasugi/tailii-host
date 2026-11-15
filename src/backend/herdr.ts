@@ -1334,6 +1334,7 @@ export class HerdrSessionManager {
       capture: () => this.captureDialogWindow(name),
       sendLiteral: (text) => this.sendKeys(name, [text], true),
       sendEnter: () => this.sendKeys(name, ["Enter"]),
+      sendClear: () => this.sendKeys(name, [KILL_LINE_SEQUENCE], true),
       delayMs: this.submitDelayMs,
       pollMs: this.loginPollMs,
       settleMs: this.loginSettleMs,

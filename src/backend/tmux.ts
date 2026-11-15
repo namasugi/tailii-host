@@ -1324,6 +1324,13 @@ export const LOGIN_CODE_NOT_ACCEPTED =
 export const LOGIN_CODE_NOT_ECHOED =
   "コードが入力欄に反映されませんでした（もう一度送ってください）";
 
+/**
+ * 打つ前のコード欄に前の入力が残っていて、消せなかった（または消す手段が無い）。
+ * 残りの後ろへ足すと壊れたコードを送ってワンタイムコードを焼くので、何も打たずに断る。
+ */
+export const LOGIN_CODE_FIELD_NOT_EMPTY =
+  "コード欄に前の入力が残っていて消せませんでした（キャンセルして /login をやり直してから送ってください）";
+
 /** 交換が長引き、受理も拒否も確定しなかった。 */
 export const LOGIN_CODE_UNSETTLED =
   "ログインの結果を確認できませんでした（ホスト側の画面を確認してください）";
@@ -1341,6 +1348,11 @@ export interface LoginCodeSubmitOps {
   capture: () => Promise<string | null>;
   sendLiteral: (text: string) => Promise<void>;
   sendEnter: () => Promise<void>;
+  /**
+   * コード欄を空にするキー（C-u = kill-line）を 1 回送る。打つ前の欄に前の入力が残っているときだけ使う。
+   * 無ければ、残っているときは打たずに断る。
+   */
+  sendClear?: () => Promise<void>;
   /** 本文→CR の間隔（Ink の取り込み窓。実測 300ms 未満で CR が飲まれる）。 */
   delayMs: number;
   /** 画面ポーリング間隔。 */
@@ -1350,13 +1362,91 @@ export interface LoginCodeSubmitOps {
   now?: () => number;
 }
 
-/** コード欄に本文が反映されたか（入力は末尾 6 文字以外マスク表示される実測に合わせ、末尾で照合）。 */
+/** コード欄のマスク表示の 1 字（実測 2.1.325）。 */
+const LOGIN_CODE_MASK_CHAR = "*";
+
+/** Ink が幅に収まらない行の末尾を切ったときに付ける省略記号（実測 2.1.325、herdr の pane 幅 119 桁）。 */
+const LOGIN_CODE_TRUNCATION_MARK = "…";
+
+/** コード欄が次の行へ折り返したとき、続きとして読む行数の上限。 */
+const LOGIN_CODE_WRAP_REACH = 4;
+
+/**
+ * コード欄に表示されている中身（TESTABLE）。マスク（`*`）も省略記号（`…`）も表示のまま返す。
+ * コード入力待ちの画面でなければ null、欄が空なら ""。
+ *
+ * 折り返しにも備える（実測は `…` で切る形だけ。折り返しの形は未実測）: コード欄の直下に続く、
+ * 空白を含まない行（コードは空白を含まない。`Esc to cancel` などの文は空白を含む）を続きとして足す。
+ */
+export function loginCodeFieldText(screen: string): string | null {
+  const lines = screen.split("\n").map((line) => stripSgr(line));
+  const index = liveDialogLineIndex(lines, LOGIN_CODE_PROMPT_MARKER, LOGIN_FOOTER_REACH);
+  if (index === null) return null;
+  let text = (lines[index] ?? "").trim().slice(LOGIN_CODE_PROMPT_MARKER.length).trimStart();
+  if (text.startsWith(">")) text = text.slice(1);
+  text = text.trim();
+  if (text.length === 0) return "";
+  const end = Math.min(lines.length, index + 1 + LOGIN_CODE_WRAP_REACH);
+  for (let below = index + 1; below < end; below += 1) {
+    const next = (lines[below] ?? "").trim();
+    if (next.length === 0 || /\s/.test(next)) break;
+    text += next;
+  }
+  return text;
+}
+
+/**
+ * コード欄に本文が反映されたか（TESTABLE）。**打つ前の欄が空だったこと**を前提にする
+ * （`submitLoginCode` が打つ前に確かめ、残っていれば空にしてから打つ）。
+ *
+ * - 末尾が見える形: 入力は末尾 6 文字以外マスク表示される実測に合わせ、末尾 6 文字で照合する（従来どおり）。
+ * - 幅で切られた形（実測 2.1.325・pane 幅 119 桁: `Paste code here if prompted >****…****…`）: 末尾 6 文字は
+ *   見えない。欄の中身が「`*` だけが 1 字以上並び、末尾が `…`」で、見えている `*` の数がコードの長さより
+ *   少ないときに反映ありとみなす。`…` は欄の中身が行に収まらなかった（= 見えている `*` より多く入った）
+ *   証拠で、打つ前の欄は空だったので、その中身は今回打った分だけ。
+ *
+ * 確かめきれない部分: 切られた形では、`…` より後ろ（コードの末尾側）が欄に届いたかは見えない。
+ * 行に収まる長さを超えて届いた後で取りこぼした場合（例: 100 字のコードの 95 字目で切れた）は
+ * 見分けられず、Enter を撃つ。行に収まる長さで止まった取りこぼしは末尾が見えるので、従来どおり断れる。
+ */
 export function loginCodeEchoed(screen: string, code: string): boolean {
-  const lines = screen.split("\n");
-  const index = liveDialogLineIndex(lines, LOGIN_CODE_PROMPT_MARKER, 3);
-  if (index === null) return false;
+  const field = loginCodeFieldText(screen);
+  if (field === null || field.length === 0) return false;
   const probe = code.slice(-Math.min(6, code.length));
-  return (lines[index] ?? "").includes(probe);
+  if (field.includes(probe)) return true;
+  if (!field.endsWith(LOGIN_CODE_TRUNCATION_MARK)) return false;
+  const visible = field.slice(0, -LOGIN_CODE_TRUNCATION_MARK.length);
+  if (visible.length === 0) return false;
+  for (const char of visible) {
+    if (char !== LOGIN_CODE_MASK_CHAR) return false;
+  }
+  return visible.length < code.length;
+}
+
+/** 打つ前のコード欄を空にするとき、C-u を送る回数の上限。 */
+const LOGIN_CODE_CLEAR_ATTEMPTS = 2;
+
+/**
+ * 打つ前のコード欄に残っている前の入力を C-u で消す（`submitLoginCode` の内部）。
+ * 消えたのを画面で確かめられなければ、何も打たずに `LOGIN_CODE_FIELD_NOT_EMPTY` で断る。
+ *
+ * C-u が `/login` のコード欄でも効くこと（通常の入力欄と同じく、カーソルより前を消す）は**推測**
+ * （実物では未確認）。効かなくても、空になったのを確かめるまで打たないので、壊れたコードは送らない。
+ */
+async function clearLoginCodeField(ops: LoginCodeSubmitOps, sleep: (ms: number) => Promise<void>): Promise<void> {
+  if (ops.sendClear === undefined) throw new LoginCodeError(LOGIN_CODE_FIELD_NOT_EMPTY);
+  for (let attempt = 0; attempt < LOGIN_CODE_CLEAR_ATTEMPTS; attempt += 1) {
+    await ops.sendClear();
+    for (let look = 0; look < 2; look += 1) {
+      await sleep(look === 0 ? ops.delayMs : ops.pollMs);
+      const screen = await ops.capture();
+      if (screen === null) continue;
+      // コード欄が消えた（別の画面になった）ら、これ以上キーを送らない。
+      if (loginCodeScreenState(screen) !== "prompt") throw new LoginCodeError(LOGIN_CODE_FIELD_NOT_EMPTY);
+      if (loginCodeFieldText(screen) === "") return;
+    }
+  }
+  throw new LoginCodeError(LOGIN_CODE_FIELD_NOT_EMPTY);
 }
 
 /**
@@ -1376,6 +1466,9 @@ export async function submitLoginCode(code: string, ops: LoginCodeSubmitOps): Pr
   const initialState = initial === null ? "pending" : loginCodeScreenState(initial);
   if (initialState === "retry") throw new LoginCodeError(LOGIN_CODE_RETRY_PENDING);
   if (initialState !== "prompt") throw new LoginCodeError(LOGIN_CODE_PROMPT_NOT_VISIBLE);
+  // 前の試行の入力が欄に残っている（反映を確かめられず Enter を撃たなかった等）と、後ろへ足して
+  // 壊れたコードを送ってしまう。空にしてから打つ（反映の判定も「打つ前は空」を前提にしている）。
+  if (initial !== null && loginCodeFieldText(initial) !== "") await clearLoginCodeField(ops, sleep);
 
   await ops.sendLiteral(code);
   await sleep(ops.delayMs);
@@ -2676,6 +2769,7 @@ export class TmuxSessionManager {
       capture: () => this.captureVisibleScreenOrNull(name),
       sendLiteral: (text) => this.sendKeys(name, [text], true),
       sendEnter: () => this.sendKeys(name, ["Enter"]),
+      sendClear: () => this.sendKeys(name, ["C-u"]),
       delayMs: this.loginTiming.delayMs,
       pollMs: this.loginTiming.pollMs,
       settleMs: this.loginTiming.settleMs,

@@ -1054,6 +1054,39 @@ describe("HerdrSessionManager", () => {
     expect(submitSends(runner).filter((args) => args[3] === "\r")).toEqual([]);
   });
 
+  test("sendLoginCode: 前の入力が残った欄は C-u で空にしてから打ち、幅で切られた欄（…）でも反映を確かめて CR を撃つ", async () => {
+    // 実測 2.1.325・pane 幅 119 桁: 長いコードはコード欄の行が幅で切られ `…` で終わり、末尾 6 文字は見えない。
+    const marker = "  Paste code here if prompted >";
+    const truncated = "*".repeat(119 - marker.length - 1) + "…";
+    let field = truncated; // 前の試行で打ったコードが Enter されずに残っている
+    let submitted = false;
+    const runner = new MockHerdrRunner((args) => {
+      if (args[0] === "pane" && args[1] === "list") return herdrOk(paneListJson([{ pane_id: "w4:p2" }]));
+      if (args[0] === "pane" && args[1] === "read") {
+        return herdrOk(submitted ? loginAcceptedScreen : loginCodeScreen.replace(marker, `${marker}${field}`));
+      }
+      if (args[0] === "pane" && args[1] === "send-text") {
+        const text = String(args[3]);
+        if (text === "\r") submitted = true;
+        else if (text === "\u0015") field = "";
+        else field = truncated;
+      }
+      return herdrOk("");
+    });
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store, submitDelayMs: 0, loginPollMs: 0, loginSettleMs: 0,
+    });
+    const code = `${"a1B2c3D4e5".repeat(10)}#StAtE_xyz`;
+    await manager.sendLoginCode("s-a", code);
+    expect(submitSends(runner)).toEqual([
+      ["pane", "send-text", "w4:p2", "\u0015"],
+      ["pane", "send-text", "w4:p2", code],
+      ["pane", "send-text", "w4:p2", "\r"],
+    ]);
+  });
+
   test("sendLoginCode: CR を 2 回送ってもコード欄が残れば ok を返さず throw する", async () => {
     const store = makeStore();
     store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
