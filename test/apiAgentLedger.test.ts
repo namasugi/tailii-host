@@ -124,8 +124,13 @@ describe("キーの受け渡し", () => {
 describe("設定と会話の記録", () => {
   test("設定の値域（bypassPermissions・キー本体・上限超過は不可）", () => {
     expect(validApiAgentConfig(CONFIG)).toBe(true);
+    expect(parseApiAgentConfig({ ...CONFIG, effort: "xhigh", budget: { turnUsd: 0, conversationUsd: 0, maxTurns: 0 } }))
+      .toMatchObject({ effort: "xhigh", budget: { turnUsd: 0, conversationUsd: 0, maxTurns: 0 } });
+    expect(validApiAgentConfig({ ...CONFIG, budget: { turnUsd: -1, conversationUsd: 0, maxTurns: 0 } })).toBe(false);
+    expect(validApiAgentConfig({ ...CONFIG, budget: { turnUsd: NaN, conversationUsd: 0, maxTurns: 0 } })).toBe(false);
+    expect(validApiAgentConfig({ ...CONFIG, effort: "bad" as never })).toBe(false);
     expect(validApiAgentConfig({ ...CONFIG, permissionMode: "bypassPermissions" as never })).toBe(false);
-    expect(validApiAgentConfig({ ...CONFIG, budget: { ...CONFIG.budget, turnUsd: 0 } })).toBe(false);
+    expect(validApiAgentConfig({ ...CONFIG, budget: { ...CONFIG.budget, turnUsd: 0 } })).toBe(true);
     expect(validApiAgentConfig({ ...CONFIG, budget: { ...CONFIG.budget, conversationUsd: 10_000 } })).toBe(false);
     expect(validApiAgentConfig({ ...CONFIG, budget: { ...CONFIG.budget, maxTurns: 1.5 } })).toBe(false);
     expect(parseApiAgentConfig({ ...CONFIG, keySource: { mode: "custom", apiKey: API_KEY } })).toBeNull();

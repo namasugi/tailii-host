@@ -173,6 +173,7 @@ export class ApiAgentManager {
       this.conversations.set(record.name, {
         session: record.name, conversationId: record.conversationId, cwd: record.cwd, config: record.config,
         ledger, started: true, queue: [], running: null, startsInFlight: 0, disposed: false,
+        lastOutcome: restoredOutcome(ledger),
       });
       restored.push(record.name);
     }
@@ -206,6 +207,7 @@ export class ApiAgentManager {
       session, conversationId: request.conversationId, cwd: request.cwd, config: request.config,
       ledger, started: request.resume || ledger.turns.length > 0 || ledger.foldedTurns > 0,
       queue: [], running: null, startsInFlight: 0, disposed: false,
+      lastOutcome: restoredOutcome(ledger),
     };
     this.conversations.set(session, conversation);
     this.persistSession(conversation);
@@ -400,7 +402,7 @@ export class ApiAgentManager {
       throw new ApiAgentRejectedError(blocked);
     }
     const usage = summarizeLedger(conversation.ledger);
-    const remaining = config.budget.conversationUsd - usage.totalUsd;
+    const remaining = config.budget.conversationUsd === 0 ? Infinity : config.budget.conversationUsd - usage.totalUsd;
     if (remaining <= 0) {
       conversation.lastError = "budget_exhausted";
       this.emitStatus(conversation);
@@ -458,7 +460,10 @@ export class ApiAgentManager {
         t: "start", conversationId: conversation.conversationId, resume: conversation.started,
         cwd: placement.launchCwd, prompt: texts.join("\n\n"), model: config.model,
         permissionMode: config.permissionMode, maxTurns: config.budget.maxTurns,
-        maxBudgetUsd: Math.min(config.budget.turnUsd, remaining),
+        ...(config.effort !== undefined ? { effort: config.effort } : {}),
+        // 0 は上限なし。ワイヤーには Infinity を載せず、SDK に渡す前に上限指定を省略する。
+        maxBudgetUsd: Number.isFinite(remaining)
+          ? Math.min(config.budget.turnUsd || Infinity, remaining) : config.budget.turnUsd,
         settingSources: this.options.settingSources ?? ["user", "project", "local"],
         ...(executable !== null ? { claudeExecutable: executable } : {}),
       });
@@ -589,13 +594,18 @@ export class ApiAgentManager {
 
   private statusOf(conversation: Conversation, restoredTexts?: string[]): ApiAgentStatusMessage {
     const state: ApiAgentState = conversation.running === null ? "idle" : conversation.running.interrupted ? "stopping" : "running";
+    const usage = summarizeLedger(conversation.ledger);
+    const exhausted = state === "idle" && conversation.config.budget.conversationUsd > 0 &&
+      usage.totalUsd >= conversation.config.budget.conversationUsd;
+    const error = conversation.lastError ?? (exhausted ? "budget_exhausted" : undefined);
     return {
       type: "api_agent_status", v: PROTOCOL_V2, session: conversation.session, state,
       model: conversation.config.model, budget: { ...conversation.config.budget },
       permissionMode: conversation.config.permissionMode,
-      usage: summarizeLedger(conversation.ledger), queued: conversation.queue.length,
+      ...(conversation.config.effort !== undefined ? { effort: conversation.config.effort } : {}),
+      usage, queued: conversation.queue.length,
       ...(conversation.lastOutcome !== undefined ? { outcome: conversation.lastOutcome } : {}),
-      ...(conversation.lastError !== undefined ? { error: conversation.lastError } : {}),
+      ...(error !== undefined ? { error } : {}),
       ...(restoredTexts !== undefined && restoredTexts.length > 0 ? { restoredTexts } : {}),
     };
   }
@@ -659,6 +669,16 @@ export class ApiAgentManager {
       this.options.log?.(`api-agent 台帳の保存に失敗: ${(error as NodeJS.ErrnoException).code ?? "error"}`);
     }
   }
+}
+
+/** 再接続・hub の再起動後も、台帳に残る上限到達や結果未確認を説明する。 */
+function restoredOutcome(ledger: ApiAgentLedger): ApiAgentTurnOutcome | undefined {
+  const last = ledger.turns.at(-1);
+  if (last === undefined) return undefined;
+  if (last.status === "unconfirmed") return "result_unknown";
+  if (last.subtype === "error_max_budget_usd") return "turn_budget_reached";
+  if (last.subtype === "error_max_turns") return "max_turns_reached";
+  return undefined;
 }
 
 function outcomeOf(result: Extract<WorkerToHub, { t: "result" }> | null, running: RunningTurn): ApiAgentTurnOutcome {

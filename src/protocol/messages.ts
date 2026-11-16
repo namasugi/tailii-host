@@ -581,17 +581,18 @@ export interface ApiUsageCredential {
  */
 export type ApiAgentPermissionMode = "default" | "acceptEdits" | "plan" | "dontAsk" | "auto";
 export interface ApiAgentBudget {
-  /** 1 ターン（1 回の送信）の概算上限（USD）。SDK の maxBudgetUsd。超過は直後のモデル呼び出し 1 回分ありうる。 */
+  /** 1 ターン（1 回の送信）の概算上限（USD）。0 は上限なし。SDK の maxBudgetUsd。超過は直後のモデル呼び出し 1 回分ありうる。 */
   turnUsd: number;
-  /** この会話の累計の概算上限（USD）。到達後は上限を上げるまで新しいターンを始めない。 */
+  /** この会話の累計の概算上限（USD）。0 は上限なし。到達後は上限を上げるまで新しいターンを始めない。 */
   conversationUsd: number;
-  /** 1 ターン内のモデル往復の上限（SDK の maxTurns）。 */
+  /** 1 ターン内のモデル往復の上限（SDK の maxTurns）。0 は上限なし。 */
   maxTurns: number;
 }
 export interface ApiAgentConfig {
   model: string;
   permissionMode: ApiAgentPermissionMode;
   budget: ApiAgentBudget;
+  effort?: "low" | "medium" | "high" | "xhigh" | "max";
   /** API 実行用のキーの取得元（automatic / file / environment）。キー本体は送らない。 */
   keySource?: ApiUsageCredential;
 }
@@ -789,7 +790,7 @@ export type ControlMessage =
    * API 作業の状態（host→iOS, api-agent）。会話のストリームに載る（後から開いた端末にも最新値が届く）。
    * `restoredTexts` は中断で送らなかった処理中の発話（入力欄へ戻す）。旧アプリは未知 type として捨てる。
    */
-  | { type: "api_agent_status"; v: number; session: string; state: ApiAgentState; model: string; budget: ApiAgentBudget; usage: ApiAgentUsage; queued: number; outcome?: ApiAgentTurnOutcome; error?: ApiAgentErrorCode; restoredTexts?: string[]; permissionMode?: ApiAgentPermissionMode }
+  | { type: "api_agent_status"; v: number; session: string; state: ApiAgentState; model: string; budget: ApiAgentBudget; usage: ApiAgentUsage; queued: number; outcome?: ApiAgentTurnOutcome; error?: ApiAgentErrorCode; restoredTexts?: string[]; permissionMode?: ApiAgentPermissionMode; effort?: ApiAgentConfig["effort"] }
   /** API 作業の設定変更（モデル・権限モード・予算・キーの取得元）。処理中は次のターンから効く。 */
   | { type: "api_agent_configure"; v: number; id: string; session: string; config: ApiAgentConfig }
   | { type: "api_agent_configure_result"; v: number; id: string; session: string; ok: boolean; error?: ApiAgentErrorCode }

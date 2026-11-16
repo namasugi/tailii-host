@@ -82,6 +82,14 @@ function decodeApiAgentErrorCode(value: string | undefined): import("./messages.
   return value !== undefined && (API_AGENT_ERRORS as readonly string[]).includes(value)
     ? value as import("./messages.js").ApiAgentErrorCode : undefined;
 }
+function decodeApiAgentEffort(raw: Record<string, unknown>): import("./messages.js").ApiAgentConfig["effort"] {
+  const effort = optionalString(raw, "effort");
+  if (effort !== undefined && !["low", "medium", "high", "xhigh", "max"].includes(effort)) {
+    throw new ProtocolDecodeError("missing-field", "effort");
+  }
+  return effort as import("./messages.js").ApiAgentConfig["effort"];
+}
+
 function decodeApiAgentBudget(value: unknown): import("./messages.js").ApiAgentBudget {
   const raw = requireObject(value, "budget");
   return { turnUsd: requireNumber(raw, "turnUsd"), conversationUsd: requireNumber(raw, "conversationUsd"), maxTurns: requireNumber(raw, "maxTurns") };
@@ -97,7 +105,7 @@ function decodeApiAgentConfig(value: unknown): import("./messages.js").ApiAgentC
   if (keySource !== undefined && (keySource.mode === "custom" || keySource.mode === "disabled")) {
     throw new ProtocolDecodeError("missing-field", "keySource");
   }
-  return compact({ model: requireString(raw, "model"), permissionMode, budget: decodeApiAgentBudget(raw["budget"]), keySource });
+  return compact({ model: requireString(raw, "model"), permissionMode, budget: decodeApiAgentBudget(raw["budget"]), keySource, effort: decodeApiAgentEffort(raw) });
 }
 function decodeSessionStartRoute(raw: Raw): { executionRoute?: "api"; apiAgent?: import("./messages.js").ApiAgentConfig } {
   if (optionalString(raw, "executionRoute") !== "api") return {};
@@ -1742,6 +1750,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         state,
         model: requireString(raw, "model"),
         budget: decodeApiAgentBudget(raw["budget"]),
+        effort: decodeApiAgentEffort(raw),
         usage: compact<import("./messages.js").ApiAgentUsage>({
           totalUsd: requireNumber(usage, "totalUsd"),
           turns: requireNumber(usage, "turns"),

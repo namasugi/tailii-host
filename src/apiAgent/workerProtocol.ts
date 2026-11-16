@@ -4,7 +4,7 @@
 // 1 プロセス = 1 ターン。hub が `start` を 1 回送り、作業プロセスは `result` か `error` を返して終わる。
 // API キーはこのプロトコルに載せない（子プロセスの環境変数だけで渡す）。
 
-import type { ApiAgentPermissionMode } from "../protocol/messages.js";
+import type { ApiAgentConfig, ApiAgentPermissionMode } from "../protocol/messages.js";
 export type { ApiAgentPermissionMode };
 
 export const API_AGENT_PERMISSION_MODES: readonly ApiAgentPermissionMode[] = ["default", "acceptEdits", "plan", "dontAsk", "auto"];
@@ -18,8 +18,9 @@ export interface WorkerStartCommand {
   prompt: string;
   model: string;
   permissionMode: ApiAgentPermissionMode;
+  effort?: ApiAgentConfig["effort"];
   maxTurns: number;
-  /** このターンで使ってよい概算額（USD）。SDK の `maxBudgetUsd`。 */
+  /** このターンで使ってよい概算額（USD）。0 は上限なし（SDK の指定を省略）。 */
   maxBudgetUsd: number;
   /** 読み込む設定（CLAUDE.md・許可ルール・スキル）。Tailii のフック設定は渡さない。 */
   settingSources: ("user" | "project" | "local")[];
@@ -119,6 +120,8 @@ export function decodeHubToWorker(line: string): HubToWorker | null {
   const prompt = str(obj["prompt"]);
   const model = str(obj["model"]);
   const permissionMode = obj["permissionMode"];
+  const effort = obj["effort"];
+  if (effort !== undefined && (typeof effort !== "string" || !["low", "medium", "high", "xhigh", "max"].includes(effort))) return null;
   const maxTurns = finiteNumber(obj["maxTurns"]);
   const maxBudgetUsd = finiteNumber(obj["maxBudgetUsd"]);
   const settingSources = obj["settingSources"];
@@ -128,14 +131,15 @@ export function decodeHubToWorker(line: string): HubToWorker | null {
   if (prompt === null || prompt.length === 0) return null;
   if (model === null || !MODEL.test(model)) return null;
   if (!API_AGENT_PERMISSION_MODES.includes(permissionMode as ApiAgentPermissionMode)) return null;
-  if (maxTurns === null || !Number.isInteger(maxTurns) || maxTurns < 1 || maxTurns > 500) return null;
-  if (maxBudgetUsd === null || maxBudgetUsd <= 0 || maxBudgetUsd > 1000) return null;
+  if (maxTurns === null || !Number.isInteger(maxTurns) || maxTurns < 0 || maxTurns > 500) return null;
+  if (maxBudgetUsd === null || maxBudgetUsd < 0 || maxBudgetUsd > 1000) return null;
   if (!Array.isArray(settingSources) || settingSources.some((s) => s !== "user" && s !== "project" && s !== "local")) return null;
   if (typeof obj["resume"] !== "boolean") return null;
   if (claudeExecutable !== null && !claudeExecutable.startsWith("/")) return null;
   return {
     t: "start", conversationId, resume: obj["resume"], cwd, prompt, model,
     permissionMode: permissionMode as ApiAgentPermissionMode, maxTurns, maxBudgetUsd,
+    ...(effort !== undefined ? { effort: effort as ApiAgentConfig["effort"] } : {}),
     settingSources: [...new Set(settingSources as ("user" | "project" | "local")[])],
     ...(claudeExecutable !== null ? { claudeExecutable } : {}),
   };

@@ -78,6 +78,50 @@ function setup(overrides: Partial<ConstructorParameters<typeof ApiAgentManager>[
 }
 
 describe("ApiAgentManager", () => {
+  test.each([
+    { turnUsd: 0, conversationUsd: 0, expected: 0 },
+    { turnUsd: 0.25, conversationUsd: 0, expected: 0.25 },
+    { turnUsd: 0, conversationUsd: 1, expected: 0.2 },
+    { turnUsd: 0.1, conversationUsd: 1, expected: 0.1 },
+  ])("金額上限の組合せ $turnUsd / $conversationUsd を SDK へ渡す", async ({ turnUsd, conversationUsd, expected }) => {
+    const t = setup();
+    t.manager.open("cs-a", { conversationId: CONV, cwd: "/tmp/w", config: CONFIG, resume: true });
+    await t.manager.submit("cs-a", "one");
+    t.workers[0]!.succeed(0.8);
+    t.writeTranscript(0.8);
+    t.manager.configure("cs-a", { ...CONFIG, effort: "low", budget: { turnUsd, conversationUsd, maxTurns: 1 } });
+    await t.manager.submit("cs-a", "next");
+    expect(t.workers[1]!.start.maxBudgetUsd).toBeCloseTo(expected);
+    expect(t.workers[1]!.start).toMatchObject({ maxTurns: 1, effort: "low" });
+    expect(t.last()).toMatchObject({ permissionMode: "default", effort: "low", budget: { maxTurns: 1 } });
+  });
+
+  test("会話上限到達は次の送信を待たず状態へ示し、上限なしで解除する", async () => {
+    const t = setup();
+    t.manager.open("cs-a", { conversationId: CONV, cwd: "/tmp/w", config: CONFIG, resume: true });
+    await t.manager.submit("cs-a", "one");
+    t.workers[0]!.succeed(1.01);
+    expect(t.last()).toMatchObject({ state: "idle", outcome: "success", error: "budget_exhausted" });
+    t.manager.configure("cs-a", { ...CONFIG, budget: { ...CONFIG.budget, conversationUsd: 0 } });
+    expect(t.last().error).toBeUndefined();
+  });
+
+  test("会話予算で止まった持ち越しを、0 へ変更して同じ会話で再開する", async () => {
+    const t = setup();
+    t.manager.open("cs-a", { conversationId: CONV, cwd: "/tmp/w", config: CONFIG, resume: true });
+    await t.manager.submit("cs-a", "one");
+    await t.manager.submit("cs-a", "続き");
+    t.writeTranscript(1.05);
+    t.workers[0]!.succeed(1.05, "error_max_budget_usd");
+    await vi.waitFor(() => expect(t.last()).toMatchObject({ error: "budget_exhausted", queued: 1 }));
+    t.manager.configure("cs-a", { ...CONFIG, budget: { turnUsd: 0, conversationUsd: 0, maxTurns: 0 } });
+    await vi.waitFor(() => expect(t.workers).toHaveLength(2));
+    expect(t.workers[1]!.start).toMatchObject({ resume: true, conversationId: CONV, prompt: "続き", maxBudgetUsd: 0, maxTurns: 0 });
+    t.workers[1]!.succeed(1.1);
+    expect(t.last()).toMatchObject({ state: "idle", outcome: "success", queued: 0 });
+    expect(t.last().error).toBeUndefined();
+  });
+
   test("新規の会話: 1 ターン目は sessionId で始め、結果の額を台帳へ。2 ターン目は resume", async () => {
     const t = setup();
     t.manager.open("cs-a", { conversationId: CONV, cwd: "/tmp/w", config: CONFIG, resume: false });
@@ -307,7 +351,7 @@ describe("ApiAgentManager", () => {
       onStatus: (_s, status) => restarted.statuses.push(status),
     });
     expect(again.restore()).toEqual(["cs-b"]);
-    expect(again.status("cs-b")).toMatchObject({ state: "idle", usage: { turns: 1, unconfirmedTurns: 1 } });
+    expect(again.status("cs-b")).toMatchObject({ state: "idle", outcome: "result_unknown", usage: { turns: 1, unconfirmedTurns: 1 } });
   });
 
   test("新規の会話で 1 ターン目が JSONL を書く前に失敗したら、次も resume にしない", async () => {

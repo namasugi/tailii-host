@@ -14,9 +14,10 @@ export function validApiAgentConfig(config: ApiAgentConfig): boolean {
   const { budget } = config;
   if (!isApiAgentModel(config.model)) return false;
   if (!API_AGENT_PERMISSION_MODES.includes(config.permissionMode)) return false;
-  if (!(budget.turnUsd > 0 && budget.turnUsd <= API_AGENT_MAX_TURN_USD)) return false;
-  if (!(budget.conversationUsd > 0 && budget.conversationUsd <= API_AGENT_MAX_CONVERSATION_USD)) return false;
-  if (!Number.isInteger(budget.maxTurns) || budget.maxTurns < 1 || budget.maxTurns > API_AGENT_MAX_TURNS_LIMIT) return false;
+  if (!(budget.turnUsd >= 0 && budget.turnUsd <= API_AGENT_MAX_TURN_USD)) return false;
+  if (!(budget.conversationUsd >= 0 && budget.conversationUsd <= API_AGENT_MAX_CONVERSATION_USD)) return false;
+  if (!Number.isInteger(budget.maxTurns) || budget.maxTurns < 0 || budget.maxTurns > API_AGENT_MAX_TURNS_LIMIT) return false;
+  if (config.effort !== undefined && !["low", "medium", "high", "xhigh", "max"].includes(config.effort)) return false;
   const source = config.keySource;
   if (source !== undefined && source.mode !== "automatic" && source.mode !== "file" && source.mode !== "environment") return false;
   if (source?.apiKey !== undefined) return false;
@@ -56,6 +57,7 @@ export function parseApiAgentConfig(value: unknown): ApiAgentConfig | null {
     permissionMode: obj["permissionMode"] as ApiAgentConfig["permissionMode"],
     budget: { turnUsd: b["turnUsd"], conversationUsd: b["conversationUsd"], maxTurns: b["maxTurns"] },
     ...(keySource !== undefined ? { keySource } : {}),
+    ...(obj["effort"] !== undefined ? { effort: obj["effort"] as ApiAgentConfig["effort"] } : {}),
   };
   return validApiAgentConfig(config) ? config : null;
 }
@@ -64,7 +66,7 @@ export const API_AGENT_ERROR_MESSAGES: Record<ApiAgentErrorCode, string> = {
   no_api_key: "API キーが見つかりません。API 作業には Console の API キーを設定してください（定額プランのログインには切り替えません）。",
   unsupported_key_source: "このキーの取得元は API 作業では使えません。自動検出・ホスト上のファイル・環境変数から選んでください。",
   unexpected_auth: "API キー以外の認証で動こうとしたため、モデルを呼ぶ前に止めました。",
-  budget_exhausted: "この会話の API 予算の上限に達しました。上限を上げると続けられます。",
+  budget_exhausted: "この会話の API 予算の上限に達しました。上限を上げるか、0（上限なし）に変更すると続けられます。",
   conversation_in_use: "この会話は別の場所で開かれているため、API 作業では実行できません。",
   sdk_unavailable: "API 作業に必要な Agent SDK がホストに入っていません。アプリで「準備する」を選ぶとホストに導入します。",
   sdk_version_mismatch: "ホストの Claude Code と Agent SDK の版が合いません。アプリで「準備する」を選ぶと合う版へ入れ直します（直らなければホストで `claude update` を実行してください）。",

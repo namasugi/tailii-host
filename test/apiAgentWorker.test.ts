@@ -98,6 +98,19 @@ describe("acceptableAgentAuth", () => {
 });
 
 describe("runApiAgentWorker", () => {
+  test.each([0, 1, 6, 200])("往復上限 %s を正確に渡し、0 は SDK の上限指定を省く", async (limit) => {
+    const { code, seen } = await runWith({
+      account: { apiKeySource: "ANTHROPIC_API_KEY", apiProvider: "firstParty" },
+      async *onPrompt() {
+        yield { type: "result", subtype: "success", is_error: false, total_cost_usd: 0.01, num_turns: 1, session_id: CONV };
+      },
+    }, { ANTHROPIC_API_KEY: KEY }, { startLine: start({ maxTurns: limit, maxBudgetUsd: 0, effort: "xhigh" }) });
+    expect(code).toBe(0);
+    expect(seen.options!["maxTurns"]).toBe(limit || undefined);
+    expect(seen.options).not.toHaveProperty("maxBudgetUsd");
+    expect(seen.options!["effort"]).toBe("xhigh");
+  });
+
   test("auto は SDK に同名で渡し、判断できない操作の canUseTool を残す", async () => {
     const { code, seen } = await runWith({
       account: { apiKeySource: "ANTHROPIC_API_KEY", apiProvider: "firstParty" },
@@ -252,8 +265,11 @@ describe("workerProtocol", () => {
     expect(decodeHubToWorker(start({ conversationId: "../etc" }))).toBeNull();
     expect(decodeHubToWorker(start({ cwd: "relative" }))).toBeNull();
     expect(decodeHubToWorker(start({ permissionMode: "bypassPermissions" as never }))).toBeNull();
-    expect(decodeHubToWorker(start({ maxBudgetUsd: 0 }))).toBeNull();
-    expect(decodeHubToWorker(start({ maxTurns: 0 }))).toBeNull();
+    expect(decodeHubToWorker(start({ maxBudgetUsd: 0 }))).not.toBeNull();
+    expect(decodeHubToWorker(start({ maxBudgetUsd: -1 }))).toBeNull();
+    expect(decodeHubToWorker(start({ maxTurns: 0 }))).not.toBeNull();
+    expect(decodeHubToWorker(start({ maxTurns: -1 }))).toBeNull();
+    expect(decodeHubToWorker(start({ effort: "invalid" as never }))).toBeNull();
     expect(decodeHubToWorker(start({ claudeExecutable: "claude" }))).toBeNull();
     expect(decodeHubToWorker("not json")).toBeNull();
   });
