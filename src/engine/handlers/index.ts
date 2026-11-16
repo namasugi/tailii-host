@@ -10,6 +10,8 @@ import { apiAgentHandoffHandlers } from "./apiAgentHandoff.js";
 import { apiDelegateHandlers } from "./apiDelegate.js";
 import { claudeModelHandlers } from "./claudeModels.js";
 import { codexHandlers } from "./codex.js";
+import { claudeUpdateHandlers } from "./claudeUpdate.js";
+import { codexUpdateHandlers } from "./codexUpdate.js";
 import { conversationHandlers } from "./conversation.js";
 import { coreHandlers } from "./core.js";
 import { gitHandlers } from "./git.js";
@@ -32,6 +34,8 @@ export const ENGINE_HANDLERS: HandlerRegistry = {
   ...sessionWorkdirHandlers,
   ...conversationHandlers,
   ...codexHandlers,
+  ...codexUpdateHandlers,
+  ...claudeUpdateHandlers,
   ...claudeModelHandlers,
   ...officialAppHandlers,
   ...modeHandlers,

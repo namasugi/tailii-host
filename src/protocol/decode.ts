@@ -12,6 +12,7 @@ import {
   PROTOCOL_MAX_SUPPORTED,
   type ClaudeAccountUsage,
   type CodexAccountUsage,
+  type CodexUpdateInfo,
   type ClaudeSessionInfo,
   type ClaudeModelInfo,
   type PeerSessionInfo,
@@ -186,9 +187,30 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         latestClientBuild: optionalString(raw, "latestClientBuild"),
         push: optionalNumber(raw, "push"),
         workdirChange: optionalNumber(raw, "workdirChange"),
+        codexUpdate: optionalNumber(raw, "codexUpdate"),
+        claudeUpdate: optionalNumber(raw, "claudeUpdate"),
         clientKind: optionalString(raw, "clientKind") === "cli" ? "cli" as const : undefined,
       });
 
+    case "claude_update_request":
+    case "codex_update_request": {
+      const action = requireString(raw, "action");
+      if (action !== "check" && action !== "install") throw new ProtocolDecodeError("missing-field", "action");
+      return { type, v, id: requireString(raw, "id"), action };
+    }
+    case "claude_update_response":
+    case "codex_update_response": {
+      const update = requireObject(raw["update"], "update");
+      const status = requireString(update, "status");
+      if (!["current", "available", "updating", "updated", "failed", "unsupported", "unavailable"].includes(status)) {
+        throw new ProtocolDecodeError("missing-field", "update.status");
+      }
+      return { type, v, id: requireString(raw, "id"), update: compact({
+        status: status as CodexUpdateInfo["status"], canUpdate: requireBoolean(update, "canUpdate"),
+        currentVersion: optionalString(update, "currentVersion"), latestVersion: optionalString(update, "latestVersion"),
+        error: optionalString(update, "error"),
+      }) };
+    }
     case "host_update_request":
       return compact({
         type, v,

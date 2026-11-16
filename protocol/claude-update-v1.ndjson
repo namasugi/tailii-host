@@ -1,0 +1,10 @@
+{"action":"check","id":"check-1","type":"claude_update_request","v":1}
+{"action":"install","id":"install-1","type":"claude_update_request","v":1}
+{"id":"update-available","type":"claude_update_response","update":{"canUpdate":true,"currentVersion":"2.1.300","latestVersion":"2.1.325","status":"available"},"v":1}
+{"id":"update-updating","type":"claude_update_response","update":{"canUpdate":true,"currentVersion":"2.1.300","latestVersion":"2.1.325","status":"updating"},"v":1}
+{"id":"update-updated","type":"claude_update_response","update":{"canUpdate":true,"currentVersion":"2.1.300","latestVersion":"2.1.325","status":"updated"},"v":1}
+{"id":"update-failed","type":"claude_update_response","update":{"canUpdate":true,"currentVersion":"2.1.300","error":"更新できませんでした。もう一度お試しください。","latestVersion":"2.1.325","status":"failed"},"v":1}
+{"id":"update-unsupported","type":"claude_update_response","update":{"canUpdate":false,"currentVersion":"2.1.300","latestVersion":"2.1.325","status":"unsupported"},"v":1}
+{"id":"update-unavailable","type":"claude_update_response","update":{"canUpdate":false,"currentVersion":"2.1.300","latestVersion":"2.1.325","status":"unavailable"},"v":1}
+{"id":"update-current","type":"claude_update_response","update":{"canUpdate":true,"currentVersion":"2.1.300","latestVersion":"2.1.325","status":"current"},"v":1}
+{"claudeUpdate":1,"maxVersion":2,"type":"channel_hello","v":1}

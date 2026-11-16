@@ -30,6 +30,8 @@ const PORTED: Record<string, (args: string[]) => Promise<number>> = {
   "hub": async (args) => (await import("./hub/hubDaemon.js")).runHubCommand(args),
   "quic-info": async (args) => (await import("./services/quicGateway.js")).runQuicInfoCommand(args),
   "self-update": async (args) => (await import("./commands/selfUpdate.js")).runSelfUpdateCommand(args),
+  "claude-update-worker": async (args) => { await (await import("./updates/claudeUpdater.js")).runClaudeUpdateWorker(args[0] ?? ""); return 0; },
+  "codex-update-worker": async (args) => { await (await import("./codex/codexUpdater.js")).runCodexUpdateWorker(args[0] ?? ""); return 0; },
   "api-agent": async (args) => (await import("./commands/apiAgentCommand.js")).runApiAgentCommand(args),
   // AI エージェント（Bot）・スクリプトから会話を始める・送る・読む（tailii-chat-cli）。
   "chat": async (args) => (await import("./commands/chat/chatCommand.js")).runChatCommand(args),

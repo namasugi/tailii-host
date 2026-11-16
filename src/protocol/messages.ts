@@ -412,6 +412,15 @@ export type RemotePendingKind = "approval" | "question";
  */
 export type HostUpdateStatus = "started" | "already" | "in_progress" | "unsupported" | "error";
 
+/** Codex CLI の更新。会話の実行状態とは独立し、使用中の daemon を停止しない。 */
+export interface CodexUpdateInfo {
+  status: "current" | "available" | "updating" | "updated" | "failed" | "unsupported" | "unavailable";
+  canUpdate: boolean;
+  currentVersion?: string;
+  latestVersion?: string;
+  error?: string;
+}
+
 /** 背景同期の境界ヒント 1 件（`background_sync_hints`）。`newerThanMs` は host 時刻の epoch ms。 */
 export interface BackgroundSyncHint {
   session: string;
@@ -704,8 +713,15 @@ export type ControlMessage =
        * だけに載る。名乗らない（古い）アプリは知らない `pc:*` を通常の行として表示するので、host は `pc:cwd` を送らない。
        */
       workdirChange?: number;
+      /** host → iOS: Codex 更新の確認・開始を受けられる。 */
+      codexUpdate?: number;
+      claudeUpdate?: number;
       /** 相手の種類（tailii-chat-cli）。"cli" は `tailii-host chat` で、会話の購読・在席の申告をしない。省略はアプリ。 */
       clientKind?: "cli" }
+  | { type: "codex_update_request"; v: number; id: string; action: "check" | "install" }
+  | { type: "codex_update_response"; v: number; id: string; update: CodexUpdateInfo }
+  | { type: "claude_update_request"; v: number; id: string; action: "check" | "install" }
+  | { type: "claude_update_response"; v: number; id: string; update: CodexUpdateInfo }
   | { type: "host_update_request"; v: number; id: string; version: string; integrity?: string }
   | { type: "host_update_response"; v: number; id: string; status: HostUpdateStatus; error?: string | null }
   /**

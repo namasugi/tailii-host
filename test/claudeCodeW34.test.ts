@@ -81,12 +81,20 @@ describe("output-style / worktree / todo-tools の起動合成", () => {
     expect(mergeClaudeLaunchSettings(null, "x\"y")).toBeNull();
   });
 
+  it("自動更新停止は起動限定の設定にも載せ、他のenvとフックを保持する", () => {
+    const hooks = JSON.stringify({ hooks: { Stop: [] }, env: { DISABLE_AUTOUPDATER: "0", KEEP: "yes" } });
+    expect(JSON.parse(mergeClaudeLaunchSettings(hooks, "Concise", true)!)).toEqual({
+      hooks: { Stop: [] }, outputStyle: "Concise", env: { DISABLE_AUTOUPDATER: "1", KEEP: "yes" },
+    });
+    expect(JSON.parse(mergeClaudeLaunchSettings(null, null, true)!)).toEqual({ env: { DISABLE_AUTOUPDATER: "1" } });
+  });
+
   it("env 前置: todo-tools と ANTHROPIC_DEFAULT_MODEL（model フラグ付きでは付けない）", () => {
-    expect(claudeLaunchEnvPrefix({ todoTools: true })).toBe("CLAUDE_CODE_ENABLE_TODO_TOOLS=1");
-    expect(claudeLaunchEnvPrefix({ defaultModel: "opus[1m]" })).toBe("ANTHROPIC_DEFAULT_MODEL=opus[1m]");
-    expect(claudeLaunchEnvPrefix({ defaultModel: "opus", hasModelFlag: true })).toBe("");
-    expect(claudeLaunchEnvPrefix({ todoTools: true, defaultModel: "$(evil)" })).toBe("CLAUDE_CODE_ENABLE_TODO_TOOLS=1");
-    expect(claudeLaunchEnvPrefix({})).toBe("");
+    expect(claudeLaunchEnvPrefix({ todoTools: true })).toBe("DISABLE_AUTOUPDATER=1 CLAUDE_CODE_ENABLE_TODO_TOOLS=1");
+    expect(claudeLaunchEnvPrefix({ defaultModel: "opus[1m]" })).toBe("DISABLE_AUTOUPDATER=1 ANTHROPIC_DEFAULT_MODEL=opus[1m]");
+    expect(claudeLaunchEnvPrefix({ defaultModel: "opus", hasModelFlag: true })).toBe("DISABLE_AUTOUPDATER=1");
+    expect(claudeLaunchEnvPrefix({ todoTools: true, defaultModel: "$(evil)" })).toBe("DISABLE_AUTOUPDATER=1 CLAUDE_CODE_ENABLE_TODO_TOOLS=1");
+    expect(claudeLaunchEnvPrefix({})).toBe("DISABLE_AUTOUPDATER=1");
   });
 });
 

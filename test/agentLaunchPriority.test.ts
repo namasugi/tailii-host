@@ -109,7 +109,7 @@ test.each(["tmux", "herdr"] as const)("%s: host が追加するタイトルは�
       const launcher = makeSessionLauncher({ agent: "codex", backend, runner: t.runner, codexAppServer: appServer,
         store: new SessionMetadataStore(tempDir()), agentClamp: CLAMP });
       expect((await launcher(tempDir(), "s-priority", null, resume, null, title)).exitCode).toBe(0);
-      expect(t.inner()).toContain(`${PREFIX}codex resume --remote unix:///tmp/fake.sock --no-alt-screen ${resume ?? "thread-new"}`);
+      expect(t.inner()).toContain(`${PREFIX}codex resume --remote unix:///tmp/fake.sock --no-alt-screen -c check_for_update_on_startup=false ${resume ?? "thread-new"}`);
     }
   }
 });
@@ -138,7 +138,10 @@ test.each(["claude-new", "claude-resume", "claude-continue", "codex-new", "codex
     if (kind === "claude-new") expect(args.slice(0, 4)).toEqual(["--session-id", "11111111-2222-3333-4444-555555555555", "--name", title]);
     else if (kind === "claude-resume") expect(args.slice(0, 2)).toEqual(["--resume", "session-id"]);
     else if (kind === "claude-continue") expect(args[0]).toBe("--continue");
-    else expect(args).toEqual(["resume", "--remote", "unix:///tmp/fake.sock", "--no-alt-screen", kind.endsWith("resume") ? "session-id" : "thread-new"]);
+    else expect(args).toEqual([
+      "resume", "--remote", "unix:///tmp/fake.sock", "--no-alt-screen",
+      "-c", "check_for_update_on_startup=false", kind.endsWith("resume") ? "session-id" : "thread-new",
+    ]);
   }
 });
 
@@ -220,6 +223,7 @@ describe.each(modes)("エージェント起動: $name", ({ probe, enabled }) => 
       if (enabled) expect(inner).toContain(`${PREFIX}claude`);
       else expect(inner).not.toContain("taskpolicy");
       expect(inner).toContain("CLAUDE_CODE_ENABLE_TODO_TOOLS=1");
+      expect(inner).toContain('"DISABLE_AUTOUPDATER":"1"');
       expect(inner).toContain("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=1000000000 ");
       if (kind === "resume") {
         expect(inner).toContain("claude --model opus --resume session-id");
@@ -244,7 +248,7 @@ describe.each(modes)("エージェント起動: $name", ({ probe, enabled }) => 
       expect((await launcher(tempDir(), "s-priority", null, resume)).exitCode).toBe(0);
       const inner = t.inner();
       expect(inner).toContain("while ! find ");
-      expect(inner).toContain(`s=$(date +%s); ${enabled ? PREFIX : ""}codex resume --remote unix:///tmp/fake.sock --no-alt-screen ${resume ?? "thread-new"}; rc=$?;`);
+      expect(inner).toContain(`s=$(date +%s); ${enabled ? PREFIX : ""}codex resume --remote unix:///tmp/fake.sock --no-alt-screen -c check_for_update_on_startup=false ${resume ?? "thread-new"}; rc=$?;`);
       if (!enabled) expect(inner).not.toContain("taskpolicy");
       expect(t.calls.every((c) => !c.exe.includes("taskpolicy"))).toBe(true);
       expect(appServer.startThread).toHaveBeenCalledTimes(resume === null ? 1 : 0);
@@ -303,7 +307,7 @@ test("herdr の短い直接コマンド / 長い起動スクリプトのどち�
 
 test("utility 固定を明示的に空に差し替えた Codex 再試行コマンドは従来のまま", () => {
   const command = codexRemoteResumeCommand("codex", "thread-id", "unix://", []);
-  expect(command).toContain("s=$(date +%s); codex resume --remote unix:// --no-alt-screen thread-id; rc=$?;");
+  expect(command).toContain("s=$(date +%s); codex resume --remote unix:// --no-alt-screen -c check_for_update_on_startup=false thread-id; rc=$?;");
   expect(command).not.toContain("taskpolicy");
 });
 
@@ -349,8 +353,8 @@ test.each(["/bin/sh", "/bin/zsh"].filter((shell) => fs.existsSync(shell)))(
       timeout: 5000,
     }, (error) => error ? reject(error) : resolve()));
     expect(fs.readFileSync(path.join(dir, "policy.log"), "utf8").trim().split("\n")).toEqual([
-      "-c utility codex resume --remote unix:// --no-alt-screen thread-retry",
-      "-c utility codex resume --remote unix:// --no-alt-screen thread-retry",
+      "-c utility codex resume --remote unix:// --no-alt-screen -c check_for_update_on_startup=false thread-retry",
+      "-c utility codex resume --remote unix:// --no-alt-screen -c check_for_update_on_startup=false thread-retry",
     ]);
   },
 );

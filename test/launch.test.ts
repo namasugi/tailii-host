@@ -174,6 +174,7 @@ describe("launchCore", () => {
     // 承認フックは settings.json へ書かず、この起動限定に `--settings '<json>'` で渡す。
     expect(newCall?.args[4]).toMatch(/^sleep 300 --settings /);
     expect(newCall?.args[4]).toContain("hook --session work");
+    expect(newCall?.args[4]).toContain('"DISABLE_AUTOUPDATER":"1"');
     expect(newCall?.cwd).toBe(dir);
     expect(store.get("work")).toEqual({ name: "work", cwd: dir, createdAt: 42 });
     // リポジトリの settings.json は汚さない（書き込まれない）。
@@ -457,7 +458,7 @@ describe("launchCore（codex モード）", () => {
       " -e '\"type\": ?\"turn_context\"' {} \\; -print -quit 2>/dev/null | grep -q .; do sleep 0.2; done",
     );
     expect(newCall?.args[4]).toContain(
-      "; n=0; while :; do s=$(date +%s); codex resume --remote unix:// --no-alt-screen thread-new; rc=$?;",
+      "; n=0; while :; do s=$(date +%s); codex resume --remote unix:// --no-alt-screen -c check_for_update_on_startup=false thread-new; rc=$?;",
     );
     // 起動 15 秒未満の非 0 終了だけ再試行（20 回までは 2 秒、以後 15 秒間隔で継続）。
     expect(newCall?.args[4]).toContain(
@@ -487,7 +488,7 @@ describe("launchCore（codex モード）", () => {
     // remote resume + 信頼オーバーライド。App Server 経路では hook は付けない。
     expect(newCall?.args[4]).toContain("-name '*abc-123*.jsonl'");
     expect(newCall?.args[4]).toContain(
-      "; n=0; while :; do s=$(date +%s); codex resume --remote unix:// --no-alt-screen abc-123; rc=$?;",
+      "; n=0; while :; do s=$(date +%s); codex resume --remote unix:// --no-alt-screen -c check_for_update_on_startup=false abc-123; rc=$?;",
     );
     expect(newCall?.args[4]).not.toContain("CLAUDE_CODE_RESUME_THRESHOLD_MINUTES");
     expect(newCall?.args[4]).not.toContain("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD");
@@ -609,7 +610,7 @@ describe("makeSessionLauncher: claude --session-id / --name の合成（lazy-ses
       await launcher(dir, "s-3", null, "resume-id", null, "無視される名前");
       const inner = recorded.find((c) => c.args[0] === "new")?.args[4];
       expect(inner).toMatch(
-        /^CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=525600 CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=1000000000 claude --resume resume-id/,
+        /^DISABLE_AUTOUPDATER=1 CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=525600 CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=1000000000 claude --resume resume-id/,
       );
       expect(inner).not.toContain("--name");
       expect(inner).not.toContain("--session-id");

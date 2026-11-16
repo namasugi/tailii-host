@@ -105,9 +105,10 @@ const CLAUDE_OUTPUT_STYLE = /^[A-Za-z0-9][A-Za-z0-9 _.-]{0,39}$/;
 export function mergeClaudeLaunchSettings(
   hookSettingsJson: string | null,
   outputStyle: string | null | undefined,
+  disableAutoUpdate = false,
 ): string | null {
   const style = outputStyle && CLAUDE_OUTPUT_STYLE.test(outputStyle.trim()) ? outputStyle.trim() : null;
-  if (style === null) return hookSettingsJson;
+  if (style === null && !disableAutoUpdate) return hookSettingsJson;
   let base: Record<string, unknown> = {};
   if (hookSettingsJson !== null) {
     try {
@@ -119,7 +120,12 @@ export function mergeClaudeLaunchSettings(
       base = {};
     }
   }
-  base["outputStyle"] = style;
+  if (style !== null) base["outputStyle"] = style;
+  if (disableAutoUpdate) {
+    const value = base["env"];
+    const env = typeof value === "object" && value !== null && !Array.isArray(value) ? value : {};
+    base["env"] = { ...env, DISABLE_AUTOUPDATER: "1" };
+  }
   return JSON.stringify(base);
 }
 
@@ -170,7 +176,8 @@ export function claudeLaunchEnvPrefix(options: {
   defaultModel?: string | null;
   hasModelFlag?: boolean;
 }): string {
-  const parts: string[] = [];
+  // Tailiiからの起動では更新を通知と明示操作に集約する。会話の再起動は行わない。
+  const parts: string[] = ["DISABLE_AUTOUPDATER=1"];
   if (options.todoTools === true) parts.push(CLAUDE_TODO_TOOLS_ENV);
   const model = options.defaultModel?.trim() ?? "";
   if (!options.hasModelFlag && model.length > 0 && DEFAULT_MODEL_ENV_SAFE.test(model)) {
@@ -664,7 +671,9 @@ export function codexRemoteResumeCommand(
   // 変わっても、TUI が一度失敗しただけで pane ごと消える（pane not found 連打・ライブビュー消失）
   // 事態にしない。長時間動いた後の終了（利用者操作・kill）は再試行しない。exec せず shell を
   // 親に残すのはこのループのため。
-  const resume = `${clamp}codex resume --remote ${remoteEndpoint} --no-alt-screen ${sessionId}`;
+  // 表示用 TUI が更新確認で止まると App Server の作業は進んでもライブビューを取得できない。
+  // この起動だけ更新確認を無効にし、利用者の config.toml や通常の Codex 起動は変えない。
+  const resume = `${clamp}codex resume --remote ${remoteEndpoint} --no-alt-screen -c check_for_update_on_startup=false ${sessionId}`;
   const retryBootstrap =
     `n=0; while :; do s=$(date +%s); ${resume}; rc=$?;` +
     " if [ $rc -ne 0 ] && [ $(( $(date +%s) - s )) -lt 15 ];" +
@@ -780,8 +789,9 @@ export async function launchCore(options: {
       }),
       claudeVersion: (options.claudeVersion ?? (() => readObservedClaudeVersion()))(),
     });
-    // 出力スタイル（Concise 等）も同じ起動限定 `--settings` に合成する（settings.json は書かない）。
-    const launchSettings = mergeClaudeLaunchSettings(hookSettings, options.outputStyle ?? null);
+    // shellのenvだけではsettings.jsonで上書きされるため、自動更新停止も起動限定設定へ合成する。
+    // フック無効時も有効。出力スタイル・他のenvは保ち、設定ファイルへは書かない。
+    const launchSettings = mergeClaudeLaunchSettings(hookSettings, options.outputStyle ?? null, true);
     if (launchSettings !== null) {
       innerCommand = `${innerCommand} --settings ${shellSingleQuote(launchSettings)}`;
     }

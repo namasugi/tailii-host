@@ -658,6 +658,8 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
       ...(latestClientBuild !== null ? { latestClientBuild } : {}),
       // プッシュ通知の登録を受け付ける（push v1）。アプリはこれがある host にだけ push_register を送る。
       push: 1,
+      codexUpdate: 1,
+      claudeUpdate: 1,
     });
 
     // ---- 1.5 画像 pending を drain し image_available を送出 ----
@@ -1330,6 +1332,8 @@ export const CONCURRENT_MESSAGE_TYPES: ReadonlySet<ControlMessage["type"]> = new
   "file_search_request",
   "usage_request",
   "account_usage_request",
+  "codex_update_request",
+  "claude_update_request",
   "claude_model_list_request",
   "codex_model_list_request",
   "official_app_status_request",

@@ -1,0 +1,10 @@
+{"action":"check","id":"check-1","type":"codex_update_request","v":1}
+{"action":"install","id":"install-1","type":"codex_update_request","v":1}
+{"id":"update-available","type":"codex_update_response","update":{"canUpdate":true,"currentVersion":"0.167.2","latestVersion":"0.169.0","status":"available"},"v":1}
+{"id":"update-updating","type":"codex_update_response","update":{"canUpdate":true,"currentVersion":"0.167.2","latestVersion":"0.169.0","status":"updating"},"v":1}
+{"id":"update-updated","type":"codex_update_response","update":{"canUpdate":true,"currentVersion":"0.167.2","latestVersion":"0.169.0","status":"updated"},"v":1}
+{"id":"update-failed","type":"codex_update_response","update":{"canUpdate":true,"currentVersion":"0.167.2","error":"更新できませんでした。もう一度お試しください。","latestVersion":"0.169.0","status":"failed"},"v":1}
+{"id":"update-unsupported","type":"codex_update_response","update":{"canUpdate":false,"currentVersion":"0.167.2","latestVersion":"0.169.0","status":"unsupported"},"v":1}
+{"id":"update-unavailable","type":"codex_update_response","update":{"canUpdate":false,"currentVersion":"0.167.2","latestVersion":"0.169.0","status":"unavailable"},"v":1}
+{"id":"update-current","type":"codex_update_response","update":{"canUpdate":true,"currentVersion":"0.167.2","latestVersion":"0.169.0","status":"current"},"v":1}
+{"codexUpdate":1,"maxVersion":2,"type":"channel_hello","v":1}
