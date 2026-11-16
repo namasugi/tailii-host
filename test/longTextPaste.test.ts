@@ -8,7 +8,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { HerdrSessionManager, type HerdrCommandResult, type HerdrCommandRunner } from "../src/backend/herdr.js";
 import {
   BRACKETED_PASTE_END,
@@ -21,6 +21,7 @@ import {
   INLINE_PASTE_MAX_BYTES,
   INLINE_PASTE_MAX_CHARS,
   INLINE_PASTE_MAX_NEWLINES,
+  INJECT_VERIFY_BUDGET_MS,
   inputBoxRealText,
   loginCodeScreenState,
   inputBoxTextIncludesProbe,
@@ -1494,7 +1495,7 @@ describe("tmux: 長い本文の注入", () => {
 
 describe("herdr: 長い本文の注入", () => {
   /** `failPasteAt`: その回の括弧付き貼り付けの send-text を、入力欄へ入れずに失敗で返す。 */
-  function makeManager(tui: Tui, options: { failPasteAt?: number } = {}) {
+  function makeManager(tui: Tui, options: { failPasteAt?: number; inputVerifyTimeoutMs?: number } = {}) {
     const store = new SessionMetadataStore(makeTempDir("long-text-paste-herdr"));
     store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
     const herdrOk = (stdout: string): HerdrCommandResult => ({ exitCode: 0, stdout, stderr: "" });
@@ -1527,7 +1528,7 @@ describe("herdr: 長い本文の注入", () => {
     };
     const manager = new HerdrSessionManager({
       runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: options.inputVerifyTimeoutMs ?? 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 1000, readyPollMs: 0,
       pastedTextPollMs: 1, pastedTextTimeoutMs: 40, clearSettleMs: 10,
     });
@@ -1670,12 +1671,43 @@ describe("herdr: 長い本文の注入", () => {
     }
   });
 
-  test("打つ経路の本文は、従来どおり 3 回まで打ち直す（変更していない）", async () => {
+  test("短文も、CLI が止まっていたら打ち直さず、後から入る本文を 1 回ぶんに保つ", async () => {
     const tui = makeTui();
     const { manager, recorded } = makeManager(tui);
     tui.state.stalled = true;
     await expect(manager.sendTextSubmit("s-a", "短い本文です。届きますか")).rejects.toThrow(/typed text did not reach/);
-    expect(recorded.filter((args) => args[1] === "send-text" && args[3] === "短い本文です。届きますか")).toHaveLength(3);
+    expect(recorded.filter((args) => args[1] === "send-text" && args[3] === "短い本文です。届きますか")).toHaveLength(1);
+    expect(tui.state.submitted).toEqual([]);
+    tui.resume();
+    expect(tui.state.input).toBe("短い本文です。届きますか");
+    // 上限を超えた後の同じ本文の明示再送でも、残存を消して 1 通だけ届ける。
+    const discarded: string[] = [];
+    await manager.sendTextSubmit("s-a", "短い本文です。届きますか", { onResidueDiscarded: (text) => discarded.push(text) });
+    expect(discarded).toEqual([]);
+    expect(tui.state.submitted).toEqual(["短い本文です。届きますか"]);
+  });
+
+  test.each([2500, 9500])("CLI の読み取りが %i ms 止まっても、検証予算内に戻れば短文を 1 通だけ届ける", async (delayMs) => {
+    vi.useFakeTimers();
+    try {
+      const tui = makeTui();
+      const { manager, recorded } = makeManager(tui, { inputVerifyTimeoutMs: INJECT_VERIFY_BUDGET_MS });
+      const text = "書き込みの排他制御は検討が必要だな";
+      tui.state.stalled = true;
+      const send = manager.sendTextSubmit("s-a", text);
+      await vi.advanceTimersByTimeAsync(delayMs);
+      const sends = () => recorded.filter((args) => args[1] === "send-text").map((args) => args[3]);
+      expect(sends()).toEqual([text]);
+      expect(tui.state.submitted).toEqual([]);
+      tui.resume();
+      await vi.advanceTimersByTimeAsync(1000);
+      await send;
+      expect(tui.state.input).toBe("");
+      expect(tui.state.submitted).toEqual([text]);
+      expect(sends()).toEqual([text, "\r"]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("貼り付けが途中で失敗して送らなかった本文の断片が後から入っても、次の別の発話の前に送らずに消して知らせる", async () => {

@@ -416,6 +416,10 @@ describe("HerdrSessionManager", () => {
     visibleTailLines?: number;
     /** 本文の send-text が届いた瞬間に選択ダイアログを開く（注入がダイアログを誘発する再現）。 */
     openDialogOnText?: boolean;
+    /** 選択ダイアログの代わりに表示する承認・確認画面。 */
+    dialogScreen?: string;
+    /** 最初の C-u が届いた直後にダイアログを開く。 */
+    openDialogOnClear?: boolean;
     /** pane read が常にこの画面を返す（罫線なし=入力欄不可視の再現）。 */
     plainScreen?: string;
     /** 最初の N 回の pane read は起動中の画面（入力欄の罫線なし）を返す（TUI 起動待ちの再現, boot-gate）。 */
@@ -455,7 +459,7 @@ describe("HerdrSessionManager", () => {
       "╰──────────────────────────────╯",
       "",
     ].join("\n");
-    const dialogScreen = [
+    const dialogScreen = options.dialogScreen ?? [
       "   Remote Control",
       "     Disconnect this session",
       "   ❯ Continue",
@@ -498,6 +502,7 @@ describe("HerdrSessionManager", () => {
           lines[lines.length - 1] = "";
           state.input = lines.length === 1 ? "" : lines.join("\n");
         }
+        if (options.openDialogOnClear === true) state.dialogOpen = true;
         return herdrOk("");
       }
       if (args[0] === "pane" && args[1] === "send-text" && args[3] === "\u001b[1;5F") {
@@ -602,7 +607,7 @@ describe("HerdrSessionManager", () => {
     const { runner, state } = makeSubmitHarness({ initialInput: "前回の本文" });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     const discarded: string[] = [];
@@ -627,7 +632,7 @@ describe("HerdrSessionManager", () => {
     const { runner, state } = makeSubmitHarness({ initialInput: text });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     const discarded: string[] = [];
@@ -663,7 +668,7 @@ describe("HerdrSessionManager", () => {
       const { runner, state } = makeSubmitHarness(harnessOptions);
       const manager = new HerdrSessionManager({
         runner: runner.runner, store,
-        submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+        submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
         readyTimeoutMs: 5000, readyPollMs: 1, inputBoxReadyTimeoutMs: 5000,
       });
       let checks = 0;
@@ -688,7 +693,7 @@ describe("HerdrSessionManager", () => {
       const { runner, state } = makeSubmitHarness(failure);
       const manager = new HerdrSessionManager({
         runner: runner.runner, store,
-        submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+        submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
         readyTimeoutMs: 5000, readyPollMs: 0,
       });
       await expect(manager.sendTextSubmit("s-a", text, { onResidueDiscarded: () => {} }))
@@ -719,7 +724,7 @@ describe("HerdrSessionManager", () => {
     const { runner, state } = makeSubmitHarness({ swallowEnters: 1000 });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     await manager.sendTextSubmit("s-a", "はい", { onUnconfirmedSubmit: () => {} });
@@ -751,7 +756,7 @@ describe("HerdrSessionManager", () => {
     const { runner } = makeSubmitHarness({ initialInput: "中周(r≈175)を1枚足す" });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     let asked = 0;
@@ -773,7 +778,7 @@ describe("HerdrSessionManager", () => {
     const { runner, state } = makeSubmitHarness({ swallowEnters: 1000 });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     let unconfirmed = 0;
@@ -801,7 +806,7 @@ describe("HerdrSessionManager", () => {
     const { runner } = makeSubmitHarness({ initialInput: "Mac 側の下書き" });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     await manager.sendTextSubmit("s-a", "/remote-control");
@@ -818,7 +823,7 @@ describe("HerdrSessionManager", () => {
     const { runner } = makeSubmitHarness({ initialInput: "queued だった本文" });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     const discarded: string[] = [];
@@ -835,7 +840,7 @@ describe("HerdrSessionManager", () => {
     const restored = makeSubmitHarness({ initialInput: "直近の発話" });
     const managerR = new HerdrSessionManager({
       runner: restored.runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     const discardedR: string[] = [];
@@ -847,7 +852,7 @@ describe("HerdrSessionManager", () => {
     const empty = makeSubmitHarness();
     const manager2 = new HerdrSessionManager({
       runner: empty.runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     let asked = 0;
@@ -862,7 +867,7 @@ describe("HerdrSessionManager", () => {
     const { runner } = makeSubmitHarness({ initialInput: prompt, wrapWidth: 20 });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     await manager.sendTextSubmit("s-a", "次の本文", { recordedPromptText: () => prompt });
@@ -879,7 +884,7 @@ describe("HerdrSessionManager", () => {
     const { runner } = makeSubmitHarness({ ghostInput: "中周(r≈175)を1枚足す" });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     // 1 キーも本文を打っていない「打つ前の拒否」（配送不明に積まない）。
@@ -949,7 +954,7 @@ describe("HerdrSessionManager", () => {
     const { runner } = makeSubmitHarness({ plainScreen: loginCodeScreen });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     // 通常経路はフォールバックの `❯ /login` 行を未送信テキストと誤認して Enter・反映検証失敗で
@@ -1021,7 +1026,7 @@ describe("HerdrSessionManager", () => {
       const { runner } = makeSubmitHarness({ plainScreen: screen });
       const manager = new HerdrSessionManager({
         runner: runner.runner, store,
-        submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+        submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0,
         readyTimeoutMs: 5000, readyPollMs: 0,
       });
       await expect(manager.sendTextSubmit("s-a", "こんにちは")).rejects.toThrow(/\/login の途中/);
@@ -1147,7 +1152,7 @@ describe("HerdrSessionManager", () => {
     });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     await manager.sendTextSubmit("s-a", "こんにちは");
@@ -1160,33 +1165,32 @@ describe("HerdrSessionManager", () => {
     ]);
   });
 
-  test("sendTextSubmit: limbo 黙殺（本文が入力欄に入らない）は再投入し、回復しなければ throw する", async () => {
+  test("sendTextSubmit: 本文が入力欄に入らなければ、打ち直さずに throw する", async () => {
     const store = makeStore();
     store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
     const { runner } = makeSubmitHarness({ swallowTextInputs: 99 });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
-    // 3 回とも反映されず throw（chat_send は uncertain となり silent loss を防ぐ）。
+    // 空の画面でも、CLI がまだ読んでいない本文は PTY に残りうる。重ね打ちも Enter も送らない。
     await expect(manager.sendTextSubmit("s-a", "重要なメッセージ")).rejects.toThrow();
     expect(submitSends(runner)).toEqual([
-      ["pane", "send-text", "w4:p2", "重要なメッセージ"],
-      ["pane", "send-text", "w4:p2", "重要なメッセージ"],
       ["pane", "send-text", "w4:p2", "重要なメッセージ"],
     ]);
   });
 
-  test("sendTextSubmit: limbo が明けたら再投入で回復し送信を完了する", async () => {
+  test("sendTextSubmit: limbo が明けた後の明示再送で、1 通だけ届ける", async () => {
     const store = makeStore();
     store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
     const { runner } = makeSubmitHarness({ swallowTextInputs: 1 });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
+    await expect(manager.sendTextSubmit("s-a", "重要なメッセージ")).rejects.toThrow(/typed text did not reach/);
     await manager.sendTextSubmit("s-a", "重要なメッセージ");
     expect(submitSends(runner)).toEqual([
       ["pane", "send-text", "w4:p2", "重要なメッセージ"],
@@ -1202,7 +1206,7 @@ describe("HerdrSessionManager", () => {
     const { runner } = makeSubmitHarness({ wrapWidth: 10 });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     const text = "このメッセージが二重になっていないか確認したいので、ZQ とだけ返して。";
@@ -1214,27 +1218,52 @@ describe("HerdrSessionManager", () => {
     ]);
   });
 
-  test("sendTextSubmit: 描画遅延の偽陰性で再投入するときは先に C-u で入力欄を空にする（初回送信二重化の根因②）", async () => {
+  test("sendTextSubmit: 描画が遅れても、打ち直さずに反映を待って送る", async () => {
     const store = makeStore();
     store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
-    // 事前確認（描画ゲート/ダイアログ/残存/シェルモード）の 4 read + attempt1 の反映検証
-    // 2 read までは入力欄が空描画（ブート直後の TUI 描画遅延を模す。罫線はあるので描画
-    // ゲートは通る）。
+    // 本文を打っても画面はしばらく空のまま。空表示を「消せた」と読んで重ね打ちしない。
     const { runner, state } = makeSubmitHarness({ hideInputReads: 6 });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 1000,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     await manager.sendTextSubmit("s-a", "はじめまして。よろしくお願いします。");
-    // 再投入前に C-u でクリアされ、送信直前の入力欄は本文 1 つ分（連結されない）。
+    // C-u も再投入もせず、届いた 1 通ぶんだけを送る。
     expect(submitSends(runner)).toEqual([
-      ["pane", "send-text", "w4:p2", "はじめまして。よろしくお願いします。"],
-      ["pane", "send-text", "w4:p2", "\u0015"],
       ["pane", "send-text", "w4:p2", "はじめまして。よろしくお願いします。"],
       ["pane", "send-text", "w4:p2", "\r"],
     ]);
     expect(state.input).toBe("");
+  });
+
+  test("sendTextSubmit: 起動待ちが 12 秒を越えても、打った本文の描画を待つ猶予を残す", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = makeStore();
+      store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+      const { runner } = makeSubmitHarness({ hideInputReads: 6 });
+      let delayed = false;
+      const manager = new HerdrSessionManager({
+        store,
+        runner: async (args) => {
+          if (!delayed && args[0] === "pane" && args[1] === "read") {
+            delayed = true;
+            await new Promise((resolve) => setTimeout(resolve, 13_000));
+          }
+          return runner.runner(args);
+        },
+      });
+      const send = manager.sendTextSubmit("s-a", "起動後の最初の本文");
+      await vi.advanceTimersByTimeAsync(15_000);
+      await send;
+      expect(submitSends(runner)).toEqual([
+        ["pane", "send-text", "w4:p2", "起動後の最初の本文"],
+        ["pane", "send-text", "w4:p2", "\r"],
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("sendTextSubmit: 入力欄を空にできないときは再投入せず throw する（二重化より明示再送）", async () => {
@@ -1244,7 +1273,7 @@ describe("HerdrSessionManager", () => {
     const { runner } = makeSubmitHarness({ ghostInput: "消えない別の残骸テキスト" });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     // 残存が居座る画面では、本文を打つ前の残存クリアが成立しない時点で失敗する
@@ -1266,7 +1295,7 @@ describe("HerdrSessionManager", () => {
     const { runner } = makeSubmitHarness({ visibleTailLines: 1 });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     const text = "一行目は窓の外に消える\n二行目も見えない\n三行目の末尾だけが見えている";
@@ -1284,7 +1313,7 @@ describe("HerdrSessionManager", () => {
     const { runner } = makeSubmitHarness({ openDialogOnText: true });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     await expect(manager.sendTextSubmit("s-a", "ダイアログを開く本文")).rejects.toThrow(
@@ -1297,6 +1326,34 @@ describe("HerdrSessionManager", () => {
     ).toHaveLength(1);
   });
 
+  test.each([
+    ["ツール承認", "   ❯ 1. Yes\n     2. No\n\n  Esc to cancel · Tab to amend"],
+    ["確認", "   ❯ Open System Settings → Screen Recording\n     Try again\n\n  Enter to confirm · Esc to cancel"],
+    ["複数 MCP の承認", "   ❯ [✔] first-server\n     [✔] second-server\n     Enable selected\n  Space to select · Esc to reject all"],
+  ])("sendTextSubmit: 反映待ちの間に%s画面が出ても、後片付けでキーを送らない", async (_label, dialogScreen) => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const { runner } = makeSubmitHarness({ openDialogOnText: true, dialogScreen });
+    const manager = new HerdrSessionManager({
+      runner: runner.runner, store,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
+    });
+    await expect(manager.sendTextSubmit("s-a", "反映を待っている本文")).rejects.toThrow(/did not reach the input box/);
+    expect(submitSends(runner)).toEqual([["pane", "send-text", "w4:p2", "反映を待っている本文"]]);
+  });
+
+  test("clearInputBox: 消している途中で承認画面に切り替わったら、その時点でキーを止める", async () => {
+    const store = makeStore();
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const { runner } = makeSubmitHarness({
+      initialInput: "先頭の本文\n末尾の本文", openDialogOnClear: true,
+      dialogScreen: "   ❯ 1. Yes\n     2. No\n\n  Esc to cancel · Tab to amend",
+    });
+    const manager = new HerdrSessionManager({ runner: runner.runner, store, clearKeyDelayMs: 0 });
+    expect(await manager.clearInputBox("s-a")).toBe(false);
+    expect(submitSends(runner)).toEqual([["pane", "send-text", "w4:p2", "\u0015"]]);
+  });
+
   test("sendTextSubmit: 入力欄が見えない画面では 1 キーも打たずに throw する（boot-gate）", async () => {
     const store = makeStore();
     store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
@@ -1305,7 +1362,7 @@ describe("HerdrSessionManager", () => {
     const { runner } = makeSubmitHarness({ plainScreen: "ただのシェル出力\n$ " });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0, inputBoxReadyTimeoutMs: 0,
     });
     await expect(manager.sendTextSubmit("s-a", "見えない本文")).rejects.toThrow(
@@ -1322,7 +1379,7 @@ describe("HerdrSessionManager", () => {
     const { runner, state } = makeSubmitHarness({ bootReads: 3 });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0, inputBoxReadyTimeoutMs: 5000,
     });
     await manager.sendTextSubmit("s-a", "はじめまして");
@@ -1358,7 +1415,7 @@ describe("HerdrSessionManager", () => {
     const { runner, state } = makeSubmitHarness({ scrolledScreen });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0, inputBoxReadyTimeoutMs: 5000,
       jumpSettleMs: 0, scrollBottomKeyAvailable: () => true,
     });
@@ -1378,7 +1435,7 @@ describe("HerdrSessionManager", () => {
     const { runner } = makeSubmitHarness({ scrolledScreen, readFailsAfterJump: true });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0, inputBoxReadyTimeoutMs: 5000,
       jumpSettleMs: 0, scrollBottomKeyAvailable: () => true,
     });
@@ -1393,7 +1450,7 @@ describe("HerdrSessionManager", () => {
     const { runner } = makeSubmitHarness({ scrolledScreen, jumpIgnored: true, escapeRevealsInput: true });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0, inputBoxReadyTimeoutMs: 20_000,
       jumpSettleMs: 0, scrollBottomKeyAvailable: () => true,
     });
@@ -1415,7 +1472,7 @@ describe("HerdrSessionManager", () => {
     const { runner } = makeSubmitHarness({ scrolledScreen });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0, inputBoxReadyTimeoutMs: 20_000,
       jumpSettleMs: 0, scrollBottomKeyAvailable: () => false,
     });
@@ -1432,7 +1489,7 @@ describe("HerdrSessionManager", () => {
       const { runner, state } = makeSubmitHarness({ scrolledScreen, jumpIgnored: true, escapeRevealsInput: true });
       const manager = new HerdrSessionManager({
         runner: runner.runner, store,
-        submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+        submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
         readyTimeoutMs: 5000, readyPollMs: 0, inputBoxReadyTimeoutMs: 5000,
         jumpSettleMs: 0, scrollBottomKeyAvailable: () => jumpAllowed,
       });
@@ -1460,7 +1517,7 @@ describe("HerdrSessionManager", () => {
     });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0, inputBoxReadyTimeoutMs: 5000,
       jumpSettleMs: 0, scrollBottomKeyAvailable: () => false,
     });
@@ -1482,7 +1539,7 @@ describe("HerdrSessionManager", () => {
     const { runner, state } = makeSubmitHarness({ swallowEnters: 1000 });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     await manager.sendTextSubmit("s-a", "止まっていた間の本文", { onUnconfirmedSubmit: () => {} });
@@ -1509,7 +1566,7 @@ describe("HerdrSessionManager", () => {
     const { runner } = makeSubmitHarness({ scrolledScreen, jumpIgnored: true });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0, inputBoxReadyTimeoutMs: 5000,
       jumpSettleMs: 0, scrollBottomKeyAvailable: () => false,
     });
@@ -1531,7 +1588,7 @@ describe("HerdrSessionManager", () => {
     const { runner } = makeSubmitHarness({ bootReads: 1000 });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0, inputBoxReadyTimeoutMs: 0,
     });
     await expect(manager.sendTextSubmit("s-a", "はじめまして")).rejects.toThrow(
@@ -1546,7 +1603,7 @@ describe("HerdrSessionManager", () => {
     const { runner } = makeSubmitHarness({ openDialogOnEnter: true });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     await manager.sendTextSubmit("s-a", "/remote-control");
@@ -1591,7 +1648,7 @@ describe("HerdrSessionManager", () => {
     const { runner } = makeSubmitHarness({ dialogInitiallyOpen: true });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     await manager.sendTextSubmit("s-a", "こんにちは");
@@ -1608,7 +1665,7 @@ describe("HerdrSessionManager", () => {
     const { runner } = makeSubmitHarness({ dialogInitiallyOpen: true, escapeStuck: true });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, choiceCancelPollMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, choiceCancelPollMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     let cancelled = 0;
@@ -1628,7 +1685,7 @@ describe("HerdrSessionManager", () => {
     const { runner } = makeSubmitHarness({ dialogInitiallyOpen: true });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, choiceCancelPollMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, choiceCancelPollMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     let cancelled = 0;
@@ -1654,7 +1711,7 @@ describe("HerdrSessionManager", () => {
     });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, choiceCancelPollMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, choiceCancelPollMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     const attempt = manager.sendTextSubmit("s-a", "1", { cancelChoiceDialog: true });
@@ -1674,7 +1731,7 @@ describe("HerdrSessionManager", () => {
     });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, choiceCancelPollMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, choiceCancelPollMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     // 画面を固定しているので本文の反映検証は通らない（ここで見たいのは Esc の有無だけ）。
@@ -1688,7 +1745,7 @@ describe("HerdrSessionManager", () => {
     const { runner, state } = makeSubmitHarness();
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     // 先頭 `!` はモード記号に吸われ入力欄には `! ls -la` と描画される。旧実装は `❯` 行が
@@ -1708,7 +1765,7 @@ describe("HerdrSessionManager", () => {
     const { runner, state } = makeSubmitHarness({ initiallyShellMode: true });
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
     // 戻さずに注入すると通常メッセージがそのままシェルコマンドとして実行される。
@@ -1730,7 +1787,7 @@ describe("HerdrSessionManager", () => {
     const { runner } = makeSubmitHarness();
     const manager = new HerdrSessionManager({
       runner: runner.runner, store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
 
@@ -1760,7 +1817,7 @@ describe("HerdrSessionManager", () => {
         return runner.runner(args);
       },
       store,
-      submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0,
+      submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0,
       readyTimeoutMs: 5000, readyPollMs: 0,
     });
 

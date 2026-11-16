@@ -640,8 +640,8 @@ export class HerdrSessionManager {
   private readonly pastedTextPollMs: number;
   private readonly pastedTextTimeoutMs: number;
   private readonly clearSettleMs: number;
-  /** 入力欄へ本文が反映されなかったときの再投入間隔 ms（RC 切断 limbo 対策）。 */
-  private readonly inputRetryDelayMs: number;
+  /** 打った本文が入力欄へ反映されるまで待つ上限 ms。本文は打ち直さない。 */
+  private readonly inputVerifyTimeoutMs: number;
   /** clearInputBox の C-u 1回ごとの反映待ち ms（実測レイテンシ 9〜27ms。テスト注入用）。 */
   private readonly clearKeyDelayMs: number;
   /** 注入前の claude 検出待ちの上限/間隔 ms（テスト注入用）。 */
@@ -675,7 +675,7 @@ export class HerdrSessionManager {
     pastedTextTimeoutMs?: number;
     /** C-u をまとめて打った後、入力欄が変わるのを待つ上限（テスト用に短くできる）。 */
     clearSettleMs?: number;
-    inputRetryDelayMs?: number;
+    inputVerifyTimeoutMs?: number;
     clearKeyDelayMs?: number;
     readyTimeoutMs?: number;
     readyPollMs?: number;
@@ -712,7 +712,7 @@ export class HerdrSessionManager {
     this.pastedTextPollMs = options.pastedTextPollMs ?? PASTED_TEXT_POLL_MS;
     this.pastedTextTimeoutMs = options.pastedTextTimeoutMs ?? PASTED_TEXT_TIMEOUT_MS;
     this.clearSettleMs = options.clearSettleMs ?? TYPED_TEXT_CLEAR_SETTLE_MS;
-    this.inputRetryDelayMs = options.inputRetryDelayMs ?? 1_500;
+    this.inputVerifyTimeoutMs = options.inputVerifyTimeoutMs ?? INJECT_VERIFY_BUDGET_MS;
     this.clearKeyDelayMs = options.clearKeyDelayMs ?? 150;
     this.readyTimeoutMs = options.readyTimeoutMs ?? 10_000;
     this.readyPollMs = options.readyPollMs ?? 300;
@@ -1158,8 +1158,10 @@ export class HerdrSessionManager {
     // Remote Control 切断直後の limbo では typed 入力が入力欄に一切入らず破棄される
     // （実測 2026-07-28: 通常メッセージが本文ごと消失し、旧実装は「入力欄に残っていない
     // = 送信成立」と誤判定して配送済みレシートを発行 → silent loss）。本文が入力欄へ
-    // 反映されたことを検証し、反映されなければ間隔を置いて再投入、最終的に throw して
-    // chat_send を uncertain（アプリの明示再送）へ倒す。
+    // 反映されたことを検証する。CLI の読み取り・描画が止まっていると、画面は空のままでも
+    // PTY に本文が残っている。「空だから消せた」として打ち直すと、後から全部が連結して入る
+    // （2026-11-16 実機: 17 字の本文が 3 回ぶんの 51 字として残った）。本文は 1 回だけ打ち、
+    // 注入全体の検証予算内で反映を待つ。回復しなければ throw して明示再送へ倒す。
     // ここから本文を打つ。送信を確かめられるまでは「自分が打った本文」として覚えておく（確かめられないまま
     // 戻ったら、次の送信で入力欄に残っていても消さずに送り出す。例外で抜けたら覚えを消す）。
     this.ownUnsubmittedText.set(name, text);
@@ -1210,28 +1212,18 @@ export class HerdrSessionManager {
         typed = true;
         typedAtMs = Date.now();
       }
-      for (let attempt = 0; attempt < 3 && !typed; attempt += 1) {
-        if (attempt > 0) {
-          await new Promise((resolve) => setTimeout(resolve, this.inputRetryDelayMs));
-          // 反映検証の偽陰性時にクリアせず再投入すると、前回分と連結され 1 メッセージの
-          // 本文が二重になる（初回送信の本文二重化・実機5件）。再投入前に必ず入力欄を
-          // 空にし、空にできたと確信できなければ再投入を諦めて throw（明示再送）へ倒す。
-          if (!(await this.clearInputBox(name))) break;
-          // クリアがシェルモード記号だけを残すことがある（実測: `!echo ...` へ C-u 1回で
-          // `!` プロンプトの空入力になる）。常に通常モードから再投入する既存方針に合わせる。
-          await this.exitShellMode(name);
-        }
+      if (!typed) {
         await this.sendKeys(name, [text], true);
         typedAtMs = Date.now();
-        // 入力欄に本文が見えるまで短い間隔で確かめる（submit-fast-verify）。見えた時点で進む。
-        // 描画遅延での誤判定 → 再投入で本文が二重になるのを避けるため、見えないと決めるまでの
-        // 待ちは従来と同じ長さ（submitDelayMs + submitVerifyDelayMs）を保つ。
-        if (await pollUntilTrue(() => this.inputBoxContainsText(name, probe as string), {
-          windowMs: this.submitDelayMs + this.submitVerifyDelayMs,
-        })) {
-          typed = true;
-          break;
-        }
+        // 通常は最初の照合で進む。遅れた場合も、本文や C-u を重ねずに読み取りだけを続ける。
+        // 起動待ちや本文送出で使った時間を差し引き、送信確定の時間も残す。ただし起動待ちだけで
+        // 予算を使い切っても、打ち終えた本文の描画には従来の 1.3 秒を残す（boot-gate は最大 20 秒）。
+        typed = await pollUntilTrue(() => this.inputBoxContainsText(name, probe as string), {
+          windowMs: Math.min(this.inputVerifyTimeoutMs, Math.max(
+            this.submitDelayMs + this.submitVerifyDelayMs,
+            startedAtMs + INJECT_VERIFY_BUDGET_MS - Date.now(),
+          )),
+        });
       }
       if (!typed) {
         // 残骸（自分の投入分）を残したまま throw すると、アプリの明示再送時に冒頭の
@@ -1243,7 +1235,7 @@ export class HerdrSessionManager {
         throw new HerdrFailedError(
           ["pane", "send-text", name],
           1,
-          "typed text did not reach the input box (RC limbo / ダイアログ表示中 / 入力欄不可視のいずれか)",
+          "typed text did not reach the input box (CLI の応答・描画の遅延 / RC limbo / ダイアログ表示中 / 入力欄不可視のいずれか)",
         );
       }
       // 起動直後の TUI は CR を飲みやすいので従来どおり長めに空ける。入力欄の描画を待った場合のほか、
@@ -1379,10 +1371,10 @@ export class HerdrSessionManager {
   }
 
   /**
-   * 入力欄を空にする（反映検証が偽陰性だったときの再投入前クリア／throw 前の残骸掃除）。
+   * 入力欄を空にする（新しい送信前の残存の始末／throw 前の残骸掃除）。
    * C-u(kill-line) のみを繰り返す（実測: 2N-1 回で必ず空になる。Backspace は本文の
    * 実文字を削るため使わない）。空にできたら true。次の場合は false を返し、呼び出し側は
-   * 再投入を諦める:
+   * 新しい本文を打つのを諦める:
    * - 選択/承認ダイアログ表示中（本文側の罫線を入力欄と誤認して C-u を撃ち込むと
    *   既存の誤 Esc/誤 Continue と同型の実害になるため、書き込み自体をしない）
    * - 入力欄が見えない（罫線が窓外・描画崩れ・capture 失敗）
@@ -1391,12 +1383,20 @@ export class HerdrSessionManager {
    *
    * トレードオフ（意図的な設計判断）: 中断直後に claude が本文を composer へ書き戻す
    * タイミングと重なると、そのテキストも C-u で消える（receipt なしの破棄）。
-   * 再投入前クリアを省くと「本文二重化」という別のデータ破損になるため、注入経路では
+   * 新しい送信前のクリアを省くと「本文連結」という別のデータ破損になるため、注入経路では
    * 「重複より欠落」を選ぶ（残存の主経路は sendTextSubmit 冒頭の身元判定 — 記録済みの
    * 発話は破棄 / それ以外は Enter flush — が先に守る。restored-prompt-discard）。
    */
   async clearInputBox(name: string): Promise<boolean> {
     try {
+      const captureText = async (): Promise<string | null> => {
+        const screen = await this.captureVisibleScreenAnsi(name);
+        // 反映を待つ間や、先の選択フッター確認の直後に承認・確認画面へ切り替わりうる。
+        // 実際に消す文字を読むのと同じ画面で判定する（選択フッターだけではツール承認や
+        // `Enter to confirm` / 複数 MCP の承認を拾えず、選択肢へ C-u を連打していた）。
+        if (classifySubmitFrame(screen) === "dialog" || screenShowsConfirmDialogFooter(screen)) return null;
+        return inputBoxRealText(screen);
+      };
       let first: string | null = null;
       for (let attempt = 0; attempt < 15; attempt += 1) {
         // ダイアログ判定は selectionDialogVisible（末尾30行窓）に揃える。全画面を
@@ -1405,7 +1405,7 @@ export class HerdrSessionManager {
         if (await this.selectionDialogVisible(name)) return false;
         // 薄字プロンプト提案は「実テキスト無し」= 空扱い（C-u で消えないのに非空判定して
         // 15 回撃ち込み失敗へ退化するのを塞ぐ, prompt-suggestion-chip）。null = 入力欄不明。
-        const realText = inputBoxRealText(await this.captureVisibleScreenAnsi(name));
+        const realText = await captureText();
         if (realText === null) return false;
         if (realText.replace(/\s+/g, "").length === 0) return true;
         first ??= realText;
@@ -1413,7 +1413,7 @@ export class HerdrSessionManager {
         await new Promise((resolve) => setTimeout(resolve, this.clearKeyDelayMs));
       }
       // 上限到達時も最後の C-u の結果は未観測なので、最終状態を見てから判定する。
-      const realText = inputBoxRealText(await this.captureVisibleScreenAnsi(name));
+      const realText = await captureText();
       if (realText === null) return false;
       if (realText.replace(/\s+/g, "").length === 0) return true;
       // 消えてはいるが行が多い（9 行以上の本文は 15 回では消し切れない）。進んでいる限り続ける。

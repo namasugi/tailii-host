@@ -1352,7 +1352,7 @@ describe("送信の門番: 最下部の `Enter to confirm` のフッターは確
         return herdrOk("");
       };
       const manager = new HerdrSessionManager({ runner, store, submitDelayMs: 0, submitVerifyDelayMs: 0,
-        inputRetryDelayMs: 0, clearKeyDelayMs: 0, readyTimeoutMs: 1000, readyPollMs: 0 } as never);
+        inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0, readyTimeoutMs: 1000, readyPollMs: 0 } as never);
       await expect(manager.sendTextSubmit("s-a", "こんにちは")).rejects.toMatchObject({ name: "ChatInjectionRejectedError" });
       expect(recorded.filter((args) => args[1] === "send-text" || args[1] === "send-keys")).toEqual([]);
     }
@@ -1393,7 +1393,7 @@ describe("送信の門番: 行頭が `Enter to confirm` でないフッターと
         if (args[0] === "pane" && args[1] === "read") return herdrOk(SELECT_ONLY);
         return herdrOk("");
       },
-      store, submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0, readyTimeoutMs: 1000, readyPollMs: 0,
+      store, submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0, readyTimeoutMs: 1000, readyPollMs: 0,
     } as never);
     await expect(herdr.sendTextSubmit("s-a", "こんにちは")).rejects.toMatchObject({ name: "ChatInjectionRejectedError" });
     expect(recorded.filter((args) => args[1] === "send-text" || args[1] === "send-keys")).toEqual([]);
@@ -1534,7 +1534,7 @@ describe("MCP が 2 つ以上のときの承認の画面（実物 2.1.325）", (
         if (args[0] === "pane" && args[1] === "read") return herdrOk(MULTI);
         return herdrOk("");
       },
-      store, submitDelayMs: 0, submitVerifyDelayMs: 0, inputRetryDelayMs: 0, clearKeyDelayMs: 0, readyTimeoutMs: 1000, readyPollMs: 0,
+      store, submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0, readyTimeoutMs: 1000, readyPollMs: 0,
     } as never);
     const started = Date.now();
     await expect(herdr.sendTextSubmit("s-a", "こんにちは")).rejects.toMatchObject({ name: "ChatInjectionRejectedError" });
@@ -1806,7 +1806,7 @@ describe("herdr の経路: 確認の画面が出ない `/cd` は「Moved to」�
         }
         return herdrOk("");
       },
-      store, submitDelayMs: 600, submitVerifyDelayMs: 700, inputRetryDelayMs: 0, clearKeyDelayMs: 0,
+      store, submitDelayMs: 600, submitVerifyDelayMs: 700, inputVerifyTimeoutMs: 0, clearKeyDelayMs: 0,
       readyTimeoutMs: 1000, readyPollMs: 0, clearSettleMs: 10,
     } as never);
     const ctx = {
