@@ -2,6 +2,7 @@
 // git ブラウズ/操作: status・diff・log・branch 一覧・checkout・discard・init・
 // worktree 作成/削除。失敗は各 response の空/ok=false 形で返し error 封筒にしない。
 
+import { randomUUID } from "node:crypto";
 import {
   gitBranchList,
   gitCheckout,
@@ -15,6 +16,7 @@ import {
 } from "../../services/gitService.js";
 import { engineDiag, type HandlerRegistry } from "../context.js";
 import { listWorktreesForApp, sweepOrphanWorktrees } from "../worktreeJanitor.js";
+import { missingWorktreeFallback } from "../../shared/paths.js";
 
 export const gitHandlers: HandlerRegistry = {
   git_status_request: async (message, ctx) => {
@@ -152,6 +154,20 @@ export const gitHandlers: HandlerRegistry = {
     try {
       const response = await gitWorktreeRemove(message.path, message.force);
       writer.write({ type: "git_worktree_remove_response", v, id: message.id, ...response });
+      if (response.ok) {
+        // 待機中の会話では Stop が来ない。記録と pc:cwd をその場で揃え、開いた会話にも反映する。
+        // ここで記録を直せなくても、削除自体の成功を失敗へ変えない（一覧・hub の照合が補完する）。
+        try {
+          for (const meta of ctx.metadataStore?.all() ?? []) {
+            const cwd = missingWorktreeFallback(meta.cwd);
+            if (cwd === null) continue;
+            ctx.metadataStore?.put({ ...meta, cwd });
+            ctx.hubLink.send({ type: "session_cwd_set", id: randomUUID(), session: meta.name, cwd });
+          }
+        } catch (error) {
+          engineDiag(`worktree 削除後の作業フォルダの通知失敗: ${String(error)}`);
+        }
+      }
     } catch (error) {
       engineDiag(`git_worktree_remove_response 失敗 id=${message.id}: ${String(error)}`);
       writer.write({ type: "git_worktree_remove_response", v, id: message.id, ok: false, error: String(error) });

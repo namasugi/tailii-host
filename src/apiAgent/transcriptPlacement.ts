@@ -22,6 +22,7 @@
 
 import * as fs from "node:fs";
 import { locateClaudeTranscript, moveClaudeTranscript } from "../sessions/claudeTranscriptLocator.js";
+import { missingWorktreeFallback } from "../shared/paths.js";
 
 /**
  * 初めて読む会話ログで、末尾から worktree-state 行を探す上限。2 回目からは前回の続き（伸びた分）だけを読む。
@@ -72,8 +73,17 @@ export function resolveConversationPlacement(
   if (located === null) return { cwd: recordedCwd, launchCwd: recordedCwd, transcriptPath: null };
   const cwd = located.moved && located.cwd !== null && located.cwd !== recordedCwd && isDirectory(located.cwd)
     ? located.cwd : recordedCwd;
-  if (isDirectory(cwd)) return { cwd, launchCwd: cwd, transcriptPath: located.path };
-  const fallback = activeWorktreeBinding(located.path)?.originalCwd ?? null;
+  if (isDirectory(cwd)) {
+    // 一覧・hub が先に戻り先へ揃えた場合も、SDK の resume が読む slug へログを戻す。
+    if (located.moved && located.cwd !== null && missingWorktreeFallback(located.cwd) !== null) {
+      const moved = moveClaudeTranscript({ conversationId, toCwd: cwd, fromCwd: located.cwd, ...projects });
+      if (moved.status === "moved" || moved.status === "in_place") {
+        return { cwd, launchCwd: cwd, transcriptPath: moved.path };
+      }
+    }
+    return { cwd, launchCwd: cwd, transcriptPath: located.path };
+  }
+  const fallback = activeWorktreeBinding(located.path)?.originalCwd ?? missingWorktreeFallback(cwd);
   if (fallback === null || !isDirectory(fallback)) return { cwd, launchCwd: cwd, transcriptPath: located.path };
   const moved = moveClaudeTranscript({ conversationId, toCwd: fallback, fromCwd: cwd, ...projects });
   if (moved.status !== "moved" && moved.status !== "in_place") return { cwd, launchCwd: cwd, transcriptPath: located.path };

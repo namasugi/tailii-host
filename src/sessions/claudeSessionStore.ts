@@ -8,7 +8,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ClaudeSessionInfo } from "../protocol.js";
-import { claudeProjectSlug, isInsideBase } from "../shared/paths.js";
+import { claudeProjectSlug, isInsideBase, missingWorktreeFallback } from "../shared/paths.js";
 import { stripInjectedReminderBlocks, stripReminderTagBlocks } from "../shared/harnessReminder.js";
 import { crossSessionOriginHint, crossSessionPreviewLine, presentCrossSessionMessage } from "../shared/crossSession.js";
 import { isCompactSummaryRecord } from "../shared/compactSummary.js";
@@ -302,7 +302,10 @@ export class ClaudeSessionStore {
     }
     this.flushMemoFile();
 
-    let result: ClaudeSessionInfo[] = [...bySessionId.values()];
+    let result: ClaudeSessionInfo[] = [...bySessionId.values()].map((info) => {
+      const fallback = missingWorktreeFallback(info.cwd);
+      return fallback === null ? info : { ...info, cwd: fallback };
+    });
     if (baseDir) {
       result = result.filter((info) => isInsideBase(info.cwd, baseDir));
     }

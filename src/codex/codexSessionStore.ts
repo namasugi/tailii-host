@@ -23,7 +23,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { setImmediate } from "node:timers/promises";
 import type { ClaudeSessionInfo } from "../protocol.js";
-import { isInsideBase, standardize } from "../shared/paths.js";
+import { isInsideBase, missingWorktreeFallback, standardize } from "../shared/paths.js";
 import { mapConcurrent } from "../sessions/mapConcurrent.js";
 import { noteReadFailure, readFailureCount } from "../shared/readFailures.js";
 import type { ListMemoFile } from "../sessions/listMemoFile.js";
@@ -275,8 +275,9 @@ export class CodexSessionStore {
       if (seen.has(id)) continue;
       seen.add(id);
       if (file.mtimeMs <= 0) index ??= this.readIndex();
+      const cwd = this.currentCwd(file) ?? meta.cwd;
       rows.push({
-        cwd: this.currentCwd(file) ?? meta.cwd,
+        cwd: missingWorktreeFallback(cwd) ?? cwd,
         updatedAt: file.mtimeMs > 0 ? Math.floor(file.mtimeMs / 1000) : index?.get(id)?.updatedAt ?? undefined,
       });
     }
@@ -324,9 +325,11 @@ export class CodexSessionStore {
       // 作業フォルダは今の値（途中で変えた会話は移った先, session-workdir-change）。圧縮ファイルの今の値は最終メッセージと
       // 同じ解凍でだけ読む（currentCwd は圧縮ファイルを解凍しない）。範囲内の会話は最終メッセージを読んだ後に読み直す。
       let cwd = this.currentCwd(file) ?? meta.cwd;
+      cwd = missingWorktreeFallback(cwd) ?? cwd;
       if (baseDir && !isInsideBase(cwd, baseDir)) continue;
       const lastMessage = this.lastMessage(file);
       cwd = this.currentCwd(file) ?? meta.cwd;
+      cwd = missingWorktreeFallback(cwd) ?? cwd;
       if (baseDir && !isInsideBase(cwd, baseDir)) continue;
       if (cwd !== meta.cwd) this.startedCwds.set(sessionId, meta.cwd);
       const info: ClaudeSessionInfo = {

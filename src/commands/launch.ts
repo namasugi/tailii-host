@@ -35,7 +35,7 @@ import {
 import { claudeHookLaunchSettings, removeCodexHookSettings } from "./hookSettings.js";
 import { tailiiWorktreeRepoRoot } from "../services/gitService.js";
 import { locateClaudeTranscript, moveClaudeTranscript } from "../sessions/claudeTranscriptLocator.js";
-import { claudeProjectSlug, isInsideBase, standardize, expandTilde } from "../shared/paths.js";
+import { claudeProjectSlug, isInsideBase, missingWorktreeFallback, standardize, expandTilde } from "../shared/paths.js";
 import {
   resolveHerdrSessionName,
   resolveSessionBackendKind,
@@ -1504,18 +1504,9 @@ export function rescueMissingWorktreeCwd(options: {
   projectsDir?: string;
 }): string | null {
   const { cwd, claudeSessionId } = options;
-  if (!cwd.startsWith("/") && !cwd.startsWith("~")) return null;
-  const resolved = standardize(cwd);
-  if (fs.existsSync(resolved)) return null;
-  const root = tailiiWorktreeRepoRoot(resolved);
+  const root = missingWorktreeFallback(cwd);
   if (root === null) return null;
-  let rootStat: fs.Stats;
-  try {
-    rootStat = fs.statSync(root);
-  } catch {
-    return null;
-  }
-  if (!rootStat.isDirectory()) return null;
+  const resolved = standardize(cwd);
 
   if (claudeSessionId !== null) {
     // 会話ログと付帯ディレクトリ（`<slug>/<id>/`、/rewind のファイルスナップショット等）を repo ルート側 slug へ移す

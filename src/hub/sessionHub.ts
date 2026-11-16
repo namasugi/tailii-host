@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { bumpHeartbeat, listHeartbeatSessions, readHeartbeat, removeHeartbeat, writeHeartbeat } from "../sessions/heartbeat.js";
-import { canonicalPath, claudeProjectSlug, ensureDirectory0700 } from "../shared/paths.js";
+import { canonicalPath, claudeProjectSlug, ensureDirectory0700, missingWorktreeFallback } from "../shared/paths.js";
 import type { EngineRelayMessage } from "./engineRelaySocket.js";
 import { encodeControlMessage } from "../protocol.js";
 import {
@@ -2598,6 +2598,7 @@ export class SessionHub {
    * 配る（同じ値を続けて配らない）。記録が無ければ false。
    */
   private applyConversationCwd(session: string, cwd: string, reason: string): boolean {
+    cwd = missingWorktreeFallback(cwd) ?? cwd;
     const meta = this.options.metadataStore.get(session);
     if (meta === null) return false;
     if (meta.cwd !== cwd) {
@@ -2715,10 +2716,12 @@ export class SessionHub {
    */
   private reconciledMeta(session: string): SessionMeta | null {
     const meta = this.options.metadataStore.get(session);
-    if (meta === null || (meta.agent ?? "claude") !== "claude") return meta;
-    const fixed = ensureClaudeMetaCwd(this.options.metadataStore, meta, {
+    if (meta === null) return null;
+    let fixed = ensureClaudeMetaCwd(this.options.metadataStore, meta, {
       log: (message) => this.options.log?.(message),
     });
+    const fallback = missingWorktreeFallback(fixed.cwd);
+    if (fallback !== null) fixed = { ...fixed, cwd: fallback };
     if (fixed.cwd !== meta.cwd) this.applyConversationCwd(session, fixed.cwd, "transcript-moved");
     return fixed;
   }
@@ -4158,6 +4161,8 @@ export class SessionHub {
       actor.processingSince = null;
       actor.processingSinceMs = null;
       actor.turnStartFiredAtMs = null;
+      // 会話中の片付けでフォルダだけ消えた場合も、次の一覧更新・開き直しを待たずに戻り先を配る。
+      this.reconciledMeta(session);
       // Claude のターン完了（Stop hook）。利用者の中断・API エラーは Stop が来ないので含まれない。
       if (event === "Stop" && wasProcessing) this.scheduleTurnDonePush(session, actor);
       if (event === "Stop" || event === "StopFailure") this.observeClaudeVersion(session);

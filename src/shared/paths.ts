@@ -47,6 +47,38 @@ export function canonicalPath(p: string): string {
   }
 }
 
+/**
+ * 削除済みの `.claude/worktrees/<名前>` を指す会話の戻り先。本体が実在するときだけ返す。
+ * 会話ログのメモとは別に毎回確かめる（worktree の削除では会話ログの mtime は変わらない）。
+ * 生きている worktree 内のサブフォルダだけが消えた場合や、権限で確認できない場合は戻さない。
+ */
+export function missingWorktreeFallback(cwd: string): string | null {
+  if (!cwd.startsWith("/") && !cwd.startsWith("~/")) return null;
+  let resolved = standardize(cwd);
+  const marker = "/.claude/worktrees/";
+  while (true) {
+    // 子だけ消えたときは親の worktree、親ごと消えたときは本体まで戻る。
+    const index = resolved.lastIndexOf(marker);
+    if (index <= 0) return null;
+    const name = resolved.slice(index + marker.length).split("/")[0];
+    if (!name) return null;
+    const worktree = resolved.slice(0, index + marker.length) + name;
+    try {
+      fs.statSync(worktree);
+      return null;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return null;
+    }
+    const root = resolved.slice(0, index);
+    try {
+      return fs.statSync(root).isDirectory() ? root : null;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return null;
+      resolved = root;
+    }
+  }
+}
+
 /** Claude Code が project ディレクトリ名をそのまま使う上限（超えた分は切ってハッシュを付ける）。 */
 const CLAUDE_SLUG_MAX_LENGTH = 200;
 
