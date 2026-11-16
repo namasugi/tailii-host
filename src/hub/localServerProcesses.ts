@@ -13,17 +13,20 @@ export interface LocalServerProcesses {
 
 export function parseProcessTable(stdout: string): {
   parents: ReadonlyMap<number, number>; terminals: ReadonlyMap<number, string>;
+  commands: ReadonlyMap<number, string>;
 } | null {
   const parents = new Map<number, number>();
   const terminals = new Map<number, string>();
+  const commands = new Map<number, string>();
   for (const line of stdout.split("\n")) {
     if (line.trim() === "") continue;
-    const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s*$/.exec(line);
+    const match = /^\s*(\d+)\s+(\d+)\s+(\S+)(?:[ \t]+(.+?))?\s*$/.exec(line);
     if (match === null || Number(match[1]) <= 0) return null;
     parents.set(Number(match[1]), Number(match[2]));
     terminals.set(Number(match[1]), match[3]!);
+    if (match[4] !== undefined && match[4].trim() !== "") commands.set(Number(match[1]), match[4].trim());
   }
-  return parents.size > 0 ? { parents, terminals } : null;
+  return parents.size > 0 ? { parents, terminals, commands } : null;
 }
 
 type InventoryCommandRunner = (command: string, args: string[]) => Promise<{ ok: boolean; stdout: string }>;
@@ -64,10 +67,18 @@ export async function listLocalServerProcesses(
     }
   }
   // LISTEN 検出より後に読む。先に ps を読むと、間に起動したサーバーの親が見つからない。
-  const processes = await run("ps", ["-axo", "pid=,ppid=,tty="]);
+  const processes = await run("ps", ["-axo", "pid=,ppid=,tty=,comm="]);
   const table = processes.ok ? parseProcessTable(processes.stdout) : null;
   return {
-    servers: [...byPid.values()].filter((server) => !excludePids.includes(server.pid)),
+    // macOS の lsof は native Claude の実行ファイル名（例 2.1.325）を返すが、ps の comm は
+    // claude を返す。版番号の名前を同じ pid の CLI 名で補うときだけ補正する。ps の表示名は
+    // 変更できるため、node 等の開発サーバーや既に判別できている CLI の名前を上書きしない。
+    servers: [...byPid.values()].filter((server) => !excludePids.includes(server.pid)).map((server) => {
+      const psCommand = table?.commands.get(server.pid);
+      const command = /^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(server.command) &&
+        psCommand !== undefined && isAgentListener(psCommand) ? psCommand : server.command;
+      return { ...server, command };
+    }),
     parents: table?.parents ?? null,
     terminals: table?.terminals,
   };

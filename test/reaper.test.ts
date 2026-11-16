@@ -23,7 +23,7 @@ import {
   scheduledPending,
 } from "../src/hub/reaper.js";
 import { MockTmuxRunner, makeTempDir, makeTempStore, ok } from "./helpers.js";
-import type { LocalServerProcesses } from "../src/hub/localServerProcesses.js";
+import { listLocalServerProcesses, type LocalServerProcesses } from "../src/hub/localServerProcesses.js";
 
 const TIMEOUT = REAPER_IDLE_TIMEOUT_SECONDS;
 const NOW = 1_000_000;
@@ -741,6 +741,29 @@ describe("reaperTick herdr backend", () => {
       listLocalServers: async () => ({ servers: [], parents: new Map() }),
     });
     expect(afterStop.killed).toEqual(["s-preview"]);
+  });
+
+  test.each(["tailii", "default"])("herdr %s で native Claude 自身の待受では延命せず、子の開発サーバーは保護する", async (herdrSession) => {
+    const dir = makeTempDir("reaper-native-claude-listener");
+    const store = makeTempStore();
+    for (const name of ["s-idle", "s-preview"]) {
+      store.put({ name, cwd: "/work/site", createdAt: 1, backend: "herdr", herdrSession });
+      writeHeartbeat(dir, name, { ts: NOW - TIMEOUT, state: "idle" });
+    }
+    const { ops, killedNames } = herdrOpsWith({
+      names: ["s-idle", "s-preview"], panePids: { "s-idle": 100, "s-preview": 200 },
+    });
+    const result = await reaperTick({
+      runner: runnerWithSessions([]).runner, heartbeatDir: dir, metadataStore: store,
+      timeoutSeconds: TIMEOUT, now: NOW, herdrOps: ops, claudeSessionsDir: null,
+      listLocalServers: () => listLocalServerProcesses([], async (command) => command === "lsof"
+        ? { ok: true, stdout: "p100\nc2.1.325\nf4\np200\nc2.1.325\nf5\np220\ncnode\nf6\n" }
+        : { ok: true, stdout: "100 1 ttys001 claude\n200 1 ttys002 claude\n220 200 ttys002 /usr/local/bin/node\n" }),
+    });
+    expect(result.killed).toEqual(["s-idle"]);
+    expect(killedNames).toEqual(["s-idle"]);
+    expect(readHeartbeat(dir, "s-idle")).toBeNull();
+    expect(readHeartbeat(dir, "s-preview")?.event).toBe("daemon-local-server");
   });
 
   test.each(["codex", "claude", "/usr/local/bin/codex"])(
