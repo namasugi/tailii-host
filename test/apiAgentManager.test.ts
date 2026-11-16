@@ -78,6 +78,28 @@ function setup(overrides: Partial<ConstructorParameters<typeof ApiAgentManager>[
 }
 
 describe("ApiAgentManager", () => {
+  test("新規 API 会話の進捗は状態照会でも復元し、終了後は消す", async () => {
+    const t = setup();
+    t.manager.open("cs-a", { conversationId: CONV, cwd: "/tmp/w", config: CONFIG, resume: false });
+    await t.manager.submit("cs-a", "hello");
+    expect(t.last()).toMatchObject({ state: "running", progress: { phase: "starting" } });
+    const worker = t.workers[0]!;
+    worker.emit({ t: "progress", progress: { phase: "tool", toolName: "Read" } });
+    expect(t.manager.status("cs-a")).toMatchObject({ progress: { phase: "tool", toolName: "Read" } });
+    const count = t.statuses.length;
+    worker.emit({ t: "progress", progress: { phase: "tool", toolName: "Read" } });
+    expect(t.statuses).toHaveLength(count);
+    t.manager.configure("cs-a", { ...CONFIG, permissionMode: "plan" });
+    expect(t.last()).toMatchObject({ progress: { phase: "tool", toolName: "Read" } });
+    worker.succeed(0.01);
+    expect(t.last()).not.toHaveProperty("progress");
+    worker.emit({ t: "progress", progress: { phase: "thinking" } });
+    expect(t.last()).toMatchObject({ state: "idle" });
+    expect(t.last()).not.toHaveProperty("progress");
+    await t.manager.submit("cs-a", "next");
+    expect(t.last()).toMatchObject({ progress: { phase: "starting" } });
+  });
+
   test.each([
     { turnUsd: 0, conversationUsd: 0, expected: 0 },
     { turnUsd: 0.25, conversationUsd: 0, expected: 0.25 },

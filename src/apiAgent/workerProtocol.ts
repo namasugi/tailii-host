@@ -4,7 +4,8 @@
 // 1 プロセス = 1 ターン。hub が `start` を 1 回送り、作業プロセスは `result` か `error` を返して終わる。
 // API キーはこのプロトコルに載せない（子プロセスの環境変数だけで渡す）。
 
-import type { ApiAgentConfig, ApiAgentPermissionMode } from "../protocol/messages.js";
+import type { ApiAgentConfig, ApiAgentPermissionMode, ApiAgentProgress } from "../protocol/messages.js";
+import { parseApiAgentProgress } from "./progress.js";
 export type { ApiAgentPermissionMode };
 
 export const API_AGENT_PERMISSION_MODES: readonly ApiAgentPermissionMode[] = ["default", "acceptEdits", "plan", "dontAsk", "auto"];
@@ -79,7 +80,8 @@ export interface WorkerErrorEvent {
   code: WorkerErrorCode;
 }
 
-export type WorkerToHub = WorkerAuthEvent | WorkerPermissionRequest | WorkerResultEvent | WorkerErrorEvent;
+export type WorkerToHub = WorkerAuthEvent | WorkerPermissionRequest | WorkerResultEvent | WorkerErrorEvent
+  | { t: "progress"; progress: ApiAgentProgress };
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MODEL = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
@@ -152,6 +154,10 @@ export function decodeWorkerToHub(line: string): WorkerToHub | null {
   const obj = record(raw);
   if (obj === null) return null;
   switch (obj["t"]) {
+    case "progress": {
+      const progress = parseApiAgentProgress(obj["progress"]);
+      return progress === null ? null : { t: "progress", progress };
+    }
     case "auth":
       if (typeof obj["ok"] !== "boolean") return null;
       return { t: "auth", ok: obj["ok"], apiKeySource: str(obj["apiKeySource"]), apiProvider: str(obj["apiProvider"]), cliVersion: str(obj["cliVersion"]) };

@@ -2914,6 +2914,11 @@ export class SessionHub {
             role: "system", text: currentCollaborationMode, eof: true },
         });
       }
+      // API 進捗は transcript に無い。backfilling 中に転送を見送った更新・完了は現在値で補う。
+      const apiStatus = this.apiAgentRuntime?.status(session) ?? null;
+      if (apiStatus !== null) {
+        this.sendTo(client, { type: "conversation_event", session, serverSeq: 0, payload: apiStatus });
+      }
     };
     // 進捗は「最後に 1 行流れた時刻」で測る。履歴行ごとに setTimeout を張り替えると
     // 巨大な transcript でタイマー生成が支配的になるため、タイマーは 1 本のまま残時間を見る。

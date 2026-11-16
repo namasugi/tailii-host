@@ -524,6 +524,47 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
+  test("別会話の API 進捗は状態スナップショット・更新・完了を session 付きのまま届ける", async () => {
+    const store = makeTempStore();
+    store.put({ name: "work", cwd: "/tmp/work", createdAt: 1, agent: "claude" });
+    const hubLink: HubLink = {
+      onMessage: null, onReconnect: null,
+      send(message) {
+        if (message.type === "hub_state_request") queueMicrotask(() => hubLink.onMessage?.({
+          type: "hub_state_response", id: message.id, session: message.session,
+          pendingQuestion: null, processing: false,
+        }));
+        return true;
+      },
+      close: vi.fn(),
+    };
+    const runner = new MockTmuxRunner((args) => args[0] === "ls" ? ok("work\n") : ok(""));
+    const engine = startEngine({ sessionManager: makeManager(runner, store), metadataStore: store, hubLink });
+    try {
+      await engine.lines.nextOfType("channel_hello");
+      engine.writeLine('{"id":"open","name":"work","type":"session_reattach","v":2}');
+      await engine.lines.nextOfType("session_list_response");
+      hubLink.onMessage?.({ type: "session_processing", session: "cs-api", state: "active" });
+      const status = {
+        type: "api_agent_status" as const, v: 2, session: "cs-api", state: "running" as const, model: "m",
+        budget: { turnUsd: 0, conversationUsd: 0, maxTurns: 0 },
+        usage: { totalUsd: 0, turns: 0, unconfirmedTurns: 0 }, queued: 0,
+      };
+      for (const [serverSeq, progress] of [[0, { phase: "thinking" }], [1, { phase: "tool", toolName: "Read" }]] as const) {
+        const payload = { ...status, progress };
+        hubLink.onMessage?.({ type: "conversation_event", session: "cs-api", serverSeq, payload });
+        expect(decodeControlMessage(await engine.lines.nextOfType("api_agent_status"))).toEqual(payload);
+      }
+      // done の直後も購読の猶予中なので、最後の idle まで取りこぼさない。
+      hubLink.onMessage?.({ type: "session_processing", session: "cs-api", state: "done" });
+      const idle = { ...status, state: "idle" as const };
+      hubLink.onMessage?.({ type: "conversation_event", session: "cs-api", serverSeq: 2, payload: idle });
+      expect(decodeControlMessage(await engine.lines.nextOfType("api_agent_status"))).toEqual(idle);
+    } finally {
+      await engine.teardown();
+    }
+  });
+
   test("subagent transcript 全文要求を現在会話の Hub tail へ中継する", async () => {
     const store = makeTempStore();
     store.put({

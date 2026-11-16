@@ -4,8 +4,8 @@ import { describe, expect, test, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { decodeControlMessage, encodeControlMessage, ProtocolDecodeError, type SessionInfo } from "../src/protocol.js";
-import { decodeHubClientLine, decodeHubServerLine, encodeHubMessage } from "../src/hub/hubProtocol.js";
+import { decodeControlMessage, encodeControlMessage, ProtocolDecodeError, type ControlMessage, type SessionInfo } from "../src/protocol.js";
+import { decodeHubClientLine, decodeHubServerLine, encodeHubMessage, type HubServerMessage } from "../src/hub/hubProtocol.js";
 import { CompositeSessionBackend, type SessionBackend } from "../src/backend/sessionBackend.js";
 import { ApiAgentSessionBackend, ApiAgentUnsupportedError } from "../src/backend/apiAgentBackend.js";
 import { ApiAgentSessionStore } from "../src/apiAgent/sessionState.js";
@@ -137,6 +137,7 @@ class FakeRuntime implements ApiAgentHubRuntime {
   calls: string[] = [];
   answers: unknown[] = [];
   running = false;
+  currentStatus: Extract<ControlMessage, { type: "api_agent_status" }> | null = null;
   constructor(readonly callbacks: ApiAgentHubCallbacks) {}
   restore(): string[] { this.calls.push("restore"); return []; }
   open(session: string, request: { conversationId: string; resume: boolean }): void {
@@ -153,11 +154,45 @@ class FakeRuntime implements ApiAgentHubRuntime {
   dispose(session: string): void { this.calls.push(`dispose:${session}`); }
   answerQuestion(id: string, answers: unknown[]): boolean { this.answers.push({ id, answers }); return true; }
   has(): boolean { return true; }
-  status(): null { return null; }
+  status(): Extract<ControlMessage, { type: "api_agent_status" }> | null { return this.currentStatus; }
   get hasTurnsInFlight(): boolean { return this.running; }
 }
 
 describe("SessionHub への合流", () => {
+  test.each(["running", "idle"] as const)("履歴を読み直す間に変わった API 状態を完了時に復元する: %s", (state) => {
+    const store = makeTempStore();
+    store.put({ name: "cs-a", cwd: "/w", createdAt: 1, agent: "claude", executionRoute: "api", claudeSessionId: CONV });
+    const writes: Array<(payload: ControlMessage) => void> = [];
+    let runtime: FakeRuntime | null = null;
+    const hub = new SessionHub({
+      runner: async () => ok(""), heartbeatDir: makeTempDir("api-agent-backfill"), metadataStore: store, timeoutSeconds: 1800,
+      tailFactory: (write) => { writes.push(write); return { open: vi.fn(), stop: vi.fn() }; },
+      apiAgentFactory: (callbacks) => { runtime = new FakeRuntime(callbacks); return runtime; },
+    });
+    hub.restoreApiAgents();
+    const initial = { type: "api_agent_status" as const, v: 2, session: "cs-a", state: "running" as const,
+      model: CONFIG.model, budget: CONFIG.budget, usage: { totalUsd: 0, turns: 0, unconfirmedTurns: 0 },
+      queued: 0, progress: { phase: "thinking" as const } };
+    const api = runtime!;
+    api.currentStatus = initial;
+    const first = {}, second = {};
+    hub.registerClient(first, () => undefined);
+    hub.handleClientMessage(first, JSON.stringify({ type: "conversation_subscribe", session: "cs-a" }));
+    const received: HubServerMessage[] = [];
+    hub.registerClient(second, (line) => received.push(decodeHubServerLine(line)!));
+    hub.handleClientMessage(second, JSON.stringify({ type: "conversation_subscribe", session: "cs-a" }));
+    expect(writes).toHaveLength(2);
+    expect(received.at(-1)).toMatchObject({ payload: initial });
+    const updated = { ...initial, state, progress: state === "running" ? { phase: "tool" as const, toolName: "Read" } : undefined };
+    api.currentStatus = updated;
+    api.callbacks.onStatus("cs-a", updated);
+    expect(received.at(-1)).toMatchObject({ payload: initial });
+    writes[1]!({ type: "chat_output", v: 2, streamId: "pc:history-done", role: "system", text: "", eof: true });
+    const statuses = received.flatMap((event) => event.type === "conversation_event" && event.payload.type === "api_agent_status" ? [event.payload] : []);
+    expect(statuses).toEqual([initial, updated]);
+    hub.close();
+  });
+
   function makeHub() {
     let runtime: FakeRuntime | null = null;
     const hub = new SessionHub({

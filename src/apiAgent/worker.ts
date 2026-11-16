@@ -10,6 +10,8 @@
 
 import { randomUUID } from "node:crypto";
 import { apiAgentChildEnvironment } from "./keyEnvironment.js";
+import type { ApiAgentProgress } from "../protocol/messages.js";
+import { progressFromSdkMessage, toolProgress } from "./progress.js";
 import type { AgentSdkModule, AgentSdkQuery } from "./sdkLoader.js";
 import {
   decodeHubToWorker,
@@ -85,6 +87,16 @@ async function runTurn(
 ): Promise<number> {
   const input = new InputQueue();
   const waiting = new Map<string, (response: WorkerPermissionResponse) => void>();
+  const pendingProgress = new Map<string, ApiAgentProgress>();
+  let lastProgress = "";
+  const publishProgress = (progress: ApiAgentProgress): void => {
+    const pending = [...pendingProgress.values()];
+    const next = pending.find((item) => item.phase === "question") ?? pending[0] ?? progress;
+    const fingerprint = JSON.stringify(next);
+    if (fingerprint === lastProgress) return;
+    lastProgress = fingerprint;
+    io.write({ t: "progress", progress: next });
+  };
   let query: AgentSdkQuery;
   try {
     query = sdk.query({
@@ -93,6 +105,7 @@ async function runTurn(
         cwd: start.cwd,
         model: start.model,
         permissionMode: start.permissionMode,
+        includePartialMessages: true,
         ...(start.effort !== undefined ? { effort: start.effort } : {}),
         ...(start.maxTurns > 0 ? { maxTurns: start.maxTurns } : {}),
         ...(start.maxBudgetUsd > 0 ? { maxBudgetUsd: start.maxBudgetUsd } : {}),
@@ -112,6 +125,8 @@ async function runTurn(
             const requestId = randomUUID();
             const onAbort = (): void => {
               waiting.delete(requestId);
+              pendingProgress.delete(requestId);
+              publishProgress({ phase: "thinking" });
               resolve({ behavior: "deny", message: "中止されました。" });
             };
             if (options.signal.aborted) { onAbort(); return; }
@@ -119,10 +134,14 @@ async function runTurn(
             waiting.set(requestId, (response) => {
               options.signal.removeEventListener("abort", onAbort);
               waiting.delete(requestId);
+              pendingProgress.delete(requestId);
+              publishProgress(response.behavior === "allow" ? toolProgress("tool", toolName) : { phase: "thinking" });
               resolve(response.behavior === "allow"
                 ? { behavior: "allow", updatedInput: response.updatedInput ?? toolInput }
                 : { behavior: "deny", message: response.message ?? "利用者が拒否しました。" });
             });
+            pendingProgress.set(requestId, toolProgress(toolName === "AskUserQuestion" ? "question" : "approval", toolName));
+            publishProgress({ phase: "thinking" });
             io.write({ t: "permission_request", requestId, toolName, input: toolInput });
           }),
       },
@@ -186,9 +205,12 @@ async function runTurn(
   }
 
   input.push(start.prompt);
+  publishProgress({ phase: "thinking" });
   let sawResult = false;
   try {
     for await (const message of query) {
+      const progress = progressFromSdkMessage(message);
+      if (progress !== null) publishProgress(progress);
       if (message["type"] !== "result") continue;
       sawResult = true;
       io.write({

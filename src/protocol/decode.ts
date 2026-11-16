@@ -1,3 +1,4 @@
+import { parseApiAgentProgress } from "../apiAgent/progress.js";
 // protocol/decode.ts
 // NDJSON 1 行 → ControlMessage のデコード。未知 type / 非対応版 / 必須欠落は
 // ProtocolDecodeError（呼び出し元は安全側 = 破棄/deny に倒す）。
@@ -1751,6 +1752,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         model: requireString(raw, "model"),
         budget: decodeApiAgentBudget(raw["budget"]),
         effort: decodeApiAgentEffort(raw),
+        progress: parseApiAgentProgress(raw["progress"]) ?? undefined,
         usage: compact<import("./messages.js").ApiAgentUsage>({
           totalUsd: requireNumber(usage, "totalUsd"),
           turns: requireNumber(usage, "turns"),

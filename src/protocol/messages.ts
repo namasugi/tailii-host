@@ -597,6 +597,11 @@ export interface ApiAgentConfig {
   keySource?: ApiUsageCredential;
 }
 export type ApiAgentState = "idle" | "running" | "stopping";
+/** 端末のない API 会話のライブ表示。本文・思考・ツール引数は含めない。 */
+export interface ApiAgentProgress {
+  phase: "starting" | "thinking" | "responding" | "tool" | "approval" | "question";
+  toolName?: string;
+}
 /** ターンの終わり方。 */
 export type ApiAgentTurnOutcome =
   | "success" | "turn_budget_reached" | "max_turns_reached" | "interrupted" | "failed" | "result_unknown";
@@ -790,7 +795,7 @@ export type ControlMessage =
    * API 作業の状態（host→iOS, api-agent）。会話のストリームに載る（後から開いた端末にも最新値が届く）。
    * `restoredTexts` は中断で送らなかった処理中の発話（入力欄へ戻す）。旧アプリは未知 type として捨てる。
    */
-  | { type: "api_agent_status"; v: number; session: string; state: ApiAgentState; model: string; budget: ApiAgentBudget; usage: ApiAgentUsage; queued: number; outcome?: ApiAgentTurnOutcome; error?: ApiAgentErrorCode; restoredTexts?: string[]; permissionMode?: ApiAgentPermissionMode; effort?: ApiAgentConfig["effort"] }
+  | { type: "api_agent_status"; v: number; session: string; state: ApiAgentState; model: string; budget: ApiAgentBudget; usage: ApiAgentUsage; queued: number; outcome?: ApiAgentTurnOutcome; error?: ApiAgentErrorCode; restoredTexts?: string[]; permissionMode?: ApiAgentPermissionMode; effort?: ApiAgentConfig["effort"]; progress?: ApiAgentProgress }
   /** API 作業の設定変更（モデル・権限モード・予算・キーの取得元）。処理中は次のターンから効く。 */
   | { type: "api_agent_configure"; v: number; id: string; session: string; config: ApiAgentConfig }
   | { type: "api_agent_configure_result"; v: number; id: string; session: string; ok: boolean; error?: ApiAgentErrorCode }

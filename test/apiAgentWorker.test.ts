@@ -98,6 +98,33 @@ describe("acceptableAgentAuth", () => {
 });
 
 describe("runApiAgentWorker", () => {
+  test("SDK の進捗を配り、同じ状態や本文・思考の内容を配らない", async () => {
+    const { seen, out } = await runWith({
+      account: { apiKeySource: "ANTHROPIC_API_KEY", apiProvider: "firstParty" },
+      async *onPrompt(_prompt, canUseTool) {
+        yield { type: "stream_event", event: { type: "content_block_start", content_block: { type: "thinking", thinking: "private-thinking" } } };
+        yield { type: "stream_event", event: { type: "content_block_start", content_block: { type: "text", text: "private-body" } } };
+        yield { type: "tool_progress", tool_name: "Read" };
+        yield { type: "tool_progress", tool_name: "Read" };
+        yield { type: "user", message: { content: [{ type: "tool_result", content: "private-result" }] } };
+        await canUseTool("Write", { file_path: "private-path" });
+        yield { type: "assistant", message: { content: [{ type: "text", text: "private-response" }] } };
+        yield { type: "result", subtype: "success", is_error: false, total_cost_usd: 0.01, num_turns: 1, session_id: CONV };
+      },
+    }, { ANTHROPIC_API_KEY: KEY }, {
+      onWrite(message, lines) {
+        if (message.t === "permission_request") lines.push(JSON.stringify({ t: "permission_response", requestId: message.requestId, behavior: "allow" }));
+      },
+    });
+    expect(seen.options!["includePartialMessages"]).toBe(true);
+    const progress = out.flatMap((message) => message.t === "progress" ? [message.progress] : []);
+    expect(progress).toEqual([
+      { phase: "thinking" }, { phase: "responding" }, { phase: "tool", toolName: "Read" }, { phase: "thinking" },
+      { phase: "approval", toolName: "Write" }, { phase: "tool", toolName: "Write" }, { phase: "responding" },
+    ]);
+    expect(JSON.stringify(progress)).not.toContain("private");
+  });
+
   test.each([0, 1, 6, 200])("往復上限 %s を正確に渡し、0 は SDK の上限指定を省く", async (limit) => {
     const { code, seen } = await runWith({
       account: { apiKeySource: "ANTHROPIC_API_KEY", apiProvider: "firstParty" },
@@ -143,6 +170,8 @@ describe("runApiAgentWorker", () => {
     expect(code).toBe(0);
     expect(out).toEqual([
       { t: "auth", ok: true, apiKeySource: "ANTHROPIC_API_KEY", apiProvider: "firstParty", cliVersion: "2.1.322" },
+      { t: "progress", progress: { phase: "thinking" } },
+      { t: "progress", progress: { phase: "responding" } },
       { t: "result", subtype: "success", isError: false, totalCostUsd: 0.0019, numTurns: 1, sessionId: CONV, terminalReason: "completed" },
     ]);
     expect(seen.prompts).toEqual(["hello"]);

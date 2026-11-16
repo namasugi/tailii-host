@@ -16,6 +16,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type {
   ApiAgentConfig,
+  ApiAgentProgress,
   ApiAgentErrorCode,
   ApiAgentState,
   ApiAgentTurnOutcome,
@@ -102,6 +103,7 @@ export interface ApiAgentManagerOptions {
 }
 
 interface RunningTurn {
+  progress: ApiAgentProgress;
   turnId: string;
   worker: ApiAgentWorkerHandle;
   baselineUsd: number | null;
@@ -446,6 +448,7 @@ export class ApiAgentManager {
     conversation.ledger.turns.push({ id: turnId, startedAt: this.now(), status: "running" });
     this.saveLedger(conversation.ledger);
     const running: RunningTurn = {
+      progress: { phase: "starting" },
       turnId, worker, baselineUsd, authOk: null, result: null, errorCode: null,
       interrupted: false, killTimer: null, questionIds: new Set(), abort: new AbortController(),
     };
@@ -477,6 +480,11 @@ export class ApiAgentManager {
   private handleWorkerMessage(conversation: Conversation, running: RunningTurn, message: WorkerToHub): void {
     if (conversation.running !== running) return;
     switch (message.t) {
+      case "progress":
+        if (running.progress.phase === message.progress.phase && running.progress.toolName === message.progress.toolName) return;
+        running.progress = message.progress;
+        this.emitStatus(conversation);
+        return;
       case "auth":
         running.authOk = message.ok;
         if (!message.ok) this.options.log?.(`api-agent 認証が想定外のため停止 session=${conversation.session} source=${message.apiKeySource ?? "none"}`);
@@ -603,6 +611,7 @@ export class ApiAgentManager {
       model: conversation.config.model, budget: { ...conversation.config.budget },
       permissionMode: conversation.config.permissionMode,
       ...(conversation.config.effort !== undefined ? { effort: conversation.config.effort } : {}),
+      ...(conversation.running !== null ? { progress: conversation.running.progress } : {}),
       usage, queued: conversation.queue.length,
       ...(conversation.lastOutcome !== undefined ? { outcome: conversation.lastOutcome } : {}),
       ...(error !== undefined ? { error } : {}),

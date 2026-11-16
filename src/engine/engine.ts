@@ -849,6 +849,9 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
               serverSeq: message.serverSeq,
               activity: message.payload.activity,
             };
+          } else if (message.payload.type === "api_agent_status") {
+            // API 状態は自身に session を持つので封筒の変換は不要。背景中も一覧のライブ表示を更新する。
+            payload = message.payload;
           } else if (!backgroundReplayFloors.has(message.session)) {
             const floor = lastServerSeq.get(message.session) ?? Math.max(0, message.serverSeq - 1);
             backgroundReplayFloors.set(message.session, floor);
