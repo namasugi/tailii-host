@@ -2499,10 +2499,10 @@ describe("launchCore herdr backend", () => {
    * `recorded` にはコア引数（pane/agent/...）だけを積んで各テストの検証を単純に保つ。
    */
   function herdrProcessRunner(overrides?: {
-    panes?: { pane_id: string; label?: string; workspace_id?: string }[];
+    panes?: { pane_id: string; label?: string; workspace_id?: string; cwd?: string; terminal_id?: string }[];
     processName?: string;
     /** herdr セッションごとの pane 一覧（指定したセッションは panes より優先）。 */
-    panesBySession?: Record<string, { pane_id: string; label?: string; workspace_id?: string }[]>;
+    panesBySession?: Record<string, { pane_id: string; label?: string; workspace_id?: string; cwd?: string; terminal_id?: string }[]>;
   }): { runner: ProcessRunner; recorded: { exe: string; args: string[]; session: string }[] } {
     const recorded: { exe: string; args: string[]; session: string }[] = [];
     const runner: ProcessRunner = async (exe, rawArgs) => {
@@ -2939,8 +2939,8 @@ describe("launchCore herdr backend", () => {
     const store = makeStore();
     const { runner, recorded } = herdrProcessRunner({
       panes: [
-        { pane_id: "w5:p1", workspace_id: "w5", cwd: real } as { pane_id: string; workspace_id: string },
-        { pane_id: "w6:p1", workspace_id: "w6", cwd: "/elsewhere" } as { pane_id: string; workspace_id: string },
+        { pane_id: "w5:p1", workspace_id: "w5", cwd: real },
+        { pane_id: "w6:p1", workspace_id: "w6", cwd: "/elsewhere" },
       ],
     });
     expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
@@ -2956,7 +2956,7 @@ describe("launchCore herdr backend", () => {
     });
     const { runner, recorded } = herdrProcessRunner({
       panes: [
-        { pane_id: "w5:p1", workspace_id: "w5", cwd: fs.realpathSync(dir) } as { pane_id: string; workspace_id: string },
+        { pane_id: "w5:p1", workspace_id: "w5", cwd: fs.realpathSync(dir) },
         { pane_id: "w5:p2", label: "s-other", workspace_id: "w5" },
       ],
     });
@@ -3078,6 +3078,49 @@ describe("launchCore herdr backend", () => {
     ]);
   });
 
+  test.each([
+    { terminalId: "term_original", create: "tab" },
+    { terminalId: "term_restored", create: "workspace" },
+  ])("同じ名前の pane の帰属は端末 ID も照合する（$terminalId）", async ({ terminalId, create }) => {
+    const dir = makeTempDir("herdr-launch-workspace-identity");
+    const store = makeStore();
+    store.put({
+      name: "s-existing", cwd: dir, createdAt: 1, backend: "herdr", herdrSession: "default",
+      herdrPaneId: "w3:p1", herdrTerminalId: "term_original",
+    });
+    const { runner, recorded } = herdrProcessRunner({
+      panes: [{
+        pane_id: "w3:p1", label: "s-existing", workspace_id: "w3", terminal_id: terminalId,
+        // 同じ端末ならメタの cwd が権威。復元された別端末なら利用者のフォルダで判断する。
+        cwd: "/r/company",
+      }],
+    });
+
+    expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
+    const created = recorded.find((call) => call.args[1] === "create")?.args;
+    expect(created?.[0]).toBe(create);
+    if (create === "tab") expect(created?.slice(0, 4)).toEqual(["tab", "create", "--workspace", "w3"]);
+  });
+
+  test.each([false, true])("未作成の worktree も実パスの本体ワークスペースへ合流する（Tailii pane: %s）", async (hasTailiiPane) => {
+    const repo = fs.realpathSync(makeTempDir("herdr-launch-pending-worktree"));
+    const alias = path.join(makeTempDir("herdr-launch-repo-alias"), "repo");
+    fs.symlinkSync(repo, alias, "dir");
+    const worktree = path.join(alias, ".claude", "worktrees", "pr-123");
+    expect(fs.existsSync(worktree)).toBe(false);
+    const store = makeStore();
+    const { runner, recorded } = herdrProcessRunner({
+      panes: [
+        ...(hasTailiiPane ? [sameFolderPane(store, alias)] : []),
+        { pane_id: "w3:p8", workspace_id: "w3", cwd: repo },
+      ],
+    });
+
+    expect(await launchCore({ ...launchOptions(alias, store, runner), recordCwd: worktree })).toBe(0);
+    expect(recorded.find((call) => call.args[1] === "create")?.args.slice(0, 4)).toEqual(["tab", "create", "--workspace", "w3"]);
+    expect(store.get("s-h")?.cwd).toBe(worktree);
+  });
+
   test("別のフォルダの会話しかないワークスペースには入れず、フォルダ名で新しく作る", async () => {
     const dir = makeTempDir("herdr-launch-other");
     const store = makeStore();
@@ -3105,7 +3148,41 @@ describe("launchCore herdr backend", () => {
     expect(recorded.filter((call) => call.args[1] === "create").map((call) => call.args[0])).toEqual(["workspace"]);
   });
 
-  test("利用者が自分で開いた pane（メタの無い label）は数えない", async () => {
+  test.each([false, true])("別フォルダの利用者 pane が混在するワークスペースには合流しない（Tailii pane: %s）", async (hasTailiiPane) => {
+    const dir = makeTempDir("herdr-launch-mixed-user");
+    const store = makeStore();
+    const { runner, recorded } = herdrProcessRunner({
+      panes: [
+        ...(hasTailiiPane ? [sameFolderPane(store, dir)] : []),
+        { pane_id: "w3:p8", workspace_id: "w3", cwd: fs.realpathSync(dir) },
+        { pane_id: "w3:p9", label: "company shell", workspace_id: "w3", cwd: "/r/company" },
+      ],
+    });
+
+    expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
+    const creates = recorded.filter((call) => call.args[1] === "create");
+    expect(creates.map((call) => call.args[0])).toEqual(["workspace"]);
+    expect(creates[0]?.args.slice(-2)).toEqual(["--label", path.basename(dir)]);
+  });
+
+  test("混在するワークスペースに一致 pane が多くても、同じフォルダだけのワークスペースを選ぶ", async () => {
+    const dir = makeTempDir("herdr-launch-pure-user");
+    const store = makeStore();
+    const cwd = fs.realpathSync(dir);
+    const { runner, recorded } = herdrProcessRunner({
+      panes: [
+        sameFolderPane(store, dir),
+        { pane_id: "w3:p8", workspace_id: "w3", cwd },
+        { pane_id: "w3:p9", workspace_id: "w3", cwd: "/r/company" },
+        { pane_id: "w5:p1", workspace_id: "w5", cwd },
+      ],
+    });
+
+    expect(await launchCore(launchOptions(dir, store, runner))).toBe(0);
+    expect(recorded.find((call) => call.args[1] === "create")?.args.slice(0, 4)).toEqual(["tab", "create", "--workspace", "w5"]);
+  });
+
+  test("利用者 pane の cwd が不明なら、同じフォルダの Tailii pane による判定を妨げない", async () => {
     const dir = makeTempDir("herdr-launch-manual");
     const store = makeStore();
     const { runner, recorded } = herdrProcessRunner({

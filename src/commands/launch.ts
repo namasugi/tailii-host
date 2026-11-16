@@ -943,40 +943,48 @@ export function herdrWorkspaceLabel(key: string, home: string = os.homedir()): s
 
 /**
  * キー `key` の会話を入れるワークスペースを、生存 pane から探す（不在は null）。
- * 1. Tailii が起動した pane（label がメタのあるセッション名）が 1 つ以上あり、その全部が同じキーのワークスペース。
+ * 1. Tailii が起動した pane（メタの名前と端末の帰属を照合）が 1 つ以上あり、その全部が同じキーのワークスペース。
  *    全会話を 1 つに入れていた頃のワークスペース（キーが混ざっている）は採らず、新しい会話からフォルダごとに分かれる。
  * 2. 無ければ、利用者が自分で開いた pane（メタの無い label）の今の作業フォルダが同じキーのワークスペース
  *    （利用者が同じフォルダで開いているワークスペースへ合流する。`default` など利用者も使うセッション向け）。
  *    ほかのキーの Tailii の pane が居るワークスペースは採らない。複数あれば同じキーの pane が多い方。
  *    pane の `cwd` は herdr が実パス（`/tmp` → `/private/tmp`）で返すので、`keyOfPanePath` で揃えて比べる。
+ * どちらも、別フォルダの利用者 pane が混在するワークスペースは採らない（company に code0630 が混ざった
+ * ワークスペースを、code0630 の入れ先として繰り返し選ばない）。cwd 不明の利用者 pane は判定から外す。
  * ID ではなく生存 pane から毎回引くので、サーバーの状態削除で ID が振り直されても取り違えない。
  */
 export function findHerdrProjectWorkspace(
   panes: readonly HerdrPane[],
   key: string,
-  keyOfSession: (label: string) => string | null,
-  keyOfPanePath: (cwd: string) => string | null = () => null,
+  keyOfSession: (label: string, pane: HerdrPane) => string | null,
+  keyOfPanePath: (cwd: string) => string | null = herdrWorkspaceKey,
 ): string | null {
   const tailiiKeys = new Map<string, Set<string>>();
   const userMatches = new Map<string, number>();
+  const foreignUserWorkspaces = new Set<string>();
   for (const pane of panes) {
     if (pane.workspaceId === null) continue;
-    const sessionKey = pane.label !== null ? keyOfSession(pane.label) : null;
+    const sessionKey = pane.label !== null ? keyOfSession(pane.label, pane) : null;
     if (sessionKey !== null) {
       const keys = tailiiKeys.get(pane.workspaceId) ?? new Set<string>();
       keys.add(sessionKey);
       tailiiKeys.set(pane.workspaceId, keys);
       continue;
     }
-    if (pane.cwd !== null && keyOfPanePath(pane.cwd) === key) {
-      userMatches.set(pane.workspaceId, (userMatches.get(pane.workspaceId) ?? 0) + 1);
+    if (pane.cwd !== null) {
+      if (keyOfPanePath(pane.cwd) === key) {
+        userMatches.set(pane.workspaceId, (userMatches.get(pane.workspaceId) ?? 0) + 1);
+      } else {
+        foreignUserWorkspaces.add(pane.workspaceId);
+      }
     }
   }
   for (const [workspaceId, keys] of tailiiKeys) {
-    if (keys.size === 1 && keys.has(key)) return workspaceId;
+    if (keys.size === 1 && keys.has(key) && !foreignUserWorkspaces.has(workspaceId)) return workspaceId;
   }
   let best: { workspaceId: string; count: number } | null = null;
   for (const [workspaceId, count] of userMatches) {
+    if (foreignUserWorkspaces.has(workspaceId)) continue;
     const keys = tailiiKeys.get(workspaceId);
     if (keys !== undefined && [...keys].some((other) => other !== key)) continue;
     if (best === null || count > best.count) best = { workspaceId, count };
@@ -986,10 +994,12 @@ export function findHerdrProjectWorkspace(
 
 /** pane の作業フォルダ（herdr が返す実パス）を、`key`（実パスに直したもの）と比べられる形にする。 */
 function realHerdrWorkspaceKey(dir: string): string {
+  // 起動前の worktree 自体はまだ無いことがある。本体のキーへまとめてから実パスに直す。
+  const key = herdrWorkspaceKey(dir);
   try {
-    return herdrWorkspaceKey(fs.realpathSync(dir));
+    return herdrWorkspaceKey(fs.realpathSync(key));
   } catch {
-    return herdrWorkspaceKey(dir);
+    return key;
   }
 }
 
@@ -1236,11 +1246,15 @@ async function launchHerdrPane(options: {
     const workspaceId = placementWorkspaceId ?? findHerdrProjectWorkspace(
       livePanes,
       workspaceKey,
-      (label) => {
+      (label, pane) => {
         const meta = store.get(label);
-        return meta !== null && meta.name === label && meta.backend === "herdr" && herdrSessionOfMeta(meta) === herdrSession
-          ? herdrWorkspaceKey(meta.cwd)
-          : null;
+        if (meta === null || meta.name !== label || meta.backend !== "herdr" || herdrSessionOfMeta(meta) !== herdrSession) return null;
+        // 復元された別の端末が古い label を引き継いでも、古い cwd でワークスペースを選ばない。
+        const owned = resolveHerdrSessionPane(livePanes, label, meta.herdrPaneId, isTailiiName, {
+          terminalId: meta.herdrTerminalId,
+          herdrSession,
+        });
+        return owned?.paneId === pane.paneId ? herdrWorkspaceKey(meta.cwd) : null;
       },
       // 利用者の pane の作業フォルダは実パスで返るので、実パスどうしで比べて一致したら `workspaceKey` として数える。
       (cwd) => (herdrWorkspaceKey(cwd) === realWorkspaceKey ? workspaceKey : null),
