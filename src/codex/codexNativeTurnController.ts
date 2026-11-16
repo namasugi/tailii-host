@@ -885,8 +885,8 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
   }
 
   /**
-   * 非同期質問の回答（codex-async-question）。iOS の設問シートは提示中の全問の回答を求めるので、
-   * 回答した分を片付け、提示後に届いて答えていない分があれば出し直す。回答は封筒にまとめ、質問した
+   * 非同期質問の回答（codex-async-question）。有効な回答がある分だけ片付け、未回答分は出し直す。
+   * iOS は全問の回答を求めるが、不完全な送信でも未回答の設問を失わない。回答は封筒にまとめ、質問した
    * 実行中の turn へ steer する（新しい turn は始めない: hub の送信キューを迂回して turn/start が競合
    * しないように。turn が終わっていれば TUI と同じく締め切り扱い）。送信は待たない（hub の回答受付は
    * 同期の真偽で返す）。届かなかったときは会話へ注記する。
@@ -917,9 +917,9 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
         itemId: entry.itemId, index: entry.question.index, title: entry.question.title, answer: text,
       });
     }
-    // 提示した分は（回答の有無にかかわらず）終わり。残りがあれば新しい id で出し直す。
-    const presentedKeys = new Set(presented.map(asyncEntryKey));
-    pending.entries = pending.entries.filter((entry) => !presentedKeys.has(asyncEntryKey(entry)));
+    // 封筒に載せる回答だけを外す。hub は受付時に旧 prompt を閉じるため、空回答でも残りを新 id で出し直す。
+    const repliedKeys = new Set(replies.map((reply) => `${reply.itemId}#${reply.index}`));
+    pending.entries = pending.entries.filter((entry) => !repliedKeys.has(asyncEntryKey(entry)));
     pending.promptId = null;
     pending.presentedEntries = [];
     pending.presentedKey = null;
@@ -971,9 +971,9 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
   }
 
   /**
-   * 回答の封筒なら指された質問を外し、通常のメッセージならその時点の未回答の質問を閉じる。
-   * Tailii / TUI / デスクトップのいずれからの入力も、Codex が受理した記録を根拠にする。
-   * snapshot の再生でも同じ順序で処理し、答えずに進めた古い設問を復活させない。
+   * 明示的な回答の封筒で指された質問だけを外す。
+   * 通常のメッセージ・添付は回答ではないため、未回答の非同期質問を保持する。
+   * snapshot の再生でも同じ順序で処理し、回答済みの設問を復活させない。
    */
   private resolveAsyncQuestionsFromInput(
     session: string,
@@ -988,7 +988,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       const record = asRecord(part);
       return record?.["type"] === "text" && typeof record["text"] === "string" ? [record["text"] as string] : [];
     }).join("\n");
-    // 空の本文や形のない履歴記録だけでは「答えずに送った」と判定しない。添付だけの入力も受ける。
+    // 空の本文や形のない履歴記録を照合に使わない。添付だけの入力も有効な入力として扱う。
     const hasValue = (value: unknown): boolean => typeof value === "string" && value.trim().length > 0;
     const hasAttachment = content.some((part) => {
       const record = asRecord(part);
@@ -1010,11 +1010,8 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       pending.seenUserMessageIds.add(id);
     }
     const targets = codexAsyncQuestionReplyTargets(text);
-    if (targets === null) {
-      pending.entries = [];
-      if (present) this.presentAsyncQuestions(session);
-      return;
-    }
+    // 0.169.0の実機確認: 通常発話の後もTUIの質問は残る。Tailiiだけ消してはいけない。
+    if (targets === null) return;
     for (const target of targets) {
       // 開き直しの再生で、後から出る質問を回答済みとして覚えておく（item id 全体の旧形式も）。
       pending.answeredKeys.add(target.index === null ? target.itemId : `${target.itemId}#${target.index}`);
