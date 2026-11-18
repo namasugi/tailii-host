@@ -30,7 +30,8 @@ export const AGENT_GUIDE = `# tailii-host chat — AI エージェント向け�
     起動先の明示（省略はアプリの設定）。明示した herdr セッションが動いていなければ、振り替えずに失敗する。
 - chat status <conversationId> [--after <依頼ID>] [--wait <秒>] --json
     state（busy=処理中 / waiting_approval=ツールの承認待ち / waiting_answer=設問への答え待ち / waiting=その他の入力待ち /
-    idle=待機 / not_running=止まっている）と reply（返答の文章）。waiting_approval / waiting_answer のときは waiting に中身が載る
+    idle=待機 / not_running=止まっている）と reply（返答の文章）。model は直近の返答を作ったモデル（設定値ではないので、
+    set-model の直後は次の返答まで前のモデルのまま）。waiting_approval / waiting_answer のときは waiting に中身が載る
     （approvals[].approvalId・tool・summary / question.questionId と questions[].options[].choice）。答え待ちは --wait でも待たずに返る。
     --after でその依頼への返答だけを返す。received はその依頼が会話に届いたか、delivery は配送状態
     （delivered=届いた / pending=保留中（設問の表示中など）/ blocked=前の送信が止まっていて流れない /
@@ -42,6 +43,19 @@ export const AGENT_GUIDE = `# tailii-host chat — AI エージェント向け�
     伝える（この会話には送らない）/ deleted → 送り直すなら人に確かめてから
     新しい依頼 ID で / unknown → 同じ依頼 ID で送り直す。
 
+- chat models [--agent claude|codex] [--refresh] --json
+    使えるモデルの一覧（id・displayName・isDefault。Codex は efforts も）。6 時間は控えを返す。--model にはこの id をそのまま渡す
+    （opus などの別名は使えない）。allowedModels があれば Bot にはその中だけ返す（restricted: true）。
+- chat new … [--model <id>] [--effort <工数>]
+    モデルと工数を選んで始める（省略はそのエージェントの既定）。一覧にないモデルは終了コード 2、allowedModels の外は 5。
+    Claude の工数は low / medium / high / xhigh / max、Codex はそのモデルの efforts。modelValidated: false は一覧が取れず
+    確かめられなかったこと（Claude だけ）。
+- chat set-model <conversationId> --model <id> --request-id <ID> --json
+    Claude の会話のモデルを変える（以後ずっと効く。止まっていれば続きから起動する。send には --model を付けられない）。利用者の
+    「新しい会話の既定モデル」も変わる（savedAsDefault: true）ので、bot.json の allowSetModel が true のときだけ使える。処理中・
+    答え待ちは終了コード 6（待機中になってから同じ依頼 ID で打ち直す）。終了コード 7（model_change_unconfirmed）は同じ依頼 ID で
+    打ち直すと確かめだけをやり直す。終了コード 5（model_change_failed）はモデルが変わらなかったことが確定した（detail に理由）。
+    superseded: true はこの後に別のモデルへ変えられている。Codex の会話は未対応。
 - chat answer <conversationId> <設問ID> --choice <番号> [--other <文>] --json
     設問に答える（Bot が new で始めた会話だけ）。番号は 1 から。複数選択は 1,3、設問が複数なら設問ごとに ; で区切る（1;2）。
     --other は設問が 1 つのときの自由記述（「その他」）。1 つだけ選ぶ設問では --choice と --other のどちらか一方。
@@ -58,7 +72,7 @@ export const AGENT_GUIDE = `# tailii-host chat — AI エージェント向け�
   ツールの承認は待たずに拒否され、Claude には「許可の要らない方法で進めるか、止めて報告する」と伝わる。
 
 ## 依頼 ID（--request-id）
-- new / send に必須。同じ依頼 ID で打ち直すと、同じ会話・同じ送信として扱われ二重にならない。終了コード 6・7 は同じ ID で打ち直す。
+- new / send / set-model に必須。同じ依頼 ID で打ち直すと、同じ会話・同じ送信として扱われ二重にならない。終了コード 6・7 は同じ ID で打ち直す。
 - 依頼ごとに新しい ID を使う（例: UUID）。
 
 ## 出力（--json）
@@ -79,7 +93,7 @@ export const AGENT_GUIDE = `# tailii-host chat — AI エージェント向け�
   打ち直す。同じ理由で何度も断られるなら人に伝える
 - 7 送信が届いたか分からない（時間切れ・結果不明）。同じ依頼 ID で打ち直す（保留中の送信に合流し、届いていれば duplicate）。
   新しい依頼 ID で送り直さない（二重になる）。設問の表示中は、送信は利用者が答えるまで保留される。
-  エラーの JSON に conversationId があれば chat status <会話ID> --after <依頼ID> の delivery で確かめられる。
+  エラーの JSON に conversationId があれば chat status <会話ID> --after <依頼ID> の delivery で確かめられる（set-model の依頼には使えない）。
   new の起動の時間切れ（start_timeout）は会話 ID がまだ無い。同じ依頼 ID で new を打ち直す（新しい ID だと会話がもう 1 つ始まる）
 - 127 tailii-host が無い（このホストに Tailii が入っていない）
 

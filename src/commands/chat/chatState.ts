@@ -32,6 +32,15 @@ export interface BotConfig {
   allowApprove: boolean;
   /** Bot に他所で動いている会話の開き直し（`chat take-over`）を許すか。既定は不可。第 2 段。 */
   allowTakeOver: boolean;
+  /**
+   * Bot が `--model` で指定してよいモデル（完全一致）。未設定は制限なし（一覧にあるモデル）。使用量の使いすぎの防止。
+   */
+  allowedModels?: string[];
+  /**
+   * Bot に会話の途中のモデル変更（`chat set-model`）を許すか。既定は不可: Claude の `/model` は利用者の「新しい会話の
+   * 既定モデル」も書き換える（2.1.322 実測 `Set model to … and saved as your default for new sessions`）。
+   */
+  allowSetModel: boolean;
 }
 
 export function botConfigPath(home: string = os.homedir()): string {
@@ -41,6 +50,7 @@ export function botConfigPath(home: string = os.homedir()): string {
 export function loadBotConfig(file: string = botConfigPath()): BotConfig {
   const config: BotConfig = {
     allowedRoots: [os.homedir()], permissionMode: "acceptEdits", allowAuto: false, allowApprove: false, allowTakeOver: false,
+    allowSetModel: false,
   };
   let raw: unknown;
   try {
@@ -58,6 +68,13 @@ export function loadBotConfig(file: string = botConfigPath()): BotConfig {
   if (typeof obj["allowAuto"] === "boolean") config.allowAuto = obj["allowAuto"];
   if (typeof obj["allowApprove"] === "boolean") config.allowApprove = obj["allowApprove"];
   if (typeof obj["allowTakeOver"] === "boolean") config.allowTakeOver = obj["allowTakeOver"];
+  if (typeof obj["allowSetModel"] === "boolean") config.allowSetModel = obj["allowSetModel"];
+  // 配列でない書き間違いは、黙って無制限にせず「何も許さない」に倒す。
+  if (obj["allowedModels"] !== undefined) {
+    config.allowedModels = Array.isArray(obj["allowedModels"])
+      ? obj["allowedModels"].filter((value): value is string => typeof value === "string" && value.length > 0)
+      : [];
+  }
   const mode = obj["permissionMode"];
   if (typeof mode === "string" && (PERMISSION_MODES as readonly string[]).includes(mode)) {
     config.permissionMode = mode as PermissionMode;
@@ -103,7 +120,7 @@ export function requestDigest(requestId: string): string {
  */
 export interface RequestRecord {
   requestId: string;
-  kind: "new" | "send";
+  kind: "new" | "send" | "set-model";
   conversationId: string;
   session: string;
   cwd: string;
@@ -124,6 +141,10 @@ export interface RequestRecord {
   agent?: "claude" | "codex";
   /** Codex の turn の承認の方針と sandbox（打ち直しでも同じ値で送る: hub は明示の再送で中身の一致を見る）。 */
   codexTurn?: CodexTurnOptions;
+  /** 指定したモデル（`new --model` / `set-model`）。同じ依頼 ID の使い回しの照合にも使う。 */
+  model?: string;
+  /** 指定した工数（`new --effort`。Codex は最初の turn にだけ載せ、以後の send には引き継がない）。 */
+  effort?: string;
 }
 
 /** Codex の turn の設定（`codex_turn_start` の approvalPolicy / sandbox / collaborationMode）。 */
@@ -345,6 +366,136 @@ export function normalizeForReplyMatch(text: string): string {
   return normalizeForTextMatch(unwrapPastedContent(normalizeTextForPaste(text)).normalize("NFC"));
 }
 
+/** 会話の記録から、直近の返答を作ったモデルを読む（`<synthetic>` は実際のモデルではないので除く）。分からなければ null。 */
+export function lastClaudeModel(file: string): string | null {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+  const lines = raw.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    if (!line.includes("\"assistant\"") || !line.includes("\"model\"")) continue;
+    try {
+      const obj = JSON.parse(line) as { type?: unknown; isSidechain?: unknown; message?: { model?: unknown } };
+      const model = obj.message?.model;
+      if (obj.type === "assistant" && obj.isSidechain !== true && typeof model === "string" && model.length > 0 &&
+        model !== "<synthetic>") return model;
+    } catch {
+      // 壊れた行は飛ばす。
+    }
+  }
+  return null;
+}
+
+/** ローカルコマンドの行の本文。待機中は `user` の行、ターンの途中に実行すると `system` / `local_command` の行になる（2.1.322 実測）。 */
+function localCommandText(obj: { type?: unknown; subtype?: unknown; content?: unknown; message?: { content?: unknown } }): string | null {
+  if (obj.type === "user") return textOf(obj.message?.content);
+  if (obj.type === "system" && obj.subtype === "local_command" && typeof obj.content === "string") return obj.content;
+  return null;
+}
+
+/**
+ * 送った `/model <id>` の結果を会話の記録から探す。コマンドの行（`<command-name>/model</command-name>` と
+ * `<command-args><id></command-args>`）が無ければ null。結果の行（`<local-command-stdout>`）がまだ無ければ detail は null。
+ * 結果は、そのコマンドの行の次のコマンドの行より手前だけを見る（別のコマンドの出力を自分の結果と取り違えない）。
+ * `superseded` は、この後に別のモデルへの `/model` が実行されたこと（今のモデルは頼んだものではない）。
+ * ターンの途中に実行した `/model` の行はターンの終わりに書かれる（時刻は実行した時刻のまま）。
+ */
+export function findModelCommandResult(
+  file: string,
+  sinceMs: number,
+  model: string,
+): { detail: string | null; superseded: boolean } | null {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+  const ownArgs = `<command-args>${model}</command-args>`;
+  let found = false;
+  /** 自分のコマンドの結果を待っている間だけ true（次のコマンドの行が来たら、その後の出力は自分の結果ではない）。 */
+  let awaitingResult = false;
+  let detail: string | null = null;
+  let superseded = false;
+  for (const line of raw.split("\n")) {
+    if (line.length === 0 || (!line.includes("command-name") && !line.includes("local-command-stdout"))) continue;
+    let obj: Parameters<typeof localCommandText>[0] & { timestamp?: unknown };
+    try {
+      obj = JSON.parse(line) as typeof obj;
+    } catch {
+      continue;
+    }
+    const text = localCommandText(obj);
+    if (text === null) continue;
+    const isCommand = text.includes("<command-name>");
+    const isModelCommand = text.includes("<command-name>/model</command-name>");
+    if (!found) {
+      const atMs = typeof obj.timestamp === "string" ? Date.parse(obj.timestamp) : Number.NaN;
+      found = Number.isFinite(atMs) && atMs >= sinceMs && isModelCommand && text.includes(ownArgs);
+      awaitingResult = found;
+      continue;
+    }
+    if (isCommand) {
+      // 同じモデルへの打ち直しなら、そちらの結果を読む。別のモデルへの変更なら、頼んだモデルはもう今のモデルではない。
+      awaitingResult = isModelCommand && text.includes(ownArgs);
+      if (awaitingResult) {
+        detail = null;
+        superseded = false;
+      } else if (isModelCommand && /<command-args>[^<]+<\/command-args>/.test(text)) {
+        superseded = true;
+      }
+      continue;
+    }
+    if (awaitingResult) {
+      const stdout = /<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/.exec(text);
+      // 色の制御文字を除いて返す。
+      if (stdout !== null) {
+        detail = stdout[1]!.replace(/\u001b\[[0-9;]*m/g, "").trim();
+        awaitingResult = false;
+      }
+    }
+  }
+  return found ? { detail, superseded } : null;
+}
+
+/** モデル一覧の控え（`~/.tailii/bot/models-<agent>.json`）。外部 API を連打しないために持つ。 */
+export interface ModelListCache<T> {
+  fetchedAtMs: number;
+  models: T[];
+}
+
+export function modelCacheDir(home: string = os.homedir()): string {
+  return path.join(home, ".tailii", "bot");
+}
+
+export function readModelCache<T>(agent: "claude" | "codex", dir: string = modelCacheDir()): ModelListCache<T> | null {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(dir, `models-${agent}.json`), "utf8")) as Partial<ModelListCache<T>>;
+    if (typeof raw.fetchedAtMs !== "number" || !Array.isArray(raw.models)) return null;
+    // 要素の形が崩れた控えは無かったことにする（取り直す）。
+    const wellFormed = raw.models.every((item) => typeof (item as { id?: unknown } | null)?.id === "string");
+    return wellFormed ? { fetchedAtMs: raw.fetchedAtMs, models: raw.models } : null;
+  } catch {
+    return null;
+  }
+}
+
+export function writeModelCache<T>(agent: "claude" | "codex", cache: ModelListCache<T>, dir: string = modelCacheDir()): void {
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const file = path.join(dir, `models-${agent}.json`);
+    const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(cache), { mode: 0o600 });
+    fs.renameSync(tmp, file);
+  } catch {
+    // 控えが書けなくても一覧は返せる。
+  }
+}
+
 // ---- Codex（rollout） ----
 
 /** Codex の会話（thread id）の rollout を探す（`~/.codex/sessions/YYYY/MM/DD/rollout-…-<id>.jsonl[.zst]`）。新しい日付から。 */
@@ -445,6 +596,24 @@ export function readCodexRollout(file: string): { lines: TranscriptLine[]; busy:
     }
   }
   return { lines: out, busy };
+}
+
+/** Codex の rollout から、直近の turn のモデルを読む（最後の `turn_context`）。分からなければ null。 */
+export function lastCodexModel(file: string): string | null {
+  const raw = readRolloutText(file);
+  if (raw === null) return null;
+  const lines = raw.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    if (!line.includes("\"turn_context\"")) continue;
+    try {
+      const obj = JSON.parse(line) as { type?: unknown; payload?: { model?: unknown } };
+      if (obj.type === "turn_context" && typeof obj.payload?.model === "string" && obj.payload.model.length > 0) return obj.payload.model;
+    } catch {
+      // 壊れた行は飛ばす。
+    }
+  }
+  return null;
 }
 
 /** Codex の会話が処理中か（rollout の最後の turn が始まったまま終わっていない）。 */

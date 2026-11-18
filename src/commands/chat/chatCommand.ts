@@ -31,17 +31,22 @@ import {
   conversationState,
   findCodexRollout,
   findLatestCodexTurnRecord,
+  findModelCommandResult,
   findTranscript,
   folderAllowed,
   isBotStartedConversation,
   isPermissionMode,
+  lastClaudeModel,
+  lastCodexModel,
   loadBotConfig,
   readCodexRollout,
   readCodexRolloutLines,
+  readModelCache,
   readReply,
   readRequest,
   readTranscriptLines,
   requestDigest,
+  writeModelCache,
   writeRequest,
   type BotConfig,
   type CodexTurnOptions,
@@ -96,6 +101,8 @@ export interface ChatDeps {
   codexRollout?: (threadId: string) => string | null;
   /** 依頼の記録の置き場（テスト用。既定 `~/.tailii/bot/requests`）。 */
   requestsDir?: string;
+  /** モデル一覧の控えの置き場（テスト用。既定 `~/.tailii/bot`）。 */
+  modelCacheDir?: string;
 }
 
 interface ParsedArgs {
@@ -105,9 +112,9 @@ interface ParsedArgs {
 
 const VALUE_FLAGS = new Set([
   "--cwd", "--request-id", "--title", "--permission-mode", "--after", "--wait",
-  "--choice", "--other", "--reason", "--backend", "--herdr-session", "--agent",
+  "--choice", "--other", "--reason", "--backend", "--herdr-session", "--agent", "--model", "--effort",
 ]);
-const BOOL_FLAGS = new Set(["--json", "--live", "--no-attach", "--interrupt", "--yes"]);
+const BOOL_FLAGS = new Set(["--json", "--live", "--no-attach", "--interrupt", "--yes", "--refresh"]);
 
 function parseArgs(args: string[]): ParsedArgs {
   const positional: string[] = [];
@@ -299,11 +306,13 @@ async function sendCodexTurn(
   clientUserMessageId: string,
   text: string,
   turn: CodexTurnOptions | undefined,
+  effort: string | undefined,
 ): Promise<"accepted" | "duplicate"> {
   const id = newId();
   let reply: ControlMessage;
   try {
-    reply = await engine.request({ type: "codex_turn_start", v: 2, id, session, text, clientUserMessageId, ...(turn ?? {}) },
+    reply = await engine.request({ type: "codex_turn_start", v: 2, id, session, text, clientUserMessageId, ...(turn ?? {}),
+      ...(effort !== undefined ? { effort } : {}) },
       isType("codex_turn_start_result", id), 100_000);
   } catch (error) {
     if (error instanceof EngineTimeoutError && await receiptOn(engine, session, clientUserMessageId).catch(() => "unknown") === "blocked") {
@@ -378,6 +387,8 @@ interface ConversationRow {
   updatedAtMs?: number;
   liveSession?: string;
   elsewhere: boolean;
+  /** API 作業の会話（端末が無く、`/model` が発話として API へ渡ってしまう）。 */
+  apiRoute: boolean;
 }
 
 async function listConversations(engine: EngineConnection): Promise<ConversationRow[]> {
@@ -398,6 +409,7 @@ async function listConversationsResolved(engine: EngineConnection): Promise<{ ro
     ...(row.updatedAt !== undefined ? { updatedAtMs: row.updatedAt * 1000 } : {}),
     ...(row.liveSessionName !== undefined ? { liveSession: row.liveSessionName } : {}),
     elsewhere: row.liveSessionName === undefined && row.peerSessionName !== undefined,
+    apiRoute: row.executionRoute === "api",
   })) };
 }
 
@@ -427,6 +439,10 @@ function utteranceRecorded(deps: ChatDeps, record: RequestRecord): boolean {
     findTranscript(id, { store: deps.store(), ...(cwdHint !== undefined ? { cwdHint } : {}) }));
   const transcript = record.conversationId === "" ? null : transcriptOf(record.conversationId, record.cwd);
   if (transcript === null) return false;
+  // `/model` は発話ではなくコマンドの行として残る（発話の読み取りでは除かれる）。
+  if (record.kind === "set-model") {
+    return record.model !== undefined && findModelCommandResult(transcript.file, record.sentAtMs, record.model) !== null;
+  }
   return readReply(readTranscriptLines(transcript.file), { sentAtMs: record.sentAtMs, text: record.text }).found;
 }
 
@@ -479,8 +495,10 @@ const hashText = (text: string): string => createHash("sha256").update(text).dig
 
 /** 同じ依頼 ID の使い回し（種類・フォルダ・会話・本文が違う）を見分ける（レビュー指摘 A5）。 */
 function assertSameRequest(record: RequestRecord, expect: { kind: RequestRecord["kind"]; cwd?: string; conversationId?: string;
-  textHash: string | null }): void {
+  textHash: string | null; model?: string | null; effort?: string | null }): void {
   const differs = record.kind !== expect.kind ||
+    (expect.model !== undefined && (record.model ?? null) !== expect.model) ||
+    (expect.effort !== undefined && (record.effort ?? null) !== expect.effort) ||
     (expect.cwd !== undefined && record.cwd !== expect.cwd) ||
     (expect.conversationId !== undefined && record.conversationId !== "" && record.conversationId !== expect.conversationId) ||
     (expect.textHash !== null && record.textHash !== undefined && record.textHash !== expect.textHash);
@@ -491,10 +509,13 @@ function assertSameRequest(record: RequestRecord, expect: { kind: RequestRecord[
 
 function withConversation(error: unknown, record: RequestRecord): unknown {
   const extra = { requestId: record.requestId, conversationId: record.conversationId, session: record.session };
-  if (error instanceof ChatError) return new ChatError(error.exitCode, error.code, error.message, error.hint, { ...error.extra, ...extra });
+  // モデルの変更の依頼には返答が無いので、`status --after` を案内しない。
+  const hintFor = (failure: ChatError): string | undefined =>
+    record.kind === "set-model" && failure.code === "delivery_unknown" ? "同じ依頼 ID で打ち直す" : failure.hint;
+  if (error instanceof ChatError) return new ChatError(error.exitCode, error.code, error.message, hintFor(error), { ...error.extra, ...extra });
   if (error instanceof EngineTimeoutError) {
     const unknown = unknownDelivery(error.message);
-    return new ChatError(unknown.exitCode, unknown.code, unknown.message, unknown.hint, extra);
+    return new ChatError(unknown.exitCode, unknown.code, unknown.message, hintFor(unknown), extra);
   }
   return error;
 }
@@ -607,7 +628,7 @@ async function sendRecorded(
   let status: "accepted" | "duplicate";
   try {
     status = record.agent === "codex"
-      ? await sendCodexTurn(engine, record.session, clientMessageIdFor(record.requestId), record.text, record.codexTurn)
+      ? await sendCodexTurn(engine, record.session, clientMessageIdFor(record.requestId), record.text, record.codexTurn, record.effort)
       : await sendText(engine, record.session, clientMessageIdFor(record.requestId), record.text);
   } catch (error) {
     // 人に回した依頼は記録に印を残す（打ち直しで届いたか分からない送信を送り直さない。5 周目レビュー 1）。
@@ -647,12 +668,19 @@ async function cmdNew(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<R
   const placement = placementOf(args);
   const attach = !bot && !args.flags.has("--no-attach");
   const prompt = readPrompt(deps, !attach);
+  const model = flagString(args, "--model");
+  const effort = flagString(args, "--effort");
+  // Codex の工数は最初の turn に載せる。指示文が無いと載せる turn が無い。
+  if (agent === "codex" && effort !== undefined && prompt === null) {
+    throw new ChatError(EXIT.usage, "effort_needs_prompt", "Codex の --effort は最初の指示文と一緒に指定します");
+  }
   const requestId = requestIdOf(args, bot);
+  const validated = await validateModelChoice(deps, bot, agent, model, effort);
   const resolvedCwd = fs.realpathSync(cwd);
   const textHash = prompt === null ? null : hashText(prompt);
   return withRequestLock(deps, requestId, () =>
     newLocked({ deps, requestId, resolvedCwd, textHash, prompt, attach, permissionMode, title: flagString(args, "--title"),
-      placement, agent }));
+      placement, agent, model, effort, modelValidated: validated }));
 }
 
 /**
@@ -682,11 +710,13 @@ async function newLocked(input: {
   permissionMode: string | undefined; title: string | undefined;
   placement: { backend?: "tmux" | "herdr"; herdrSession?: string };
   agent: "claude" | "codex";
+  model: string | undefined; effort: string | undefined; modelValidated: boolean;
 }): Promise<Record<string, unknown> & { attach?: string }> {
-  const { deps, requestId, resolvedCwd, textHash, prompt, attach, permissionMode, title, placement, agent } = input;
+  const { deps, requestId, resolvedCwd, textHash, prompt, attach, permissionMode, title, placement, agent, model, effort, modelValidated } = input;
+  const choice = { ...(model !== undefined ? { model } : {}), ...(effort !== undefined ? { effort } : {}) };
   const codexTurn = agent === "codex" ? codexTurnOptions(permissionMode as PermissionMode | undefined) : undefined;
   const previous = (deps.readRequest ?? readRequest)(requestId);
-  if (previous !== null) assertSameRequest(previous, { kind: "new", cwd: resolvedCwd, textHash });
+  if (previous !== null) assertSameRequest(previous, { kind: "new", cwd: resolvedCwd, textHash, model: model ?? null, effort: effort ?? null });
   if (previous !== null && (previous.agent ?? "claude") !== agent) {
     throw new ChatError(EXIT.usage, "request_id_reused", "この依頼 ID は別の依頼で使われています（依頼ごとに新しい ID を使う）");
   }
@@ -713,7 +743,7 @@ async function newLocked(input: {
     } else {
       writeReq({
         requestId, kind: "new", conversationId: "", session: name, cwd: resolvedCwd, sentAtMs: deps.now(), text: "",
-        ...(textHash !== null ? { textHash } : {}), state: "starting", ...(agent === "codex" ? { agent } : {}),
+        ...(textHash !== null ? { textHash } : {}), state: "starting", ...(agent === "codex" ? { agent } : {}), ...choice,
       });
       try {
         started = await startSession(engine, {
@@ -721,6 +751,10 @@ async function newLocked(input: {
           // Codex は許可モードではなく sandbox（起動時）と承認の方針（turn ごと）で決める。
           ...(agent === "claude" && permissionMode !== undefined ? { permissionMode } : {}),
           ...(codexTurn?.sandbox !== undefined ? { codexSandbox: codexTurn.sandbox } : {}),
+          // モデル: Claude は起動フラグ、Codex は thread の開始時。工数: Claude は起動フラグ、Codex は最初の turn。
+          ...(agent === "claude" && model !== undefined ? { model } : {}),
+          ...(agent === "claude" && effort !== undefined ? { effort } : {}),
+          ...(agent === "codex" && model !== undefined ? { codexModel: model } : {}),
           ...(title !== undefined ? { title } : {}),
           ...placement,
         });
@@ -738,6 +772,7 @@ async function newLocked(input: {
       sentAtMs: deps.now(), text: prompt === null ? "" : deliverableText(prompt, requestId, deps),
       ...(textHash !== null ? { textHash } : {}),
       ...(agent === "codex" ? { agent, ...(codexTurn !== undefined ? { codexTurn } : {}) } : {}),
+      ...choice,
     };
     // 送信が未確定の記録は、指示文なしで打ち直されても送信済みにしない（記録の本文で打ち直す。6 周目 補足）。
     if (prompt === null && !(previous !== null && previous.state === "started")) {
@@ -757,7 +792,8 @@ async function newLocked(input: {
     return { session: toSend.session, conversationId: started.conversationId };
   });
   return {
-    requestId, conversationId: result.conversationId, session: result.session, cwd: resolvedCwd, agent,
+    requestId, conversationId: result.conversationId, session: result.session, cwd: resolvedCwd, agent, ...choice,
+    ...(!modelValidated ? { modelValidated: false } : {}),
     ...(permissionMode !== undefined ? { permissionMode } : {}),
     ...(attach ? { attach: result.session } : {}),
   };
@@ -766,6 +802,10 @@ async function newLocked(input: {
 async function cmdSend(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<Record<string, unknown>> {
   const conversationId = requireConversationId(args);
   if (args.flags.has("--cwd")) throw new ChatError(EXIT.usage, "unexpected_cwd", "send は --cwd を受け取りません（会話のフォルダで続ける）");
+  if (args.flags.has("--model") || args.flags.has("--effort")) {
+    throw new ChatError(EXIT.usage, "use_set_model", "send は --model / --effort を受け取りません（1 通だけに効かせる仕組みがありません）",
+      "会話のモデルを変えるなら chat set-model（以後ずっと効く）");
+  }
   const prompt = readPrompt(deps, true)!;
   const requestId = requestIdOf(args, bot);
   const textHash = hashText(prompt);
@@ -865,6 +905,9 @@ async function cmdStatus(args: ParsedArgs, deps: ChatDeps): Promise<Record<strin
   if (!Number.isFinite(waitSec) || waitSec < 0) throw new ChatError(EXIT.usage, "bad_wait", "--wait は 0 以上の秒数");
   // 送信が未確定（started）の記録も受け付ける（時間切れの後に「届いたか」を確かめる用途。レビュー指摘 A3）。
   const after = afterId !== undefined ? (deps.readRequest ?? readRequest)(afterId) : null;
+  if (after !== null && after.kind === "set-model") {
+    throw new ChatError(EXIT.usage, "request_has_no_reply", "モデルの変更の依頼には返答がありません（--after に使えません）");
+  }
   if (after !== null && after.state === "starting") {
     throw new ChatError(EXIT.notFound, "request_not_started", "この依頼は会話の起動の途中で終わっています",
       "同じ依頼 ID で chat new を打ち直す（起動済みなら起動し直さずに続ける）");
@@ -912,6 +955,14 @@ async function cmdStatus(args: ParsedArgs, deps: ChatDeps): Promise<Record<strin
     const state: ConversationState = snapshot?.busy === true ? "busy" : (await codexIsAlive()) ? "idle" : "not_running";
     return { state, lines: snapshot?.lines ?? null };
   };
+  // 直近の返答を作ったモデル（設定値ではない。set-model の直後は次の返答まで前のモデルのまま）。
+  let currentModel: string | null | undefined;
+  const currentModelOf = (): string | null => {
+    if (currentModel !== undefined) return currentModel;
+    if (agent === "codex") return (currentModel = codexRollout === null ? null : lastCodexModel(codexRollout));
+    const transcript = transcriptOf(conversationId, after?.cwd);
+    return (currentModel = transcript === null ? null : lastClaudeModel(transcript.file));
+  };
   // Codex の設問は登録簿に出ないので、処理中のあいだ hub に聞く（数秒おき）。
   let codexQuestionCheckedAtMs = Number.NEGATIVE_INFINITY;
   const deadline = deps.now() + Math.min(waitSec, 100) * 1000;
@@ -952,6 +1003,7 @@ async function cmdStatus(args: ParsedArgs, deps: ChatDeps): Promise<Record<strin
         conversationId, state: waiting.state, complete,
         ...(waiting.detail !== undefined ? { waiting: waiting.detail } : {}),
         ...(agent === "codex" ? { agent } : {}),
+        ...(currentModelOf() !== null ? { model: currentModelOf() } : {}),
         ...(afterId !== undefined ? { after: afterId, received: read.found || delivery === "delivered", delivery } : {}),
         // 届いたか分からない送信で、この会話の後ろの送信が止まっている（記録に発話があっても hub は解かない）。
         // Bot には解けない（3 周目レビュー 2）。
@@ -1279,6 +1331,231 @@ async function cmdTakeOver(args: ParsedArgs, deps: ChatDeps, bot: boolean): Prom
   return { conversationId, ...result, ...(attach && session !== undefined && result["cancelled"] !== true ? { attach: session } : {}) };
 }
 
+// ---- モデルの選択 ----
+
+/** 一覧の 1 件（Claude は工数の欄が無い）。 */
+interface ModelEntry {
+  id: string;
+  displayName: string;
+  isDefault?: boolean;
+  description?: string;
+  efforts?: string[];
+  defaultEffort?: string;
+}
+
+/** 控えを使う長さ（アプリの一覧の控えと同じ 6 時間）。一覧の取得は外部 API を叩くので、呼び出しごとに引かない。 */
+const MODEL_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+/** モデル ID（起動フラグへ渡すので、engine の検証と同じ文字だけ。先頭の `-` はオプションと紛れるので断る）。 */
+const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const CLAUDE_EFFORTS: readonly string[] = ["low", "medium", "high", "xhigh", "max"];
+
+async function fetchModelList(deps: ChatDeps, agent: "claude" | "codex"): Promise<ModelEntry[] | null> {
+  try {
+    return await withEngine(deps, async (engine) => {
+      const id = newId();
+      if (agent === "claude") {
+        const reply = await engine.request({ type: "claude_model_list_request", v: 2, id }, isType("claude_model_list_response", id), 20_000);
+        if (reply.type !== "claude_model_list_response") return null;
+        return reply.models.map((model) => ({
+          id: model.id, displayName: model.displayName, ...(model.isDefault === true ? { isDefault: true } : {}),
+        }));
+      }
+      const reply = await engine.request({ type: "codex_model_list_request", v: 2, id }, isType("codex_model_list_response", id), 20_000);
+      if (reply.type !== "codex_model_list_response") return null;
+      return reply.models.map((model) => ({
+        id: model.id, displayName: model.displayName, description: model.description, isDefault: model.isDefault,
+        ...(model.supportedReasoningEfforts !== undefined ? { efforts: model.supportedReasoningEfforts } : {}),
+        ...(model.defaultReasoningEffort !== undefined ? { defaultEffort: model.defaultReasoningEffort } : {}),
+      }));
+    });
+  } catch {
+    return null;
+  }
+}
+
+/** モデル一覧（控え → 取得 → 取れなければ古い控え）。どれも無ければ null。 */
+async function loadModelList(deps: ChatDeps, agent: "claude" | "codex", refresh: boolean): Promise<{
+  models: ModelEntry[]; source: "live" | "cache"; fetchedAtMs: number; stale: boolean;
+} | null> {
+  const cache = readModelCache<ModelEntry>(agent, deps.modelCacheDir);
+  const cacheAgeMs = cache === null ? Number.POSITIVE_INFINITY : deps.now() - cache.fetchedAtMs;
+  if (!refresh && cache !== null && cacheAgeMs >= 0 && cacheAgeMs < MODEL_CACHE_TTL_MS) {
+    return { models: cache.models, source: "cache", fetchedAtMs: cache.fetchedAtMs, stale: false };
+  }
+  const models = await fetchModelList(deps, agent);
+  if (models !== null && models.length > 0) {
+    const fetchedAtMs = deps.now();
+    writeModelCache(agent, { fetchedAtMs, models }, deps.modelCacheDir);
+    return { models, source: "live", fetchedAtMs, stale: false };
+  }
+  return cache !== null ? { models: cache.models, source: "cache", fetchedAtMs: cache.fetchedAtMs, stale: true } : null;
+}
+
+/**
+ * 指定されたモデル・工数を送る前に確かめる（engine は不正な値を黙って捨てて既定のモデルで起動するので、Bot が指定が効いたと
+ * 誤解する）。戻り値は一覧と照らせたか（Claude は一覧が取れなければ文字の検査だけで通す）。
+ */
+async function validateModelChoice(
+  deps: ChatDeps, bot: boolean, agent: "claude" | "codex", model: string | undefined, effort: string | undefined,
+): Promise<boolean> {
+  if (model === undefined && effort === undefined) return true;
+  if (model !== undefined && !MODEL_ID.test(model)) {
+    throw new ChatError(EXIT.usage, "bad_model", `モデル ID が正しくありません: ${model}`, "tailii-host chat models --json で確かめる");
+  }
+  const allowed = bot ? deps.config().allowedModels : undefined;
+  if (model !== undefined && allowed !== undefined && !allowed.includes(model)) {
+    throw new ChatError(EXIT.policy, "model_not_allowed", `このモデルは Bot に許されていません: ${model}`,
+      `使えるのは ${allowed.join(", ") || "（なし）"}（~/.tailii/bot.json の allowedModels）`);
+  }
+  if (agent === "claude" && effort !== undefined && !CLAUDE_EFFORTS.includes(effort)) {
+    throw new ChatError(EXIT.usage, "bad_effort", `工数は ${CLAUDE_EFFORTS.join(" / ")}: ${effort}`);
+  }
+  // Claude で allowedModels に書かれたモデルは一覧を見ない（利用者が明示した。外部 API も叩かない）。Codex は必ず一覧と照らす
+  // （不正な値で turn が始まった後に失敗すると、届いたか分からない送信として残る。一覧は App Server から取る）。
+  const needsList = (model !== undefined && (allowed === undefined || agent === "codex")) || (agent === "codex" && effort !== undefined);
+  if (!needsList) return true;
+  let list = await loadModelList(deps, agent, false);
+  // 控えに無いモデルは、控えの後に増えたのかもしれないので 1 回だけ取り直す。
+  if (model !== undefined && list?.source === "cache" && !list.stale && !list.models.some((item) => item.id === model)) {
+    list = await loadModelList(deps, agent, true);
+  }
+  if (list === null) {
+    if (agent === "codex") {
+      throw new ChatError(EXIT.retryLater, "model_list_unavailable", "Codex のモデル一覧を取得できませんでした", "少し待って打ち直す");
+    }
+    return false;
+  }
+  const entry = model !== undefined ? list.models.find((item) => item.id === model) : list.models.find((item) => item.isDefault === true);
+  if (model !== undefined && entry === undefined) {
+    // 取得に失敗して古い控えしか無い Claude は、新しいモデルかもしれないので断らない（確かめられなかったと返す）。
+    if (agent === "claude" && list.stale) return false;
+    throw new ChatError(EXIT.usage, "unknown_model", `一覧にないモデルです: ${model}`, "tailii-host chat models --json で確かめる（別名は使えない）");
+  }
+  if (agent === "codex" && effort !== undefined && entry?.efforts?.includes(effort) !== true) {
+    throw new ChatError(EXIT.usage, "bad_effort", `このモデルで使えない工数です: ${effort}`,
+      entry?.efforts !== undefined ? `使えるのは ${entry.efforts.join(" / ")}` : "tailii-host chat models --agent codex --json で確かめる");
+  }
+  return !list.stale;
+}
+
+async function cmdModels(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<Record<string, unknown>> {
+  const agent = flagString(args, "--agent") ?? "claude";
+  if (agent !== "claude" && agent !== "codex") throw new ChatError(EXIT.usage, "bad_agent", `--agent は claude か codex: ${agent}`);
+  const list = await loadModelList(deps, agent, args.flags.has("--refresh"));
+  if (list === null) {
+    throw new ChatError(EXIT.retryLater, "model_list_unavailable", "モデル一覧を取得できませんでした", "少し待って打ち直す");
+  }
+  const allowed = bot ? deps.config().allowedModels : undefined;
+  return {
+    agent,
+    models: allowed === undefined ? list.models : list.models.filter((model) => allowed.includes(model.id)),
+    source: list.source, fetchedAtMs: list.fetchedAtMs,
+    ...(list.stale ? { stale: true } : {}),
+    ...(allowed !== undefined ? { restricted: true } : {}),
+  };
+}
+
+/** `/model` の結果が会話の記録に出るまで待つ上限（秒）。 */
+const SET_MODEL_CONFIRM_SECONDS = 15;
+
+/** 会話の記録で `/model` の結果を確かめる。確かめられなければ 7（送信は済んでいるので、同じ依頼 ID の打ち直しは確かめだけをやり直す）。 */
+async function confirmModelChange(deps: ChatDeps, record: RequestRecord, model: string): Promise<Record<string, unknown>> {
+  const transcriptOf = deps.transcript ?? ((id: string, cwdHint?: string) =>
+    findTranscript(id, { store: deps.store(), ...(cwdHint !== undefined ? { cwdHint } : {}) }));
+  const where = { requestId: record.requestId, conversationId: record.conversationId, session: record.session, model };
+  let result: ReturnType<typeof findModelCommandResult> = null;
+  for (let attempt = 0; attempt <= SET_MODEL_CONFIRM_SECONDS; attempt++) {
+    const transcript = transcriptOf(record.conversationId, record.cwd);
+    result = transcript === null ? null : findModelCommandResult(transcript.file, record.sentAtMs, model);
+    if (result?.detail != null) break;
+    if (attempt < SET_MODEL_CONFIRM_SECONDS) await deps.sleep(1_000);
+  }
+  const detail = result?.detail ?? null;
+  if (detail === null) {
+    throw new ChatError(EXIT.timeout, "model_change_unconfirmed", "モデルが変わったことを確かめられませんでした",
+      "同じ依頼 ID で打ち直すと確かめだけをやり直す（処理中だった会話は、ターンが終わるまで記録に出ない）。次の返答の後に chat status の model でも確かめられる",
+      where);
+  }
+  // 結果が出て成功の文言でなければ確定した失敗（打ち直しても同じ行を読むだけ）。
+  if (!detail.startsWith("Set model to")) {
+    throw new ChatError(EXIT.policy, "model_change_failed", `モデルを変えられませんでした: ${detail}`,
+      "chat models --json で確かめて新しい依頼 ID でやり直すか、人に伝える", { ...where, detail });
+  }
+  return {
+    ...where, applied: true, detail, savedAsDefault: /saved as your default/i.test(detail),
+    // この後に別のモデルへ変えられている（今のモデルは頼んだものではない）。
+    ...(result?.superseded === true ? { superseded: true } : {}),
+  };
+}
+
+/** 処理中・答え待ちの間に `/model` を打つと、確認の画面が承認されないまま残りうる。待機中だけ受け付ける。 */
+function assertIdleForModelChange(deps: ChatDeps, conversationId: string): void {
+  const state = (deps.state ?? ((id: string) => conversationState(id)))(conversationId);
+  if (state === "busy" || state === "waiting" || pendingApprovalsOf(deps, conversationId).length > 0) {
+    throw new ChatError(EXIT.retryLater, "conversation_busy", "会話が処理中か答え待ちなのでモデルを変えられません",
+      "chat status --wait で待機中になってから同じ依頼 ID で打ち直す", { state });
+  }
+}
+
+async function cmdSetModel(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<Record<string, unknown>> {
+  const conversationId = requireConversationId(args);
+  const model = flagString(args, "--model");
+  if (model === undefined) throw new ChatError(EXIT.usage, "missing_model", "--model が要ります", "tailii-host chat models --json で確かめる");
+  if (args.flags.has("--effort")) throw new ChatError(EXIT.usage, "unexpected_effort", "set-model は --effort を受け取りません");
+  // Claude の `/model` は利用者の「新しい会話の既定モデル」も書き換えるので、Bot には既定で許さない。
+  if (bot && !deps.config().allowSetModel) {
+    throw new ChatError(EXIT.policy, "set_model_not_allowed", "Bot は会話の途中でモデルを変えられません（利用者の既定モデルも変わるため）",
+      "人に伝える。許すなら利用者が ~/.tailii/bot.json の allowSetModel を true にする。新しい会話なら chat new --model で選べる");
+  }
+  if (conversationAgent(deps, conversationId) === "codex") {
+    throw new ChatError(EXIT.policy, "unsupported_agent", "Codex の会話の途中のモデル変更は未対応です", "新しい会話なら chat new --agent codex --model で選べる");
+  }
+  const requestId = requestIdOf(args, bot);
+  const validated = await validateModelChoice(deps, bot, "claude", model, undefined);
+  const result = await withRequestLock(deps, requestId, async () => {
+    const previous = (deps.readRequest ?? readRequest)(requestId);
+    if (previous !== null) assertSameRequest(previous, { kind: "set-model", conversationId, textHash: null, model });
+    if (previous !== null && previous.state === "sent") return confirmModelChange(deps, previous, model);
+    const sent = await withEngine(deps, async (engine) => {
+      let record = previous !== null && previous.state === "started" ? previous : null;
+      if (record !== null) {
+        const revived = await retryStarted(engine, deps, record);
+        if (revived.delivered) {
+          (deps.writeRequest ?? writeRequest)({ ...record, state: "sent" });
+          return record;
+        }
+        record = revived.record;
+        // 打ち直しの間に会話が動き出していることがある（初回と同じ確かめ。記録は started のまま残る）。
+        assertIdleForModelChange(deps, conversationId);
+      } else {
+        const rows = await listConversations(engine);
+        const row = rows.find((entry) => entry.conversationId === conversationId);
+        if (row === undefined) throw new ChatError(EXIT.notFound, "not_found", "会話が見つかりません", "tailii-host chat list --json で確かめる");
+        if (row.agent !== "claude") {
+          throw new ChatError(EXIT.policy, "unsupported_agent", "Codex の会話の途中のモデル変更は未対応です", "新しい会話なら chat new --agent codex --model で選べる");
+        }
+        if (row.apiRoute) throw new ChatError(EXIT.policy, "unsupported_route", "API 作業の会話のモデルはこのコマンドでは変えられません");
+        if (!folderAllowed(row.cwd, deps.config().allowedRoots)) {
+          throw new ChatError(EXIT.policy, "folder_not_allowed", `この会話の作業フォルダは許可されていません: ${row.cwd}`,
+            "~/.tailii/bot.json の allowedRoots に入っている会話だけ変えられる");
+        }
+        if (row.liveSession !== undefined) assertIdleForModelChange(deps, conversationId);
+        const session = row.liveSession ?? (await startSession(engine, {
+          cwd: row.cwd, name: sessionNameFor(`${requestId}:${conversationId}`), resumeSessionId: conversationId,
+          agentType: "claude", peerCheck: true,
+        })).session;
+        record = {
+          requestId, kind: "set-model", conversationId, session, cwd: row.cwd, sentAtMs: deps.now(), text: `/model ${model}`, model,
+        };
+      }
+      await sendRecorded(engine, deps, record);
+      return record;
+    });
+    return confirmModelChange(deps, sent, model);
+  });
+  return { ...result, ...(!validated ? { modelValidated: false } : {}) };
+}
+
 async function cmdAttach(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<{ attach: string }> {
   if (bot) throw new ChatError(EXIT.usage, "attach_needs_terminal", "attach は人が端末で使うコマンドです（--json・端末なしでは使えない）");
   const conversationId = requireConversationId(args);
@@ -1301,7 +1578,7 @@ async function cmdAttach(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promis
 
 // ---------------------------------------------------------------------------------------------------------------
 
-const USAGE = `usage: tailii-host chat <list|new|send|status|answer|approve|take-over|attach> [options]
+const USAGE = `usage: tailii-host chat <list|models|new|send|set-model|status|answer|approve|take-over|attach> [options]
   AI エージェント（Bot）は tailii-host agent-guide を読んで、必ず --json を付ける。
   端末が無い（パイプで指示を渡すなど）ときは Bot として扱い、--request-id が要る。
   list [--live] [--json]
@@ -1312,7 +1589,9 @@ const USAGE = `usage: tailii-host chat <list|new|send|status|answer|approve|take
   approve <conversationId> <承認ID> allow|deny [--reason <理由>] [--json]
   take-over <conversationId> [--interrupt] [--yes] [--no-attach] [--json]
   attach <conversationId>
-  new … [--agent claude|codex] [--backend herdr|tmux] [--herdr-session <名前>]
+  new … [--agent claude|codex] [--model <id>] [--effort <工数>] [--backend herdr|tmux] [--herdr-session <名前>]
+  models [--agent claude|codex] [--refresh] [--json]
+  set-model <conversationId> --model <id> [--request-id <ID>] [--json]
 `;
 
 function render(deps: ChatDeps, json: boolean, payload: Record<string, unknown>, human: string): void {
@@ -1384,6 +1663,18 @@ export async function runChat(argv: string[], deps: ChatDeps): Promise<number> {
             : rest2["cancelled"] === true ? "開き直しませんでした" : "他所では動いていません");
         return EXIT.ok;
       }
+      case "models": {
+        const payload = await cmdModels(args, deps, bot);
+        const rows = payload["models"] as ModelEntry[];
+        render(deps, json, payload, rows.map((row) => `${row.id}${row.isDefault === true ? "  （既定）" : ""}  ${row.displayName}`).join("\n") ||
+          "（使えるモデルがありません）");
+        return EXIT.ok;
+      }
+      case "set-model": {
+        const payload = await cmdSetModel(args, deps, bot);
+        render(deps, json, payload, `モデルを変えました: ${payload["model"]}${payload["savedAsDefault"] === true ? "（新しい会話の既定にもなりました）" : ""}`);
+        return EXIT.ok;
+      }
       case "attach": {
         const payload = await cmdAttach(args, deps, bot);
         return deps.attach(payload.attach);
@@ -1400,7 +1691,9 @@ export async function runChat(argv: string[], deps: ChatDeps): Promise<number> {
         code: failure.code, message: failure.message, ...(failure.hint !== undefined ? { hint: failure.hint } : {}),
       }, ...failure.extra })}\n`);
     } else {
-      deps.write(`エラー: ${failure.message}${failure.hint !== undefined ? `\n→ ${failure.hint}` : ""}\n`);
+      const detail = typeof failure.extra["detail"] === "string" && !failure.message.includes(failure.extra["detail"])
+        ? `（${failure.extra["detail"]}）` : "";
+      deps.write(`エラー: ${failure.message}${detail}${failure.hint !== undefined ? `\n→ ${failure.hint}` : ""}\n`);
     }
     return failure.exitCode;
   }

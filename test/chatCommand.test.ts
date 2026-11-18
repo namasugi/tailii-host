@@ -8,6 +8,7 @@ import {
   acquireRequestLock,
   codexRolloutBusy,
   findCodexRollout,
+  findModelCommandResult,
   folderAllowed,
   readCodexRolloutLines,
   loadBotConfig,
@@ -241,6 +242,7 @@ describe("chatState", () => {
     fs.writeFileSync(file, JSON.stringify({ allowedRoots: ["/srv/work"], permissionMode: "auto" }));
     expect(loadBotConfig(file)).toEqual({
       allowedRoots: ["/srv/work"], permissionMode: "acceptEdits", allowAuto: false, allowApprove: false, allowTakeOver: false,
+      allowSetModel: false,
     });
   });
 
@@ -1293,4 +1295,335 @@ test("Codex の最初の送信の打ち直しで thread が失われていたら
   h.deps.requestsDir = makeTempDir("p-req-lost");
   expect(await runChat(["send", THREAD, "--request-id", "s-lost", "--json"], h.deps)).toBe(EXIT.notFound);
   expect(h.json()).toMatchObject({ error: { code: "conversation_ended_before_start" } });
+});
+
+describe("モデルの選択", () => {
+  const CONV = "conv-model-0001";
+  const SESSION = "s-model-1";
+  const claudeModels = [{ id: "claude-opus-5-5", displayName: "Opus" }, { id: "claude-haiku-5-5", displayName: "Haiku" }];
+  const codexModels = [
+    { id: "gpt-a", displayName: "A", description: "", isDefault: true, supportedReasoningEfforts: ["low", "high"], defaultReasoningEffort: "low" },
+    { id: "gpt-b", displayName: "B", description: "", isDefault: false },
+  ];
+  const listHandler = (next: Handler = defaultHandler): Handler => (message) => {
+    const id = String(message["id"]);
+    if (message["type"] === "claude_model_list_request") return { type: "claude_model_list_response", v: 2, id, models: claudeModels } as ControlMessage;
+    if (message["type"] === "codex_model_list_request") return { type: "codex_model_list_response", v: 2, id, models: codexModels } as ControlMessage;
+    if (message["type"] === "codex_turn_start") return { type: "codex_turn_start_result", v: 2, id, status: "started" } as ControlMessage;
+    return next(message);
+  };
+  const modelHarness = (options: Parameters<typeof harness>[0] = {}) => {
+    const h = harness({ handler: listHandler(), ...options });
+    h.deps.modelCacheDir = makeTempDir("model-cache");
+    return h;
+  };
+  const withConfig = (h: ReturnType<typeof harness>, extra: Record<string, unknown>) => {
+    const base = h.deps.config();
+    h.deps.config = () => ({ ...base, ...extra });
+  };
+
+  test("models は一覧を返し、6 時間は控えを使う（外部 API を連打しない）。--refresh で引き直す", async () => {
+    const h = modelHarness();
+    expect(await runChat(["models", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.json()).toMatchObject({ agent: "claude", source: "live", models: [{ id: "claude-opus-5-5" }, { id: "claude-haiku-5-5" }] });
+    const again = modelHarness();
+    again.deps.modelCacheDir = h.deps.modelCacheDir!;
+    expect(await runChat(["models", "--json"], again.deps)).toBe(EXIT.ok);
+    expect(again.json()).toMatchObject({ source: "cache" });
+    expect(again.sent).toEqual([]);
+    const refreshed = modelHarness();
+    refreshed.deps.modelCacheDir = h.deps.modelCacheDir!;
+    expect(await runChat(["models", "--refresh", "--json"], refreshed.deps)).toBe(EXIT.ok);
+    expect(refreshed.sent.map((m) => m["type"])).toEqual(["claude_model_list_request"]);
+  });
+
+  test("models: Codex は工数も返す。allowedModels があれば Bot にはその中だけ。取れなければ 6", async () => {
+    const h = modelHarness();
+    withConfig(h, { allowedModels: ["gpt-b"] });
+    expect(await runChat(["models", "--agent", "codex", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.json()).toMatchObject({ restricted: true, models: [{ id: "gpt-b" }] });
+    const c = modelHarness();
+    expect(await runChat(["models", "--agent", "codex", "--json"], c.deps)).toBe(EXIT.ok);
+    expect(c.json()).toMatchObject({ models: [{ id: "gpt-a", efforts: ["low", "high"], defaultEffort: "low" }, { id: "gpt-b" }] });
+    const down = modelHarness({ handler: (message) => ({ type: "error", v: 2, id: String(message["id"]), code: "x", message: "down" }) as ControlMessage });
+    expect(await runChat(["models", "--json"], down.deps)).toBe(EXIT.retryLater);
+    expect(down.json()).toMatchObject({ error: { code: "model_list_unavailable" } });
+  });
+
+  test("new --model --effort: Claude は起動フラグで渡し、記録と結果に載せる", async () => {
+    const root = makeTempDir("model-new");
+    const h = modelHarness({ stdin: "x", roots: [root] });
+    expect(await runChat(["new", "--cwd", root, "--request-id", "m-1", "--model", "claude-haiku-5-5", "--effort", "high", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.sent.find((m) => m["type"] === "session_start")).toMatchObject({ model: "claude-haiku-5-5", effort: "high" });
+    expect(h.records.get("m-1")).toMatchObject({ model: "claude-haiku-5-5", effort: "high", state: "sent" });
+    expect(h.json()).toMatchObject({ model: "claude-haiku-5-5", effort: "high" });
+  });
+
+  test("new --agent codex: モデルは codexModel、工数は最初の turn に載せる", async () => {
+    const root = makeTempDir("model-new-codex");
+    const h = modelHarness({ stdin: "x", roots: [root] });
+    expect(await runChat(["new", "--agent", "codex", "--cwd", root, "--request-id", "m-2", "--model", "gpt-a", "--effort", "high", "--json"], h.deps)).toBe(EXIT.ok);
+    const start = h.sent.find((m) => m["type"] === "session_start")!;
+    expect(start).toMatchObject({ codexModel: "gpt-a" });
+    expect(start).not.toHaveProperty("model");
+    expect(start).not.toHaveProperty("effort");
+    expect(h.sent.find((m) => m["type"] === "codex_turn_start")).toMatchObject({ effort: "high" });
+  });
+
+  test.each([
+    { label: "文字が不正（[1m]）", agent: "claude", extra: ["--model", "claude-opus-5-5[1m]"], code: EXIT.usage, err: "bad_model" },
+    { label: "先頭がハイフン", agent: "claude", extra: ["--model", "-x"], code: EXIT.usage, err: "bad_model" },
+    { label: "別名", agent: "claude", extra: ["--model", "opus"], code: EXIT.usage, err: "unknown_model" },
+    { label: "Claude の工数の誤り", agent: "claude", extra: ["--effort", "ultra"], code: EXIT.usage, err: "bad_effort" },
+    { label: "Codex のそのモデルで使えない工数", agent: "codex", extra: ["--model", "gpt-a", "--effort", "max"], code: EXIT.usage, err: "bad_effort" },
+    { label: "Codex の工数の欄が無いモデル", agent: "codex", extra: ["--model", "gpt-b", "--effort", "low"], code: EXIT.usage, err: "bad_effort" },
+  ])("送る前に断る（起動しない）: $label", async ({ agent, extra, code, err }) => {
+    const root = makeTempDir("model-bad");
+    const h = modelHarness({ stdin: "x", roots: [root] });
+    expect(await runChat(["new", "--agent", agent, "--cwd", root, "--request-id", "m-bad", ...extra, "--json"], h.deps)).toBe(code);
+    expect(h.json()).toMatchObject({ error: { code: err } });
+    expect(h.sent.some((m) => m["type"] === "session_start")).toBe(false);
+  });
+
+  test("allowedModels: 外は 5、中は一覧を見ずに通す（一覧に無い古い ID も書けば使える）", async () => {
+    const root = makeTempDir("model-allowed");
+    const h = modelHarness({ stdin: "x", roots: [root] });
+    withConfig(h, { allowedModels: ["claude-old-1"] });
+    expect(await runChat(["new", "--cwd", root, "--request-id", "m-a1", "--model", "claude-opus-5-5", "--json"], h.deps)).toBe(EXIT.policy);
+    expect(h.json()).toMatchObject({ error: { code: "model_not_allowed" } });
+    const ok = modelHarness({ stdin: "x", roots: [root] });
+    withConfig(ok, { allowedModels: ["claude-old-1"] });
+    expect(await runChat(["new", "--cwd", root, "--request-id", "m-a2", "--model", "claude-old-1", "--json"], ok.deps)).toBe(EXIT.ok);
+    expect(ok.sent.some((m) => m["type"] === "claude_model_list_request")).toBe(false);
+  });
+
+  test("一覧が取れないとき: Claude は文字の検査だけで通して modelValidated: false、Codex は 6", async () => {
+    const root = makeTempDir("model-nolist");
+    const failing = (message: Record<string, unknown>): ControlMessage => String(message["type"]).endsWith("_model_list_request")
+      ? { type: "error", v: 2, id: String(message["id"]), code: "x", message: "down" } as ControlMessage : listHandler()(message);
+    const h = modelHarness({ stdin: "x", roots: [root], handler: failing });
+    expect(await runChat(["new", "--cwd", root, "--request-id", "m-n1", "--model", "claude-new-9", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.json()).toMatchObject({ model: "claude-new-9", modelValidated: false });
+    const c = modelHarness({ stdin: "x", roots: [root], handler: failing });
+    expect(await runChat(["new", "--agent", "codex", "--cwd", root, "--request-id", "m-n2", "--model", "gpt-a", "--json"], c.deps)).toBe(EXIT.retryLater);
+    expect(c.json()).toMatchObject({ error: { code: "model_list_unavailable" } });
+  });
+
+  test("同じ依頼 ID でモデルが違えば使い回しとして断る", async () => {
+    const root = makeTempDir("model-reuse");
+    const h = modelHarness({ stdin: "x", roots: [root] });
+    await runChat(["new", "--cwd", root, "--request-id", "m-r", "--model", "claude-opus-5-5", "--json"], h.deps);
+    const again = modelHarness({ stdin: "x", roots: [root] });
+    again.records.set("m-r", h.records.get("m-r")!);
+    expect(await runChat(["new", "--cwd", root, "--request-id", "m-r", "--model", "claude-haiku-5-5", "--json"], again.deps)).toBe(EXIT.usage);
+    expect(again.json()).toMatchObject({ error: { code: "request_id_reused" } });
+  });
+
+  test("send は --model を受け取らず set-model を案内する", async () => {
+    const h = modelHarness({ stdin: "x" });
+    expect(await runChat(["send", "conv-live-1", "--request-id", "m-s", "--model", "claude-opus-5-5", "--json"], h.deps)).toBe(EXIT.usage);
+    expect(h.json()).toMatchObject({ error: { code: "use_set_model" } });
+    expect(h.sent).toEqual([]);
+  });
+
+  test("status は直近の返答のモデルを返す（<synthetic> は除く）", async () => {
+    const file = path.join(makeTempDir("model-status"), "c.jsonl");
+    fs.writeFileSync(file, [
+      { type: "assistant", timestamp: new Date(1).toISOString(), message: { model: "claude-haiku-5-5", content: [{ type: "text", text: "a" }] } },
+      { type: "assistant", timestamp: new Date(2).toISOString(), message: { model: "<synthetic>", content: [{ type: "text", text: "b" }] } },
+    ].map((line) => JSON.stringify(line)).join("\n"));
+    const h = modelHarness({ state: () => "idle", transcript: () => ({ file, cwd: "/w" }) });
+    expect(await runChat(["status", CONV, "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.json()).toMatchObject({ model: "claude-haiku-5-5" });
+  });
+
+  const commandLines = (model: string, atMs: number, stdout: string | null) => [
+    { type: "user", timestamp: new Date(atMs).toISOString(), message: { role: "user",
+      content: `<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>${model}</command-args>` } },
+    ...(stdout !== null ? [{ type: "user", timestamp: new Date(atMs).toISOString(), message: { role: "user",
+      content: `<local-command-stdout>${stdout}</local-command-stdout>` } }] : []),
+  ];
+  const setModelHarness = (lines: object[], options: { state?: ChatDeps["state"]; list?: object } = {}) => {
+    const file = path.join(makeTempDir("set-model"), "c.jsonl");
+    fs.writeFileSync(file, lines.map((line) => JSON.stringify(line)).join("\n"));
+    const h = modelHarness({
+      state: options.state ?? (() => "idle"), transcript: () => ({ file, cwd: "/tmp" }),
+      handler: listHandler((message) => {
+        const id = String(message["id"]);
+        if (message["type"] === "claude_session_list_request") {
+          return { type: "claude_session_list_response", v: 2, id,
+            claudeSessions: [{ sessionId: CONV, cwd: "/tmp", title: "t", liveSessionName: SESSION, ...(options.list ?? {}) }] } as ControlMessage;
+        }
+        return defaultHandler(message);
+      }),
+    });
+    withConfig(h, { allowSetModel: true });
+    return { h, file };
+  };
+  const OK = "Set model to `Haiku 5.5` and saved as your default for new sessions";
+
+  test("set-model: /model を送り、会話の記録で効いたことを確かめて返す", async () => {
+    const { h } = setModelHarness(commandLines("claude-haiku-5-5", 1_000_100, OK));
+    expect(await runChat(["set-model", CONV, "--model", "claude-haiku-5-5", "--request-id", "sm-1", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.sent.find((m) => m["type"] === "chat_send")).toMatchObject({ session: SESSION, text: "/model claude-haiku-5-5" });
+    expect(h.json()).toMatchObject({ applied: true, model: "claude-haiku-5-5", savedAsDefault: true, detail: OK });
+    expect(h.records.get("sm-1")).toMatchObject({ kind: "set-model", model: "claude-haiku-5-5", state: "sent" });
+  });
+
+  test("set-model: Bot は allowSetModel が無ければ断る（既定は不可）", async () => {
+    const { h } = setModelHarness([]);
+    withConfig(h, { allowSetModel: false });
+    expect(await runChat(["set-model", CONV, "--model", "claude-haiku-5-5", "--request-id", "sm-2", "--json"], h.deps)).toBe(EXIT.policy);
+    expect(h.json()).toMatchObject({ error: { code: "set_model_not_allowed" } });
+    expect(h.sent).toEqual([]);
+  });
+
+  test.each(["busy", "waiting"] as const)("set-model: 会話が %s の間は送らずに 6", async (state) => {
+    const { h } = setModelHarness([], { state: () => state });
+    expect(await runChat(["set-model", CONV, "--model", "claude-haiku-5-5", "--request-id", "sm-3", "--json"], h.deps)).toBe(EXIT.retryLater);
+    expect(h.json()).toMatchObject({ error: { code: "conversation_busy" } });
+    expect(h.sent.some((m) => m["type"] === "chat_send")).toBe(false);
+  });
+
+  test("set-model: API 作業の会話は断る", async () => {
+    const { h } = setModelHarness([], { list: { executionRoute: "api" } });
+    expect(await runChat(["set-model", CONV, "--model", "claude-haiku-5-5", "--request-id", "sm-4", "--json"], h.deps)).toBe(EXIT.policy);
+    expect(h.json()).toMatchObject({ error: { code: "unsupported_route" } });
+  });
+
+  test("set-model: 記録に結果が出なければ 7。打ち直しは送り直さず確かめだけをやり直す", async () => {
+    const { h, file } = setModelHarness([]);
+    expect(await runChat(["set-model", CONV, "--model", "claude-haiku-5-5", "--request-id", "sm-5", "--json"], h.deps)).toBe(EXIT.timeout);
+    expect(h.json()).toMatchObject({ error: { code: "model_change_unconfirmed" } });
+    expect(h.records.get("sm-5")?.state).toBe("sent");
+    fs.writeFileSync(file, commandLines("claude-haiku-5-5", 1_000_100, OK).map((line) => JSON.stringify(line)).join("\n"));
+    const retry = setModelHarness([]).h;
+    retry.deps.transcript = () => ({ file, cwd: "/tmp" });
+    retry.records.set("sm-5", h.records.get("sm-5")!);
+    expect(await runChat(["set-model", CONV, "--model", "claude-haiku-5-5", "--request-id", "sm-5", "--json"], retry.deps)).toBe(EXIT.ok);
+    expect(retry.sent.some((m) => m["type"] === "chat_send")).toBe(false);
+  });
+
+  test("set-model: 結果が成功の文言でなければ確定した失敗（5）で、打ち直しを促さない", async () => {
+    const { h } = setModelHarness(commandLines("claude-haiku-5-5", 1_000_100, "Kept model as `Opus 5.5`"));
+    expect(await runChat(["set-model", CONV, "--model", "claude-haiku-5-5", "--request-id", "sm-f", "--json"], h.deps)).toBe(EXIT.policy);
+    expect(h.json()).toMatchObject({ error: { code: "model_change_failed" }, detail: "Kept model as `Opus 5.5`" });
+  });
+
+  test("set-model: ターンの途中に実行された /model の記録（system / local_command の行）も読む", async () => {
+    const at = new Date(1_000_100).toISOString();
+    const { h } = setModelHarness([
+      { type: "system", subtype: "local_command", timestamp: at,
+        content: "<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>claude-haiku-5-5</command-args>" },
+      { type: "system", subtype: "local_command", timestamp: at, content: `<local-command-stdout>${OK}</local-command-stdout>` },
+    ]);
+    expect(await runChat(["set-model", CONV, "--model", "claude-haiku-5-5", "--request-id", "sm-s", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.json()).toMatchObject({ applied: true, savedAsDefault: true });
+  });
+
+  test("結果の照合: 次のコマンドの出力は自分の結果にしない。後に別のモデルへ変えられたら superseded", () => {
+    const file = path.join(makeTempDir("model-result"), "c.jsonl");
+    const write = (lines: object[]) => fs.writeFileSync(file, lines.map((line) => JSON.stringify(line)).join("\n"));
+    const other = { type: "user", timestamp: new Date(1_000_200).toISOString(), message: { role: "user", content: "<command-name>/cost</command-name>" } };
+    const otherOut = { type: "user", timestamp: new Date(1_000_200).toISOString(), message: { role: "user", content: "<local-command-stdout>Set model to `x`</local-command-stdout>" } };
+    write([...commandLines("claude-haiku-5-5", 1_000_100, null), other, otherOut]);
+    expect(findModelCommandResult(file, 1_000_000, "claude-haiku-5-5")).toEqual({ detail: null, superseded: false });
+    write([...commandLines("claude-haiku-5-5", 1_000_100, OK), ...commandLines("claude-opus-5-5", 1_000_300, "Set model to `Opus 5.5`")]);
+    expect(findModelCommandResult(file, 1_000_000, "claude-haiku-5-5")).toEqual({ detail: OK, superseded: true });
+    expect(findModelCommandResult(file, 1_000_200, "claude-haiku-5-5")).toBeNull();
+  });
+
+  test("set-model: 送信が未確定の打ち直しでも、会話が処理中なら送らずに 6（記録は started のまま）", async () => {
+    const { h } = setModelHarness([], { state: () => "busy" });
+    h.records.set("sm-b", { requestId: "sm-b", kind: "set-model", conversationId: CONV, session: SESSION, cwd: "/tmp",
+      sentAtMs: 1_000_000, text: "/model claude-haiku-5-5", model: "claude-haiku-5-5", state: "started" });
+    const base = h.deps.connect;
+    h.deps.connect = async () => {
+      const engine = await base();
+      return { ...engine, request: async (message, match, timeout) => message["type"] === "chat_receipt_query"
+        ? { type: "chat_receipt_query_result", v: 2, id: String(message["id"]), status: "unknown" } as ControlMessage
+        : engine.request(message, match, timeout) };
+    };
+    expect(await runChat(["set-model", CONV, "--model", "claude-haiku-5-5", "--request-id", "sm-b", "--json"], h.deps)).toBe(EXIT.retryLater);
+    expect(h.json()).toMatchObject({ error: { code: "conversation_busy" } });
+    expect(h.sent.some((m) => m["type"] === "chat_send")).toBe(false);
+    expect(h.records.get("sm-b")?.state).toBe("started");
+  });
+
+  test("set-model: 届いたか分からない失敗の案内に status --after を出さない", async () => {
+    const { h } = setModelHarness([]);
+    const base = h.deps.connect;
+    h.deps.connect = async () => {
+      const engine = await base();
+      return { ...engine, request: async (message, match, timeout) => message["type"] === "chat_send"
+        ? { type: "error", v: 2, id: String(message["id"]), code: "chat_send_failed", message: "hub timeout" } as ControlMessage
+        : engine.request(message, match, timeout) };
+    };
+    expect(await runChat(["set-model", CONV, "--model", "claude-haiku-5-5", "--request-id", "sm-h", "--json"], h.deps)).toBe(EXIT.timeout);
+    expect((h.json() as { error: { hint: string } }).error.hint).not.toContain("--after");
+  });
+
+  test("allowedModels: Codex は中にあっても一覧と照らす。配列でない書き間違いは何も許さない", async () => {
+    const root = makeTempDir("model-allowed-codex");
+    const h = modelHarness({ stdin: "x", roots: [root] });
+    withConfig(h, { allowedModels: ["claude-opus-5-5"] });
+    expect(await runChat(["new", "--agent", "codex", "--cwd", root, "--request-id", "m-c1", "--model", "claude-opus-5-5", "--json"], h.deps)).toBe(EXIT.usage);
+    expect(h.json()).toMatchObject({ error: { code: "unknown_model" } });
+    const file = path.join(makeTempDir("bot-models"), "bot.json");
+    fs.writeFileSync(file, JSON.stringify({ allowedModels: "claude-opus-5-5" }));
+    expect(loadBotConfig(file).allowedModels).toEqual([]);
+  });
+
+  test("控え: 無いモデルは 1 回だけ取り直す。古い控えしか無いときは確かめられなかったと返す。壊れた・未来の控えは使わない", async () => {
+    const root = makeTempDir("model-cache-cases");
+    const writeCache = (dir: string, fetchedAtMs: number, models: unknown[]) =>
+      fs.writeFileSync(path.join(dir, "models-claude.json"), JSON.stringify({ fetchedAtMs, models }));
+    const miss = modelHarness({ stdin: "x", roots: [root] });
+    writeCache(miss.deps.modelCacheDir!, 1_000_000, [{ id: "claude-opus-5-5", displayName: "Opus" }]);
+    expect(await runChat(["new", "--cwd", root, "--request-id", "m-k1", "--model", "claude-haiku-5-5", "--json"], miss.deps)).toBe(EXIT.ok);
+    expect(miss.sent.filter((m) => m["type"] === "claude_model_list_request")).toHaveLength(1);
+
+    const down = (message: Record<string, unknown>): ControlMessage => message["type"] === "claude_model_list_request"
+      ? { type: "error", v: 2, id: String(message["id"]), code: "x", message: "down" } as ControlMessage : listHandler()(message);
+    const stale = modelHarness({ stdin: "x", roots: [root], handler: down });
+    writeCache(stale.deps.modelCacheDir!, 1, [{ id: "claude-opus-5-5", displayName: "Opus" }]);
+    expect(await runChat(["new", "--cwd", root, "--request-id", "m-k2", "--model", "claude-new-9", "--json"], stale.deps)).toBe(EXIT.ok);
+    expect(stale.json()).toMatchObject({ model: "claude-new-9", modelValidated: false });
+
+    for (const [fetchedAtMs, models] of [[1_000_000, [null]], [9_000_000_000, [{ id: "claude-opus-5-5", displayName: "Opus" }]]] as const) {
+      const h = modelHarness();
+      writeCache(h.deps.modelCacheDir!, fetchedAtMs, [...models]);
+      expect(await runChat(["models", "--json"], h.deps)).toBe(EXIT.ok);
+      expect(h.json()).toMatchObject({ source: "live" });
+    }
+  });
+
+  test("set-model: 送信が未確定の打ち直しは、コマンドの行があれば届いた扱いで送り直さない", async () => {
+    const { h } = setModelHarness(commandLines("claude-haiku-5-5", 1_000_100, OK));
+    h.records.set("sm-6", { requestId: "sm-6", kind: "set-model", conversationId: CONV, session: "s-dead", cwd: "/tmp",
+      sentAtMs: 1_000_000, text: "/model claude-haiku-5-5", model: "claude-haiku-5-5", state: "started" });
+    const base = h.deps.connect;
+    h.deps.connect = async () => {
+      const engine = await base();
+      return { ...engine, request: async (message, match, timeout) => message["type"] === "chat_receipt_query"
+        ? { type: "chat_receipt_query_result", v: 2, id: String(message["id"]), status: "unknown" } as ControlMessage
+        : engine.request(message, match, timeout) };
+    };
+    expect(await runChat(["set-model", CONV, "--model", "claude-haiku-5-5", "--request-id", "sm-6", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.sent.some((m) => m["type"] === "chat_send")).toBe(false);
+    expect(h.records.get("sm-6")?.state).toBe("sent");
+  });
+
+  test("set-model: Codex の会話は未対応。status --after に set-model の依頼は使えない", async () => {
+    const store = makeTempStore();
+    store.put({ name: "s-cx", cwd: "/tmp", createdAt: 1, agent: "codex", providerSessionId: CONV });
+    const { h } = setModelHarness([]);
+    h.deps.store = () => store;
+    expect(await runChat(["set-model", CONV, "--model", "gpt-a", "--request-id", "sm-7", "--json"], h.deps)).toBe(EXIT.policy);
+    expect(h.json()).toMatchObject({ error: { code: "unsupported_agent" } });
+    const s = setModelHarness([]).h;
+    s.records.set("sm-8", { requestId: "sm-8", kind: "set-model", conversationId: CONV, session: SESSION, cwd: "/tmp", sentAtMs: 1, text: "/model x", state: "sent" });
+    expect(await runChat(["status", CONV, "--after", "sm-8", "--json"], s.deps)).toBe(EXIT.usage);
+    expect(s.json()).toMatchObject({ error: { code: "request_has_no_reply" } });
+  });
 });
