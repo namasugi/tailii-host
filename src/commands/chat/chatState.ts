@@ -120,7 +120,7 @@ export function requestDigest(requestId: string): string {
  */
 export interface RequestRecord {
   requestId: string;
-  kind: "new" | "send" | "set-model";
+  kind: "new" | "send" | "set-model" | "set-mode";
   conversationId: string;
   session: string;
   cwd: string;
@@ -145,6 +145,8 @@ export interface RequestRecord {
   model?: string;
   /** 指定した工数（`new --effort`。Codex は最初の turn にだけ載せ、以後の send には引き継がない）。 */
   effort?: string;
+  /** 指定した許可モード（`set-mode`）。同じ依頼 ID の使い回しの照合にも使う。 */
+  mode?: string;
 }
 
 /** Codex の turn の設定（`codex_turn_start` の approvalPolicy / sandbox / collaborationMode）。 */

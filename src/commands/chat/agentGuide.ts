@@ -43,9 +43,11 @@ export const AGENT_GUIDE = `# tailii-host chat — AI エージェント向け�
     伝える（この会話には送らない）/ deleted → 送り直すなら人に確かめてから
     新しい依頼 ID で / unknown → 同じ依頼 ID で送り直す。
 
-- chat models [--agent claude|codex] [--refresh] --json
-    使えるモデルの一覧（id・displayName・isDefault。Codex は efforts も）。6 時間は控えを返す。--model にはこの id をそのまま渡す
+- chat models [--agent claude|codex] [--cwd <フォルダ>] [--refresh] --json
+    使えるモデルの一覧（id・displayName。Codex は efforts も）。6 時間は控えを返す。--model にはこの id をそのまま渡す
     （opus などの別名は使えない）。allowedModels があれば Bot にはその中だけ返す（restricted: true）。
+    isDefault: true は --model を省いたときに使われるモデル。フォルダの設定で変わるので、始めるフォルダを --cwd で渡す。
+    どの行にも付かなければ既定を決められなかった（実際のモデルは最初の返答の後に chat status の model で分かる）。
 - chat new … [--model <id>] [--effort <工数>]
     モデルと工数を選んで始める（省略はそのエージェントの既定）。一覧にないモデルは終了コード 2、allowedModels の外は 5。
     Claude の工数は low / medium / high / xhigh / max、Codex はそのモデルの efforts。modelValidated: false は一覧が取れず
@@ -56,6 +58,12 @@ export const AGENT_GUIDE = `# tailii-host chat — AI エージェント向け�
     答え待ちは終了コード 6（待機中になってから同じ依頼 ID で打ち直す）。終了コード 7（model_change_unconfirmed）は同じ依頼 ID で
     打ち直すと確かめだけをやり直す。終了コード 5（model_change_failed）はモデルが変わらなかったことが確定した（detail に理由）。
     superseded: true はこの後に別のモデルへ変えられている。Codex の会話は未対応。
+- chat set-mode <conversationId> --permission-mode default|acceptEdits|plan|auto --request-id <ID> --json
+    Bot が new で始めた Claude の会話の許可モードを、動いている途中で変える（止まっていれば続きから起動する）。auto は allowAuto が
+    true のときだけ。処理中・答え待ちは終了コード 6（待機中になってから同じ依頼 ID で打ち直す）。changed: false は既にそのモード。
+    終了コード 6 の mode_change_incomplete は変えきれなかった（元のモードのまま。同じ依頼 ID で打ち直す）。終了コード 5 の mode_change_failed は
+    auto へ切り替えられない（元のモードのまま）、mode_change_blocked は元に戻せなかった（JSON の mode が今のモード）。どちらも人に伝える。
+    Codex の会話は chat send --permission-mode を使う。
 - chat answer <conversationId> <設問ID> --choice <番号> [--other <文>] --json
     設問に答える（Bot が new で始めた会話だけ）。番号は 1 から。複数選択は 1,3、設問が複数なら設問ごとに ; で区切る（1;2）。
     --other は設問が 1 つのときの自由記述（「その他」）。1 つだけ選ぶ設問では --choice と --other のどちらか一方。
@@ -72,7 +80,7 @@ export const AGENT_GUIDE = `# tailii-host chat — AI エージェント向け�
   ツールの承認は待たずに拒否され、Claude には「許可の要らない方法で進めるか、止めて報告する」と伝わる。
 
 ## 依頼 ID（--request-id）
-- new / send / set-model に必須。同じ依頼 ID で打ち直すと、同じ会話・同じ送信として扱われ二重にならない。終了コード 6・7 は同じ ID で打ち直す。
+- new / send / set-model / set-mode に必須。同じ依頼 ID で打ち直すと、同じ会話・同じ送信として扱われ二重にならない。終了コード 6・7 は同じ ID で打ち直す。
 - 依頼ごとに新しい ID を使う（例: UUID）。
 
 ## 出力（--json）
@@ -93,7 +101,7 @@ export const AGENT_GUIDE = `# tailii-host chat — AI エージェント向け�
   打ち直す。同じ理由で何度も断られるなら人に伝える
 - 7 送信が届いたか分からない（時間切れ・結果不明）。同じ依頼 ID で打ち直す（保留中の送信に合流し、届いていれば duplicate）。
   新しい依頼 ID で送り直さない（二重になる）。設問の表示中は、送信は利用者が答えるまで保留される。
-  エラーの JSON に conversationId があれば chat status <会話ID> --after <依頼ID> の delivery で確かめられる（set-model の依頼には使えない）。
+  エラーの JSON に conversationId があれば chat status <会話ID> --after <依頼ID> の delivery で確かめられる（set-model / set-mode の依頼には使えない。同じ依頼 ID で打ち直す）。
   new の起動の時間切れ（start_timeout）は会話 ID がまだ無い。同じ依頼 ID で new を打ち直す（新しい ID だと会話がもう 1 つ始まる）
 - 127 tailii-host が無い（このホストに Tailii が入っていない）
 

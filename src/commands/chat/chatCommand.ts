@@ -17,6 +17,12 @@ import {
 } from "../../backend/herdr.js";
 import { AGENT_GUIDE } from "./agentGuide.js";
 import {
+  defaultModelContext,
+  resolveClaudeDefaultModel,
+  resolveCodexDefaultModel,
+  type DefaultModelContext,
+} from "./defaultModel.js";
+import {
   defaultApprovalsBase,
   findPendingApproval,
   listPendingApprovals,
@@ -103,6 +109,8 @@ export interface ChatDeps {
   requestsDir?: string;
   /** モデル一覧の控えの置き場（テスト用。既定 `~/.tailii/bot`）。 */
   modelCacheDir?: string;
+  /** 既定のモデルを読む設定の置き場（テスト用）。 */
+  defaultModelContext?: DefaultModelContext;
 }
 
 interface ParsedArgs {
@@ -495,8 +503,9 @@ const hashText = (text: string): string => createHash("sha256").update(text).dig
 
 /** 同じ依頼 ID の使い回し（種類・フォルダ・会話・本文が違う）を見分ける（レビュー指摘 A5）。 */
 function assertSameRequest(record: RequestRecord, expect: { kind: RequestRecord["kind"]; cwd?: string; conversationId?: string;
-  textHash: string | null; model?: string | null; effort?: string | null }): void {
+  textHash: string | null; model?: string | null; effort?: string | null; mode?: string }): void {
   const differs = record.kind !== expect.kind ||
+    (expect.mode !== undefined && record.mode !== expect.mode) ||
     (expect.model !== undefined && (record.model ?? null) !== expect.model) ||
     (expect.effort !== undefined && (record.effort ?? null) !== expect.effort) ||
     (expect.cwd !== undefined && record.cwd !== expect.cwd) ||
@@ -675,8 +684,8 @@ async function cmdNew(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<R
     throw new ChatError(EXIT.usage, "effort_needs_prompt", "Codex の --effort は最初の指示文と一緒に指定します");
   }
   const requestId = requestIdOf(args, bot);
-  const validated = await validateModelChoice(deps, bot, agent, model, effort);
   const resolvedCwd = fs.realpathSync(cwd);
+  const validated = await validateModelChoice(deps, bot, agent, model, effort, resolvedCwd);
   const textHash = prompt === null ? null : hashText(prompt);
   return withRequestLock(deps, requestId, () =>
     newLocked({ deps, requestId, resolvedCwd, textHash, prompt, attach, permissionMode, title: flagString(args, "--title"),
@@ -905,8 +914,8 @@ async function cmdStatus(args: ParsedArgs, deps: ChatDeps): Promise<Record<strin
   if (!Number.isFinite(waitSec) || waitSec < 0) throw new ChatError(EXIT.usage, "bad_wait", "--wait は 0 以上の秒数");
   // 送信が未確定（started）の記録も受け付ける（時間切れの後に「届いたか」を確かめる用途。レビュー指摘 A3）。
   const after = afterId !== undefined ? (deps.readRequest ?? readRequest)(afterId) : null;
-  if (after !== null && after.kind === "set-model") {
-    throw new ChatError(EXIT.usage, "request_has_no_reply", "モデルの変更の依頼には返答がありません（--after に使えません）");
+  if (after !== null && (after.kind === "set-model" || after.kind === "set-mode")) {
+    throw new ChatError(EXIT.usage, "request_has_no_reply", "モデルや許可モードの変更の依頼には返答がありません（--after に使えません）");
   }
   if (after !== null && after.state === "starting") {
     throw new ChatError(EXIT.notFound, "request_not_started", "この依頼は会話の起動の途中で終わっています",
@@ -1356,14 +1365,12 @@ async function fetchModelList(deps: ChatDeps, agent: "claude" | "codex"): Promis
       if (agent === "claude") {
         const reply = await engine.request({ type: "claude_model_list_request", v: 2, id }, isType("claude_model_list_response", id), 20_000);
         if (reply.type !== "claude_model_list_response") return null;
-        return reply.models.map((model) => ({
-          id: model.id, displayName: model.displayName, ...(model.isDefault === true ? { isDefault: true } : {}),
-        }));
+        return reply.models.map((model) => ({ id: model.id, displayName: model.displayName }));
       }
       const reply = await engine.request({ type: "codex_model_list_request", v: 2, id }, isType("codex_model_list_response", id), 20_000);
       if (reply.type !== "codex_model_list_response") return null;
       return reply.models.map((model) => ({
-        id: model.id, displayName: model.displayName, description: model.description, isDefault: model.isDefault,
+        id: model.id, displayName: model.displayName, description: model.description,
         ...(model.supportedReasoningEfforts !== undefined ? { efforts: model.supportedReasoningEfforts } : {}),
         ...(model.defaultReasoningEffort !== undefined ? { defaultEffort: model.defaultReasoningEffort } : {}),
       }));
@@ -1377,7 +1384,9 @@ async function fetchModelList(deps: ChatDeps, agent: "claude" | "codex"): Promis
 async function loadModelList(deps: ChatDeps, agent: "claude" | "codex", refresh: boolean): Promise<{
   models: ModelEntry[]; source: "live" | "cache"; fetchedAtMs: number; stale: boolean;
 } | null> {
-  const cache = readModelCache<ModelEntry>(agent, deps.modelCacheDir);
+  // 既定の印は控えに持たない（設定はいつでも変わるので毎回読む）。前の版の控えに残っている印も捨てる。
+  const stored = readModelCache<ModelEntry>(agent, deps.modelCacheDir);
+  const cache = stored === null ? null : { ...stored, models: stored.models.map(({ isDefault: _stale, ...model }) => model) };
   const cacheAgeMs = cache === null ? Number.POSITIVE_INFINITY : deps.now() - cache.fetchedAtMs;
   if (!refresh && cache !== null && cacheAgeMs >= 0 && cacheAgeMs < MODEL_CACHE_TTL_MS) {
     return { models: cache.models, source: "cache", fetchedAtMs: cache.fetchedAtMs, stale: false };
@@ -1396,7 +1405,7 @@ async function loadModelList(deps: ChatDeps, agent: "claude" | "codex", refresh:
  * 誤解する）。戻り値は一覧と照らせたか（Claude は一覧が取れなければ文字の検査だけで通す）。
  */
 async function validateModelChoice(
-  deps: ChatDeps, bot: boolean, agent: "claude" | "codex", model: string | undefined, effort: string | undefined,
+  deps: ChatDeps, bot: boolean, agent: "claude" | "codex", model: string | undefined, effort: string | undefined, cwd: string | null,
 ): Promise<boolean> {
   if (model === undefined && effort === undefined) return true;
   if (model !== undefined && !MODEL_ID.test(model)) {
@@ -1425,7 +1434,12 @@ async function validateModelChoice(
     }
     return false;
   }
-  const entry = model !== undefined ? list.models.find((item) => item.id === model) : list.models.find((item) => item.isDefault === true);
+  // `--effort` だけのときは、そのフォルダで実際に使われる既定のモデルで確かめる。
+  const defaultId = model === undefined ? defaultModelIdOf(deps, agent, list.models, cwd) : null;
+  if (agent === "codex" && model === undefined && defaultId === null) {
+    throw new ChatError(EXIT.usage, "effort_needs_model", "既定のモデルを決められないので、工数を確かめられません", "--model も指定する（chat models --agent codex --json で確かめる）");
+  }
+  const entry = list.models.find((item) => item.id === (model ?? defaultId));
   if (model !== undefined && entry === undefined) {
     // 取得に失敗して古い控えしか無い Claude は、新しいモデルかもしれないので断らない（確かめられなかったと返す）。
     if (agent === "claude" && list.stale) return false;
@@ -1438,17 +1452,30 @@ async function validateModelChoice(
   return !list.stale;
 }
 
+/** そのフォルダで実際に使われる既定のモデルの行の id（決められなければ null）。 */
+function defaultModelIdOf(deps: ChatDeps, agent: "claude" | "codex", rows: readonly ModelEntry[], cwd: string | null): string | null {
+  const context = deps.defaultModelContext ?? defaultModelContext();
+  return (agent === "claude" ? resolveClaudeDefaultModel(rows, cwd, context) : resolveCodexDefaultModel(rows, cwd, context)).id;
+}
+
 async function cmdModels(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<Record<string, unknown>> {
   const agent = flagString(args, "--agent") ?? "claude";
   if (agent !== "claude" && agent !== "codex") throw new ChatError(EXIT.usage, "bad_agent", `--agent は claude か codex: ${agent}`);
+  const cwdFlag = flagString(args, "--cwd");
+  if (cwdFlag !== undefined && !folderAllowed(cwdFlag, deps.config().allowedRoots)) {
+    throw new ChatError(EXIT.usage, "folder_not_allowed", `作業フォルダが無いか、許可されていません: ${cwdFlag}`,
+      "許可されているのは ~/.tailii/bot.json の allowedRoots の中");
+  }
   const list = await loadModelList(deps, agent, args.flags.has("--refresh"));
   if (list === null) {
     throw new ChatError(EXIT.retryLater, "model_list_unavailable", "モデル一覧を取得できませんでした", "少し待って打ち直す");
   }
+  const defaultId = defaultModelIdOf(deps, agent, list.models, cwdFlag === undefined ? null : fs.realpathSync(cwdFlag));
+  const marked = list.models.map((model) => model.id === defaultId ? { ...model, isDefault: true } : model);
   const allowed = bot ? deps.config().allowedModels : undefined;
   return {
     agent,
-    models: allowed === undefined ? list.models : list.models.filter((model) => allowed.includes(model.id)),
+    models: allowed === undefined ? marked : marked.filter((model) => allowed.includes(model.id)),
     source: list.source, fetchedAtMs: list.fetchedAtMs,
     ...(list.stale ? { stale: true } : {}),
     ...(allowed !== undefined ? { restricted: true } : {}),
@@ -1492,7 +1519,7 @@ async function confirmModelChange(deps: ChatDeps, record: RequestRecord, model: 
 function assertIdleForModelChange(deps: ChatDeps, conversationId: string): void {
   const state = (deps.state ?? ((id: string) => conversationState(id)))(conversationId);
   if (state === "busy" || state === "waiting" || pendingApprovalsOf(deps, conversationId).length > 0) {
-    throw new ChatError(EXIT.retryLater, "conversation_busy", "会話が処理中か答え待ちなのでモデルを変えられません",
+    throw new ChatError(EXIT.retryLater, "conversation_busy", "会話が処理中か答え待ちなので今は変えられません",
       "chat status --wait で待機中になってから同じ依頼 ID で打ち直す", { state });
   }
 }
@@ -1511,7 +1538,7 @@ async function cmdSetModel(args: ParsedArgs, deps: ChatDeps, bot: boolean): Prom
     throw new ChatError(EXIT.policy, "unsupported_agent", "Codex の会話の途中のモデル変更は未対応です", "新しい会話なら chat new --agent codex --model で選べる");
   }
   const requestId = requestIdOf(args, bot);
-  const validated = await validateModelChoice(deps, bot, "claude", model, undefined);
+  const validated = await validateModelChoice(deps, bot, "claude", model, undefined, null);
   const result = await withRequestLock(deps, requestId, async () => {
     const previous = (deps.readRequest ?? readRequest)(requestId);
     if (previous !== null) assertSameRequest(previous, { kind: "set-model", conversationId, textHash: null, model });
@@ -1556,6 +1583,145 @@ async function cmdSetModel(args: ParsedArgs, deps: ChatDeps, bot: boolean): Prom
   return { ...result, ...(!validated ? { modelValidated: false } : {}) };
 }
 
+/** engine の `mode_get` / `mode_set`（どちらも応答は `mode_set_response`）。 */
+async function requestMode(engine: EngineConnection, session: string, mode: string | null, timeoutMs: number): Promise<ControlMessage> {
+  const id = newId();
+  return engine.request({ type: mode === null ? "mode_get" : "mode_set", v: 2, id, session, ...(mode !== null ? { mode } : {}) },
+    isType("mode_set_response", id), timeoutMs);
+}
+
+/** 起動した直後の会話で、今の許可モードを読めるまで待つ回数と間隔（engine の 1 回の読み取りと合わせて 30 秒ほど）。 */
+const MODE_READY_ATTEMPTS = 12;
+const MODE_READY_INTERVAL_MS = 2_000;
+
+/** 今の許可モードを読む。`attempts` 回読めなければ null。 */
+async function readPermissionMode(engine: EngineConnection, deps: ChatDeps, session: string, attempts: number): Promise<string | null> {
+  for (let attempt = 1; ; attempt++) {
+    const reply = await requestMode(engine, session, null, 15_000).catch((error: unknown) => {
+      if (error instanceof EngineTimeoutError) return null;
+      throw error;
+    });
+    if (reply?.type === "mode_set_response") return reply.mode;
+    if (attempt >= attempts) return null;
+    await deps.sleep(MODE_READY_INTERVAL_MS);
+  }
+}
+
+/** 変更が失敗した後の今のモードを返す。元でも目的でもなければ元へ戻す。読めなければ null。 */
+async function settlePermissionMode(engine: EngineConnection, session: string, before: string, target: string): Promise<string | null> {
+  const current = await requestMode(engine, session, null, 15_000).catch(() => null);
+  if (current?.type !== "mode_set_response") return null;
+  if (current.mode === before || current.mode === target) return current.mode;
+  const restored = await requestMode(engine, session, before, 30_000).catch(() => null);
+  return restored?.type === "mode_set_response" ? restored.mode : current.mode;
+}
+
+/**
+ * 動いている Claude の会話の許可モードを変える。engine の `mode_set` は Shift+Tab でモードを巡回するので、目的のモードが巡回に
+ * 無いときや状態行を読み損ねたときは別のモードで止まる。そのときは元のモードへ戻してから失敗を返す。
+ */
+async function cmdSetMode(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<Record<string, unknown>> {
+  const conversationId = requireConversationId(args);
+  const mode = flagString(args, "--permission-mode");
+  if (mode === undefined) throw new ChatError(EXIT.usage, "missing_permission_mode", "--permission-mode が要ります（default / acceptEdits / plan / auto）");
+  if (!isPermissionMode(mode)) throw new ChatError(EXIT.usage, "bad_permission_mode", `許可モードは default / acceptEdits / plan / auto: ${mode}`);
+  if (bot && mode === "auto" && !deps.config().allowAuto) {
+    throw new ChatError(EXIT.policy, "auto_not_allowed", "auto（何でも許可）は Bot に許されていません",
+      "利用者が ~/.tailii/bot.json の allowAuto を true にしたときだけ使える");
+  }
+  if (bot && !(deps.botStarted ?? ((id: string) => isBotStartedConversation(id)))(conversationId)) {
+    throw new ChatError(EXIT.policy, "set_mode_not_allowed", "この会話は Bot が始めた会話ではないので、許可モードを変えられません", "人に伝える");
+  }
+  const codexHint = "Codex は chat send --permission-mode で送信ごとの方針を変える";
+  if (conversationAgent(deps, conversationId) === "codex") {
+    throw new ChatError(EXIT.policy, "unsupported_agent", "Codex の会話には set-mode を使えません", codexHint);
+  }
+  const requestId = requestIdOf(args, bot);
+  return withRequestLock(deps, requestId, async () => {
+    const previous = (deps.readRequest ?? readRequest)(requestId);
+    if (previous !== null) assertSameRequest(previous, { kind: "set-mode", conversationId, textHash: null, mode });
+    // 済んだ依頼の打ち直しで、その後の変更を巻き戻さない。
+    if (previous !== null && previous.state === "sent") {
+      return { duplicate: true, requestId, conversationId, session: previous.session, permissionMode: mode };
+    }
+    return withEngine(deps, async (engine) => {
+      const rows = await listConversations(engine);
+      const row = rows.find((entry) => entry.conversationId === conversationId);
+      if (row === undefined) throw new ChatError(EXIT.notFound, "not_found", "会話が見つかりません", "tailii-host chat list --json で確かめる");
+      if (row.agent !== "claude") throw new ChatError(EXIT.policy, "unsupported_agent", "Codex の会話には set-mode を使えません", codexHint);
+      if (row.apiRoute) throw new ChatError(EXIT.policy, "unsupported_route", "API 作業の会話の許可モードはこのコマンドでは変えられません");
+      if (!folderAllowed(row.cwd, deps.config().allowedRoots)) {
+        throw new ChatError(EXIT.policy, "folder_not_allowed", `この会話の作業フォルダは許可されていません: ${row.cwd}`,
+          "~/.tailii/bot.json の allowedRoots に入っている会話だけ変えられる");
+      }
+      const session = row.liveSession ?? (await startSession(engine, {
+        cwd: row.cwd, name: sessionNameFor(`${requestId}:${conversationId}`), resumeSessionId: conversationId,
+        agentType: "claude", peerCheck: true,
+      })).session;
+      // 処理中・答え待ちの間に Shift+Tab を打つと、設問や確認の画面へ入る。待機中だけ受け付ける（打ち直しでも確かめ直す）。
+      // 一覧に出ていなくても session_start が動いている会話を採用することがあるので、起動の後に確かめる。
+      assertIdleForModelChange(deps, conversationId);
+      const record: RequestRecord = {
+        requestId, kind: "set-mode", conversationId, session, cwd: row.cwd, sentAtMs: previous?.sentAtMs ?? deps.now(), text: "", mode, state: "started",
+      };
+      const write = deps.writeRequest ?? writeRequest;
+      write(record);
+      const where = { requestId, conversationId, session };
+      // このコマンドが起動した会話は、画面が出そろうまで読めない。
+      const before = await readPermissionMode(engine, deps, session, row.liveSession === undefined ? MODE_READY_ATTEMPTS : 1);
+      if (before === null) {
+        throw new ChatError(EXIT.retryLater, "mode_unavailable", "今の許可モードを読めませんでした（確認の画面が出ているかもしれません）",
+          "少し待って同じ依頼 ID で打ち直す", where);
+      }
+      if (before === mode) {
+        write({ ...record, state: "sent" });
+        return { ...where, permissionMode: mode, previousMode: before, changed: false };
+      }
+      const changed = (): Record<string, unknown> => {
+        write({ ...record, state: "sent" });
+        return { ...where, permissionMode: mode, previousMode: before, changed: true };
+      };
+      const incomplete = (): ChatError => new ChatError(EXIT.retryLater, "mode_change_incomplete", "許可モードを変えきれませんでした（元のモードのままです）",
+        "少し待って同じ依頼 ID で打ち直す", { ...where, mode: before });
+      const blocked = (current: string): ChatError => new ChatError(EXIT.policy, "mode_change_blocked",
+        "許可モードを元に戻せませんでした（画面に確認が出ているかもしれません）", "人に伝える", { ...where, mode: current });
+
+      let reply: ControlMessage | null;
+      try {
+        reply = await requestMode(engine, session, mode, 30_000);
+      } catch (error) {
+        if (!(error instanceof EngineTimeoutError)) throw error;
+        reply = null;
+      }
+      if (reply?.type === "error" && (reply.code === "mode_set_busy" || reply.code === "mode_unavailable")) {
+        // どちらもキーを打つ前に断られている。
+        throw new ChatError(EXIT.retryLater, reply.code, reply.message, "少し待って同じ依頼 ID で打ち直す", where);
+      }
+      if (reply === null || reply.type === "error") {
+        // 巡回の途中で止まると、許していない auto に残ることがある（default へ向かう巡回は auto を通る）。今のモードを確かめて片付ける。
+        const settled = await settlePermissionMode(engine, session, before, mode);
+        if (settled === mode) return changed();
+        if (settled === before) throw incomplete();
+        if (settled !== null) throw blocked(settled);
+        throw new ChatError(EXIT.timeout, reply === null ? "timeout" : reply.code,
+          reply === null ? "許可モードの変更の応答がありませんでした" : reply.message, "同じ依頼 ID で打ち直す", where);
+      }
+      if (reply.type !== "mode_set_response") throw engineFailure(reply, "許可モードの変更");
+      if (reply.mode === mode) return changed();
+      // 状態行の変化を読み損ねると、engine は途中のモードを正常応答で返す。一度も動いていなければ戻す必要はない。
+      if (reply.mode === before) throw incomplete();
+      const restored = await requestMode(engine, session, before, 30_000).catch(() => null);
+      if (restored?.type !== "mode_set_response" || restored.mode !== before) {
+        throw blocked(restored?.type === "mode_set_response" ? restored.mode : reply.mode);
+      }
+      // 巡回に無いことがあるのは auto だけ。ほかのモードは必ず巡回にあるので、読み損ねとして打ち直せる。
+      if (mode !== "auto") throw incomplete();
+      throw new ChatError(EXIT.policy, "mode_change_failed", `このモードへは切り替えられません: ${mode}`,
+        "今のモードのまま。人に伝える", { ...where, mode: before });
+    });
+  });
+}
+
 async function cmdAttach(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<{ attach: string }> {
   if (bot) throw new ChatError(EXIT.usage, "attach_needs_terminal", "attach は人が端末で使うコマンドです（--json・端末なしでは使えない）");
   const conversationId = requireConversationId(args);
@@ -1578,7 +1744,7 @@ async function cmdAttach(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promis
 
 // ---------------------------------------------------------------------------------------------------------------
 
-const USAGE = `usage: tailii-host chat <list|models|new|send|set-model|status|answer|approve|take-over|attach> [options]
+const USAGE = `usage: tailii-host chat <list|models|new|send|set-model|set-mode|status|answer|approve|take-over|attach> [options]
   AI エージェント（Bot）は tailii-host agent-guide を読んで、必ず --json を付ける。
   端末が無い（パイプで指示を渡すなど）ときは Bot として扱い、--request-id が要る。
   list [--live] [--json]
@@ -1590,8 +1756,9 @@ const USAGE = `usage: tailii-host chat <list|models|new|send|set-model|status|an
   take-over <conversationId> [--interrupt] [--yes] [--no-attach] [--json]
   attach <conversationId>
   new … [--agent claude|codex] [--model <id>] [--effort <工数>] [--backend herdr|tmux] [--herdr-session <名前>]
-  models [--agent claude|codex] [--refresh] [--json]
+  models [--agent claude|codex] [--cwd <フォルダ>] [--refresh] [--json]
   set-model <conversationId> --model <id> [--request-id <ID>] [--json]
+  set-mode <conversationId> --permission-mode <mode> [--request-id <ID>] [--json]
 `;
 
 function render(deps: ChatDeps, json: boolean, payload: Record<string, unknown>, human: string): void {
@@ -1673,6 +1840,12 @@ export async function runChat(argv: string[], deps: ChatDeps): Promise<number> {
       case "set-model": {
         const payload = await cmdSetModel(args, deps, bot);
         render(deps, json, payload, `モデルを変えました: ${payload["model"]}${payload["savedAsDefault"] === true ? "（新しい会話の既定にもなりました）" : ""}`);
+        return EXIT.ok;
+      }
+      case "set-mode": {
+        const payload = await cmdSetMode(args, deps, bot);
+        render(deps, json, payload, payload["duplicate"] === true ? `この依頼は済んでいます: ${payload["permissionMode"]}`
+          : payload["changed"] === false ? `許可モードは既に ${payload["permissionMode"]} です` : `許可モードを変えました: ${payload["permissionMode"]}`);
         return EXIT.ok;
       }
       case "attach": {

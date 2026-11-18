@@ -1627,3 +1627,351 @@ describe("モデルの選択", () => {
     expect(s.json()).toMatchObject({ error: { code: "request_has_no_reply" } });
   });
 });
+
+describe("chat models の既定の印", () => {
+  const claudeModels = [
+    { id: "claude-opus-5-5", displayName: "Opus" }, { id: "claude-haiku-5-5", displayName: "Haiku", isDefault: true },
+  ];
+  const codexModels = [
+    { id: "gpt-a", displayName: "A", description: "", isDefault: true, supportedReasoningEfforts: ["low"] },
+    { id: "gpt-b", displayName: "B", description: "", isDefault: false, supportedReasoningEfforts: ["low", "high"] },
+  ];
+  const listHandler: Handler = (message) => {
+    const id = String(message["id"]);
+    if (message["type"] === "claude_model_list_request") return { type: "claude_model_list_response", v: 2, id, models: claudeModels } as ControlMessage;
+    if (message["type"] === "codex_model_list_request") return { type: "codex_model_list_response", v: 2, id, models: codexModels } as ControlMessage;
+    if (message["type"] === "codex_turn_start") return { type: "codex_turn_start_result", v: 2, id, status: "started" } as ControlMessage;
+    return defaultHandler(message);
+  };
+  const setup = (options: Parameters<typeof harness>[0] = {}) => {
+    const h = harness({ handler: listHandler, ...options });
+    const home = makeTempDir("models-home");
+    fs.mkdirSync(path.join(home, ".claude"));
+    fs.mkdirSync(path.join(home, ".codex"));
+    h.deps.modelCacheDir = makeTempDir("models-cache");
+    h.deps.defaultModelContext = { home, env: {}, claudeManagedDir: path.join(home, "managed"), codexHome: path.join(home, ".codex"),
+      codexManagedConfig: path.join(home, "none.toml") };
+    return { h, home };
+  };
+  const rows = (h: ReturnType<typeof harness>) => (h.json() as { models: Array<{ id: string; isDefault?: boolean }> }).models;
+
+  test("engine の印は使わず、設定の既定の 1 行だけに印を付ける。控えには印を書かない", async () => {
+    const { h, home } = setup();
+    fs.writeFileSync(path.join(home, ".claude", "settings.json"), JSON.stringify({ model: "claude-opus-5-5" }));
+    expect(await runChat(["models", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(rows(h)).toEqual([{ id: "claude-opus-5-5", displayName: "Opus", isDefault: true }, { id: "claude-haiku-5-5", displayName: "Haiku" }]);
+    const cache = JSON.parse(fs.readFileSync(path.join(h.deps.modelCacheDir!, "models-claude.json"), "utf8")) as { models: object[] };
+    expect(JSON.stringify(cache.models)).not.toContain("isDefault");
+  });
+
+  test("決められなければどの行にも印を付けない。古い控えの印も持ち越さない", async () => {
+    const { h } = setup();
+    fs.writeFileSync(path.join(h.deps.modelCacheDir!, "models-claude.json"), JSON.stringify({ fetchedAtMs: 1_000_000, models: claudeModels }));
+    expect(await runChat(["models", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.json()).toMatchObject({ source: "cache" });
+    expect(rows(h).some((row) => row.isDefault === true)).toBe(false);
+  });
+
+  test("--cwd のフォルダの設定で印が変わる。許可外・無いフォルダは 2", async () => {
+    const root = makeTempDir("models-cwd");
+    fs.mkdirSync(path.join(root, ".claude"));
+    fs.writeFileSync(path.join(root, ".claude", "settings.json"), JSON.stringify({ model: "claude-haiku-5-5" }));
+    const { h, home } = setup({ roots: [root] });
+    fs.writeFileSync(path.join(home, ".claude", "settings.json"), JSON.stringify({ model: "claude-opus-5-5" }));
+    expect(await runChat(["models", "--cwd", root, "--json"], h.deps)).toBe(EXIT.ok);
+    expect(rows(h).find((row) => row.isDefault === true)?.id).toBe("claude-haiku-5-5");
+    const bad = setup({ roots: [root] }).h;
+    expect(await runChat(["models", "--cwd", path.join(root, "nope"), "--json"], bad.deps)).toBe(EXIT.usage);
+    expect(bad.json()).toMatchObject({ error: { code: "folder_not_allowed" } });
+  });
+
+  test("allowedModels で既定の行が消えれば印も出ない", async () => {
+    const { h, home } = setup();
+    fs.writeFileSync(path.join(home, ".claude", "settings.json"), JSON.stringify({ model: "claude-opus-5-5" }));
+    const base = h.deps.config();
+    h.deps.config = () => ({ ...base, allowedModels: ["claude-haiku-5-5"] });
+    expect(await runChat(["models", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(rows(h)).toEqual([{ id: "claude-haiku-5-5", displayName: "Haiku" }]);
+  });
+
+  test("Codex の --effort だけ: 設定の既定のモデルの工数で確かめ、決められなければ 2", async () => {
+    const root = makeTempDir("models-effort");
+    const { h, home } = setup({ stdin: "x", roots: [root] });
+    fs.writeFileSync(path.join(home, ".codex", "config.toml"), 'model = "gpt-b"\n');
+    expect(await runChat(["new", "--agent", "codex", "--cwd", root, "--request-id", "de-1", "--effort", "high", "--json"], h.deps)).toBe(EXIT.ok);
+    expect(h.sent.find((m) => m["type"] === "codex_turn_start")).toMatchObject({ effort: "high" });
+    const unknown = setup({ stdin: "x", roots: [root] }).h;
+    expect(await runChat(["new", "--agent", "codex", "--cwd", root, "--request-id", "de-2", "--effort", "low", "--json"], unknown.deps)).toBe(EXIT.usage);
+    expect(unknown.json()).toMatchObject({ error: { code: "effort_needs_model" } });
+    expect(unknown.sent.some((m) => m["type"] === "session_start")).toBe(false);
+  });
+});
+
+describe("chat set-mode", () => {
+  const CONV = "conv-mode-0001";
+  const SESSION = "s-mode-1";
+  type ModeReply = string | { error: string } | "timeout";
+  /** `gets` / `sets` は mode_get / mode_set の応答を順に返す。 */
+  const modeHarness = (options: { gets?: ModeReply[]; sets?: ModeReply[]; state?: ChatDeps["state"]; list?: object; allowAuto?: boolean } = {}) => {
+    const gets = [...(options.gets ?? ["acceptEdits"])];
+    const sets = [...(options.sets ?? ["auto"])];
+    const answer = (id: string, reply: ModeReply): ControlMessage => {
+      if (reply === "timeout") throw new EngineTimeoutError("mode");
+      if (typeof reply !== "string") return { type: "error", v: 2, id, code: reply.error, message: reply.error } as ControlMessage;
+      return { type: "mode_set_response", v: 2, id, mode: reply } as ControlMessage;
+    };
+    const h = harness({
+      state: options.state ?? (() => "idle"), allowAuto: options.allowAuto ?? true,
+      handler: (message) => {
+        const id = String(message["id"]);
+        if (message["type"] === "claude_session_list_request") {
+          return { type: "claude_session_list_response", v: 2, id,
+            claudeSessions: [{ sessionId: CONV, cwd: "/tmp", title: "t", liveSessionName: SESSION, ...(options.list ?? {}) }] } as ControlMessage;
+        }
+        if (message["type"] === "mode_get") return answer(id, gets.shift() ?? "acceptEdits");
+        if (message["type"] === "mode_set") return answer(id, sets.shift() ?? "auto");
+        if (message["type"] === "session_start") {
+          return { type: "session_list_response", v: 2, id, adoptedName: String(message["name"]),
+            sessions: [{ name: String(message["name"]), cwd: "/tmp", alive: true, providerSessionId: CONV }] } as ControlMessage;
+        }
+        return defaultHandler(message);
+      },
+    });
+    h.deps.botStarted = (id) => id === CONV;
+    h.deps.approvalsBase = makeTempDir("mode-approvals");
+    return h;
+  };
+  const run = (h: ReturnType<typeof harness>, mode = "auto", id = "sm-1") =>
+    runChat(["set-mode", CONV, "--permission-mode", mode, "--request-id", id, "--json"], h.deps);
+  const types = (h: ReturnType<typeof harness>) => h.sent.map((m) => m["type"]);
+
+  test("今のモードを読んでから変え、応答のモードで確かめて記録する", async () => {
+    const h = modeHarness();
+    expect(await run(h)).toBe(EXIT.ok);
+    expect(h.sent.find((m) => m["type"] === "mode_set")).toMatchObject({ session: SESSION, mode: "auto" });
+    expect(h.json()).toMatchObject({ permissionMode: "auto", previousMode: "acceptEdits", changed: true, session: SESSION });
+    expect(h.records.get("sm-1")).toMatchObject({ kind: "set-mode", mode: "auto", state: "sent" });
+  });
+
+  test("既に同じモードならキーを打たない", async () => {
+    const h = modeHarness({ gets: ["auto"] });
+    expect(await run(h)).toBe(EXIT.ok);
+    expect(h.json()).toMatchObject({ changed: false, previousMode: "auto" });
+    expect(types(h)).not.toContain("mode_set");
+  });
+
+  test.each([
+    { label: "--permission-mode が無い", args: [] as string[], code: EXIT.usage, err: "missing_permission_mode" },
+    { label: "知らないモード", args: ["--permission-mode", "yolo"], code: EXIT.usage, err: "bad_permission_mode" },
+  ])("engine を開く前に断る: $label", async ({ args, code, err }) => {
+    const h = modeHarness();
+    expect(await runChat(["set-mode", CONV, ...args, "--request-id", "sm-u", "--json"], h.deps)).toBe(code);
+    expect(h.json()).toMatchObject({ error: { code: err } });
+    expect(h.sent).toEqual([]);
+  });
+
+  test("auto は allowAuto が要る。Bot が始めていない会話は変えられない", async () => {
+    const noAuto = modeHarness({ allowAuto: false });
+    expect(await run(noAuto)).toBe(EXIT.policy);
+    expect(noAuto.json()).toMatchObject({ error: { code: "auto_not_allowed" } });
+    const other = modeHarness();
+    other.deps.botStarted = () => false;
+    expect(await run(other)).toBe(EXIT.policy);
+    expect(other.json()).toMatchObject({ error: { code: "set_mode_not_allowed" } });
+    expect(other.sent).toEqual([]);
+  });
+
+  test.each([
+    { label: "Codex", list: { agent: "codex" }, code: EXIT.policy, err: "unsupported_agent" },
+    { label: "API 作業", list: { executionRoute: "api" }, code: EXIT.policy, err: "unsupported_route" },
+  ])("対象外の会話は断る: $label", async ({ list, code, err }) => {
+    const h = modeHarness({ list });
+    expect(await run(h)).toBe(code);
+    expect(h.json()).toMatchObject({ error: { code: err } });
+    expect(types(h)).not.toContain("mode_set");
+  });
+
+  test("見つからない会話は 3、許可外のフォルダは 5", async () => {
+    const missing = modeHarness({ list: { sessionId: "conv-other-1" } });
+    expect(await run(missing)).toBe(EXIT.notFound);
+    const outside = modeHarness();
+    const base = outside.deps.config();
+    outside.deps.config = () => ({ ...base, allowedRoots: [makeTempDir("mode-root")] });
+    expect(await run(outside)).toBe(EXIT.policy);
+    expect(outside.json()).toMatchObject({ error: { code: "folder_not_allowed" } });
+  });
+
+  test.each(["busy", "waiting"] as const)("会話が %s の間はキーを打たずに 6", async (state) => {
+    const h = modeHarness({ state: () => state });
+    expect(await run(h)).toBe(EXIT.retryLater);
+    expect(h.json()).toMatchObject({ error: { code: "conversation_busy" } });
+    expect(types(h)).not.toContain("mode_get");
+  });
+
+  test("承認待ちの間もキーを打たない", async () => {
+    const h = modeHarness();
+    const store = makeTempStore();
+    store.put({ name: SESSION, cwd: "/tmp", createdAt: 1, backend: "herdr", claudeSessionId: CONV, providerSessionId: CONV });
+    h.deps.store = () => store;
+    writePendingApproval({ id: "ap-m", session: SESSION, tool: "Bash", summary: "x", cwd: "/tmp", atMs: 1, pid: process.pid }, h.deps.approvalsBase!);
+    expect(await run(h)).toBe(EXIT.retryLater);
+    expect(types(h)).not.toContain("mode_set");
+  });
+
+  test("止まっている会話は続きから起動してから変える", async () => {
+    const h = modeHarness({ list: { liveSessionName: undefined } });
+    expect(await run(h)).toBe(EXIT.ok);
+    const start = h.sent.find((m) => m["type"] === "session_start")!;
+    expect(start).toMatchObject({ resumeSessionId: CONV, peerCheck: true });
+    expect(h.sent.find((m) => m["type"] === "mode_set")).toMatchObject({ session: start["name"] });
+  });
+
+  test("今のモードを読めなければキーを打たずに 6", async () => {
+    const h = modeHarness({ gets: [{ error: "mode_unavailable" }] });
+    expect(await run(h)).toBe(EXIT.retryLater);
+    expect(h.json()).toMatchObject({ error: { code: "mode_unavailable" } });
+    expect(types(h)).not.toContain("mode_set");
+    expect(h.records.get("sm-1")?.state).toBe("started");
+  });
+
+  test("目的のモードへ届かなければ元のモードへ戻して 5", async () => {
+    const h = modeHarness({ sets: ["plan", "acceptEdits"] });
+    expect(await run(h)).toBe(EXIT.policy);
+    expect(h.json()).toMatchObject({ error: { code: "mode_change_failed" }, mode: "acceptEdits" });
+    expect(h.sent.filter((m) => m["type"] === "mode_set").map((m) => m["mode"])).toEqual(["auto", "acceptEdits"]);
+    expect(h.records.get("sm-1")?.state).toBe("started");
+  });
+
+  test.each([
+    { label: "別のモードで止まった", sets: ["plan", "default"] as ModeReply[], mode: "default" },
+    { label: "戻す要求が失敗した", sets: ["plan", { error: "mode_unavailable" }] as ModeReply[], mode: "plan" },
+  ])("元のモードへ戻せなければ人に回す: $label", async ({ sets, mode }) => {
+    const h = modeHarness({ sets });
+    expect(await run(h)).toBe(EXIT.policy);
+    expect(h.json()).toMatchObject({ error: { code: "mode_change_blocked" }, mode });
+  });
+
+  test.each([
+    { reply: { error: "mode_set_busy" } as ModeReply, code: EXIT.retryLater, err: "mode_set_busy" },
+    { reply: { error: "mode_unavailable" } as ModeReply, code: EXIT.retryLater, err: "mode_unavailable" },
+  ])("キーを打つ前に断られたら確かめずに 6: $err", async ({ reply, code, err }) => {
+    const h = modeHarness({ sets: [reply] });
+    expect(await run(h)).toBe(code);
+    expect(h.json()).toMatchObject({ error: { code: err } });
+    expect(types(h).filter((type) => type === "mode_get")).toHaveLength(1);
+    expect(h.records.get("sm-1")?.state).toBe("started");
+  });
+
+  describe.each([
+    { label: "mode_set_failed", reply: { error: "mode_set_failed" } as ModeReply, err: "mode_set_failed" },
+    { label: "時間切れ", reply: "timeout" as ModeReply, err: "timeout" },
+  ])("変更が途中で失敗した: $label", ({ reply, err }) => {
+    test("元のモードのままなら 6 で打ち直せる", async () => {
+      const h = modeHarness({ sets: [reply] });
+      expect(await run(h)).toBe(EXIT.retryLater);
+      expect(h.json()).toMatchObject({ error: { code: "mode_change_incomplete" }, mode: "acceptEdits" });
+      expect(h.records.get("sm-1")?.state).toBe("started");
+    });
+
+    test("目的のモードに届いていれば成功として記録する", async () => {
+      const h = modeHarness({ gets: ["acceptEdits", "auto"], sets: [reply] });
+      expect(await run(h)).toBe(EXIT.ok);
+      expect(h.json()).toMatchObject({ permissionMode: "auto", changed: true });
+      expect(h.records.get("sm-1")?.state).toBe("sent");
+    });
+
+    test("途中のモードに残っていれば元へ戻す", async () => {
+      const h = modeHarness({ gets: ["plan", "auto"], sets: [reply, "plan"] });
+      expect(await run(h, "default")).toBe(EXIT.retryLater);
+      expect(h.json()).toMatchObject({ error: { code: "mode_change_incomplete" }, mode: "plan" });
+      expect(h.sent.filter((m) => m["type"] === "mode_set").map((m) => m["mode"])).toEqual(["default", "plan"]);
+    });
+
+    test("許していない auto に残って戻せなければ、今のモードを載せて人に回す", async () => {
+      const h = modeHarness({ allowAuto: false, gets: ["plan", "auto"], sets: [reply, { error: "mode_unavailable" }] });
+      expect(await run(h, "default")).toBe(EXIT.policy);
+      expect(h.json()).toMatchObject({ error: { code: "mode_change_blocked" }, mode: "auto" });
+    });
+
+    test("今のモードを読めなければ 7", async () => {
+      const h = modeHarness({ gets: ["acceptEdits", "timeout"], sets: [reply] });
+      expect(await run(h)).toBe(EXIT.timeout);
+      expect(h.json()).toMatchObject({ error: { code: err } });
+      expect(h.records.get("sm-1")?.state).toBe("started");
+    });
+  });
+
+  test("auto 以外で別のモードに止まったら、元へ戻して 6（読み損ね）", async () => {
+    const h = modeHarness({ gets: ["default"], sets: ["acceptEdits", "default"] });
+    expect(await run(h, "plan")).toBe(EXIT.retryLater);
+    expect(h.json()).toMatchObject({ error: { code: "mode_change_incomplete" }, mode: "default" });
+    expect(h.sent.filter((m) => m["type"] === "mode_set").map((m) => m["mode"])).toEqual(["plan", "default"]);
+  });
+
+  test("一度も動かなかったら戻す要求を出さずに 6", async () => {
+    const h = modeHarness({ gets: ["default"], sets: ["default"] });
+    expect(await run(h, "plan")).toBe(EXIT.retryLater);
+    expect(h.json()).toMatchObject({ error: { code: "mode_change_incomplete" } });
+    expect(types(h).filter((type) => type === "mode_set")).toHaveLength(1);
+  });
+
+  test("起動した会話は、今のモードを読めるまで待つ", async () => {
+    const h = modeHarness({ list: { liveSessionName: undefined }, gets: [{ error: "mode_unavailable" }, "timeout", "acceptEdits"] });
+    expect(await run(h)).toBe(EXIT.ok);
+    expect(types(h).filter((type) => type === "mode_get")).toHaveLength(3);
+    expect(h.json()).toMatchObject({ permissionMode: "auto", changed: true });
+  });
+
+  test("起動した会話でも、読めないまま待ち切ればキーを打たずに 6", async () => {
+    const h = modeHarness({ list: { liveSessionName: undefined }, gets: Array<ModeReply>(12).fill({ error: "mode_unavailable" }) });
+    expect(await run(h)).toBe(EXIT.retryLater);
+    expect(h.json()).toMatchObject({ error: { code: "mode_unavailable" } });
+    expect(types(h).filter((type) => type === "mode_get")).toHaveLength(12);
+    expect(types(h)).not.toContain("mode_set");
+  });
+
+  test("一覧に出ていなくても、起動の後に処理中と分かればキーを打たない", async () => {
+    const h = modeHarness({ list: { liveSessionName: undefined }, state: () => "busy" });
+    expect(await run(h)).toBe(EXIT.retryLater);
+    expect(h.json()).toMatchObject({ error: { code: "conversation_busy" } });
+    expect(types(h)).not.toContain("mode_get");
+  });
+
+  test("started の打ち直しは、まだ変わっていなければ実際に変える", async () => {
+    const h = modeHarness({ gets: ["acceptEdits"], sets: ["auto"] });
+    h.records.set("sm-s", { requestId: "sm-s", kind: "set-mode", conversationId: CONV, session: SESSION, cwd: "/tmp", sentAtMs: 5, text: "", mode: "auto", state: "started" });
+    expect(await run(h, "auto", "sm-s")).toBe(EXIT.ok);
+    expect(h.json()).toMatchObject({ changed: true });
+    expect(h.records.get("sm-s")).toMatchObject({ state: "sent", sentAtMs: 5 });
+  });
+
+  test("時間切れの打ち直しは今のモードから確かめ直し、最初の時刻を変えない", async () => {
+    const h = modeHarness({ gets: ["auto"] });
+    h.records.set("sm-r", { requestId: "sm-r", kind: "set-mode", conversationId: CONV, session: SESSION, cwd: "/tmp", sentAtMs: 5, text: "", mode: "auto", state: "started" });
+    expect(await run(h, "auto", "sm-r")).toBe(EXIT.ok);
+    expect(h.json()).toMatchObject({ changed: false });
+    expect(h.records.get("sm-r")).toMatchObject({ state: "sent", sentAtMs: 5 });
+  });
+
+  test("済んだ依頼の打ち直しは engine を開かず、後の変更を巻き戻さない", async () => {
+    const h = modeHarness();
+    h.records.set("sm-d", { requestId: "sm-d", kind: "set-mode", conversationId: CONV, session: SESSION, cwd: "/tmp", sentAtMs: 1, text: "", mode: "auto", state: "sent" });
+    expect(await run(h, "auto", "sm-d")).toBe(EXIT.ok);
+    expect(h.json()).toMatchObject({ duplicate: true, permissionMode: "auto" });
+    expect(h.sent).toEqual([]);
+  });
+
+  test("依頼 ID の使い回し（モード違い・会話違い）は 2。status --after には使えない", async () => {
+    const h = modeHarness();
+    h.records.set("sm-x", { requestId: "sm-x", kind: "set-mode", conversationId: CONV, session: SESSION, cwd: "/tmp", sentAtMs: 1, text: "", mode: "plan", state: "sent" });
+    expect(await run(h, "auto", "sm-x")).toBe(EXIT.usage);
+    expect(h.json()).toMatchObject({ error: { code: "request_id_reused" } });
+    const other = modeHarness();
+    other.records.set("sm-y", { requestId: "sm-y", kind: "set-mode", conversationId: "conv-other-2", session: SESSION, cwd: "/tmp", sentAtMs: 1, text: "", mode: "auto", state: "sent" });
+    expect(await run(other, "auto", "sm-y")).toBe(EXIT.usage);
+    const status = modeHarness();
+    status.records.set("sm-z", { requestId: "sm-z", kind: "set-mode", conversationId: CONV, session: SESSION, cwd: "/tmp", sentAtMs: 1, text: "", mode: "auto", state: "sent" });
+    expect(await runChat(["status", CONV, "--after", "sm-z", "--json"], status.deps)).toBe(EXIT.usage);
+    expect(status.json()).toMatchObject({ error: { code: "request_has_no_reply" } });
+  });
+});
