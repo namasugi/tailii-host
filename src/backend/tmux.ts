@@ -123,6 +123,20 @@ function findInputBoxFrame(lines: string[]): { top: number; bottom: number } | n
   return null;
 }
 
+/**
+ * 行が、スクロールした入力欄の上の枠か（`─── ↑ 31 more ───── 会話のタイトル ─`。2.1.326 以降）。タイトルの後ろの罫線は 1 個だけ
+ * なので `isInputBoxRuleLine` では枠と読めない。読めないと、打った本文が入力欄に入っているのに「届いていない」と判定して送信が
+ * 失敗する。タイトルが長いと `more` の直後に罫線が入らない（`─── ↑ 31 more  長いタイトル… ─`）ので、行末の罫線だけを見る。
+ */
+function isScrolledInputTopRule(rawLine: string): boolean {
+  return /^[─━]{3,} ↑ \d+ more /u.test(rawLine) && /[─━]\s*$/u.test(rawLine);
+}
+
+/** 行が、下に隠れた行がある入力欄の下の枠か（`─── ↓ 3 more ─────`。カーソルが本文の途中にあるとき）。 */
+function isScrolledInputBottomRule(rawLine: string): boolean {
+  return /^[─━]{3,} ↓ \d+ more [─━]+\s*$/u.test(rawLine);
+}
+
 /** 行（trim していない）が、入力欄の 1 行目の形（行頭がプロンプト記号）か。 */
 function startsWithInputPrompt(rawLine: string): boolean {
   return INPUT_PROMPT_SIGILS.some((sigil) => rawLine.startsWith(sigil));
@@ -143,7 +157,7 @@ function startsWithInputPrompt(rawLine: string): boolean {
 function findFrameAbovePrompt(lines: string[]): { top: number; bottom: number } | null {
   let bottom = -1;
   for (let index = lines.length - 1; index >= 0; index -= 1) {
-    if (isPureFrameLine(lines[index] ?? "")) {
+    if (isPureFrameLine(lines[index] ?? "") || isScrolledInputBottomRule(lines[index] ?? "")) {
       bottom = index;
       break;
     }
@@ -153,9 +167,11 @@ function findFrameAbovePrompt(lines: string[]): { top: number; bottom: number } 
   if (startsWithInputPrompt(lines[bottom + 1] ?? "")) return null;
   let index = bottom - 1;
   while (index >= 0 && /^(?: {2}|\s*$)/u.test(lines[index] ?? "")) index -= 1;
-  if (index < 1) return null;
+  if (index < 0) return null;
   const first = lines[index] ?? "";
-  if (!startsWithInputPrompt(first)) return null;
+  // 本文が入力欄の高さを超えると 1 行目（プロンプト記号の行）は窓の外へ出て、上の枠に `↑ 31 more` が入る（実測 2.1.327）。
+  if (isScrolledInputTopRule(first)) return { top: index, bottom };
+  if (index < 1 || !startsWithInputPrompt(first)) return null;
   return /[─━]\s*$/u.test(lines[index - 1] ?? "") ? { top: index - 1, bottom } : null;
 }
 

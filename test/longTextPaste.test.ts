@@ -11,6 +11,8 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, test, vi } from "vitest";
 import { HerdrSessionManager, type HerdrCommandResult, type HerdrCommandRunner } from "../src/backend/herdr.js";
 import {
+  typedTextProbe,
+  inputBoxResidueText,
   BRACKETED_PASTE_END,
   BRACKETED_PASTE_START,
   ChatInjectionRejectedError,
@@ -1493,6 +1495,44 @@ describe("tmux: 長い本文の注入", () => {
   });
 });
 
+describe("herdr: スクロールした入力欄への送信", () => {
+  test("入力欄の高さを超える本文も、反映を確かめて Enter 1 回で送る", async () => {
+    const tui = makeTui();
+    const rule = "─".repeat(80);
+    const screen = (): string => {
+      const lines = tui.state.input.split("\n");
+      if (lines.length <= 8) return tui.screen();
+      return [
+        " ▐▛███▛█   Claude Code v2.1.327", "", `─── ↑ ${lines.length - 8} more ${"─".repeat(40)} 長い指示の会話 ─`,
+        ...lines.slice(-8).map((line) => `  ${line}`), rule, "  ⏵⏵ accept edits on (shift+tab to cycle)",
+      ].join("\n");
+    };
+    const store = new SessionMetadataStore(makeTempDir("scrolled-input-herdr"));
+    store.put({ name: "s-a", cwd: "/a", createdAt: 1, backend: "herdr", herdrPaneId: "w4:p2" });
+    const herdrOk = (stdout: string): HerdrCommandResult => ({ exitCode: 0, stdout, stderr: "" });
+    let enters = 0;
+    const runner: HerdrCommandRunner = async (args) => {
+      if (args[1] === "list") {
+        return herdrOk(JSON.stringify({ id: "cli:pane:list", result: { type: "pane_list", panes: [{ pane_id: "w4:p2", label: "s-a" }] } }));
+      }
+      if (args[1] === "get") return herdrOk(JSON.stringify({ id: "cli:pane:get", result: { pane: { agent_status: "idle" } } }));
+      if (args[1] === "read") return herdrOk(screen());
+      if (args[1] === "send-text") {
+        if (args[3] === "\r") { enters += 1; tui.enter(); } else tui.write(args[3] ?? "");
+      }
+      return herdrOk("");
+    };
+    const manager = new HerdrSessionManager({
+      runner, store, submitDelayMs: 0, submitVerifyDelayMs: 0, inputVerifyTimeoutMs: 200, clearKeyDelayMs: 0,
+      readyTimeoutMs: 1000, readyPollMs: 0, pastedTextPollMs: 1, pastedTextTimeoutMs: 40, clearSettleMs: 10,
+    });
+    const text = Array.from({ length: 20 }, (_, index) => `${index + 1} 行目の日本語の指示文です。よろしくお願いします。`).join("\n");
+    await manager.sendTextSubmit("s-a", text);
+    expect(tui.state.submitted).toEqual([text]);
+    expect(enters).toBe(1);
+  });
+});
+
 describe("herdr: 長い本文の注入", () => {
   /** `failPasteAt`: その回の括弧付き貼り付けの send-text を、入力欄へ入れずに失敗で返す。 */
   function makeManager(tui: Tui, options: { failPasteAt?: number; inputVerifyTimeoutMs?: number } = {}) {
@@ -1780,5 +1820,51 @@ describe("herdr: 長い本文の注入", () => {
     const { manager } = makeManager(tui);
     await manager.sendTextSubmit("s-a", text);
     expect(tui.state.submitted).toEqual([text]);
+  });
+});
+
+describe("スクロールした入力欄（本文が入力欄の高さを超えたとき）", () => {
+  const rule = "─".repeat(80);
+  const frame = (top: string, body: string[]): string => [
+    " ▐▛███▛█   Claude Code v2.1.327", "", top, ...body, rule, "  ⏵⏵ accept edits on (shift+tab to cycle)",
+  ].join("\n");
+  const body = ["  ・前の行の続きです。", "", "  出力は重要度順の指摘リストでお願いします。コードの修正そのものは不要で、レビューコ", "  メントだけを返してください。"];
+
+  test.each([
+    { label: "タイトルあり", top: `─── ↑ 31 more ${"─".repeat(40)} 天気取得と材料共通化のレビュー ─` },
+    { label: "タイトルなし", top: `─── ↑ 31 more ${"─".repeat(60)}` },
+  ])("上の枠の `↑ N more` を入力欄の枠と読み、末尾の本文を照合できる: $label", ({ top }) => {
+    const text = inputBoxRealText(frame(top, body));
+    expect(text).not.toBeNull();
+    expect(text).not.toContain("more");
+    expect(inputBoxTextIncludesProbe(text!, typedTextProbe("コードの修正そのものは不要で、レビューコメントだけを返してください。")!)).toBe(true);
+  });
+
+  test("タイトルが長くて `more` の直後に罫線が入らない枠も読む", () => {
+    const text = inputBoxRealText(frame("─── ↑ 31 more  とても長い会話のタイトルが枠の幅を使い切ったとき… ─", body));
+    expect(text).toContain("メントだけを返してください。");
+  });
+
+  test("カーソルが本文の途中で下の枠に `↓ N more` が出ていても読む", () => {
+    const screen = [`─── ↑ 3 more ${"─".repeat(30)} タイトル ─`, ...body, `─── ↓ 2 more ${"─".repeat(60)}`, "  ⏵⏵ accept edits on"].join("\n");
+    expect(inputBoxRealText(screen)).toContain("メントだけを返してください。");
+  });
+
+  test("本文の中に同じ形の行があっても、本文の一部として読む", () => {
+    const quoted = [...body.slice(0, 1), "  ─── ↑ 9 more ─────", ...body.slice(1)];
+    const text = inputBoxRealText(frame(`─── ↑ 31 more ${"─".repeat(40)} タイトル ─`, quoted));
+    expect(text).toContain("─── ↑ 9 more ─────");
+    expect(text).toContain("前の行の続きです。");
+  });
+
+  test("送信前は未送信（pending）と読み、残留としてはアプリへ知らせない", () => {
+    const screen = frame(`─── ↑ 31 more ${"─".repeat(40)} 天気取得と材料共通化のレビュー ─`, body);
+    expect(classifySubmitFrame(screen)).toBe("pending");
+    expect(inputBoxResidueText(screen)).toBe("");
+  });
+
+  test("字下げされていない行が挟まれば入力欄の枠と読まない（履歴の行を本文にしない）", () => {
+    const screen = frame(`─── ↑ 31 more ${"─".repeat(40)} タイトル ─`, ["履歴の行", ...body]);
+    expect(extractClaudeInputBox(screen)?.text ?? "").not.toContain("レビューコ");
   });
 });
