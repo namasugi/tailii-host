@@ -10,9 +10,8 @@ import { claudeProjectSlug } from "../../shared/paths.js";
 import { locateClaudeTranscript } from "../../sessions/claudeTranscriptLocator.js";
 import { defaultPeerSessionsDir, parsePeerSessionRecord } from "../../services/peerSessions.js";
 import { SessionMetadataStore } from "../../sessions/sessionMetadataStore.js";
-import { normalizeForTextMatch } from "../../shared/invisibleText.js";
+import { normalizeUtteranceForMatch } from "../../hub/chatDeliveryLog.js";
 import { unwrapPastedContent } from "../../shared/pastedContent.js";
-import { normalizeTextForPaste } from "../../backend/tmux.js";
 import { defaultCodexHome } from "../../codex/codexSessionStore.js";
 import { isCompressedRollout, isRolloutFileName, readCompressedRollout } from "../../codex/rolloutFile.js";
 import { isVisibleCodexMessagePhase } from "../../codex/codexMessagePhase.js";
@@ -112,6 +111,12 @@ export function folderAllowed(dir: string, roots: readonly string[]): boolean {
 export function requestDigest(requestId: string): string {
   return createHash("sha256").update(requestId).digest("hex");
 }
+
+/**
+ * 依頼 ID から決まる送信 ID（`chat_send.clientMessageId` / `codex_turn_start.clientUserMessageId`）。打ち直しても同じ。
+ * `cli-` で始まるので、hub の送信の記録や Codex の rollout の `client_id` から、このコマンドの送信だと見分けられる。
+ */
+export const clientMessageIdFor = (requestId: string): string => `cli-${requestDigest(requestId).slice(0, 24)}`;
 
 /**
  * 依頼の記録（`~/.tailii/bot/requests/<digest>.json`）。同じ依頼 ID の打ち直しを二重にしない。
@@ -299,6 +304,98 @@ export function findTranscript(
   return located === null ? null : { file: located.path, cwd: located.cwd };
 }
 
+/** 記録を少しずつ読むときの 1 回の大きさ。 */
+const LINE_READ_CHUNK_BYTES = 4 * 1024 * 1024;
+/** これを超える 1 行は読まずに飛ばす（1 行を 1 つの文字列にするので、長さとメモリを抑える）。 */
+const MAX_LINE_BYTES = 256 * 1024 * 1024;
+
+export interface LineReadOptions {
+  /** 1 回に読む大きさ（テスト用）。 */
+  chunkBytes?: number;
+  /** これを超える 1 行は飛ばす（テスト用）。 */
+  maxLineBytes?: number;
+}
+
+/** メモリに載っているデータを、改行で切って 1 行ずつ渡す（空の行と長すぎる行は渡さない）。 */
+function emitBufferLines(data: Buffer, emit: (line: Buffer) => void, maxLineBytes: number): void {
+  let start = 0;
+  for (let end = data.indexOf(0x0a); end !== -1; end = data.indexOf(0x0a, start)) {
+    if (end > start && end - start <= maxLineBytes) emit(data.subarray(start, end));
+    start = end + 1;
+  }
+  if (start < data.length && data.length - start <= maxLineBytes) emit(data.subarray(start));
+}
+
+/**
+ * ファイルを少しずつ読んで、改行で切った 1 行ずつを渡す（空の行と長すぎる行は渡さない）。読めなければ false（途中まで
+ * 渡していることがある）。渡す `line` は次の読み込みで上書きされるので、その場で使い切る。
+ * ファイル全体を 1 つの文字列にしない: Node の文字列は約 512 MiB までで、それを超える記録は `readFileSync(file, "utf8")`
+ * では読めない（実例: ツールの出力が積もった Codex の rollout 654 MB。Claude の会話ログも最大 438 MB まで育っている）。
+ */
+function emitFileLines(file: string, emit: (line: Buffer) => void, options: LineReadOptions): boolean {
+  const maxLineBytes = options.maxLineBytes ?? MAX_LINE_BYTES;
+  let fd: number;
+  try {
+    fd = fs.openSync(file, "r");
+  } catch {
+    return false;
+  }
+  try {
+    const chunk = Buffer.allocUnsafe(Math.max(1, options.chunkBytes ?? LINE_READ_CHUNK_BYTES));
+    /** 読んだ分をまたいで続いている行の、ここまでの分。 */
+    let pending: Buffer[] = [];
+    let pendingBytes = 0;
+    /** 長すぎる行の残りを、次の改行まで捨てている途中。 */
+    let skipping = false;
+    for (;;) {
+      let read: number;
+      try {
+        read = fs.readSync(fd, chunk, 0, chunk.length, null);
+      } catch {
+        return false;
+      }
+      if (read === 0) break;
+      const data = chunk.subarray(0, read);
+      let start = 0;
+      for (let end = data.indexOf(0x0a); end !== -1; end = data.indexOf(0x0a, start)) {
+        if (skipping) {
+          skipping = false;
+        } else if (pending.length === 0) {
+          if (end > start && end - start <= maxLineBytes) emit(data.subarray(start, end));
+        } else {
+          if (pendingBytes + end - start <= maxLineBytes) emit(Buffer.concat([...pending, data.subarray(start, end)]));
+          pending = [];
+          pendingBytes = 0;
+        }
+        start = end + 1;
+      }
+      if (start < read && !skipping) {
+        pendingBytes += read - start;
+        if (pendingBytes > maxLineBytes) {
+          pending = [];
+          pendingBytes = 0;
+          skipping = true;
+        } else {
+          // `chunk` は次の読み込みで上書きされるので、写しを取っておく。
+          pending.push(Buffer.from(data.subarray(start)));
+        }
+      }
+    }
+    if (pending.length > 0) emit(Buffer.concat(pending));
+    return true;
+  } finally {
+    try { fs.closeSync(fd); } catch { /* 閉じられなくても読んだ結果は変わらない */ }
+  }
+}
+
+/**
+ * 記録のファイル（1 行 1 件の JSON）を 1 行ずつ `onLine` に渡す。読めなければ false（途中まで渡していることがある。
+ * 呼び出し側は、それまでに集めた分を捨てる）。
+ */
+export function forEachFileLine(file: string, onLine: (line: string) => void, options: LineReadOptions = {}): boolean {
+  return emitFileLines(file, (line) => { onLine(line.toString("utf8")); }, options);
+}
+
 export interface TranscriptLine {
   role: "user" | "assistant";
   text: string;
@@ -307,7 +404,8 @@ export interface TranscriptLine {
   clientId?: string;
 }
 
-function textOf(content: unknown): string {
+/** Claude の記録の `message.content` から文章の部分だけをつなぐ（ツールの結果・思考は除く）。 */
+export function textOf(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   return content
@@ -318,46 +416,72 @@ function textOf(content: unknown): string {
     .join("\n");
 }
 
-/** 会話の記録から、人の発話と Claude の文章だけを古い順に読む（ツールの結果・注入・メタ行は除く）。 */
-export function readTranscriptLines(file: string): TranscriptLine[] {
-  let raw: string;
-  try {
-    raw = fs.readFileSync(file, "utf8");
-  } catch {
-    return [];
+/** 人の発話として読まない行（コマンドの記録・注入・背景タスクの通知）の本文の形。 */
+const INJECTED_TEXT = /^<(?:command-|local-command-|system-reminder|bash-|task-notification)/;
+/** サブエージェントから親へ戻る報告（ツールの結果にあたる）。 */
+const SUBAGENT_MESSAGE = /^<agent-message /;
+const CROSS_SESSION_MESSAGE = /^<cross-session-message /;
+
+/**
+ * 記録の発話が誰のものか（記録の `origin` の印。2.1.3xx）。human = 人の発話 / peer = 別の Claude のセッションから届いた /
+ * injected = 人の発話ではない（背景タスクの通知・サブエージェントから親への報告・コマンドの記録と注入）。
+ * 待機中に届いた通知・報告は user 行（多くはメタ行）、処理中に届いたものは attachment(queued_command) 行に残る。
+ * 本文の形だけでの見分け（`<agent-message …>` で始まるなど）は、`origin` が無い旧い記録に限る（人の発話の印が付いた行は、
+ * 貼り付けた本文がその形で始まっていても人の発話）。
+ */
+export function utteranceOrigin(origin: unknown, text: string): { kind: "human" } | { kind: "peer"; name?: string } | { kind: "injected" } {
+  const mark = typeof origin === "object" && origin !== null
+    ? origin as { kind?: unknown; senderTaskId?: unknown; name?: unknown } : null;
+  const kind = typeof mark?.kind === "string" ? mark.kind : null;
+  const unmarked = kind === null;
+  if (kind === "task-notification" || INJECTED_TEXT.test(text)) return { kind: "injected" };
+  if (typeof mark?.senderTaskId === "string" || (unmarked && SUBAGENT_MESSAGE.test(text))) return { kind: "injected" };
+  if (kind === "peer" || (unmarked && CROSS_SESSION_MESSAGE.test(text))) {
+    return { kind: "peer", ...(typeof mark?.name === "string" && mark.name.length > 0 ? { name: mark.name } : {}) };
   }
+  return { kind: "human" };
+}
+
+/**
+ * 会話の記録から、人の発話と Claude の文章だけを古い順に読む（ツールの結果・注入・メタ行は除く）。
+ * 処理中に届いた背景タスクの通知・サブエージェントの報告・別のセッションからの発話は、人の発話に数えない（数えると、
+ * `status` の返答がそこで切れる: 依頼の処理中に通知が届くと、返答は通知より前の文章だけになっていた）。
+ */
+export function readTranscriptLines(file: string): TranscriptLine[] {
   const out: TranscriptLine[] = [];
-  for (const line of raw.split("\n")) {
-    if (line.length === 0) continue;
+  const readable = forEachFileLine(file, (line) => {
     let obj: Record<string, unknown>;
     try {
       obj = JSON.parse(line) as Record<string, unknown>;
     } catch {
-      continue;
+      return;
     }
     const type = obj["type"];
     const ts = typeof obj["timestamp"] === "string" ? Date.parse(obj["timestamp"]) : Number.NaN;
     const atMs = Number.isFinite(ts) ? ts : 0;
-    if (obj["isMeta"] === true || obj["isSidechain"] === true) continue;
+    if (obj["isMeta"] === true || obj["isSidechain"] === true) return;
     // 処理中の会話へ送った発話は user 行ではなく attachment(queued_command) 行としてだけ残る（transcriptTailer と同じ扱い。
     // 3 周目レビュー 1b）。
     if (type === "attachment") {
-      const attachment = obj["attachment"] as { type?: unknown; prompt?: unknown } | undefined;
-      if (attachment?.type !== "queued_command" || typeof attachment.prompt !== "string") continue;
+      const attachment = obj["attachment"] as { type?: unknown; prompt?: unknown; origin?: unknown; commandMode?: unknown } | undefined;
+      if (attachment?.type !== "queued_command" || typeof attachment.prompt !== "string") return;
       const prompt = unwrapPastedContent(attachment.prompt).trim();
-      if (prompt.length > 0) out.push({ role: "user", text: prompt, atMs });
-      continue;
+      if (prompt.length === 0) return;
+      if (attachment.commandMode === "task-notification" || utteranceOrigin(attachment.origin, prompt).kind !== "human") return;
+      out.push({ role: "user", text: prompt, atMs });
+      return;
     }
-    if (type !== "user" && type !== "assistant") continue;
+    if (type !== "user" && type !== "assistant") return;
     const message = obj["message"] as { role?: unknown; content?: unknown } | undefined;
     const raw = textOf(message?.content).trim();
     const text = type === "user" ? unwrapPastedContent(raw).trim() : raw;
-    if (text.length === 0) continue;
+    if (text.length === 0) return;
     // 人の発話のうち、コマンドの記録・注入（`<command-…>` `<local-command-…>` `<system-reminder>` など）は除く。
-    if (type === "user" && /^<(?:command-|local-command-|system-reminder|bash-|task-notification)/.test(text)) continue;
+    if (type === "user" && INJECTED_TEXT.test(text)) return;
     out.push({ role: type, text, atMs });
-  }
-  return out;
+  });
+  // 途中までしか読めなかった記録は、欠けた列を返さずに「読めない」とする。
+  return readable ? out : [];
 }
 
 /**
@@ -365,31 +489,26 @@ export function readTranscriptLines(file: string): TranscriptLine[] {
  * 不可視文字を除く）なので、両辺を同じ形にそろえてから空白を除いて比べる（3 周目レビュー 1）。
  */
 export function normalizeForReplyMatch(text: string): string {
-  return normalizeForTextMatch(unwrapPastedContent(normalizeTextForPaste(text)).normalize("NFC"));
+  // hub が届けた発話の記録に残すハッシュ（chatDeliveryLog.ts）と同じ正規化。
+  return normalizeUtteranceForMatch(text);
 }
 
 /** 会話の記録から、直近の返答を作ったモデルを読む（`<synthetic>` は実際のモデルではないので除く）。分からなければ null。 */
 export function lastClaudeModel(file: string): string | null {
-  let raw: string;
-  try {
-    raw = fs.readFileSync(file, "utf8");
-  } catch {
-    return null;
-  }
-  const lines = raw.split("\n");
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i]!;
-    if (!line.includes("\"assistant\"") || !line.includes("\"model\"")) continue;
+  // 先頭から読み、当てはまる最後の行のモデルを残す（末尾から探すには、全体をメモリに載せることになる）。
+  let last: string | null = null;
+  const readable = forEachFileLine(file, (line) => {
+    if (!line.includes("\"assistant\"") || !line.includes("\"model\"")) return;
     try {
       const obj = JSON.parse(line) as { type?: unknown; isSidechain?: unknown; message?: { model?: unknown } };
       const model = obj.message?.model;
       if (obj.type === "assistant" && obj.isSidechain !== true && typeof model === "string" && model.length > 0 &&
-        model !== "<synthetic>") return model;
+        model !== "<synthetic>") last = model;
     } catch {
       // 壊れた行は飛ばす。
     }
-  }
-  return null;
+  });
+  return readable ? last : null;
 }
 
 /** ローカルコマンドの行の本文。待機中は `user` の行、ターンの途中に実行すると `system` / `local_command` の行になる（2.1.322 実測）。 */
@@ -411,35 +530,29 @@ export function findModelCommandResult(
   sinceMs: number,
   model: string,
 ): { detail: string | null; superseded: boolean } | null {
-  let raw: string;
-  try {
-    raw = fs.readFileSync(file, "utf8");
-  } catch {
-    return null;
-  }
   const ownArgs = `<command-args>${model}</command-args>`;
   let found = false;
   /** 自分のコマンドの結果を待っている間だけ true（次のコマンドの行が来たら、その後の出力は自分の結果ではない）。 */
   let awaitingResult = false;
   let detail: string | null = null;
   let superseded = false;
-  for (const line of raw.split("\n")) {
-    if (line.length === 0 || (!line.includes("command-name") && !line.includes("local-command-stdout"))) continue;
+  const readable = forEachFileLine(file, (line) => {
+    if (!line.includes("command-name") && !line.includes("local-command-stdout")) return;
     let obj: Parameters<typeof localCommandText>[0] & { timestamp?: unknown };
     try {
       obj = JSON.parse(line) as typeof obj;
     } catch {
-      continue;
+      return;
     }
     const text = localCommandText(obj);
-    if (text === null) continue;
+    if (text === null) return;
     const isCommand = text.includes("<command-name>");
     const isModelCommand = text.includes("<command-name>/model</command-name>");
     if (!found) {
       const atMs = typeof obj.timestamp === "string" ? Date.parse(obj.timestamp) : Number.NaN;
       found = Number.isFinite(atMs) && atMs >= sinceMs && isModelCommand && text.includes(ownArgs);
       awaitingResult = found;
-      continue;
+      return;
     }
     if (isCommand) {
       // 同じモデルへの打ち直しなら、そちらの結果を読む。別のモデルへの変更なら、頼んだモデルはもう今のモデルではない。
@@ -450,7 +563,7 @@ export function findModelCommandResult(
       } else if (isModelCommand && /<command-args>[^<]+<\/command-args>/.test(text)) {
         superseded = true;
       }
-      continue;
+      return;
     }
     if (awaitingResult) {
       const stdout = /<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/.exec(text);
@@ -460,8 +573,8 @@ export function findModelCommandResult(
         awaitingResult = false;
       }
     }
-  }
-  return found ? { detail, superseded } : null;
+  });
+  return readable && found ? { detail, superseded } : null;
 }
 
 /** モデル一覧の控え（`~/.tailii/bot/models-<agent>.json`）。外部 API を連打しないために持つ。 */
@@ -529,16 +642,45 @@ export function findCodexRollout(threadId: string, codexHome: string = defaultCo
   return null;
 }
 
-function readRolloutText(file: string): string | null {
+/** 圧縮 rollout を解凍して持つ上限。 */
+const ROLLOUT_COMPRESSED_LIMIT_BYTES = 256 * 1024 * 1024;
+/** 行の先頭にある、行の種類（`{"timestamp":"…","ordinal":N,"type":"…"`。`ordinal` は無い版もある）。 */
+const ROLLOUT_LINE_TYPE = /^\{"timestamp":"[^"]*",(?:"ordinal":\d+,)?"type":"([A-Za-z_]+)"/;
+
+/**
+ * Codex の rollout（圧縮も）を 1 行ずつ `onLine` に渡す。読めなければ false（途中まで渡していることがある）。
+ * `types` を渡すと、行の先頭から種類が読み取れて、それが `types` に無い行は文字列にせずに飛ばす（rollout の大半は
+ * ツールの出力の `response_item`。先頭から種類を読み取れない行は飛ばさずに渡す）。
+ */
+export function forEachRolloutLine(
+  file: string,
+  onLine: (line: string) => void,
+  options: LineReadOptions & { types?: ReadonlySet<string> } = {},
+): boolean {
+  const emit = (line: Buffer): void => {
+    if (options.types !== undefined) {
+      const head = ROLLOUT_LINE_TYPE.exec(line.subarray(0, 128).toString("latin1"));
+      if (head !== null && !options.types.has(head[1]!)) return;
+    }
+    onLine(line.toString("utf8"));
+  };
+  if (!isCompressedRollout(file)) return emitFileLines(file, emit, options);
+  let data: Buffer | null;
   try {
-    if (!isCompressedRollout(file)) return fs.readFileSync(file, "utf8");
-    return readCompressedRollout(file, 256 * 1024 * 1024)?.toString("utf8") ?? null;
+    data = readCompressedRollout(file, ROLLOUT_COMPRESSED_LIMIT_BYTES);
   } catch {
-    return null;
+    return false;
   }
+  if (data === null) return false;
+  emitBufferLines(data, emit, options.maxLineBytes ?? MAX_LINE_BYTES);
+  return true;
 }
 
-function itemText(content: unknown, textType: string): string {
+const ROLLOUT_EVENT_TYPES: ReadonlySet<string> = new Set(["event_msg"]);
+const ROLLOUT_TURN_CONTEXT_TYPES: ReadonlySet<string> = new Set(["turn_context"]);
+
+/** Codex の item の `content` から、指定した種類の文章だけをつなぐ。 */
+export function itemText(content: unknown, textType: string): string {
   if (!Array.isArray(content)) return "";
   return content
     .filter((part): part is { type: string; text: string } =>
@@ -558,23 +700,20 @@ export function readCodexRolloutLines(file: string): TranscriptLine[] {
  * （status の待ちで毎秒 2 回全体を読まない。Fable レビュー 低2）。
  */
 export function readCodexRollout(file: string): { lines: TranscriptLine[]; busy: boolean } {
-  const raw = readRolloutText(file);
-  if (raw === null) return { lines: [], busy: false };
   const out: TranscriptLine[] = [];
   let busy = false;
-  for (const line of raw.split("\n")) {
-    if (line.length === 0) continue;
+  const readable = forEachRolloutLine(file, (line) => {
     let obj: Record<string, unknown>;
     try {
       obj = JSON.parse(line) as Record<string, unknown>;
     } catch {
-      continue;
+      return;
     }
-    if (obj["type"] !== "event_msg") continue;
+    if (obj["type"] !== "event_msg") return;
     const payload = obj["payload"] as Record<string, unknown> | undefined;
-    if (payload === undefined) continue;
-    if (payload["type"] === "task_started") { busy = true; continue; }
-    if (payload["type"] === "task_complete" || payload["type"] === "turn_aborted") { busy = false; continue; }
+    if (payload === undefined) return;
+    if (payload["type"] === "task_started") { busy = true; return; }
+    if (payload["type"] === "task_complete" || payload["type"] === "turn_aborted") { busy = false; return; }
     const ts = typeof obj["timestamp"] === "string" ? Date.parse(obj["timestamp"]) : Number.NaN;
     const atMs = Number.isFinite(ts) ? ts : 0;
     // 0.16x: item_completed（UserMessage / AgentMessage）。旧版: user_message / agent_message。
@@ -596,26 +735,24 @@ export function readCodexRollout(file: string): { lines: TranscriptLine[]; busy:
       const text = payload["message"].trim();
       if (text.length > 0) out.push({ role: "assistant", text, atMs });
     }
-  }
-  return { lines: out, busy };
+  }, { types: ROLLOUT_EVENT_TYPES });
+  // 途中までしか読めなかった記録は、欠けた列を返さずに「読めない」とする。
+  return readable ? { lines: out, busy } : { lines: [], busy: false };
 }
 
 /** Codex の rollout から、直近の turn のモデルを読む（最後の `turn_context`）。分からなければ null。 */
 export function lastCodexModel(file: string): string | null {
-  const raw = readRolloutText(file);
-  if (raw === null) return null;
-  const lines = raw.split("\n");
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i]!;
-    if (!line.includes("\"turn_context\"")) continue;
+  let model: string | null = null;
+  const readable = forEachRolloutLine(file, (line) => {
+    if (!line.includes("\"turn_context\"")) return;
     try {
       const obj = JSON.parse(line) as { type?: unknown; payload?: { model?: unknown } };
-      if (obj.type === "turn_context" && typeof obj.payload?.model === "string" && obj.payload.model.length > 0) return obj.payload.model;
+      if (obj.type === "turn_context" && typeof obj.payload?.model === "string" && obj.payload.model.length > 0) model = obj.payload.model;
     } catch {
       // 壊れた行は飛ばす。
     }
-  }
-  return null;
+  }, { types: ROLLOUT_TURN_CONTEXT_TYPES });
+  return readable ? model : null;
 }
 
 /** Codex の会話が処理中か（rollout の最後の turn が始まったまま終わっていない）。 */

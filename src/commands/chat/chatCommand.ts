@@ -33,7 +33,25 @@ import {
 import type { QuestionAnswer, QuestionPromptQuestion } from "../../protocol.js";
 import { connectEngine, EngineTimeoutError, type EngineConnection } from "./engineClient.js";
 import {
+  ChatReadError,
+  READ_LIMITS,
+  findConversationRequests,
+  parseCursor,
+  readChatDeliveries,
+  readClaudeElements,
+  readCodexElements,
+  readHubDeliveredIds,
+  readHubSendLog,
+  resolveSources,
+  searchElements,
+  sliceElements,
+  type ChatElement,
+  type OutputMessage,
+  type SearchHit,
+} from "./chatRead.js";
+import {
   acquireRequestLock,
+  clientMessageIdFor,
   conversationState,
   findCodexRollout,
   findLatestCodexTurnRecord,
@@ -111,6 +129,12 @@ export interface ChatDeps {
   modelCacheDir?: string;
   /** 既定のモデルを読む設定の置き場（テスト用）。 */
   defaultModelContext?: DefaultModelContext;
+  /** engine の送信ログ（テスト用。既定 `~/.tailii/chat-send.log`）。read / search の出所の判定に使う。 */
+  sendLog?: string;
+  /** hub の配送済みの台帳（テスト用。既定 `~/.tailii/hub/chat-receipts.json`）。read / search の出所の判定に使う。 */
+  chatReceipts?: string;
+  /** hub が届けた発話の記録（テスト用。既定 `~/.tailii/hub/chat-deliveries.ndjson`）。read / search の出所の判定に使う。 */
+  chatDeliveries?: string;
 }
 
 interface ParsedArgs {
@@ -121,6 +145,7 @@ interface ParsedArgs {
 const VALUE_FLAGS = new Set([
   "--cwd", "--request-id", "--title", "--permission-mode", "--after", "--wait",
   "--choice", "--other", "--reason", "--backend", "--herdr-session", "--agent", "--model", "--effort",
+  "--last", "--before", "--limit", "--max-text", "--query", "--context",
 ]);
 const BOOL_FLAGS = new Set(["--json", "--live", "--no-attach", "--interrupt", "--yes", "--refresh"]);
 
@@ -176,7 +201,6 @@ function requestIdOf(args: ParsedArgs, bot: boolean): string {
  * （`s-` で始めるのは reaper などが Tailii の会話として扱う条件。レビュー指摘 A9）。
  */
 const sessionNameFor = (requestId: string): string => `s-cli${requestDigest(requestId).slice(0, 16)}`;
-const clientMessageIdFor = (requestId: string): string => `cli-${requestDigest(requestId).slice(0, 24)}`;
 
 function newId(): string {
   return `cli-${randomUUID()}`;
@@ -1028,6 +1052,136 @@ async function cmdStatus(args: ParsedArgs, deps: ChatDeps): Promise<Record<strin
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// 記録の部分取得: read / search（読み取り専用。会話を起動せず、engine も通さない）
+
+/** 0 以上の整数の指定を読む（範囲の外は、黙って丸めずに使い方の誤りにする）。 */
+function intFlag(args: ParsedArgs, name: string, fallback: number, min: number, max: number): number {
+  const raw = flagString(args, name);
+  if (raw === undefined) return fallback;
+  const value = /^\d{1,9}$/.test(raw) ? Number(raw) : Number.NaN;
+  if (!Number.isFinite(value) || value < min || value > max) {
+    throw new ChatError(EXIT.usage, "out_of_range", `${name} は ${min}〜${max} の整数`);
+  }
+  return value;
+}
+
+/**
+ * 会話の記録を要素の列にして、出所を付ける。`inProgress` はターンの途中（処理中・承認や設問の答え待ち）で、末尾の返答が
+ * まだ続くかもしれないこと。Codex の待機中と停止中の区別には engine が要るので、ここでは見ない（詳しい状態は status）。
+ */
+function loadConversation(deps: ChatDeps, conversationId: string): {
+  agent: "claude" | "codex";
+  elements: ChatElement[];
+  inProgress: boolean;
+} {
+  const notFound = (): ChatError =>
+    new ChatError(EXIT.notFound, "not_found", "会話が見つかりません", "tailii-host chat list --json で確かめる");
+  const unreadable = (): ChatError =>
+    new ChatError(EXIT.internal, "record_unreadable", "会話の記録を読めませんでした（大きすぎる・壊れている）");
+  const agent = conversationAgent(deps, conversationId);
+  let elements: ChatElement[];
+  let inProgress: boolean;
+  if (agent === "codex") {
+    const rollout = codexRolloutOf(deps, conversationId);
+    if (rollout === null) throw notFound();
+    const read = readCodexElements(rollout);
+    if (read === null) throw unreadable();
+    elements = read.elements;
+    inProgress = read.busy;
+  } else {
+    const transcript = (deps.transcript ?? ((id: string) => findTranscript(id, { store: deps.store() })))(conversationId);
+    if (transcript === null) throw notFound();
+    const read = readClaudeElements(transcript.file);
+    if (read === null) throw unreadable();
+    elements = read;
+    const state = (deps.state ?? ((id: string) => conversationState(id)))(conversationId);
+    inProgress = state === "busy" || state === "waiting";
+  }
+  resolveSources(elements, {
+    agent,
+    conversationId,
+    deliveries: readChatDeliveries(deps.chatDeliveries),
+    requests: findConversationRequests(conversationId, deps.requestsDir),
+    sessions: conversationSessionNames(deps, conversationId),
+    hub: agent === "claude" ? readHubSendLog(deps.sendLog) : null,
+    deliveredIds: agent === "codex" ? readHubDeliveredIds(deps.chatReceipts) : new Set<string>(),
+  });
+  return { agent, elements, inProgress };
+}
+
+/**
+ * その動詞では効かない指定を、黙って無視せずに断る（`read --query` を「探した」と取り違えさせない）。
+ * ほかの動詞は知らない指定を無視するが、read / search は指定で返る範囲が変わるので厳しくする。
+ */
+function rejectFlags(args: ParsedArgs, names: readonly string[], hint: string): void {
+  const given = names.find((name) => args.flags.has(name));
+  if (given !== undefined) throw new ChatError(EXIT.usage, "unsupported_option", `${given} はこの動詞では使えません`, hint);
+}
+
+/** カーソルの誤りを、使い方の誤り（終了コード 2）として返す。 */
+function withCursorErrors<T>(conversationId: string, body: () => T): T {
+  try {
+    return body();
+  } catch (error) {
+    if (!(error instanceof ChatReadError)) throw error;
+    throw new ChatError(EXIT.usage, error.code, error.message, error.code === "stale_cursor"
+      ? `tailii-host chat read ${conversationId} --last <件数> --json で取り直す` : undefined);
+  }
+}
+
+async function cmdRead(args: ParsedArgs, deps: ChatDeps): Promise<Record<string, unknown>> {
+  const conversationId = requireConversationId(args);
+  rejectFlags(args, ["--query", "--context"], "語で探すのは tailii-host chat search <会話ID> --query <語>");
+  const afterRaw = flagString(args, "--after");
+  const beforeRaw = flagString(args, "--before");
+  const conflict = (message: string): ChatError => new ChatError(EXIT.usage, "conflicting_options", message);
+  if (afterRaw !== undefined && beforeRaw !== undefined) throw conflict("--after と --before は同時に指定できません");
+  if (args.flags.has("--last") && (afterRaw ?? beforeRaw) !== undefined) {
+    throw conflict("--last と --after / --before は同時に指定できません");
+  }
+  const mode = afterRaw !== undefined ? "after" as const : beforeRaw !== undefined ? "before" as const : "last" as const;
+  if (mode === "last" && args.flags.has("--limit")) throw conflict("--limit は --after / --before と使います（末尾からは --last <件数>）");
+  const count = intFlag(args, mode === "last" ? "--last" : "--limit", READ_LIMITS.defaultCount, 1, READ_LIMITS.maxCount);
+  const maxTextBytes = intFlag(args, "--max-text", READ_LIMITS.defaultTextBytes, READ_LIMITS.minTextBytes, READ_LIMITS.maxTextBytes);
+  const cursorRaw = afterRaw ?? beforeRaw;
+  const loaded = loadConversation(deps, conversationId);
+  const result = withCursorErrors(conversationId, () => sliceElements(loaded.elements, {
+    mode, count, maxTextBytes, ...(cursorRaw !== undefined ? { cursor: parseCursor(cursorRaw) } : {}),
+  }));
+  const { messages, ...summary } = result;
+  return { conversationId, agent: loaded.agent, inProgress: loaded.inProgress, ...summary, messages };
+}
+
+async function cmdSearch(args: ParsedArgs, deps: ChatDeps): Promise<Record<string, unknown>> {
+  const conversationId = requireConversationId(args);
+  rejectFlags(args, ["--last", "--after", "--max-text"],
+    "search は新しい一致から返す（古い一致は --before <カーソル>）。全文や広い前後は chat read で読む");
+  // 検索語は --query か、標準入力の 1 行目（SSH 越しに空白や記号を含む語を渡すときは、シェルを通らない標準入力で）。
+  const query = (flagString(args, "--query") ?? deps.readStdin()?.split(/\r\n|\r|\n/)[0] ?? "").trim();
+  if (query.length === 0) {
+    throw new ChatError(EXIT.usage, "empty_query", "検索語が空です（--query <語> か、標準入力の 1 行目で渡す）");
+  }
+  if (query.length > READ_LIMITS.maxQueryChars) {
+    throw new ChatError(EXIT.usage, "query_too_long", `検索語は ${READ_LIMITS.maxQueryChars} 文字まで`);
+  }
+  const context = intFlag(args, "--context", READ_LIMITS.defaultContext, 0, READ_LIMITS.maxContext);
+  const limit = intFlag(args, "--limit", READ_LIMITS.defaultHits, 1, READ_LIMITS.maxHits);
+  const beforeRaw = flagString(args, "--before");
+  const loaded = loadConversation(deps, conversationId);
+  const result = withCursorErrors(conversationId, () => searchElements(loaded.elements, {
+    query, context, limit, ...(beforeRaw !== undefined ? { before: parseCursor(beforeRaw) } : {}),
+  }));
+  const { hits, ...summary } = result;
+  return { conversationId, agent: loaded.agent, query, inProgress: loaded.inProgress, ...summary, hits };
+}
+
+/** 人向けの 1 要素の見出し（`#位置 役割(出所) 時刻`）。 */
+function elementHeading(message: Pick<OutputMessage, "seq" | "role" | "atMs" | "source">): string {
+  const who = message.role === "assistant" ? "assistant" : `user(${message.source?.kind ?? "unknown"})`;
+  return `#${message.seq} ${who} ${message.atMs > 0 ? new Date(message.atMs).toISOString() : "-"}`;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // 第 2 段: 承認・設問・開き直し・画面
 
 /**
@@ -1744,13 +1898,15 @@ async function cmdAttach(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promis
 
 // ---------------------------------------------------------------------------------------------------------------
 
-const USAGE = `usage: tailii-host chat <list|models|new|send|set-model|set-mode|status|answer|approve|take-over|attach> [options]
+const USAGE = `usage: tailii-host chat <list|models|new|send|set-model|set-mode|status|read|search|answer|approve|take-over|attach> [options]
   AI エージェント（Bot）は tailii-host agent-guide を読んで、必ず --json を付ける。
   端末が無い（パイプで指示を渡すなど）ときは Bot として扱い、--request-id が要る。
   list [--live] [--json]
   new --cwd <フォルダ> [--request-id <ID>] [--title <名前>] [--permission-mode <mode>] [--no-attach] [--json]  < 指示文
   send <conversationId> [--request-id <ID>] [--json]  < 指示文
   status <conversationId> [--after <依頼ID>] [--wait <秒>] [--json]
+  read <conversationId> [--last <件数> | --after <カーソル> | --before <カーソル>] [--limit <件数>] [--max-text <バイト>] [--json]
+  search <conversationId> --query <語> [--context <件数>] [--limit <件数>] [--before <カーソル>] [--json]
   answer <conversationId> <設問ID> --choice <番号> [--other <文>] [--json]
   approve <conversationId> <承認ID> allow|deny [--reason <理由>] [--json]
   take-over <conversationId> [--interrupt] [--yes] [--no-attach] [--json]
@@ -1805,6 +1961,21 @@ export async function runChat(argv: string[], deps: ChatDeps): Promise<number> {
       case "status": {
         const payload = await cmdStatus(args, deps);
         render(deps, json, payload, `${payload["state"]}${payload["complete"] ? "（完了）" : ""}\n${payload["reply"] ?? ""}`);
+        return EXIT.ok;
+      }
+      case "read": {
+        const payload = await cmdRead(args, deps);
+        const messages = payload["messages"] as OutputMessage[];
+        render(deps, json, payload, messages.map((message) =>
+          `${elementHeading(message)}\n${message.text}${message.truncated === true ? "\n…（続きは --max-text を上げて読む）" : ""}`,
+        ).join("\n\n") || "（発話がありません）");
+        return EXIT.ok;
+      }
+      case "search": {
+        const payload = await cmdSearch(args, deps);
+        const hits = payload["hits"] as SearchHit[];
+        render(deps, json, payload, hits.map((hit) => `${elementHeading(hit)}\n${hit.excerpt}`).join("\n\n") ||
+          "（見つかりません）");
         return EXIT.ok;
       }
       case "answer": {

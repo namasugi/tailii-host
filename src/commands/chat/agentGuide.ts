@@ -3,7 +3,7 @@
 
 export const AGENT_GUIDE = `# tailii-host chat — AI エージェント向けの使い方
 
-このホストの Tailii（iPhone から Claude Code を操作するアプリ）の会話を、コマンドで始める・続けを送る・結果を読む。
+このホストの Tailii（iPhone から Claude Code を操作するアプリ）の会話を、コマンドで始める・続けを送る・結果を読む・過去の分を読む。
 始めた会話は利用者の iPhone の Tailii にもそのまま出て、利用者が続きを引き取れる。
 
 ## 呼び方
@@ -42,6 +42,34 @@ export const AGENT_GUIDE = `# tailii-host chat — AI エージェント向け�
     もう一度 status / uncertain・blocked（needsHuman: true。blocked は前の送信が止まっていて、この送信も流れない）→ 人に
     伝える（この会話には送らない）/ deleted → 送り直すなら人に確かめてから
     新しい依頼 ID で / unknown → 同じ依頼 ID で送り直す。
+
+- chat read <conversationId> [--last <件数> | --after <カーソル> | --before <カーソル>] [--limit <件数>] [--max-text <バイト>] --json
+    会話の記録を必要な分だけ読む（読むだけ。会話を起動せず、止まっている会話や他所で動いている会話も読める）。指定が無ければ
+    末尾 10 件（--last。上限 50）。messages は古い順で、1 件は人の発話 1 つか、エージェントの文章 1 かたまり（連続する文章は
+    つなげずに並ぶ。ツールの実行・思考・背景タスクの通知・サブエージェントの報告は入らない）。seq は会話の中の位置。
+    続きだけ読む: 前の応答の cursors.after を --after に渡す（新しい発話が無ければ messages は空で range は null）。
+    遡る: cursors.before を --before に渡す。--after / --before の件数は --limit（既定 10・上限 50）。カーソルは <seq>:<atMs>
+    で、seq だけでも渡せる（その場合は記録の組み替わりを確かめない）。
+    hasMoreBefore / hasMoreAfter は返した範囲の前後に残りがあるか。total は全体の件数。全文を一度に返す指定は無い。
+    応答は全体で 32 KiB まで、1 件の本文は 8 KiB まで（超えた分は切り、truncated: true と本来の textBytes が付く。その 1 件を
+    --after <その手前の seq> --limit 1 --max-text 32768 で読み直せる）。上限に収まらない分は返さず hasMore… が true になる。
+    inProgress: true はターンの途中（処理中・答え待ち）で、末尾の返答はまだ続くかもしれない（詳しい状態は chat status）。
+    人の発話には source（出所）が付く。kind: cli = このコマンドから（requestId があればその依頼）/ app = 利用者が Tailii の
+    アプリから / terminal = 端末の画面へ直接（Tailii の送信を通っていない）/ peer = 別の Claude のセッションから届いた（name）/
+    system = 人の発話ではない記録（detail: interrupted = 利用者が処理を中断した・compact_summary = 圧縮で作られた要約・
+    scheduled = 予約した再開のプロンプト）/
+    unknown = 判定できない（entrypoint があれば、SDK やデスクトップアプリなど端末の画面ではない入口）。
+    confidence: exact = その発話に結び付く記録がある / inferred = 送信の記録との時刻の突き合わせによる推定。Claude の会話の
+    app は、host が届けた発話を記録し始めてからの分は exact、それより前の発話は inferred。terminal はいつも inferred。
+    誰の指示かで扱いを変えるときは、inferred と unknown を確定として扱わない。
+    エージェントの文章には、分かれば model（その文章を作ったモデル）が付く。
+- chat search <conversationId> --query <語> [--context <件数>] [--limit <件数>] [--before <カーソル>] --json
+    会話の記録から語を探す（部分一致。空白・全角と半角・大文字と小文字の違いは無視する。語は 1 つで、AND / OR は無い）。
+    hits は一致した発話・文章のうち新しい方から --limit 件（既定 10・上限 50）を古い順に並べたもの。excerpt は一致した箇所の
+    前後の抜粋（全文ではない）、matchCount はその中の一致の数、before / after は前後の要素（--context。既定 2・上限 5。
+    本文は 1 KiB まで）。totalHits が hits より多ければ（hasMoreBefore: true）、cursors.before を --before に渡すと、より古い
+    一致を取れる。全文や広い前後は、hits[].seq を使って chat read --after <seq - 1> / --before <seq + 1> で読む。
+    空白や記号を含む語は --query を付けずに標準入力の 1 行目で渡す（コマンドラインに書くとシェルを通って壊れる）。
 
 - chat models [--agent claude|codex] [--cwd <フォルダ>] [--refresh] --json
     使えるモデルの一覧（id・displayName。Codex は efforts も）。6 時間は控えを返す。--model にはこの id をそのまま渡す
@@ -90,7 +118,8 @@ export const AGENT_GUIDE = `# tailii-host chat — AI エージェント向け�
 ## 終了コード
 - 0 成功（status が処理中でも 0。state を見る）
 - 1 内部エラー
-- 2 使い方の誤り・許可されていない作業フォルダ・指示文が空
+- 2 使い方の誤り・許可されていない作業フォルダ・指示文が空。read / search の stale_cursor は、カーソルが今の記録と合わない
+  （記録が組み替わった・別の会話のカーソル）。chat read <会話ID> --last <件数> で取り直す
 - 3 会話が見つからない（chat list で確かめる）。code が conversation_ended_before_start なら、new の最初の指示が届く前に
   会話が終わった。新しい依頼 ID で new をやり直す
 - 4 他所で動いている（送っていない）。人に伝える

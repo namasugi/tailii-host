@@ -13,6 +13,7 @@ import { defaultHeartbeatDir } from "../sessions/heartbeat.js";
 import { startEngineRelaySocket, type EngineRelayServer } from "./engineRelaySocket.js";
 import { encodeHubMessage } from "./hubProtocol.js";
 import { ensureDirectory0700 } from "../shared/paths.js";
+import { defaultChatDeliveryLogPath } from "./chatDeliveryLog.js";
 import {
   REAPER_CHECK_INTERVAL_SECONDS,
   REAPER_IDLE_TIMEOUT_SECONDS,
@@ -594,6 +595,7 @@ export async function runHubCommand(args: string[]): Promise<number> {
     listLocalServers: () => listLocalServerProcesses([process.pid]),
     pendingQuestionsPath: defaultPendingQuestionsPath(),
     chatReceiptsPath: defaultChatReceiptsPath(),
+    chatDeliveryLogPath: defaultChatDeliveryLogPath(),
     log,
     tailFactory: (write, onCodexTurnLifecycle, onClaudeTurnLifecycle) => new ChatTailController({
       backgroundStopRecords,

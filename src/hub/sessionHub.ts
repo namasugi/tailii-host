@@ -77,6 +77,7 @@ import { ensureClaudeMetaCwd, locateClaudeTranscript } from "../sessions/claudeT
 import { cwdMarker } from "../shared/cwdMarker.js";
 import { isNonBlockingQuestionId } from "../codex/codexAsyncQuestion.js";
 import { randomUUID } from "node:crypto";
+import { appendChatDelivery, utteranceDigest } from "./chatDeliveryLog.js";
 import { describeUsageLimitWait } from "../shared/usageLimitWait.js";
 import type { PresenceState, PushDispatcher, PushPresenceConnection } from "../push/pushDispatcher.js";
 import { isValidDeviceId, normalizeDeviceId, type PushDeviceStore } from "../push/pushDeviceStore.js";
@@ -235,6 +236,11 @@ export type SessionHubOptions = Omit<ReaperTickOptions, "now"> & {
   chatReceiptsPath?: string;
   /** receipt 永続化のテスト注入口。省略時は atomic rename を使う。 */
   chatReceiptsWriter?: (target: string, contents: string) => void;
+  /**
+   * 届けた発話の記録（追記だけで消さない, chatDeliveryLog.ts）。`tailii-host chat read` が発話の出所を確かめるのに使う。
+   * 省略時は記録しない（daemon は既定パスを明示する）。
+   */
+  chatDeliveryLogPath?: string;
 };
 
 type PendingQuestion = NonNullable<SessionActor["pendingQuestion"]>;
@@ -3552,6 +3558,7 @@ export class SessionHub {
           actor.pendingChatMessages.delete(message.clientMessageId);
           removeOrderedID(actor.chatOrder, message.clientMessageId);
           recordDeliveredReceipt(actor.deliveredChatMessageIds, message.clientMessageId);
+          this.recordChatDelivery(session, "claude", message.clientMessageId, message.text);
           const receiptPersisted = this.persistChatReceipts();
           if (!receiptPersisted) {
             // pane 注入済みというメモリ上の権威結果を返す。failed を返すと利用者の明示再送で
@@ -3790,6 +3797,7 @@ export class SessionHub {
       actor.pendingCodexTurns.delete(message.clientUserMessageId);
       removeOrderedID(actor.codexOrder, message.clientUserMessageId);
       recordDeliveredReceipt(actor.deliveredCodexMessageIds, message.clientUserMessageId);
+      this.recordChatDelivery(message.session, "codex", message.clientUserMessageId, message.text);
       const receiptPersisted = this.persistChatReceipts();
       if (!receiptPersisted) {
         this.options.log?.(
@@ -4622,6 +4630,24 @@ export class SessionHub {
       this.chatReceiptsDirty = true;
       this.options.log?.(`chat receipt 書込失敗: ${String(error)}`);
       return false;
+    }
+  }
+
+  /**
+   * 届けた発話を記録に追記する（chatDeliveryLog.ts）。失敗しても配送の結果は変えない（出所の判定が推定に戻るだけ）。
+   */
+  private recordChatDelivery(session: string, agent: "claude" | "codex", clientMessageId: string, text: string): void {
+    const target = this.options.chatDeliveryLogPath;
+    if (target === undefined) return;
+    try {
+      const meta = this.options.metadataStore.get(session);
+      const conversationId = meta?.providerSessionId ?? meta?.claudeSessionId;
+      appendChatDelivery(target, {
+        v: 1, atMs: Date.now(), session, agent, clientMessageId, textHash: utteranceDigest(text),
+        ...(conversationId !== undefined && conversationId.length > 0 ? { conversationId } : {}),
+      });
+    } catch (error) {
+      this.options.log?.(`chat delivery 記録失敗 session=${session}: ${String(error)}`);
     }
   }
 
