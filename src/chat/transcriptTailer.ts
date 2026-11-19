@@ -80,7 +80,7 @@ const TRANSCRIPT_YIELD_INTERVAL_MS = 8;
 const INTERRUPT_MARKER_PREFIX = "[Request interrupted by user";
 
 /** user ターン本文が中断確定マーカーか（行頭一致。本文中の引用は除外する）。 */
-function isClaudeInterruptMarker(text: string): boolean {
+export function isClaudeInterruptMarker(text: string): boolean {
   return text.trimStart().startsWith(INTERRUPT_MARKER_PREFIX);
 }
 

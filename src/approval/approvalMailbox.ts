@@ -20,6 +20,8 @@ export interface PendingApprovalRecord {
   atMs: number;
   /** 待っている承認フックのプロセス（居なければ残骸）。 */
   pid: number;
+  /** この時刻まで PermissionRequest が画面と並行して承認を待つ。旧方式と Codex では省略。 */
+  permissionRequestUntilMs?: number;
   agentId?: string;
   agentType?: string;
 }
@@ -143,6 +145,7 @@ function parsePending(raw: unknown): PendingApprovalRecord | null {
     typeof r["pid"] !== "number") return null;
   return {
     id: r["id"], session: r["session"], tool: r["tool"], summary: r["summary"], cwd: r["cwd"], atMs: r["atMs"], pid: r["pid"],
+    ...(typeof r["permissionRequestUntilMs"] === "number" ? { permissionRequestUntilMs: r["permissionRequestUntilMs"] } : {}),
     ...(typeof r["agentId"] === "string" ? { agentId: r["agentId"] } : {}),
     ...(typeof r["agentType"] === "string" ? { agentType: r["agentType"] } : {}),
   };

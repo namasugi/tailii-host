@@ -14,10 +14,14 @@ import type * as net from "node:net";
 import {
   HOOK_INTERNAL_DEADLINE_SECONDS,
   autoAllowReasonForMode,
+  defersToClaudeForMode,
   isInternalForkHook,
   runHookCore,
   type ApprovalPushRequest,
+  type RunHookOptions,
 } from "../src/approval/hook.js";
+import { listPendingApprovals, takeApprovalResult, writeApprovalDecision } from "../src/approval/approvalMailbox.js";
+import { takePreToolUse, watchExternalApproval } from "../src/approval/permissionRequest.js";
 import {
   HOOK_EXTERNAL_TIMEOUT_SECONDS,
   claudeHookLaunchSettings,
@@ -172,6 +176,341 @@ class SpyNotifier {
     this.calls.push(request);
   };
 }
+
+describe("Hook — PermissionRequest 承認", () => {
+  const tool = { session_id: "claude-work", tool_name: "Bash", tool_input: { command: "echo hello" }, cwd: "/work" };
+  const input = (event: string, fields: Record<string, unknown> = {}) =>
+    Buffer.from(JSON.stringify({ ...tool, hook_event_name: event, ...fields }));
+  const roots: string[] = [];
+  afterEach(() => {
+    for (const dir of roots.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function setup(): Omit<RunHookOptions, "stdinData"> & { approvalsBase: string; session: string } {
+    const dir = tempDir("permission-request");
+    roots.push(dir);
+    return {
+      approvalsBase: dir, session: "cs-work", socketPath: null, deadlineSeconds: 4,
+      usePermissionRequest: true, engineRelaySocketPath: null, approvalsPollMs: 10,
+    };
+  }
+
+  function appendResult(file: string, toolUseId: string, isError: boolean): void {
+    fs.appendFileSync(file, JSON.stringify({
+      type: "user", timestamp: new Date().toISOString(),
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: toolUseId, is_error: isError }] },
+    }) + "\n");
+  }
+
+  it.each(["default", "plan", "acceptEdits", "auto", "dontAsk", "bypassPermissions"])(
+    "PreToolUse は %s モードでも判定せず、モード表に問い合わせない", async (mode) => {
+      const opts = setup();
+      const permissionModeProvider = vi.fn(async () => "auto");
+      expect(await runHookCore({ ...opts, permissionModeProvider,
+        stdinData: input("PreToolUse", { permission_mode: mode, tool_use_id: "toolu_bash" }) }))
+        .toEqual({ exitCode: 0, stdout: "" });
+      expect(permissionModeProvider).not.toHaveBeenCalled();
+      expect(listPendingApprovals(opts.session, opts.approvalsBase)).toEqual([]);
+    });
+
+  it("PreToolUse は処理中の通知を行い、画像は投入せず（承認を出すときだけ）、設問には従来どおり allow を返す", async () => {
+    const opts = setup();
+    const imagesPendingBase = path.join(opts.approvalsBase, "images");
+    const heartbeatDir = path.join(opts.approvalsBase, "heartbeat");
+    const pre = await runHookCore({ ...opts, heartbeatDir, imagesPendingBase,
+      stdinData: input("PreToolUse", { tool_name: "Read", tool_input: { file_path: "/work/pic.png" }, tool_use_id: "toolu_img" }) });
+    expect(pre.stdout).toBe("");
+    expect(readHeartbeat(heartbeatDir, opts.session)).toMatchObject({ state: "active", event: "PreToolUse" });
+    // 確認の出ないツール呼び出しでは画像を投入しない（auto の Read などで毎回投入しない）。
+    expect(fs.existsSync(imagesPendingBase)).toBe(false);
+    const question = await runHookCore({ ...opts, stdinData: askUserQuestionPreToolUse("toolu_q") });
+    expect(parseDecision(question.stdout).decision).toBe("allow");
+  });
+
+  it.each([
+    { tool_name: "AskUserQuestion" },
+    { tool_name: "ExitPlanMode" },
+    { agent_id: "internal" },
+  ])("PermissionRequest は対象外の入力 %j では無出力で終わる", async (fields) => {
+    const opts = setup();
+    expect(await runHookCore({ ...opts, stdinData: input("PermissionRequest", fields) }))
+      .toEqual({ exitCode: 0, stdout: "" });
+    expect(listPendingApprovals(opts.session, opts.approvalsBase)).toEqual([]);
+  });
+
+  it("同時の PreToolUse を会話・エージェント・ツール・入力で照合し、各 id を一度だけ使う", async () => {
+    const opts = setup();
+    const makeRecord = (toolUseId: string, fields: Record<string, unknown> = {}, session = opts.session) =>
+      runHookCore({ ...opts, session, stdinData: input("PreToolUse", { tool_use_id: toolUseId, ...fields }) });
+    const base = { sessionId: tool.session_id, toolName: tool.tool_name, toolInput: tool.tool_input };
+    const anotherTool = { toolName: "Mcp", toolInput: { args: [1, 2], object: { a: 3, b: 4 } } };
+    await Promise.all([
+      makeRecord("toolu_main"),
+      makeRecord("toolu_sub", { agent_id: "a1", agent_type: "worker" }),
+      makeRecord("toolu_other_session", { session_id: "other-claude" }),
+      makeRecord("toolu_other_app_session", {}, "cs-other"),
+      makeRecord("toolu_mcp", { tool_name: anotherTool.toolName, tool_input: anotherTool.toolInput }),
+    ]);
+    const take = (fields = {}, session = opts.session) => takePreToolUse(opts.approvalsBase, session, { ...base, ...fields })?.toolUseId;
+    expect(take({ toolInput: { command: "echo different" } })).toBeUndefined();
+    expect(take({ toolName: "Write" })).toBeUndefined();
+    expect(take({ agentId: "a1" })).toBe("toolu_sub");
+    expect(take({ sessionId: "other-claude" })).toBe("toolu_other_session");
+    expect(take({}, "cs-other")).toBe("toolu_other_app_session");
+    expect(take({ ...anotherTool, toolInput: { object: { b: 4, a: 3 }, args: [1, 2] } })).toBe("toolu_mcp");
+    expect(take()).toBe("toolu_main");
+    expect(take()).toBeUndefined();
+    await Promise.all([makeRecord("toolu_same_1"), makeRecord("toolu_same_2")]);
+    expect(take()).toBeUndefined();
+    expect(take()).toBeUndefined();
+  });
+
+  it("実行されたツールの記録は PostToolUse で消し、後の同じ入力と紛れない", async () => {
+    const opts = setup();
+    const base = { sessionId: tool.session_id, toolName: tool.tool_name, toolInput: tool.tool_input };
+    const take = () => takePreToolUse(opts.approvalsBase, opts.session, base)?.toolUseId;
+    // 1 回目は確認なしで実行された（PermissionRequest は走らない）→ PostToolUse で記録が消える。
+    await runHookCore({ ...opts, stdinData: input("PreToolUse", { tool_use_id: "toolu_first" }) });
+    await runHookCore({ ...opts, stdinData: input("PostToolUse", { tool_use_id: "toolu_first" }) });
+    // 2 回目は確認が出る。残っているのは 2 回目の記録だけなので、取り違えずに引ける。
+    await runHookCore({ ...opts, stdinData: input("PreToolUse", { tool_use_id: "toolu_second" }) });
+    expect(take()).toBe("toolu_second");
+    expect(take()).toBeUndefined();
+  });
+
+  it("同じ入力の記録が並んでいれば、片方が失効していても別の呼び出しの記録を使わない", async () => {
+    const opts = setup();
+    const base = { sessionId: tool.session_id, toolName: tool.tool_name, toolInput: tool.tool_input };
+    await runHookCore({ ...opts, stdinData: input("PreToolUse", { tool_use_id: "toolu_old" }) });
+    await runHookCore({ ...opts, stdinData: input("PreToolUse", { tool_use_id: "toolu_new" }) });
+    // 古い方だけを失効させる（記録の時刻を期限より前へ書き換える）。
+    const dir = path.join(opts.approvalsBase, ".pre-tool-use");
+    for (const name of fs.readdirSync(dir)) {
+      const file = path.join(dir, name);
+      const record = JSON.parse(fs.readFileSync(file, "utf8"));
+      if (record.toolUseId === "toolu_old") fs.writeFileSync(file, JSON.stringify({ ...record, atMs: Date.now() - 3_600_000 }));
+    }
+    expect(takePreToolUse(opts.approvalsBase, opts.session, base)).toBeNull();
+  });
+
+  it("打ち切り済みなら、確定済みの答えがあっても出力しない", async () => {
+    const opts = setup();
+    const cancel = new AbortController();
+    const pending = runHookCore({ ...opts, socketPath: path.join(opts.approvalsBase, "missing.sock"),
+      cancelSignal: cancel.signal, stdinData: input("PermissionRequest") });
+    const [record] = await vi.waitFor(() => {
+      const records = listPendingApprovals(opts.session, opts.approvalsBase);
+      expect(records).toHaveLength(1);
+      return records;
+    });
+    // 受け渡し口の決定と打ち切りが重なった場合も、画面側の決着（打ち切り）を優先する。
+    cancel.abort();
+    writeApprovalDecision(opts.session, record!.id, { decision: "allow", atMs: Date.now() }, opts.approvalsBase);
+    expect(await pending).toEqual({ exitCode: 0, stdout: "" });
+  });
+
+  it("同じ入力の古い記録（前の呼び出しの残り）は、新しい記録を残すときに消す", async () => {
+    const opts = setup();
+    const base = { sessionId: tool.session_id, toolName: tool.tool_name, toolInput: tool.tool_input };
+    const dir = path.join(opts.approvalsBase, ".pre-tool-use");
+    // 1 回目は確認なしで拒否された（PermissionRequest も PostToolUse も走らない）→ 記録が残る。
+    await runHookCore({ ...opts, stdinData: input("PreToolUse", { tool_use_id: "toolu_denied" }) });
+    const [stale] = fs.readdirSync(dir);
+    // 2 分前の記録にする（名前の先頭が記録した時刻）。別の入力の古い記録は消さない。
+    const aged = (name: string, tag = "") => `${Date.now() - 120_000}${tag}${name.slice(name.indexOf("-"))}`;
+    fs.renameSync(path.join(dir, stale!), path.join(dir, aged(stale!)));
+    await runHookCore({ ...opts, stdinData: input("PreToolUse", { tool_use_id: "toolu_other", tool_input: { command: "echo other" } }) });
+    const other = fs.readdirSync(dir).find((name) => name !== aged(stale!) && !name.startsWith(aged(stale!).split("-")[0]!));
+    fs.renameSync(path.join(dir, other!), path.join(dir, aged(other!)));
+    await runHookCore({ ...opts, stdinData: input("PreToolUse", { tool_use_id: "toolu_again" }) });
+    expect(takePreToolUse(opts.approvalsBase, opts.session, base)?.toolUseId).toBe("toolu_again");
+    expect(takePreToolUse(opts.approvalsBase, opts.session, { ...base, toolInput: { command: "echo other" } })?.toolUseId)
+      .toBe("toolu_other");
+  });
+
+  const dialogScreen = " Do you want to proceed?\n ❯ 1. Yes\n   2. No\n\n Esc to cancel · Tab to amend\n";
+  const idleScreen = "⏺ done\n\n────\n❯ \n────\n  ⏸ manual mode on\n";
+
+  it("画面の確認ダイアログが消えたら（端末で Yes）、会話ログに結果が出る前でも待ちをやめる", async () => {
+    const opts = setup();
+    let screen = dialogScreen;
+    const paneCapture = vi.fn(async () => screen);
+    const pending = runHookCore({ ...opts, deadlineSeconds: 30, socketPath: path.join(opts.approvalsBase, "missing.sock"),
+      paneCapture, panePollEveryTicks: 1, stdinData: input("PermissionRequest") });
+    await vi.waitFor(() => expect(paneCapture).toHaveBeenCalled());
+    expect(listPendingApprovals(opts.session, opts.approvalsBase)).toHaveLength(1);
+    screen = idleScreen; // 端末で答えた。ツールは実行中で、会話ログにはまだ何も書かれない。
+    expect(await pending).toEqual({ exitCode: 0, stdout: "" });
+    expect(listPendingApprovals(opts.session, opts.approvalsBase)).toEqual([]);
+  });
+
+  it("確認を見たあとでも、閉じたと言えない画面（上へスクロール・別のダイアログ・空・取得の失敗）では待ちをやめない", async () => {
+    const opts = setup();
+    const scrolledAway = "⏺ working\n\n                    Jump to bottom: fn+↓ to scroll                    \n────\n❯ \n────\n  ⏸ manual mode on · esc to interrupt\n";
+    const question = " Which color?\n ❯ 1. Red\n   2. Blue\n\n Enter to select · ↑/↓ to navigate · Esc to cancel\n";
+    // 入力欄が戻った画面は 1 回だけ（続かない）。間に判定できない画面が挟まるたびに数え直す。
+    const login = " Select login method:\n ❯ 1. Claude account with subscription\n   2. Anthropic Console account\n\n Esc to cancel\n";
+    const frames: (string | null)[] = [dialogScreen, scrolledAway, idleScreen, "", idleScreen, question, idleScreen, null, idleScreen, login, idleScreen];
+    let calls = 0;
+    const paneCapture = vi.fn(async () => {
+      const frame = calls < frames.length ? frames[calls]! : scrolledAway;
+      calls += 1;
+      if (frame === null) throw new Error("capture failed"); // 取得の失敗（連続を数え直す）
+      return frame;
+    });
+    const { stdout } = await runHookCore({ ...opts, deadlineSeconds: 4, socketPath: path.join(opts.approvalsBase, "missing.sock"),
+      paneCapture, panePollEveryTicks: 1, stdinData: input("PermissionRequest") });
+    expect(calls).toBeGreaterThan(frames.length);
+    expect(JSON.parse(stdout).hookSpecificOutput.decision.behavior).toBe("deny"); // 期限まで待って、今までどおり拒否
+  });
+
+  it("会話ログの追記が 1 回の読み取りより大きくても、追い付いてから決着を判定する", () => {
+    const opts = setup();
+    const file = path.join(opts.approvalsBase, "big.jsonl");
+    fs.writeFileSync(file, "");
+    const record = { toolUseId: "toolu_big", approvalId: "ap", fingerprint: "f", atMs: Date.now(),
+      positions: [{ file, inode: fs.statSync(file).ino, offset: 0 }] };
+    const watch = watchExternalApproval({ sessionId: "s", transcriptPath: file, toolName: "Bash", toolInput: {} }, record, Date.now());
+    expect(watch.check()).toBe(false);
+    // 約 700 KiB の別の行の後ろに、対象の結果行が続く。
+    fs.appendFileSync(file, JSON.stringify({ type: "user", message: { role: "user", content: "x".repeat(700 * 1024) } }) + "\n");
+    appendResult(file, "toolu_big", false);
+    expect(watch.check()).toBe(true);
+  });
+
+  it("確認ダイアログを一度も見ていなければ、画面の様子では待ちをやめない（取得の失敗も数えない）", async () => {
+    const opts = setup();
+    const screens: (string | null)[] = [idleScreen, null, idleScreen, idleScreen];
+    const paneCapture = vi.fn(async () => {
+      const next = screens.shift();
+      if (next === undefined) throw new Error("capture failed");
+      return next;
+    });
+    const { stdout } = await runHookCore({ ...opts, deadlineSeconds: 1.5, socketPath: path.join(opts.approvalsBase, "missing.sock"),
+      paneCapture, panePollEveryTicks: 1, stdinData: input("PermissionRequest") });
+    expect(paneCapture.mock.calls.length).toBeGreaterThan(4);
+    expect(JSON.parse(stdout).hookSpecificOutput.decision.behavior).toBe("deny"); // 期限まで待って、今までどおり拒否
+  });
+
+  it.each(["allow", "deny"] as const)("照合できなくても CLI の %s を PermissionRequest の形で返す", async (decision) => {
+    const opts = setup();
+    const pending = runHookCore({ ...opts, socketPath: path.join(opts.approvalsBase, "missing.sock"),
+      stdinData: input("PermissionRequest", { permission_mode: "auto" }) });
+    const [record] = listPendingApprovals(opts.session, opts.approvalsBase);
+    expect(record?.permissionRequestUntilMs).toBeGreaterThan(Date.now());
+    writeApprovalDecision(opts.session, record!.id, { decision, reason: "指定した理由", atMs: Date.now() }, opts.approvalsBase);
+    expect(JSON.parse((await pending).stdout)).toEqual({ hookSpecificOutput: {
+      hookEventName: "PermissionRequest", decision: decision === "allow"
+        ? { behavior: "allow" } : { behavior: "deny", message: "指定した理由" },
+    } });
+    expect(takeApprovalResult(opts.session, record!.id, opts.approvalsBase)).toEqual({ decision, by: "cli" });
+    expect(listPendingApprovals(opts.session, opts.approvalsBase)).toEqual([]);
+  });
+
+  it("承認できる人のいない Bot はすぐに拒否する", async () => {
+    const opts = setup();
+    const { stdout } = await runHookCore({ ...opts, socketPath: path.join(opts.approvalsBase, "missing.sock"),
+      session: "s-cli0123456789abcdef", approverAvailable: () => false, stdinData: input("PermissionRequest") });
+    expect(JSON.parse(stdout).hookSpecificOutput.decision).toEqual({
+      behavior: "deny", message: expect.stringContaining("No one can approve this right now"),
+    });
+  });
+
+  it("再接続の時間切れでは PermissionRequest の deny を返す", async () => {
+    const opts = setup();
+    const { stdout } = await runHookCore({ ...opts, socketPath: path.join(opts.approvalsBase, "missing.sock"),
+      deadlineSeconds: 0.05, stdinData: input("PermissionRequest") });
+    expect(JSON.parse(stdout).hookSpecificOutput.decision).toEqual({
+      behavior: "deny", message: expect.stringContaining("iPhone unavailable (no reconnect"),
+    });
+    expect(listPendingApprovals(opts.session, opts.approvalsBase)).toEqual([]);
+  });
+
+  it("打ち切り（SIGTERM = 画面で No・中断）で待ちをやめ、無出力で受け渡し口を片付ける", async () => {
+    const opts = setup();
+    const cancel = new AbortController();
+    const pending = runHookCore({ ...opts, socketPath: path.join(opts.approvalsBase, "missing.sock"),
+      cancelSignal: cancel.signal, stdinData: input("PermissionRequest") });
+    await vi.waitFor(() => expect(listPendingApprovals(opts.session, opts.approvalsBase)).toHaveLength(1));
+    cancel.abort();
+    expect(await pending).toEqual({ exitCode: 0, stdout: "" });
+    expect(listPendingApprovals(opts.session, opts.approvalsBase)).toEqual([]);
+    // 打ち切り済みで始まった場合は、承認を出さずに終わる。
+    expect(await runHookCore({ ...opts, socketPath: path.join(opts.approvalsBase, "missing.sock"),
+      cancelSignal: cancel.signal, stdinData: input("PermissionRequest") })).toEqual({ exitCode: 0, stdout: "" });
+    expect(listPendingApprovals(opts.session, opts.approvalsBase)).toEqual([]);
+  });
+
+  it("tool_use_id が無ければ新しいターン終了で待ちを解除する", async () => {
+    const opts = setup();
+    const file = path.join(opts.approvalsBase, "turn.jsonl");
+    fs.writeFileSync(file, JSON.stringify({ type: "system", subtype: "turn_duration", timestamp: "2025-01-01T00:00:00Z" }) + "\n");
+    const pending = runHookCore({ ...opts, socketPath: path.join(opts.approvalsBase, "missing.sock"),
+      stdinData: input("PermissionRequest", { transcript_path: file }) });
+    expect(listPendingApprovals(opts.session, opts.approvalsBase)).toHaveLength(1);
+    fs.appendFileSync(file, JSON.stringify({ type: "system", subtype: "turn_duration", timestamp: new Date().toISOString() }) + "\n");
+    expect(await pending).toEqual({ exitCode: 0, stdout: "" });
+    expect(listPendingApprovals(opts.session, opts.approvalsBase)).toEqual([]);
+  });
+
+  it.each([false, true])("未接続時も端末側の結果（is_error=%s）で再接続待ちを打ち切る", async (isError) => {
+    const opts = setup();
+    const transcript = path.join(opts.approvalsBase, "claude-work.jsonl");
+    const fields = { transcript_path: transcript, tool_name: "Read", tool_input: { file_path: "/work/pic.png" } };
+    await runHookCore({ ...opts, stdinData: input("PreToolUse", { ...fields, tool_use_id: "toolu_waiting" }) });
+    const notifier = vi.fn(async () => {});
+    const pending = runHookCore({ ...opts, socketPath: path.join(opts.approvalsBase, "missing.sock"), notifier,
+      stdinData: input("PermissionRequest", fields) });
+    expect(listPendingApprovals(opts.session, opts.approvalsBase)).toHaveLength(1);
+    await vi.waitFor(() => expect(notifier).toHaveBeenCalledOnce());
+    appendResult(transcript, "toolu_waiting", isError);
+    expect(await pending).toEqual({ exitCode: 0, stdout: "" });
+    expect(listPendingApprovals(opts.session, opts.approvalsBase)).toEqual([]);
+  });
+
+  it.each([false, true])("端末側の決着（is_error=%s）で承認ソケットを閉じてアプリと受け渡し口を片付ける", async (isError) => {
+    const opts = setup();
+    const file = path.join(opts.approvalsBase, "claude-work.jsonl");
+    const child = path.join(opts.approvalsBase, "claude-work", "subagents", "agent-a1.jsonl");
+    fs.mkdirSync(path.dirname(child), { recursive: true });
+    fs.writeFileSync(file, "");
+    fs.writeFileSync(child, "");
+    const agent = isError ? { agent_id: "a1", agent_type: "worker" } : {};
+    const fields = { ...agent, transcript_path: file };
+    const target = isError ? child : file;
+    await runHookCore({ ...opts, stdinData: input("PreToolUse", { ...fields, tool_use_id: "toolu_waiting" }) });
+    const pendingEvents: EngineRelayMessage[] = [];
+    const socketPath = tempSocketPath("pr-gate");
+    const relayPath = tempSocketPath("pr-relay");
+    const listener = await startListener(socketPath);
+    try {
+      const relay = await startEngineRelaySocket({ socketPath: relayPath, onMessage: (message) => pendingEvents.push(message) });
+      try {
+        const result = runHookCore({ ...opts, socketPath, engineRelaySocketPath: relayPath, stdinData: input("PermissionRequest", fields) });
+        const socket = await listener.nextConnection();
+        const reader = new SocketLineReader(socket);
+        const request = decodeControlMessage(await reader.nextLine());
+        expect(request.type).toBe("approval_request");
+        if (request.type !== "approval_request") throw new Error("承認要求が無い");
+        appendResult(target, "toolu_other", isError);
+        // 結果の id が異なる間は閉じない。拒否のケースでも PostToolUse は送らない。
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        expect(listPendingApprovals(opts.session, opts.approvalsBase).map(({ id }) => id)).toEqual([request.id]);
+        appendResult(target, "toolu_waiting", isError);
+        expect(await result).toEqual({ exitCode: 0, stdout: "" });
+        await reader.waitForEOF();
+        await vi.waitFor(() => expect(pendingEvents).toEqual([{
+          type: "remote_pending_cleared", v: 1, session: opts.session, id: request.id, kind: "approval",
+        }]));
+        expect(listPendingApprovals(opts.session, opts.approvalsBase)).toEqual([]);
+      } finally {
+        await relay?.close();
+      }
+    } finally {
+      await listener.close();
+    }
+  });
+});
 
 describe("Hook — PreToolUse 承認ゲート", () => {
   let listener: FakeListener | null = null;
@@ -880,6 +1219,43 @@ describe("Hook — permission mode 自動許可（mode-picker 連動）", () => 
     } finally {
       await relay?.close();
     }
+  });
+
+  it("hook 入力 permission_mode=dontAsk → 判定を返さず Claude Code に任せる（iPhone に聞かない）", async () => {
+    let providerCalled = false;
+    const { exitCode, stdout } = await runHookCore({
+      stdinData: bashPreToolUse("echo x", "/w", "dontAsk"),
+      // socket が無いので、ゲートへ進んでいれば deny が出る。空の出力 = ゲートへ進んでいない。
+      socketPath: null,
+      deadlineSeconds: 5,
+      permissionModeProvider: async () => {
+        providerCalled = true;
+        return "auto";
+      },
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toBe("");
+    expect(providerCalled).toBe(false);
+  });
+
+  it("hook 入力 permission_mode=bypassPermissions → 素通しせず従来どおりゲート（広げない）", async () => {
+    const { stdout } = await runHookCore({
+      stdinData: bashPreToolUse("echo x", "/w", "bypassPermissions"),
+      socketPath: null,
+      deadlineSeconds: 5,
+      permissionModeProvider: async () => "auto",
+    });
+    expect(parseDecision(stdout).decision).toBe("deny");
+  });
+
+  it("defersToClaudeForMode 純ロジック（6 つのモード + 未知 + 判定不能）", () => {
+    expect(defersToClaudeForMode("dontAsk")).toBe(true);
+    for (const mode of ["default", "plan", "acceptEdits", "auto", "bypassPermissions", "futureMode", null]) {
+      expect(defersToClaudeForMode(mode)).toBe(false);
+    }
+    // 任せるモードは、即 allow の対象にもならない（許可を広げない）。
+    expect(autoAllowReasonForMode("dontAsk", "Bash")).toBeNull();
+    expect(autoAllowReasonForMode("bypassPermissions", "Bash")).toBeNull();
   });
 
   it("autoAllowReasonForMode 純ロジック", () => {

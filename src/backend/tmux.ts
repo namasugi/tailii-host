@@ -1758,10 +1758,9 @@ export function screenShowsCancellableChoice(screen: string): boolean {
 
 /**
  * ツール承認ダイアログ（フッター `Esc to cancel · Tab to amend`）が画面下部に出ているか（TESTABLE）。
- * 通常の承認は PreToolUse hook がアプリの承認モーダルで捌き TUI には出ないが、hook の allow を
- * 上書きする Claude Code 自身の安全確認（作業フォルダ外への Artifact 保存・`.claude/` への書き込み等）
- * は TUI に残り、利用者が答えるまで会話が止まる。pane_preview の「静止した入力待ち」として初回
- * フレームから送り、iPhone の転写カードで答えられるようにする（開き直しでもカードが出る）。
+ * pane_preview の「静止した入力待ち」として初回フレームから拾う。PermissionRequest がアプリの返事を
+ * 待っている間は TUI にも同じ確認が出るので、転写カードを閉じるフレームにして送る（PanePreviewPump）。
+ * フックが待っていない確認は転写カードで答えられる（開き直しでも初回からカードが出る）。
  * フッターはカーソルが 1 番目のとき `Esc to cancel · Tab to amend`、2 番目以降へ動かすと
  * `Esc to cancel` 単独になる（実測 2.1.283）ので、行頭の `Esc to cancel` で拾う（`/login` の各画面も
  * 同じフッターだが、そちらも静止した入力待ちとして初回から送る対象なので区別しない）。

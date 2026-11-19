@@ -1,6 +1,7 @@
 // panePreviewPump.test.ts — tmux pane 一時進捗 pump テスト
 
 import { Writable } from "node:stream";
+import { readFileSync } from "node:fs";
 import { performance } from "node:perf_hooks";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { LineWriter } from "../src/shared/lineWriter.js";
@@ -304,6 +305,68 @@ describe("PanePreviewPump", () => {
     ]);
 
     pump.stop();
+  });
+
+  test("フックが待ち始めたら転写を閉じ、静止した承認でも待ちが終わったら転写を再開する", async () => {
+    vi.useFakeTimers();
+    const dialog = readFileSync(new URL("./fixtures/pane/approval-dialog.ansi", import.meta.url), "utf8");
+    const login = readFileSync(new URL("./fixtures/login/method-select.txt", import.meta.url), "utf8");
+    const selection = "Select an option\n❯ One\n  Two\n\n Enter to select · ↑/↓ to navigate\n Esc to cancel";
+    let paneText = dialog;
+    let waiting = false;
+    const { writer, messages } = memoryWriter();
+    const pump = new PanePreviewPump({
+      writer, capture: async () => paneText, pollIntervalMs: 10,
+      emitInitialIf: () => true, hasPermissionRequest: (session) => session === "work" && waiting,
+    });
+    try {
+      pump.start("work");
+      await flushMicrotasks();
+      expect(messages().at(-1)).toMatchObject({ active: true, text: dialog });
+      waiting = true;
+      // 再購読が次の capture より先でも、生の承認を再送しない。
+      pump.resendLastIfInteractive();
+      expect(messages().at(-1)).toMatchObject({ active: true, text: "Esc to cancel" });
+      waiting = false;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(messages().at(-1)).toMatchObject({ active: true, text: dialog });
+      waiting = true;
+      await vi.advanceTimersByTimeAsync(10);
+      expect(messages().at(-1)).toMatchObject({ active: true, text: "Esc to cancel" });
+      paneText = login;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(messages().at(-1)).toMatchObject({ active: true, text: login });
+      paneText = selection;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(messages().at(-1)).toMatchObject({ active: true, text: selection });
+    } finally {
+      pump.stop();
+    }
+  });
+
+  test("フックの待ちが終わった直後の再購読は、次の capture を待たずに生の承認を送る（取得が失敗し続けても転写が戻る）", async () => {
+    vi.useFakeTimers();
+    const dialog = readFileSync(new URL("./fixtures/pane/approval-dialog.ansi", import.meta.url), "utf8");
+    let paneText: string | null = dialog;
+    let waiting = true;
+    const { writer, messages } = memoryWriter();
+    const pump = new PanePreviewPump({
+      writer, capture: async () => paneText, pollIntervalMs: 10,
+      emitInitialIf: () => true, hasPermissionRequest: () => waiting,
+    });
+    try {
+      pump.start("work");
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(10);
+      expect(messages().at(-1)).toMatchObject({ active: true, text: "Esc to cancel" });
+      // フックが終わり、それ以降の取得は失敗し続ける。再購読したら、持っている画面そのものを送る。
+      waiting = false;
+      paneText = null;
+      pump.resendLastIfInteractive();
+      expect(messages().at(-1)).toMatchObject({ active: true, text: dialog });
+    } finally {
+      pump.stop();
+    }
   });
 
   test("emitInitial 指定時は初回 capture から emit する（処理中会話の一覧 watch 開始）", async () => {

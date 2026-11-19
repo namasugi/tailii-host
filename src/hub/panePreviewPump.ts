@@ -4,7 +4,10 @@
 import type { LineWriter } from "../shared/lineWriter.js";
 import { parsePermissionMode } from "../shared/permissionMode.js";
 import { parseUsageLimitWait, sameUsageLimitWait, type UsageLimitWaitState } from "../shared/usageLimitWait.js";
-import { extractInputBoxSuggestion, inputBoxResidueText, inputResidueExcerpt } from "../backend/tmux.js";
+import {
+  extractInputBoxSuggestion, inputBoxResidueText, inputResidueExcerpt,
+  screenInLoginFlow, screenShowsApprovalDialog, screenShowsCancellableChoice, screenShowsConfirmDialogFooter,
+} from "../backend/tmux.js";
 import { PROTOCOL_V2 } from "../protocol.js";
 import { abortableSleep } from "../shared/sleep.js";
 import { performance } from "node:perf_hooks";
@@ -64,6 +67,8 @@ export interface PanePreviewPumpOptions {
    * 会話を開き直しても転写カードが出ない（2026-08-25 実障害）。
    */
   emitInitialIf?: (text: string) => boolean;
+  /** 同じ会話で PermissionRequest が iPhone の承認を待っているか。 */
+  hasPermissionRequest?: (session: string) => boolean;
   /**
    * 静止していても消灯しないフレームの判定（claude_status のみ）。端末側で上へスクロールされた
    * 処理中の Claude はスピナーが画面外に出て画面が動かなくなるため、静止を処理の終わりと
@@ -95,6 +100,8 @@ export class PanePreviewPump {
   private task: Promise<void> | null = null;
   private seq = 0;
   private lastText: string | null = null;
+  /** 直前に送ったフレームで、ツール承認の転写を抑えたか（フックの待ちの始まり・終わりを見分ける）。 */
+  private lastSuppressed = false;
   private lastChangeAt = 0;
   private lastEmitAt = 0;
   private pendingText: string | null = null;
@@ -108,6 +115,7 @@ export class PanePreviewPump {
   private lastUsageLimitWait: UsageLimitWaitState | null = null;
   private readonly log: ((message: string) => void) | null;
   private readonly emitInitialIf: ((text: string) => boolean) | null;
+  private readonly hasPermissionRequest: ((session: string) => boolean) | undefined;
   private readonly holdActiveIf: ((text: string) => boolean) | null;
   private readonly jumpToLatest: ((session: string) => Promise<void>) | null;
   private readonly jumpToLatestIf: ((text: string) => boolean) | null;
@@ -154,6 +162,7 @@ export class PanePreviewPump {
     this.onUsageLimitWait = options.onUsageLimitWait ?? null;
     this.log = options.log ?? null;
     this.emitInitialIf = options.emitInitialIf ?? null;
+    this.hasPermissionRequest = options.hasPermissionRequest;
     this.holdActiveIf = options.holdActiveIf ?? null;
     this.jumpToLatest = options.jumpToLatest ?? null;
     this.jumpToLatestIf = options.jumpToLatestIf ?? null;
@@ -201,6 +210,7 @@ export class PanePreviewPump {
     this.emitInitial = opts?.emitInitial ?? false;
     this.lastPermissionMode = null;
     this.lastText = null;
+    this.lastSuppressed = false;
     this.lastChangeAt = 0;
     this.lastEmitAt = 0;
     this.pendingText = null;
@@ -244,6 +254,7 @@ export class PanePreviewPump {
     this.emitInitial = false;
     this.lastPermissionMode = null;
     this.lastText = null;
+    this.lastSuppressed = false;
     this.lastChangeAt = 0;
     this.lastEmitAt = 0;
     this.pendingText = null;
@@ -312,6 +323,14 @@ export class PanePreviewPump {
 
       const now = Date.now();
       if (text !== null && mode === "claude_status") this.maybeJumpToLatest(session, text, now);
+      if (text !== null && this.suppressesApproval(session, text, mode) !== this.lastSuppressed) {
+        // フックの待ちが始まった・終わった。間引きを待たずに出し直す（始まり: 転写済みのカードを閉じる /
+        // 終わり: 画面が静止したままでも転写を戻す）。`lastText` は画面そのものを持ち、差し替えは送るときに決める。
+        this.lastText = text;
+        this.lastChangeAt = now;
+        this.inactiveSent = false;
+        this.emitActive(session, text, now, mode);
+      }
       if (text !== null && text !== this.lastText) {
         if (this.lastText === null) {
           this.lastText = text;
@@ -487,7 +506,19 @@ export class PanePreviewPump {
         `pane_preview dialog-frame ${dialogFrame ? "開始" : "終了"} session=${session} bytes=${Buffer.byteLength(text, "utf8")}`,
       );
     }
-    this.emit(session, true, text, mode);
+    // 間引き中や再購読時に使うフレームも、配信する時点のフックの待ちで判定する（持っているのは画面そのもの）。
+    // フッターだけのフレームは、iOS の既存の「転写できない承認」でカードを閉じる。
+    // 画面と本文注入の門番は別の capture を読むので、端末からの回答と誤入力防止はそのまま働く。
+    const suppressed = this.suppressesApproval(session, text, mode);
+    this.lastSuppressed = suppressed;
+    this.emit(session, true, suppressed ? "Esc to cancel" : text, mode);
+  }
+
+  /** この画面のツール承認の転写を抑えるか（同じ会話で PermissionRequest が iPhone の承認を待っている間）。 */
+  private suppressesApproval(session: string, text: string, mode: PanePreviewMode): boolean {
+    return mode === "claude_status" && this.hasPermissionRequest !== undefined &&
+      screenShowsApprovalDialog(text) && !screenShowsCancellableChoice(text) && !screenShowsConfirmDialogFooter(text) &&
+      !screenInLoginFlow(text) && this.hasPermissionRequest(session);
   }
 
   private emit(

@@ -14,6 +14,7 @@ import { startEngineRelaySocket, type EngineRelayServer } from "./engineRelaySoc
 import { encodeHubMessage } from "./hubProtocol.js";
 import { ensureDirectory0700 } from "../shared/paths.js";
 import { defaultChatDeliveryLogPath } from "./chatDeliveryLog.js";
+import { listPendingApprovals } from "../approval/approvalMailbox.js";
 import {
   REAPER_CHECK_INTERVAL_SECONDS,
   REAPER_IDLE_TIMEOUT_SECONDS,
@@ -622,6 +623,9 @@ export async function runHubCommand(args: string[]): Promise<number> {
       },
       priority: () => isForeground?.() === false ? "background" : "foreground",
       log,
+      hasPermissionRequest: (session) => listPendingApprovals(session).some(
+        (approval) => (approval.permissionRequestUntilMs ?? 0) > Date.now(),
+      ),
       // 静止した入力待ちダイアログ（選択 / 確認系 / /login / hook で通らなかった承認）は初回フレームから送る
       // （開き直しで転写カードを出す）。使用量制限の待機フッター（usage-limit-wait）も静止画面なので
       // 初回フレームから送る。端末側で上へスクロールされた処理中の Claude も静止画面なので同じ

@@ -363,6 +363,28 @@ describe("claudeHookLaunchSettings", () => {
     }
   });
 
+  test("PermissionRequest は 2.1.327 以上の会話だけに登録し、承認を担うフックに印を付ける", () => {
+    const dir = makeTempDir("hooks-permission-request");
+    const command = "/usr/local/bin/tailii hook --session work";
+    const entry = (command: string) => [{ matcher: "*", hooks: [{ type: "command", command, timeout: 600 }] }];
+    for (const claudeVersion of ["2.1.326", "2.1.327", "2.2.0", null, undefined, "unknown"]) {
+      const json = claudeHookLaunchSettings({
+        dir, binaryPath: "/usr/local/bin/tailii", session: "work", globalMarkerPath: path.join(dir, "no-marker"),
+        ...(claudeVersion !== undefined ? { claudeVersion } : {}),
+      });
+      const { hooks } = JSON.parse(json!);
+      expect(hooks.PostToolUse).toEqual(entry(command));
+      if (claudeVersion === "2.1.327" || claudeVersion === "2.2.0") {
+        const marked = entry(`${command} --permission-request`);
+        expect(hooks.PreToolUse).toEqual(marked);
+        expect(hooks.PermissionRequest).toEqual(marked);
+      } else {
+        expect(hooks.PreToolUse).toEqual(entry(command));
+        expect(hooks).not.toHaveProperty("PermissionRequest");
+      }
+    }
+  });
+
   test(".tailii-nohook マーカーがある dir は null（フック無し）", () => {
     const dir = makeTempDir("hooks-nohook");
     fs.writeFileSync(path.join(dir, ".tailii-nohook"), "");

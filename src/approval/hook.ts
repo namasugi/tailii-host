@@ -1,18 +1,13 @@
 // hook.ts
 // tailii (TS host) — hook サブコマンド実装（Swift 版 Hook.swift の移植）
 //
-// Claude Code の PreToolUse / PostToolUse フック。stdin JSON の `hook_event_name` で分岐する。
-//
-// PreToolUse（ツール実行の唯一のゲート意思決定点）:
-//   まず hook 入力の `permission_mode`（Claude Code が渡す現在値）を判定し、
-//   旧版互換で欠落時だけ tmux pane の mode-picker 表示へフォールバックする。
-//   auto（全自動）なら即 allow、acceptEdits なら編集系ツールのみ即 allow して
-//   iPhone 承認をスキップする（mode_set での途中切替が確認モーダルに反映される）。
-//   それ以外は summary と構造化 diff（Write=create+全文 / Edit=edit+old/new）を生成し、
-//   unix domain socket クライアントとして broker（=iPhone）へ approval_request（一意 id）を
-//   送り、内部デッドライン内に approval_decision を受信して permissionDecision を stdout 出力。
-//   決定はブロードキャストされるため自 id のみ受理する（5.4）。tool_input のパスが
-//   画像拡張子なら pending キューへレコードを書く（リサイズせず＝デッドライン非影響）。
+// Claude Code のフック。stdin JSON の `hook_event_name` で分岐する。
+// `--permission-request` を付けて起動した会話では、許可モード・ルール・auto の判定を Claude Code が行い、
+// 確認が必要なツールだけ PermissionRequest から iPhone に届ける。PreToolUse は処理中の通知・画像の検出と
+// 照合用の tool_use_id の記録を担う。AskUserQuestion の設問の中継と allow は従来どおり PreToolUse が行う。
+// 引数の無い稼働中の会話・旧版は互換のため PreToolUse でモードを判定し、必要に応じて iPhone に聞く。
+// 承認は同じチャネルと `chat approve` の受け渡し口で待つ。PermissionRequest の返答は decision.behavior、
+// 旧方式の返答は permissionDecision。端末で決着したら会話ログで検知し、無出力で待機とアプリの承認を片付ける。
 //
 // connect 不能（アプリ背景/未起動）ブランチ:
 //   即 deny せず背景 push（notifier 注入時のみ・このブランチのみ, 相互排他 7.1）→
@@ -24,11 +19,10 @@
 //
 // PostToolUse（別呼び出し、ゲートしない）: ObservationLog に監査追記して exit 0（5.8）。
 //
-// CLI 内部の複製（返答案など。`agent_id` だけ付き `agent_type` が無い）の Pre/PostToolUse は、
+// CLI 内部の複製（返答案など。`agent_id` だけ付き `agent_type` が無い）のツールフックは、
 // 処理中の通知・設問・承認のどれにも使わない（`isInternalForkHook`）。
 //
-// 既定は常に deny（安全側）。connect 失敗・stdin 解析不能・id 不一致・非対応 v・
-// undecodable 行・EOF・デッドラインのいずれでも deny を出力する。
+// 承認を待つ経路では、接続や返答が間に合わなければ deny を返す。
 
 import * as fs from "node:fs";
 import * as net from "node:net";
@@ -61,6 +55,7 @@ import { claudePidOfHook } from "../sessions/claudeLiveStatus.js";
 import { ensureHubDaemon } from "../hub/hubDaemonClient.js";
 import { decodeHubServerLine, encodeHubMessage, type HubPushEvent } from "../hub/hubProtocol.js";
 import { closeAfterReply, replyDecisionApplied } from "./decisionResult.js";
+import { forgetPreToolUse, rememberPreToolUse, takePreToolUse, watchExternalApproval } from "./permissionRequest.js";
 import {
   botMayApprove,
   defaultApprovalsBase,
@@ -74,7 +69,7 @@ import { ObservationLog, defaultObservationBase } from "../shared/observationLog
 import { parsePermissionMode } from "../shared/permissionMode.js";
 import { resolveHubSocketPath, resolveSocketPath } from "../shared/socketPath.js";
 import { attachedSessions } from "../hub/reaper.js";
-import { sleep } from "../shared/sleep.js";
+import { abortableSleep, sleep } from "../shared/sleep.js";
 import { makeBackendForSession } from "../backend/sessionBackend.js";
 import { processTmuxCommandRunner, type TmuxCommandRunner } from "../backend/tmux.js";
 import {
@@ -89,7 +84,7 @@ import {
 /**
  * hook 内部デッドラインの既定値（秒）。settings の外部タイムアウト
  * （hookSettings.HOOK_EXTERNAL_TIMEOUT_SECONDS = 600）より**厳密に小さく**保つこと。
- * この順序により hook は外部打切り前に必ず permissionDecision（無応答時は deny）を
+ * この順序により hook は外部打切り前に承認の判定（無応答時は deny）を
  * 出力でき、fall-through を回避する（Req 5.7、HookTimeoutOrderingTests が検証）。
  * connect 不能時は背景 push で気づかせたうえで、人間が通知タップ→cold launch→
  * SSH 再接続→承認判断を完了できる猶予を与える（90→540 に延長, Req 8.4）。
@@ -145,11 +140,31 @@ export const HUB_PRESENCE_RPC_TIMEOUT_MS = 300;
 /** Hub への push_request の接続・書き込みの上限（ここまでに接続できなければ hub が居ないとみなして自分で送る）。 */
 export const HUB_PUSH_RPC_TIMEOUT_MS = 500;
 
+/** 打ち切り（SIGTERM）を受けてから、承認の後始末を待つ上限。超えたらそのまま終了する。 */
+export const HOOK_CANCEL_CLEANUP_LIMIT_MS = 2000;
+
 // MARK: - テスタブルコア
 
 export interface RunHookOptions {
   stdinData: Buffer;
-  /** 接続する unix socket パス。null は接続不能と同義（PreToolUse は即 deny）。 */
+  /** 起動時に PermissionRequest を登録した会話。未指定なら旧方式。 */
+  usePermissionRequest?: boolean;
+  /** フックが発火した時刻。tool_use_id が引けないとき、会話ログの古いターン終了を除く。 */
+  startedAtMs?: number;
+  /**
+   * Claude Code がこのフックを打ち切った（SIGTERM）。承認の待ちをやめ、アプリへ出した承認と受け渡し口を片付けて
+   * 無出力で終わる。画面の確認で「No」を選ぶ・Esc で中断すると、待っているフックに SIGTERM が届く（2.1.327 実測。
+   * 「Yes」では届かない）。後始末をせずに落ちると、承認の記録とアプリの承認待ちが残る。
+   */
+  cancelSignal?: AbortSignal;
+  /**
+   * 会話の画面（pane）の取得。PermissionRequest の待ち中に、画面の確認ダイアログが消えたこと（端末で「Yes」）を拾う。
+   * 省略時は会話ログ（tool_result・ターン終了）と打ち切りだけで決着を拾う。
+   */
+  paneCapture?: () => Promise<string | null>;
+  /** 画面を見る間隔（会話ログを見る回数で数える。省略時は 2 秒ごと。テスト用）。 */
+  panePollEveryTicks?: number;
+  /** 接続する unix socket パス。null は接続不能と同義（承認待ちの経路では即 deny）。 */
   socketPath: string | null;
   /** 内部デッドライン（秒）。 */
   deadlineSeconds: number;
@@ -167,8 +182,6 @@ export interface RunHookOptions {
   presenceProbe?: PresenceProbe;
   /** presence により push を抑制した場合の観測先。 */
   pushObserver?: Pick<PushObserving, "recordSkipped">;
-  /** 内部用（runHookCore が作る）: 承認をアプリへ知らせたかの記録。終わりの remote_pending_cleared の判断に使う。 */
-  approvalTracker?: ApprovalTracker;
   /** connect 不能時に engine relay へ通知する socket path。省略時は既定パス。null なら送らない。 */
   engineRelaySocketPath?: string | null;
   /** connect 不能ブランチでの retry-connect ポーリング間隔（秒）。既定 1.0。 */
@@ -211,7 +224,6 @@ export interface HookRunResult {
 /** hook の本体（テスタブル・完全版）。stdin JSON の `hook_event_name` で分岐する。 */
 export async function runHookCore(options: RunHookOptions): Promise<HookRunResult> {
   const session = options.session ?? "default";
-  const deadlineSeconds = options.deadlineSeconds;
   const parsed = parsePreToolUse(options.stdinData);
 
   // --- 0. hook_event_name で分岐 ---
@@ -284,6 +296,10 @@ export async function runHookCore(options: RunHookOptions): Promise<HookRunResul
   }
 
   if (parsed.eventName === "PostToolUse") {
+    // 実行されたツールの照合用の記録（新方式の PreToolUse が残す）は、ここで消す。
+    if (options.approvalsBase !== undefined && parsed.explicitToolUseId !== undefined) {
+      forgetPreToolUse(options.approvalsBase, parsed.explicitToolUseId);
+    }
     // ツールイベント＝処理中ハートビート（長時間ターンでも処理中判定が失効しないよう更新）。
     await notifySessionProcessing(options, session, "active", parsed.eventName, undefined, subagentIdOf(parsed));
     // 設問の解決通知（iOS/TUI どちらで回答されても sheet/バッジを閉じる, question-hook-relay）。
@@ -296,6 +312,25 @@ export async function runHookCore(options: RunHookOptions): Promise<HookRunResul
       });
     }
     return runPostToolUse(parsed, session, options.observationBase);
+  }
+
+  if (parsed.eventName === "PermissionRequest") {
+    if (!options.usePermissionRequest || parsed.toolName === "AskUserQuestion" || parsed.toolName === "ExitPlanMode") {
+      return { exitCode: 0, stdout: "" };
+    }
+    const record = options.approvalsBase === undefined ? null : takePreToolUse(options.approvalsBase, session, parsed);
+    const external = watchExternalApproval(
+      parsed, record, options.startedAtMs ?? Date.now(), options.paneCapture, options.panePollEveryTicks);
+    const decision = await runApproval(options, parsed, external, record?.approvalId);
+    // 決着は runApproval の中の 1 か所で決まる（打ち切り・画面側の決着を見たうえで、結果の記録とアプリへの反映を出す）。
+    // ここまで来た答えは記録済みなので、そのまま出力する。
+    if (decision === null) return { exitCode: 0, stdout: "" };
+    return { exitCode: 0, stdout: JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "PermissionRequest",
+        decision: decision.kind === "allow" ? { behavior: "allow" } : { behavior: "deny", message: decision.reason },
+      },
+    }) };
   }
 
   // === 以降 PreToolUse（既定） ===
@@ -323,6 +358,16 @@ export async function runHookCore(options: RunHookOptions): Promise<HookRunResul
     return allow("AskUserQuestion is presented natively (Tailii auto-approved)");
   }
 
+  if (options.usePermissionRequest) {
+    // 承認が出たときに PermissionRequest が tool_use_id を引けるよう、照合用の記録だけ残す。
+    // 画像の検出は承認を実際に出すとき（PermissionRequest 側）に行う。ここで行うと、確認の出ないツール呼び出し
+    // （auto の Read など）でも毎回投入され、今までの「承認に添える画像」より広がる。
+    if (options.approvalsBase !== undefined && parsed.explicitToolUseId !== undefined && parsed.toolName !== "ExitPlanMode") {
+      rememberPreToolUse(options.approvalsBase, session, parsed, parsed.explicitToolUseId, randomUUID());
+    }
+    return { exitCode: 0, stdout: "" };
+  }
+
   // --- 0.5 permission mode による自動許可（mode-picker 連動） ---
   // TUI が auto（全自動）のとき、および acceptEdits の編集系ツールは iPhone 承認を
   // 出さずに即 allow する。これが無いと mode_set で Auto に切り替えても hook が
@@ -330,92 +375,130 @@ export async function runHookCore(options: RunHookOptions): Promise<HookRunResul
   // hook 入力の permission_mode は処理中にも消えない権威値として優先する。旧版で
   // 欠落する場合だけ provider を使い、provider 無し・capture 失敗・ダイアログ表示中
   // = null なら従来どおり iPhone ゲートへフォールバックする（安全側）。
-  const autoAllowReason = autoAllowReasonForMode(
-    await currentPermissionMode(options, parsed.permissionMode),
-    parsed.toolName,
-  );
+  const permissionMode = await currentPermissionMode(options, parsed.permissionMode);
+  const autoAllowReason = autoAllowReasonForMode(permissionMode, parsed.toolName);
   if (autoAllowReason !== null) return allow(autoAllowReason);
+
+  // --- 0.6 確認を出さないモード（dontAsk）は判定を返さず、Claude Code 自身の判定に任せる ---
+  // dontAsk は「許可ルールに合うものだけ実行し、確認が要るものは聞かずに拒否する」モード。Claude Code は
+  // 組み込みのサブエージェント（web-fetch など）をこのモードで起動することがあり（meta の spawnMode、
+  // 2026-11-19 実測）、会話本体が auto でもフック入力の permission_mode は dontAsk で届く。ここで
+  // iPhone に聞くと「確認を出さない」モードなのに承認が開き、allow を返すとモードが許す範囲を広げてしまう。
+  if (defersToClaudeForMode(permissionMode)) return { exitCode: 0, stdout: "" };
+
+  const decision = await runApproval(options, parsed);
+  return decision === null ? { exitCode: 0, stdout: "" }
+    : decision.kind === "allow" ? allow(decision.reason) : deny(decision.reason);
+}
+
+type ApprovalDecision = { kind: "allow" | "deny"; reason: string; by?: "cli" | "timeout" };
+type ApprovalFlowOptions = RunHookOptions & {
+  signal: AbortSignal;
+  tracker: { announced: boolean };
+  checkExternal?: () => boolean;
+};
+
+/** 共通の iPhone / CLI 承認待ち。null は端末側で決着して承認の返答を取り下げた場合。 */
+async function runApproval(
+  options: RunHookOptions,
+  parsed: ParsedPreToolUse,
+  external?: ReturnType<typeof watchExternalApproval>,
+  requestId: string = randomUUID(),
+): Promise<ApprovalDecision | null> {
+  if (external?.check() === true || options.cancelSignal?.aborted === true) return null;
+  if (options.socketPath === null) return { kind: "deny", reason: "iPhone unavailable (no socket path)" };
 
   const summary = buildSummary(parsed.toolName, parsed.toolInput);
   const diff = buildDiff(parsed.toolName, parsed.toolInput);
+  const session = options.session ?? "default";
 
   // 単一の内部デッドライン。push→retry-connect→send→waitForDecision の全フェーズが
   // この 1 本の予算を共有する（Req 8.1）。
-  const deadlineAtMs = Date.now() + deadlineSeconds * 1000;
-
-  if (options.socketPath === null) {
-    // socket パス未決定は接続不能と同義。retry-connect の余地もないため即 deny。
-    return deny("iPhone unavailable (no socket path)");
-  }
+  const deadlineAtMs = Date.now() + options.deadlineSeconds * 1000;
 
   // 承認の待ちが終わるすべての出口（許可・拒否・時間切れ・つなぎ直しの期限切れ・エラー）で、アプリへ知らせた承認
   // （承認チャネルへ要求を書いた・一覧へ remote_pending を出した）なら必ず remote_pending_cleared を出す（ここ 1 か所）。
   // 送信は最善努力で、hook の結果は変えない。受け手は id で照合するので、重ねて出しても害は無い。
-  const tracker: ApprovalTracker = { id: null, announced: false };
-  const flowOptions: RunHookOptions = { ...options, approvalTracker: tracker };
+  const tracker = { announced: false };
+  const stop = new AbortController();
+  const flowOptions: ApprovalFlowOptions = {
+    ...options, signal: stop.signal, tracker,
+    ...(external !== undefined ? { checkExternal: external.check } : {}),
+  };
   const socketPath = options.socketPath;
-  // 承認 id はここで 1 つに決める（アプリへの要求・受け渡し口の記録・つなぎ直しの送り直しで同じ id）。
-  const requestId = randomUUID();
+  // アプリへの要求・受け渡し口・つなぎ直しの送り直しでは同じ id を使う。
   const mailbox = options.approvalsBase;
-  const stopMailbox = new AbortController();
-  let decidedBy: "cli" | undefined;
-  let finalResult: HookRunResult | null = null;
+  let finalResult: ApprovalDecision | null = null;
   if (mailbox !== undefined) {
     writePendingApproval({
       id: requestId, session, tool: parsed.toolName, summary, cwd: parsed.cwd, atMs: Date.now(), pid: process.pid,
+      ...(external !== undefined ? { permissionRequestUntilMs: deadlineAtMs } : {}),
       ...(parsed.agentId !== undefined && parsed.agentType !== undefined
         ? { agentId: parsed.agentId, agentType: parsed.agentType } : {}),
     }, mailbox);
   }
-  try {
-    const socket = await connectUnixSocket(socketPath);
+  const flow = (async (): Promise<ApprovalDecision | null> => {
+    const socket = await connectUnixSocket(socketPath, stop.signal);
+    if (stop.signal.aborted || external?.check() === true) {
+      socket?.destroy();
+      return null;
+    }
     // `tailii-host chat` が起動した会話で、アプリがつながっておらず承認できる人も居なければ、540 秒待たずに拒否する
     // （Bot は待つだけで、誰にも知らされない。tailii-chat-cli 第 2 段）。
     if (socket === null && isCliSession(session) && options.approverAvailable !== undefined && !options.approverAvailable()) {
-      return deny(NO_APPROVER_REASON);
+      return { kind: "deny", reason: NO_APPROVER_REASON };
     }
-    const flow = socket
+    return socket
       // 接続済み（アプリ前面）。従来経路をそのまま実行する（push しない, 7.1）。
-      ? sendRequestAndReflect(socket, parsed, summary, diff, flowOptions, deadlineAtMs, requestId)
+      ? sendRequestAndReflect(socket, parsed, summary, diff, flowOptions, deadlineAtMs, requestId, false)
       // === connect 不能ブランチ（Req 2.1 / 8.1〜8.3） ===
       : publishPendingAndAwaitReconnect(socketPath, parsed, summary, diff, flowOptions, deadlineAtMs, requestId, false);
-    if (mailbox === undefined) return await flow;
+  })();
+  try {
+    const contenders = [flow];
     // アプリの返事と、受け渡し口の決定（`tailii-host chat approve`）の早い方で決める。受け渡し口が先なら、アプリへの
     // 要求は待たずに終える（hook はこの後すぐ終了する）。
-    const fromMailbox = waitForMailboxDecision(session, requestId, deadlineAtMs, stopMailbox.signal, {
-      base: mailbox, ...(options.approvalsPollMs !== undefined ? { intervalMs: options.approvalsPollMs } : {}),
-    }).then((decision): HookRunResult | null => {
-      if (decision === null) return null;
-      decidedBy = "cli";
-      return decision.decision === "allow"
-        ? allow(decision.reason ?? "Approved via tailii-host chat")
-        : deny(decision.reason ?? "Denied via tailii-host chat");
-    });
-    const first = await Promise.race([flow, fromMailbox.then((result) => result ?? flow)]);
-    finalResult = first;
-    return first;
+    if (mailbox !== undefined) {
+      contenders.push(waitForMailboxDecision(session, requestId, deadlineAtMs, stop.signal, {
+        base: mailbox, ...(options.approvalsPollMs !== undefined ? { intervalMs: options.approvalsPollMs } : {}),
+      }).then((decision): ApprovalDecision | null | Promise<ApprovalDecision | null> => {
+        if (decision === null) return flow;
+        return {
+          kind: decision.decision, by: "cli",
+          reason: decision.reason ?? (decision.decision === "allow" ? "Approved via tailii-host chat" : "Denied via tailii-host chat"),
+        };
+      }));
+    }
+    if (external !== undefined) contenders.push(external.wait(stop.signal).then((settled) => settled ? null : flow));
+    const cancelSignal = options.cancelSignal;
+    if (cancelSignal !== undefined) {
+      // 打ち切られたら返事を待たずに終える（finally が待ちを止め、アプリの承認と受け渡し口を片付ける）。
+      contenders.push(new Promise<null>((resolve) => {
+        const onCancel = (): void => resolve(null);
+        if (cancelSignal.aborted) onCancel();
+        else {
+          cancelSignal.addEventListener("abort", onCancel, { once: true });
+          stop.signal.addEventListener("abort", () => cancelSignal.removeEventListener("abort", onCancel), { once: true });
+        }
+      }));
+    }
+    finalResult = await Promise.race(contenders);
+    if (cancelSignal?.aborted === true) finalResult = null;
+    if (external?.check() === true) finalResult = null;
+    return finalResult;
   } finally {
-    stopMailbox.abort();
+    stop.abort();
+    // 決着後の再接続・再送を止め、最後の remote_pending が clear を追い越さないよう待つ。
+    await flow.catch(() => {});
     if (mailbox !== undefined) {
       // CLI が決定を置いていれば、決めた側と決定を残す（CLI の applied の判断に使う）。
-      const decision = finalResult !== null ? permissionDecisionOf(finalResult.stdout) : null;
       removePendingApproval(session, requestId, mailbox,
-        decision !== null ? { decision, by: decidedBy ?? (finalResult?.stdout.includes("No response within") ? "timeout" : "app") } : undefined);
+        finalResult !== null ? { decision: finalResult.kind, by: finalResult.by ?? "app" } : undefined);
     }
-    if (tracker.announced && tracker.id !== null) {
+    if (tracker.announced) {
       // 片付けの失敗（例外を含む）で hook の結果を変えない。送信は engine relay の短い上限（250ms）で打ち切られる。
-      try { await clearRemotePendingIfNeeded(tracker.id, options); } catch { /* 最善努力。 */ }
+      try { await clearRemotePendingIfNeeded(requestId, options); } catch { /* 最善努力。 */ }
     }
-  }
-}
-
-/** hook の出力から allow / deny を読む（読めなければ null）。 */
-function permissionDecisionOf(stdout: string): "allow" | "deny" | null {
-  try {
-    const value = (JSON.parse(stdout) as { hookSpecificOutput?: { permissionDecision?: unknown } }).hookSpecificOutput?.permissionDecision;
-    return value === "allow" || value === "deny" ? value : null;
-  } catch {
-    return null;
   }
 }
 
@@ -424,12 +507,6 @@ export const NO_APPROVER_REASON =
   "No one can approve this right now (the Tailii app is not connected, no device is registered for notifications, " +
   "and approvals by the bot are not enabled). Continue in a way that does not need this tool, or stop and report " +
   "what you need to the user.";
-
-/** 承認をアプリへ知らせたか（runHookCore が終わりに 1 回だけ remote_pending_cleared を出すための記録）。 */
-interface ApprovalTracker {
-  id: string | null;
-  announced: boolean;
-}
 
 // MARK: - 処理中/処理完了ライフサイクル通知
 
@@ -555,6 +632,24 @@ export function autoAllowReasonForMode(mode: string | null, toolName: string): s
 }
 
 /**
+ * 旧方式でフックが判定を返さず、Claude Code 自身の判定に任せるモードか（純ロジック）。
+ *
+ * Claude Code がフックへ渡す permission_mode は default / plan / acceptEdits / auto / dontAsk /
+ * bypassPermissions の 6 つ。Tailii の扱いは次のとおり（`autoAllowReasonForMode` と合わせて全部）:
+ * - auto: 全ツールを即 allow。
+ * - acceptEdits: 編集系ツールだけ即 allow、ほかは iPhone で確認。
+ * - dontAsk: 判定を返さない（ここ）。Claude Code が許可ルールで決め、確認が要るものは聞かずに拒否する。
+ * - default / plan: iPhone で確認。
+ * - bypassPermissions: iPhone で確認（広げない）。Tailii からは選べないモードで、届くのはサブエージェントの
+ *   定義などが指定したときだけ。任せると確認なしで何でも動くので、会話のモードより広い許可を素通ししない
+ *   （API 作業の引き継ぎが auto・bypassPermissions を default へ落とすのと同じ考え）。
+ * - 未知の値 / null（判定不能）: iPhone で確認（安全側）。
+ */
+export function defersToClaudeForMode(mode: string | null): boolean {
+  return mode === "dontAsk";
+}
+
+/**
  * 現在の permission mode を取得する。
  * Claude Code の hook 入力値を権威として優先し、フィールド自体が無い旧版だけ provider へ
  * フォールバックする。未知の入力値も provider で上書きせず、そのまま安全側判定へ渡す。
@@ -611,18 +706,16 @@ async function publishPendingAndAwaitReconnect(
   parsed: ParsedPreToolUse,
   summary: string,
   diff: ToolDiff | undefined,
-  options: RunHookOptions,
+  options: ApprovalFlowOptions,
   deadlineAtMs: number,
   requestId: string,
   imagesAlreadyEnqueued: boolean,
-): Promise<HookRunResult> {
+): Promise<ApprovalDecision | null> {
+  if (options.signal.aborted || options.checkExternal?.() === true) return null;
   const session = options.session ?? "default";
   if (options.engineRelaySocketPath !== null) {
     // 送信の成否に関わらず「知らせた」とみなす（届いていれば終わりに必ず片付ける。重ねても害は無い）。
-    if (options.approvalTracker !== undefined) {
-      options.approvalTracker.id = requestId;
-      options.approvalTracker.announced = true;
-    }
+    options.tracker.announced = true;
     await sendRemotePendingToEngine({
       type: "remote_pending",
       v: PROTOCOL_V1,
@@ -633,8 +726,10 @@ async function publishPendingAndAwaitReconnect(
       summary,
     }, options.engineRelaySocketPath).catch(() => {});
   }
+  if (options.signal.aborted) return null;
   if (options.notifier) {
-    const presence = await probePresence(options.presenceProbe, session);
+    const presence = await probePresence(options.presenceProbe, session, options.signal);
+    if (options.signal.aborted || options.checkExternal?.() === true) return null;
     if (presence !== null) {
       try { options.pushObserver?.recordSkipped(requestId, presence, session); } catch { /* 観測失敗は無視。 */ }
     } else {
@@ -648,13 +743,14 @@ async function publishPendingAndAwaitReconnect(
           })(),
         },
         options.notifierTimeLimitMs ?? 5000,
+        options.signal,
       );
     }
   }
 
   const retryIntervalSeconds =
     options.retryConnectIntervalSeconds ?? HOOK_RETRY_CONNECT_INTERVAL_SECONDS;
-  const reconnected = await retryConnect(socketPath, deadlineAtMs, retryIntervalSeconds);
+  const reconnected = await retryConnect(socketPath, deadlineAtMs, retryIntervalSeconds, options.signal);
   if (reconnected) {
     return sendRequestAndReflect(
       reconnected,
@@ -669,7 +765,9 @@ async function publishPendingAndAwaitReconnect(
   }
 
   // 内部デッドライン内に一度も再接続できなかった → 安全側 deny（8.3）。
-  return deny(`iPhone unavailable (no reconnect within ${Math.round(options.deadlineSeconds)}s)`);
+  return options.signal.aborted ? null : {
+    kind: "deny", reason: `iPhone unavailable (no reconnect within ${Math.round(options.deadlineSeconds)}s)`,
+  };
 }
 
 // MARK: - approval_request 送出＋決定反映（connect 成功／再接続で共有）
@@ -679,13 +777,13 @@ async function sendRequestAndReflect(
   parsed: ParsedPreToolUse,
   summary: string,
   diff: ToolDiff | undefined,
-  options: RunHookOptions,
+  options: ApprovalFlowOptions,
   deadlineAtMs: number,
-  requestIdOverride?: string,
-  imagesAlreadyEnqueued = false,
-): Promise<HookRunResult> {
+  requestId: string,
+  imagesAlreadyEnqueued: boolean,
+): Promise<ApprovalDecision | null> {
   try {
-    const requestId = requestIdOverride ?? randomUUID();
+    if (options.signal.aborted || options.checkExternal?.() === true) return null;
 
     // 画像パス検出 → pending キュー投入（非ブロッキング・リサイズなし, 8.1/8.2/8.5）。
     // 切断→再接続の送り直しでは投入済み（同一承認 id での二重投入を防ぐ）。
@@ -707,33 +805,32 @@ async function sendRequestAndReflect(
     });
     try {
       socket.write(encoded + "\n");
-      if (options.approvalTracker !== undefined) {
-        options.approvalTracker.id = requestId;
-        options.approvalTracker.announced = true;
-      }
+      options.tracker.announced = true;
     } catch {
       // 送出直前に serve チャネルが落ちた（chat 離脱/開き直しレース）。切断と同じ扱い。
-      if (options.socketPath === null) return deny("iPhone disconnected (write failed)");
+      if (options.socketPath === null) return { kind: "deny", reason: "iPhone disconnected (write failed)" };
       return publishPendingAndAwaitReconnect(
         options.socketPath, parsed, summary, diff, options, deadlineAtMs, requestId, true,
       );
     }
 
     // 残りデッドライン内で approval_decision を待つ（自 id のみ受理, 5.4）。
-    const outcome = await waitForDecision(socket, requestId, deadlineAtMs);
-    // remote_pending_cleared は runHookCore の終わりで 1 回だけ出す（すべての出口を 1 か所で）。
+    const outcome = await waitForDecision(socket, requestId, deadlineAtMs, options);
+    // remote_pending_cleared は runApproval の終わりで 1 回だけ出す。
     switch (outcome.kind) {
       case "allow":
-        return allow(outcome.reason ?? "Approved on iPhone");
+        return { kind: "allow", reason: outcome.reason ?? "Approved on iPhone" };
       case "deny":
-        return deny(outcome.reason ?? "Denied on iPhone");
+        return { kind: "deny", reason: outcome.reason ?? "Denied on iPhone" };
       case "timeout":
-        return deny(`No response within ${Math.round(options.deadlineSeconds)}s`);
+        return { kind: "deny", reason: `No response within ${Math.round(options.deadlineSeconds)}s`, by: "timeout" };
+      case "cancelled":
+        return null;
       case "disconnected":
         // 決定待ち中の切断 = iOS の chat 離脱（serve チャネル close）や SSH 断。
         // 承認自体はまだ生きているので即 deny せず、connect 不能ブランチと同じ
         // フォールバックに合流して再接続（chat 開き直し）後に同一 id で送り直す。
-        if (options.socketPath === null) return deny("iPhone disconnected");
+        if (options.socketPath === null) return { kind: "deny", reason: "iPhone disconnected" };
         return publishPendingAndAwaitReconnect(
           options.socketPath, parsed, summary, diff, options, deadlineAtMs, requestId, true,
         );
@@ -762,7 +859,8 @@ async function clearRemotePendingIfNeeded(
 type DecisionOutcome =
   | { kind: "allow" | "deny"; reason?: string }
   | { kind: "timeout" }
-  | { kind: "disconnected" };
+  | { kind: "disconnected" }
+  | { kind: "cancelled" };
 
 /**
  * デッドライン内で approval_decision を1行ずつ受信し、id が一致する有効決定を待つ。
@@ -773,6 +871,7 @@ function waitForDecision(
   socket: net.Socket,
   expectedId: string,
   deadlineAtMs: number,
+  { signal, checkExternal, cancelSignal }: ApprovalFlowOptions,
 ): Promise<DecisionOutcome> {
   return new Promise((resolve) => {
     const remaining = deadlineAtMs - Date.now();
@@ -787,6 +886,7 @@ function waitForDecision(
       socket.removeListener("end", onDisconnect);
       socket.removeListener("error", onDisconnect);
       socket.removeListener("close", onDisconnect);
+      signal.removeEventListener("abort", onAbort);
       resolve(outcome);
     };
 
@@ -798,6 +898,10 @@ function waitForDecision(
         buf = buf.subarray(idx + 1);
         const outcome = evaluateLine(line, expectedId);
         if (outcome !== null) {
+          if (checkExternal?.() === true || cancelSignal?.aborted === true) {
+            settle({ kind: "cancelled" });
+            return;
+          }
           // 決定の反映結果をアプリへ返す（push v1.1 §6。最善努力・確定を遅らせない）。
           replyDecisionApplied(socket, expectedId);
           settle(outcome);
@@ -806,6 +910,7 @@ function waitForDecision(
       }
     };
     const onDisconnect = (): void => settle({ kind: "disconnected" });
+    const onAbort = (): void => settle({ kind: "cancelled" });
 
     const timer = setTimeout(() => settle({ kind: "timeout" }), Math.max(0, remaining));
     if (remaining <= 0) {
@@ -817,6 +922,8 @@ function waitForDecision(
     socket.once("end", onDisconnect);
     socket.once("error", onDisconnect);
     socket.once("close", onDisconnect);
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
   });
 }
 
@@ -846,19 +953,24 @@ function evaluateLine(line: Buffer, expectedId: string): DecisionOutcome | null 
 // MARK: - unix socket クライアント / retry-connect
 
 /** unix domain socket に接続し、接続済み socket を返す。失敗時は null（→ 安全側 deny）。 */
-function connectUnixSocket(socketPath: string): Promise<net.Socket | null> {
+function connectUnixSocket(socketPath: string, signal: AbortSignal): Promise<net.Socket | null> {
   return new Promise((resolve) => {
+    if (signal.aborted) { resolve(null); return; }
     const socket = net.connect(socketPath);
+    const abort = (): void => {
+      signal.removeEventListener("abort", abort);
+      socket.destroy();
+      resolve(null);
+    };
+    signal.addEventListener("abort", abort, { once: true });
     socket.once("connect", () => {
+      signal.removeEventListener("abort", abort);
       socket.removeAllListeners("error");
       // 決定待機中の error は waitForDecision が disconnected として扱う。
       socket.on("error", () => {});
       resolve(socket);
     });
-    socket.once("error", () => {
-      socket.destroy();
-      resolve(null);
-    });
+    socket.once("error", abort);
   });
 }
 
@@ -870,32 +982,31 @@ async function retryConnect(
   socketPath: string,
   deadlineAtMs: number,
   intervalSeconds: number,
+  signal: AbortSignal,
 ): Promise<net.Socket | null> {
   const intervalMs = Math.max(0, Math.min(intervalSeconds, 3600) * 1000);
   for (;;) {
-    const socket = await connectUnixSocket(socketPath);
+    const socket = await connectUnixSocket(socketPath, signal);
     if (socket) return socket;
     const remaining = deadlineAtMs - Date.now();
     if (remaining <= 0) return null;
-    await sleep(Math.min(intervalMs, remaining));
+    if (!await abortableSleep(Math.min(intervalMs, remaining), signal)) return null;
   }
 }
 
 // MARK: - 背景 push 送出（connect 不能ブランチのみ）
 
 /** 注入された presence 判定を全体上限内で実行する。失敗・超過は null（push 継続）。 */
-async function probePresence(probe: PresenceProbe | undefined, session: string): Promise<PresenceReason | null> {
+async function probePresence(probe: PresenceProbe | undefined, session: string, signal: AbortSignal): Promise<PresenceReason | null> {
   if (probe === undefined) return null;
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  const stop = new AbortController();
   try {
-    const timeout = new Promise<null>((resolve) => {
-      timer = setTimeout(() => resolve(null), PRESENCE_PROBE_TIME_LIMIT_MS);
-    });
+    const timeout = abortableSleep(PRESENCE_PROBE_TIME_LIMIT_MS, AbortSignal.any([stop.signal, signal])).then(() => null);
     return await Promise.race([probe(session).catch(() => null), timeout]);
   } catch {
     return null;
   } finally {
-    if (timer !== undefined) clearTimeout(timer);
+    stop.abort();
   }
 }
 
@@ -1077,8 +1188,17 @@ async function sendBackgroundPush(
   notifier: ApprovalPushNotifier,
   request: ApprovalPushRequest,
   timeLimitMs: number,
+  signal: AbortSignal,
 ): Promise<void> {
-  await Promise.race([notifier(request, timeLimitMs).catch(() => {}), sleep(timeLimitMs)]);
+  const stop = new AbortController();
+  try {
+    await Promise.race([
+      notifier(request, timeLimitMs).catch(() => {}),
+      abortableSleep(timeLimitMs, AbortSignal.any([stop.signal, signal])),
+    ]);
+  } finally {
+    stop.abort();
+  }
 }
 
 // MARK: - PostToolUse 監査（5.8）
@@ -1275,6 +1395,9 @@ interface ParsedPreToolUse {
   permissionMode?: string;
   /** 監査 id（`tool_use_id` があれば優先、無ければ `session_id`）。秘密ではない。 */
   toolUseId: string;
+  /** `session_id` で補わない照合用の id。PermissionRequest の入力には無い。 */
+  explicitToolUseId?: string;
+  transcriptPath?: string;
   /** PostToolUse の tool_response 内 permissionDecision（あれば）。 */
   postDecision?: string;
   /** Stop の `session_crons`（未検証の生値。解釈は scheduledFromSessionCrons）。 */
@@ -1336,11 +1459,13 @@ function parsePreToolUse(data: Buffer): ParsedPreToolUse {
   }
   if (typeof raw["tool_use_id"] === "string" && raw["tool_use_id"].length > 0) {
     parsed.toolUseId = raw["tool_use_id"];
+    parsed.explicitToolUseId = raw["tool_use_id"];
   } else if (typeof raw["session_id"] === "string") {
     parsed.toolUseId = raw["session_id"];
   }
   if ("session_crons" in raw) parsed.sessionCrons = raw["session_crons"];
   if (typeof raw["session_id"] === "string" && raw["session_id"].length > 0) parsed.sessionId = raw["session_id"];
+  if (typeof raw["transcript_path"] === "string") parsed.transcriptPath = raw["transcript_path"];
   if (typeof raw["agent_id"] === "string" && raw["agent_id"].length > 0) parsed.agentId = raw["agent_id"];
   if (typeof raw["agent_type"] === "string" && raw["agent_type"].length > 0) parsed.agentType = raw["agent_type"];
   if (parsed.eventName === "StopFailure" && typeof raw["error"] === "string" && /^[a-z_]{1,64}$/u.test(raw["error"])) {
@@ -1385,7 +1510,7 @@ function deny(reason: string): HookRunResult {
 /**
  * hook サブコマンドのエントリポイント。
  * 引数: `--socket <path>` | `--session <name>` | `--deadline <seconds>` |
- * `--retry-interval <seconds>` | `--images-dir <path>`。
+ * `--retry-interval <seconds>` | `--images-dir <path>` | `--permission-request`。
  * 常に exit 0（Claude Code は stdout の JSON を読む）。
  *
  * connect 不能ブランチでは本番 ApprovalPushNotifier を注入し、背景 push で気づかせる
@@ -1398,6 +1523,7 @@ export async function runHookCommand(args: string[]): Promise<number> {
   let imagesDirArg: string | null = null;
   let deadlineSeconds = HOOK_INTERNAL_DEADLINE_SECONDS;
   let retryIntervalSeconds = HOOK_RETRY_CONNECT_INTERVAL_SECONDS;
+  let usePermissionRequest = false;
   // Codex の承認は App Server native 経路（codexNativeTurnController）に統一済み。
   // この hook CLI は Claude のフックだけを扱う。
 
@@ -1425,6 +1551,9 @@ export async function runHookCommand(args: string[]): Promise<number> {
       case "--images-dir":
         imagesDirArg = next();
         break;
+      case "--permission-request":
+        usePermissionRequest = true;
+        break;
       default:
         break;
     }
@@ -1450,8 +1579,21 @@ export async function runHookCommand(args: string[]): Promise<number> {
   }
 
   const pushObserver = new ObservationLogPushObserver();
+  // Claude Code がフックを打ち切るとき（画面の確認で「No」・Esc での中断）は SIGTERM が届く。既定の動きのまま落ちると
+  // 承認の後始末（remote_pending_cleared・受け渡し口の記録の削除）が走らないので、受けて待ちをやめさせる。
+  // 後始末が終わらないときに居残らないよう、少し待って必ず終了する。
+  const cancel = new AbortController();
+  const onTerminate = (): void => {
+    if (cancel.signal.aborted) return;
+    cancel.abort();
+    setTimeout(() => process.exit(0), HOOK_CANCEL_CLEANUP_LIMIT_MS).unref();
+  };
+  for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) process.on(signal, onTerminate);
   const { exitCode, stdout } = await runHookCore({
     stdinData,
+    cancelSignal: cancel.signal,
+    usePermissionRequest,
+    startedAtMs: hookSpawnedAtMs(),
     socketPath,
     deadlineSeconds,
     session: effectiveSession ?? "default",
@@ -1480,10 +1622,12 @@ export async function runHookCommand(args: string[]): Promise<number> {
     ...(effectiveSession !== null
       ? {
           permissionModeProvider: makeTmuxPermissionModeProvider(effectiveSession),
+          // プレビュー配信（hubDaemon）と同じ取り方（下から 60 行・折り返しを繋ぐ）で、同じ判定を使う。
+          paneCapture: () => makeBackendForSession(effectiveSession).capturePane(effectiveSession, { lines: 60, joinWrappedLines: true }),
           presenceProbe: makeMacAttachedProbe(),
         }
       : {}),
   });
-  process.stdout.write(stdout + "\n");
+  if (stdout !== "" || !usePermissionRequest) process.stdout.write(stdout + "\n");
   return exitCode;
 }
