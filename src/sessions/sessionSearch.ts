@@ -27,6 +27,8 @@ export interface SessionSearchOptions {
   limit?: number;
   agents?: ("claude" | "codex")[];
   cwd?: string;
+  executionRoute?: "api" | "terminal";
+  resolveExecutionRoute?: (info: ClaudeSessionInfo) => "api" | "terminal" | undefined;
   nowMs?: () => number;
   timeBudgetMs?: number;
   perFileBytes?: number;
@@ -88,8 +90,10 @@ export async function searchSessions(
   if (agents?.size === 0) return { results: [], stats: { scannedFiles: 0, truncated: false } };
   const sessions = stores.flatMap((store) =>
     (store.listForSearch?.() ?? store.list())
+      .map((info) => ({ ...info, executionRoute: options.resolveExecutionRoute?.(info) ?? info.executionRoute }))
       .filter((info) => (agents === undefined || agents.has(info.agent?.toLowerCase() ?? "claude"))
-        && (options.cwd === undefined || sameSearchDirectory(info.cwd, options.cwd)))
+        && (options.cwd === undefined || sameSearchDirectory(info.cwd, options.cwd))
+        && (options.executionRoute === undefined || (info.executionRoute ?? "terminal") === options.executionRoute))
       .map((info) => ({ info, filePath: store.transcriptPath(info.sessionId) })),
   ).sort((a, b) => (b.info.updatedAt ?? 0) - (a.info.updatedAt ?? 0) || a.info.sessionId.localeCompare(b.info.sessionId));
   const results: SessionSearchResult[] = [];
@@ -119,6 +123,7 @@ export async function searchSessions(
     };
     if (info.updatedAt !== undefined) result.updatedAt = info.updatedAt;
     if (info.agent !== undefined) result.agent = info.agent;
+    if (info.executionRoute === "api") result.executionRoute = "api";
     results.push(result);
     options.onProgress?.([...results]);
   }

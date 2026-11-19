@@ -704,9 +704,21 @@ describe("decode 詳細", () => {
       .not.toHaveProperty("supportsFilters");
   });
 
+  it("本文検索のAPI実行経路と対応flagを往復する", () => {
+    for (const executionRoute of ["api", "terminal"] as const) {
+      const request = { type: "session_search_request", v: 2, id: "sdk", query: "needle", executionRoute } as const;
+      expect(decodeControlMessage(encodeControlMessage(request))).toEqual(request);
+    }
+    const response = { type: "session_search_response", v: 2, id: "sdk", supportsFilters: true, supportsExecutionRouteFilter: true,
+      results: [{ sessionId: "sdk", title: "SDK", cwd: "/repo", snippet: "needle", agent: "claude", executionRoute: "api" as const },
+        { sessionId: "terminal", title: "CLI", cwd: "/repo", snippet: "needle", agent: "claude", executionRoute: "terminal" as const }] } as const;
+    expect(decodeControlMessage(encodeControlMessage({ ...response, results: [...response.results] }))).toEqual(response);
+  });
+
   it("本文検索の不正な条件を無条件検索へ戻さず拒否する", () => {
     for (const condition of [
       { agents: "codex" }, { agents: ["openai"] }, { agents: [null] }, { agents: null },
+      { executionRoute: null }, { executionRoute: 42 }, { executionRoute: "future" },
       { cwd: null }, { cwd: 42 }, { cwd: "" }, { cwd: "/repo\nother" }, { cwd: "/repo\u0000other" },
       { cwd: "x".repeat(4097) },
     ]) {

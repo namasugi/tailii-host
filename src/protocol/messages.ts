@@ -194,6 +194,8 @@ export interface ClaudeSessionInfo {
 
 /** session_search_response の 1 検索結果。 */
 export interface SessionSearchResult {
+  /** 対応ホストでは省略を端末と確定できる。端末側で正規化した terminal も受理する。 */
+  executionRoute?: "api" | "terminal";
   /** 一覧に未取得の会話を正しい CLI で開くための種別（旧 host は省略）。 */
   agent?: string;
   sessionId: string;
@@ -1149,9 +1151,9 @@ export type ControlMessage =
   | { type: "dir_create_request"; v: number; id: string; baseDir: string; relative: string }
   | { type: "dir_create_response"; v: number; id: string; path: string; ok: boolean; error?: string }
   /** agents省略は全種別、[]は0件。cwdは完全一致＋worktreeのrepo正規化。いずれもlimitより前に適用。 */
-  | { type: "session_search_request"; v: number; id: string; query: string; limit?: number; agents?: ("claude" | "codex")[]; cwd?: string }
-  /** complete:false は累積の途中結果。省略/true は完了。supportsFilters:trueだけが絞込後limitを保証する。 */
-  | { type: "session_search_response"; v: number; id: string; results: SessionSearchResult[]; complete?: boolean; supportsFilters?: boolean }
+  | { type: "session_search_request"; v: number; id: string; query: string; limit?: number; agents?: ("claude" | "codex")[]; cwd?: string; executionRoute?: "api" | "terminal" }
+  /** complete:false は累積の途中結果。省略/true は完了。agents/cwdはsupportsFilters、実行経路はsupportsExecutionRouteFilterで絞込後limitを保証する。 */
+  | { type: "session_search_response"; v: number; id: string; results: SessionSearchResult[]; complete?: boolean; supportsFilters?: boolean; supportsExecutionRouteFilter?: boolean }
   | { type: "preview_open"; v: number; id: string; target: string }
   | { type: "preview_ready"; v: number; id: string; url: string }
   | { type: "preview_error"; v: number; id: string; message: string }

@@ -65,6 +65,28 @@ describe("ホストの会話全文検索", () => {
     expect(source.transcriptPath.mock.calls).toEqual([["older-codex"]]);
   });
 
+  test("Agent SDKのAPI作業を件数上限の前に絞り、実行経路を結果と途中応答に残す", async () => {
+    const source = searchSource([
+      ...Array.from({ length: 20 }, (_, index) => ({ sessionId: `terminal-${index}`, title: "Terminal", cwd: "/repo", agent: "claude", updatedAt: 100 - index })),
+      { sessionId: "sdk", title: "SDK", cwd: "/repo", agent: "claude", updatedAt: 1, executionRoute: "api" },
+    ]);
+    const progress: unknown[] = [];
+    const result = await searchSessions([source], "needle", { agents: ["claude"], cwd: "/repo", executionRoute: "api", limit: 1,
+      onProgress: (hits) => progress.push(hits) });
+    expect(result.results).toMatchObject([{ sessionId: "sdk", executionRoute: "api" }]);
+    expect(result.stats.scannedFiles).toBe(1);
+    expect(progress).toEqual([result.results]);
+    expect(source.transcriptPath.mock.calls).toEqual([["sdk"]]);
+    const terminal = await searchSessions([source], "needle", { executionRoute: "terminal", limit: 100 });
+    expect(terminal.results).toHaveLength(20);
+    expect(terminal.results.every((hit) => hit.executionRoute === undefined)).toBe(true);
+    expect((await searchSessions([source], "needle", { agents: ["codex"], executionRoute: "api" })).results).toEqual([]);
+    const returned = await searchSessions([source], "needle", { executionRoute: "terminal", limit: 100,
+      resolveExecutionRoute: () => "terminal" });
+    expect(returned.results).toHaveLength(21);
+    expect(returned.results.every((hit) => hit.executionRoute === undefined)).toBe(true);
+  });
+
   test("先頭20件が別cwdでも、選択cwdの会話を検索件数の打切りより前に拾う", async () => {
     const source = searchSource([
       ...Array.from({ length: 20 }, (_, index) => ({ sessionId: `other-${index}`, title: "Other", cwd: "/other", updatedAt: 100 - index })),

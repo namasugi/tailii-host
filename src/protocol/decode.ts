@@ -119,6 +119,12 @@ function decodeSessionSearchAgents(raw: Raw): ("claude" | "codex")[] | undefined
   if (agents.some((agent) => agent !== "claude" && agent !== "codex")) throw new ProtocolDecodeError("missing-field", "agents");
   return [...new Set(agents)] as ("claude" | "codex")[];
 }
+function decodeSessionSearchRoute(raw: Raw): "api" | "terminal" | undefined {
+  if (raw["executionRoute"] === undefined) return undefined;
+  const route = requireString(raw, "executionRoute");
+  if (route !== "api" && route !== "terminal") throw new ProtocolDecodeError("missing-field", "executionRoute");
+  return route;
+}
 function decodeSessionSearchCwd(raw: Raw): string | undefined {
   if (raw["cwd"] === undefined) return undefined;
   const cwd = requireString(raw, "cwd");
@@ -1543,6 +1549,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         limit: optionalNumber(raw, "limit"),
         agents: decodeSessionSearchAgents(raw),
         cwd: decodeSessionSearchCwd(raw),
+        executionRoute: decodeSessionSearchRoute(raw),
       });
 
     case "session_search_response":
@@ -1551,9 +1558,11 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         id: requireString(raw, "id"),
         complete: optionalBoolean(raw, "complete"),
         supportsFilters: optionalBoolean(raw, "supportsFilters"),
+        supportsExecutionRouteFilter: optionalBoolean(raw, "supportsExecutionRouteFilter"),
         results: requireArray(raw, "results").map((element) => {
           const obj = requireObject(element, "results");
           return compact<SessionSearchResult>({
+            executionRoute: optionalString(obj, "executionRoute") === "api" ? "api" : optionalString(obj, "executionRoute") === "terminal" ? "terminal" : undefined,
             sessionId: requireString(obj, "sessionId"),
             title: requireString(obj, "title"),
             cwd: requireString(obj, "cwd"),

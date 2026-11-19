@@ -8,6 +8,7 @@ import {
   CodexAppServerManager,
   type CodexAppServerThreadOptions,
 } from "../src/codex/codexAppServer.js";
+import { ApiAgentLedgerStore } from "../src/apiAgent/ledger.js";
 import { claudeProjectSlug } from "../src/shared/paths.js";
 import { ImageService } from "../src/chat/imageService.js";
 import { CONCURRENT_MESSAGE_TYPES } from "../src/engine/engine.js";
@@ -3558,6 +3559,113 @@ describe("EngineControl — 横断制御チャネル", () => {
         expect(response).toMatchObject({ id: "no-sources", supportsFilters: true, results: [] });
       } while (response.type === "session_search_response" && response.complete === false);
     } finally { await engine.teardown(); }
+  });
+
+  test("本文検索は台帳からAPI作業を判定し、端末へ戻した会話をAPIから外す", async () => {
+    const projects = makeTempDir("search-sdk-engine");
+    const slug = path.join(projects, "-repo");
+    fs.mkdirSync(slug);
+    const sdkId = "a1234567-1234-4234-8234-123456789abc";
+    const terminalId = "b1234567-1234-4234-8234-123456789abc";
+    for (const [id, timestamp] of [[sdkId, "2026-01-01T00:00:00Z"], [terminalId, "2026-01-02T00:00:00Z"]] as const) {
+      fs.writeFileSync(path.join(slug, `${id}.jsonl`), JSON.stringify({ type: "user", cwd: "/repo", timestamp, message: { content: "needle" } }) + "\n");
+    }
+    const ledger = new ApiAgentLedgerStore();
+    ledger.setRoute(sdkId, "api");
+    ledger.setRoute(terminalId, "api");
+    ledger.setRoute(terminalId, "terminal");
+    const engine = startEngine({ sessionManager: makeManager(new MockTmuxRunner(() => ok(""))), claudeSessionStore: new ClaudeSessionStore(projects) });
+    try {
+      await engine.lines.nextOfType("channel_hello");
+      for (const executionRoute of ["api", "terminal"] as const) {
+        engine.writeLine(JSON.stringify({ id: executionRoute, query: "needle", executionRoute, agents: ["claude"], cwd: "/repo", limit: 1, type: "session_search_request", v: 2 }));
+        let response;
+        do {
+          response = decodeControlMessage(await engine.lines.nextOfType("session_search_response"));
+          expect(response).toMatchObject({ id: executionRoute, supportsFilters: true, supportsExecutionRouteFilter: true });
+        } while (response.type === "session_search_response" && response.complete === false);
+        expect(response).toMatchObject({ results: [{ sessionId: executionRoute === "api" ? sdkId : terminalId }] });
+        if (response.type === "session_search_response") expect(response.results[0]?.executionRoute).toBe(executionRoute === "api" ? "api" : undefined);
+      }
+    } finally { await engine.teardown(); }
+  });
+
+  test("端末一覧の取得失敗でもAPI作業の印を会話一覧と本文検索へ返す", async () => {
+    const projects = makeTempDir("search-sdk-offline");
+    fs.mkdirSync(path.join(projects, "-repo"));
+    const id = "c1234567-1234-4234-8234-123456789abc";
+    fs.writeFileSync(path.join(projects, "-repo", `${id}.jsonl`), JSON.stringify({ type: "user", cwd: "/repo", message: { content: "needle" } }) + "\n");
+    new ApiAgentLedgerStore().setRoute(id, "api");
+    const manager = makeManager(new MockTmuxRunner(() => ok("")));
+    vi.spyOn(manager, "list").mockRejectedValue(new Error("terminal unavailable"));
+    const engine = startEngine({ sessionManager: manager, claudeSessionStore: new ClaudeSessionStore(projects) });
+    try {
+      await engine.lines.nextOfType("channel_hello");
+      engine.writeLine(JSON.stringify({ type: "claude_session_list_request", v: 2, id: "list" }));
+      const list = decodeControlMessage(await engine.lines.nextOfType("claude_session_list_response"));
+      expect(list).toMatchObject({ claudeSessions: [{ sessionId: id, executionRoute: "api" }] });
+      expect(list).not.toHaveProperty("liveSessionsResolved");
+      engine.writeLine(JSON.stringify({ type: "session_search_request", v: 2, id: "search", query: "needle", executionRoute: "api" }));
+      let response;
+      do { response = decodeControlMessage(await engine.lines.nextOfType("session_search_response")); }
+      while (response.type === "session_search_response" && response.complete === false);
+      expect(response).toMatchObject({ results: [{ sessionId: id, executionRoute: "api" }] });
+    } finally { await engine.teardown(); }
+  });
+
+  test("本文検索は台帳の古い経路より生存セッションの実行経路を優先する", async () => {
+    const projects = makeTempDir("search-sdk-live-route");
+    fs.mkdirSync(path.join(projects, "-repo"));
+    const id = "d1234567-1234-4234-8234-123456789abc";
+    fs.writeFileSync(path.join(projects, "-repo", `${id}.jsonl`), JSON.stringify({ type: "user", cwd: "/repo", message: { content: "needle" } }) + "\n");
+    for (const liveRoute of ["api", "terminal"] as const) {
+      const ledger = new ApiAgentLedgerStore();
+      ledger.setRoute(id, "api");
+      if (liveRoute === "api") ledger.setRoute(id, "terminal");
+      const manager = makeManager(new MockTmuxRunner(() => ok("")));
+      vi.spyOn(manager, "list").mockResolvedValue([{ name: "cs-sdk", cwd: "/repo", alive: true, providerSessionId: id,
+        executionRoute: liveRoute === "api" ? "api" : undefined }]);
+      const engine = startEngine({ sessionManager: manager, claudeSessionStore: new ClaudeSessionStore(projects) });
+      try {
+        await engine.lines.nextOfType("channel_hello");
+        for (const filterRoute of ["api", "terminal"] as const) {
+          engine.writeLine(JSON.stringify({ type: "session_search_request", v: 2, id: filterRoute, query: "needle", executionRoute: filterRoute }));
+          let response;
+          do { response = decodeControlMessage(await engine.lines.nextOfType("session_search_response")); }
+          while (response.type === "session_search_response" && response.complete === false);
+          expect(response).toMatchObject({ results: filterRoute === liveRoute ? [{ sessionId: id }] : [] });
+          if (response.type === "session_search_response" && response.results.length) {
+            expect(response.results[0]?.executionRoute).toBe(liveRoute === "api" ? "api" : undefined);
+          }
+        }
+      } finally { await engine.teardown(); }
+    }
+  });
+
+  test("生存一覧の取得中でも空の検索で中止でき、古い結果を返さない", async () => {
+    const manager = makeManager(new MockTmuxRunner(() => ok("")));
+    let finishList!: (value: Awaited<ReturnType<typeof manager.list>>) => void;
+    const pendingList = new Promise<Awaited<ReturnType<typeof manager.list>>>((resolve) => { finishList = resolve; });
+    const list = vi.spyOn(manager, "list").mockReturnValue(pendingList);
+    const store = new ClaudeSessionStore(makeTempDir("search-cancel-live"));
+    const read = vi.spyOn(store, "list");
+    const engine = startEngine({ sessionManager: manager, claudeSessionStore: store });
+    try {
+      await engine.lines.nextOfType("channel_hello");
+      engine.writeLine(JSON.stringify({ type: "session_search_request", v: 2, id: "old", query: "needle" }));
+      expect(decodeControlMessage(await engine.lines.nextOfType("session_search_response"))).toMatchObject({ id: "old", complete: false });
+      await vi.waitFor(() => expect(list).toHaveBeenCalled());
+      engine.writeLine(JSON.stringify({ type: "session_search_request", v: 2, id: "clear", query: "" }));
+      let response;
+      do {
+        response = decodeControlMessage(await engine.lines.nextOfType("session_search_response"));
+        expect(response).toMatchObject({ id: "clear", results: [] });
+      } while (response.type === "session_search_response" && response.complete === false);
+      finishList([]);
+      engine.writeLine(JSON.stringify({ type: "image_fetch_request", v: 2, id: "probe" }));
+      expect(decodeControlMessage(await engine.lines.nextOfType("error"))).toMatchObject({ id: "probe" });
+      expect(read).not.toHaveBeenCalled();
+    } finally { finishList([]); await engine.teardown(); }
   });
 
   test("検索語の変更は前の全文走査を止め、制御要求を待たせない", async () => {

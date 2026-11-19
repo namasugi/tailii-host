@@ -13,6 +13,7 @@ import { PROTOCOL_V2, type BackgroundCommandStopStatus, type ControlMessage, typ
 import {
   annotateLiveSessions,
   buildLiveSessionIndex,
+  liveSessionFor,
 } from "../../sessions/liveSessionJoin.js";
 import { annotatePeerSessions, listPeerSessions } from "../../services/peerSessions.js";
 import { defaultClaudeSessionsDir } from "../../sessions/claudeLiveStatus.js";
@@ -419,7 +420,7 @@ export const conversationHandlers: HandlerRegistry = {
       return lhs.sessionId < rhs.sessionId ? -1 : lhs.sessionId > rhs.sessionId ? 1 : 0;
     });
     // live-pill: 生存セッションを 1 回だけ列挙し、会話 id + agent で各行へ join する。
-    // 失敗時は annotate なしで返し、`liveSessionsResolved` も載せない（嘘の「全停止」を出さない）。
+    // 失敗時は生存状態を注記せず、`liveSessionsResolved` も載せない（嘘の「全停止」を出さない）。
     let annotated = sessions;
     let liveResolved = false;
     try {
@@ -428,11 +429,6 @@ export const conversationHandlers: HandlerRegistry = {
         live, (name) => ctx.metadataStore?.get(name)?.createdAt ?? null,
       );
       annotated = annotateLiveSessions(sessions, index);
-      // API 作業の会話（api-agent）: 停止中でも最後の実行経路が API の Claude の会話には印を付ける（開き直しを API 作業で行う。
-      // 端末へ戻した会話は付けない, api-agent-handoff）。
-      const ledger = new ApiAgentLedgerStore();
-      annotated = annotated.map((row) => row.liveSessionName === undefined && (row.agent ?? "claude") === "claude" &&
-        row.executionRoute === undefined && ledger.routeOf(row.sessionId) === "api" ? { ...row, executionRoute: "api" as const } : row);
       liveResolved = true;
       engineDiag(`claude_session_list live join count=${index.size}`);
       // peer-live: Tailii 管理外の生存 CLI（Mac の端末 / `claude remote-control`）が掴んでいる会話を
@@ -448,6 +444,10 @@ export const conversationHandlers: HandlerRegistry = {
     } catch (error) {
       engineDiag(`claude_session_list live join 失敗: ${String(error)}`);
     }
+    // 端末一覧を取れなくても、停止中の API 作業は台帳から判定する。生存中は実際の経路を優先する。
+    const ledger = new ApiAgentLedgerStore();
+    annotated = annotated.map((row) => row.liveSessionName === undefined && (row.agent ?? "claude") === "claude" &&
+      row.executionRoute === undefined && ledger.routeOf(row.sessionId) === "api" ? { ...row, executionRoute: "api" as const } : row);
     engineDiag(
       `claude_session_list_response id=${message.id} count=${sessions.length} liveResolved=${liveResolved}`,
     );
@@ -591,20 +591,35 @@ export const conversationHandlers: HandlerRegistry = {
     engineDiag(`session_search_request id=${message.id}`);
     try {
       // 全文走査の前に受理を知らせる。旧 host の無応答タイムアウトと長い検索を区別する。
-      writer.write({ type: "session_search_response", v, id: message.id, results: [], complete: false, supportsFilters: true });
+      writer.write({ type: "session_search_response", v, id: message.id, results: [], complete: false, supportsFilters: true, supportsExecutionRouteFilter: true });
       const stores = [ctx.claudeSessionStore, ctx.codexSessionStore].filter((store) => store !== null);
+      const ledger = new ApiAgentLedgerStore();
+      let liveIndex = buildLiveSessionIndex([], () => null);
+      if (message.query.trim() && message.agents?.length !== 0) {
+        try {
+          liveIndex = buildLiveSessionIndex(await ctx.sessionManager.list(), (name) => ctx.metadataStore?.get(name)?.createdAt ?? null);
+        } catch (error) {
+          engineDiag(`session_search live join 失敗（台帳から判定）: ${String(error)}`);
+        }
+      }
       const response = await searchSessions(stores, message.query, {
         limit: message.limit,
         agents: message.agents,
         cwd: message.cwd,
+        executionRoute: message.executionRoute,
+        resolveExecutionRoute: (info) => {
+          const live = liveSessionFor(liveIndex, info.sessionId, info.agent);
+          if (live !== undefined) return live.executionRoute ?? "terminal";
+          return (info.agent ?? "claude").toLowerCase() === "claude" ? ledger.routeOf(info.sessionId) ?? undefined : undefined;
+        },
         signal: controller.signal,
         onProgress: (results) => {
-          writer.write({ type: "session_search_response", v, id: message.id, results, complete: false, supportsFilters: true });
+          writer.write({ type: "session_search_response", v, id: message.id, results, complete: false, supportsFilters: true, supportsExecutionRouteFilter: true });
         },
       });
       if (controller.signal.aborted) return;
       engineDiag(`session_search_response id=${message.id} count=${response.results.length} scanned=${response.stats.scannedFiles}`);
-      writer.write({ type: "session_search_response", v, id: message.id, results: response.results, supportsFilters: true });
+      writer.write({ type: "session_search_response", v, id: message.id, results: response.results, supportsFilters: true, supportsExecutionRouteFilter: true });
     } catch (error) {
       if (!controller.signal.aborted) {
         process.stderr.write(`[tailii-host engine] session_search 失敗: ${String(error)}\n`);
