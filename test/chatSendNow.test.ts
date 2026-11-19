@@ -53,6 +53,8 @@ const QUEUED_STREAMING_MULTI = frame("queued-streaming-multi");
 const QUEUED_WRAPPED = frame("queued-wrapped");
 /** herdr（拡張キーを解する端末。ヒントは `ctrl+enter to send now`）。 */
 const QUEUED_HERDR = frame("queued-herdr");
+/** 2.1.327 のヒントは `⎿  Queued · ` で始まる。 */
+const QUEUED_HERDR_327 = frame("queued-herdr-2.1.327");
 /**
  * fullscreen（`tui: fullscreen`）で `/diff` の差分パネルを右に開いたまま、ツール実行中にキュー済み 1 件
  * （herdr 0.9.3 + 2.1.292 の生キャプチャ。pane 214×62）。本文の各行は 125 桁目の縦線 `│` でパネルと区切られ、
@@ -235,6 +237,19 @@ describe("sendQueuedNow", () => {
     expect(sendChord).toHaveBeenCalledTimes(1);
   });
 
+  test("2.1.327 のキュー表示でも既定キーで送れ、変更済みのキーでは送らない", async () => {
+    const { io, sendChord } = makeIo([
+      QUEUED_HERDR_327.replace("ctrl+enter to send now", "Ctrl+Enter To Send Now"),
+      QUEUED_SENT,
+    ]);
+    expect(await sendQueuedNow(io)).toEqual({ status: "sent" });
+    expect(sendChord).toHaveBeenCalledTimes(1);
+
+    const rebound = makeIo([QUEUED_HERDR_327.replace("ctrl+enter to send now", "ctrl+j to send now")]);
+    expect(await sendQueuedNow(rebound.io)).toEqual({ status: "blocked", reason: SEND_NOW_BLOCKED_BY_REBOUND });
+    expect(rebound.sendChord).not.toHaveBeenCalled();
+  });
+
   test("fullscreen の差分パネル（縦線 │ 付きの行）でも chord を送り、消えたら sent", async () => {
     const { io, sendChord } = makeIo([QUEUED_FULLSCREEN_DIFF, QUEUED_FULLSCREEN_DIFF, QUEUED_FULLSCREEN_DIFF_SENT]);
     expect(await sendQueuedNow(io)).toEqual({ status: "sent" });
@@ -323,6 +338,12 @@ describe("sendQueuedNow", () => {
   test("chord の後に画面を読めない間は待ち、読めたフレームだけで判断する", async () => {
     const { io, sendChord } = makeIo([QUEUED_TOOL, null, QUEUED_SENT]);
     expect(await sendQueuedNow(io)).toEqual({ status: "sent" });
+    expect(sendChord).toHaveBeenCalledTimes(1);
+  });
+
+  test("再描画やダイアログでキューが見えないだけでは送信済みにしない", async () => {
+    const { io, sendChord } = makeIo([QUEUED_HERDR_327, "", frame("approval-dialog"), QUEUED_HERDR_327]);
+    expect(await sendQueuedNow(io)).toEqual({ status: "failed", reason: SEND_NOW_UNCONFIRMED });
     expect(sendChord).toHaveBeenCalledTimes(1);
   });
 });

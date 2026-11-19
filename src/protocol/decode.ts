@@ -1775,6 +1775,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         budget: decodeApiAgentBudget(raw["budget"]),
         effort: decodeApiAgentEffort(raw),
         progress: parseApiAgentProgress(raw["progress"]) ?? undefined,
+        sendNowAvailable: typeof raw["sendNowAvailable"] === "boolean" ? raw["sendNowAvailable"] : undefined,
         usage: compact<import("./messages.js").ApiAgentUsage>({
           totalUsd: requireNumber(usage, "totalUsd"),
           turns: requireNumber(usage, "turns"),

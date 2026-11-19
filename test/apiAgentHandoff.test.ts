@@ -97,6 +97,7 @@ interface FakeOptions {
   question?: boolean;
   openStatus?: "ok" | "failed";
   closeStatus?: { status: "ok" | "failed"; error?: "turn_running" | "not_open" };
+  waitUntilReady?: (timeoutMs: number) => Promise<boolean>;
 }
 
 function makeCtx(options: FakeOptions = {}) {
@@ -124,7 +125,7 @@ function makeCtx(options: FakeOptions = {}) {
       if (request.type === "api_agent_close") return { type: "api_agent_result", id, ...(options.closeStatus ?? { status: "ok" }) } as HubServerMessage;
       return { type: "api_agent_result", id, status: options.openStatus ?? "ok", ...(options.openStatus === "failed" ? { error: "no_api_key" } : {}) } as HubServerMessage;
     },
-    hubLink: { send: (message: HubClientMessage) => { hubSent.push(message); return true; } },
+    hubLink: { send: (message: HubClientMessage) => { hubSent.push(message); return true; }, waitUntilReady: options.waitUntilReady },
     processingSessions: new Map<string, number>(),
     backgroundChatSessions: new Set<string>(),
     codexTurnController: null,
@@ -163,6 +164,18 @@ const TERMINAL: SessionInfo = { name: "cs-98cc4122", cwd: "/repo/.claude/worktre
 const handoffMessage = { type: "api_agent_handoff" as const, v: 2, id: "h1", conversationId: CONV, cwd: "/repo/.claude/worktrees/pr-1", name: "cs-new", config: CONFIG };
 
 describe("引き継ぎ", () => {
+  test("接続待ちが失敗したら引き継ぎ元の端末を停止しない", async () => {
+    const t = makeCtx({ sessions: [TERMINAL], waitUntilReady: async () => false });
+    const meta = { name: TERMINAL.name, cwd: TERMINAL.cwd, createdAt: 1, agent: "claude" as const, claudeSessionId: CONV, backend: "tmux" as const };
+    t.metadataStore.put(meta);
+    const result = await handoffToApiAgent(handoffMessage, t.ctx, deps());
+    expect(result).toMatchObject({ ok: false, error: "worker_failed" });
+    expect(t.killed).toEqual([]);
+    expect(t.hubRequests).toEqual([]);
+    expect(t.hubSent).toEqual([]);
+    expect(t.metadataStore.get(TERMINAL.name)).toEqual(meta);
+  });
+
   test("成功: 端末側を終え（worktree は消さない）、claude の終了を確かめてから同じ名前・同じ会話 id で API 作業を resume で開く", async () => {
     const t = makeCtx({ sessions: [TERMINAL] });
     t.metadataStore.put({ name: TERMINAL.name, cwd: TERMINAL.cwd, createdAt: 1, agent: "claude", claudeSessionId: CONV, backend: "tmux" });

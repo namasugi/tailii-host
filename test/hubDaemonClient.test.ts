@@ -145,3 +145,52 @@ it("起動保証の失敗を接続ループへ漏らさず、次のエラーで�
     expect(ensureHubDaemonAsync).toHaveBeenCalledTimes(2);
   } finally { link.close(); }
 });
+
+it("接続待ちは hello 完了と再接続後の snapshot 反映を待つ", async () => {
+  vi.useFakeTimers();
+  const sockets: net.Socket[] = [];
+  vi.mocked(net.connect).mockImplementation(() => {
+    const socket = new EventEmitter() as net.Socket;
+    socket.write = vi.fn(() => true);
+    socket.destroy = vi.fn(() => socket);
+    sockets.push(socket);
+    return socket;
+  });
+  const link = connectHubSocket({ socketPath: "/unused", ensureDaemon: () => {} });
+  const order: string[] = [];
+  link.onMessage = () => {};
+  link.onReconnect = () => { order.push("snapshot"); };
+  try {
+    const waiting = link.waitUntilReady!(10_000).then((ready) => { order.push("ready"); return ready; });
+    sockets[0]!.emit("connect");
+    await vi.advanceTimersByTimeAsync(100);
+    expect(order).toEqual([]);
+    sockets[0]!.emit("data", Buffer.from('{"type":"hub_hello_ack","version":"0.21.0","bootId":"first"}\n'));
+    expect(await waiting).toBe(true);
+    expect(order).toEqual(["snapshot", "ready"]);
+    expect(await link.waitUntilReady!(10_000)).toBe(true);
+    sockets[0]!.emit("close");
+    const reconnecting = link.waitUntilReady!(10_000).then((ready) => { order.push("ready-again"); return ready; });
+    await vi.advanceTimersByTimeAsync(250);
+    expect(order).toEqual(["snapshot", "ready"]);
+    sockets[1]!.emit("connect");
+    sockets[1]!.emit("data", Buffer.from('{"type":"hub_hello_ack","version":"0.21.0","bootId":"second"}\n'));
+    expect(await reconnecting).toBe(true);
+    expect(order).toEqual(["snapshot", "ready", "snapshot", "ready-again"]);
+  } finally { link.close(); }
+});
+
+it("接続待ちは期限と close で false を返し、待機を解除する", async () => {
+  vi.useFakeTimers();
+  rejectConnections();
+  const link = connectHubSocket({ socketPath: "/unused", ensureDaemon: () => {} });
+  try {
+    const expired = link.waitUntilReady!(100);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(await expired).toBe(false);
+    const pending = link.waitUntilReady!(10_000);
+    link.close();
+    expect(await pending).toBe(false);
+    expect(await link.waitUntilReady!(10_000)).toBe(false);
+  } finally { link.close(); }
+});

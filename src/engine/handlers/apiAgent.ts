@@ -29,6 +29,11 @@ type ApiAgentResult = Extract<HubServerMessage, { type: "api_agent_result" }>;
 
 const HUB_TIMEOUT_MS = 5_000;
 
+/** 接続待ちは、排他の確認や引き継ぎ元の停止より前に済ませる。 */
+export async function waitForApiAgentHub(ctx: HandlerContext): Promise<boolean> {
+  return await ctx.hubLink.waitUntilReady?.(10_000) !== false;
+}
+
 function errorText(code: ApiAgentErrorCode | undefined): string {
   return API_AGENT_ERROR_MESSAGES[code ?? "worker_failed"];
 }
@@ -67,6 +72,12 @@ export async function startApiAgentSession(message: SessionStartMessage, ctx: Ha
   const conversationId = message.resumeSessionId ?? randomUUID();
   if (!isConversationUuid(conversationId)) {
     writeError(writer, v, message.id, "launch_failed", errorText("invalid_config"));
+    return false;
+  }
+  // 一覧を読めても hub は起動・再接続中のことがある。待機中に他の接続で会話が開かれ得るので、
+  // 名前・会話の排他は接続ができてから確かめる（アプリの prepare の期限は 30 秒）。
+  if (!await waitForApiAgentHub(ctx)) {
+    writeError(writer, v, message.id, "launch_failed", errorText("worker_failed"));
     return false;
   }
   // 同じ会話を端末側（Tailii の pane・Tailii 外の claude）で動かしていれば作らない（hub もターンの直前に確かめる）。
@@ -115,6 +126,7 @@ export async function startApiAgentSession(message: SessionStartMessage, ctx: Ha
 /**
  * API 作業のメタデータを書いて hub に会話を開かせる（新規・開き直し・引き継ぎで共有）。失敗は理由を返し、
  * 書き換えたメタデータは元へ戻す（端末で今までどおり開き直せる状態を保つ）。
+ * 呼び手が接続待ちを済ませて排他を確かめた後に使う。ここではオフライン待機・要求の再送をしない。
  */
 export async function openApiAgentRuntime(
   ctx: HandlerContext,
@@ -123,6 +135,9 @@ export async function openApiAgentRuntime(
   const { metadataStore } = ctx;
   if (metadataStore === null) return "invalid_config";
   const previous = metadataStore.get(request.name);
+  // 別の会話をこの名前の API 作業が所有しているときは、hub が断る前に記録を上書きしない。
+  if (previous?.executionRoute === "api" &&
+    (previous.providerSessionId ?? previous.claudeSessionId) !== request.conversationId) return "conversation_in_use";
   metadataStore.put({
     name: request.name, cwd: request.cwd, createdAt: Math.floor(Date.now() / 1_000), agent: "claude",
     claudeSessionId: request.conversationId, providerSessionId: request.conversationId, executionRoute: "api",

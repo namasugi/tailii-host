@@ -1,5 +1,5 @@
 // apiAgent/worker.ts
-// API 作業プロセスの本体（1 プロセス = 1 ターン = 1 回の Agent SDK `query()`）。
+// API 作業プロセスの本体（1 プロセス = 1 回の予算付き Agent SDK `query()`）。
 //
 // - API キーは自分の環境変数（ANTHROPIC_API_KEY）からだけ受け取り、SDK の子プロセスの env へ渡す。
 //   引数・標準出力・ログへは出さない。
@@ -16,6 +16,8 @@ import type { AgentSdkModule, AgentSdkQuery } from "./sdkLoader.js";
 import {
   decodeHubToWorker,
   encodeWorkerLine,
+  isApiAgentResetPrompt,
+  supportsApiAgentSendNow,
   type WorkerPermissionResponse,
   type WorkerStartCommand,
   type WorkerToHub,
@@ -42,11 +44,17 @@ class InputQueue implements AsyncIterable<Record<string, unknown>> {
   private readonly items: Record<string, unknown>[] = [];
   private wake: (() => void) | null = null;
   private closed = false;
-  push(text: string): void {
-    this.items.push({ type: "user", message: { role: "user", content: text }, parent_tool_use_id: null, session_id: "" });
+  push(text: string, id?: string): void {
+    if (this.closed) return;
+    this.items.push({ type: "user", message: { role: "user", content: text }, parent_tool_use_id: null, session_id: "",
+      ...(id !== undefined ? { uuid: id, priority: "now", origin: { kind: "human" } } : {}) });
     this.wake?.();
   }
-  close(): void { this.closed = true; this.wake?.(); }
+  close(): string[] {
+    const discarded = this.items.flatMap((item) => typeof item["uuid"] === "string" ? [item["uuid"]] : []);
+    this.closed = true; this.items.length = 0; this.wake?.();
+    return discarded;
+  }
   async *[Symbol.asyncIterator](): AsyncIterator<Record<string, unknown>> {
     while (true) {
       while (this.items.length > 0) yield this.items.shift()!;
@@ -152,6 +160,35 @@ async function runTurn(
   }
 
   let interrupted = false;
+  let accepting = false;
+  let sendNowSupported = false;
+  const pendingSteers = new Set<string>();
+  const acceptedSteers = new Set<string>();
+  const returnUnapplied = (ids: Iterable<string>): void => {
+    for (const id of ids) {
+      if (!pendingSteers.delete(id)) continue;
+      io.write({ t: "steer_result", id, status: "not_applied" });
+    }
+  };
+  let interruptWork: Promise<void> | null = null;
+  const interrupt = (): void => {
+    if (interrupted) return;
+    interrupted = true;
+    accepting = false;
+    returnUnapplied(input.close());
+    const hasSteers = pendingSteers.size > 0;
+    interruptWork = query.interrupt().then((receipt) => {
+      if (hasSteers) {
+        // 通常の interrupt は CLI の未読キューを残す。receipt で未読と確認できた分だけ返し、
+        // query を閉じて Stop の後に追加指示が勝手に実行されるのを防ぐ。
+        if (typeof receipt === "object" && receipt !== null && "still_queued" in receipt && Array.isArray(receipt.still_queued)) {
+          const queued = receipt.still_queued.filter((id): id is string => typeof id === "string" && pendingSteers.has(id));
+          returnUnapplied(queued);
+        }
+        query.close?.();
+      }
+    }).catch(() => { if (hasSteers) query.close?.(); });
+  };
   // hub からの後続の指示（承認の答え・中断）。hub が居なくなったら中断する。
   const control = (async () => {
     while (true) {
@@ -160,15 +197,26 @@ async function runTurn(
       const command = decodeHubToWorker(next.value);
       if (command === null) continue;
       if (command.t === "permission_response") waiting.get(command.requestId)?.(command);
-      else if (command.t === "interrupt" && !interrupted) {
-        interrupted = true;
-        query.interrupt().catch(() => undefined);
+      else if (command.t === "interrupt") interrupt();
+      else if (command.t === "steer") {
+        if (acceptedSteers.has(command.id)) {
+          io.write({ t: "steer_result", id: command.id, status: "accepted" });
+        } else if (Date.now() >= command.expiresAtMs) {
+          io.write({ t: "steer_result", id: command.id, status: "expired" });
+        } else if (!accepting || interrupted) {
+          io.write({ t: "steer_result", id: command.id, status: "not_running" });
+        } else if (!sendNowSupported || waiting.size > 0 || isApiAgentResetPrompt(command.prompt)) {
+          io.write({ t: "steer_result", id: command.id, status: "blocked" });
+        } else {
+          acceptedSteers.add(command.id);
+          pendingSteers.add(command.id);
+          input.push(command.prompt, command.id);
+          io.write({ t: "steer_result", id: command.id, status: "accepted" });
+        }
       }
     }
     if (!interrupted) {
-      interrupted = true;
-      query.interrupt().catch(() => undefined);
-      input.close();
+      interrupt();
     }
   })();
   void control;
@@ -184,6 +232,7 @@ async function runTurn(
   }
   const account = init.account;
   const ok = acceptableAgentAuth(account);
+  sendNowSupported = supportsApiAgentSendNow(init.claude_code_version ?? null);
   io.write({
     t: "auth", ok,
     apiKeySource: typeof account?.["apiKeySource"] === "string" ? account["apiKeySource"] as string : null,
@@ -205,6 +254,7 @@ async function runTurn(
   }
 
   input.push(start.prompt);
+  accepting = true;
   publishProgress({ phase: "thinking" });
   let sawResult = false;
   try {
@@ -212,27 +262,42 @@ async function runTurn(
       const progress = progressFromSdkMessage(message);
       if (progress !== null) publishProgress(progress);
       if (message["type"] !== "result") continue;
+      const answered = Array.isArray(message["user_message_uuids"]) ? message["user_message_uuids"] : [message["user_message_uuid"]];
+      for (const id of answered) if (typeof id === "string") pendingSteers.delete(id);
+      const subtype = typeof message["subtype"] === "string" ? message["subtype"] : "unknown";
+      const terminalReason = typeof message["terminal_reason"] === "string" ? message["terminal_reason"] : null;
+      // 即時反映は同じターンに合流する場合と、現在の応答を中断して次のターンになる場合がある。
+      // 追加した UUID を回答した結果まで、同じ query（同じ金額上限）のまま読み続ける。
+      if (!interrupted && pendingSteers.size > 0 && (subtype === "success" || subtype === "error_max_turns" ||
+        (subtype === "error_during_execution" && terminalReason?.startsWith("aborted_") === true))) continue;
+      accepting = false;
+      if (interrupted) await interruptWork;
+      else if (Array.isArray(message["user_message_uuids"]) || typeof message["user_message_uuid"] === "string") {
+        returnUnapplied([...pendingSteers]);
+      }
       sawResult = true;
       io.write({
         t: "result",
-        subtype: typeof message["subtype"] === "string" ? message["subtype"] : "unknown",
+        subtype,
         isError: message["is_error"] === true,
         totalCostUsd: typeof message["total_cost_usd"] === "number" && Number.isFinite(message["total_cost_usd"])
           ? message["total_cost_usd"] : null,
         numTurns: typeof message["num_turns"] === "number" ? message["num_turns"] : null,
         sessionId: typeof message["session_id"] === "string" ? message["session_id"] : null,
-        terminalReason: typeof message["terminal_reason"] === "string" ? message["terminal_reason"] : null,
+        terminalReason,
       });
-      // 1 ターンで終える（結果の後に来る提案などは待たない）。
-      input.close();
+      // 追加 UUID への回答が揃ったら終える（結果の後に来る提案などは待たない）。
+      break;
     }
   } catch {
     // 失敗の結果（中断・予算到達）の後、SDK は「error result を返した」として例外を投げる（実測）。
     // 結果を受け取れていればそれが正。受け取れていなければ失敗として返す。
     if (!sawResult) io.write({ t: "error", code: "query_failed" });
   } finally {
+    accepting = false;
     for (const resolve of waiting.values()) resolve({ t: "permission_response", requestId: "", behavior: "deny", message: "ターンが終わりました。" });
-    input.close();
+    // 異常終了でも、作業プロセスの入力列に残っていた追加指示は SDK に渡っていない。
+    returnUnapplied(input.close());
     query.close?.();
   }
   return sawResult ? 0 : 5;

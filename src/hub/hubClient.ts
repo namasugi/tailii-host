@@ -41,6 +41,8 @@ export interface HubLink {
    * （chat_send が黙って消えて永遠に pending になる実障害の再発防止）。
    */
   send(message: HubClientMessage): boolean;
+  /** 起動・再接続中の hello 完了を待つ。RPC をオフラインで再生せず、送る前にだけ待機する。 */
+  waitUntilReady?(timeoutMs: number): Promise<boolean>;
   close(): void;
 }
 
@@ -67,6 +69,10 @@ export function connectHubSocket(options: {
   const heldUntilReconnectHandler: HubServerMessage[] = [];
   const HELD_UNTIL_RECONNECT_HANDLER_MAX = 10_000;
   const helloCompletedSockets = new WeakSet<net.Socket>();
+  const readyWaiters = new Set<(ready: boolean) => void>();
+  const finishReadyWaiters = (ready: boolean): void => {
+    for (const finish of [...readyWaiters]) finish(ready);
+  };
   const queued: HubClientMessage[] = [];
   const isReplayableState = (message: HubClientMessage): boolean =>
     message.type === "session_processing" || message.type === "runtime_claim_release" ||
@@ -117,8 +123,22 @@ export function connectHubSocket(options: {
       // false を返す（オフライン再生対象は queue に合流済みなので true）。
       return isReplayableState(message);
     },
+    waitUntilReady(timeoutMs) {
+      if (closed) return Promise.resolve(false);
+      if (socket !== null && !socket.destroyed && helloCompletedSockets.has(socket)) return Promise.resolve(true);
+      return new Promise((resolve) => {
+        const finish = (ready: boolean): void => {
+          clearTimeout(timer);
+          readyWaiters.delete(finish);
+          resolve(ready);
+        };
+        const timer = setTimeout(() => finish(false), timeoutMs);
+        readyWaiters.add(finish);
+      });
+    },
     close() {
       closed = true;
+      finishReadyWaiters(false);
       pendingReconnect = null;
       heldUntilReconnectHandler.length = 0;
       socket?.destroy();
@@ -205,6 +225,8 @@ export function connectHubSocket(options: {
             } else {
               reconnectHandler(info);
             }
+            // onReconnect が古い RPC を失敗させた後で、新しい API 起動要求の待機を解く。
+            finishReadyWaiters(true);
           }
         }
       });
@@ -243,6 +265,7 @@ export function connectInProcessHub(hub: SessionHub): HubLink {
       hub.handleClientMessage(client, JSON.stringify(message));
       return true;
     },
+    waitUntilReady: async () => true,
     close() { hub.unregisterClient(client); },
   };
   hub.registerClient(client, (line) => {

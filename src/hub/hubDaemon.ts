@@ -770,6 +770,9 @@ export async function runHubCommand(args: string[]): Promise<number> {
     fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, version: startupVersion }));
     hub.startRestoredDrains();
     relayServer = await startEngineRelaySocket({ onMessage: (message) => hub.handleRelayMessage(message), log });
+    // 起動を頼んだ engine は接続失敗後の backoff（最大 5 秒）の途中にいる。端末の無い API 会話では
+    // 最初の tick が 0 件になり、listen 直後に自然終了すると接続前の起動→終了を繰り返す。
+    const startupGraceUntil = Date.now() + 10_000;
     while (!abort.signal.aborted) {
       let result: ReaperTickResult;
       try {
@@ -781,7 +784,8 @@ export async function runHubCommand(args: string[]): Promise<number> {
       }
       if (once) break;
       if (result.liveCount === 0 && hub.clientCount === 0 && !hub.hasPendingQuestions &&
-        !hub.hasInjectionsInFlight && !hub.hasCodexTurnsInFlight && !hub.hasApiAgentTurnsInFlight) {
+        !hub.hasInjectionsInFlight && !hub.hasCodexTurnsInFlight && !hub.hasApiAgentTurnsInFlight &&
+        Date.now() >= startupGraceUntil) {
         log("対象セッション 0 / client 0 → 自然終了");
         break;
       }
@@ -790,7 +794,9 @@ export async function runHubCommand(args: string[]): Promise<number> {
         log(`stale dist 検知(${startupVersion} → ${currentVersion}) → 終了`);
         break;
       }
-      await abortableSleep(intervalSeconds * 1000, abort.signal);
+      const startupGraceRemaining = startupGraceUntil - Date.now();
+      await abortableSleep(startupGraceRemaining > 0
+        ? Math.min(intervalSeconds * 1000, startupGraceRemaining) : intervalSeconds * 1000, abort.signal);
     }
   } finally {
     previewLoad.close();

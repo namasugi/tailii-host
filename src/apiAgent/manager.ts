@@ -1,7 +1,8 @@
 // apiAgent/manager.ts
 // API 作業（Agent SDK で 1 ターンずつ実行する Claude 会話）の hub 側の制御。所有者は hub。
 //
-// - 1 ターン = 1 作業プロセス = 1 回の `query()`。新規は `sessionId: 会話id`、2 ターン目以降は `resume: 会話id`。
+// - 1 回の予算付き実行 = 1 作業プロセス = 1 回の `query()`。即時反映による SDK のターン切り替えも同じ query。
+//   新規は `sessionId: 会話id`、2 回目以降は `resume: 会話id`。
 // - 処理中に届いた発話は貯めて、ターンが終わったら次のターンとしてまとめて送る。中断したら送らずに返す
 //   （`restoredTexts`。入力欄へ戻す。対話型 Claude Code の Esc と同じ扱い）。
 // - 予算: 会話の累計が上限に達していれば始めない。1 ターンの上限は min(1 ターン上限, 残り) を SDK の
@@ -40,7 +41,8 @@ import {
   type ApiAgentLedger,
 } from "./ledger.js";
 import { ApiAgentSessionStore } from "./sessionState.js";
-import { isConversationUuid, type HubToWorker, type WorkerToHub } from "./workerProtocol.js";
+import { isApiAgentResetPrompt, isConversationUuid, supportsApiAgentSendNow, type HubToWorker, type WorkerToHub } from "./workerProtocol.js";
+import type { SendQueuedNowOutcome } from "../backend/tmux.js";
 
 export interface ApiAgentWorkerHandle {
   readonly pid: number | null;
@@ -108,6 +110,8 @@ interface RunningTurn {
   worker: ApiAgentWorkerHandle;
   baselineUsd: number | null;
   authOk: boolean | null;
+  sendNowSupported: boolean;
+  steers: Map<string, SteeringBatch>;
   result: Extract<WorkerToHub, { t: "result" }> | null;
   errorCode: Extract<WorkerToHub, { t: "error" }>["code"] | null;
   interrupted: boolean;
@@ -115,6 +119,21 @@ interface RunningTurn {
   questionIds: Set<string>;
   /** このターンの承認待ちの中止（ターンの終わりで abort）。 */
   abort: AbortController;
+}
+
+interface SteeringBatch {
+  texts: string[];
+  accepted: boolean;
+  returned: boolean;
+  timer: ReturnType<typeof setTimeout> | null;
+  resolve: ((outcome: SendQueuedNowOutcome) => void) | null;
+}
+
+function settleSteering(batch: SteeringBatch, outcome: SendQueuedNowOutcome): void {
+  if (batch.timer !== null) clearTimeout(batch.timer);
+  batch.timer = null;
+  batch.resolve?.(outcome);
+  batch.resolve = null;
 }
 
 interface Conversation {
@@ -328,6 +347,48 @@ export class ApiAgentManager {
     return "started";
   }
 
+  /** 待機中の発話を、実行中の query へ human / priority:now で追加する。ACK があるまで成功にしない。 */
+  async sendQueuedNow(session: string): Promise<SendQueuedNowOutcome> {
+    const conversation = this.require(session);
+    if ([...(conversation.running?.steers.values() ?? [])].some((batch) => !batch.accepted)) {
+      return { status: "blocked", reason: "前の即時反映を確認中です。確認が終わるまでお待ちください。" };
+    }
+    if (conversation.queue.length === 0) return { status: "nothing_queued" };
+    if (conversation.queue.some(isApiAgentResetPrompt)) return { status: "blocked", reason: "会話をリセットするコマンドは、現在の応答が終わってから実行します。" };
+    const running = conversation.running;
+    if (running === null || running.result !== null) {
+      return { status: "blocked", reason: "応答が終わったため、発話は通常の送信待ちに残っています。" };
+    }
+    if (!this.sendNowAvailable(running)) return { status: "blocked", reason: "今は「今すぐ送信」できません。承認・設問への回答や実行状態を確認してください。" };
+    const id = randomUUID();
+    const texts = conversation.queue.splice(0);
+    const pending = new Promise<SendQueuedNowOutcome>((resolve) => {
+      const batch: SteeringBatch = { texts, accepted: false, returned: false, timer: null, resolve };
+      running.steers.set(id, batch);
+      // worker にも期限を渡す。期限切れの要求を後から実行せず、ACK 不明の発話を自動で撃ち直さない。
+      batch.timer = setTimeout(() => {
+        settleSteering(batch, { status: "failed", reason: "API 作業への即時反映を確認できませんでした。自動再送は行いません。" });
+        this.emitStatus(conversation);
+      }, 5_000);
+      batch.timer.unref?.();
+      try {
+        running.worker.send({ t: "steer", id, prompt: texts.join("\n\n"), expiresAtMs: this.now() + 4_000 });
+      } catch {
+        running.steers.delete(id);
+        conversation.queue.unshift(...texts);
+        settleSteering(batch, { status: "failed", reason: "API 作業へ追加指示を送れませんでした。発話は送信待ちに残っています。" });
+      }
+    });
+    this.emitStatus(conversation);
+    return pending;
+  }
+
+  private sendNowAvailable(running: RunningTurn): boolean {
+    return running.authOk === true && running.sendNowSupported && !running.interrupted && running.result === null &&
+      running.progress.phase !== "approval" && running.progress.phase !== "question" &&
+      ![...running.steers.values()].some((batch) => !batch.accepted || batch.returned);
+  }
+
   /** 処理中のターンを止める。貯まっていた発話は送らずに返す。 */
   interrupt(session: string): boolean {
     const conversation = this.conversations.get(session);
@@ -353,6 +414,8 @@ export class ApiAgentManager {
     conversation.queue = [];
     const running = conversation.running;
     if (running !== null) {
+      for (const batch of running.steers.values()) settleSteering(batch, { status: "failed", reason: "API 作業が終了しました。" });
+      running.steers.clear();
       running.interrupted = true;
       running.abort.abort();
       try { running.worker.send({ t: "interrupt" }); } catch { /* 終了済み。 */ }
@@ -450,6 +513,7 @@ export class ApiAgentManager {
     const running: RunningTurn = {
       progress: { phase: "starting" },
       turnId, worker, baselineUsd, authOk: null, result: null, errorCode: null,
+      sendNowSupported: false, steers: new Map(),
       interrupted: false, killTimer: null, questionIds: new Set(), abort: new AbortController(),
     };
     conversation.running = running;
@@ -487,8 +551,32 @@ export class ApiAgentManager {
         return;
       case "auth":
         running.authOk = message.ok;
+        running.sendNowSupported = supportsApiAgentSendNow(message.cliVersion);
         if (!message.ok) this.options.log?.(`api-agent 認証が想定外のため停止 session=${conversation.session} source=${message.apiKeySource ?? "none"}`);
+        this.emitStatus(conversation);
         return;
+      case "steer_result": {
+        const batch = running.steers.get(message.id);
+        if (batch === undefined) return;
+        if (message.status === "accepted") {
+          batch.accepted = true;
+          settleSteering(batch, { status: "sent" });
+        } else if (message.status === "not_applied") {
+          // 複数の即時反映が未読で残っても、受け付けた順に戻す（イベントごとの unshift は逆順になる）。
+          batch.returned = true;
+        } else {
+          running.steers.delete(message.id);
+          conversation.queue.unshift(...batch.texts);
+          // 終了と入れ違った。返した発話はまだ待機中なので、キューが空という応答は返さない。
+          if (message.status === "not_running") running.sendNowSupported = false;
+          settleSteering(batch, {
+            status: message.status === "expired" ? "failed" : "blocked",
+            reason: "即時反映されなかった発話は送信待ちに残っています。実行状態を確認してからもう一度試してください。",
+          });
+        }
+        this.emitStatus(conversation);
+        return;
+      }
       case "error":
         running.errorCode = message.code;
         return;
@@ -542,6 +630,15 @@ export class ApiAgentManager {
     if (running.killTimer !== null) clearTimeout(running.killTimer);
     running.abort.abort();
     conversation.running = null;
+    let hasUnacknowledged = false;
+    const recoveredSteers: string[] = [];
+    for (const batch of running.steers.values()) {
+      if (batch.returned || !batch.accepted) recoveredSteers.push(...batch.texts);
+      if (!batch.accepted && !batch.returned) hasUnacknowledged = true;
+      settleSteering(batch, { status: "failed", reason: "即時反映の確認前に API 作業が終了しました。発話を入力欄へ戻します。" });
+    }
+    running.steers.clear();
+    if (!hasUnacknowledged) conversation.queue.unshift(...recoveredSteers);
     for (const id of running.questionIds) {
       if (this.pendingQuestions.delete(id)) this.options.onQuestionDismiss?.(conversation.session, id);
     }
@@ -577,9 +674,9 @@ export class ApiAgentManager {
     if (conversation.disposed) return;
     this.options.onProcessing?.(conversation.session, "done");
     let restoredTexts: string[] | undefined;
-    if (running.interrupted || conversation.lastError === "unexpected_auth" || conversation.lastError === "sdk_unavailable") {
+    if (hasUnacknowledged || running.interrupted || conversation.lastError === "unexpected_auth" || conversation.lastError === "sdk_unavailable") {
       // 中断・止めるべき失敗の後は貯まっていた発話を送らずに返す（入力欄へ戻す）。
-      if (conversation.queue.length > 0) restoredTexts = conversation.queue.splice(0);
+      restoredTexts = [...(hasUnacknowledged ? recoveredSteers : []), ...conversation.queue.splice(0)];
     }
     this.emitStatus(conversation, restoredTexts);
     if (conversation.queue.length > 0) void this.drain(conversation);
@@ -612,7 +709,9 @@ export class ApiAgentManager {
       permissionMode: conversation.config.permissionMode,
       ...(conversation.config.effort !== undefined ? { effort: conversation.config.effort } : {}),
       ...(conversation.running !== null ? { progress: conversation.running.progress } : {}),
-      usage, queued: conversation.queue.length,
+      usage, queued: conversation.queue.length + [...(conversation.running?.steers.values() ?? [])]
+        .filter((batch) => !batch.accepted || batch.returned).reduce((total, batch) => total + batch.texts.length, 0),
+      ...(conversation.running !== null && this.sendNowAvailable(conversation.running) ? { sendNowAvailable: true } : {}),
       ...(conversation.lastOutcome !== undefined ? { outcome: conversation.lastOutcome } : {}),
       ...(error !== undefined ? { error } : {}),
       ...(restoredTexts !== undefined && restoredTexts.length > 0 ? { restoredTexts } : {}),

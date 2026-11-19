@@ -150,6 +150,7 @@ class FakeRuntime implements ApiAgentHubRuntime {
     this.calls.push(`submit:${session}:${text}`);
     return "started";
   }
+  async sendQueuedNow(session: string): Promise<{ status: "sent" }> { this.calls.push(`sendNow:${session}`); return { status: "sent" }; }
   interrupt(session: string): boolean { this.calls.push(`interrupt:${session}`); return this.running; }
   dispose(session: string): void { this.calls.push(`dispose:${session}`); }
   answerQuestion(id: string, answers: unknown[]): boolean { this.answers.push({ id, answers }); return true; }
@@ -159,6 +160,28 @@ class FakeRuntime implements ApiAgentHubRuntime {
 }
 
 describe("SessionHub への合流", () => {
+  test("API の今すぐ送信は端末へキーを送らず runtime に渡す", async () => {
+    const terminalSend = vi.fn(async () => ({ status: "sent" as const }));
+    let runtime!: FakeRuntime;
+    const hub = new SessionHub({ runner: async () => ok(""), heartbeatDir: makeTempDir("api-send-now"),
+      metadataStore: makeTempStore(), timeoutSeconds: 1800, sendNowInjector: terminalSend,
+      apiAgentFactory: (callbacks) => { runtime = new FakeRuntime(callbacks); return runtime; } });
+    hub.restoreApiAgents();
+    const received: unknown[] = [], client = {};
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send_now", id: "now", session: "cs-a" }));
+    await vi.waitFor(() => expect(received).toContainEqual({ type: "chat_send_now_result", id: "now", status: "sent" }));
+    expect(runtime.calls).toContain("sendNow:cs-a");
+    expect(terminalSend).not.toHaveBeenCalled();
+    runtime.callbacks.onQuestion({ session: "cs-a", id: "api-agent-question-now", questions: [
+      { question: "Which?", header: "Choose", multiSelect: false, options: [{ label: "A", description: "" }] },
+    ] });
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send_now", id: "blocked", session: "cs-a" }));
+    await vi.waitFor(() => expect(received).toContainEqual(expect.objectContaining({ type: "chat_send_now_result", id: "blocked", status: "blocked" })));
+    expect(runtime.calls.filter((call) => call === "sendNow:cs-a")).toHaveLength(1);
+    hub.close();
+  });
+
   test.each(["running", "idle"] as const)("履歴を読み直す間に変わった API 状態を完了時に復元する: %s", (state) => {
     const store = makeTempStore();
     store.put({ name: "cs-a", cwd: "/w", createdAt: 1, agent: "claude", executionRoute: "api", claudeSessionId: CONV });

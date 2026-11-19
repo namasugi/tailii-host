@@ -1,7 +1,7 @@
 // apiAgent/workerProtocol.ts
 // hub ↔ API 作業プロセス（Agent SDK を読み込む子プロセス）の NDJSON。iOS のワイヤーではない（内部専用）。
 //
-// 1 プロセス = 1 ターン。hub が `start` を 1 回送り、作業プロセスは `result` か `error` を返して終わる。
+// 1 プロセス = 1 回の予算付き query。即時反映で SDK のターンが切り替わっても、最後の結果まで同じ予算で動かす。
 // API キーはこのプロトコルに載せない（子プロセスの環境変数だけで渡す）。
 
 import type { ApiAgentConfig, ApiAgentPermissionMode, ApiAgentProgress } from "../protocol/messages.js";
@@ -40,7 +40,8 @@ export interface WorkerPermissionResponse {
 
 export interface WorkerInterruptCommand { t: "interrupt" }
 
-export type HubToWorker = WorkerStartCommand | WorkerPermissionResponse | WorkerInterruptCommand;
+export interface WorkerSteerCommand { t: "steer"; id: string; prompt: string; expiresAtMs: number }
+export type HubToWorker = WorkerStartCommand | WorkerPermissionResponse | WorkerInterruptCommand | WorkerSteerCommand;
 
 /** 認証の判定（モデルを呼ぶ前）。`ok=false` なら作業プロセスはプロンプトを送らずに終わる。 */
 export interface WorkerAuthEvent {
@@ -81,6 +82,7 @@ export interface WorkerErrorEvent {
 }
 
 export type WorkerToHub = WorkerAuthEvent | WorkerPermissionRequest | WorkerResultEvent | WorkerErrorEvent
+  | { t: "steer_result"; id: string; status: "accepted" | "blocked" | "not_running" | "expired" | "not_applied" }
   | { t: "progress"; progress: ApiAgentProgress };
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -96,6 +98,15 @@ function finiteNumber(value: unknown): number | null {
 
 export function isConversationUuid(value: string): boolean { return UUID.test(value); }
 export function isApiAgentModel(value: string): boolean { return MODEL.test(value); }
+export function isApiAgentResetPrompt(text: string): boolean { return /^\s*\/(?:clear|reset|new)(?:\s|$)/.test(text); }
+
+/** human origin 付きの即時反映（WebFetch / WebSearch を含む）がある CLI だけで使う。 */
+export function supportsApiAgentSendNow(version: string | null): boolean {
+  const parts = version === null ? null : /^(\d+)\.(\d+)\.(\d+)(?:$|[-+ ])/.exec(version);
+  if (parts === null) return false;
+  const [major, minor, patch] = parts.slice(1, 4).map(Number);
+  return major! > 2 || (major === 2 && (minor! > 1 || (minor === 1 && patch! >= 287)));
+}
 
 /** hub → 作業プロセスの 1 行を検証して読む。不正は null。 */
 export function decodeHubToWorker(line: string): HubToWorker | null {
@@ -104,6 +115,11 @@ export function decodeHubToWorker(line: string): HubToWorker | null {
   const obj = record(raw);
   if (obj === null) return null;
   if (obj["t"] === "interrupt") return { t: "interrupt" };
+  if (obj["t"] === "steer") {
+    const id = str(obj["id"]), prompt = str(obj["prompt"]), expiresAtMs = finiteNumber(obj["expiresAtMs"]);
+    return id !== null && UUID.test(id) && prompt !== null && prompt.trim().length > 0 && expiresAtMs !== null && expiresAtMs > 0
+      ? { t: "steer", id, prompt, expiresAtMs } : null;
+  }
   if (obj["t"] === "permission_response") {
     const requestId = str(obj["requestId"]);
     const behavior = obj["behavior"];
@@ -154,6 +170,11 @@ export function decodeWorkerToHub(line: string): WorkerToHub | null {
   const obj = record(raw);
   if (obj === null) return null;
   switch (obj["t"]) {
+    case "steer_result": {
+      const id = str(obj["id"]), status = obj["status"];
+      return id !== null && UUID.test(id) && (status === "accepted" || status === "blocked" || status === "not_running" || status === "expired" || status === "not_applied")
+        ? { t: "steer_result", id, status } : null;
+    }
     case "progress": {
       const progress = parseApiAgentProgress(obj["progress"]);
       return progress === null ? null : { t: "progress", progress };

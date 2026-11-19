@@ -77,6 +77,147 @@ function setup(overrides: Partial<ConstructorParameters<typeof ApiAgentManager>[
   };
 }
 
+describe("API 作業の今すぐ送信", () => {
+  async function ready() {
+    const t = setup();
+    t.manager.open("cs-a", { conversationId: CONV, cwd: "/tmp/w", config: CONFIG, resume: true });
+    await t.manager.submit("cs-a", "one");
+    const worker = t.workers[0]!;
+    worker.emit({ t: "auth", ok: true, apiKeySource: "ANTHROPIC_API_KEY", apiProvider: "firstParty", cliVersion: "2.1.322" });
+    await t.manager.submit("cs-a", "two");
+    return { ...t, worker };
+  }
+  function latestSteer(worker: FakeWorker) {
+    return worker.sent.filter((m): m is Extract<HubToWorker, { t: "steer" }> => m.t === "steer").at(-1)!;
+  }
+
+  test("待機中の発話を一度だけ渡し、ACK 後に成功と空のキューを示す", async () => {
+    const t = await ready();
+    await t.manager.submit("cs-a", "three");
+    expect(t.last().sendNowAvailable).toBe(true);
+    const sending = t.manager.sendQueuedNow("cs-a");
+    const command = latestSteer(t.worker);
+    expect(command).toMatchObject({ prompt: "two\n\nthree" });
+    expect(t.last()).toMatchObject({ queued: 2 });
+    expect(t.last().sendNowAvailable).toBeUndefined();
+    t.worker.emit({ t: "steer_result", id: command.id, status: "accepted" });
+    expect(await sending).toEqual({ status: "sent" });
+    expect(t.last().queued).toBe(0);
+    expect(await t.manager.sendQueuedNow("cs-a")).toEqual({ status: "nothing_queued" });
+    t.worker.succeed(0.03);
+    expect(t.last().usage).toMatchObject({ totalUsd: 0.03, turns: 1 });
+    expect(t.workers).toHaveLength(1);
+  });
+
+  test.each(["approval", "question"])("%s 待ちは追加送信せず、待機中の発話を保つ", async (phase) => {
+    const t = await ready();
+    t.worker.emit({ t: "progress", progress: { phase: phase as "approval" | "question" } });
+    expect((await t.manager.sendQueuedNow("cs-a")).status).toBe("blocked");
+    expect(t.last().queued).toBe(1);
+    expect(latestSteer(t.worker)).toBeUndefined();
+    t.manager.dispose("cs-a");
+  });
+
+  test("未対応の CLI には要求を送らず、対応版の状態でだけ利用可能にする", async () => {
+    const t = await ready();
+    t.worker.emit({ t: "auth", ok: true, apiKeySource: "ANTHROPIC_API_KEY", apiProvider: "firstParty", cliVersion: "2.1.200" });
+    expect((await t.manager.sendQueuedNow("cs-a")).status).toBe("blocked");
+    expect(t.last().sendNowAvailable).toBeUndefined();
+    expect(latestSteer(t.worker)).toBeUndefined();
+    t.manager.dispose("cs-a");
+  });
+
+  test.each(["/clear", "/reset", "/new"])("%s で実行中の金額上限をリセットさせない", async (command) => {
+    const t = await ready();
+    await t.manager.submit("cs-a", command);
+    expect((await t.manager.sendQueuedNow("cs-a")).status).toBe("blocked");
+    expect(t.last().queued).toBe(2);
+    expect(latestSteer(t.worker)).toBeUndefined();
+    t.manager.dispose("cs-a");
+  });
+
+  test("期限切れの拒否は発話を送信待ちに戻す", async () => {
+    const t = await ready();
+    const sending = t.manager.sendQueuedNow("cs-a");
+    t.worker.emit({ t: "steer_result", id: latestSteer(t.worker).id, status: "expired" });
+    expect((await sending).status).toBe("failed");
+    expect(t.last().queued).toBe(1);
+    t.worker.succeed(0.02);
+    await vi.waitFor(() => expect(t.workers).toHaveLength(2));
+    expect(t.workers[1]!.start.prompt).toBe("two");
+    t.workers[1]!.succeed(0.04);
+  });
+
+  test("応答の終了と入れ違っても待機中の発話を空扱いにせず、次のターンへ回す", async () => {
+    const t = await ready();
+    const sending = t.manager.sendQueuedNow("cs-a");
+    t.worker.emit({ t: "steer_result", id: latestSteer(t.worker).id, status: "not_running" });
+    expect((await sending).status).toBe("blocked");
+    expect(t.last().queued).toBe(1);
+    expect(t.last().sendNowAvailable).toBeUndefined();
+    t.worker.succeed(0.02);
+    await vi.waitFor(() => expect(t.workers).toHaveLength(2));
+    expect(t.workers[1]!.start.prompt).toBe("two");
+    t.workers[1]!.succeed(0.03);
+  });
+
+  test("ACK 前の終了は発話を入力欄へ戻し、自動で別の worker へ再送しない", async () => {
+    const t = await ready();
+    const sending = t.manager.sendQueuedNow("cs-a");
+    await t.manager.submit("cs-a", "three");
+    t.worker.exit();
+    expect((await sending).status).toBe("failed");
+    expect(t.last()).toMatchObject({ restoredTexts: ["two", "three"], queued: 0, usage: { unconfirmedTurns: 1 } });
+    expect(t.workers).toHaveLength(1);
+  });
+
+  test("ACK 不明のタイムアウト後に発話を自動再送しない", async () => {
+    vi.useFakeTimers();
+    try {
+      const t = await ready();
+      const sending = t.manager.sendQueuedNow("cs-a");
+      await vi.advanceTimersByTimeAsync(5000);
+      expect((await sending).status).toBe("failed");
+      expect(t.last().queued).toBe(1);
+      expect(t.worker.sent.filter((m) => m.t === "steer")).toHaveLength(1);
+      t.manager.dispose("cs-a");
+    } finally { vi.useRealTimers(); }
+  });
+
+  test("未読で戻った複数の即時反映は FIFO で入力欄へ戻す", async () => {
+    const t = await ready();
+    const first = t.manager.sendQueuedNow("cs-a"), firstId = latestSteer(t.worker).id;
+    t.worker.emit({ t: "steer_result", id: firstId, status: "accepted" });
+    await first;
+    await t.manager.submit("cs-a", "three");
+    const second = t.manager.sendQueuedNow("cs-a"), secondId = latestSteer(t.worker).id;
+    t.worker.emit({ t: "steer_result", id: secondId, status: "accepted" });
+    await second;
+    await t.manager.submit("cs-a", "four");
+    t.worker.emit({ t: "steer_result", id: firstId, status: "not_applied" });
+    t.worker.emit({ t: "steer_result", id: secondId, status: "not_applied" });
+    t.manager.interrupt("cs-a");
+    t.worker.succeed(0.02, "error_during_execution");
+    expect(t.last()).toMatchObject({ restoredTexts: ["two", "three", "four"], outcome: "interrupted", queued: 0 });
+    expect(t.workers).toHaveLength(1);
+  });
+
+  test("未読で戻った発話と ACK 不明の発話が混ざっても受理順で入力欄へ戻す", async () => {
+    const t = await ready();
+    const first = t.manager.sendQueuedNow("cs-a"), firstId = latestSteer(t.worker).id;
+    t.worker.emit({ t: "steer_result", id: firstId, status: "accepted" });
+    await first;
+    await t.manager.submit("cs-a", "three");
+    const second = t.manager.sendQueuedNow("cs-a");
+    await t.manager.submit("cs-a", "four");
+    t.worker.emit({ t: "steer_result", id: firstId, status: "not_applied" });
+    t.worker.exit();
+    expect((await second).status).toBe("failed");
+    expect(t.last().restoredTexts).toEqual(["two", "three", "four"]);
+    expect(t.workers).toHaveLength(1);
+  });
+});
+
 describe("ApiAgentManager", () => {
   test("新規 API 会話の進捗は状態照会でも復元し、終了後は消す", async () => {
     const t = setup();

@@ -36,27 +36,42 @@ class Lines implements AsyncIterable<string> {
 interface FakeScript {
   account: Record<string, unknown>;
   /** プロンプトを受け取ったら返すメッセージ。canUseTool を呼ぶ関数も書ける。 */
-  onPrompt?: (prompt: string, canUseTool: (name: string, input: Record<string, unknown>) => Promise<unknown>) => AsyncGenerator<Record<string, unknown>>;
+  onPrompt?: (prompt: string, canUseTool: (name: string, input: Record<string, unknown>) => Promise<unknown>,
+    message: Record<string, unknown>, readNext: () => Promise<Record<string, unknown>>) => AsyncGenerator<Record<string, unknown>>;
   throwAfterResult?: boolean;
+  interruptReceipt?: unknown;
+  cliVersion?: string;
 }
 
 function fakeSdk(script: FakeScript) {
-  const seen: { options?: Record<string, unknown>; prompts: string[]; interrupted: number } = { prompts: [], interrupted: 0 };
+  const seen: { options?: Record<string, unknown>; prompts: string[]; messages: Record<string, unknown>[]; interrupted: number; closed: boolean } =
+    { prompts: [], messages: [], interrupted: 0, closed: false };
   const sdk: AgentSdkModule = {
     query({ prompt, options }) {
       seen.options = options;
       const canUseTool = options["canUseTool"] as (name: string, input: Record<string, unknown>, o: { signal: AbortSignal }) => Promise<unknown>;
       const controller = new AbortController();
       const q: AgentSdkQuery = {
-        async initializationResult() { return { account: script.account, claude_code_version: "2.1.322" }; },
-        async interrupt() { seen.interrupted += 1; controller.abort(); return undefined; },
-        close() { /* noop */ },
+        async initializationResult() { return { account: script.account, claude_code_version: script.cliVersion ?? "2.1.322" }; },
+        async interrupt() { seen.interrupted += 1; controller.abort(); return script.interruptReceipt; },
+        close() { seen.closed = true; },
         async *[Symbol.asyncIterator]() {
-          for await (const message of prompt) {
+          const input = prompt[Symbol.asyncIterator]();
+          const readNext = async (): Promise<Record<string, unknown>> => {
+            const next = await input.next();
+            if (next.done === true) throw new Error("input ended");
+            seen.messages.push(next.value);
+            return next.value;
+          };
+          for (;;) {
+            const next = await input.next();
+            if (next.done === true) return;
+            const message = next.value;
+            seen.messages.push(message);
             const text = String((message["message"] as Record<string, unknown>)["content"]);
             seen.prompts.push(text);
             if (script.onPrompt) {
-              for await (const out of script.onPrompt(text, (name, input) => canUseTool(name, input, { signal: controller.signal }))) yield out;
+              for await (const out of script.onPrompt(text, (name, input) => canUseTool(name, input, { signal: controller.signal }), message, readNext)) yield out;
             }
             if (script.throwAfterResult) throw new Error("Claude Code returned an error result: x");
           }
@@ -94,6 +109,156 @@ describe("acceptableAgentAuth", () => {
     expect(acceptableAgentAuth({ apiKeySource: "apiKeyHelper", apiProvider: "firstParty" })).toBe(false);
     expect(acceptableAgentAuth({ apiKeySource: "ANTHROPIC_API_KEY", apiProvider: "bedrock" })).toBe(false);
     expect(acceptableAgentAuth(undefined)).toBe(false);
+  });
+});
+
+describe("API 作業への即時反映", () => {
+  const id = "98cc4122-019a-4cf5-aa55-020565ae2eca";
+  const auth = { apiKeySource: "ANTHROPIC_API_KEY", apiProvider: "firstParty" };
+  const steer = (expiresAtMs = Date.now() + 4000) => JSON.stringify({ t: "steer", id, prompt: "change course", expiresAtMs });
+  const result = (overrides: Record<string, unknown> = {}) => ({ type: "result", subtype: "success", is_error: false,
+    total_cost_usd: 0.03, num_turns: 1, session_id: CONV, user_message_uuids: [id], ...overrides });
+  const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+  test("ツール実行中の query に UUID・human origin・priority:now を渡す", async () => {
+    const t = await runWith({ account: auth, async *onPrompt(_text, _tool, _message, readNext) {
+      yield { type: "tool_progress", tool_name: "Read" };
+      expect(await readNext()).toMatchObject({ uuid: id, priority: "now", origin: { kind: "human" }, message: { content: "change course" } });
+      yield result();
+    } }, { ANTHROPIC_API_KEY: KEY }, { onWrite(message, lines) {
+      if (message.t === "progress" && message.progress.phase === "tool") lines.push(steer());
+    } });
+    expect(t.code).toBe(0);
+    expect(t.out).toContainEqual({ t: "steer_result", id, status: "accepted" });
+    expect(t.out.filter((m) => m.t === "result")).toHaveLength(1);
+    expect(t.seen.options).toMatchObject({ maxBudgetUsd: 0.5 });
+  });
+
+  test.each(["error_during_execution", "error_max_turns"])("%s の結果では閉じず、追加 UUID に答えた最後の累計額だけを返す", async (subtype) => {
+    const t = await runWith({ account: auth, async *onPrompt(text, _tool, message) {
+      if (text === "hello") {
+        yield { type: "stream_event", event: { type: "content_block_start", content_block: { type: "text" } } };
+        await tick();
+        yield result({ subtype, is_error: true, terminal_reason: "aborted_streaming", total_cost_usd: 0.01, user_message_uuids: [] });
+      } else {
+        expect(message["priority"]).toBe("now");
+        yield result();
+      }
+    } }, { ANTHROPIC_API_KEY: KEY }, { onWrite(message, lines) {
+      if (message.t === "progress" && message.progress.phase === "responding") lines.push(steer());
+    } });
+    expect(t.seen.prompts).toEqual(["hello", "change course"]);
+    expect(t.out.filter((m) => m.t === "result")).toEqual([expect.objectContaining({ subtype: "success", totalCostUsd: 0.03 })]);
+    expect(t.code).toBe(0);
+  });
+
+  test("承認待ちには追加指示を渡さず、元の承認を保つ", async () => {
+    const t = await runWith({ account: auth, async *onPrompt(_text, tool) {
+      expect(await tool("Write", { file_path: "/tmp/test" })).toMatchObject({ behavior: "allow" });
+      yield result({ user_message_uuids: [] });
+    } }, { ANTHROPIC_API_KEY: KEY }, { onWrite(message, lines) {
+      if (message.t === "permission_request") {
+        lines.push(steer());
+        lines.push(JSON.stringify({ t: "permission_response", requestId: message.requestId, behavior: "allow" }));
+      }
+    } });
+    expect(t.out).toContainEqual({ t: "steer_result", id, status: "blocked" });
+    expect(t.seen.messages).toHaveLength(1);
+    expect(t.seen.interrupted).toBe(0);
+  });
+
+  test("期限を過ぎた即時反映を後から実行しない", async () => {
+    const t = await runWith({ account: auth, async *onPrompt() {
+      yield { type: "tool_progress", tool_name: "Read" };
+      await tick();
+      yield result({ user_message_uuids: [] });
+    } }, { ANTHROPIC_API_KEY: KEY }, { onWrite(message, lines) {
+      if (message.t === "progress" && message.progress.phase === "tool") lines.push(steer(Date.now() - 1));
+    } });
+    expect(t.out).toContainEqual({ t: "steer_result", id, status: "expired" });
+    expect(t.seen.messages).toHaveLength(1);
+  });
+
+  test("未対応の CLI には worker 側でも即時反映を渡さない", async () => {
+    const t = await runWith({ account: auth, cliVersion: "2.1.200", async *onPrompt() {
+      yield { type: "tool_progress", tool_name: "Read" };
+      await tick();
+      yield result({ user_message_uuids: [] });
+    } }, { ANTHROPIC_API_KEY: KEY }, { onWrite(message, lines) {
+      if (message.t === "progress" && message.progress.phase === "tool") lines.push(steer());
+    } });
+    expect(t.out).toContainEqual({ t: "steer_result", id, status: "blocked" });
+    expect(t.seen.messages).toHaveLength(1);
+  });
+
+  test("同じ UUID の再送は SDK に一度だけ渡す", async () => {
+    const t = await runWith({ account: auth, async *onPrompt(_text, _tool, _message, readNext) {
+      yield { type: "tool_progress", tool_name: "Read" };
+      await readNext();
+      await tick();
+      yield result();
+    } }, { ANTHROPIC_API_KEY: KEY }, { onWrite(message, lines) {
+      if (message.t === "progress" && message.progress.phase === "tool") { lines.push(steer()); lines.push(steer()); }
+    } });
+    expect(t.seen.messages).toHaveLength(2);
+    expect(t.code).toBe(0);
+  });
+
+  test("予算に達して未読の追加指示は返し、次のモデル呼び出しを始めない", async () => {
+    const t = await runWith({ account: auth, async *onPrompt() {
+      yield { type: "tool_progress", tool_name: "Read" };
+      await tick();
+      yield result({ subtype: "error_max_budget_usd", is_error: true, user_message_uuids: [] });
+    } }, { ANTHROPIC_API_KEY: KEY }, { onWrite(message, lines) {
+      if (message.t === "progress" && message.progress.phase === "tool") lines.push(steer());
+    } });
+    expect(t.out).toContainEqual({ t: "steer_result", id, status: "not_applied" });
+    expect(t.out.filter((m) => m.t === "result")).toEqual([expect.objectContaining({ subtype: "error_max_budget_usd" })]);
+    expect(t.seen.messages).toHaveLength(1);
+  });
+
+  test("Stop は SDK に残る未読キューも止め、receipt で確認できた分だけ返す", async () => {
+    const t = await runWith({ account: auth, interruptReceipt: { still_queued: [id] }, async *onPrompt(_text, _tool, _message, readNext) {
+      yield { type: "tool_progress", tool_name: "Read" };
+      await readNext();
+      await tick();
+      yield result({ subtype: "error_during_execution", is_error: true, terminal_reason: "aborted_tools", user_message_uuids: [] });
+    } }, { ANTHROPIC_API_KEY: KEY }, { onWrite(message, lines) {
+      if (message.t === "progress" && message.progress.phase === "tool") lines.push(steer());
+      if (message.t === "steer_result" && message.status === "accepted") lines.push(JSON.stringify({ t: "interrupt" }));
+    } });
+    expect(t.seen.interrupted).toBe(1);
+    expect(t.seen.closed).toBe(true);
+    expect(t.out).toContainEqual({ t: "steer_result", id, status: "not_applied" });
+  });
+
+  test("SDK が入力を読む前の Stop でも、入力列に残った追加指示を失わない", async () => {
+    const t = await runWith({ account: auth, async *onPrompt() {
+      yield { type: "tool_progress", tool_name: "Read" };
+      await tick();
+      yield result({ subtype: "error_during_execution", is_error: true, terminal_reason: "aborted_tools", user_message_uuids: [] });
+    } }, { ANTHROPIC_API_KEY: KEY }, { onWrite(message, lines) {
+      if (message.t === "progress" && message.progress.phase === "tool") lines.push(steer());
+      if (message.t === "steer_result" && message.status === "accepted") lines.push(JSON.stringify({ t: "interrupt" }));
+    } });
+    expect(t.seen.messages).toHaveLength(1);
+    expect(t.out).toContainEqual({ t: "steer_result", id, status: "not_applied" });
+    expect(t.seen.interrupted).toBe(1);
+  });
+
+  test("ターン切り替え途中の異常終了で、古い結果を最終の利用額として返さない", async () => {
+    const t = await runWith({ account: auth, throwAfterResult: true, async *onPrompt() {
+      yield { type: "tool_progress", tool_name: "Read" };
+      await tick();
+      yield result({ subtype: "error_during_execution", is_error: true, terminal_reason: "aborted_streaming", user_message_uuids: [] });
+    } }, { ANTHROPIC_API_KEY: KEY }, { onWrite(message, lines) {
+      if (message.t === "progress" && message.progress.phase === "tool") lines.push(steer());
+    } });
+    expect(t.out.filter((m) => m.t === "result")).toEqual([]);
+    expect(t.out).toContainEqual({ t: "error", code: "query_failed" });
+    expect(t.seen.messages).toHaveLength(1);
+    expect(t.out).toContainEqual({ t: "steer_result", id, status: "not_applied" });
+    expect(t.code).toBe(5);
   });
 });
 

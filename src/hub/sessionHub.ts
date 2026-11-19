@@ -254,6 +254,7 @@ export interface ApiAgentHubRuntime {
   open(session: string, request: { conversationId: string; cwd: string; config: ApiAgentConfig; resume: boolean }): void;
   configure(session: string, config: ApiAgentConfig): void;
   submit(session: string, text: string): Promise<"started" | "queued">;
+  sendQueuedNow?(session: string): Promise<SendQueuedNowOutcome>;
   interrupt(session: string): boolean;
   dispose(session: string): void;
   close(session: string): "closed" | "running" | "not_open";
@@ -3471,7 +3472,8 @@ export class SessionHub {
     }
     // 設問を Esc で閉じている最中（`cancellingQuestionId`）は chat の注入の中なので、上の
     // `chatDrainRunning` で待っている。ここへ来るのは注入が終わった後だけ。
-    if (actor.questionAnswerInjections > 0 || actor.pendingQuestion?.answerRoute === "tui") {
+    const isApiAgent = this.apiAgentRuntime?.has(session) === true || this.options.metadataStore?.get(session)?.executionRoute === "api";
+    if (actor.questionAnswerInjections > 0 || actor.pendingQuestion?.answerRoute === "tui" || (isApiAgent && actor.pendingQuestion !== null)) {
       reply({ status: "blocked", reason: SEND_NOW_BLOCKED_BY_DIALOG });
       // 注入の終わりから呼ばれた場合、残りの queue の再開はこちらの役目（門番は drain 側が持つ）。
       void this.drainChatQueue(session, actor);
@@ -3481,8 +3483,11 @@ export class SessionHub {
     this.injectionsInFlight += 1;
     let outcome: SendQueuedNowOutcome;
     try {
-      outcome = await (this.options.sendNowInjector?.(session) ??
-        Promise.resolve<SendQueuedNowOutcome>({ status: "failed", reason: "send-now is unavailable" }));
+      outcome = isApiAgent
+        ? await (this.ensureApiAgent()?.sendQueuedNow?.(session) ??
+          Promise.resolve<SendQueuedNowOutcome>({ status: "blocked", reason: "この API 作業は即時反映に対応していません。ホストを更新してください。" }))
+        : await (this.options.sendNowInjector?.(session) ??
+          Promise.resolve<SendQueuedNowOutcome>({ status: "failed", reason: "send-now is unavailable" }));
     } catch (error) {
       outcome = { status: "failed", reason: error instanceof Error ? error.message : String(error) };
     } finally {

@@ -30,7 +30,7 @@ import { defaultPeerSessionsDir } from "../../services/peerSessions.js";
 import { claudeProjectSlug } from "../../shared/paths.js";
 import { locateClaudeTranscript } from "../../sessions/claudeTranscriptLocator.js";
 import { engineDiag, type HandlerContext, type HandlerRegistry } from "../context.js";
-import { openApiAgentRuntime } from "./apiAgent.js";
+import { openApiAgentRuntime, waitForApiAgentHub } from "./apiAgent.js";
 import { killSessionForUser } from "./session.js";
 
 type HandoffMessage = Extract<ControlMessage, { type: "api_agent_handoff" }>;
@@ -120,6 +120,9 @@ export async function handoffToApiAgent(
   });
   if (!isConversationUuid(message.conversationId) || !path.isAbsolute(message.cwd) || !validApiAgentConfig(message.config) ||
     message.name.length === 0) return fail("invalid_config");
+
+  // 接続ができてから端末側の最新状態を確かめ、引き継ぎ元を停止する。
+  if (!await waitForApiAgentHub(ctx)) return fail("worker_failed");
 
   // 1. 端末側が処理中・承認待ち・設問待ちなら断る（何も変えない）。
   let holders: SessionInfo[];

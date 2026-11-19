@@ -2062,6 +2062,9 @@ export type SendNowHintState = "absent" | "ready" | "rebound";
 /** ヒント行の末尾（実測 2.1.283。chord の表記だけが端末で変わる）。 */
 const SEND_NOW_HINT_SUFFIX = " to send now";
 
+/** Claude Code 2.1.327 でヒントの前に付くキュー状態。 */
+const SEND_NOW_QUEUED_PREFIX = "⎿  Queued · ";
+
 /**
  * 既定の `chat:sendNow` の表記。tmux は `ctrl+x ctrl+s`、拡張キーを解する端末（herdr）は
  * `ctrl+enter` を出す（どちらの端末でも既定の割り当ては両方生きている）。
@@ -2113,10 +2116,13 @@ export function screenSendNowHint(screen: string): SendNowHintState {
     if (mainColumnBlank(line)) continue;
     scanned += 1;
     if (!line.startsWith("  ")) continue;
-    const text = hintCandidateText(line);
+    const body = line.trimStart();
+    // 接頭辞にも空白が 2 桁あるので、差分パネルとの空白を探す前に外す。
+    const hint = body.startsWith(SEND_NOW_QUEUED_PREFIX) ? body.slice(SEND_NOW_QUEUED_PREFIX.length) : body;
+    const text = hintCandidateText(hint).toLowerCase();
     if (!text.endsWith(SEND_NOW_HINT_SUFFIX)) continue;
     if (!lineFollowsQueuedPrompt(lines, index)) continue;
-    const chord = text.slice(0, -SEND_NOW_HINT_SUFFIX.length).trim().toLowerCase();
+    const chord = text.slice(0, -SEND_NOW_HINT_SUFFIX.length).trim();
     if (SEND_NOW_DEFAULT_CHORDS.has(chord)) return "ready";
     if (CHORD_NOTATION.test(chord)) return "rebound";
   }
@@ -2235,7 +2241,10 @@ export async function sendQueuedNow(io: {
   for (let poll = 0; poll < io.maxPolls; poll += 1) {
     await new Promise((resolve) => setTimeout(resolve, io.pollMs));
     const after = await io.capture();
-    if (after !== null && screenSendNowHint(after) === "absent") return { status: "sent" };
+    // 再描画中やダイアログの画面ではキュー行が隠れる。入力欄を読めたときだけ消滅を確定する。
+    if (after === null || screenSendNowHint(after) !== "absent") continue;
+    const afterFrame = classifySubmitFrame(after);
+    if (afterFrame === "submitted" || afterFrame === "pending") return { status: "sent" };
   }
   return { status: "failed", reason: SEND_NOW_UNCONFIRMED };
 }

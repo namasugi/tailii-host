@@ -13,6 +13,9 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { defaultChatReceiptsPath, defaultHubLockPath, readHubLock, runHubCommand } from "../src/hub/hubDaemon.js";
 import { defaultHeartbeatDir, writeHeartbeat } from "../src/sessions/heartbeat.js";
 import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
+import { connectHubSocket } from "../src/hub/hubClient.js";
+import type { HubServerMessage } from "../src/hub/hubProtocol.js";
+import { SessionHub } from "../src/hub/sessionHub.js";
 
 const FAKE_HERDR = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "fake-herdr.mjs");
 const SESSION = "s-exp00001";
@@ -120,7 +123,36 @@ describe("runHubCommand の終了手順（graceful shutdown）", () => {
     }
     removeFakeHerdr();
     resetHubState();
+    vi.restoreAllMocks();
   }, 30_000);
+
+  test("端末のない hub も起動元の再接続を待ち、遅れて届く API 会話の再開を受け付ける", async () => {
+    // OS 上の tmux の有無に依存せず、端末セッションが無いと確定した tick を通す。
+    vi.spyOn(SessionHub.prototype, "tick").mockResolvedValue({ liveCount: 0, killed: [], demoted: [], reclaimed: [] });
+    const hub = startHub(["--interval-seconds", "0.05"]);
+    await vi.waitFor(() => expect(readHubLock(defaultHubLockPath())?.pid).toBe(process.pid));
+    // engine の接続リトライは socket の listen より後になる。最初の tick で自然終了すると
+    // 起動→終了を繰り返し、API 会話を再開できない（2026-11-17 実ログ）。
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(hub.settled).toBe(false);
+    const received: HubServerMessage[] = [];
+    const link = connectHubSocket({ ensureDaemon: () => {} });
+    link.onMessage = (message) => { received.push(message); };
+    link.onReconnect = () => {};
+    try {
+      await vi.waitFor(() => expect(received.some((message) => message.type === "hub_hello_ack")).toBe(true));
+      expect(link.send({ type: "api_agent_open", id: "reopen", session: "s-api-reopen",
+        conversationId: "7b2c6a3f-ba60-45fd-89ae-cba51afaf7dc", cwd: isolatedHome(), resume: true,
+        config: { model: "claude-haiku-5-5", permissionMode: "default", budget: { turnUsd: 0.5, conversationUsd: 5, maxTurns: 20 } },
+      })).toBe(true);
+      await vi.waitFor(() => expect(received).toContainEqual({ type: "api_agent_result", id: "reopen", status: "ok" }));
+    } finally {
+      link.close();
+      await hub.sigterm();
+      await hub.done;
+      fs.rmSync(path.join(isolatedHome(), ".tailii", "api-agent"), { recursive: true, force: true });
+    }
+  });
 
   test("復元した queue を socket を取ってから届け、打っている途中の SIGTERM では最後まで送ってから lock を外す", async () => {
     const log = setup({ status: "idle", textDelayMs: 1500, text: "hello" });

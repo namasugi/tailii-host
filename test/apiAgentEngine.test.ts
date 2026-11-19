@@ -1,6 +1,6 @@
 // apiAgentEngine.test.ts — engine 側の API 作業（session_start の executionRoute:"api"・中断キー・設定変更）。
 
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { startApiAgentSession, configureApiAgent } from "../src/engine/handlers/apiAgent.js";
@@ -12,7 +12,8 @@ import { makeTempDir, makeTempStore } from "./helpers.js";
 const CONFIG = { model: "claude-haiku-5-5", permissionMode: "default" as const, budget: { turnUsd: 0.5, conversationUsd: 5, maxTurns: 20 } };
 const CONV = "7b2c6a3f-ba60-45fd-89ae-cba51afaf7dc";
 
-function makeCtx(options: { hubReply?: (request: HubClientMessage) => HubServerMessage; sessions?: SessionInfo[] } = {}) {
+function makeCtx(options: { hubReply?: (request: HubClientMessage) => HubServerMessage; sessions?: SessionInfo[];
+  waitUntilReady?: (timeoutMs: number) => Promise<boolean> } = {}) {
   const written: ControlMessage[] = [];
   const hubRequests: HubClientMessage[] = [];
   const hubSent: HubClientMessage[] = [];
@@ -26,7 +27,7 @@ function makeCtx(options: { hubReply?: (request: HubClientMessage) => HubServerM
       hubRequests.push(request);
       return options.hubReply?.(request) ?? { type: "api_agent_result", id: (request as { id: string }).id, status: "ok" };
     },
-    hubLink: { send: (message: HubClientMessage) => { hubSent.push(message); } },
+    hubLink: { send: (message: HubClientMessage) => { hubSent.push(message); }, waitUntilReady: options.waitUntilReady },
     activeChatSession: { name: null as string | null },
     processingSessions: new Set<string>(),
     backgroundChatSessions: new Set<string>(),
@@ -62,6 +63,83 @@ describe("engine: API 作業の会話の作成", () => {
     const t = makeCtx();
     await startApiAgentSession(startMessage(cwd, { resumeSessionId: CONV }), t.ctx);
     expect(t.hubRequests[0]).toMatchObject({ conversationId: CONV, resume: true });
+  });
+
+  test("hub の接続ができるまで待ち、API 会話の再開要求を一度だけ送る", async () => {
+    let ready!: (value: boolean) => void;
+    const waitUntilReady = vi.fn(() => new Promise<boolean>((resolve) => { ready = resolve; }));
+    const t = makeCtx({ waitUntilReady });
+    const pending = startApiAgentSession(startMessage(makeTempDir("api-agent-engine-cold"), { resumeSessionId: CONV }), t.ctx);
+    await vi.waitFor(() => expect(waitUntilReady).toHaveBeenCalledWith(10_000));
+    expect(t.hubRequests).toEqual([]);
+    expect(t.metadataStore.get("cs-api")).toBeNull();
+    ready(true);
+    expect(await pending).toBe(true);
+    expect(t.hubRequests).toEqual([expect.objectContaining({ type: "api_agent_open", conversationId: CONV, resume: true })]);
+    expect(t.written.at(-1)).toMatchObject({ type: "session_list_response", adoptedName: "cs-api" });
+  });
+
+  test("接続待ちが失敗したら要求を送らず、保存済みのメタデータを保つ", async () => {
+    const t = makeCtx({ waitUntilReady: async () => false });
+    const meta = { name: "cs-api", cwd: "/previous", createdAt: 1, agent: "claude" as const,
+      providerSessionId: CONV, executionRoute: "api" as const };
+    t.metadataStore.put(meta);
+    expect(await startApiAgentSession(startMessage(makeTempDir("api-agent-engine-offline"), { resumeSessionId: CONV }), t.ctx)).toBe(false);
+    expect(t.hubRequests).toEqual([]);
+    expect(t.metadataStore.get("cs-api")).toEqual(meta);
+    expect(t.written).toEqual([expect.objectContaining({ type: "error", code: "launch_failed" })]);
+  });
+
+  test("接続待ちの間に同名の端末会話が開かれたら、その記録を上書きしない", async () => {
+    let ready!: (value: boolean) => void;
+    const waitUntilReady = vi.fn(() => new Promise<boolean>((resolve) => { ready = resolve; }));
+    const t = makeCtx({ waitUntilReady });
+    const pending = startApiAgentSession(startMessage(makeTempDir("api-agent-engine-name-race"), { resumeSessionId: CONV }), t.ctx);
+    await vi.waitFor(() => expect(waitUntilReady).toHaveBeenCalledOnce());
+    const terminal = { name: "cs-api", cwd: "/terminal", createdAt: 2, agent: "claude" as const,
+      providerSessionId: CONV, backend: "herdr" as const, herdrPaneId: "w1:p1" };
+    t.metadataStore.put(terminal);
+    ready(true);
+    expect(await pending).toBe(false);
+    expect(t.hubRequests).toEqual([]);
+    expect(t.metadataStore.get("cs-api")).toEqual(terminal);
+    expect(t.written).toEqual([expect.objectContaining({ type: "error", code: "launch_failed", message: expect.stringContaining("別の場所") })]);
+  });
+
+  test("接続待ちの間に同じ会話が端末側で開かれたら、最新の一覧で断る", async () => {
+    let ready!: (value: boolean) => void;
+    const waitUntilReady = vi.fn(() => new Promise<boolean>((resolve) => { ready = resolve; }));
+    const sessions: SessionInfo[] = [];
+    const t = makeCtx({ waitUntilReady, sessions });
+    const cwd = makeTempDir("api-agent-engine-conversation-race");
+    const pending = startApiAgentSession(startMessage(cwd, { resumeSessionId: CONV }), t.ctx);
+    await vi.waitFor(() => expect(waitUntilReady).toHaveBeenCalledOnce());
+    sessions.push({ name: "cs-terminal", cwd, alive: true, agent: "claude", providerSessionId: CONV, backend: "tmux" });
+    ready(true);
+    expect(await pending).toBe(false);
+    expect(t.hubRequests).toEqual([]);
+    expect(t.metadataStore.get("cs-api")).toBeNull();
+    expect(t.written).toEqual([expect.objectContaining({ type: "error", code: "launch_failed", message: expect.stringContaining("別の場所") })]);
+  });
+
+  test("同名の別の API 会話の記録は、再開を断るときにも上書きしない", async () => {
+    const t = makeCtx({ hubReply: (request) => ({ type: "api_agent_result", id: (request as { id: string }).id,
+      status: "failed", error: "conversation_in_use" }) });
+    const otherId = "98cc4122-019a-4cf5-aa55-020565ae2eca";
+    const other = { name: "cs-api", cwd: "/other", createdAt: 2, agent: "claude" as const,
+      providerSessionId: otherId, claudeSessionId: otherId, executionRoute: "api" as const };
+    t.metadataStore.put(other);
+    expect(await startApiAgentSession(startMessage(makeTempDir("api-agent-engine-api-owner"), { resumeSessionId: CONV }), t.ctx)).toBe(false);
+    expect(t.metadataStore.get("cs-api")).toEqual(other);
+    expect(t.hubRequests).toEqual([]);
+    expect(t.written).toEqual([expect.objectContaining({ type: "error", code: "launch_failed", message: expect.stringContaining("別の場所") })]);
+  });
+
+  test("送出後に接続が切れても起動要求を自動再送しない", async () => {
+    const t = makeCtx({ waitUntilReady: async () => true, hubReply: () => { throw new Error("Session Hub disconnected during RPC"); } });
+    expect(await startApiAgentSession(startMessage(makeTempDir("api-agent-engine-disconnect"), { resumeSessionId: CONV }), t.ctx)).toBe(false);
+    expect(t.hubRequests).toHaveLength(1);
+    expect(t.written).toEqual([expect.objectContaining({ type: "error", code: "launch_failed" })]);
   });
 
   test("同じ会話を別の名前の API 作業で開いていればそれを使う", async () => {
