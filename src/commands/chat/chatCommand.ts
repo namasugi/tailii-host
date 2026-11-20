@@ -93,7 +93,7 @@ export { EXIT };
 /** 差し替え可能な外部（テスト用）。 */
 export interface ChatDeps extends WatchObservationDeps {
   connect: () => Promise<EngineConnection>;
-  readStdin: () => string | null;
+  readStdin: () => string | null | Promise<string | null>;
   isTty: boolean;
   config: () => BotConfig;
   store: () => SessionMetadataStore;
@@ -478,8 +478,8 @@ function utteranceRecorded(deps: ChatDeps, record: RequestRecord): boolean {
   return readReply(readTranscriptLines(transcript.file), { sentAtMs: record.sentAtMs, text: record.text }).found;
 }
 
-function readPrompt(deps: ChatDeps, required: boolean): string | null {
-  const text = deps.readStdin();
+async function readPrompt(deps: ChatDeps, required: boolean): Promise<string | null> {
+  const text = await deps.readStdin();
   const trimmed = text?.replace(/\s+$/, "") ?? "";
   if (trimmed.length === 0) {
     if (required) throw new ChatError(EXIT.usage, "empty_prompt", "指示文が空です（標準入力で渡す）");
@@ -743,7 +743,7 @@ async function cmdNew(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<R
   const agent: "claude" | "codex" = agentRaw;
   const placement = placementOf(args);
   const attach = !bot && !args.flags.has("--no-attach");
-  const prompt = readPrompt(deps, !attach);
+  const prompt = await readPrompt(deps, !attach);
   const model = flagString(args, "--model");
   const effort = flagString(args, "--effort");
   // Codex の工数は最初の turn に載せる。指示文が無いと載せる turn が無い。
@@ -888,7 +888,7 @@ async function cmdSend(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<
     throw new ChatError(EXIT.usage, "use_set_model", "send は --model / --effort を受け取りません（1 通だけに効かせる仕組みがありません）",
       "会話のモデルを変えるなら chat set-model（以後ずっと効く）");
   }
-  const prompt = readPrompt(deps, true)!;
+  const prompt = (await readPrompt(deps, true))!;
   const requestId = requestIdOf(args, bot);
   const textHash = hashText(prompt);
   // Codex の会話だけ、送るたびに許可モードを変えられる（プランから戻すなど）。Claude は起動時のモードのまま。
@@ -1235,7 +1235,7 @@ async function cmdWatch(args: ParsedArgs, deps: ChatDeps): Promise<{ payload: Re
   // メモは --note を付けたときだけ標準入力から読む（付けていないのに読むと、標準入力が閉じない呼び方で止まる）。
   let note: string | undefined;
   if (args.flags.has("--note")) {
-    const stdin = deps.readStdin();
+    const stdin = await deps.readStdin();
     if (stdin === null || stdin.trim().length === 0) {
       throw new ChatError(EXIT.usage, "empty_note", "--note を付けたときは、メモを標準入力で渡してください");
     }
@@ -1353,7 +1353,7 @@ async function cmdSearch(args: ParsedArgs, deps: ChatDeps): Promise<Record<strin
   rejectFlags(args, ["--last", "--after", "--max-text"],
     "search は新しい一致から返す（古い一致は --before <カーソル>）。全文や広い前後は chat read で読む");
   // 検索語は --query か、標準入力の 1 行目（SSH 越しに空白や記号を含む語を渡すときは、シェルを通らない標準入力で）。
-  const query = (flagString(args, "--query") ?? deps.readStdin()?.split(/\r\n|\r|\n/)[0] ?? "").trim();
+  const query = (flagString(args, "--query") ?? (await deps.readStdin())?.split(/\r\n|\r|\n/)[0] ?? "").trim();
   if (query.length === 0) {
     throw new ChatError(EXIT.usage, "empty_query", "検索語が空です（--query <語> か、標準入力の 1 行目で渡す）");
   }
@@ -2272,13 +2272,13 @@ export async function runChatCommand(argv: string[]): Promise<number> {
   };
   const code = await runChat(argv, {
     connect: () => connectEngine(),
-    readStdin: () => {
-      if (process.stdin.isTTY) return null;
-      try {
-        return fs.readFileSync(0, "utf8");
-      } catch {
-        return null;
-      }
+    readStdin: async () => {
+      const stdin = process.stdin;
+      if (stdin.isTTY) return null;
+      // パイプの fd は非ブロッキングになる。SSH で一時的に入力が途切れても EOF まで待つ。
+      const chunks: Buffer[] = [];
+      for await (const chunk of stdin) chunks.push(chunk);
+      return Buffer.concat(chunks).toString("utf8");
     },
     isTty: process.stdin.isTTY === true && process.stdout.isTTY === true,
     config: () => loadBotConfig(),

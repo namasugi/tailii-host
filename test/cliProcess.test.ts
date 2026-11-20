@@ -2,10 +2,13 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import { fork, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { once } from "node:events";
 import { expect, it } from "vitest";
 import { makeTempDir } from "./helpers.js";
 import { readPackageVersion } from "../src/shared/version.js";
+import { writeRequest } from "../src/commands/chat/chatState.js";
 
 const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
 const dist = new URL("../dist/", import.meta.url).href;
@@ -51,4 +54,34 @@ it.each(["hook", "serve"])("%s は使うコマンドだけを読み込み、hub 
   expect(result.modules).toContain(command === "hook" ? "approval/hook.js" : "approval/broker.js");
   expect(result.modules).not.toContain("engine/engine.js"); expect(result.modules).not.toContain("hub/hubDaemon.js"); expect(result.modules).not.toContain("hub/sessionHub.js");
   expect(result.modules).not.toContain("commands/setup.js"); expect(result.modules).not.toContain("commands/doctor.js");
+});
+
+it("chat send は遅れて届く日本語の指示文を最後まで読む", async () => {
+  const prompt = "短い指示文";
+  const requestId = "probe-stdin";
+  const conversationId = "probe-conversation";
+  // 送信済みの依頼を用意する。同じ本文なら engine につながず、重複の応答を返す。
+  writeRequest({ requestId, kind: "send", conversationId, session: "s-probe", cwd: process.cwd(), sentAtMs: 1,
+    text: prompt, textHash: createHash("sha256").update(prompt).digest("hex").slice(0, 32), state: "sent" });
+
+  // CLI が標準入力を参照した JS の処理が一段落してから親に知らせる。その時点までパイプを空にしておく。
+  const notifyStdinAccess = `data:text/javascript,${encodeURIComponent(`
+    const descriptor = Object.getOwnPropertyDescriptor(process, "stdin");
+    Object.defineProperty(process, "stdin", { ...descriptor, get() {
+      Object.defineProperty(process, "stdin", descriptor);
+      setImmediate(() => process.send("stdin-ready"));
+      return process.stdin;
+    } });
+  `)}`;
+  const child = fork(cli, ["chat", "send", conversationId, "--request-id", requestId, "--json"], {
+    execArgv: ["--import", notifyStdinAccess], stdio: ["pipe", "pipe", "inherit", "ipc"], signal: AbortSignal.timeout(5_000),
+  });
+  const output: Buffer[] = [];
+  child.stdout!.on("data", (chunk: Buffer) => output.push(chunk));
+  child.stdin!.on("error", () => {});
+  child.once("message", () => child.stdin!.end(`${prompt}\n`));
+  const [code] = await once(child, "close");
+  const stdout = Buffer.concat(output).toString("utf8");
+  expect(code, stdout).toBe(0);
+  expect(JSON.parse(stdout)).toMatchObject({ ok: true, duplicate: true, requestId });
 });
