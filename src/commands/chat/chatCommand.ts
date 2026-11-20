@@ -16,6 +16,12 @@ import {
   parseHerdrPaneList,
 } from "../../backend/herdr.js";
 import { AGENT_GUIDE } from "./agentGuide.js";
+import { ChatError, EXIT } from "./chatErrors.js";
+import { approvalViews, questionView, sessionNamesForConversation, type PendingQuestion } from "./chatWaiting.js";
+import {
+  captureWatchBaseline, changeWatch, isWatchMode, isWatchRemoveReason, listWatches, pollWatches, registerWatch,
+  validateWatchId, watchNote, type WatchMode, type WatchObservationDeps, type WatchOptions,
+} from "./chatWatch.js";
 import {
   defaultModelContext,
   resolveClaudeDefaultModel,
@@ -80,21 +86,10 @@ import {
   type TranscriptLine,
 } from "./chatState.js";
 
-/** 終了コード（agent-guide に書いた表と同じ）。 */
-export const EXIT = {
-  ok: 0, internal: 1, usage: 2, notFound: 3, elsewhere: 4, policy: 5, retryLater: 6, timeout: 7,
-} as const;
-
-class ChatError extends Error {
-  constructor(readonly exitCode: number, readonly code: string, message: string, readonly hint?: string,
-    readonly extra: Record<string, unknown> = {}) {
-    super(message);
-    this.name = "ChatError";
-  }
-}
+export { EXIT };
 
 /** 差し替え可能な外部（テスト用）。 */
-export interface ChatDeps {
+export interface ChatDeps extends WatchObservationDeps {
   connect: () => Promise<EngineConnection>;
   readStdin: () => string | null;
   isTty: boolean;
@@ -142,24 +137,31 @@ interface ParsedArgs {
   flags: Map<string, string | true>;
 }
 
+const WATCH_VALUE_FLAGS = new Set(["--mode", "--ttl", "--read-cursor", "--token", "--watch", "--watch-ttl"]);
 const VALUE_FLAGS = new Set([
   "--cwd", "--request-id", "--title", "--permission-mode", "--after", "--wait",
   "--choice", "--other", "--reason", "--backend", "--herdr-session", "--agent", "--model", "--effort",
   "--last", "--before", "--limit", "--max-text", "--query", "--context",
+  ...WATCH_VALUE_FLAGS,
 ]);
-const BOOL_FLAGS = new Set(["--json", "--live", "--no-attach", "--interrupt", "--yes", "--refresh"]);
+const BOOL_FLAGS = new Set(["--json", "--live", "--no-attach", "--interrupt", "--yes", "--refresh", "--all", "--note"]);
 
-function parseArgs(args: string[]): ParsedArgs {
+function parseArgs(args: string[], verb: string): ParsedArgs {
   const positional: string[] = [];
   const flags = new Map<string, string | true>();
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
-    if (VALUE_FLAGS.has(arg)) {
+    const sendWatch = (verb === "new" || verb === "send") && (arg === "--watch" || arg === "--watch-ttl");
+    if (verb === "watch" && arg === "--wait") {
+      flags.set(arg, true);
+    } else if (VALUE_FLAGS.has(arg) && (!WATCH_VALUE_FLAGS.has(arg) || verb === "watch" || sendWatch)) {
       const value = args[i + 1];
-      if (value === undefined) throw new ChatError(EXIT.usage, "missing_value", `${arg} に値がありません`);
+      if (value === undefined || ((verb === "watch" || sendWatch) && value.startsWith("--"))) {
+        throw new ChatError(EXIT.usage, "missing_value", `${arg} に値がありません`);
+      }
       flags.set(arg, value);
       i++;
-    } else if (BOOL_FLAGS.has(arg)) {
+    } else if (BOOL_FLAGS.has(arg) && ((arg !== "--all" && arg !== "--note") || verb === "watch")) {
       flags.set(arg, true);
     } else if (arg.startsWith("--")) {
       throw new ChatError(EXIT.usage, "unknown_option", `知らないオプションです: ${arg}`, "tailii-host agent-guide を読んでください");
@@ -673,10 +675,53 @@ async function sendRecorded(
   return status;
 }
 
+function watchModeOf(value: string | undefined, flag: string): WatchMode {
+  if (!isWatchMode(value)) throw new ChatError(EXIT.usage, "bad_watch_mode", `${flag} は continue か notify を指定してください`);
+  return value;
+}
+
+function sendWatchOptions(args: ParsedArgs): WatchOptions | undefined {
+  const raw = flagString(args, "--watch");
+  if (raw === undefined) {
+    if (args.flags.has("--watch-ttl")) throw new ChatError(EXIT.usage, "watch_required", "--watch-ttl には --watch が要ります");
+    return undefined;
+  }
+  return { mode: watchModeOf(raw, "--watch"), ttlMinutes: intFlag(args, "--watch-ttl", 1440, 1, 10080) };
+}
+
+function recordWatchBaseline(deps: ChatDeps, record: RequestRecord, watch?: WatchOptions): RequestRecord {
+  if (watch === undefined || record.watchBaseline !== undefined) return record;
+  return {
+    ...record,
+    watchBaseline: captureWatchBaseline(deps, record.conversationId, record.agent ?? "claude", record.kind === "new", record.cwd),
+  };
+}
+
+async function watchAfterSend(deps: ChatDeps, record: RequestRecord, prompt: string | null, duplicate: boolean, watch?: WatchOptions) {
+  if (watch === undefined) return {};
+  try {
+    const { mode, expiresAtMs } = await registerWatch(deps, record.conversationId, {
+      ...watch, lastRequestId: record.requestId,
+      ...(prompt !== null ? { note: `依頼の冒頭: ${watchNote(prompt, 200)}` } : {}),
+    }, {
+      agent: record.agent ?? "claude", baseline: record.watchBaseline, duplicate, cwd: record.cwd, empty: record.kind === "new",
+    });
+    return { watch: { mode, expiresAtMs } };
+  } catch (error) {
+    const failure = error instanceof ChatError ? error
+      : new ChatError(EXIT.internal, "watch_registration_failed", error instanceof Error ? error.message : String(error));
+    throw new ChatError(failure.exitCode, failure.code, `依頼は受け付けられましたが見張りを登録できませんでした。 ${failure.message}`,
+      "同じ依頼 ID と --watch を付けて打ち直す", {
+        conversationId: record.conversationId, requestId: record.requestId, session: record.session,
+      });
+  }
+}
+
 async function cmdNew(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<Record<string, unknown> & { attach?: string }> {
   if (args.positional.length > 0) {
     throw new ChatError(EXIT.usage, "unexpected_argument", "new は会話 ID を受け取りません（続きを送るなら chat send）");
   }
+  const watch = sendWatchOptions(args);
   const cwd = flagString(args, "--cwd");
   if (cwd === undefined) throw new ChatError(EXIT.usage, "missing_cwd", "--cwd が要ります");
   const config = deps.config();
@@ -713,7 +758,7 @@ async function cmdNew(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<R
   const textHash = prompt === null ? null : hashText(prompt);
   return withRequestLock(deps, requestId, () =>
     newLocked({ deps, requestId, resolvedCwd, textHash, prompt, attach, permissionMode, title: flagString(args, "--title"),
-      placement, agent, model, effort, modelValidated: validated }));
+      placement, agent, model, effort, modelValidated: validated, watch }));
 }
 
 /**
@@ -744,8 +789,9 @@ async function newLocked(input: {
   placement: { backend?: "tmux" | "herdr"; herdrSession?: string };
   agent: "claude" | "codex";
   model: string | undefined; effort: string | undefined; modelValidated: boolean;
+  watch?: WatchOptions;
 }): Promise<Record<string, unknown> & { attach?: string }> {
-  const { deps, requestId, resolvedCwd, textHash, prompt, attach, permissionMode, title, placement, agent, model, effort, modelValidated } = input;
+  const { deps, requestId, resolvedCwd, textHash, prompt, attach, permissionMode, title, placement, agent, model, effort, modelValidated, watch } = input;
   const choice = { ...(model !== undefined ? { model } : {}), ...(effort !== undefined ? { effort } : {}) };
   const codexTurn = agent === "codex" ? codexTurnOptions(permissionMode as PermissionMode | undefined) : undefined;
   const previous = (deps.readRequest ?? readRequest)(requestId);
@@ -756,6 +802,7 @@ async function newLocked(input: {
   // state の無い記録は 31f97bc の旧形式で、送信済み（3 周目レビュー 6）。
   if (previous !== null && (previous.state === undefined || previous.state === "sent")) {
     return { duplicate: true, requestId, conversationId: previous.conversationId, session: previous.session, cwd: previous.cwd,
+      ...await watchAfterSend(deps, previous, prompt, true, watch),
       ...(attach ? { attach: previous.session } : {}) };
   }
   const name = sessionNameFor(requestId);
@@ -809,31 +856,36 @@ async function newLocked(input: {
     };
     // 送信が未確定の記録は、指示文なしで打ち直されても送信済みにしない（記録の本文で打ち直す。6 周目 補足）。
     if (prompt === null && !(previous !== null && previous.state === "started")) {
-      writeReq({ ...record, state: "sent" });
-      return started;
+      const watched = recordWatchBaseline(deps, record, watch);
+      writeReq({ ...watched, state: "sent" });
+      return { record: watched, duplicate: false };
     }
     let toSend = record;
     if (previous !== null && previous.state === "started") {
       const revived = await retryStarted(engine, deps, record);
       if (revived.delivered) {
         writeReq({ ...record, state: "sent" });
-        return started;
+        return { record, duplicate: true };
       }
       toSend = revived.record;
     }
-    await sendRecorded(engine, deps, toSend);
-    return { session: toSend.session, conversationId: started.conversationId };
+    toSend = recordWatchBaseline(deps, toSend, watch);
+    const status = await sendRecorded(engine, deps, toSend);
+    return { record: toSend, duplicate: status === "duplicate" };
   });
   return {
-    requestId, conversationId: result.conversationId, session: result.session, cwd: resolvedCwd, agent, ...choice,
+    requestId, conversationId: result.record.conversationId, session: result.record.session, cwd: resolvedCwd, agent, ...choice,
+    ...await watchAfterSend(deps, result.record, prompt, result.duplicate, watch),
     ...(!modelValidated ? { modelValidated: false } : {}),
     ...(permissionMode !== undefined ? { permissionMode } : {}),
-    ...(attach ? { attach: result.session } : {}),
+    ...(attach ? { attach: result.record.session } : {}),
   };
 }
 
 async function cmdSend(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<Record<string, unknown>> {
   const conversationId = requireConversationId(args);
+  const watch = sendWatchOptions(args);
+  if (watch !== undefined) validateWatchId(conversationId);
   if (args.flags.has("--cwd")) throw new ChatError(EXIT.usage, "unexpected_cwd", "send は --cwd を受け取りません（会話のフォルダで続ける）");
   if (args.flags.has("--model") || args.flags.has("--effort")) {
     throw new ChatError(EXIT.usage, "use_set_model", "send は --model / --effort を受け取りません（1 通だけに効かせる仕組みがありません）",
@@ -852,7 +904,7 @@ async function cmdSend(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<
       "利用者が ~/.tailii/bot.json の allowAuto を true にしたときだけ使える");
   }
   return withRequestLock(deps, requestId, () => sendLocked({
-    deps, requestId, conversationId, textHash, prompt, bot,
+    deps, requestId, conversationId, textHash, prompt, bot, watch,
     ...(requestedMode !== undefined ? { permissionMode: requestedMode as PermissionMode } : {}),
   }));
 }
@@ -860,15 +912,17 @@ async function cmdSend(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<
 async function sendLocked(input: {
   deps: ChatDeps; requestId: string; conversationId: string; textHash: string; prompt: string; bot: boolean;
   permissionMode?: PermissionMode;
+  watch?: WatchOptions;
 }): Promise<Record<string, unknown>> {
-  const { deps, requestId, conversationId, textHash, prompt, bot, permissionMode } = input;
+  const { deps, requestId, conversationId, textHash, prompt, bot, permissionMode, watch } = input;
   const previous = (deps.readRequest ?? readRequest)(requestId);
   if (previous !== null) assertSameRequest(previous, { kind: "send", conversationId, textHash });
   if (previous !== null && previous.state !== "started" && previous.state !== "starting") {
-    return { duplicate: true, requestId, conversationId, session: previous.session };
+    return { duplicate: true, requestId, conversationId, session: previous.session,
+      ...await watchAfterSend(deps, previous, prompt, true, watch) };
   }
   const config = deps.config();
-  const session = await withEngine(deps, async (engine) => {
+  const result = await withEngine(deps, async (engine) => {
     let record = previous !== null && previous.state === "started" ? previous : null;
     if (record === null) {
       const rows = await listConversations(engine);
@@ -909,14 +963,16 @@ async function sendLocked(input: {
       const revived = await retryStarted(engine, deps, record);
       if (revived.delivered) {
         (deps.writeRequest ?? writeRequest)({ ...record, state: "sent" });
-        return record.session;
+        return { record, duplicate: true };
       }
       record = revived.record;
     }
-    await sendRecorded(engine, deps, record);
-    return record.session;
+    record = recordWatchBaseline(deps, record, watch);
+    const status = await sendRecorded(engine, deps, record);
+    return { record, duplicate: status === "duplicate" };
   });
-  return { requestId, conversationId, session };
+  return { requestId, conversationId, session: result.record.session,
+    ...await watchAfterSend(deps, result.record, prompt, result.duplicate, watch) };
 }
 
 /** 送信の配送状態（delivered / pending / blocked / uncertain / deleted / unknown）。照会できなければ unknown。 */
@@ -1063,6 +1119,89 @@ function intFlag(args: ParsedArgs, name: string, fallback: number, min: number, 
     throw new ChatError(EXIT.usage, "out_of_range", `${name} は ${min}〜${max} の整数`);
   }
   return value;
+}
+
+async function cmdWatch(args: ParsedArgs, deps: ChatDeps): Promise<{ payload: Record<string, unknown>; human: string }> {
+  const [verb, ...positional] = args.positional;
+  let allowed: string[];
+  switch (verb) {
+    case "add": allowed = ["--mode", "--ttl", "--request-id", "--read-cursor", "--note"]; break;
+    case "list": allowed = ["--all"]; break;
+    case "update": allowed = ["--mode", "--ttl", "--note"]; break;
+    case "remove": allowed = ["--reason"]; break;
+    case "poll": allowed = []; break;
+    case "ack": allowed = ["--token", "--read-cursor"]; break;
+    default: throw new ChatError(EXIT.usage, "unknown_watch_verb", "watch の動詞は add / list / update / remove / poll / ack です");
+  }
+  for (const flag of args.flags.keys()) {
+    if (flag !== "--json" && !allowed.includes(flag)) {
+      throw new ChatError(EXIT.usage, "unsupported_option", `${flag} は watch ${verb} では使えません`);
+    }
+  }
+  if (verb === "list" || verb === "poll") {
+    if (positional.length > 0) throw new ChatError(EXIT.usage, "extra_argument", `余分な引数があります: ${positional[0]}`);
+    if (verb === "list") {
+      const watches = listWatches(deps, args.flags.has("--all"));
+      const human = watches.map((watch) =>
+        `${watch.conversationId}  ${watch.agent}  ${watch.mode}  未受領 ${watch.pending}` +
+        (watch.closed === undefined ? "" : `  終了: ${watch.closed.reason}`) +
+        (watch.note === null ? "" : `  ${watch.note.replace(/[\r\n]+/g, " ")}`)).join("\n");
+      return { payload: { watches }, human: human || "（見張りがありません）" };
+    }
+    const payload = await pollWatches(deps);
+    const lines = payload.items.flatMap((item) => item.reasons.map((reason) => `- ${item.conversationId}  ${reason.kind}`));
+    for (const error of payload.errors ?? []) lines.push(`- ${error.conversationId}  エラー: ${error.message}`);
+    return { payload, human: lines.join("\n") || "（変化がありません）" };
+  }
+  const id = requireConversationId({ positional, flags: args.flags });
+  validateWatchId(id);
+  const cursor = flagString(args, "--read-cursor");
+  if (cursor !== undefined) withCursorErrors(id, () => parseCursor(cursor));
+  if (verb === "ack") {
+    const raw = flagString(args, "--token");
+    const token = raw !== undefined && /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
+    if (!Number.isSafeInteger(token)) throw new ChatError(EXIT.usage, "bad_token", "--token は poll が返した番号を指定してください");
+    const payload = await changeWatch(deps, id, { kind: "ack", token, readCursor: cursor });
+    return { payload, human: `受け取りました: ${id}` };
+  }
+  if (verb === "remove") {
+    const reason = flagString(args, "--reason");
+    if (!isWatchRemoveReason(reason)) {
+      throw new ChatError(EXIT.usage, "bad_watch_reason", "--reason は done / handed_over / boss_stop / other から指定してください");
+    }
+    const payload = await changeWatch(deps, id, { kind: "remove", reason });
+    return { payload, human: `見張りを閉じました: ${id}（${reason}）` };
+  }
+  const rawMode = flagString(args, "--mode");
+  const mode = verb === "add" || rawMode !== undefined ? watchModeOf(rawMode, "--mode") : undefined;
+  const ttlMinutes = intFlag(args, "--ttl", 1440, 1, 10080);
+  // メモは --note を付けたときだけ標準入力から読む（付けていないのに読むと、標準入力が閉じない呼び方で止まる）。
+  let note: string | undefined;
+  if (args.flags.has("--note")) {
+    const stdin = deps.readStdin();
+    if (stdin === null || stdin.trim().length === 0) {
+      throw new ChatError(EXIT.usage, "empty_note", "--note を付けたときは、メモを標準入力で渡してください");
+    }
+    note = watchNote(stdin.trim(), 2000);
+  }
+  if (verb === "update") {
+    const ttl = args.flags.has("--ttl") ? ttlMinutes : undefined;
+    if (mode === undefined && ttl === undefined && note === undefined) {
+      throw new ChatError(EXIT.usage, "missing_watch_update", "--mode、--ttl、--note（メモは標準入力）のいずれかを指定してください");
+    }
+    const payload = await changeWatch(deps, id, { kind: "update", mode, ttlMinutes: ttl, note });
+    return { payload, human: `見張りを更新しました: ${id}` };
+  }
+  const lastRequestId = args.flags.has("--request-id") ? requestIdOf(args, false) : undefined;
+  if (lastRequestId !== undefined) {
+    const record = deps.readRequest !== undefined
+      ? deps.readRequest(lastRequestId) : readRequest(lastRequestId, deps.requestsDir);
+    if (record?.conversationId !== id) {
+      throw new ChatError(EXIT.notFound, "request_not_found", "この会話への依頼 ID の記録がありません");
+    }
+  }
+  const payload = await registerWatch(deps, id, { mode: mode!, ttlMinutes, note, lastRequestId, readCursor: cursor });
+  return { payload, human: `見張りを登録しました: ${id}` };
 }
 
 /**
@@ -1227,17 +1366,13 @@ async function hasPendingQuestionOn(engine: EngineConnection, deps: ChatDeps, co
 
 /** 会話 id を収容している Tailii の会話名（メタから）。 */
 function conversationSessionNames(deps: ChatDeps, conversationId: string): string[] {
-  return deps.store().all()
-    .filter((meta) => meta.providerSessionId === conversationId || meta.claudeSessionId === conversationId)
-    .map((meta) => meta.name);
+  return sessionNamesForConversation(deps.store(), conversationId);
 }
 
 function pendingApprovalsOf(deps: ChatDeps, conversationId: string): PendingApprovalRecord[] {
   const base = deps.approvalsBase ?? defaultApprovalsBase();
   return conversationSessionNames(deps, conversationId).flatMap((session) => listPendingApprovals(session, base));
 }
-
-interface PendingQuestion { session: string; id: string; questions: QuestionPromptQuestion[] }
 
 /** hub に、会話名がいま待っている設問を聞く。 */
 async function pendingQuestionOn(engine: EngineConnection, session: string): Promise<PendingQuestion | null> {
@@ -1246,18 +1381,6 @@ async function pendingQuestionOn(engine: EngineConnection, session: string): Pro
     isType("chat_pending_query_result", id), 10_000);
   if (reply.type !== "chat_pending_query_result") throw engineFailure(reply, "設問の確認");
   return reply.question !== undefined ? { session, ...reply.question } : null;
-}
-
-function questionView(question: PendingQuestion): Record<string, unknown> {
-  return {
-    questionId: question.id,
-    questions: question.questions.map((entry, index) => ({
-      number: index + 1, header: entry.header, question: entry.question, multiSelect: entry.multiSelect,
-      options: entry.options.map((option, optionIndex) => ({
-        choice: optionIndex + 1, label: option.label, ...(option.description.length > 0 ? { description: option.description } : {}),
-      })),
-    })),
-  };
 }
 
 /**
@@ -1275,10 +1398,7 @@ async function waitingDetails(
     return {
       state: "waiting_approval",
       detail: {
-        approvals: approvals.map((approval) => ({
-          approvalId: approval.id, tool: approval.tool, summary: approval.summary,
-          ...(approval.agentType !== undefined ? { agentType: approval.agentType } : {}),
-        })),
+        approvals: approvalViews(approvals),
       },
     };
   }
@@ -1898,7 +2018,7 @@ async function cmdAttach(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promis
 
 // ---------------------------------------------------------------------------------------------------------------
 
-const USAGE = `usage: tailii-host chat <list|models|new|send|set-model|set-mode|status|read|search|answer|approve|take-over|attach> [options]
+const USAGE = `usage: tailii-host chat <list|models|new|send|set-model|set-mode|status|read|search|watch|answer|approve|take-over|attach> [options]
   AI エージェント（Bot）は tailii-host agent-guide を読んで、必ず --json を付ける。
   端末が無い（パイプで指示を渡すなど）ときは Bot として扱い、--request-id が要る。
   list [--live] [--json]
@@ -1907,6 +2027,13 @@ const USAGE = `usage: tailii-host chat <list|models|new|send|set-model|set-mode|
   status <conversationId> [--after <依頼ID>] [--wait <秒>] [--json]
   read <conversationId> [--last <件数> | --after <カーソル> | --before <カーソル>] [--limit <件数>] [--max-text <バイト>] [--json]
   search <conversationId> --query <語> [--context <件数>] [--limit <件数>] [--before <カーソル>] [--json]
+  watch add <conversationId> --mode continue|notify [--ttl <分>] [--request-id <ID>] [--read-cursor <カーソル>] [--note] [--json]   --note はメモを標準入力から読む
+  watch list [--all] [--json]
+  watch update <conversationId> [--mode continue|notify] [--ttl <分>] [--note] [--json]
+  watch remove <conversationId> --reason done|handed_over|boss_stop|other [--json]
+  watch poll [--json]
+  watch ack <conversationId> --token <番号> [--read-cursor <カーソル>] [--json]
+  new … / send … [--watch continue|notify [--watch-ttl <分>]]
   answer <conversationId> <設問ID> --choice <番号> [--other <文>] [--json]
   approve <conversationId> <承認ID> allow|deny [--reason <理由>] [--json]
   take-over <conversationId> [--interrupt] [--yes] [--no-attach] [--json]
@@ -1933,7 +2060,7 @@ export async function runChat(argv: string[], deps: ChatDeps): Promise<number> {
       deps.write(USAGE);
       return verb === undefined ? EXIT.usage : EXIT.ok;
     }
-    const args = parseArgs(rest);
+    const args = parseArgs(rest, verb);
     switch (verb) {
       case "list": {
         const payload = await cmdList(args, deps);
@@ -1976,6 +2103,11 @@ export async function runChat(argv: string[], deps: ChatDeps): Promise<number> {
         const hits = payload["hits"] as SearchHit[];
         render(deps, json, payload, hits.map((hit) => `${elementHeading(hit)}\n${hit.excerpt}`).join("\n\n") ||
           "（見つかりません）");
+        return EXIT.ok;
+      }
+      case "watch": {
+        const { payload, human } = await cmdWatch(args, deps);
+        render(deps, json, payload, human);
         return EXIT.ok;
       }
       case "answer": {

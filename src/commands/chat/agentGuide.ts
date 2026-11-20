@@ -103,6 +103,42 @@ export const AGENT_GUIDE = `# tailii-host chat — AI エージェント向け�
     Tailii の外（利用者の端末など）で動いている会話を終了させて Tailii で開き直す。bot.json の allowTakeOver が true で、
     相手が待機中のときだけ（処理中は終了コード 4）。
 
+## 会話の見張り（chat watch）
+- 会話を始めた後、返答が出そろったときや、設問・承認で止まったときに気づくための仕組み。始めた人や作業フォルダを問わず、
+  会話 ID を指定して見張れる。continue は続きを進めるとき、notify はターンの終了・途中停止・削除・期限切れだけ知りたいとき。
+- chat watch add <会話ID> --mode continue|notify [--ttl <分>] [--request-id <依頼ID>] [--read-cursor <カーソル>] [--note] --json
+    見張りを登録する。依頼元や目的は、--note を付けて標準入力にメモとして渡す（上限 2000 文字。--note が無ければ標準入力は
+    読まない）。メモは poll の応答にそのまま返るので、後で起こされたときに何の見張りかが分かる。同じ会話を登録し直すと期限を数え直し、
+    未受領の変化を引き継ぐ。依頼 ID はその会話への記録があるもの。カーソルは read と同じ <seq>:<atMs> または <seq>。
+- chat new … / chat send … --watch continue|notify [--watch-ttl <分>] --json  < 指示文
+    受け付けられたら見張りを登録し、応答の watch に mode と expiresAtMs を返す。依頼 ID を控え、メモが無ければ指示文の冒頭を入れる。
+    開いている見張りがある会話へ送ると、それまでに起こされた変化は受領済みになる（ack を兼ねる）。
+    同じ依頼 ID の打ち直しでは、開いている見張りがあるときはその設定を使う。
+- chat watch list [--all] --json
+    開いている見張りを一覧にする。pending は未受領の変化の数。--all で閉じた見張りも表示する（30 日分）。
+- chat watch update <会話ID> [--mode continue|notify] [--ttl <分>] [--note] --json
+    モード・期限・メモ（--note を付けて標準入力で渡す）のうち指定したものを変え、未受領の変化を受領済みにする。
+- chat watch remove <会話ID> --reason done|handed_over|boss_stop|other --json
+    見張りを閉じる。done は目的を達成した、handed_over は利用者に引き継いだ、boss_stop は利用者の指示で止めた、other はその他。
+- chat watch poll --json
+    フックなどから繰り返し呼び、wake: true のとき items を処理する。nextPollSec（処理中・入力待ち・未受領ありは 30、待機は 120、
+    見張りなしは 300）秒後にまた呼ぶ。items[].note と reasons を見て次にすることを判断する。
+    - turn_ended: ターンが終わった。outcome は completed / interrupted / unknown。この版は状態の照合で判断するため、
+      API エラーで終わったターンも completed になり、エラー文は返答の本文に入る。unknown は返答が増えないまま待機に戻った。
+    - question: 設問への回答待ち。waiting.question に中身がある。
+    - approval: 承認待ち。waiting.approvals に中身がある。
+    - waiting_other: 画面での確認など、設問・承認以外の入力待ちが続いている。
+    - human_activity: 利用者がアプリから発話を届けた（detail: message）。端末へ直接打った発話は chat read の source で見分ける。
+    - stopped_mid_turn: 処理中か入力待ちの Claude の会話が、新しい返答を残さず止まった。
+    - deleted: 会話の記録が無くなり、見張りを閉じた。
+    - expired: 期限切れで見張りを閉じた。unacked: true は未受領の変化が残っていた印。
+    返答は chat status <会話ID> --after <lastRequestId> --json か、chat read <会話ID> --after <readCursor> --json で読む。
+- chat watch ack <会話ID> --token <トークン> [--read-cursor <カーソル>] --json
+    処理が済んだら items[].token を渡す。その番号までを受領済みにし、--read-cursor があれば読んだ位置を控える。
+    未受領のまま 10 分たつと redelivery: true で起こし直す（3 回まで）。新しい変化が増えたときはすぐ起こす。
+- 期限は既定 24 時間、上限 7 日（1〜10080 分）。期限切れと削除は 1 回起こしてから閉じる。closed.reason に理由が載る。
+  会話を止めても見張りは続く。watch_busy（終了コード 6）は少し待って打ち直す。
+
 ## 承認できる人が居ないとき
 - このコマンドが起動した会話（new・take-over など）で、iPhone のアプリがつながっておらず、通知を受ける端末も無く、Bot の承認も許されていなければ、
   ツールの承認は待たずに拒否され、Claude には「許可の要らない方法で進めるか、止めて報告する」と伝わる。

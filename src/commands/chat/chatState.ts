@@ -8,6 +8,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { claudeProjectSlug } from "../../shared/paths.js";
 import { locateClaudeTranscript } from "../../sessions/claudeTranscriptLocator.js";
+import { ClaudeSessionStore } from "../../sessions/claudeSessionStore.js";
+import type { WatchBaseline } from "./chatWatch.js";
 import { defaultPeerSessionsDir, parsePeerSessionRecord } from "../../services/peerSessions.js";
 import { SessionMetadataStore } from "../../sessions/sessionMetadataStore.js";
 import { normalizeUtteranceForMatch } from "../../hub/chatDeliveryLog.js";
@@ -152,6 +154,8 @@ export interface RequestRecord {
   effort?: string;
   /** 指定した許可モード（`set-mode`）。同じ依頼 ID の使い回しの照合にも使う。 */
   mode?: string;
+  /** `--watch` 付きの送信前の控え。配送確認の打ち直しでも最初の控えを使う。 */
+  watchBaseline?: WatchBaseline;
 }
 
 /** Codex の turn の設定（`codex_turn_start` の approvalPolicy / sandbox / collaborationMode）。 */
@@ -253,18 +257,27 @@ export type ConversationState = "busy" | "waiting" | "idle" | "not_running";
 
 /** 会話の状態（Claude Code の登録簿の生存と status）。 */
 export function conversationState(conversationId: string, registryDir: string = defaultPeerSessionsDir()): ConversationState {
+  return conversationStateSnapshot(conversationId, registryDir).state;
+}
+
+/** 状態と、登録簿で分かる入力待ちの開始時刻。 */
+export function conversationStateSnapshot(conversationId: string, registryDir: string = defaultPeerSessionsDir()): {
+  state: ConversationState; waitingSinceMs?: number;
+} {
   let entries: string[];
   try {
     entries = fs.readdirSync(registryDir);
   } catch {
-    return "not_running";
+    return { state: "not_running" };
   }
   let state: ConversationState = "not_running";
   for (const entry of entries) {
     if (!/^\d+\.json$/.test(entry)) continue;
+    let raw: Record<string, unknown>;
     let record;
     try {
-      record = parsePeerSessionRecord(JSON.parse(fs.readFileSync(path.join(registryDir, entry), "utf8")));
+      raw = JSON.parse(fs.readFileSync(path.join(registryDir, entry), "utf8")) as Record<string, unknown>;
+      record = parsePeerSessionRecord(raw);
     } catch {
       continue;
     }
@@ -276,17 +289,21 @@ export function conversationState(conversationId: string, registryDir: string = 
     }
     // 登録簿の status は busy / shell（シェルのコマンドを実行中）/ waiting / idle（claudeLiveStatus.ts と同じ）。
     // shell は「ターンは終わり、背景のシェルが動いている」（claudeLiveStatus.ts）。返答は出そろっているので待機と同じに扱う。
-    if (record.status === "busy") return "busy";
-    if (record.status === "waiting") return "waiting";
+    if (record.status === "busy") return { state: "busy" };
+    if (record.status === "waiting") {
+      const waitingSinceMs = [raw["statusUpdatedAt"], raw["updatedAt"]]
+        .find((at): at is number => typeof at === "number" && Number.isFinite(at));
+      return { state: "waiting", waitingSinceMs };
+    }
     state = "idle";
   }
-  return state;
+  return { state };
 }
 
 /** 会話の記録ファイルを探す（Tailii のメタの作業フォルダ → 全プロジェクトの中から会話 id で）。 */
 export function findTranscript(
   conversationId: string,
-  options: { store?: SessionMetadataStore; projectsDir?: string; cwdHint?: string } = {},
+  options: { store?: SessionMetadataStore; projectsDir?: string; cwdHint?: string; resolveCwd?: boolean } = {},
 ): { file: string; cwd: string | null } | null {
   const projectsDir = options.projectsDir ?? path.join(os.homedir(), ".claude", "projects");
   const candidates: Array<string> = [];
@@ -298,6 +315,10 @@ export function findTranscript(
   for (const cwd of candidates) {
     const file = path.join(projectsDir, claudeProjectSlug(cwd), `${conversationId}.jsonl`);
     if (fs.existsSync(file)) return { file, cwd };
+  }
+  if (options.resolveCwd === false) {
+    const file = new ClaudeSessionStore(projectsDir).transcriptPath(conversationId);
+    return file === null ? null : { file, cwd: null };
   }
   // 会話中の `/cd` 等で移った会話（session-workdir-change）: 全 slug から会話 id で探し、会話ログが指す今のフォルダを添える。
   const located = locateClaudeTranscript(conversationId, null, { projectsDir });
