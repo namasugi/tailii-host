@@ -5,6 +5,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import { writePendingApproval } from "../src/approval/approvalMailbox.js";
 import { runChat, type ChatDeps } from "../src/commands/chat/chatCommand.js";
 import { codexRolloutBusy, conversationStateSnapshot, type RequestRecord } from "../src/commands/chat/chatState.js";
+import { pollWatches } from "../src/commands/chat/chatWatch.js";
 import { EngineTimeoutError } from "../src/commands/chat/engineClient.js";
 import { ChatEventLog } from "../src/hub/chatEventLog.js";
 import type { ControlMessage } from "../src/protocol.js";
@@ -401,6 +402,28 @@ describe("chat watch poll", () => {
     });
   });
 
+  test("処理中の Codex の記録は、書かれ続けても 10 秒に 1 回しか読み直さない（終わりの出来事があれば待たない）", async () => {
+    const h = harness("codex");
+    const writer = eventWriter(h);
+    writer.append({ type: "hub_started" });
+    h.append(codexEvent("task_started"));
+    const busy = vi.fn(codexRolloutBusy);
+    h.deps.watchCodexBusy = busy;
+    await h.add();
+    for (let second = 1; second <= 9; second++) {
+      h.advance(1_000);
+      h.append(codexEvent("agent_message", `途中 ${second}`));
+      expect((await h.poll()).wake).toBe(false);
+    }
+    // 最初の 1 回（登録の後に記録が変わった）だけ読み、その後 10 秒は読み直さない。
+    expect(busy).toHaveBeenCalledTimes(1);
+    h.advance(1_000);
+    h.append(codexEvent("agent_message", "返答"), codexEvent("task_complete"));
+    writer.append({ type: "turn_ended", outcome: "completed", session: SESSION, conversationId: ID, agent: "codex" });
+    expect(await h.poll()).toMatchObject({ items: [{ state: "idle", reasons: [{ kind: "turn_ended", outcome: "completed" }] }] });
+    expect(busy).toHaveBeenCalledTimes(2);
+  });
+
   test("Codex の処理中判定はサイズか更新時刻が変わったときだけ読む", async () => {
     const h = harness("codex");
     h.append(codexEvent("task_started"));
@@ -671,6 +694,8 @@ describe("見張りの出来事", () => {
         }
         if (message.type !== "question_answer") throw new Error("予期しない要求");
         writer.append({ type: "question_resolved", reason: "answered", questionId: message.id, ...sessionFields });
+        // hub が受理してから CLI が戻るまでの間に poll が走っても、Bot 自身の回答を人の回答として起こさない。
+        expect(await pollWatches(h.deps)).toMatchObject({ wake: false });
         return { type: "remote_pending_cleared", v: 2, id: message.id, session: SESSION, kind: "question" };
       },
     }) as Awaited<ReturnType<ChatDeps["connect"]>>;

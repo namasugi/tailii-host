@@ -106,3 +106,21 @@ test("書き手を作っただけではファイルに触らず、2 つの書き
     [1, "aaaaaaaa"], [2, "aaaaaaaa"], [3, "bbbbbbbb"], [4, "aaaaaaaa"], [5, "bbbbbbbb"],
   ]);
 });
+
+test("読み取りの塊の境をまたぐ多数の行を、順番どおり欠けなく読む", () => {
+  const file = logPath();
+  const writer = new ChatEventLog(file, { bootId: "cccccccc", now: () => 400 });
+  // 1 行の長さをばらつかせて、16 KiB の塊の境が行の途中・改行の直前直後に当たるようにする。
+  for (let index = 0; index < 1500; index++) {
+    writer.append({ type: "approval_requested", approvalId: `a-${index}`, tool: "T".repeat(index % 97),
+      session: "s-many", conversationId: "conv-多バイト", agent: "claude" });
+  }
+  const all = readChatEvents(file, { after: { seq: 0 }, limit: Infinity });
+  expect(all.events.map((event) => event.seq)).toEqual(Array.from({ length: 1500 }, (_unused, index) => index + 1));
+  expect(all.events.every((event, index) => event.type === "approval_requested" && event.approvalId === `a-${index}`)).toBe(true);
+  expect(all.gap).toBe(false);
+  // 途中のカーソルから、限られた件数を古い順に。
+  const page = readChatEvents(file, { after: { seq: 700, atMs: 400 }, limit: 5 });
+  expect(page.events.map((event) => event.seq)).toEqual([701, 702, 703, 704, 705]);
+  expect(page).toMatchObject({ hasMore: true, stale: false, gap: false });
+});

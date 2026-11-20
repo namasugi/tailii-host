@@ -48,7 +48,8 @@ export interface WatchBaseline {
   assistantElements: number;
   totalElements: number;
   seenLog: boolean;
-  codex?: Mark & { busy: boolean };
+  /** Codex の rollout を最後に読んだときの大きさ・更新時刻・処理中か。`checkedAtMs` は読んだ時刻。 */
+  codex?: Mark & { busy: boolean; checkedAtMs?: number };
 }
 
 type Reason = { atMs: number } & (
@@ -554,16 +555,24 @@ interface Observation {
   sessions: string[];
 }
 
+/** 処理中の Codex の rollout を読み直す間隔の下限（処理中は書かれ続け、判定には全体を読むため）。 */
+const CODEX_BUSY_RECHECK_MS = 10_000;
+
 function observe(
   deps: ChatDeps, record: WatchRecord, file: string | null, mark: Mark | null, questionsBySession: Map<string, PendingQuestion>,
+  now: number,
 ): Observation {
   const id = record.conversationId;
   const live = record.agent === "claude" ? claudeState(deps, id) : { state: "idle" as const };
   let state: WatchState = live.state;
   if (record.agent === "codex" && file !== null && mark !== null) {
     const cached = record.baseline.codex;
-    if (cached?.size !== mark.size || cached.mtimeMs !== mark.mtimeMs) {
-      record.baseline.codex = { ...mark, busy: (deps.watchCodexBusy ?? codexRolloutBusy)(file) };
+    const changed = cached?.size !== mark.size || cached.mtimeMs !== mark.mtimeMs;
+    // 処理中と分かっている間は、読み直しを間引く（`poll --wait` は毎秒確かめる）。終わりの出来事が届いていれば待たない。
+    const recentlyBusy = cached?.busy === true && cached.checkedAtMs !== undefined &&
+      now - cached.checkedAtMs < CODEX_BUSY_RECHECK_MS && record.turnEndHint === undefined;
+    if (changed && !recentlyBusy) {
+      record.baseline.codex = { ...mark, busy: (deps.watchCodexBusy ?? codexRolloutBusy)(file), checkedAtMs: now };
     }
     state = record.baseline.codex?.busy === true ? "busy" : "idle";
   }
@@ -656,6 +665,8 @@ function checkTurn(record: WatchRecord, state: WatchState, file: string, mark: M
   const wasActive = isActive(baseline.state) || record.turnCheckPending;
   const active = isActive(state);
   const hint = record.turnEndHint;
+  // 終わりの出来事（手がかり）があれば、書き込みから 10 秒の待ちも「記録が伸びていない」の見送りも省いて記録を読む。
+  // 記録を書かずに失敗するターン（API 作業が予算で断るなど）も、出来事だけを根拠に知らせるため。
   if (active || (hint === undefined && (now - mark.mtimeMs < 10_000 || (baseline.log?.size === mark.size && !wasActive)))) {
     baseline.state = state;
     record.turnCheckPending = !active && wasActive;
@@ -858,7 +869,7 @@ export async function pollWatches(deps: ChatDeps) {
           fast ||= isActive(record.baseline.state) || record.pending.length > 0;
           continue;
         }
-        const current = observe(deps, record, file, mark, questions);
+        const current = observe(deps, record, file, mark, questions, now);
         if (closed === "expired") {
           addReason(record, { kind: "expired", atMs: now, ...(record.pending.length > 0 ? { unacked: true } : {}) });
         } else if (closed === "deleted") {

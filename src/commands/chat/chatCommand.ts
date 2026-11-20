@@ -1555,6 +1555,9 @@ async function cmdAnswer(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promis
         "chat status で今待っているものを確かめる");
     }
     const answers = buildAnswers(target.questions, choiceRaw, other);
+    // 送る前に「Bot が答える設問」として見張りに控える。受理の後に控えると、その間に走った poll が、hub の書いた
+    // 「答えられた」を人の回答と読む。送信が失敗したら控えは残るが、その設問を人が答えたときに起こさないだけで済む。
+    if (bot) await recordWatchBotAnswer(deps, conversationId, questionId);
     const reply = await engine.request({ type: "question_answer", v: 2, id: questionId, session: target.session, answers },
       (message) => message.type === "remote_pending_cleared" && message.id === questionId, 20_000);
     if (reply.type === "error") {
@@ -1567,7 +1570,6 @@ async function cmdAnswer(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promis
       }
       throw new ChatError(EXIT.retryLater, reply.code, reply.message, "少し待って打ち直す");
     }
-    if (bot) await recordWatchBotAnswer(deps, conversationId, questionId);
     return { conversationId, questionId, answered: true };
   });
 }

@@ -131,8 +131,10 @@ export const AGENT_GUIDE = `# tailii-host chat — AI エージェント向け�
     - approval: 承認待ち。waiting.approvals に中身がある。
     - waiting_other: 画面での確認など、設問・承認以外の入力待ちが続いている。
     - usage_limit: 使用量制限の再開待ち。分かる場合は resumeAt に時刻がある。continue の見張りに返る。
-    - human_activity: 利用者の操作。detail は message（アプリの発話。count と lastAtMs 付き）、approval（アプリの承認判断）、
-      answer（アプリや端末での設問への回答）。端末への直接の発話は chat read の source で見分ける。
+    - human_activity: 利用者の操作。detail は message（アプリから発話が届いた。count と lastAtMs 付き）、approval（アプリで承認に
+      答えた）、answer（アプリや端末で設問に答えた）。利用者が会話を自分で進め始めた（引き取り）と読んでよいのは message だけ。
+      approval と answer は、止まっていた承認・設問を利用者が片付けたという知らせで、会話はそのまま進む。
+      端末への直接の発話は出来事にならないので、chat read の source で見分ける。
     - stopped_mid_turn: 処理中か入力待ちの Claude の会話が、新しい返答を残さず止まった。
     - deleted: 会話の記録が無くなり、見張りを閉じた。
     - expired: 期限切れで見張りを閉じた。unacked: true は未受領の変化が残っていた印。
@@ -141,6 +143,7 @@ export const AGENT_GUIDE = `# tailii-host chat — AI エージェント向け�
     処理が済んだら items[].token を渡す。その番号までを受領済みにし、--read-cursor があれば読んだ位置を控える。
     未受領のまま 10 分たつと redelivery: true で起こし直す（3 回まで）。新しい変化が増えたときはすぐ起こす。
 - 期限は既定 24 時間、上限 7 日（1〜10080 分）。期限切れと削除は 1 回起こしてから閉じる。closed.reason に理由が載る。
+  closed が付いた item は見張りがもう閉じているので、ack は要らない（打つと watch_not_found・終了コード 3）。
   会話を止めても見張りは続く。watch_busy（終了コード 6）は少し待って打ち直す。
 
 ## 出来事の履歴（chat events）

@@ -179,7 +179,8 @@ export function decodeEngineRelayLine(line: string): EngineRelayMessage<true> | 
         if (typeof session !== "string" || session.length === 0 || typeof id !== "string" || id.length === 0 ||
           (event !== "request" && event !== "resolved")) return null;
         return { type: "approval_event", session, id, event,
-          ...(typeof tool === "string" ? { tool } : {}),
+          // ツール名だけを通す（出来事の記録に長い文字列を書かない）。
+          ...(typeof tool === "string" && tool.length > 0 && tool.length <= 200 ? { tool } : {}),
           ...(decision === "allow" || decision === "deny" ? { decision } : {}),
           ...(by === "app" || by === "cli" || by === "timeout" || by === "terminal" ? { by } : {}) };
       }
