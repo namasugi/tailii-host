@@ -28,6 +28,8 @@ vi.mock("node:child_process", async (importOriginal) => ({
   ...await importOriginal<typeof import("node:child_process")>(),
   execFile: vi.fn(), spawn: vi.fn(),
 }));
+// herdr サーバーを直接起こす経路を、テスト実行元のログインに関係なく通す。
+vi.mock("../src/shared/loginSession.js", () => ({ loginSessionKind: async () => "screen" }));
 const { agentClampArgv, withAgentClampShellCommand } = await vi.importActual<typeof import("../src/shared/agentPriority.js")>(
   "../src/shared/agentPriority.js",
 );

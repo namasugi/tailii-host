@@ -65,6 +65,11 @@ export function resolveHubSocketPath(base?: string): string {
   return path.join(baseDir, "hub.sock");
 }
 
+/** hub が専用の herdr サーバーの起動依頼を受けるソケット。 */
+export function resolveHubSpawnSocketPath(base?: string): string {
+  return resolveSocketPath("hub-spawn", base);
+}
+
 /** session 名が安全かどうかを検証する（Swift 版 validateSessionName と同一規約）。 */
 function validateSessionName(session: string): void {
   if (session.length === 0) {

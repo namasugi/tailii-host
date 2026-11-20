@@ -11,8 +11,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { defaultHeartbeatDir } from "../sessions/heartbeat.js";
 import { startEngineRelaySocket, type EngineRelayServer } from "./engineRelaySocket.js";
+import { startHerdrServerSpawnSocket, type HerdrServerSpawnListener } from "./herdrServerSpawn.js";
 import { encodeHubMessage } from "./hubProtocol.js";
 import { ensureDirectory0700 } from "../shared/paths.js";
+import { loginSessionKind } from "../shared/loginSession.js";
 import { defaultChatDeliveryLogPath } from "./chatDeliveryLog.js";
 import { listPendingApprovals } from "../approval/approvalMailbox.js";
 import {
@@ -753,6 +755,7 @@ export async function runHubCommand(args: string[]): Promise<number> {
   hub.restoreChatReceipts({ startDrains: false });
   let socketServer: HubSocketServer | null = null;
   let relayServer: EngineRelayServer | null = null;
+  let herdrSpawnServer: HerdrServerSpawnListener | null = null;
 
   log(
     `起動 pid=${process.pid} version=${startupVersion ?? "?"} ` +
@@ -774,6 +777,15 @@ export async function runHubCommand(args: string[]): Promise<number> {
     fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, version: startupVersion }));
     hub.startRestoredDrains();
     relayServer = await startEngineRelaySocket({ onMessage: (message) => hub.handleRelayMessage(message), log });
+    if (process.platform === "darwin") {
+      const kind = await loginSessionKind();
+      log(`audit login_session kind=${kind}`);
+      try {
+        herdrSpawnServer = await startHerdrServerSpawnSocket({ screenLogin: kind === "screen" });
+      } catch (error) {
+        log(`herdr サーバー起動口の listen に失敗(継続): ${String(error)}`);
+      }
+    }
     // 起動を頼んだ engine は接続失敗後の backoff（最大 5 秒）の途中にいる。端末の無い API 会話では
     // 最初の tick が 0 件になり、listen 直後に自然終了すると接続前の起動→終了を繰り返す。
     const startupGraceUntil = Date.now() + 10_000;
@@ -804,6 +816,11 @@ export async function runHubCommand(args: string[]): Promise<number> {
     }
   } finally {
     previewLoad.close();
+    try {
+      await herdrSpawnServer?.close();
+    } catch (error) {
+      log(`herdr サーバー起動口の終了に失敗(継続): ${String(error)}`);
+    }
     // 実行中の注入を終わらせてから接続を閉じ、最後に lock を外す（graceful shutdown）。待っている間に重ねて届く
     // SIGTERM（版違いの engine が ensure のたびに送る）は abort を繰り返すだけで、待ちを打ち切らない。
     await shutdownHub({

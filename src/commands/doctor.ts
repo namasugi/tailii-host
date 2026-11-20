@@ -17,9 +17,10 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { defaultInjectedPath } from "./launch.js";
 import { resolveHerdrSessionName, resolveSessionBackendKind } from "../backend/sessionBackend.js";
-import { herdrRestartCommand } from "../backend/herdr.js";
+import { HERDR_DEFAULT_SESSION, HERDR_TAILII_SESSION, herdrRestartCommand } from "../backend/herdr.js";
 // 型だけ。実体は quicGateway が doctor の findCommand を import する循環を避けるため動的 import。
 import type { QuicGatewayServiceState } from "../services/quicGateway.js";
 import { ApnsConfigStore } from "../push/apnsConfigStore.js";
@@ -163,6 +164,68 @@ export function herdrStatusRestartNeeded(output: string): boolean | null {
   const match = /^\s*restart_needed:\s*(yes|no)\s*$/m.exec(output);
   if (match === null) return null;
   return match[1] === "yes";
+}
+
+/** `ps -axo pid=,command=` から、調べるセッションのサーバーだけを拾う。 */
+export function parseHerdrServerPids(output: string, sessions: readonly string[], herdrPath?: string): Map<string, number> {
+  const pids = new Map<string, number>();
+  for (const line of output.split("\n")) {
+    const match = /^\s*(\d+)\s+(.+)$/.exec(line.trimEnd());
+    if (match === null) continue;
+    const pid = Number(match[1]);
+    const command = match[2]!;
+    // ps では実行パスに含まれる空白もそのまま出る。分かっている herdr のパスなら照合できる。
+    const normalized = herdrPath !== undefined && command.startsWith(herdrPath + " ")
+      ? "herdr" + command.slice(herdrPath.length) : command;
+    const server = /^(?:\S*\/)?herdr\s+(?:--session\s+(\S+)\s+)?server$/.exec(normalized);
+    if (server === null || !Number.isSafeInteger(pid) || pid <= 0) continue;
+    const session = server[1] ?? HERDR_DEFAULT_SESSION;
+    if (sessions.includes(session) && !pids.has(session)) pids.set(session, pid);
+  }
+  return pids;
+}
+
+/** SSH の環境変数が残っているときだけ、起動元の診断行を作る。 */
+export function herdrServerLoginDoctorCheck(session: string, psOutput: string | null): DoctorCheck | null {
+  if (!/(?:^|\s)SSH_(?:CONNECTION|CLIENT|TTY)=/.test(psOutput ?? "")) return null;
+  return {
+    id: `herdr-server-login-${session}`,
+    label: `herdr サーバーの起動元(${session})`,
+    ok: false,
+    required: false,
+    detail: "SSH のログインから起動されているため、このサーバー内の会話ではログイン鍵束を使えず、実機向けの署名や鍵束に保存した資格情報を利用できません。",
+    remediation: session === HERDR_TAILII_SESSION
+      ? `${herdrRestartCommand(session)}（実行中の herdr 会話は終了します。次に会話を開くと画面のログイン側で起動し直します）`
+      : "画面のターミナルから herdr を起動し直す（実行中の herdr 会話は終了します）か、アプリの設定で herdr のセッションを tailii にしてください。",
+  };
+}
+
+const doctorExecFile = promisify(execFile);
+
+async function readHerdrPs(args: string[]): Promise<string | null> {
+  try {
+    const { stdout } = await doctorExecFile("/bin/ps", args, {
+      timeout: 1_000, killSignal: "SIGKILL", maxBuffer: 8 * 1024 * 1024,
+    });
+    return stdout;
+  } catch {
+    return null;
+  }
+}
+
+async function probeHerdrServerLogin(herdr: string, configuredSession: string): Promise<DoctorCheck[]> {
+  const listing = await readHerdrPs(["-axo", "pid=,command="]);
+  if (listing === null) return [];
+  const sessions = [...new Set([configuredSession, HERDR_TAILII_SESSION])];
+  const pids = parseHerdrServerPids(listing, sessions, herdr);
+  // 両方の環境を並行に読み、プロセス一覧の取得と合わせて約 2 秒に収める。
+  const checks = await Promise.all(sessions.map(async (session) => {
+    const pid = pids.get(session);
+    if (pid === undefined) return null;
+    const output = await readHerdrPs(["eww", "-o", "command=", "-p", String(pid)]);
+    return herdrServerLoginDoctorCheck(session, output);
+  }));
+  return checks.filter((check) => check !== null);
 }
 
 /**
@@ -464,6 +527,9 @@ export async function collectDoctorChecks(envPath: string = defaultInjectedPath(
   // 新しい会話を入れる herdr セッション（設定値, herdr-session-setting）のサーバーを見る。
   const herdrSession = resolveHerdrSessionName();
   const herdrRestartNeededPromise = probeHerdrServerRestartNeeded(herdr, envPath, herdrSession);
+  const herdrServerLoginPromise = process.platform === "darwin" && herdr !== null
+    ? probeHerdrServerLogin(herdr, herdrSession)
+    : Promise.resolve([]);
   const [tmuxVersion, herdrVersion, claudeVersion, codexVersion] = await Promise.all([
     probeVersion(tmux, ["-V"], envPath),
     probeVersion(herdr, ["--version"], envPath),
@@ -517,6 +583,7 @@ export async function collectDoctorChecks(envPath: string = defaultInjectedPath(
       });
     }
   }
+  checks.push(...await herdrServerLoginPromise);
 
   const claudeVersionOK = versionCompatibility(
     claude,

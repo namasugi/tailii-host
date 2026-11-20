@@ -45,6 +45,9 @@ import { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
 import { sleep } from "../shared/sleep.js";
 import { agentClampArgv, agentClampShellPrefix, withAgentClampShellCommand } from "../shared/agentPriority.js";
 import { DEFAULT_TMUX_PATH, paneCommandLooksLikeAgent } from "../backend/tmux.js";
+import { loginSessionKind, type LoginSessionKind } from "../shared/loginSession.js";
+import { ensureHubDaemonAsync } from "../hub/hubDaemonClient.js";
+import { requestHerdrServerSpawn, type HerdrServerSpawnResult } from "../hub/herdrServerSpawn.js";
 
 /** tmux 内で起動する既定コマンド（claude TUI）。テストでは無害な値に差し替える。 */
 export const DEFAULT_INNER_COMMAND = "claude";
@@ -1003,11 +1006,27 @@ function realHerdrWorkspaceKey(dir: string): string {
   }
 }
 
+/** SSH などから専用セッションを起こすときは、画面のログインにいる hub へ先に頼む。 */
+export async function ensureHerdrTailiiServerStarted(options: {
+  herdrSession: string;
+  platform?: NodeJS.Platform;
+  loginKind?: () => Promise<LoginSessionKind>;
+  ensureHub?: () => void | Promise<void>;
+  requestSpawn?: () => Promise<HerdrServerSpawnResult>;
+  spawnLocal: () => void;
+}): Promise<void> {
+  if (options.herdrSession === HERDR_TAILII_SESSION &&
+      (options.platform ?? process.platform) === "darwin" &&
+      await (options.loginKind ?? loginSessionKind)() !== "screen") {
+    await (options.ensureHub ?? ensureHubDaemonAsync)();
+    if (await (options.requestSpawn ?? requestHerdrServerSpawn)() === "started") return;
+  }
+  options.spawnLocal();
+}
+
 /**
- * herdr backend の起動実体。tmux の「死んだ同名セッション掃除 → デタッチ起動 → pane ID 記録」に
- * 対応する herdr 版。ユーザーの default セッションを汚さないよう、専用 named session
- * `tailii`（`--session` を全コマンドに前置）へ収容する:
- * 1. tailii セッションサーバーの ensure（不在ならヘッドレス起動）→
+ * herdr backend の起動実体。tmux の「死んだ同名セッション掃除 → デタッチ起動 → pane ID 記録」に対応する。
+ * 1. herdr セッションサーバーの ensure（不在なら専用の tailii をヘッドレス起動）→
  * 2. stale pane 掃除（claude が終了してシェル化した pane）→
  * 3. `tab create --cwd --env` で新タブ+pane 生成 → 4. `pane rename` で label=session 名 →
  * 5. `pane run "exec env -u HERDR_ENV /bin/zsh -lc '<inner>'"` で起動（長いときは一時スクリプト経由） → 6. backend/herdrPaneId 込みでメタ権威記録。
@@ -1116,12 +1135,6 @@ async function launchHerdrPane(options: {
     }
   }
   const runHerdr = (args: string[]) => runHerdrIn(herdrSession, args);
-  const spawnDetached =
-    options.spawnDetached ??
-    ((executable: string, args: string[]) => {
-      const child = spawn(executable, args, { detached: true, stdio: "ignore" });
-      child.unref();
-    });
 
   // --- 1. herdr セッションのサーバーの ensure（`pane list` が通れば稼働中） ---
   let paneList = await runHerdr(["pane", "list"]);
@@ -1171,7 +1184,19 @@ async function launchHerdrPane(options: {
     }
   }
   if (paneList.code !== 0) {
-    spawnDetached(options.herdrPath, ["--session", herdrSession, "server"]);
+    const args = ["--session", herdrSession, "server"];
+    const { spawnDetached } = options;
+    if (spawnDetached !== undefined) {
+      spawnDetached(options.herdrPath, args);
+    } else {
+      await ensureHerdrTailiiServerStarted({
+        herdrSession,
+        spawnLocal: () => {
+          const child = spawn(options.herdrPath, args, { detached: true, stdio: "ignore" });
+          child.unref();
+        },
+      });
+    }
     const deadline = Date.now() + 5000;
     const pollMs = options.ensurePollMs ?? 150;
     while (Date.now() <= deadline) {
