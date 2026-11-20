@@ -205,9 +205,9 @@ describe("EngineControl — 在席による画面プレビューの抑止", () =
     h.watch(desired);
     h.presence(state);
     await h.drain();
-    for (const bootId of ["hub-a", "hub-a", "hub-b"]) {
+    for (const [bootId, disconnectedAtMs] of [["hub-a", null], ["hub-a", 1_000], ["hub-b", 2_000]] as const) {
       h.send.mockClear();
-      h.hubLink.onReconnect?.({ bootId, disconnectedAtMs: 1_000 });
+      h.hubLink.onReconnect?.({ bootId, disconnectedAtMs });
       expect(h.send).toHaveBeenCalledWith({ type: "client_presence", deviceId: DEVICE_ID.toUpperCase(), state });
       expect(h.watchMessages()).toEqual(state === "foreground" && desired
         ? [{ type: "session_preview_watch", enabled: true }] : []);
@@ -215,7 +215,12 @@ describe("EngineControl — 在席による画面プレビューの抑止", () =
         type: "conversation_subscribe", session: "work", preview: true,
       }));
       h.emitPreview(preview("work", 1));
-      expect(await h.drain()).toEqual(state === "background" ? [] : [preview("work", 1)]);
+      // Hub の初回接続と再接続のたびに、送信待ちの状態を取り直すようアプリへ知らせる。
+      const written = await h.drain();
+      expect(written.filter((message) => message.type === "pending_message_state_reset"))
+        .toEqual([{ type: "pending_message_state_reset", v: 2, available: true }]);
+      expect(written.filter((message) => message.type !== "pending_message_state_reset"))
+        .toEqual(state === "background" ? [] : [preview("work", 1)]);
     }
     if (state === "background") {
       h.send.mockClear();

@@ -240,6 +240,8 @@ describe("SessionHub actor", () => {
     expect(await drain).toMatchObject({ inFlight: 1, drained: true });
     expect(injected).toEqual([]);
     expect(log).toContain("audit chat-inject-deferred session=work");
+    expect(received).toContainEqual({ type: "pending_message_state", session: "work",
+      clientMessageId: "client-booting", kind: "chat", state: "held" });
     expect(received).not.toContainEqual(expect.objectContaining({ type: "chat_send_result", id: "one" }));
     // 配送不明（uncertain）にしない。queued のまま残り、次の hub が明示再送を待たずに届ける。
     expect(JSON.parse(fs.readFileSync(receiptsPath, "utf8"))).toMatchObject({
@@ -659,6 +661,7 @@ describe("SessionHub actor", () => {
     await vi.waitFor(() => expect(received).toContainEqual({
       type: "chat_send_result", id: "one", status: "accepted",
     }));
+    expect(received).not.toContainEqual(expect.objectContaining({ type: "pending_message_state" }));
     expect(JSON.parse(fs.readFileSync(receiptsPath, "utf8"))).toMatchObject({
       sessions: { work: { delivered: ["client-1"], queued: [], injecting: [] } },
     });
@@ -973,6 +976,97 @@ describe("SessionHub actor", () => {
     expect(chatInjector).not.toHaveBeenCalled();
     hub.handleRelayMessage({ type: "question_event", session: "work", event: "dismiss", id: "q1" });
     await vi.waitFor(() => expect(chatInjector).toHaveBeenCalledWith("after answer", "work", expect.objectContaining({ recordedPromptText: expect.any(Function) })));
+  });
+
+  test("設問で保留したチャットは waiter と照会元に held、回答後に started を通知する", async () => {
+    let release!: () => void;
+    const injection = new Promise<void>((resolve) => { release = resolve; });
+    const chatInjector = vi.fn(async () => injection);
+    const hub = new SessionHub({ runner: async () => ok(""),
+      heartbeatDir: makeTempDir("hub-pending-message-state"), metadataStore: makeTempStore(),
+      timeoutSeconds: 1800, chatInjector, questionInjector: async () => {} });
+    hub.handleRelayMessage({ type: "question_event", session: "work", event: "prompt", id: "q1", questions: QUESTIONS });
+    const client = {}, joined = {}, observer = {}, unrelated = {};
+    const received: unknown[] = [], joinedReceived: unknown[] = [], observed: unknown[] = [], otherReceived: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.registerClient(joined, (line) => joinedReceived.push(decodeHubServerLine(line)));
+    hub.registerClient(observer, (line) => observed.push(decodeHubServerLine(line)));
+    hub.registerClient(unrelated, (line) => otherReceived.push(decodeHubServerLine(line)));
+    const message = { type: "chat_send", session: "work", clientMessageId: "client-1", text: "保留中" };
+    const held = { type: "pending_message_state", session: "work", clientMessageId: "client-1", kind: "chat", state: "held" };
+    const started = { ...held, state: "started" };
+    const finished = { ...held, state: "finished" };
+    const query = { type: "chat_receipt_query", session: "work", clientMessageId: "client-1", watchPendingMessage: true };
+    hub.handleClientMessage(client, JSON.stringify({ ...message, id: "send" }));
+    hub.handleClientMessage(joined, JSON.stringify({ ...message, id: "join" }));
+    hub.handleClientMessage(observer, JSON.stringify({ ...query, id: "held-query" }));
+    expect(received).toContainEqual(held);
+    expect(joinedReceived).toEqual([held]);
+    expect(observed).toEqual([held, { type: "chat_receipt_query_result", id: "held-query", status: "pending" }]);
+    expect(chatInjector).not.toHaveBeenCalled();
+
+    hub.handleClientMessage(client, JSON.stringify({ type: "question_answer_submit", id: "answer",
+      session: "work", questionId: "q1", answers: ANSWER }));
+    await vi.waitFor(() => expect(chatInjector).toHaveBeenCalledOnce());
+    expect(received).toContainEqual(started);
+    expect(joinedReceived).toContainEqual(started);
+    expect(observed).toContainEqual(started);
+    expect(otherReceived).not.toContainEqual(expect.objectContaining({ type: "pending_message_state" }));
+    hub.handleClientMessage(observer, JSON.stringify({ ...query, id: "started-query" }));
+    expect(observed.slice(-2)).toEqual([started,
+      { type: "chat_receipt_query_result", id: "started-query", status: "pending" }]);
+    release();
+    await vi.waitFor(() => expect(observed).toContainEqual(finished));
+    expect(joinedReceived).toContainEqual({ type: "chat_send_result", id: "join", status: "accepted" });
+    expect(observed).not.toContainEqual(expect.objectContaining({ type: "chat_send_result" }));
+  });
+
+  test("注入開始の受理記録を書けなければ、発話をキューへ戻して held を知らせる", () => {
+    let writes = 0;
+    const chatInjector = vi.fn(async () => {});
+    const hub = new SessionHub({ runner: async () => ok(""),
+      heartbeatDir: makeTempDir("hub-held-on-inject-write-failure"), metadataStore: makeTempStore(),
+      timeoutSeconds: 1800, chatInjector, chatReceiptsPath: path.join(makeTempDir("hub-held-receipts"), "receipts.json"),
+      chatReceiptsWriter: () => { if (++writes === 2) throw new Error("disk full"); } });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "send", session: "work",
+      clientMessageId: "client-1", text: "保留" }));
+    expect(chatInjector).not.toHaveBeenCalled();
+    expect(received).not.toContainEqual(expect.objectContaining({ type: "pending_message_state", state: "started" }));
+    expect(received).toContainEqual({ type: "pending_message_state", session: "work",
+      clientMessageId: "client-1", kind: "chat", state: "held" });
+    hub.handleClientMessage(client, JSON.stringify({ type: "pending_message_delete", id: "delete",
+      session: "work", clientMessageId: "client-1", kind: "chat" }));
+    expect(received).toContainEqual({ type: "pending_message_delete_result", id: "delete", status: "deleted" });
+  });
+
+  test("保存の失敗で止まった会話は、別の会話の保存が先に成功したあとでも定期処理で再開する", async () => {
+    let writes = 0;
+    const chatInjector = vi.fn(async () => {});
+    const hub = new SessionHub({ runner: async () => ok(""),
+      heartbeatDir: makeTempDir("hub-resume-after-other-save"), metadataStore: makeTempStore(),
+      timeoutSeconds: 1800, chatInjector,
+      chatReceiptsPath: path.join(makeTempDir("hub-resume-receipts"), "receipts.json"),
+      chatReceiptsWriter: () => { if (++writes === 2) throw new Error("disk full"); } });
+    const client = {}, received: unknown[] = [];
+    hub.registerClient(client, (line) => received.push(decodeHubServerLine(line)));
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "a", session: "work",
+      clientMessageId: "client-a", text: "止まる発話" }));
+    expect(received).toContainEqual({ type: "pending_message_state", session: "work",
+      clientMessageId: "client-a", kind: "chat", state: "held" });
+    // 別の会話の送信で保存が成功し、hub 共通の dirty が落ちる。
+    hub.handleClientMessage(client, JSON.stringify({ type: "chat_send", id: "b", session: "other",
+      clientMessageId: "client-b", text: "別の会話" }));
+    await vi.waitFor(() => expect(received).toContainEqual({
+      type: "chat_send_result", id: "b", status: "accepted",
+    }));
+    expect(chatInjector).not.toHaveBeenCalledWith("止まる発話", "work", expect.anything());
+
+    await hub.tick();
+    await vi.waitFor(() => expect(chatInjector).toHaveBeenCalledWith("止まる発話", "work", expect.anything()));
+    expect(received).toContainEqual({ type: "pending_message_state", session: "work",
+      clientMessageId: "client-a", kind: "chat", state: "started" });
   });
 
   // MARK: chat-cancel-choice（設問に答えずに送る）
@@ -4640,6 +4734,28 @@ describe("chat_receipt_query の Codex の turn（tailii-host chat の Codex 対
     query("q-two", "cli-two");
     expect(received).toContainEqual({ type: "chat_receipt_query_result", id: "q-one", status: "uncertain" });
     expect(received).toContainEqual({ type: "chat_receipt_query_result", id: "q-two", status: "pending", blocked: true });
+
+    const observer = {}, observed: unknown[] = [];
+    hub.registerClient(observer, (line) => observed.push(decodeHubServerLine(line)));
+    for (const clientMessageId of ["cli-one", "cli-two"]) {
+      hub.handleClientMessage(observer, JSON.stringify({
+        type: "chat_receipt_query", id: clientMessageId, session: "work", clientMessageId, watchPendingMessage: true,
+      }));
+    }
+    const held = { type: "pending_message_state", session: "work", clientMessageId: "cli-two", kind: "codex", state: "held" };
+    expect(observed).toEqual([
+      { type: "chat_receipt_query_result", id: "cli-one", status: "uncertain" },
+      held,
+      { type: "chat_receipt_query_result", id: "cli-two", status: "pending", blocked: true },
+    ]);
+
+    hub.handleClientMessage(client, JSON.stringify({
+      type: "codex_turn_submit", id: "retry-one", session: "work", text: "one", clientUserMessageId: "cli-one",
+      effort: null, sandbox: null, threadId: "thread-1", cwd: "/tmp/work", explicitRetry: true,
+    }));
+    await vi.waitFor(() => expect(observed.slice(3)).toEqual([
+      { ...held, state: "started" }, { ...held, state: "finished" },
+    ]));
   });
 });
 

@@ -660,6 +660,7 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
       push: 1,
       codexUpdate: 1,
       claudeUpdate: 1,
+      pendingMessageState: 1,
     });
 
     // ---- 1.5 画像 pending を drain し image_available を送出 ----
@@ -807,8 +808,19 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
 
     const rpcWaiters = new Map<string, (message: HubServerMessage) => void>();
     const rpcDisconnectFailures = new Map<string, () => void>();
+    const writePendingMessageState = (message: Extract<ControlMessage, {
+      type: "pending_message_state" | "pending_message_state_reset";
+    }>): void => {
+      if (state.clientKind === "cli") return;
+      try { writer.write(message); }
+      catch (error) { process.stderr.write(`[tailii-host engine] ${message.type} 書込失敗: ${String(error)}\n`); }
+    };
     hubLink.onMessage = (message) => {
       if (message.type === "hub_hello_ack") return;
+      if (message.type === "pending_message_state") {
+        writePendingMessageState({ ...message, v: state.negotiatedVersion });
+        return;
+      }
       if (message.type === "presence_ping") {
         // push 直前の生存確認（push v1 §6）。iOS がすぐ presence_pong で応える（presence_pong ハンドラが hub へ返す）。
         try { writer.write({ type: "presence_ping", v: state.negotiatedVersion, id: message.id }); }
@@ -1028,9 +1040,14 @@ export async function runEngine(options: RunEngineOptions): Promise<void> {
           reject(new Error("Session Hub link unavailable"));
         }
       });
+    hubLink.onDisconnect = () => {
+      writePendingMessageState({ type: "pending_message_state_reset", v: state.negotiatedVersion, available: false });
+    };
     hubLink.onReconnect = ({
       bootId, disconnectedAtMs, processingSessions: processingSnapshot, pendingQuestions, resumeHint,
     }) => {
+      // 初回 hello より先に届いた照会も、Hub が使えるようになった時点でやり直してもらう。
+      writePendingMessageState({ type: "pending_message_state_reset", v: state.negotiatedVersion, available: true });
       if (disconnectedAtMs !== null) {
         const failures = [...rpcDisconnectFailures.values()];
         rpcDisconnectFailures.clear();

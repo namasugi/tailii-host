@@ -1,3 +1,11 @@
 {"clientMessageId":"8966C951-9F4C-4E00-B5F3-C31BFF404715","id":"rq1","session":"s-80979d14","type":"chat_receipt_query","v":1}
 {"id":"rq1","status":"delivered","type":"chat_receipt_query_result","v":1}
 {"id":"rq2","status":"unknown","type":"chat_receipt_query_result","v":1}
+{"maxVersion":2,"pendingMessageState":1,"type":"channel_hello","v":1}
+{"clientMessageId":"turn-1","id":"rq3","session":"work","type":"chat_receipt_query","v":2,"watchPendingMessage":true}
+{"clientMessageId":"turn-1","kind":"codex","session":"work","state":"held","type":"pending_message_state","v":2}
+{"id":"rq3","status":"pending","type":"chat_receipt_query_result","v":2}
+{"clientMessageId":"turn-1","kind":"codex","session":"work","state":"started","type":"pending_message_state","v":2}
+{"clientMessageId":"turn-1","kind":"codex","session":"work","state":"finished","type":"pending_message_state","v":2}
+{"available":false,"type":"pending_message_state_reset","v":2}
+{"available":true,"type":"pending_message_state_reset","v":2}

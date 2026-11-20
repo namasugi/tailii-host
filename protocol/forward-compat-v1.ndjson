@@ -1,3 +1,6 @@
 {"maxVersion":2,"type":"channel_hello","v":2,"xFutureField":"decode は未知フィールドを無視する(この行はラウンドトリップ対象外)"}
 {"cwd":"/tmp","id":"fc1","summary":"ls","tool":"Bash","type":"approval_request","v":1,"xFutureFlag":true}
 {"id":"fc2","type":"host_update_request","v":2,"version":"9.9.9","xFutureNested":{"a":1}}
+{"maxVersion":2,"pendingMessageState":1,"type":"channel_hello","v":1,"xFutureCapability":2}
+{"clientMessageId":"turn-1","id":"fc3","session":"work","type":"chat_receipt_query","v":2,"watchPendingMessage":true,"xFutureFlag":true}
+{"clientMessageId":"turn-1","kind":"codex","session":"work","state":"held","type":"pending_message_state","v":2,"xFutureFlag":true}

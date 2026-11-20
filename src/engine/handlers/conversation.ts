@@ -163,6 +163,7 @@ export const conversationHandlers: HandlerRegistry = {
             id: message.id,
             session: message.session,
             clientMessageId: message.clientMessageId,
+            ...(message.watchPendingMessage === true ? { watchPendingMessage: true } : {}),
           },
           message.id,
           5_000,

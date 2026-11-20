@@ -127,8 +127,8 @@ export type HubClientMessage =
       cancelQuestionId?: string;
     }
   | { type: "pending_message_delete"; id: string; session: string; clientMessageId: string; kind: "chat" | "codex" }
-  /** Claude 発話の配送状態の照会（engine→hub, restored-receipt-probe）。何も登録しない。 */
-  | { type: "chat_receipt_query"; id: string; session: string; clientMessageId: string }
+  /** Claude 発話・Codex turn の受理記録の照会。送信は登録しない。 */
+  | { type: "chat_receipt_query"; id: string; session: string; clientMessageId: string; watchPendingMessage?: boolean }
   /** CLI のキューに溜まっている発話を今すぐ届ける（engine→hub, chat-send-now）。 */
   | { type: "chat_send_now"; id: string; session: string }
   | { type: "runtime_claim"; id: string; session: string }
@@ -267,6 +267,7 @@ export type HubServerMessage =
   | { type: "codex_cwd_result"; id: string; status: "ok" | "busy" | "unsupported" | "failed"; cwd?: string; error?: string }
   | { type: "chat_send_result"; id: string; status: "accepted" | "duplicate" | "failed"; error?: string }
   | { type: "pending_message_delete_result"; id: string; status: "deleted" | "not_found" | "processing" | "failed"; error?: string }
+  | Omit<Extract<ControlMessage, { type: "pending_message_state" }>, "v">
   | { type: "chat_receipt_query_result"; id: string; status: "delivered" | "deleted" | "uncertain" | "pending" | "unknown";
   /**
    * pending のとき、送信順の先頭に「届いたか分からない」別の送信が残っていて、それが解けるまで流れない（任意。CLI の
@@ -524,7 +525,8 @@ export function decodeHubClientLine(line: string): HubClientMessage | null {
     return typeof id === "string" && id.length > 0 &&
       typeof session === "string" && session.length > 0 &&
       typeof clientMessageId === "string" && clientMessageId.length > 0
-      ? { type: "chat_receipt_query", id, session, clientMessageId }
+      ? { type: "chat_receipt_query", id, session, clientMessageId,
+          ...(record["watchPendingMessage"] === true ? { watchPendingMessage: true } : {}) }
       : null;
   }
   if (record["type"] === "subagent_control") {
@@ -789,6 +791,13 @@ export function decodeHubServerLine(line: string): HubServerMessage | null {
       status,
       ...(typeof error === "string" ? { error } : {}),
     };
+  }
+  if (record["type"] === "pending_message_state") {
+    const { session, clientMessageId, kind, state } = record;
+    if (typeof session !== "string" || typeof clientMessageId !== "string" ||
+      (kind !== "chat" && kind !== "codex") ||
+      (state !== "held" && state !== "started" && state !== "finished")) return null;
+    return { type: "pending_message_state", session, clientMessageId, kind, state };
   }
   if (record["type"] === "chat_receipt_query_result") {
     const id = record["id"], status = record["status"];

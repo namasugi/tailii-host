@@ -272,14 +272,15 @@ export type ApiAgentHubCallbacks = Required<Pick<ApiAgentManagerOptions,
 
 interface SubscriberState { preview: boolean; backfilling: boolean }
 interface ReplayEvent { serverSeq: number; payload: ControlMessage }
-interface PendingChatSend {
-  message: Extract<HubClientMessage, { type: "chat_send" }>;
+interface PendingSend<Message> {
+  message: Message;
   waiters: Array<{ client: object; id: string }>;
+  /** 保留を知らせた waiter と、復元時の照会で通知を申し込んだ client。journal には保存しない。 */
+  stateClients?: Set<object>;
 }
-interface PendingCodexTurn {
-  message: Extract<HubClientMessage, { type: "codex_turn_submit" }>;
-  waiters: Array<{ client: object; id: string }>;
-}
+type PendingChatSend = PendingSend<Extract<HubClientMessage, { type: "chat_send" }>>;
+type PendingCodexTurn = PendingSend<Extract<HubClientMessage, { type: "codex_turn_submit" }>>;
+type PendingMessageState = Extract<HubServerMessage, { type: "pending_message_state" }>["state"];
 /** 履歴ページ用に全履歴を覚えておく会話の数。 */
 const HISTORY_PAGE_CACHE_LIMIT = 3;
 /** 履歴ページ用に覚えた全履歴を使い回す期間（遡り中の連続要求だけを速くし、メモリに長く残さない）。 */
@@ -979,6 +980,8 @@ export class SessionHub {
     const wasWatcher = this.previewWatchers.delete(client);
     for (const [session, actor] of this.actors) {
       actor.focusedBy.delete(client);
+      for (const entry of actor.pendingChatMessages.values()) entry.stateClients?.delete(client);
+      for (const entry of actor.pendingCodexTurns.values()) entry.stateClients?.delete(client);
       if (actor.runtimeClaim?.client === client) actor.runtimeClaim = null;
       // 作業フォルダの変更の途中で切れた engine の押さえは放す（送信待ちを止めたままにしない）。
       if (actor.workdirChange?.client === client) this.endWorkdirChange(session, actor);
@@ -1414,15 +1417,13 @@ export class SessionHub {
           });
           return;
         }
-        actor.codexDrainBlocked = false;
-        void this.drainCodexQueue(message.session, actor);
+        this.drainAndReportHeld(actor, retryEntry, client);
         return;
       }
       const pending = actor.pendingCodexTurns.get(message.clientUserMessageId);
       if (pending !== undefined) {
         pending.waiters.push({ client, id: message.id });
-        actor.codexDrainBlocked = false;
-        void this.drainCodexQueue(message.session, actor);
+        this.drainAndReportHeld(actor, pending, client);
         return;
       }
       const entry: PendingCodexTurn = { message, waiters: [{ client, id: message.id }] };
@@ -1439,8 +1440,7 @@ export class SessionHub {
         });
         return;
       }
-      actor.codexDrainBlocked = false;
-      void this.drainCodexQueue(message.session, actor);
+      this.drainAndReportHeld(actor, entry, client);
       return;
     }
     if (message.type === "codex_cwd_submit") {
@@ -1566,8 +1566,7 @@ export class SessionHub {
           });
           return;
         }
-        actor.chatDrainBlocked = false;
-        void this.drainChatQueue(message.session, actor);
+        this.drainAndReportHeld(actor, retryEntry, client);
         return;
       }
       const pending = actor.pendingChatMessages.get(message.clientMessageId);
@@ -1582,8 +1581,7 @@ export class SessionHub {
         // durable queue 内の同一入力。まだ注入完了ではないため duplicate と確定せず、
         // 完了 ACK を待つ RPC waiter として合流させる。
         pending.waiters.push({ client, id: message.id });
-        actor.chatDrainBlocked = false;
-        void this.drainChatQueue(message.session, actor);
+        this.drainAndReportHeld(actor, pending, client);
         return;
       }
       const entry: PendingChatSend = { message, waiters: [{ client, id: message.id }] };
@@ -1600,8 +1598,7 @@ export class SessionHub {
           });
           return;
         }
-      actor.chatDrainBlocked = false;
-      void this.drainChatQueue(message.session, actor);
+      this.drainAndReportHeld(actor, entry, client);
       return;
     }
     if (message.type === "chat_send_now") {
@@ -1669,6 +1666,9 @@ export class SessionHub {
       return;
     }
     if (message.type === "chat_receipt_query") {
+      if (message.watchPendingMessage === true) {
+        this.watchPendingMessage(message.session, message.clientMessageId, client);
+      }
       this.sendTo(client, {
         type: "chat_receipt_query_result", id: message.id,
         status: this.chatReceiptStatus(message.session, message.clientMessageId),
@@ -1768,8 +1768,9 @@ export class SessionHub {
     // pane へ安全に配送できず、同名再作成後へ旧 queue を持ち越してはならない。
     for (const session of result.demoted) this.retireSession(session, "Agent process ended");
     for (const session of result.reclaimed) this.retireSession(session, "Session disappeared");
-    if (this.chatReceiptsDirty && this.persistChatReceipts()) {
+    if (!this.chatReceiptsDirty || this.persistChatReceipts()) {
       // queued→injecting の保存だけが一時失敗した actor を、disk 回復後に自動再開する。
+      // 別の会話の保存が先に成功して dirty が落ちていても、止まった会話はここで再開する。
       for (const [session, actor] of this.actors) {
         if (actor.chatDrainBlocked) {
           actor.chatDrainBlocked = false;
@@ -1935,6 +1936,7 @@ export class SessionHub {
       this.broadcast({ type: "question_event", session, event: "dismiss", id: actor.pendingQuestion.id });
     }
     for (const entry of actor.pendingChatMessages.values()) {
+      this.publishPendingMessageState(entry, "finished");
       for (const waiter of entry.waiters) {
         this.sendTo(waiter.client, {
           type: "chat_send_result", id: waiter.id, status: "failed",
@@ -1944,6 +1946,7 @@ export class SessionHub {
       entry.waiters.length = 0;
     }
     for (const entry of actor.pendingCodexTurns.values()) {
+      this.publishPendingMessageState(entry, "finished");
       for (const waiter of entry.waiters) {
         this.sendTo(waiter.client, {
           type: "codex_turn_result", id: waiter.id, status: "failed",
@@ -3266,6 +3269,61 @@ export class SessionHub {
     return false;
   }
 
+  private drainAndReportHeld(actor: SessionActor, entry: PendingChatSend | PendingCodexTurn, client: object): void {
+    const { message } = entry;
+    // drain は最初の await より前に注入・開始の印を付ける。そこまで進んだ発話には held を送らない。
+    if (message.type === "chat_send") {
+      actor.chatDrainBlocked = false;
+      void this.drainChatQueue(message.session, actor);
+      if (actor.pendingChatMessages.get(message.clientMessageId) !== entry ||
+        actor.injectingChatMessageIds.has(message.clientMessageId)) return;
+    } else {
+      actor.codexDrainBlocked = false;
+      void this.drainCodexQueue(message.session, actor);
+      if (actor.pendingCodexTurns.get(message.clientUserMessageId) !== entry ||
+        actor.startingCodexMessageIds.has(message.clientUserMessageId)) return;
+    }
+    this.observePendingMessage(entry, client, "held");
+  }
+
+  private watchPendingMessage(session: string, clientMessageId: string, client: object): void {
+    const actor = this.actors.get(session);
+    if (actor === undefined) return;
+    const entry = actor.pendingChatMessages.get(clientMessageId) ?? actor.pendingCodexTurns.get(clientMessageId);
+    if (entry === undefined) return;
+    const started = actor.injectingChatMessageIds.has(clientMessageId) || actor.startingCodexMessageIds.has(clientMessageId);
+    this.observePendingMessage(entry, client, started ? "started" : "held");
+  }
+
+  private observePendingMessage(
+    entry: PendingChatSend | PendingCodexTurn, client: object, state: "held" | "started",
+  ): void {
+    if (!this.clients.has(client)) return;
+    (entry.stateClients ??= new Set()).add(client);
+    this.sendPendingMessageState(entry, client, state);
+  }
+
+  private sendPendingMessageState(
+    entry: PendingChatSend | PendingCodexTurn, client: object, state: PendingMessageState,
+  ): void {
+    const { message } = entry;
+    const identity = message.type === "chat_send"
+      ? { kind: "chat" as const, clientMessageId: message.clientMessageId }
+      : { kind: "codex" as const, clientMessageId: message.clientUserMessageId };
+    this.sendTo(client, { type: "pending_message_state", session: message.session, ...identity, state });
+  }
+
+  private publishPendingMessageState(entry: PendingChatSend | PendingCodexTurn, state: PendingMessageState): void {
+    if (state === "held") {
+      // 見送り・保存失敗でキューへ戻した場合は、まだ保留を知らせていない waiter にも知らせる。
+      const clients = new Set(entry.stateClients);
+      for (const waiter of entry.waiters) clients.add(waiter.client);
+      for (const client of clients) this.observePendingMessage(entry, client, state);
+    } else {
+      for (const client of entry.stateClients ?? []) this.sendPendingMessageState(entry, client, state);
+    }
+  }
+
   private deletePendingChatMessage(
     client: object,
     requestId: string,
@@ -3330,6 +3388,7 @@ export class SessionHub {
         error: "Message was deleted before processing",
       });
     }
+    this.publishPendingMessageState(entry, "finished");
     this.sendTo(client, {
       type: "pending_message_delete_result", id: requestId, status: "deleted",
     });
@@ -3401,6 +3460,7 @@ export class SessionHub {
         error: "Codex turn was deleted before processing",
       });
     }
+    this.publishPendingMessageState(entry, "finished");
     this.sendTo(client, {
       type: "pending_message_delete_result", id: requestId, status: "deleted",
     });
@@ -3533,8 +3593,10 @@ export class SessionHub {
                 error: "Session Hub injecting receipt write failed",
               });
             }
-            continue;
+            this.publishPendingMessageState(entry, "held");
+            break;
           }
+          this.publishPendingMessageState(entry, "started");
           const resolveCancelledQuestion = (): void => {
             if (cancelledQuestion === null || this.actors.get(session) !== actor ||
               actor.pendingQuestion?.id !== cancelledQuestion.id) return;
@@ -3572,6 +3634,7 @@ export class SessionHub {
               `chat delivered receipt 遅延永続化 session=${session} clientMessageId=${message.clientMessageId}`,
             );
           }
+          this.publishPendingMessageState(entry, "finished");
           for (const waiter of entry.waiters) {
             this.sendTo(waiter.client, { type: "chat_send_result", id: waiter.id, status: "accepted" });
           }
@@ -3586,6 +3649,7 @@ export class SessionHub {
             // アプリの明示再送が次の hub の queued へ合流する）。
             actor.chatQueue.unshift(entry);
             this.persistChatReceipts();
+            this.publishPendingMessageState(entry, "held");
             this.options.log?.(`audit chat-inject-deferred session=${auditValue(session)}`);
             continue;
           }
@@ -3613,6 +3677,7 @@ export class SessionHub {
             actor.uncertainChatMessages.set(message.clientMessageId, message);
           }
           this.persistChatReceipts();
+          this.publishPendingMessageState(entry, "finished");
           // 利用者向け文言だけを出す（`String(error)` は `LoginCodeError: …` と型名が前置される）。
           const userText = rejectedBeforeSend && error instanceof Error ? error.message : String(error);
           for (const waiter of entry.waiters) {
@@ -3758,8 +3823,10 @@ export class SessionHub {
               error: "Session Hub Codex starting receipt write failed",
             });
           }
+          this.publishPendingMessageState(entry, "held");
           break;
         }
+        this.publishPendingMessageState(entry, "started");
         this.codexStartsInFlight += 1;
         try {
           await this.startCodexTurn(entry, actor);
@@ -3809,6 +3876,7 @@ export class SessionHub {
           `Codex delivered receipt 遅延永続化 session=${message.session} clientUserMessageId=${message.clientUserMessageId}`,
         );
       }
+      this.publishPendingMessageState(entry, "finished");
       for (const waiter of entry.waiters) {
         this.sendTo(waiter.client, { type: "codex_turn_result", id: waiter.id, status: "started" });
       }
@@ -3826,6 +3894,7 @@ export class SessionHub {
         actor.uncertainCodexMessages.set(message.clientUserMessageId, message);
       }
       this.persistChatReceipts();
+      this.publishPendingMessageState(entry, "finished");
       for (const waiter of entry.waiters) {
         this.sendTo(waiter.client, {
           type: "codex_turn_result", id: waiter.id, status: "failed", error: String(error),
@@ -4704,7 +4773,7 @@ export class SessionHub {
       if (actor.uncertainChatMessages.has(clientMessageId)) return "uncertain";
       if (actor.pendingChatMessages.has(clientMessageId)) return "pending";
       // Codex の turn（`codex_turn_submit` の clientUserMessageId。`tailii-host chat` が Codex の送信を確かめる）。
-      // アプリは Codex の送信をこの照会に使わない。id は Claude の送信と重ならない。
+      // アプリは Codex の復元行の削除可否にもこの照会を使う。id は Claude の送信と重ならない。
       if (hasDeliveredReceipt(actor.deletedCodexMessageIds, clientMessageId)) return "deleted";
       if (hasDeliveredReceipt(actor.deliveredCodexMessageIds, clientMessageId)) return "delivered";
       if (actor.uncertainCodexMessages.has(clientMessageId)) return "uncertain";

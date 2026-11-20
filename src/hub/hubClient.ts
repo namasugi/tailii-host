@@ -32,6 +32,8 @@ export interface HubReconnectInfo {
  */
 export interface HubLink {
   onMessage: ((message: HubServerMessage) => void) | null;
+  /** 確立していた Hub リンクが切れた。 */
+  onDisconnect?: () => void;
   /** hello 完了時に購読を再送する。切断時刻は Hub 世代変更時の差分 backfill 境界。 */
   onReconnect: ((info: HubReconnectInfo) => void) | null;
   /**
@@ -245,6 +247,7 @@ export function connectHubSocket(options: {
       if (socket === candidate) socket = null;
       if (closed) return;
       if (connected && disconnectedAtMs === null) disconnectedAtMs = Date.now();
+      if (helloHandled) link.onDisconnect?.();
       const delay = retryMs;
       retryMs = Math.min(5_000, retryMs * 2);
       setTimeout(connect, delay).unref();

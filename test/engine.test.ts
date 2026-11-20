@@ -1383,31 +1383,90 @@ describe("EngineControl — 横断制御チャネル", () => {
     await engine.teardown();
   });
 
-  test("chat_receipt_query を Hub へ転送し結果を中継する", async () => {
+  test("chat_receipt_query の購読指定と、キュー状態・照会結果を中継する", async () => {
     const sent: unknown[] = [];
     const hubLink: HubLink = {
       onMessage: null, onReconnect: null,
       send(message) {
         sent.push(message);
         if (message.type === "chat_receipt_query") {
-          queueMicrotask(() => hubLink.onMessage?.({
-            type: "chat_receipt_query_result", id: message.id, status: "delivered",
-          }));
+          queueMicrotask(() => {
+            hubLink.onMessage?.({ type: "pending_message_state", session: message.session,
+              clientMessageId: message.clientMessageId, kind: "codex", state: "held" });
+            hubLink.onMessage?.({ type: "chat_receipt_query_result", id: message.id, status: "pending" });
+          });
         }
         return true;
       },
       close: vi.fn(),
     };
     const engine = startEngine({ sessionManager: makeManager(new MockTmuxRunner(() => ok(""))), hubLink });
-    await engine.lines.nextOfType("channel_hello");
-    engine.writeLine('{"clientMessageId":"client-1","id":"rq-1","session":"work","type":"chat_receipt_query","v":2}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("channel_hello"))).toMatchObject({ pendingMessageState: 1 });
+    engine.writeLine('{"clientMessageId":"client-1","id":"rq-1","session":"work","type":"chat_receipt_query","v":2,"watchPendingMessage":true}');
+    expect(decodeControlMessage(await engine.lines.nextOfType("pending_message_state"))).toEqual({
+      type: "pending_message_state", v: 2, session: "work", clientMessageId: "client-1", kind: "codex", state: "held",
+    });
     expect(decodeControlMessage(await engine.lines.nextOfType("chat_receipt_query_result"))).toEqual({
-      type: "chat_receipt_query_result", v: 2, id: "rq-1", status: "delivered",
+      type: "chat_receipt_query_result", v: 2, id: "rq-1", status: "pending",
     });
     expect(sent).toContainEqual({
-      type: "chat_receipt_query", id: "rq-1", session: "work", clientMessageId: "client-1",
+      type: "chat_receipt_query", id: "rq-1", session: "work", clientMessageId: "client-1", watchPendingMessage: true,
+    });
+    hubLink.onDisconnect?.();
+    expect(decodeControlMessage(await engine.lines.nextOfType("pending_message_state_reset"))).toEqual({
+      type: "pending_message_state_reset", v: 2, available: false,
+    });
+    hubLink.onReconnect?.({ bootId: "new", disconnectedAtMs: 1 });
+    expect(decodeControlMessage(await engine.lines.nextOfType("pending_message_state_reset"))).toEqual({
+      type: "pending_message_state_reset", v: 2, available: true,
     });
     await engine.teardown();
+  });
+
+  test("最初の受理照会が Hub の接続より先なら、初回 hello で照会のやり直しを促す", async () => {
+    let hubReady = false;
+    const hubLink: HubLink = {
+      onMessage: null, onReconnect: null,
+      send(message) {
+        if (!hubReady) return false;
+        if (message.type === "chat_receipt_query" && message.watchPendingMessage) {
+          queueMicrotask(() => {
+            hubLink.onMessage?.({ type: "pending_message_state", session: message.session,
+              clientMessageId: message.clientMessageId, kind: "chat", state: "held" });
+            hubLink.onMessage?.({ type: "chat_receipt_query_result", id: message.id, status: "pending" });
+          });
+        }
+        return true;
+      },
+      close: vi.fn(),
+    };
+    const engine = startEngine({ sessionManager: makeManager(new MockTmuxRunner(() => ok(""))), hubLink });
+    const query = (id: string) => engine.writeLine(JSON.stringify({
+      type: "chat_receipt_query", v: 2, id, session: "work",
+      clientMessageId: "restored", watchPendingMessage: true,
+    }));
+    try {
+      await engine.lines.nextOfType("channel_hello");
+      query("before-hello");
+      expect(decodeControlMessage(await engine.lines.nextOfType("error"))).toMatchObject({
+        id: "before-hello", code: "chat_receipt_query_failed",
+      });
+
+      hubReady = true;
+      hubLink.onReconnect?.({ bootId: "first", disconnectedAtMs: null });
+      expect(decodeControlMessage(await engine.lines.nextOfType("pending_message_state_reset"))).toEqual({
+        type: "pending_message_state_reset", v: 2, available: true,
+      });
+      query("after-hello");
+      expect(decodeControlMessage(await engine.lines.nextOfType("pending_message_state"))).toMatchObject({
+        session: "work", clientMessageId: "restored", kind: "chat", state: "held",
+      });
+      expect(decodeControlMessage(await engine.lines.nextOfType("chat_receipt_query_result"))).toMatchObject({
+        id: "after-hello", status: "pending",
+      });
+    } finally {
+      await engine.teardown();
+    }
   });
 
   test("chat_pending_query は Hub の状態（未回答の設問）を返す（chat 第 2 段）", async () => {
@@ -1769,7 +1828,7 @@ describe("EngineControl — 横断制御チャネル", () => {
     // latestClientBuild は記録が無くても host 版のピンを広告する（host 先行更新でも
     // 古いアプリへ更新導線を出すため）。push: 1 はプッシュ通知の登録を受け付ける能力（push v1）。
     expect(await engine.lines.nextOfType("channel_hello")).toBe(
-      `{"claudeUpdate":1,"codexUpdate":1,"latestClientBuild":"${CLIENT_BUILD_PIN}","managed":false,"maxVersion":2,"push":1,`
+      `{"claudeUpdate":1,"codexUpdate":1,"latestClientBuild":"${CLIENT_BUILD_PIN}","managed":false,"maxVersion":2,"pendingMessageState":1,"push":1,`
         + '"serverVersion":"0.1.0","type":"channel_hello","v":1}',
     );
     currentVersion = "0.2.0";

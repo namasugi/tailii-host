@@ -195,6 +195,7 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
         workdirChange: optionalNumber(raw, "workdirChange"),
         codexUpdate: optionalNumber(raw, "codexUpdate"),
         claudeUpdate: optionalNumber(raw, "claudeUpdate"),
+        pendingMessageState: optionalNumber(raw, "pendingMessageState"),
         clientKind: optionalString(raw, "clientKind") === "cli" ? "cli" as const : undefined,
       });
 
@@ -694,12 +695,27 @@ export function decodeControlMessage(line: string | Buffer): ControlMessage {
       return compact({ type, v, id: requireString(raw, "id"), status, error: optionalString(raw, "error") });
     }
 
+    case "pending_message_state": {
+      const kind = requireString(raw, "kind");
+      const state = requireString(raw, "state");
+      if (kind !== "chat" && kind !== "codex") throw new ProtocolDecodeError("missing-field", "kind");
+      if (state !== "held" && state !== "started" && state !== "finished") {
+        throw new ProtocolDecodeError("missing-field", "state");
+      }
+      return { type, v, session: requireString(raw, "session"),
+        clientMessageId: requireString(raw, "clientMessageId"), kind, state };
+    }
+
+    case "pending_message_state_reset":
+      return { type, v, available: requireBoolean(raw, "available") };
+
     case "chat_receipt_query":
       return {
         type, v,
         id: requireString(raw, "id"),
         session: requireString(raw, "session"),
         clientMessageId: requireString(raw, "clientMessageId"),
+        ...(raw["watchPendingMessage"] === true ? { watchPendingMessage: true } : {}),
       };
 
     case "chat_receipt_query_result": {

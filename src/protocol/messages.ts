@@ -718,6 +718,8 @@ export type ControlMessage =
       /** host → iOS: Codex 更新の確認・開始を受けられる。 */
       codexUpdate?: number;
       claudeUpdate?: number;
+      /** host → iOS: 送信待ちの削除可否を通知できる。 */
+      pendingMessageState?: number;
       /** 相手の種類（tailii-chat-cli）。"cli" は `tailii-host chat` で、会話の購読・在席の申告をしない。省略はアプリ。 */
       clientKind?: "cli" }
   | { type: "codex_update_request"; v: number; id: string; action: "check" | "install" }
@@ -905,12 +907,14 @@ export type ControlMessage =
   | { type: "chat_send_result"; v: number; id: string; status: "accepted" | "duplicate" | "failed"; error?: string }
   | { type: "pending_message_delete"; v: number; id: string; session: string; clientMessageId: string; kind: "chat" | "codex" }
   | { type: "pending_message_delete_result"; v: number; id: string; status: "deleted" | "not_found" | "processing" | "failed"; error?: string }
+  | { type: "pending_message_state"; v: number; session: string; clientMessageId: string; kind: "chat" | "codex";
+    state: "held" | "started" | "finished" }
+  | { type: "pending_message_state_reset"; v: number; available: boolean }
   /**
-   * Claude 発話（`chat_send` の clientMessageId）の配送状態を、何も登録せずに照会する（iOS→host,
-   * restored-receipt-probe）。`chat_send` と違い、未知の ID を新規として注入しない。iOS は ACK を
-   * 取りこぼしたまま復元された配送不明の Outbox を、delivered / deleted のときだけ解決する。
+   * Claude 発話・Codex turn の受理記録を照会する。未知の ID を新規として注入しない。
+   * watchPendingMessage を指定すると、現存する待ち行の状態とその変化も同じ接続へ通知する。
    */
-  | { type: "chat_receipt_query"; v: number; id: string; session: string; clientMessageId: string }
+  | { type: "chat_receipt_query"; v: number; id: string; session: string; clientMessageId: string; watchPendingMessage?: boolean }
   | { type: "chat_receipt_query_result"; v: number; id: string; status: "delivered" | "deleted" | "uncertain" | "pending" | "unknown";
     /**
      * pending のとき、送信順の先頭に「届いたか分からない」別の送信が残っていて、それが解けるまで流れない（任意。CLI の
