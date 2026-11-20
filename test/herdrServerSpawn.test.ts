@@ -47,7 +47,7 @@ async function sendRaw(input: string) {
   } finally { socket.destroy(); }
 }
 
-it("固定の依頼を受け、既定パスの tailii サーバーを環境から TMUX を外して起動する", async () => {
+it("セッション名を省いた依頼では既定パスで tailii を起動し、環境から TMUX を外す", async () => {
   vi.stubEnv("TMUX", "外側のソケット");
   vi.stubEnv("TMUX_PANE", "%17");
   const { spawnDetached } = await listen();
@@ -64,6 +64,14 @@ it("固定の依頼を受け、既定パスの tailii サーバーを環境か�
   expect(env).not.toHaveProperty("TMUX_PANE");
 });
 
+it("セッション名つきの依頼ではその名前を既定パスの herdr に渡す", async () => {
+  const { spawnDetached } = await listen();
+  expect(await requestHerdrServerSpawn("work.test_1", { socketPath })).toBe("started");
+  expect(spawnDetached).toHaveBeenCalledExactlyOnceWith(defaultHerdrPath(), ["--session", "work.test_1", "server"], {
+    detached: true, stdio: "ignore", env: expect.any(Object),
+  });
+});
+
 it("別の依頼、余分な項目、壊れた JSON、未完の行、4096 バイト超を断る", async () => {
   const { spawnDetached } = await listen();
   for (const line of [
@@ -75,6 +83,14 @@ it("別の依頼、余分な項目、壊れた JSON、未完の行、4096 バイ
     `${" ".repeat(4097 - Buffer.byteLength(request))}${request}\n`,
   ]) {
     expect(await sendRaw(line)).toEqual({ ok: false, reason: "bad-request" });
+  }
+  expect(spawnDetached).not.toHaveBeenCalled();
+});
+
+it("不正な herdr セッション名を断る", async () => {
+  const { spawnDetached } = await listen();
+  for (const session of [null, 1, {}, "", "-work", ".work", "work/name", "my work", "work\n", "x".repeat(65)]) {
+    expect(await sendRaw(JSON.stringify({ spawn: "herdr-server", session }) + "\n")).toEqual({ ok: false, reason: "bad-request" });
   }
   expect(spawnDetached).not.toHaveBeenCalled();
 });
@@ -97,7 +113,7 @@ it("画面のログイン以外の hub は起動せずに断り、クライア�
   const { spawnDetached } = await listen({ screenLogin: false });
   expect(await sendRaw(request + "\n")).toEqual({ ok: false, reason: "not-screen-login" });
   const start = performance.now();
-  expect(await requestHerdrServerSpawn({ socketPath, timeoutMs: 2_000 })).toBe("refused");
+  expect(await requestHerdrServerSpawn("tailii", { socketPath, timeoutMs: 2_000 })).toBe("refused");
   expect(performance.now() - start).toBeLessThan(1_000);
   expect(spawnDetached).not.toHaveBeenCalled();
 });
@@ -106,7 +122,7 @@ it("起動に失敗したときは断り、次の依頼で起動を試せる", a
   const spawnDetached = vi.fn().mockRejectedValueOnce(new Error("起動失敗")).mockResolvedValueOnce(41);
   await listen({ spawnDetached });
   expect(await sendRaw(request + "\n")).toEqual({ ok: false, reason: "spawn-failed" });
-  expect(await requestHerdrServerSpawn({ socketPath })).toBe("started");
+  expect(await requestHerdrServerSpawn("tailii", { socketPath })).toBe("started");
   expect(spawnDetached).toHaveBeenCalledTimes(2);
 });
 
@@ -122,7 +138,7 @@ it("依頼を送った接続が応答前に切れても、次の依頼に答え�
     socket.destroy();
     await closed;
     spawnResult.resolve(41);
-    expect(await requestHerdrServerSpawn({ socketPath })).toBe("started");
+    expect(await requestHerdrServerSpawn("tailii", { socketPath })).toBe("started");
     expect(spawnDetached).toHaveBeenCalledTimes(1);
   } finally {
     socket.destroy();
@@ -134,7 +150,7 @@ it("並行した依頼と直前 5 秒以内の依頼では同じ起動を使う"
   let now = 0;
   const spawnDetached = vi.fn(async () => { await sleep(30); return 41; });
   await listen({ now: () => now, spawnDetached });
-  const replies = await Promise.all([sendRaw(request + "\n"), sendRaw(request + "\n")]);
+  const replies = await Promise.all([sendRaw(request + "\n"), sendRaw('{"spawn":"herdr-server","session":"tailii"}\n')]);
   expect(replies).toEqual(expect.arrayContaining([{ ok: true, pid: 41 }, { ok: true }]));
   now = 4_999;
   expect(await sendRaw(request + "\n")).toEqual({ ok: true });
@@ -144,10 +160,34 @@ it("並行した依頼と直前 5 秒以内の依頼では同じ起動を使う"
   expect(spawnDetached).toHaveBeenCalledTimes(2);
 });
 
+it("別のセッションは起動中の依頼や直前 5 秒以内の起動に合流しない", async () => {
+  const tailiiSpawn = Promise.withResolvers<number>();
+  const spawnDetached = vi.fn(async (_executable: string, args: string[]) =>
+    args[1] === "tailii" ? tailiiSpawn.promise : 42,
+  );
+  await listen({ now: () => 0, spawnDetached });
+  const pending = sendRaw(request + "\n");
+  const settled = pending.catch(() => {});
+  try {
+    await vi.waitFor(() => expect(spawnDetached).toHaveBeenCalledTimes(1));
+    const workRequest = '{"spawn":"herdr-server","session":"work"}\n';
+    expect(await sendRaw(workRequest)).toEqual({ ok: true, pid: 42 });
+    expect(await sendRaw(workRequest)).toEqual({ ok: true });
+    tailiiSpawn.resolve(41);
+    expect(await pending).toEqual({ ok: true, pid: 41 });
+    expect(await sendRaw(request + "\n")).toEqual({ ok: true });
+    expect(await sendRaw('{"spawn":"herdr-server","session":"default"}\n')).toEqual({ ok: true, pid: 42 });
+    expect(spawnDetached.mock.calls.map(([, args]) => args[1])).toEqual(["tailii", "work", "default"]);
+  } finally {
+    tailiiSpawn.resolve(41);
+    await settled;
+  }
+});
+
 it("生きているソケットは引き継がず、close で接続とファイルを閉じる", async () => {
   const { server } = await listen();
   expect(await startHerdrServerSpawnSocket({ socketPath, screenLogin: false })).toBeNull();
-  expect(await requestHerdrServerSpawn({ socketPath })).toBe("started");
+  expect(await requestHerdrServerSpawn("tailii", { socketPath })).toBe("started");
   const socket = await connectUnixClient(socketPath);
   try {
     const reader = new SocketLineReader(socket);
@@ -164,11 +204,11 @@ it("停止したプロセスが残したソケットを取り除いて listen �
   expect(child.status, child.stderr).toBe(0);
   expect(statSync(socketPath).isSocket()).toBe(true);
   await listen();
-  expect(await requestHerdrServerSpawn({ socketPath })).toBe("started");
+  expect(await requestHerdrServerSpawn("tailii", { socketPath })).toBe("started");
 });
 
 it("クライアントは最初にソケットが無くても listen 開始までつなぎ直す", async () => {
-  const pending = requestHerdrServerSpawn({ socketPath, timeoutMs: 1_000, retryIntervalMs: 20 });
+  const pending = requestHerdrServerSpawn("tailii", { socketPath, timeoutMs: 1_000, retryIntervalMs: 20 });
   await sleep(70);
   await listen();
   expect(await pending).toBe("started");
@@ -176,7 +216,7 @@ it("クライアントは最初にソケットが無くても listen 開始ま�
 
 it("接続できないときは合計の上限まで待って unavailable を返す", async () => {
   const start = performance.now();
-  expect(await requestHerdrServerSpawn({ socketPath, timeoutMs: 120, retryIntervalMs: 20 })).toBe("unavailable");
+  expect(await requestHerdrServerSpawn("tailii", { socketPath, timeoutMs: 120, retryIntervalMs: 20 })).toBe("unavailable");
   const elapsed = performance.now() - start;
   expect(elapsed).toBeGreaterThanOrEqual(100);
   expect(elapsed).toBeLessThan(1_000);
@@ -186,7 +226,7 @@ it.each([undefined, "?\n"])("応答が読めなければ期限内に unavailable
   const fake = await startListener(socketPath);
   cleanup = () => fake.close();
   const start = performance.now();
-  const pending = requestHerdrServerSpawn({ socketPath, timeoutMs: 150, retryIntervalMs: 20 });
+  const pending = requestHerdrServerSpawn("tailii", { socketPath, timeoutMs: 150, retryIntervalMs: 20 });
   const socket = await fake.nextConnection(1_000);
   const reader = new SocketLineReader(socket);
   expect(await reader.nextLine(1_000)).toBe(request);

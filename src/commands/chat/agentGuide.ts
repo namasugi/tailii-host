@@ -27,7 +27,7 @@ export const AGENT_GUIDE = `# tailii-host chat — AI エージェント向け�
     Codex は sandbox が作業フォルダの中だけ書ける workspace-write で、許可モードを承認の方針に当てる（default=untrusted /
     acceptEdits=on-request / plan=on-request＋プランモード / auto=never）。take-over は Codex では使えない。
 - chat new … [--backend herdr|tmux] [--herdr-session <名前>]
-    起動先の明示（省略はアプリの設定）。明示した herdr セッションが動いていなければ、振り替えずに失敗する。
+    起動先の明示（省略はアプリの設定）。選んだ herdr セッションが停止中なら起動する。
 - chat status <conversationId> [--after <依頼ID>] [--wait <秒>] --json
     state（busy=処理中 / waiting_approval=ツールの承認待ち / waiting_answer=設問への答え待ち / waiting=その他の入力待ち /
     idle=待機 / not_running=止まっている）と reply（返答の文章）。model は直近の返答を作ったモデル（設定値ではないので、

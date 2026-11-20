@@ -17,7 +17,6 @@ import {
   type HerdrCommandResult,
   HERDR_LAUNCH_GRACE_SECONDS,
   HERDR_DEFAULT_SESSION,
-  HERDR_TAILII_SESSION,
   type HerdrPane,
   herdrRestartNeededMessage,
   herdrSessionOfMeta,
@@ -288,8 +287,7 @@ export type EngineLauncher = (
      */
     takeover?: LaunchTakeover | null;
     /**
-     * 起動先の明示（`tailii-host chat new --backend / --herdr-session`。tailii-chat-cli 第 2 段）。設定より優先し、
-     * herdr セッションを明示したときは、動いていなくても `tailii` へ振り替えずに起動失敗にする。開き直しの起動先が先。
+     * 起動先の明示（`tailii-host chat new --backend / --herdr-session`）。設定より優先する。開き直しの起動先が先。
      */
     placement?: { backend?: SessionBackendKind; herdrSession?: string } | null;
   },
@@ -554,8 +552,6 @@ export function makeSessionLauncher(options: {
           (typeof backendOption === "function" ? backendOption() : backendOption),
       herdrSession: launchOptions?.takeover?.herdr?.session ?? launchOptions?.placement?.herdrSession ??
         (typeof options.herdrSession === "function" ? options.herdrSession() : options.herdrSession ?? HERDR_DEFAULT_SESSION),
-      ...(launchOptions?.takeover?.herdr == null && launchOptions?.placement?.herdrSession !== undefined
-        ? { herdrSessionStrict: true } : {}),
       ...(launchOptions?.takeover != null
         ? {
             beforeRun: launchOptions.takeover.terminate,
@@ -712,16 +708,11 @@ export async function launchCore(options: {
   beforeRun?: () => Promise<boolean>;
   /** herdr: この pane と同じワークスペースに新しいタブを作る（peer-takeover の相手のタブ）。 */
   herdrPlacementPaneId?: string;
-  /**
-   * herdr セッションが明示された（`tailii-host chat new --herdr-session`）。動いていなくても `tailii` へ振り替えず、
-   * 理由を返して起動しない（tailii-chat-cli 第 2 段）。`tailii` 自身は Tailii のものなので従来どおり起動する。
-   */
-  herdrSessionStrict?: boolean;
   /** herdr セッションのソケットのファイルがあるか（テスト注入用。既定は実ファイル）。 */
   herdrSocketExists?: (herdrSession: string) => boolean;
   /** herdr 実行ファイルの絶対パス（backend=herdr のときのみ使用）。 */
   herdrPath?: string | null;
-  /** detached プロセス起動の注入点（herdr tailii セッションサーバーの ensure 用, テスト注入可）。 */
+  /** detached プロセス起動の注入点（herdr セッションサーバーの起動用）。 */
   spawnDetached?: (executable: string, args: string[]) => void;
   /** herdr ensure のポーリング待機 ms（テストは 0 に差し替え可能）。 */
   ensurePollMs?: number;
@@ -813,7 +804,6 @@ export async function launchCore(options: {
       herdrSession: options.herdrSession ?? HERDR_DEFAULT_SESSION,
       ...(options.beforeRun !== undefined ? { beforeRun: options.beforeRun } : {}),
       ...(options.herdrPlacementPaneId !== undefined ? { placementPaneId: options.herdrPlacementPaneId } : {}),
-      ...(options.herdrSessionStrict === true ? { herdrSessionStrict: true } : {}),
       ...(options.herdrSocketExists !== undefined ? { herdrSocketExists: options.herdrSocketExists } : {}),
       injectedPath: options.path,
       env,
@@ -1006,27 +996,26 @@ function realHerdrWorkspaceKey(dir: string): string {
   }
 }
 
-/** SSH などから専用セッションを起こすときは、画面のログインにいる hub へ先に頼む。 */
-export async function ensureHerdrTailiiServerStarted(options: {
+/** SSH などから herdr サーバーを起こすときは、デスクトップ側のログインにいる hub へ先に頼む。 */
+export async function ensureHerdrServerStarted(options: {
   herdrSession: string;
   platform?: NodeJS.Platform;
   loginKind?: () => Promise<LoginSessionKind>;
   ensureHub?: () => void | Promise<void>;
-  requestSpawn?: () => Promise<HerdrServerSpawnResult>;
+  requestSpawn?: (herdrSession: string) => Promise<HerdrServerSpawnResult>;
   spawnLocal: () => void;
 }): Promise<void> {
-  if (options.herdrSession === HERDR_TAILII_SESSION &&
-      (options.platform ?? process.platform) === "darwin" &&
+  if ((options.platform ?? process.platform) === "darwin" &&
       await (options.loginKind ?? loginSessionKind)() !== "screen") {
     await (options.ensureHub ?? ensureHubDaemonAsync)();
-    if (await (options.requestSpawn ?? requestHerdrServerSpawn)() === "started") return;
+    if (await (options.requestSpawn ?? requestHerdrServerSpawn)(options.herdrSession) === "started") return;
   }
   options.spawnLocal();
 }
 
 /**
  * herdr backend の起動実体。tmux の「死んだ同名セッション掃除 → デタッチ起動 → pane ID 記録」に対応する。
- * 1. herdr セッションサーバーの ensure（不在なら専用の tailii をヘッドレス起動）→
+ * 1. 収容先の herdr サーバーを確認（停止中ならヘッドレス起動）→
  * 2. stale pane 掃除（claude が終了してシェル化した pane）→
  * 3. `tab create --cwd --env` で新タブ+pane 生成 → 4. `pane rename` で label=session 名 →
  * 5. `pane run "exec env -u HERDR_ENV /bin/zsh -lc '<inner>'"` で起動（長いときは一時スクリプト経由） → 6. backend/herdrPaneId 込みでメタ権威記録。
@@ -1038,14 +1027,12 @@ async function launchHerdrPane(options: {
   innerCommand: string;
   agent: LaunchAgent;
   herdrPath: string;
-  /** 新しい会話を入れる herdr セッション名（設定値）。前の pane が別のセッションで生きていればそちらを使う。 */
+  /** 新しい会話を入れる herdr セッション名。前の pane が別のセッションで生きていればそちらを使う。 */
   herdrSession: string;
   /** 新しい pane を作って名前を付けた後、`pane run` の前に呼ぶ（peer-takeover）。false なら pane を閉じて起動しない。 */
   beforeRun?: () => Promise<boolean>;
   /** この pane と同じワークスペースに新しいタブを作る（peer-takeover の相手のタブ）。 */
   placementPaneId?: string;
-  /** herdr セッションの明示（動いていなければ振り替えずに起動失敗。tailii-chat-cli 第 2 段）。 */
-  herdrSessionStrict?: boolean;
   /** herdr セッションのソケットのファイルがあるか（テスト注入用。既定は実ファイル）。 */
   herdrSocketExists?: (herdrSession: string) => boolean;
   injectedPath: string;
@@ -1060,7 +1047,7 @@ async function launchHerdrPane(options: {
   recordCwd?: string | null;
   /** 会話の表示タイトル（session-title）。新規タブのラベルに使う（未命名は session 名）。 */
   displayTitle?: string | null;
-  /** detached プロセス起動の注入点（tailii セッションサーバーのヘッドレス起動用）。 */
+  /** detached プロセス起動の注入点（herdr セッションサーバーのヘッドレス起動用）。 */
   spawnDetached?: (executable: string, args: string[]) => void;
   /** ensure のポーリング待機（テストは 0ms に差し替え可能）。 */
   ensurePollMs?: number;
@@ -1157,39 +1144,13 @@ async function launchHerdrPane(options: {
     );
     return 1;
   }
-  if (paneList.code !== 0 && herdrSession !== HERDR_TAILII_SESSION && options.herdrSessionStrict === true) {
-    errorSink(
-      `tailii launch: herdr セッション '${herdrSession}' が動いていません。指定どおりに入れられないので起動していません` +
-        `（herdr --session ${herdrSession} で起動するか、指定を外してください）\n`,
-    );
-    return 1;
-  }
-  if (paneList.code !== 0 && herdrSession !== HERDR_TAILII_SESSION) {
-    // 専用セッション以外（herdr の既定 `default`・利用者が名前を付けたセッション）は利用者自身のもの。
-    // 動いていなければ Tailii は代わりに起こさず、専用の `tailii` に入れる（Fable レビュー B-2）。起こすと、
-    // 利用者の保存状態が裏で復元されて claude が自動再開したり、hub の環境がその後の pane へ引き継がれたりする。
-    herdrSession = HERDR_TAILII_SESSION;
-    paneList = await runHerdr(["pane", "list"]);
-    if (paneList.code !== 0 && herdrErrorCode(paneList.err) === "protocol_mismatch") {
-      errorSink(`tailii launch: ${herdrRestartNeededMessage(herdrSession)}\n`);
-      return 1;
-    }
-    if (paneList.code !== 0 && !serverNotRunning(paneList, herdrSession)) {
-      const detail = (paneList.err || paneList.out).trim().slice(0, 200);
-      errorSink(
-        `tailii launch: herdr セッション '${herdrSession}' に問い合わせできませんでした` +
-          `${detail.length > 0 ? `: ${detail}` : ` (${paneList.code})`}\n`,
-      );
-      return 1;
-    }
-  }
   if (paneList.code !== 0) {
     const args = ["--session", herdrSession, "server"];
     const { spawnDetached } = options;
     if (spawnDetached !== undefined) {
       spawnDetached(options.herdrPath, args);
     } else {
-      await ensureHerdrTailiiServerStarted({
+      await ensureHerdrServerStarted({
         herdrSession,
         spawnLocal: () => {
           const child = spawn(options.herdrPath, args, { detached: true, stdio: "ignore" });

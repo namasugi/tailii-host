@@ -217,11 +217,6 @@ function engineFailure(reply: ControlMessage, what: string): ChatError {
   if (reply.type === "error" && reply.code === "chat_send_failed") {
     return unknownDelivery(reply.message);
   }
-  if (reply.type === "error" && /指定どおりに入れられない/.test(reply.message)) {
-    // 起動先を明示した herdr セッションが動いていない（打ち直しても同じ。第 2 段）。
-    return new ChatError(EXIT.policy, "placement_unavailable", reply.message.trim(),
-      "--herdr-session を外す（アプリの設定に入れる）か、人に herdr セッションを起動してもらう");
-  }
   if (reply.type === "error") {
     const retry = /launch_failed|tmux_error|claim|起動中/.test(`${reply.code} ${reply.message}`);
     return new ChatError(retry ? EXIT.retryLater : EXIT.internal, reply.code, reply.message,
@@ -763,7 +758,6 @@ async function cmdNew(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promise<R
 
 /**
  * 起動先の明示（`--backend herdr|tmux` / `--herdr-session <名前>`）。省略はアプリの設定。`--herdr-session` だけなら herdr。
- * 明示したときは振り替えない（動いていない herdr セッションなら起動せずに理由を返す。第 2 段）。
  */
 function placementOf(args: ParsedArgs): { backend?: "tmux" | "herdr"; herdrSession?: string } {
   const backend = flagString(args, "--backend");

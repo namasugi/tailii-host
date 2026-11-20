@@ -38,17 +38,17 @@ it.each(["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"])("%s があれば tailii の
     ok: false,
     required: false,
     detail: expect.stringContaining("ログイン鍵束を使えず、実機向けの署名や鍵束に保存した資格情報を利用できません"),
-    remediation: `${herdrRestartCommand("tailii")}（実行中の herdr 会話は終了します。次に会話を開くと画面のログイン側で起動し直します）`,
+    remediation: `${herdrRestartCommand("tailii")}（実行中の herdr 会話は終了します。次に会話を開くとデスクトップ側のログインで起動し直します）`,
   });
   expect(check?.detail).not.toContain("example");
 });
 
-it.each(["default", "project.test_1"])("利用者のセッション %s は画面からの再起動か設定変更を案内する", (session) => {
+it.each(["default", "project.test_1"])("利用者のセッション %s も起動し直す手順を案内する", (session) => {
   const check = herdrServerLoginDoctorCheck(session, "herdr server SSH_TTY=/dev/ttys001");
   expect(check?.id).toBe(`herdr-server-login-${session}`);
   expect(check?.label).toBe(`herdr サーバーの起動元(${session})`);
   expect(check?.remediation).toBe(
-    "画面のターミナルから herdr を起動し直す（実行中の herdr 会話は終了します）か、アプリの設定で herdr のセッションを tailii にしてください。",
+    `herdr session stop ${session}（実行中の herdr 会話は終了します。次に会話を開くとデスクトップ側のログインで起動し直します）`,
   );
 });
 

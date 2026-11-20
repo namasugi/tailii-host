@@ -1016,17 +1016,17 @@ describe("第 2 段: 承認・設問・開き直し・画面・起動先", () =>
   });
 });
 
-test("明示した herdr セッションが動いていない起動失敗は、打ち直しを促さずに 5（第 2 段）", async () => {
+test("明示した herdr セッションを起動できなければ、同じ依頼 ID での再試行を案内する", async () => {
   const root = makeTempDir("chat-placement-down");
   const h = harness({
     stdin: "x", roots: [root],
     handler: (message) => message["type"] === "session_start"
       ? { type: "error", v: 2, id: String(message["id"]), code: "launch_failed",
-          message: "tailii launch: herdr セッション 'w' が動いていません。指定どおりに入れられないので起動していません\n" } as ControlMessage
+          message: "tailii launch: herdr セッション 'w' を起動できませんでした\n" } as ControlMessage
       : defaultHandler(message),
   });
-  expect(await runChat(["new", "--cwd", root, "--request-id", "r-down", "--herdr-session", "w", "--json"], h.deps)).toBe(EXIT.policy);
-  expect(h.json()).toMatchObject({ error: { code: "placement_unavailable" } });
+  expect(await runChat(["new", "--cwd", root, "--request-id", "r-down", "--herdr-session", "w", "--json"], h.deps)).toBe(EXIT.retryLater);
+  expect(h.json()).toMatchObject({ error: { code: "launch_failed", hint: "少し待って同じ依頼 ID で打ち直す" } });
 });
 
 describe("Codex の会話（tailii-host chat の Codex 対応）", () => {

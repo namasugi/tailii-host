@@ -194,9 +194,7 @@ export function herdrServerLoginDoctorCheck(session: string, psOutput: string | 
     ok: false,
     required: false,
     detail: "SSH のログインから起動されているため、このサーバー内の会話ではログイン鍵束を使えず、実機向けの署名や鍵束に保存した資格情報を利用できません。",
-    remediation: session === HERDR_TAILII_SESSION
-      ? `${herdrRestartCommand(session)}（実行中の herdr 会話は終了します。次に会話を開くと画面のログイン側で起動し直します）`
-      : "画面のターミナルから herdr を起動し直す（実行中の herdr 会話は終了します）か、アプリの設定で herdr のセッションを tailii にしてください。",
+    remediation: `${herdrRestartCommand(session)}（実行中の herdr 会話は終了します。次に会話を開くとデスクトップ側のログインで起動し直します）`,
   };
 }
 

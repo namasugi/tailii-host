@@ -1,12 +1,11 @@
 import { spawn, type SpawnOptions } from "node:child_process";
 import { chmodSync, rmSync } from "node:fs";
 import { createConnection, createServer, type Socket } from "node:net";
-import { defaultHerdrPath, envWithoutTmux, HERDR_TAILII_SESSION } from "../backend/herdr.js";
+import { defaultHerdrPath, envWithoutTmux, HERDR_TAILII_SESSION, isValidHerdrSessionName } from "../backend/herdr.js";
 import { sleep } from "../shared/sleep.js";
 import { resolveHubSpawnSocketPath } from "../shared/socketPath.js";
 import { isSocketAlive } from "./hubStartup.js";
 
-const REQUEST = '{"spawn":"herdr-server"}';
 const MAX_LINE_BYTES = 4096;
 const REQUEST_TIMEOUT_MS = 1_000;
 const SPAWN_DEDUP_MS = 5_000;
@@ -43,13 +42,17 @@ function readLine(socket: Socket, timeoutMs: number): Promise<string | null> {
   });
 }
 
-function isSpawnRequest(line: string | null): boolean {
-  if (line === null) return false;
+function parseSpawnSession(line: string | null): string | null {
+  if (line === null) return null;
   try {
-    const request = JSON.parse(line) as { spawn?: unknown } | null;
-    return request?.spawn === "herdr-server" && Object.keys(request).length === 1;
+    const request = JSON.parse(line) as { spawn?: unknown; session?: unknown } | null;
+    if (request?.spawn !== "herdr-server" || Object.keys(request).some((key) => key !== "spawn" && key !== "session")) {
+      return null;
+    }
+    if (!Object.hasOwn(request, "session")) return HERDR_TAILII_SESSION;
+    return typeof request.session === "string" && isValidHerdrSessionName(request.session) ? request.session : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -68,7 +71,7 @@ export interface HerdrServerSpawnListener {
   close(): Promise<void>;
 }
 
-/** 画面のログインにいる hub が、専用セッションのサーバーを起こす。 */
+/** デスクトップ側のログインにいる hub が、指定された herdr サーバーを起こす。 */
 export async function startHerdrServerSpawnSocket(options: {
   screenLogin: boolean;
   socketPath?: string;
@@ -80,29 +83,35 @@ export async function startHerdrServerSpawnSocket(options: {
   rmSync(socketPath, { force: true });
 
   const now = options.now ?? (() => performance.now());
-  let lastSpawnAt = -Infinity;
-  let pending: Promise<SpawnReply> | undefined;
-  async function startServer(): Promise<SpawnReply> {
+  const recentSpawns = new Map<string, number>();
+  const pendingSpawns = new Map<string, Promise<SpawnReply>>();
+  async function startServer(session: string): Promise<SpawnReply> {
     if (!options.screenLogin) return { ok: false, reason: "not-screen-login" };
-    if (now() - lastSpawnAt < SPAWN_DEDUP_MS) return { ok: true };
+    const cutoff = now() - SPAWN_DEDUP_MS;
+    for (const [name, at] of recentSpawns) {
+      if (at <= cutoff) recentSpawns.delete(name);
+    }
+    if (recentSpawns.has(session)) return { ok: true };
+    const pending = pendingSpawns.get(session);
     if (pending !== undefined) {
       const reply = await pending;
       return reply.ok ? { ok: true } : reply;
     }
-    // spawn の成否が返る前に来た依頼も同じ起動を待つ。
-    pending = Promise.resolve().then(async (): Promise<SpawnReply> => {
+    // 同じセッション宛ての依頼は、先に始めた起動の成否を待つ。
+    const starting = Promise.resolve().then(async (): Promise<SpawnReply> => {
       try {
         const pid = await (options.spawnDetached ?? spawnDetached)(
-          defaultHerdrPath(), ["--session", HERDR_TAILII_SESSION, "server"],
+          defaultHerdrPath(), ["--session", session, "server"],
           { detached: true, stdio: "ignore", env: envWithoutTmux(process.env) },
         );
-        lastSpawnAt = now();
+        recentSpawns.set(session, now());
         return { ok: true, pid };
       } catch {
         return { ok: false, reason: "spawn-failed" };
       }
-    }).finally(() => { pending = undefined; });
-    return pending;
+    }).finally(() => { pendingSpawns.delete(session); });
+    pendingSpawns.set(session, starting);
+    return starting;
   }
 
   const clients = new Set<Socket>();
@@ -110,10 +119,10 @@ export async function startHerdrServerSpawnSocket(options: {
     socket.on("error", () => {});
     clients.add(socket);
     socket.once("close", () => clients.delete(socket));
-    const request = await readLine(socket, REQUEST_TIMEOUT_MS);
+    const session = parseSpawnSession(await readLine(socket, REQUEST_TIMEOUT_MS));
     if (socket.destroyed) return;
-    const reply: SpawnReply = isSpawnRequest(request)
-      ? await startServer() : { ok: false, reason: "bad-request" };
+    const reply: SpawnReply = session === null
+      ? { ok: false, reason: "bad-request" } : await startServer(session);
     if (socket.destroyed) return;
     socket.end(JSON.stringify(reply) + "\n");
     socket.destroySoon();
@@ -146,13 +155,15 @@ export async function startHerdrServerSpawnSocket(options: {
 export type HerdrServerSpawnResult = "started" | "refused" | "unavailable";
 
 /** hub の起動中は接続を取り直す。接続できたら 1 回の依頼と応答で終える。 */
-export async function requestHerdrServerSpawn(options: {
+export async function requestHerdrServerSpawn(session: string, options: {
   socketPath?: string;
   timeoutMs?: number;
   retryIntervalMs?: number;
 } = {}): Promise<HerdrServerSpawnResult> {
   try {
     const socketPath = options.socketPath ?? resolveHubSpawnSocketPath();
+    const request = JSON.stringify(session === HERDR_TAILII_SESSION
+      ? { spawn: "herdr-server" } : { spawn: "herdr-server", session }) + "\n";
     const deadline = performance.now() + (options.timeoutMs ?? 3_000);
     for (let remaining = deadline - performance.now(); remaining > 0; remaining = deadline - performance.now()) {
       const socket = createConnection(socketPath);
@@ -160,7 +171,7 @@ export async function requestHerdrServerSpawn(options: {
       let connected = false;
       socket.once("connect", () => {
         connected = true;
-        socket.write(REQUEST + "\n");
+        socket.write(request);
       });
       const line = await readLine(socket, remaining);
       socket.destroy();

@@ -65,7 +65,7 @@ export function resolveHubSocketPath(base?: string): string {
   return path.join(baseDir, "hub.sock");
 }
 
-/** hub が専用の herdr サーバーの起動依頼を受けるソケット。 */
+/** hub が herdr サーバーの起動依頼を受けるソケット。 */
 export function resolveHubSpawnSocketPath(base?: string): string {
   return resolveSocketPath("hub-spawn", base);
 }

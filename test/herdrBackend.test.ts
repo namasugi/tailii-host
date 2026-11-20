@@ -2495,7 +2495,7 @@ describe("herdr のワークスペース名", () => {
 describe("launchCore herdr backend", () => {
   /**
    * herdr 呼び出しを記録するモック ProcessRunner。
-   * 実装は全コマンドに `--session tailii` を前置する。ここで前置を検証しつつ剥がし、
+   * 実装は全コマンドに `--session <名前>` を前置する。ここで前置を検証しつつ剥がし、
    * `recorded` にはコア引数（pane/agent/...）だけを積んで各テストの検証を単純に保つ。
    */
   function herdrProcessRunner(overrides?: {
@@ -2724,7 +2724,7 @@ describe("launchCore herdr backend", () => {
     expect(store.get("s-h")?.createdAt).toBe(30);
   });
 
-  test("herdr セッションのサーバー不在なら detached 起動して待つ", async () => {
+  test("専用の tailii のサーバーが不在なら detached 起動して待つ", async () => {
     const dir = makeTempDir("herdr-launch-ensure");
     const store = makeStore();
     const spawned: { exe: string; args: string[] }[] = [];
@@ -2748,6 +2748,7 @@ describe("launchCore herdr backend", () => {
 
     const options = {
       ...launchOptions(dir, store, runner),
+      herdrSession: "tailii",
       spawnDetached: (exe: string, args: string[]) => {
         spawned.push({ exe, args });
         serverUp = true;
@@ -2755,8 +2756,7 @@ describe("launchCore herdr backend", () => {
     };
     expect(await launchCore(options)).toBe(0);
     expect(spawned).toEqual([
-      // 設定の default が止まっているので、起こすのは専用の tailii（利用者の default は起こさない）。
-      { exe: "/Users/x/.local/bin/herdr", args: ["--session", "tailii", "server"] },
+      { exe: options.herdrPath, args: ["--session", "tailii", "server"] },
     ]);
     expect(store.get("s-h")?.herdrPaneId).toBe("w1:p1");
   });
@@ -2878,59 +2878,40 @@ describe("launchCore herdr backend", () => {
     expect(herdrExitCode(Object.assign(new Error("x"), { code: null, killed: false, signal: null }))).toBe(1);
   });
 
-  test("明示した herdr セッションが動いていなければ、tailii へ振り替えずに理由を返して起動しない（chat 第 2 段）", async () => {
-    const dir = makeTempDir("herdr-launch-strict");
+  test.each([
+    { label: "設定の既定", requested: undefined, previous: undefined, target: "default" },
+    { label: "明示指定", requested: "work", previous: undefined, target: "work" },
+    { label: "前の起動先が停止中", requested: undefined, previous: "previous", target: "default" },
+  ])("$label で収容先が停止中なら $target を起動して記録する", async ({ requested, previous, target }) => {
+    const dir = makeTempDir("herdr-launch-stopped");
     const store = makeStore();
+    if (previous !== undefined) {
+      store.put({ name: "s-h", cwd: dir, createdAt: 1, backend: "herdr", herdrPaneId: "w1:p1", herdrSession: previous });
+    }
+    const { runner, recorded } = herdrProcessRunner();
     const spawned: string[][] = [];
-    const sessions: string[] = [];
-    const errors: string[] = [];
+    const sessions = new Set<string>();
+    let running: string | undefined;
     const notRunning = '{"id":"cli:pane:list","error":{"code":"server_not_running","message":"x"}}';
-    const runner: ProcessRunner = async (_exe, rawArgs) => {
-      sessions.push(rawArgs[1]!);
-      return { exitCode: 1, stdout: "", stderr: notRunning };
-    };
-    expect(await launchCore({
-      ...launchOptions(dir, store, runner), herdrSession: "work", herdrSessionStrict: true,
-      errorSink: (message: string) => errors.push(message),
-      spawnDetached: (_exe: string, args: string[]) => spawned.push(args),
-    })).toBe(1);
-    expect(spawned).toEqual([]);
-    expect(new Set(sessions)).toEqual(new Set(["work"]));
-    expect(errors.join("")).toContain("'work' が動いていません");
-    expect(store.get("s-h")).toBeNull();
-  });
-
-  test("設定の herdr セッション（default）が動いていなければ起こさず、専用の tailii に入れる", async () => {
-    const dir = makeTempDir("herdr-launch-default-stopped");
-    const store = makeStore();
-    const spawned: string[][] = [];
-    const sessions: string[] = [];
-    let tailiiUp = false;
-    const notRunning = '{"id":"cli:pane:list","error":{"code":"server_not_running","message":"x"}}';
-    const runner: ProcessRunner = async (_exe, rawArgs) => {
+    const tracking: ProcessRunner = async (exe, rawArgs, options) => {
       const session = rawArgs[1]!;
-      const args = rawArgs.slice(2);
-      sessions.push(session);
-      if (args[0] === "pane" && args[1] === "list") {
-        if (session === "default" || !tailiiUp) return { exitCode: 1, stdout: "", stderr: notRunning };
-        return { exitCode: 0, stdout: paneListJson([]) };
+      sessions.add(session);
+      if (rawArgs[2] === "pane" && rawArgs[3] === "list" && session !== running) {
+        return { exitCode: 1, stdout: "", stderr: notRunning };
       }
-      if (args[1] === "create") {
-        return { exitCode: 0, stdout: JSON.stringify({ result: { root_pane: { pane_id: "w1:p1", tab_id: "w1:t1" } } }) };
-      }
-      return { exitCode: 0, stdout: "{}" };
+      return runner(exe, rawArgs, options);
     };
     expect(await launchCore({
-      ...launchOptions(dir, store, runner),
+      ...launchOptions(dir, store, tracking), herdrSession: requested,
       spawnDetached: (_exe: string, args: string[]) => {
         spawned.push(args);
-        tailiiUp = true;
+        running = args[1];
       },
     })).toBe(0);
-    // 利用者の default は起こさない。専用の tailii のサーバーだけ起こす。
-    expect(spawned).toEqual([["--session", "tailii", "server"]]);
-    expect(sessions.filter((session) => session === "default")).toHaveLength(1);
-    expect(store.get("s-h")?.herdrSession).toBe("tailii");
+    expect(spawned).toEqual([["--session", target, "server"]]);
+    expect([...sessions]).toEqual(previous === undefined ? [target] : [previous, target]);
+    expect(recorded.find((call) => call.args[1] === "create")?.session).toBe(target);
+    expect(store.get("s-h")?.herdrSession).toBe(target);
   });
 
   test("同じフォルダで利用者が開いているワークスペースに合流する（Tailii の pane が無くても）", async () => {
