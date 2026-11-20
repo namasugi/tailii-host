@@ -39,6 +39,8 @@ import { SessionMetadataStore } from "../sessions/sessionMetadataStore.js";
 import {
   sendQuestionEventToEngine,
   sendRemotePendingToEngine,
+  sendApprovalEventToEngine,
+  type ApprovalEventMessage,
   sendSessionProcessingToEngine,
   sendSubagentLifecycleToEngine,
 } from "../hub/engineRelaySocket.js";
@@ -391,7 +393,11 @@ export async function runHookCore(options: RunHookOptions): Promise<HookRunResul
     : decision.kind === "allow" ? allow(decision.reason) : deny(decision.reason);
 }
 
-type ApprovalDecision = { kind: "allow" | "deny"; reason: string; by?: "cli" | "timeout" };
+type ApprovalDecision = {
+  kind: "allow" | "deny"; reason: string; by?: "cli" | "timeout";
+  /** 人が決めたのではない拒否（承認できる人が居ない・アプリに届かないまま期限）。出来事の記録で「アプリで決めた」と書かないための印。 */
+  auto?: true;
+};
 type ApprovalFlowOptions = RunHookOptions & {
   signal: AbortSignal;
   tracker: { announced: boolean };
@@ -437,6 +443,9 @@ async function runApproval(
         ? { agentId: parsed.agentId, agentType: parsed.agentType } : {}),
     }, mailbox);
   }
+  const requestEvent = relayApprovalEvent(options, {
+    type: "approval_event", session, id: requestId, event: "request", tool: parsed.toolName,
+  });
   const flow = (async (): Promise<ApprovalDecision | null> => {
     const socket = await connectUnixSocket(socketPath, stop.signal);
     if (stop.signal.aborted || external?.check() === true) {
@@ -446,7 +455,7 @@ async function runApproval(
     // `tailii-host chat` が起動した会話で、アプリがつながっておらず承認できる人も居なければ、540 秒待たずに拒否する
     // （Bot は待つだけで、誰にも知らされない。tailii-chat-cli 第 2 段）。
     if (socket === null && isCliSession(session) && options.approverAvailable !== undefined && !options.approverAvailable()) {
-      return { kind: "deny", reason: NO_APPROVER_REASON };
+      return { kind: "deny", reason: NO_APPROVER_REASON, auto: true };
     }
     return socket
       // 接続済み（アプリ前面）。従来経路をそのまま実行する（push しない, 7.1）。
@@ -495,11 +504,25 @@ async function runApproval(
       removePendingApproval(session, requestId, mailbox,
         finalResult !== null ? { decision: finalResult.kind, by: finalResult.by ?? "app" } : undefined);
     }
+    await requestEvent;
+    // 決めた側が分かる通知を先に送り、後続の remote_pending_cleared で重ねて記録されないようにする。
+    await relayApprovalEvent(options, {
+      type: "approval_event", session, id: requestId, event: "resolved",
+      ...(finalResult === null ? { by: "terminal" }
+        : { decision: finalResult.kind, by: finalResult.by ?? (finalResult.auto === true ? "timeout" : "app") }),
+    });
     if (tracker.announced) {
       // 片付けの失敗（例外を含む）で hook の結果を変えない。送信は engine relay の短い上限（250ms）で打ち切られる。
       try { await clearRemotePendingIfNeeded(requestId, options); } catch { /* 最善努力。 */ }
     }
   }
+}
+
+async function relayApprovalEvent(options: RunHookOptions, event: ApprovalEventMessage): Promise<void> {
+  if (options.engineRelaySocketPath === null) return;
+  try {
+    await sendApprovalEventToEngine(event, options.engineRelaySocketPath);
+  } catch { /* relay は最善努力。 */ }
 }
 
 /** 承認できる人が居ないときの拒否の理由（Claude に読ませる）。 */
@@ -766,7 +789,7 @@ async function publishPendingAndAwaitReconnect(
 
   // 内部デッドライン内に一度も再接続できなかった → 安全側 deny（8.3）。
   return options.signal.aborted ? null : {
-    kind: "deny", reason: `iPhone unavailable (no reconnect within ${Math.round(options.deadlineSeconds)}s)`,
+    kind: "deny", reason: `iPhone unavailable (no reconnect within ${Math.round(options.deadlineSeconds)}s)`, auto: true,
   };
 }
 
@@ -808,7 +831,7 @@ async function sendRequestAndReflect(
       options.tracker.announced = true;
     } catch {
       // 送出直前に serve チャネルが落ちた（chat 離脱/開き直しレース）。切断と同じ扱い。
-      if (options.socketPath === null) return { kind: "deny", reason: "iPhone disconnected (write failed)" };
+      if (options.socketPath === null) return { kind: "deny", reason: "iPhone disconnected (write failed)", auto: true };
       return publishPendingAndAwaitReconnect(
         options.socketPath, parsed, summary, diff, options, deadlineAtMs, requestId, true,
       );
@@ -830,7 +853,7 @@ async function sendRequestAndReflect(
         // 決定待ち中の切断 = iOS の chat 離脱（serve チャネル close）や SSH 断。
         // 承認自体はまだ生きているので即 deny せず、connect 不能ブランチと同じ
         // フォールバックに合流して再接続（chat 開き直し）後に同一 id で送り直す。
-        if (options.socketPath === null) return { kind: "deny", reason: "iPhone disconnected" };
+        if (options.socketPath === null) return { kind: "deny", reason: "iPhone disconnected", auto: true };
         return publishPendingAndAwaitReconnect(
           options.socketPath, parsed, summary, diff, options, deadlineAtMs, requestId, true,
         );

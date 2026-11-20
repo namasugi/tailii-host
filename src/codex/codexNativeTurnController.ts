@@ -112,9 +112,19 @@ export interface CodexTurnOutcome {
   errorMessage?: string;
 }
 
+type CodexApprovalEvent = {
+  session: string;
+  id: string;
+  event: "request" | "resolved";
+  tool?: string;
+  decision?: Decision;
+  by?: "cli" | "app" | "timeout";
+};
+
 export interface CodexNativeTurnControllerOptions {
   appServer: CodexAppServerThreadRuntime;
   approvalBroker?: CodexApprovalBroker;
+  onApprovalEvent?: (event: CodexApprovalEvent) => void;
   onProcessing?: (session: string, state: "active" | "done", outcome?: CodexTurnOutcome) => void;
   onModel?: (session: string, model: string) => void;
   onTokenUsage?: (
@@ -492,7 +502,8 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
 
   constructor(options: CodexNativeTurnControllerOptions) {
     this.appServer = options.appServer;
-    this.approvalBroker = options.approvalBroker ?? requestCodexApprovalViaBroker;
+    this.approvalBroker = options.approvalBroker ??
+      ((approval) => requestCodexApprovalViaBroker(approval, { onApprovalEvent: options.onApprovalEvent }));
     this.onProcessing = options.onProcessing ?? (() => {});
     this.onModel = options.onModel ?? (() => {});
     this.onTokenUsage = options.onTokenUsage ?? (() => {});
@@ -1864,6 +1875,7 @@ export async function requestCodexApprovalViaBroker(
     /** Bot に承認が許されているか（既定は `~/.tailii/bot.json` の allowApprove）。 */
     botMayApprove?: () => boolean;
     approvalsPollMs?: number;
+    onApprovalEvent?: CodexNativeTurnControllerOptions["onApprovalEvent"];
   } = {},
 ): Promise<Decision> {
   const deadline = Date.now() + (options.decisionTimeoutMs ?? 540_000);
@@ -1880,6 +1892,11 @@ export async function requestCodexApprovalViaBroker(
       ...(approval.agentType !== undefined ? { agentType: approval.agentType } : {}),
     }, base);
   }
+  const emitApprovalEvent = (event: Omit<CodexApprovalEvent, "session" | "id">): void => {
+    try { options.onApprovalEvent?.({ session: approval.session, id: approval.id, ...event }); }
+    catch { /* 承認の決着には影響させない。 */ }
+  };
+  emitApprovalEvent({ event: "request", tool: approval.tool });
   const fromMailbox: Promise<Decision | null> = base === null
     ? new Promise<null>(() => {})
     : waitForMailboxDecision(approval.session, approval.id, deadline, stop.signal, {
@@ -1929,6 +1946,7 @@ export async function requestCodexApprovalViaBroker(
     const opened = socket as net.Socket | null;
     opened?.destroy();
     if (base !== null) removePendingApproval(approval.session, approval.id, base, { decision, by: decidedBy });
+    emitApprovalEvent({ event: "resolved", decision, by: decidedBy });
   }
 }
 

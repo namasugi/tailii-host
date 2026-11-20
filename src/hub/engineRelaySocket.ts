@@ -62,8 +62,20 @@ export type SubagentLifecycleMessage = {
   agentId: string;
 };
 
-export type EngineRelayMessage =
-  RemotePendingMessage | SessionProcessingMessage | QuestionEventMessage | SubagentLifecycleMessage;
+export type ApprovalEventMessage = {
+  type: "approval_event";
+  session: string;
+  id: string;
+  event: "request" | "resolved";
+  tool?: string;
+  decision?: "allow" | "deny";
+  by?: "app" | "cli" | "timeout" | "terminal";
+};
+
+// hub から engine へ流す既存の型でも使うため、hub 内だけで扱う承認の知らせは受信側で明示する。
+export type EngineRelayMessage<IncludeApproval extends boolean = false> =
+  RemotePendingMessage | SessionProcessingMessage | QuestionEventMessage | SubagentLifecycleMessage |
+  (IncludeApproval extends true ? ApprovalEventMessage : never);
 
 export interface EngineRelayServer {
   socketPath: string;
@@ -83,7 +95,7 @@ async function isSocketAlive(socketPath: string): Promise<boolean> {
 
 export async function startEngineRelaySocket(options: {
   socketPath?: string;
-  onMessage: (message: EngineRelayMessage) => void;
+  onMessage: (message: EngineRelayMessage<true>) => void;
   log?: (message: string) => void;
 }): Promise<EngineRelayServer | null> {
   const socketPath = options.socketPath ?? resolveEngineRelaySocketPath();
@@ -136,7 +148,7 @@ export async function startEngineRelaySocket(options: {
   };
 }
 
-function decodeEngineRelayLine(line: string): EngineRelayMessage | null {
+export function decodeEngineRelayLine(line: string): EngineRelayMessage<true> | null {
   if (!line.trim()) return null;
   // session_processing / question_event は host 内部 IPC 専用型（共有プロトコル外）なので
   // 先にローカル判定する。
@@ -161,6 +173,15 @@ function decodeEngineRelayLine(line: string): EngineRelayMessage | null {
           };
         }
         return null;
+      }
+      if (record["type"] === "approval_event") {
+        const { session, id, event, tool, decision, by } = record;
+        if (typeof session !== "string" || session.length === 0 || typeof id !== "string" || id.length === 0 ||
+          (event !== "request" && event !== "resolved")) return null;
+        return { type: "approval_event", session, id, event,
+          ...(typeof tool === "string" ? { tool } : {}),
+          ...(decision === "allow" || decision === "deny" ? { decision } : {}),
+          ...(by === "app" || by === "cli" || by === "timeout" || by === "terminal" ? { by } : {}) };
       }
       if (record["type"] === "question_event") {
         return decodeQuestionEvent(record);
@@ -229,6 +250,14 @@ export async function sendSubagentLifecycleToEngine(
 /** hook から engine relay へ session_processing を送る（接続不能は timeLimit 内リトライ後に諦める）。 */
 export async function sendSessionProcessingToEngine(
   message: SessionProcessingMessage,
+  socketPath: string = resolveEngineRelaySocketPath(),
+  timeLimitMs = 250,
+): Promise<void> {
+  await sendLineToEngine(JSON.stringify(message), socketPath, timeLimitMs);
+}
+
+export async function sendApprovalEventToEngine(
+  message: ApprovalEventMessage,
   socketPath: string = resolveEngineRelaySocketPath(),
   timeLimitMs = 250,
 ): Promise<void> {

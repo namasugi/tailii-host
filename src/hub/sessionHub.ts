@@ -78,8 +78,12 @@ import { cwdMarker } from "../shared/cwdMarker.js";
 import { isNonBlockingQuestionId } from "../codex/codexAsyncQuestion.js";
 import { randomUUID } from "node:crypto";
 import { appendChatDelivery, utteranceDigest } from "./chatDeliveryLog.js";
+import {
+  isChatEventErrorKind, type ApprovalResolution, type ChatEventInput, type QuestionResolution,
+  type SessionChatEvent, type SessionEndReason,
+} from "./chatEventLog.js";
 import { describeUsageLimitWait } from "../shared/usageLimitWait.js";
-import type { PresenceState, PushDispatcher, PushPresenceConnection } from "../push/pushDispatcher.js";
+import { TURN_DONE_DELAY_MS, type PresenceState, type PushDispatcher, type PushPresenceConnection } from "../push/pushDispatcher.js";
 import { isValidDeviceId, normalizeDeviceId, type PushDeviceStore } from "../push/pushDeviceStore.js";
 import { handlePushRegister, handlePushUnregister } from "../push/pushRegistration.js";
 import { findTrailingClaudeVersion } from "../shared/claudeVersionRecord.js";
@@ -161,6 +165,12 @@ export type HubPreviewPumpFactory = (
   isForeground?: () => boolean,
 ) => HubPreviewPump;
 
+const SESSION_END_REASONS = new Map<string, SessionEndReason>([
+  ["Session was killed", "killed"],
+  ["Agent process ended", "agent_exited"],
+  ["Session disappeared", "disappeared"],
+]);
+
 export type SessionHubOptions = Omit<ReaperTickOptions, "now"> & {
   /** Unix 秒。テストでは固定時計を注入する。 */
   now?: () => number;
@@ -201,6 +211,8 @@ export type SessionHubOptions = Omit<ReaperTickOptions, "now"> & {
    * この hub の接続一覧から行う。使用量制限は `usageLimitNotify`（購読者ゼロでだけ送る旧経路）より優先する。
    */
   pushDispatcher?: PushDispatcher;
+  chatEvents?: { append(event: ChatEventInput): void };
+  turnEndedDelayMs?: number;
   /**
    * 端末記録（push v1）。書き手は hub だけで、engine から中継された登録・解除をここへ保存する。
    * dispatcher と同じインスタンスを渡す（メモリ上の一覧を共有する）。省略時は登録を failed で返す。
@@ -630,6 +642,10 @@ export class SessionHub {
   /** Codex の現在のターンの最後の回答（購読者の有無に関係なく持つ。ターンの開始で捨てる）。 */
   private readonly codexTurnAnswers = new Map<string, string>();
   private readonly pushDispatcher: PushDispatcher | null;
+  private readonly chatTurnDoneTimers = new Map<string, NodeJS.Timeout>();
+  private readonly chatApprovals = new Map<string, { session: string; resolved: boolean }>();
+  private readonly retiringActors = new WeakSet<SessionActor>();
+  private chatEventWriteFailed = false;
   private apiAgentRuntime: ApiAgentHubRuntime | null = null;
   /** 終わりを push へまだ写していない API 作業のターン（会話名）。 */
   private readonly apiAgentTurnsAwaitingPush = new Set<string>();
@@ -1058,9 +1074,15 @@ export class SessionHub {
     }
   }
 
-  handleRelayMessage(message: EngineRelayMessage): void {
+  handleRelayMessage(message: EngineRelayMessage<true>): void {
+    if (message.type === "approval_event") {
+      this.recordChatApproval(message.session, message.id, message.event, message.tool, message);
+      return;
+    }
     if ((message.type === "remote_pending" || message.type === "remote_pending_cleared") && message.kind === "approval") {
       this.trackApproval(message.id, message.session, message.type === "remote_pending_cleared");
+      this.recordChatApproval(message.session, message.id, message.type === "remote_pending" ? "request" : "resolved",
+        message.type === "remote_pending" ? message.tool : undefined);
     }
     if (message.type === "subagent_lifecycle") {
       const actor = this.actor(message.session);
@@ -1074,7 +1096,8 @@ export class SessionHub {
       }
       const actor = this.actor(message.session);
       this.setPendingQuestion(message.session, actor, message.event === "prompt"
-        ? { id: message.id, questions: message.questions ?? [], answerRoute: "tui" } : null);
+        ? { id: message.id, questions: message.questions ?? [], answerRoute: "tui" } : null,
+        message.event === "dismiss" ? { reason: "dismissed", by: "terminal" } : undefined);
       if (message.event === "dismiss") void this.drainChatQueue(message.session, actor);
     } else if (message.type === "session_processing") {
       // サブエージェントのツール呼び出し: 数えているエージェントの「最後に見た時刻」を更新する（数は変えない）。
@@ -1263,7 +1286,7 @@ export class SessionHub {
         const answerRoute = actor.pendingQuestion.answerRoute;
         // 注入失敗時の復元用スナップショット（clear 前に取る）。
         const restoreSnapshot: PendingQuestion = actor.pendingQuestion;
-        this.setPendingQuestion(message.session, actor, null);
+        this.setPendingQuestion(message.session, actor, null, { reason: "answered" });
         this.broadcast({ type: "question_event", session: message.session, event: "dismiss", id: message.questionId });
         if (answerRoute === "api_agent") {
           this.sendTo(client, { type: "question_answer_result", id: message.id, status: "accepted" });
@@ -1791,6 +1814,7 @@ export class SessionHub {
     for (const client of this.historyPageRequests.keys()) this.cancelHistoryPageRequests(client);
     this.historyPageCache.clear();
     this.pushDispatcher?.dispose();
+    for (const session of this.chatTurnDoneTimers.keys()) this.cancelChatTurnDone(session);
     for (const client of [...this.clientPresence.keys()]) this.settlePresencePings(client, false);
     for (const recheck of this.staleQuestionRechecks.values()) clearTimeout(recheck.timer);
     this.staleQuestionRechecks.clear();
@@ -1879,6 +1903,8 @@ export class SessionHub {
   }
 
   private retireSession(session: string, reason = "Session was retired"): void {
+    this.emitChatEvent(session, { type: "session_ended", reason: SESSION_END_REASONS.get(reason) ?? "retired" });
+    this.retireChatEvents(session);
     for (const client of this.historyPageRequests.keys()) this.cancelHistoryPageRequests(client, session);
     this.historyPageCache.delete(session);
 
@@ -1899,6 +1925,7 @@ export class SessionHub {
     }
     // 終わった会話の完了通知の予約・設問の送信記録は持ち越さない。保留中の承認は解決済みにする（push v1）。
     this.pushDispatcher?.cancelTurnDone(session);
+    this.cancelChatTurnDone(session);
     this.pushedQuestionIds.delete(session);
     this.codexTurnAnswers.delete(session);
     for (const state of this.approvalStates.values()) {
@@ -1976,6 +2003,7 @@ export class SessionHub {
     actor.startingCodexMessageIds.clear();
     actor.uncertainCodexMessages.clear();
     actor.deletedCodexMessageIds.clear();
+    this.recordChatQuestionChange(session, actor, actor.pendingQuestion?.id ?? null, null, { reason: "session_ended" });
     actor.pendingQuestion = null;
     const retiredSubscribers = [...actor.subscribers.keys()];
     actor.focusedBy.clear();
@@ -3741,6 +3769,7 @@ export class SessionHub {
         });
         if (goal === null || goal.status !== "active") this.maybeCloseIdleCodexSession(session);
       },
+      onApprovalEvent: (event) => this.recordChatApproval(event.session, event.id, event.event, event.tool, event),
       onCollaborationMode: (session, mode) => {
         // backfill 中は iOS が live 行を history-done まで捨てるため、finish で配る値も最新へ更新しておく。
         const live = this.actors.get(session)?.codexLive ?? null;
@@ -4062,7 +4091,10 @@ export class SessionHub {
     // 現在のターンの終端と確かめた後でだけ完了通知の予約を取り消す（履歴再生の古いマーカーで、今回の Stop の
     // 予約を消さない）。
     this.pushDispatcher?.cancelTurnDone(session);
+    this.cancelChatTurnDone(session);
     this.applyProcessing(session, "done");
+    if (event.kind === "interrupted") this.emitChatEvent(session, { type: "turn_ended", outcome: "interrupted" });
+    else this.recordChatTurnFailure(session, event.errorKind);
     this.broadcast({ type: "session_processing", session, state: "done" });
     // 進行中のターンが API エラーで終わった（rate_limit は使用量制限の見張りが知らせる）→ turn_error。
     if (event.kind === "api_error" && event.errorKind !== "rate_limit") this.notifyTurnError(session, actor, claudeApiErrorNotificationBody(event.errorKind));
@@ -4209,8 +4241,10 @@ export class SessionHub {
         return false;
       }
       actor.processingSince = this.now();
+      if (!wasProcessing) this.emitChatEvent(session, { type: "turn_started" });
       // 完了通知の 3 秒待ちの間に処理へ戻った（送信待ちの自動投入・task-notification の再開・遅着 Stop）→ 送らない。
       this.pushDispatcher?.cancelTurnDone(session);
+      this.cancelChatTurnDone(session);
       // 使用量制限の待機中に処理へ戻った = 自動再開（usage-limit-wait）。pane の過渡表示を取りこぼしても
       // 処理中遷移を権威に「再開した」を知らせ、見張りを畳む。
       if (actor.usageLimitWatch !== null && actor.usageLimitWatch.state !== null) {
@@ -4274,7 +4308,7 @@ export class SessionHub {
     // done（steer の不確定失敗などでも来る）で消すと、controller は提示済みのままで出し直さない。
     if (state === "done" && actor.pendingQuestion !== null && !isNonBlockingQuestionId(actor.pendingQuestion.id)) {
       const id = actor.pendingQuestion.id;
-      this.setPendingQuestion(session, actor, null);
+      this.setPendingQuestion(session, actor, null, { reason: "turn_ended" });
       this.broadcast({ type: "question_event", session, event: "dismiss", id });
       void this.drainChatQueue(session, actor);
     }
@@ -4342,10 +4376,13 @@ export class SessionHub {
     this.staleQuestionRechecks.delete(session);
   }
 
-  private setPendingQuestion(session: string, actor: SessionActor, pending: PendingQuestion | null): void {
+  private setPendingQuestion(
+    session: string, actor: SessionActor, pending: PendingQuestion | null, resolution: QuestionResolution = { reason: "dismissed" },
+  ): void {
     const previousId = actor.pendingQuestion?.id ?? null;
     actor.pendingQuestion = pending;
     this.persistPendingQuestions();
+    this.recordChatQuestionChange(session, actor, previousId, pending?.id ?? null, resolution);
     // 新しい設問を push（push v1 §5）。turn を止めない Codex の非同期質問は送らない。同じ設問の
     // 再提示（stale の再確認・注入失敗の復元）では送り直さない。
     if (pending !== null && pending.id !== previousId && !isNonBlockingQuestionId(pending.id) &&
@@ -4373,6 +4410,7 @@ export class SessionHub {
    * 送信器が無い・終了後は false（呼び手は送らない）。結果は待たない（承認の待機を止めない）。
    */
   requestPush(event: HubPushEvent): boolean {
+    if (!this.closed && event.kind === "approval" && event.id !== undefined) this.recordChatApproval(event.session, event.id, "request", event.tool);
     if (this.pushDispatcher === null || this.closed) return false;
     const approvalId = event.kind === "approval" ? event.id : undefined;
     if (approvalId === undefined) {
@@ -4483,6 +4521,7 @@ export class SessionHub {
 
   /** Claude / Codex のターン完了 → 3 秒後に完了通知（その間に処理中へ戻ったら送らない）。 */
   private scheduleTurnDonePush(session: string, actor: SessionActor): void {
+    this.scheduleChatTurnDone(session, actor);
     this.pushDispatcher?.scheduleTurnDone(session, {
       isStillDone: () => this.actors.get(session) === actor && actor.processingSince === null,
       body: () => summarizeForNotification(this.lastAssistantText(session), TURN_DONE_BODY_CHARS),
@@ -4519,6 +4558,9 @@ export class SessionHub {
       return;
     }
     this.pushDispatcher?.cancelTurnDone(session);
+    this.cancelChatTurnDone(session);
+    if (outcome.status === "failed") this.recordChatTurnFailure(session, "codex_turn_failed");
+    else this.emitChatEvent(session, { type: "turn_ended", outcome: "interrupted" });
     if (outcome.status === "failed") this.notifyTurnError(session, actor, outcome.errorMessage ?? null, outcome.turnId);
   }
 
@@ -4532,6 +4574,9 @@ export class SessionHub {
       return;
     }
     this.pushDispatcher?.cancelTurnDone(session);
+    this.cancelChatTurnDone(session);
+    if (status.outcome === "interrupted") this.emitChatEvent(session, { type: "turn_ended", outcome: "interrupted" });
+    else this.recordChatTurnFailure(session, "api_agent_failed");
     if (status.outcome === "interrupted") return;
     this.notifyTurnError(session, actor, apiAgentTurnEndNotificationBody(status));
   }
@@ -4549,6 +4594,7 @@ export class SessionHub {
   /** エラーで止まったターンを知らせる（在席確認の間に処理が再開していたら送らない = 利用者は既に対応している）。 */
   private notifyTurnError(session: string, actor: SessionActor, body: string | null, id?: string): void {
     this.pushDispatcher?.cancelTurnDone(session);
+    this.cancelChatTurnDone(session);
     void this.pushDispatcher?.notify({
       kind: "turn_error",
       session,
@@ -4565,7 +4611,9 @@ export class SessionHub {
    * （先に来た方が処理中を落とし、後から来た方は wasProcessing = false で何もしない）。
    */
   private handleStopFailurePush(session: string, actor: SessionActor, error: string | undefined): void {
+    this.recordChatTurnFailure(session, error);
     this.pushDispatcher?.cancelTurnDone(session);
+    this.cancelChatTurnDone(session);
     if (error === "rate_limit") {
       this.armUsageLimitWatch(session, actor);
       return;
@@ -4578,6 +4626,7 @@ export class SessionHub {
    * 接続も正しく不在と判定できる）。無ければ旧経路（購読者ゼロのときだけ `usageLimitNotify`）。
    */
   private notifyUsageLimit(session: string, state: UsageLimitWaitState | { kind: "resumed" }, unattended: boolean): void {
+    this.recordChatUsageLimit(session, state);
     if (this.pushDispatcher !== null) {
       const body = state.kind === "resumed"
         ? "使用量制限の待機が終わり、作業を再開しました"
@@ -4593,6 +4642,98 @@ export class SessionHub {
       return;
     }
     if (unattended) this.options.usageLimitNotify?.(session, state);
+  }
+
+  private emitChatEvent(session: string, event: SessionChatEvent): void {
+    if (this.options.chatEvents === undefined) return;
+    try {
+      const meta = this.options.metadataStore.get(session);
+      const conversationId = meta?.providerSessionId ?? meta?.claudeSessionId;
+      this.options.chatEvents.append({ ...event, session, agent: meta?.agent === "codex" ? "codex" : "claude",
+        ...(conversationId ? { conversationId } : {}) });
+      this.chatEventWriteFailed = false;
+    } catch (error) {
+      if (!this.chatEventWriteFailed) {
+        this.chatEventWriteFailed = true;
+        try { this.options.log?.(`chat events 記録失敗 session=${session}: ${String(error)}`); } catch { /* 最善努力。 */ }
+      }
+    }
+  }
+
+  private recordChatUsageLimit(session: string, state: UsageLimitWaitState | { kind: "resumed" }): void {
+    if (state.kind === "needs_enter" || state.kind === "stopped") return;
+    this.emitChatEvent(session, { type: "usage_limit", state: state.kind,
+      ...(state.kind === "waiting" && state.resumeAt !== null ? { resumeAt: state.resumeAt } : {}) });
+  }
+
+  private recordChatTurnFailure(session: string, error: string | null | undefined): void {
+    this.emitChatEvent(session, { type: "turn_ended", outcome: "failed", error: isChatEventErrorKind(error) ? error : "unknown" });
+  }
+
+  private scheduleChatTurnDone(session: string, actor: SessionActor): void {
+    if (this.options.chatEvents === undefined || this.closed) return;
+    this.cancelChatTurnDone(session);
+    const timer = setTimeout(() => {
+      if (this.chatTurnDoneTimers.get(session) !== timer) return;
+      this.chatTurnDoneTimers.delete(session);
+      if (this.actors.get(session) === actor && actor.processingSince === null) {
+        this.emitChatEvent(session, { type: "turn_ended", outcome: "completed" });
+      }
+    }, this.options.turnEndedDelayMs ?? TURN_DONE_DELAY_MS);
+    timer.unref();
+    this.chatTurnDoneTimers.set(session, timer);
+  }
+
+  private cancelChatTurnDone(session: string): void {
+    const timer = this.chatTurnDoneTimers.get(session);
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    this.chatTurnDoneTimers.delete(session);
+  }
+
+  private recordChatQuestionChange(
+    session: string, actor: SessionActor, previousId: string | null, nextId: string | null, resolution: QuestionResolution,
+  ): void {
+    if (previousId === nextId) return;
+    if (previousId !== null) {
+      this.emitChatEvent(session, { type: "question_resolved", questionId: previousId,
+        ...(this.retiringActors.has(actor) ? { reason: "session_ended" } : resolution) });
+    }
+    if (nextId !== null) {
+      this.emitChatEvent(session, { type: "question_asked", questionId: nextId, blocking: !isNonBlockingQuestionId(nextId) });
+    }
+  }
+
+  private recordChatApproval(
+    session: string, id: string, event: "request" | "resolved", tool?: string, resolution?: ApprovalResolution,
+  ): void {
+    if (this.options.chatEvents === undefined) return;
+    const previous = this.chatApprovals.get(id);
+    if (previous === undefined) {
+      this.emitChatEvent(session, { type: "approval_requested", approvalId: id, ...(tool !== undefined ? { tool } : {}) });
+    }
+    if (event === "resolved" && previous?.resolved !== true) {
+      const { decision, by } = resolution ?? {};
+      this.emitChatEvent(session, { type: "approval_resolved", approvalId: id,
+        ...(decision !== undefined ? { decision } : {}), ...(by !== undefined ? { by } : {}) });
+    }
+    this.chatApprovals.delete(id);
+    this.chatApprovals.set(id, { session, resolved: event === "resolved" || previous?.resolved === true });
+    if (this.chatApprovals.size > APPROVAL_STATES_MAX) {
+      const oldest = this.chatApprovals.keys().next();
+      if (!oldest.done) this.chatApprovals.delete(oldest.value);
+    }
+  }
+
+  private retireChatEvents(session: string): void {
+    if (this.options.chatEvents === undefined) return;
+    const actor = this.actors.get(session);
+    if (actor !== undefined) this.retiringActors.add(actor);
+    for (const [id, approval] of this.chatApprovals) {
+      if (approval.session !== session || approval.resolved) continue;
+      approval.resolved = true;
+      this.emitChatEvent(session, { type: "approval_resolved", approvalId: id });
+    }
   }
 
   private persistPendingQuestions(): void {
@@ -4711,6 +4852,7 @@ export class SessionHub {
    * 届けた発話を記録に追記する（chatDeliveryLog.ts）。失敗しても配送の結果は変えない（出所の判定が推定に戻るだけ）。
    */
   private recordChatDelivery(session: string, agent: "claude" | "codex", clientMessageId: string, text: string): void {
+    this.emitChatEvent(session, { type: "message_delivered", clientMessageId, origin: clientMessageId.startsWith("cli-") ? "cli" : "app" });
     const target = this.options.chatDeliveryLogPath;
     if (target === undefined) return;
     try {

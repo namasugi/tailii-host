@@ -499,9 +499,14 @@ describe("Hook — PermissionRequest 承認", () => {
         appendResult(target, "toolu_waiting", isError);
         expect(await result).toEqual({ exitCode: 0, stdout: "" });
         await reader.waitForEOF();
-        await vi.waitFor(() => expect(pendingEvents).toEqual([{
+        // 承認の始めと終わりの知らせ（approval_event）は、会話の出来事の記録用に別に届く。
+        await vi.waitFor(() => expect(pendingEvents.filter((event) => event.type !== "approval_event")).toEqual([{
           type: "remote_pending_cleared", v: 1, session: opts.session, id: request.id, kind: "approval",
         }]));
+        expect(pendingEvents.filter((event) => event.type === "approval_event")).toEqual([
+          { type: "approval_event", session: opts.session, id: request.id, event: "request", tool: expect.any(String) },
+          { type: "approval_event", session: opts.session, id: request.id, event: "resolved", by: "terminal" },
+        ]);
         expect(listPendingApprovals(opts.session, opts.approvalsBase)).toEqual([]);
       } finally {
         await relay?.close();
@@ -1527,9 +1532,13 @@ describe("Hook — 待機延長・retry-connect（Req 8.1/8.2/8.3）", () => {
         // 発火時刻（hook プロセスの開始時刻）。Hub の遅着 hook 判定（late-hook-before-turn-end）に使う。
         atMs: expect.any(Number),
       });
-      const socket = await relay.nextConnection();
-      const reader = new SocketLineReader(socket);
-      const pending = decodeControlMessage(await reader.nextLine());
+      // 承認の始めの知らせ（approval_event。別接続）は読み飛ばし、remote_pending の行を待つ。
+      let pendingLine = "";
+      for (;;) {
+        pendingLine = await new SocketLineReader(await relay.nextConnection()).nextLine();
+        if ((JSON.parse(pendingLine) as { type?: string }).type !== "approval_event") break;
+      }
+      const pending = decodeControlMessage(pendingLine);
       const { stdout } = await run;
 
       expect(pending).toMatchObject({

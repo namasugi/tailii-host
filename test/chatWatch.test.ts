@@ -6,6 +6,7 @@ import { writePendingApproval } from "../src/approval/approvalMailbox.js";
 import { runChat, type ChatDeps } from "../src/commands/chat/chatCommand.js";
 import { codexRolloutBusy, conversationStateSnapshot, type RequestRecord } from "../src/commands/chat/chatState.js";
 import { EngineTimeoutError } from "../src/commands/chat/engineClient.js";
+import { ChatEventLog } from "../src/hub/chatEventLog.js";
 import type { ControlMessage } from "../src/protocol.js";
 import { SessionMetadataStore } from "../src/sessions/sessionMetadataStore.js";
 import { makeTempDir } from "./helpers.js";
@@ -53,7 +54,7 @@ function harness(agent: "claude" | "codex" = "claude", withLog = true) {
     transcript: (id) => agent === "claude" && id === ID && fs.existsSync(transcript) ? { file: transcript, cwd: home } : null,
     codexRollout: (id) => agent === "codex" && id === ID && fs.existsSync(transcript) ? transcript : null,
     requestsDir: path.join(home, "requests"),
-    watchesDir, chatDeliveries, pendingQuestionsPath, approvalsBase,
+    watchesDir, chatDeliveries, pendingQuestionsPath, approvalsBase, chatEvents: path.join(home, "events.ndjson"),
   };
   const setState = (status: string, times: { statusUpdatedAt?: number; updatedAt?: number } = {}) => {
     fs.writeFileSync(path.join(registry, `${process.pid}.json`), JSON.stringify({
@@ -139,9 +140,9 @@ describe("chat watch の登録と台帳", () => {
     expect(await h.watch("add", OTHER, "--mode", "continue")).toMatchObject({ code: 3, json: { error: { code: "not_found" } } });
     expect(await h.add("continue", "--request-id", "missing")).toMatchObject({ code: 3, json: { error: { code: "request_not_found" } } });
     expect(await h.watch("remove", ID, "--reason", "done")).toMatchObject({ code: 3, json: { error: { code: "watch_not_found" } } });
-    for (const wait of [[], ["25"]]) {
-      expect(await h.watch("poll", "--wait", ...wait)).toMatchObject({ code: 2, json: { error: { code: "unsupported_option" } } });
-    }
+    expect(await h.watch("poll", "--wait")).toMatchObject({ code: 2, json: { error: { code: "missing_value" } } });
+    expect(await h.watch("poll", "--wait", "101")).toMatchObject({ code: 2, json: { error: { code: "out_of_range" } } });
+    expect(await h.watch("list", "--wait", "25")).toMatchObject({ code: 2, json: { error: { code: "unsupported_option" } } });
     expect(await h.list()).toEqual([]);
     expect(h.connect).not.toHaveBeenCalled();
   });
@@ -584,5 +585,230 @@ describe("chat new / send --watch", () => {
     await h.watch("remove", ID, "--reason", "other");
     expect((await send("r1", "continue", "3")).json.watch).toEqual({ mode: "continue", expiresAtMs: T0 + 100 + 3 * MINUTE });
     expect(await h.list()).toMatchObject([{ lastRequestId: "r1", note: "依頼の冒頭: 指示" }]);
+  });
+});
+
+function eventWriter(h: ReturnType<typeof harness>, maxBytes?: number) {
+  return new ChatEventLog(h.deps.chatEvents!, { bootId: "testboot", now: h.deps.now, maxBytes });
+}
+
+const sessionFields = { session: SESSION, agent: "claude" } as const;
+
+describe("見張りの出来事", () => {
+  test("完了の手がかりを busy 中は持ち越し、待機へ戻ったら 10 秒を待たずに知らせる", async () => {
+    const h = harness();
+    const writer = eventWriter(h);
+    writer.append({ type: "hub_started" });
+    await h.add();
+    h.setState("busy");
+    h.append(assistant());
+    writer.append({ type: "turn_ended", outcome: "completed", ...sessionFields });
+    expect(await h.poll()).toMatchObject({ source: "events+state", wake: false });
+    h.setState("idle");
+    const poll = await h.poll();
+    expect(poll).toMatchObject({ source: "events+state", wake: true,
+      items: [{ reasons: [{ kind: "turn_ended", outcome: "completed" }] }] });
+    await h.ack(poll.items[0].token);
+    h.advance(11_000);
+    expect(await h.poll()).toMatchObject({ wake: false });
+  });
+
+  test("返答が増えない失敗と中断も拾い、新しいターンで古い手がかりを捨てる", async () => {
+    const h = harness();
+    const writer = eventWriter(h);
+    writer.append({ type: "hub_started" });
+    await h.add();
+    writer.append({ type: "turn_ended", outcome: "failed", error: "server_error", ...sessionFields });
+    let poll = await h.poll();
+    expect(poll).toMatchObject({ source: "events+state", items: [{ reasons: [
+      { kind: "turn_ended", outcome: "failed", error: "server_error", atMs: T0 },
+    ] }] });
+    await h.ack(poll.items[0].token);
+    writer.append({ type: "turn_ended", outcome: "interrupted", ...sessionFields });
+    poll = await h.poll();
+    expect(poll.items[0].reasons).toMatchObject([{ kind: "turn_ended", outcome: "interrupted" }]);
+    await h.ack(poll.items[0].token);
+    writer.append({ type: "turn_ended", outcome: "failed", error: "unknown", ...sessionFields });
+    writer.append({ type: "turn_started", ...sessionFields });
+    expect(await h.poll()).toMatchObject({ wake: false });
+  });
+
+  test("使用量制限の同じ待機は 1 回だけ返し、notify では返さない", async () => {
+    const h = harness();
+    const writer = eventWriter(h);
+    writer.append({ type: "hub_started" });
+    await h.add();
+    const waiting = { type: "usage_limit", state: "waiting", resumeAt: "3pm", ...sessionFields } as const;
+    writer.append(waiting);
+    writer.append(waiting);
+    const poll = await h.poll();
+    expect(poll.items[0].reasons).toEqual([{ kind: "usage_limit", resumeAt: "3pm", atMs: T0 }]);
+    await h.ack(poll.items[0].token);
+    writer.append(waiting);
+    expect(await h.poll()).toMatchObject({ wake: false });
+    writer.append({ type: "usage_limit", state: "resumed", ...sessionFields });
+    writer.append(waiting);
+    expect((await h.poll()).items[0].reasons).toHaveLength(1);
+    const quiet = harness();
+    const quietWriter = eventWriter(quiet);
+    await quiet.add("notify");
+    quietWriter.append(waiting);
+    expect(await quiet.poll()).toMatchObject({ wake: false, source: "events+state" });
+  });
+
+  test("アプリの承認・設問の回答・端末の決着を別々に返し、Bot の回答は除く", async () => {
+    const h = harness();
+    const writer = eventWriter(h);
+    writer.append({ type: "hub_started" });
+    await h.add();
+    h.deps.botStarted = () => true;
+    h.deps.connect = async () => ({
+      close: async () => {},
+      request: async (message: ControlMessage) => {
+        if (message.type === "chat_pending_query") {
+          return { type: "chat_pending_query_result", v: 2, id: message.id, session: SESSION,
+            question: { id: "bot-q", questions: [{ header: "色", question: "どの色？", multiSelect: false, options: [{ label: "青" }] }] } };
+        }
+        if (message.type !== "question_answer") throw new Error("予期しない要求");
+        writer.append({ type: "question_resolved", reason: "answered", questionId: message.id, ...sessionFields });
+        return { type: "remote_pending_cleared", v: 2, id: message.id, session: SESSION, kind: "question" };
+      },
+    }) as Awaited<ReturnType<ChatDeps["connect"]>>;
+    expect(await h.call("answer", ID, "bot-q", "--choice", "1")).toMatchObject({ code: 0, json: { answered: true } });
+    writer.append({ type: "approval_resolved", approvalId: "app-a", by: "app", decision: "allow", ...sessionFields });
+    writer.append({ type: "approval_resolved", approvalId: "cli-a", by: "cli", decision: "deny", ...sessionFields });
+    writer.append({ type: "question_resolved", questionId: "app-q", reason: "answered", ...sessionFields });
+    writer.append({ type: "question_resolved", questionId: "terminal-q", reason: "dismissed", by: "terminal", ...sessionFields });
+    writer.append({ type: "message_delivered", clientMessageId: "app-one", origin: "app", ...sessionFields });
+    const poll = await h.poll();
+    expect(poll.items[0].reasons).toEqual(["approval", "answer", "answer"].map((detail) => ({
+      kind: "human_activity", detail, atMs: T0,
+    })));
+    expect(await h.poll()).toMatchObject({ wake: false });
+  });
+
+  test("履歴の欠落と hub 再起動のときは状態に戻り、次の回は新しい位置から読む", async () => {
+    const h = harness();
+    const writer = eventWriter(h, 130);
+    writer.append({ type: "hub_started" });
+    await h.add();
+    for (let index = 0; index < 4; index++) {
+      writer.append({ type: "turn_ended", outcome: "failed", error: "server_error", ...sessionFields });
+    }
+    expect(await h.poll()).toMatchObject({ source: "state", wake: false });
+    writer.append({ type: "hub_started" });
+    writer.append({ type: "turn_ended", outcome: "failed", error: "server_error", ...sessionFields });
+    expect(await h.poll()).toMatchObject({ source: "state", wake: false });
+    writer.append({ type: "turn_ended", outcome: "failed", error: "server_error", ...sessionFields });
+    expect(await h.poll()).toMatchObject({ source: "events+state", items: [
+      { reasons: [{ outcome: "failed", error: "server_error" }] },
+    ] });
+  });
+
+  test("履歴を信じられるかは、同じ poll でも見張りの読み位置ごとに決める", async () => {
+    const h = harness();
+    const writer = eventWriter(h);
+    writer.append({ type: "hub_started" });
+    await h.add();
+    writer.append({ type: "hub_started" });
+    const transcript = h.deps.transcript!;
+    h.deps.transcript = (id, cwd) => transcript(id === OTHER ? ID : id, cwd);
+    expect(await h.watch("add", OTHER, "--mode", "continue")).toMatchObject({ code: 0 });
+    writer.append({ type: "turn_ended", outcome: "failed", error: "server_error", ...sessionFields });
+    writer.append({ type: "turn_ended", outcome: "failed", error: "server_error",
+      session: "s-other", conversationId: OTHER, agent: "claude" });
+    expect(await h.poll()).toMatchObject({ source: "state", open: 2, items: [
+      { conversationId: OTHER, reasons: [{ outcome: "failed", error: "server_error" }] },
+    ] });
+  });
+
+  test("古い台帳は今の末尾から始め、履歴を読めない場合も状態を照合する", async () => {
+    const h = harness();
+    const writer = eventWriter(h);
+    await h.add();
+    const ledger = path.join(h.watchesDir, ID + ".json");
+    const data = JSON.parse(fs.readFileSync(ledger, "utf8"));
+    delete data.eventPosition;
+    fs.writeFileSync(ledger, JSON.stringify(data));
+    writer.append({ type: "turn_ended", outcome: "failed", error: "server_error", ...sessionFields });
+    expect(await h.poll()).toMatchObject({ source: "events+state", wake: false, open: 1 });
+    fs.unlinkSync(h.deps.chatEvents!);
+    h.append(assistant());
+    h.advance(10_001);
+    expect(await h.poll()).toMatchObject({ source: "state", items: [{ reasons: [{ outcome: "completed" }] }] });
+  });
+
+  test("poll --wait は錠を解いてから待ち、変化か時間切れで返す", async () => {
+    const h = harness();
+    const writer = eventWriter(h);
+    writer.append({ type: "hub_started" });
+    await h.add();
+    let sleeps = 0;
+    h.deps.sleep = async (ms) => {
+      expect(ms).toBe(1_000);
+      expect(fs.existsSync(path.join(h.watchesDir, ".lock"))).toBe(false);
+      h.advance(ms);
+      if (++sleeps === 2) writer.append({ type: "approval_resolved", approvalId: "a", by: "app", ...sessionFields });
+    };
+    expect(await h.watch("poll", "--wait", "10")).toMatchObject({ code: 0, json: { wake: true, source: "events+state" } });
+    expect(sleeps).toBe(2);
+    expect(await h.watch("poll", "--wait", "3")).toMatchObject({ code: 0, json: { wake: false } });
+    expect(sleeps).toBe(5);
+  });
+});
+
+describe("chat events", () => {
+  test("会話 ID と会話名・種別で絞り、カーソルの次のページを古い順に返す", async () => {
+    const h = harness();
+    const writer = eventWriter(h);
+    writer.append({ type: "hub_started" });
+    writer.append({ type: "turn_started", ...sessionFields, conversationId: OTHER });
+    writer.append({ type: "turn_ended", outcome: "completed", session: "previous-session", agent: "claude", conversationId: ID });
+    writer.append({ type: "turn_ended", outcome: "failed", session: "other-session", agent: "claude", conversationId: OTHER });
+    writer.append({ type: "turn_started", ...sessionFields });
+    const filtered = ["--conversation", ID, "--type", "turn_started,turn_ended", "--limit", "2"];
+    const latest = await h.call("events", ...filtered);
+    expect(latest).toMatchObject({ code: 0, json: { events: [{ seq: 3 }, { seq: 5 }], hasMore: true, gap: false } });
+    const page = await h.call("events", "--after", `1:${T0}`, ...filtered);
+    expect(page).toMatchObject({ code: 0, json: { events: [{ seq: 2 }, { seq: 3 }], cursors: { after: `3:${T0}` }, hasMore: true } });
+    expect(await h.call("events", "--after", page.json.cursors.after, ...filtered))
+      .toMatchObject({ code: 0, json: { events: [{ seq: 5 }], hasMore: false } });
+    expect(await h.call("events", "--after", `5:${T0}`, ...filtered))
+      .toMatchObject({ code: 0, json: { events: [], cursors: { after: `5:${T0}` }, hasMore: false } });
+    expect(h.connect).not.toHaveBeenCalled();
+  });
+
+  test("間の消失・再起動と stale を区別する", async () => {
+    const h = harness();
+    const writer = eventWriter(h, 130);
+    for (let index = 0; index < 4; index++) writer.append({ type: "turn_started", ...sessionFields });
+    expect(await h.call("events", "--after", `1:${T0}`)).toMatchObject({ code: 0, json: { gap: true } });
+    expect(await h.call("events", "--after", `4:${T0 - 1}`)).toMatchObject({ code: 2, json: { error: { code: "stale_cursor" } } });
+    expect(await h.call("events", "--after", "5")).toMatchObject({ code: 2, json: { error: { code: "stale_cursor" } } });
+    writer.append({ type: "hub_started" });
+    expect(await h.call("events", "--after", `4:${T0}`, "--type", "turn_started"))
+      .toMatchObject({ code: 0, json: { gap: true, events: [] } });
+  });
+
+  test("--wait は条件に合う出来事か指定時間まで待つ。範囲外と未知の種別を断る", async () => {
+    const h = harness();
+    const writer = eventWriter(h);
+    writer.append({ type: "hub_started" });
+    let sleeps = 0;
+    h.deps.sleep = async (ms) => {
+      h.advance(ms);
+      if (++sleeps === 1) writer.append({ type: "turn_started", ...sessionFields });
+      if (sleeps === 2) writer.append({ type: "turn_ended", outcome: "completed", ...sessionFields });
+    };
+    const result = await h.call("events", "--after", `1:${T0}`, "--wait", "5", "--type", "turn_ended");
+    expect(result).toMatchObject({ code: 0, json: { events: [{ seq: 3 }], cursors: { after: `3:${T0 + 2_000}` } } });
+    expect(sleeps).toBe(2);
+    expect(await h.call("events", "--after", result.json.cursors.after, "--wait", "2"))
+      .toMatchObject({ code: 0, json: { events: [], cursors: result.json.cursors } });
+    expect(sleeps).toBe(4);
+    expect(await h.call("events", "--wait", "0")).toMatchObject({ code: 2, json: { error: { code: "missing_after" } } });
+    expect(await h.call("events", "--after", "1", "--wait", "101")).toMatchObject({ code: 2, json: { error: { code: "out_of_range" } } });
+    expect(await h.call("events", "--limit", "201")).toMatchObject({ code: 2, json: { error: { code: "out_of_range" } } });
+    expect(await h.call("events", "--type", "constructor")).toMatchObject({ code: 2, json: { error: { code: "unknown_event_type" } } });
   });
 });

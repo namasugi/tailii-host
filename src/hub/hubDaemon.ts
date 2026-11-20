@@ -16,6 +16,7 @@ import { encodeHubMessage } from "./hubProtocol.js";
 import { ensureDirectory0700 } from "../shared/paths.js";
 import { loginSessionKind } from "../shared/loginSession.js";
 import { defaultChatDeliveryLogPath } from "./chatDeliveryLog.js";
+import { ChatEventLog, defaultChatEventLogPath } from "./chatEventLog.js";
 import { listPendingApprovals } from "../approval/approvalMailbox.js";
 import {
   REAPER_CHECK_INTERVAL_SECONDS,
@@ -588,7 +589,9 @@ export async function runHubCommand(args: string[]): Promise<number> {
   };
   const pushDevices = new PushDeviceStore();
   const previewLoad = new PreviewLoadMonitor({ log });
+  const chatEvents = new ChatEventLog(defaultChatEventLogPath(), { bootId, log });
   const hub = new SessionHub({
+    chatEvents,
     runner,
     imageService,
     heartbeatDir: defaultHeartbeatDir(),
@@ -772,6 +775,7 @@ export async function runHubCommand(args: string[]): Promise<number> {
       throw error;
     }
     if (socketServer === null) return 0;
+    chatEvents.append({ type: "hub_started", ...(startupVersion !== null ? { version: startupVersion } : {}) });
     // socket を勝ち取った時点で lock（pid と版の情報）の権威は自分。従来の判定で起動した場合の名残があっても、
     // ここで上書きすれば最終状態は必ず整合する。
     fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, version: startupVersion }));

@@ -5,6 +5,10 @@ import * as path from "node:path";
 import { performance } from "node:perf_hooks";
 import { listPendingApprovals, type PendingApprovalRecord } from "../../approval/approvalMailbox.js";
 import { defaultChatDeliveryLogPath, parseChatDeliveryLine } from "../../hub/chatDeliveryLog.js";
+import {
+  defaultChatEventLogPath, isChatEventErrorKind, isChatTurnOutcome, readChatEvents, staleChatEventCursor,
+  type ChatEvent, type ChatEventCursor, type ChatTurnOutcome,
+} from "../../hub/chatEventLog.js";
 import type { QuestionPromptQuestion } from "../../protocol.js";
 import type { ChatDeps } from "./chatCommand.js";
 import { ChatError, EXIT } from "./chatErrors.js";
@@ -25,6 +29,8 @@ export type WatchRemoveReason = typeof REMOVE_REASONS[number];
 type Agent = "claude" | "codex";
 type CloseReason = WatchRemoveReason | "expired" | "deleted";
 type WatchState = ConversationState | "waiting_answer" | "waiting_approval";
+type EventPosition = Required<ChatEventCursor>;
+type TurnEndHint = { outcome: ChatTurnOutcome; error?: string; atMs: number };
 type Mark = { size: number; mtimeMs: number };
 
 export interface WatchOptions { mode: WatchMode; ttlMinutes: number }
@@ -50,7 +56,9 @@ type Reason = { atMs: number } & (
   | { kind: "approval"; approvalIds: string[] }
   | { kind: "waiting_other" | "stopped_mid_turn" | "deleted" }
   | { kind: "human_activity"; detail: "message"; count: number; lastAtMs: number }
-  | { kind: "turn_ended"; outcome: "completed" | "interrupted" | "unknown" }
+  | { kind: "human_activity"; detail: "approval" | "answer" }
+  | { kind: "usage_limit"; resumeAt?: string }
+  | { kind: "turn_ended"; outcome: ChatTurnOutcome | "unknown"; error?: string }
   | { kind: "expired"; unacked?: true }
 );
 
@@ -71,6 +79,10 @@ interface WatchRecord {
   questionIds: string[];
   approvalIds: string[];
   deliveryOffset: number;
+  eventPosition?: EventPosition;
+  turnEndHint?: TurnEndHint;
+  usageLimitResumeAt?: string | null;
+  botQuestionIds?: string[];
   waitingNotifiedSinceMs?: number;
   pending: Array<Reason & { n: number }>;
   nextNumber: number;
@@ -252,8 +264,11 @@ function validReason(value: unknown, nextNumber: number): value is Reason & { n:
   switch (value.kind) {
     case "question": return typeof value.questionId === "string";
     case "approval": return strings(value.approvalIds);
-    case "human_activity": return value.detail === "message" && counter(value.count) && finite(value.lastAtMs);
-    case "turn_ended": return value.outcome === "completed" || value.outcome === "interrupted" || value.outcome === "unknown";
+    case "human_activity": return value.detail === "approval" || value.detail === "answer" ||
+      (value.detail === "message" && counter(value.count) && finite(value.lastAtMs));
+    case "usage_limit": return value.resumeAt === undefined || typeof value.resumeAt === "string";
+    case "turn_ended": return (value.outcome === "unknown" || isChatTurnOutcome(value.outcome)) &&
+      (value.error === undefined || isChatEventErrorKind(value.error));
     case "expired": return value.unacked === undefined || value.unacked === true;
     case "waiting_other": case "stopped_mid_turn": case "deleted": return true;
     default: return false;
@@ -269,6 +284,11 @@ function readWatch(file: string, id: string): WatchRecord | null {
     (raw.readCursor !== undefined && typeof raw.readCursor !== "string") ||
     !validBaseline(raw.baseline) || typeof raw.turnCheckPending !== "boolean" ||
     !strings(raw.questionIds) || !strings(raw.approvalIds) || !counter(raw.deliveryOffset) ||
+    (raw.eventPosition !== undefined && (!object(raw.eventPosition) || !counter(raw.eventPosition.seq) || !finite(raw.eventPosition.atMs))) ||
+    (raw.turnEndHint !== undefined && (!object(raw.turnEndHint) || !isChatTurnOutcome(raw.turnEndHint.outcome) ||
+      !finite(raw.turnEndHint.atMs) || (raw.turnEndHint.error !== undefined && !isChatEventErrorKind(raw.turnEndHint.error)))) ||
+    (raw.usageLimitResumeAt !== undefined && raw.usageLimitResumeAt !== null && typeof raw.usageLimitResumeAt !== "string") ||
+    (raw.botQuestionIds !== undefined && !strings(raw.botQuestionIds)) ||
     (raw.waitingNotifiedSinceMs !== undefined && !finite(raw.waitingNotifiedSinceMs)) ||
     !counter(raw.nextNumber) || raw.nextNumber === 0 || !Array.isArray(raw.pending)) return null;
   const nextNumber = raw.nextNumber;
@@ -396,6 +416,18 @@ function findConversationBaseline(deps: ChatDeps, id: string): { agent: Agent; b
   return null;
 }
 
+function readWatchEvents(deps: ChatDeps, after?: EventPosition) {
+  try {
+    return readChatEvents(deps.chatEvents ?? defaultChatEventLogPath(), { after, limit: after === undefined ? 1 : Infinity });
+  } catch {
+    return undefined;
+  }
+}
+
+function eventPosition(event: ChatEvent | undefined): EventPosition {
+  return event === undefined ? { seq: 0, atMs: 0 } : { seq: event.seq, atMs: event.atMs };
+}
+
 type RegisterOptions = WatchOptions & { note?: string; lastRequestId?: string; readCursor?: string };
 
 export async function registerWatch(
@@ -425,6 +457,8 @@ export async function registerWatch(
         expiresAtMs: now, turnCheckPending: false, questionIds: [], approvalIds: [], pending: [], nextNumber: 1,
         deliveryOffset: (deps.watchStat ?? fileStat)(deps.chatDeliveries ?? defaultChatDeliveryLogPath())?.size ?? 0,
       };
+      const feed = readWatchEvents(deps);
+      if (feed !== undefined) record.eventPosition = eventPosition(feed.latest);
     }
     record.mode = options.mode;
     record.updatedAtMs = now;
@@ -472,6 +506,19 @@ export async function changeWatch(deps: ChatDeps, id: string, change: WatchChang
 }
 
 // poll の状態の照合。
+
+export async function recordWatchBotAnswer(deps: ChatDeps, id: string, questionId: string): Promise<void> {
+  try {
+    if (!UUID.test(id) || !fs.existsSync(path.join(ledgerDir(deps), `${id}.json`))) return;
+    await withWatchLock(deps, (dir) => {
+      const file = path.join(dir, `${id}.json`);
+      const record = readWatch(file, id);
+      if (record === null || record.closed !== undefined || record.expiresAtMs <= deps.now()) return;
+      record.botQuestionIds = [questionId, ...(record.botQuestionIds ?? []).filter((id) => id !== questionId)].slice(0, HISTORY_LIMIT);
+      writeWatch(file, record);
+    });
+  } catch { /* 見張りの控えの失敗で回答結果は変えない。 */ }
+}
 
 function isQuestion(value: unknown): value is QuestionPromptQuestion {
   return object(value) && typeof value.header === "string" && typeof value.question === "string" &&
@@ -608,7 +655,8 @@ function checkTurn(record: WatchRecord, state: WatchState, file: string, mark: M
   const baseline = record.baseline;
   const wasActive = isActive(baseline.state) || record.turnCheckPending;
   const active = isActive(state);
-  if (active || now - mark.mtimeMs < 10_000 || (baseline.log?.size === mark.size && !wasActive)) {
+  const hint = record.turnEndHint;
+  if (active || (hint === undefined && (now - mark.mtimeMs < 10_000 || (baseline.log?.size === mark.size && !wasActive)))) {
     baseline.state = state;
     record.turnCheckPending = !active && wasActive;
     return null;
@@ -618,7 +666,9 @@ function checkTurn(record: WatchRecord, state: WatchState, file: string, mark: M
   if (elements === null) return null;
   const assistants = countAssistant(elements);
   let reason: Reason | null = null;
-  if (assistants > baseline.assistantElements) {
+  if (hint?.outcome === "failed" || hint?.outcome === "interrupted") {
+    reason = { kind: "turn_ended", ...hint };
+  } else if (assistants > baseline.assistantElements) {
     let cut = elements.length;
     while (cut > 0 && elements[cut - 1]?.role !== "assistant") cut--;
     const outcome = elements.slice(cut).some(interrupted) ? "interrupted" : "completed";
@@ -634,6 +684,7 @@ function checkTurn(record: WatchRecord, state: WatchState, file: string, mark: M
   baseline.assistantElements = assistants;
   baseline.totalElements = elements.length;
   record.turnCheckPending = false;
+  delete record.turnEndHint;
   return reason;
 }
 
@@ -668,6 +719,39 @@ function checkReasons(
   if (activity !== null) addReason(record, activity);
   const turn = checkTurn(record, current.state, file, mark, now);
   if (turn !== null) addReason(record, turn);
+}
+
+function applyWatchEvents(record: WatchRecord, events: readonly ChatEvent[], sessions: string[]): void {
+  for (const event of events) {
+    if (event.seq <= (record.eventPosition?.seq ?? 0) || event.type === "hub_started" ||
+      (event.conversationId !== record.conversationId && !sessions.includes(event.session))) continue;
+    switch (event.type) {
+      case "turn_started":
+        delete record.turnEndHint;
+        break;
+      case "turn_ended":
+        record.turnEndHint = { outcome: event.outcome, error: event.error, atMs: event.atMs };
+        break;
+      case "usage_limit":
+        if (event.state === "waiting") {
+          if (record.usageLimitResumeAt !== (event.resumeAt ?? null)) {
+            record.usageLimitResumeAt = event.resumeAt ?? null;
+            addReason(record, { kind: "usage_limit", resumeAt: event.resumeAt, atMs: event.atMs });
+          }
+        } else if (event.state === "resumed") {
+          delete record.usageLimitResumeAt;
+        }
+        break;
+      case "approval_resolved":
+        if (event.by === "app") addReason(record, { kind: "human_activity", detail: "approval", atMs: event.atMs });
+        break;
+      case "question_resolved":
+        if (event.by === "terminal" || (event.reason === "answered" && !record.botQuestionIds?.includes(event.questionId))) {
+          addReason(record, { kind: "human_activity", detail: "answer", atMs: event.atMs });
+        }
+        break;
+    }
+  }
 }
 
 function deliveryItem(record: WatchRecord, current: Pick<Observation, "state" | "waiting">, now: number, closed?: CloseReason) {
@@ -705,6 +789,7 @@ export async function pollWatches(deps: ChatDeps) {
     const items: NonNullable<ReturnType<typeof deliveryItem>>[] = [];
     const errors: Array<{ conversationId: string; message: string }> = [];
     const questions = readQuestions(deps);
+    const records: Array<{ ledger: string; record: WatchRecord }> = [];
     let open = 0;
     let fast = false;
     for (const name of ledgerFiles(dir)) {
@@ -719,19 +804,61 @@ export async function pollWatches(deps: ChatDeps) {
           archiveWatch(dir, ledger, conversationId, record.closed.atMs);
           continue;
         }
+        records.push({ ledger, record });
+      } catch (error) {
+        if (record?.closed === undefined) {
+          open++;
+          fast ||= record !== null && (isActive(record.baseline.state) || record.pending.length > 0);
+        }
+        errors.push({ conversationId, message: error instanceof Error ? error.message : String(error) });
+      }
+    }
+
+    let earliest: EventPosition | undefined;
+    for (const { record } of records) {
+      const position = record.eventPosition;
+      if (position !== undefined && (earliest === undefined || position.seq < earliest.seq)) earliest = position;
+    }
+    const feed = readWatchEvents(deps, earliest);
+    const anchors = new Map(feed?.events.map((event) => [event.seq, event]));
+    if (feed?.anchor !== undefined) anchors.set(feed.anchor.seq, feed.anchor);
+    const lastBoot = feed?.lastHubStartSeq;
+    let source: "state" | "events+state" = feed?.available === true ? "events+state" : "state";
+
+    for (const { ledger, record } of records) {
+      const { conversationId, eventPosition: position } = record;
+      const trusted = feed?.available === true && (position === undefined || (
+        !staleChatEventCursor(position, feed.latest, anchors.get(position.seq)) &&
+        (feed.oldest === undefined || position.seq >= feed.oldest.seq - 1) &&
+        (lastBoot === undefined || position.seq >= lastBoot)
+      ));
+      if (!trusted) source = "state";
+      try {
         const before = JSON.stringify(record);
+        if (!trusted) delete record.turnEndHint;
         const expired = now >= record.expiresAtMs;
         const file = findLog(deps, record.agent, conversationId);
         const mark = file === null ? null : (deps.watchStat ?? fileStat)(file);
         const missing = file === null || mark === null;
         const deleted = missing && (record.baseline.seenLog || now - record.createdAtMs > 120_000);
-        if (missing && !expired && !deleted) {
+        const closed = expired ? "expired" : deleted ? "deleted" : undefined;
+        if (closed === undefined) {
+          if (trusted && position !== undefined && feed.events.length > 0) {
+            applyWatchEvents(record, feed.events, sessionNamesForConversation(deps.store(), conversationId));
+          }
+          if (feed?.available === true) record.eventPosition = eventPosition(feed.latest);
+          else if (feed === undefined || position?.seq !== 0) delete record.eventPosition;
+        }
+        if (missing && closed === undefined) {
+          if (before !== JSON.stringify(record)) {
+            record.updatedAtMs = now;
+            writeWatch(ledger, record);
+          }
           open++;
           fast ||= isActive(record.baseline.state) || record.pending.length > 0;
           continue;
         }
         const current = observe(deps, record, file, mark, questions);
-        const closed = expired ? "expired" : deleted ? "deleted" : undefined;
         if (closed === "expired") {
           addReason(record, { kind: "expired", atMs: now, ...(record.pending.length > 0 ? { unacked: true } : {}) });
         } else if (closed === "deleted") {
@@ -754,15 +881,13 @@ export async function pollWatches(deps: ChatDeps) {
         }
         if (item !== null) items.push(item);
       } catch (error) {
-        if (record?.closed === undefined) {
-          open++;
-          fast ||= record !== null && (isActive(record.baseline.state) || record.pending.length > 0);
-        }
+        open++;
+        fast ||= isActive(record.baseline.state) || record.pending.length > 0;
         errors.push({ conversationId, message: error instanceof Error ? error.message : String(error) });
       }
     }
     return {
-      wake: items.length > 0, nextPollSec: open === 0 ? 300 : fast ? 30 : 120, open, source: "state" as const, items,
+      wake: items.length > 0, nextPollSec: open === 0 ? 300 : fast ? 30 : 120, open, source, items,
       ...(errors.length > 0 ? { errors } : {}),
     };
   });

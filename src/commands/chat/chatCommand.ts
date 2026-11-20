@@ -15,11 +15,12 @@ import {
   herdrSessionOfMeta,
   parseHerdrPaneList,
 } from "../../backend/herdr.js";
+import { defaultChatEventLogPath, isChatEventType, readChatEvents } from "../../hub/chatEventLog.js";
 import { AGENT_GUIDE } from "./agentGuide.js";
 import { ChatError, EXIT } from "./chatErrors.js";
 import { approvalViews, questionView, sessionNamesForConversation, type PendingQuestion } from "./chatWaiting.js";
 import {
-  captureWatchBaseline, changeWatch, isWatchMode, isWatchRemoveReason, listWatches, pollWatches, registerWatch,
+  captureWatchBaseline, changeWatch, isWatchMode, isWatchRemoveReason, listWatches, pollWatches, recordWatchBotAnswer, registerWatch,
   validateWatchId, watchNote, type WatchMode, type WatchObservationDeps, type WatchOptions,
 } from "./chatWatch.js";
 import {
@@ -43,6 +44,7 @@ import {
   READ_LIMITS,
   findConversationRequests,
   parseCursor,
+  formatCursor,
   readChatDeliveries,
   readClaudeElements,
   readCodexElements,
@@ -130,6 +132,7 @@ export interface ChatDeps extends WatchObservationDeps {
   chatReceipts?: string;
   /** hub が届けた発話の記録（テスト用。既定 `~/.tailii/hub/chat-deliveries.ndjson`）。read / search の出所の判定に使う。 */
   chatDeliveries?: string;
+  chatEvents?: string;
 }
 
 interface ParsedArgs {
@@ -138,11 +141,12 @@ interface ParsedArgs {
 }
 
 const WATCH_VALUE_FLAGS = new Set(["--mode", "--ttl", "--read-cursor", "--token", "--watch", "--watch-ttl"]);
+const EVENT_VALUE_FLAGS = new Set(["--conversation", "--type"]);
 const VALUE_FLAGS = new Set([
   "--cwd", "--request-id", "--title", "--permission-mode", "--after", "--wait",
   "--choice", "--other", "--reason", "--backend", "--herdr-session", "--agent", "--model", "--effort",
   "--last", "--before", "--limit", "--max-text", "--query", "--context",
-  ...WATCH_VALUE_FLAGS,
+  ...WATCH_VALUE_FLAGS, ...EVENT_VALUE_FLAGS,
 ]);
 const BOOL_FLAGS = new Set(["--json", "--live", "--no-attach", "--interrupt", "--yes", "--refresh", "--all", "--note"]);
 
@@ -152,11 +156,10 @@ function parseArgs(args: string[], verb: string): ParsedArgs {
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
     const sendWatch = (verb === "new" || verb === "send") && (arg === "--watch" || arg === "--watch-ttl");
-    if (verb === "watch" && arg === "--wait") {
-      flags.set(arg, true);
-    } else if (VALUE_FLAGS.has(arg) && (!WATCH_VALUE_FLAGS.has(arg) || verb === "watch" || sendWatch)) {
+    if (VALUE_FLAGS.has(arg) && (!WATCH_VALUE_FLAGS.has(arg) || verb === "watch" || sendWatch) &&
+      (!EVENT_VALUE_FLAGS.has(arg) || verb === "events")) {
       const value = args[i + 1];
-      if (value === undefined || ((verb === "watch" || sendWatch) && value.startsWith("--"))) {
+      if (value === undefined || ((verb === "watch" || verb === "events" || sendWatch) && value.startsWith("--"))) {
         throw new ChatError(EXIT.usage, "missing_value", `${arg} に値がありません`);
       }
       flags.set(arg, value);
@@ -1115,6 +1118,66 @@ function intFlag(args: ParsedArgs, name: string, fallback: number, min: number, 
   return value;
 }
 
+function chatWaitMs(args: ParsedArgs): number {
+  const raw = flagString(args, "--wait");
+  if (raw === undefined) return 0;
+  const seconds = /^(?:\d+(?:\.\d+)?|\.\d+)$/.test(raw) ? Number(raw) : Number.NaN;
+  if (!Number.isFinite(seconds) || seconds > 100) {
+    throw new ChatError(EXIT.usage, "out_of_range", "--wait は 0〜100 の秒数");
+  }
+  return seconds * 1_000;
+}
+
+async function waitForChat<T>(deps: ChatDeps, waitMs: number, read: () => T | Promise<T>, ready: (value: T) => boolean): Promise<T> {
+  const deadline = deps.now() + waitMs;
+  for (;;) {
+    const result = await read();
+    const remaining = deadline - deps.now();
+    if (ready(result) || remaining <= 0) return result;
+    await deps.sleep(Math.min(1_000, remaining));
+  }
+}
+
+async function cmdEvents(args: ParsedArgs, deps: ChatDeps) {
+  if (args.positional.length > 0) throw new ChatError(EXIT.usage, "extra_argument", `余分な引数があります: ${args.positional[0]}`);
+  for (const flag of args.flags.keys()) {
+    if (flag !== "--json" && flag !== "--after" && flag !== "--limit" && flag !== "--wait" && !EVENT_VALUE_FLAGS.has(flag)) {
+      throw new ChatError(EXIT.usage, "unsupported_option", `${flag} は chat events では使えません`);
+    }
+  }
+  const rawCursor = flagString(args, "--after");
+  const after = rawCursor === undefined ? undefined : withCursorErrors("", () => parseCursor(rawCursor));
+  if (after === undefined && args.flags.has("--wait")) {
+    throw new ChatError(EXIT.usage, "missing_after", "--wait には --after が要ります");
+  }
+  const conversationId = flagString(args, "--conversation");
+  if (conversationId !== undefined && !CONVERSATION_ID.test(conversationId)) {
+    throw new ChatError(EXIT.usage, "bad_conversation_id", "会話 ID の形が違います");
+  }
+  const types = flagString(args, "--type")?.split(",");
+  const unknownType = types?.find((type) => !isChatEventType(type));
+  if (unknownType !== undefined) throw new ChatError(EXIT.usage, "unknown_event_type", `知らない種別です: ${unknownType}`);
+  const limit = intFlag(args, "--limit", 50, 1, 200);
+  const file = deps.chatEvents ?? defaultChatEventLogPath();
+  const result = await waitForChat(deps, chatWaitMs(args), () => {
+    const sessions = conversationId === undefined ? [] : conversationSessionNames(deps, conversationId);
+    return readChatEvents(file, { after, limit, matches: (event) => (
+      (types === undefined || types.includes(event.type)) && (conversationId === undefined ||
+        (event.type !== "hub_started" && (event.conversationId === conversationId || sessions.includes(event.session))))
+    ) });
+  }, (result) => result.events.length > 0 || result.stale);
+  if (result.stale) {
+    throw new ChatError(EXIT.usage, "stale_cursor", "カーソルが今の出来事の記録と合いません", "--after を付けずに取り直す");
+  }
+  const last = result.events.at(-1);
+  const cursor = last === undefined ? rawCursor : formatCursor(last.seq, last.atMs);
+  return {
+    events: result.events.map(({ v: _v, boot: _boot, ...event }) => event),
+    cursors: cursor === undefined ? {} : { after: cursor },
+    hasMore: result.hasMore, gap: result.gap || (after !== undefined && result.lastHubStartSeq !== undefined),
+  };
+}
+
 async function cmdWatch(args: ParsedArgs, deps: ChatDeps): Promise<{ payload: Record<string, unknown>; human: string }> {
   const [verb, ...positional] = args.positional;
   let allowed: string[];
@@ -1123,7 +1186,7 @@ async function cmdWatch(args: ParsedArgs, deps: ChatDeps): Promise<{ payload: Re
     case "list": allowed = ["--all"]; break;
     case "update": allowed = ["--mode", "--ttl", "--note"]; break;
     case "remove": allowed = ["--reason"]; break;
-    case "poll": allowed = []; break;
+    case "poll": allowed = ["--wait"]; break;
     case "ack": allowed = ["--token", "--read-cursor"]; break;
     default: throw new ChatError(EXIT.usage, "unknown_watch_verb", "watch の動詞は add / list / update / remove / poll / ack です");
   }
@@ -1142,7 +1205,7 @@ async function cmdWatch(args: ParsedArgs, deps: ChatDeps): Promise<{ payload: Re
         (watch.note === null ? "" : `  ${watch.note.replace(/[\r\n]+/g, " ")}`)).join("\n");
       return { payload: { watches }, human: human || "（見張りがありません）" };
     }
-    const payload = await pollWatches(deps);
+    const payload = await waitForChat(deps, chatWaitMs(args), () => pollWatches(deps), (poll) => poll.wake);
     const lines = payload.items.flatMap((item) => item.reasons.map((reason) => `- ${item.conversationId}  ${reason.kind}`));
     for (const error of payload.errors ?? []) lines.push(`- ${error.conversationId}  エラー: ${error.message}`);
     return { payload, human: lines.join("\n") || "（変化がありません）" };
@@ -1504,6 +1567,7 @@ async function cmdAnswer(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promis
       }
       throw new ChatError(EXIT.retryLater, reply.code, reply.message, "少し待って打ち直す");
     }
+    if (bot) await recordWatchBotAnswer(deps, conversationId, questionId);
     return { conversationId, questionId, answered: true };
   });
 }
@@ -2012,7 +2076,7 @@ async function cmdAttach(args: ParsedArgs, deps: ChatDeps, bot: boolean): Promis
 
 // ---------------------------------------------------------------------------------------------------------------
 
-const USAGE = `usage: tailii-host chat <list|models|new|send|set-model|set-mode|status|read|search|watch|answer|approve|take-over|attach> [options]
+const USAGE = `usage: tailii-host chat <list|models|new|send|set-model|set-mode|status|read|search|events|watch|answer|approve|take-over|attach> [options]
   AI エージェント（Bot）は tailii-host agent-guide を読んで、必ず --json を付ける。
   端末が無い（パイプで指示を渡すなど）ときは Bot として扱い、--request-id が要る。
   list [--live] [--json]
@@ -2021,11 +2085,12 @@ const USAGE = `usage: tailii-host chat <list|models|new|send|set-model|set-mode|
   status <conversationId> [--after <依頼ID>] [--wait <秒>] [--json]
   read <conversationId> [--last <件数> | --after <カーソル> | --before <カーソル>] [--limit <件数>] [--max-text <バイト>] [--json]
   search <conversationId> --query <語> [--context <件数>] [--limit <件数>] [--before <カーソル>] [--json]
+  events [--after <カーソル>] [--conversation <会話ID>] [--type <種別,種別>] [--limit <件数>] [--wait <秒>] [--json]
   watch add <conversationId> --mode continue|notify [--ttl <分>] [--request-id <ID>] [--read-cursor <カーソル>] [--note] [--json]   --note はメモを標準入力から読む
   watch list [--all] [--json]
   watch update <conversationId> [--mode continue|notify] [--ttl <分>] [--note] [--json]
   watch remove <conversationId> --reason done|handed_over|boss_stop|other [--json]
-  watch poll [--json]
+  watch poll [--wait <秒>] [--json]
   watch ack <conversationId> --token <番号> [--read-cursor <カーソル>] [--json]
   new … / send … [--watch continue|notify [--watch-ttl <分>]]
   answer <conversationId> <設問ID> --choice <番号> [--other <文>] [--json]
@@ -2097,6 +2162,13 @@ export async function runChat(argv: string[], deps: ChatDeps): Promise<number> {
         const hits = payload["hits"] as SearchHit[];
         render(deps, json, payload, hits.map((hit) => `${elementHeading(hit)}\n${hit.excerpt}`).join("\n\n") ||
           "（見つかりません）");
+        return EXIT.ok;
+      }
+      case "events": {
+        const payload = await cmdEvents(args, deps);
+        const lines = payload.events.map((event) =>
+          `${new Date(event.atMs).toISOString()}  ${event.type}${"session" in event ? `  ${event.session}` : ""}`);
+        render(deps, json, payload, lines.join("\n") || "（出来事がありません）");
         return EXIT.ok;
       }
       case "watch": {
