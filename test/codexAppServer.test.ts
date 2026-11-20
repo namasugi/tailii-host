@@ -3,7 +3,7 @@
 import * as path from "node:path";
 import * as fs from "node:fs";
 import { describe, expect, test, vi } from "vitest";
-import { CodexNativeTurnController } from "../src/codex/codexNativeTurnController.js";
+import { CodexNativeTurnController, CodexTurnNotStartedError } from "../src/codex/codexNativeTurnController.js";
 import {
   CodexAppServerManager,
   type CodexAppServerConnection,
@@ -1409,6 +1409,143 @@ describe("CodexAppServerManager", () => {
       .toHaveLength(2);
     // open 時の resume 失敗は確認するが、状態読み取りの timeout では追加 probe しない。
     expect(connection.requests.filter((request) => request.method === "thread/read")).toHaveLength(1);
+  });
+
+  test.each(["completed", "inProgress"])(
+    "送信前の状態読み取りが刺さった接続を交換し、%s の現在状態へ一度だけ送る",
+    async (status) => {
+      const probe = new FakeConnection();
+      const stale = new FakeConnection("thread-reconnect");
+      const recovered = new FakeConnection("thread-reconnect");
+      const remaining = [probe, stale, recovered];
+      stale.request = async (method, params) => {
+        stale.requests.push({ method, params });
+        if (method === "thread/resume") throw new Error("no rollout found for thread id thread-reconnect");
+        if (method === "thread/read") return { thread: { id: "thread-reconnect", status: { type: "idle" } } };
+        if (method === "thread/turns/list") throw new Error("Codex App Server request timed out: thread/turns/list");
+        throw new Error(`古い接続へ書き込んだ: ${method}`);
+      };
+      recovered.request = async (method, params) => {
+        recovered.requests.push({ method, params });
+        if (method === "thread/resume") return { thread: { id: "thread-reconnect", historyMode: "paginated" } };
+        if (method === "thread/turns/list") return { data: [{ id: "turn-current", status }], nextCursor: null };
+        if (method === "thread/goal/get") return { goal: null };
+        if (method === "turn/start") return { turn: { id: "turn-new" } };
+        if (method === "turn/steer") return { turnId: "turn-current" };
+        throw new Error(`unexpected request: ${method}`);
+      };
+      const manager = new CodexAppServerManager({
+        codexHome: makeTempDir("codex-stale-control"),
+        connect: async () => {
+          const connection = remaining.shift();
+          if (!connection) throw new Error("再接続を繰り返した");
+          return connection;
+        },
+        launch: () => { throw new Error("daemon を再起動した"); },
+      });
+      const disconnected = vi.fn();
+      const controller = new CodexNativeTurnController({ appServer: manager, onDisconnect: disconnected });
+      const session = { session: "work", threadId: "thread-reconnect", cwd: "/tmp/work" };
+      await controller.subscribeSession(session);
+
+      await expect(controller.startTurn({ ...session, text: "画像を見て", clientUserMessageId: "client-once" }))
+        .resolves.toBe(status === "inProgress" ? "turn-current" : "turn-new");
+
+      expect(stale.closed).toBe(1);
+      expect(stale.notificationHandler).toBeNull();
+      expect(stale.serverRequestHandler).toBeNull();
+      expect(stale.requests.some((r) => r.method.startsWith("turn/"))).toBe(false);
+      expect(recovered.requests.some((r) => r.method === "thread/items/list")).toBe(false);
+      expect(recovered.requests.filter((r) => r.method === "thread/turns/list")).toHaveLength(1);
+      expect(recovered.requests.filter((r) => r.method.startsWith("turn/"))).toEqual([{
+        method: status === "inProgress" ? "turn/steer" : "turn/start",
+        params: expect.objectContaining({ clientUserMessageId: "client-once" }),
+      }]);
+      expect(disconnected).toHaveBeenCalledTimes(1);
+      expect(recovered.notificationHandler).not.toBeNull();
+      expect(recovered.serverRequestHandler).not.toBeNull();
+      expect(remaining).toEqual([]);
+      controller.close();
+    },
+  );
+
+  test("送信前の交換接続も応答しなければ一度で諦め、本文未送信として返す", async () => {
+    const probe = new FakeConnection();
+    const stale = new FakeConnection("thread-unresponsive");
+    const recovery = new FakeConnection("thread-unresponsive");
+    const remaining = [probe, stale, recovery];
+    for (const connection of [stale, recovery]) {
+      connection.request = async (method, params) => {
+        connection.requests.push({ method, params });
+        if (method === "thread/resume") {
+          if (connection === stale) throw new Error("no rollout found for thread id thread-unresponsive");
+          return { thread: { id: "thread-unresponsive", historyMode: "paginated" } };
+        }
+        if (method === "thread/read") return { thread: { id: "thread-unresponsive", status: { type: "idle" } } };
+        if (method === "thread/turns/list") throw new Error("Codex App Server request timed out: thread/turns/list");
+        throw new Error(`unexpected request: ${method}`);
+      };
+    }
+    const manager = new CodexAppServerManager({
+      codexHome: makeTempDir("codex-stale-control-failed"),
+      connect: async () => {
+        const connection = remaining.shift();
+        if (!connection) throw new Error("再接続を繰り返した");
+        return connection;
+      },
+      launch: () => {},
+    });
+    const controller = new CodexNativeTurnController({ appServer: manager });
+    const session = { session: "work", threadId: "thread-unresponsive", cwd: "/tmp/work" };
+    await controller.subscribeSession(session);
+    await expect(controller.startTurn({ ...session, text: "未送信" })).rejects.toBeInstanceOf(CodexTurnNotStartedError);
+    expect(remaining).toEqual([]);
+    expect(stale.closed).toBe(1);
+    expect(recovery.closed).toBe(1);
+    for (const connection of [stale, recovery]) {
+      expect(connection.requests.some((r) => r.method.startsWith("turn/"))).toBe(false);
+    }
+    controller.close();
+  });
+
+  test("制御接続の復旧は接続・initialize・resume・最新 turn で3秒の予算を共有する", async () => {
+    let now = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const connection = new FakeConnection("thread-budget");
+    const timeouts: Array<number | undefined> = [];
+    connection.initialize = async (timeoutMs?: number) => {
+      timeouts.push(timeoutMs);
+      now = 2_000;
+    };
+    connection.request = async (method, params, timeoutMs) => {
+      connection.requests.push({ method, params });
+      timeouts.push(timeoutMs);
+      if (method === "thread/resume") {
+        now = 2_900;
+        return { thread: { id: "thread-budget", historyMode: "paginated" } };
+      }
+      if (method === "thread/turns/list") return { data: [], nextCursor: null };
+      throw new Error(`unexpected request: ${method}`);
+    };
+    try {
+      const manager = new CodexAppServerManager({
+        codexHome: makeTempDir("codex-control-budget"),
+        connect: async (_path, timeoutMs, handshakeTimeoutMs) => {
+          expect(timeoutMs).toBeUndefined(); // 復旧後の本文送信は既定の応答待ちを保つ。
+          timeouts.push(handshakeTimeoutMs);
+          now = 750;
+          return connection;
+        },
+        launch: () => { throw new Error("daemon を再起動した"); },
+      });
+      const thread = await manager.openThread({ threadId: "thread-budget", controlOnly: true });
+      expect(timeouts).toEqual([2_000, 2_250, 1_000, 100]);
+      expect(thread.initialTurnStateKnown).toBe(true);
+      expect(thread.initialActiveTurnId).toBeNull();
+      thread.close();
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   test("fallback 接続の実行中 turn 読み直しは thread/turns/list の最新 1 件だけを読む", async () => {

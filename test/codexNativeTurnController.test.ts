@@ -1207,6 +1207,90 @@ describe("CodexNativeTurnController", () => {
     expect(thread.interrupts).toEqual(["turn-real"]);
   });
 
+  test.each([false, true])("制御復旧の本文送信は目標の再取得を待たず、目標通知の上書きも防ぐ（通知=%s）", async (notify) => {
+    const goal: CodexGoalInfo = {
+      threadId: "thread-1", objective: "テストを緑にする", status: "active",
+      tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1,
+    };
+    const stale = Object.assign(new FakeThread(), { goalGet: async () => goal });
+    stale.liveSubscriptionReady = false;
+    stale.activeTurnReadError = new Error("Codex App Server request timed out: thread/turns/list");
+    let finishGoal!: (goal: CodexGoalInfo | null) => void;
+    const goalResult = new Promise<CodexGoalInfo | null>((resolve) => { finishGoal = resolve; });
+    const recovered = Object.assign(new FakeThread(), {
+      initialTurnStateKnown: true,
+      goalGet: vi.fn(() => goalResult),
+    });
+    const threads = [stale, recovered];
+    let openOptions: CodexAppServerThreadOptions | undefined;
+    const goals: (CodexGoalInfo | null)[] = [];
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async (options) => { openOptions = options; return threads.shift()!; } },
+      onGoal: (_session, value) => goals.push(value),
+    });
+    const session = { session: "work", threadId: "thread-1", cwd: "/tmp/work" };
+    await controller.subscribeSession(session);
+    const sent = vi.fn();
+    const send = controller.startTurn({ ...session, text: "続けて" }).then(sent);
+    try {
+      await vi.waitFor(() => expect(sent).toHaveBeenCalledWith("turn-1"), { timeout: 500 });
+      expect(controller.hasActiveGoal("work")).toBe(true);
+      expect(recovered.goalGet).toHaveBeenCalledTimes(1);
+      if (notify) {
+        openOptions?.onNotification?.({ method: "thread/goal/updated", params: {
+          threadId: "thread-1", goal: { ...goal, tokensUsed: 100, updatedAt: 2 },
+        } });
+      }
+      finishGoal(null);
+      await goalResult; // 遅い取得結果の継続処理まで進めてから、新しい通知が残ることを確かめる。
+      await vi.waitFor(() => expect(controller.hasActiveGoal("work")).toBe(notify));
+      expect(goals.at(-1)?.tokensUsed ?? null).toBe(notify ? 100 : null);
+    } finally {
+      finishGoal(null);
+      await send;
+      controller.close();
+    }
+  });
+
+  test("turn/start の到達不明は再送せず接続を捨て、明示の再送で現在の turn に戻る", async () => {
+    const stale = new FakeThread();
+    stale.startTurn = async (text, clientId) => {
+      stale.starts.push({ text, clientId });
+      throw new Error("Codex App Server request timed out: turn/start");
+    };
+    // timeout 後に App Server が受理した turn が、接続し直した時点で見つかる。
+    const recovered = new FakeThread();
+    recovered.initialActiveTurnId = "turn-accepted";
+    const threads = [stale, recovered];
+    const disconnected = vi.fn();
+    const controller = new CodexNativeTurnController({
+      appServer: { openThread: async () => {
+        const thread = threads.shift();
+        if (!thread) throw new Error("自動再送した");
+        return thread;
+      } },
+      onDisconnect: disconnected,
+    });
+    const message = {
+      session: "work", threadId: "thread-1", cwd: "/tmp/work", text: "一度だけ",
+      clientUserMessageId: "client-ambiguous-timeout",
+    };
+    await expect(controller.startTurn(message)).rejects.toThrow("timed out: turn/start");
+    expect(stale.closed).toBe(1);
+    expect(stale.starts).toHaveLength(1);
+    expect(recovered.starts).toEqual([]);
+    expect(threads).toHaveLength(1);
+    expect(controller.hasOpenSession("work")).toBe(false);
+    expect(disconnected).toHaveBeenCalledTimes(1);
+
+    await expect(controller.startTurn(message)).resolves.toBe("turn-accepted");
+    expect(recovered.starts).toEqual([]);
+    expect(recovered.steers).toEqual([{
+      turnId: "turn-accepted", text: message.text, clientId: message.clientUserMessageId,
+    }]);
+    controller.close();
+  });
+
   test("steer timeoutはturn/startへフォールバックせず到達不明として返す", async () => {
     const thread = new FakeThread();
     const controller = new CodexNativeTurnController({
@@ -1222,6 +1306,9 @@ describe("CodexNativeTurnController", () => {
       session: "work", threadId: "thread-1", cwd: "/tmp/work", text: "一度だけ",
       clientUserMessageId: "client-ambiguous-timeout",
     })).rejects.toThrow("timed out");
+
+    expect(thread.closed).toBe(1);
+    expect(controller.hasOpenSession("work")).toBe(false);
 
     expect(thread.steers).toEqual([{
       turnId: "turn-1", text: "一度だけ", clientId: "client-ambiguous-timeout",

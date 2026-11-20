@@ -162,6 +162,8 @@ export interface CodexAppServerRequest extends CodexAppServerNotification {
 export interface CodexAppServerThreadOptions {
   threadId: string;
   cwd?: string | null;
+  /** 応答不能な接続の交換。全履歴を再取得せず、購読と最新 turn だけを復元する。 */
+  controlOnly?: boolean;
   onNotification?: (notification: CodexAppServerNotification) => void;
   onServerRequest?: (request: CodexAppServerRequest) => Promise<unknown>;
   onDisconnect?: (error: Error) => void;
@@ -170,7 +172,7 @@ export interface CodexAppServerThreadOptions {
 /** テスト差し替え可能なApp Server 1接続分。 */
 export interface CodexAppServerConnection {
   /** initialize 応答（`userAgent` 等）を返す。診断用で、void を返す実装でもよい。 */
-  initialize(): Promise<unknown>;
+  initialize(timeoutMs?: number): Promise<unknown>;
   request(method: string, params: unknown, timeoutMs?: number): Promise<unknown>;
   onNotification(handler: (notification: CodexAppServerNotification) => void): () => void;
   onServerRequest(handler: (request: CodexAppServerRequest) => void): () => void;
@@ -183,6 +185,8 @@ export interface CodexAppServerConnection {
 export type CodexAppServerConnect = (
   socketPath: string,
   requestTimeoutMs?: number,
+  /** 接続確立だけを短く待つ場合の上限。後続 RPC の既定には引き継がない。 */
+  handshakeTimeoutMs?: number,
 ) => Promise<CodexAppServerConnection>;
 export type CodexAppServerLaunch = (
   executable: string,
@@ -213,7 +217,11 @@ class WebSocketCodexAppServerConnection implements CodexAppServerConnection {
     socket.on("error", (error) => this.disconnect(error));
   }
 
-  static connect(socketPath: string, requestTimeoutMs = 5_000): Promise<CodexAppServerConnection> {
+  static connect(
+    socketPath: string,
+    requestTimeoutMs = 5_000,
+    handshakeTimeoutMs = requestTimeoutMs,
+  ): Promise<CodexAppServerConnection> {
     return new Promise((resolve, reject) => {
       const socket = new WebSocket("ws://localhost/", {
         createConnection: () => net.createConnection(socketPath),
@@ -248,20 +256,25 @@ class WebSocketCodexAppServerConnection implements CodexAppServerConnection {
         socket.on("error", () => {});
         socket.terminate();
         reject(new Error("Codex App Server handshake timed out"));
-      }, requestTimeoutMs);
+      }, handshakeTimeoutMs);
     });
   }
 
-  async initialize(): Promise<unknown> {
+  async initialize(timeoutMs?: number): Promise<unknown> {
     const response = await this.request("initialize", {
       clientInfo: { name: "tailii_host", title: "Tailii Host", version: "0.1.1" },
       capabilities: { experimentalApi: true },
-    });
+    }, timeoutMs);
     this.notify("initialized", undefined);
     return response;
   }
 
   request(method: string, params: unknown, timeoutMs?: number): Promise<unknown> {
+    // close 後の ws.send は callback が無いと失敗を通知しない。切断通知の後に始まる RPC も
+    // pending に積んでしまうと、全件が期限まで待ってから timeout になっていた。
+    if (this.disconnected || this.socket.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error("Codex App Server connection closed"));
+    }
     const id = this.nextId;
     this.nextId += 1;
     return new Promise((resolve, reject) => {
@@ -442,6 +455,9 @@ export class CodexAppServerThread {
     reasoningEffort: string | null = null,
     /** 購読時点の thread の collaboration mode（0.156+ の `thread.collaborationMode.mode`）。不明なら null。 */
     initialCollaborationMode: CodexCollaborationMode | null = null,
+    private readonly removeListeners: () => void = () => {},
+    /** 接続を開く時点で、最新 turn（idle を含む）を確認済みか。 */
+    readonly initialTurnStateKnown = false,
   ) {
     this.currentModel = model;
     this.currentEffort = reasoningEffort;
@@ -846,6 +862,8 @@ export class CodexAppServerThread {
   }
 
   close(): void {
+    // 交換した旧 socket の遅い通知が、新しい thread 状態へ混ざらないよう先に購読を外す。
+    this.removeListeners();
     this.connection.close();
   }
 }
@@ -1095,8 +1113,8 @@ export class CodexAppServerManager {
       options.socketPath ?? path.join(this.codexHome, "app-server-control", "app-server-control.sock");
     this.remoteEndpoint = options.remoteEndpoint ?? "unix://";
     this.connect =
-      options.connect ?? ((socketPath, requestTimeoutMs) =>
-        WebSocketCodexAppServerConnection.connect(socketPath, requestTimeoutMs));
+      options.connect ?? ((socketPath, requestTimeoutMs, handshakeTimeoutMs) =>
+        WebSocketCodexAppServerConnection.connect(socketPath, requestTimeoutMs, handshakeTimeoutMs));
     this.launch = options.launch ?? defaultLaunch;
     this.pollIntervalMs = options.pollIntervalMs ?? 100;
     this.startupTimeoutMs = options.startupTimeoutMs ?? 10_000;
@@ -1807,14 +1825,17 @@ export class CodexAppServerManager {
 
   /** 既存 thread を購読する長寿命接続を開く。turn と native approval はこの接続を流れる。 */
   async openThread(options: CodexAppServerThreadOptions): Promise<CodexAppServerThread> {
-    await this.ensureRunning();
-    return this.openThreadAttempt(options, null);
+    // 既存接続の timeout 回復では daemon 自体を置換・再起動しない。
+    if (!options.controlOnly) await this.ensureRunning();
+    return this.openThreadAttempt(options, options.controlOnly ? "送信前の制御接続を再確立" : null);
   }
 
   private async openThreadAttempt(
     options: CodexAppServerThreadOptions,
     historyTimeout: string | null,
   ): Promise<CodexAppServerThread> {
+    // 読み直しを積み重ねて上位の送信 ACK 待ちを超えないよう、制御復旧は全手順で3秒を共有する。
+    const controlDeadline = options.controlOnly ? Date.now() + THREAD_HISTORY_SNAPSHOT_TIMEOUT_MS : undefined;
     const bootstrap = this.bootstrapConnections.get(options.threadId) ?? null;
     if (bootstrap !== null) this.bootstrapConnections.delete(options.threadId);
     // 作成元接続を引き継ぐ場合は thread/start 応答の model を購読時のモデルとして使う。
@@ -1827,7 +1848,11 @@ export class CodexAppServerManager {
     let initialCollaborationMode: CodexCollaborationMode | null = null;
     /** thread/resume 応答の今の作業フォルダ（session-workdir-change。作成元 bootstrap は開いた側の値）。 */
     let resumedCwd: string | null = null;
-    const connection = bootstrap ?? (await this.connect(this.socketPath));
+    const connection = bootstrap ?? (await this.connect(
+      this.socketPath,
+      undefined,
+      historyRequestTimeout("connect", controlDeadline, options.controlOnly ? THREAD_METADATA_PROBE_TIMEOUT_MS : undefined),
+    ));
     const removeNotification = connection.onNotification((notification) => {
       options.onNotification?.(notification);
     });
@@ -1847,10 +1872,11 @@ export class CodexAppServerManager {
     try {
       let initialItems: Record<string, unknown>[] = [];
       let initialActiveTurnId: string | null = null;
+      let initialTurnStateKnown = bootstrap !== null;
       let liveSubscriptionReady = bootstrap !== null;
       let liveSubscriptionError: string | null = historyTimeout;
       if (bootstrap === null) {
-        await connection.initialize();
+        await connection.initialize(historyRequestTimeout("initialize", controlDeadline));
         try {
           // 全履歴 hydration（excludeTurns:false）は paginated thread で非推奨（codex 0.153.4+ は
           // 呼び出した接続へ deprecationNotice を返す）。resume はメタデータだけにし、
@@ -1861,7 +1887,7 @@ export class CodexAppServerManager {
           const resumed = await connection.request("thread/resume", {
             threadId: options.threadId,
             excludeTurns: true,
-          });
+          }, historyRequestTimeout("thread/resume", controlDeadline));
           resumedSuccessfully = true;
           // thread の現在モデルは resume 応答が権威。履歴読み取りが失敗する未materialize
           // thread（turn 前）でも resume 自体は成立するため、snapshot より先に確定する。
@@ -1878,6 +1904,7 @@ export class CodexAppServerManager {
             );
             initialItems = snapshot.items;
             initialActiveTurnId = snapshot.activeTurnId;
+            initialTurnStateKnown = true;
             liveSubscriptionReady = true;
           } else {
             // 大きい画像・tool 出力を含む履歴は、同じ socket の後続 RPC も塞ぐ。
@@ -1888,8 +1915,9 @@ export class CodexAppServerManager {
               sortDirection: "desc",
               itemsView: "notLoaded",
               all: false,
-              timeoutMs: THREAD_METADATA_PROBE_TIMEOUT_MS,
+              timeoutMs: historyRequestTimeout("thread/turns/list", controlDeadline, THREAD_METADATA_PROBE_TIMEOUT_MS),
             }));
+            initialTurnStateKnown = true;
           }
         } catch (error) {
           // 公式アプリなど別 App Server の writer が thread を保持している場合は再開不能。
@@ -1911,7 +1939,7 @@ export class CodexAppServerManager {
           // （resume 自体が成立していても live 権威にはせず、従来どおり rollout fallback）。
           // 判定は文言一致に加えて runtime のロード状態（文言非依存）で行う。
           if (!(await confirmThreadHistoryUnavailable(connection, options.threadId, error, {
-            requireLoaded: true, loadedPreviously: resumedSuccessfully,
+            requireLoaded: true, loadedPreviously: resumedSuccessfully, deadlineMs: controlDeadline,
           }))) {
             throw error;
           }
@@ -1936,6 +1964,12 @@ export class CodexAppServerManager {
         model,
         reasoningEffort,
         initialCollaborationMode,
+        () => {
+          removeNotification();
+          removeServerRequest();
+          removeDisconnect();
+        },
+        initialTurnStateKnown,
       );
     } catch (error) {
       removeNotification();
@@ -2372,7 +2406,7 @@ async function confirmThreadHistoryUnavailable(
   connection: CodexAppServerConnection,
   threadId: string,
   error: unknown,
-  options: { requireLoaded?: boolean; loadedPreviously?: boolean } = {},
+  options: { requireLoaded?: boolean; loadedPreviously?: boolean; deadlineMs?: number } = {},
 ): Promise<boolean> {
   if (!options.requireLoaded && isUnmaterializedThreadError(error, threadId)) return true;
   if (!(error instanceof Error)) return false;
@@ -2381,7 +2415,7 @@ async function confirmThreadHistoryUnavailable(
     const response = objectRecord(await connection.request(
       "thread/read",
       { threadId, includeTurns: false },
-      THREAD_METADATA_PROBE_TIMEOUT_MS,
+      historyRequestTimeout("thread/read", options.deadlineMs, THREAD_METADATA_PROBE_TIMEOUT_MS),
     ));
     const thread = objectRecord(response?.["thread"]);
     if (thread === null || thread["id"] !== threadId) return false;

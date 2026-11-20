@@ -88,7 +88,7 @@ export interface CodexNativeApproval {
 const MAX_OPERATE_REOPENS = 3;
 
 /**
- * turn を始める前（App Server の thread 接続を開く段階）で失敗した: turn/start も turn/steer も送っていないので、
+ * turn を始める前（App Server の接続・状態確認）で失敗した: turn/start も turn/steer も送っていないので、
  * 届いていないと確かである。hub はこれを「届いたか分からない」にせず、順番から外して失敗を返す（同じ送信 ID で
  * 打ち直せる。Fable レビュー 中3）。
  */
@@ -204,6 +204,8 @@ export interface CodexTurnControllerRuntime {
 export interface CodexThreadClient {
   readonly initialItems?: readonly Record<string, unknown>[];
   readonly initialActiveTurnId?: string | null;
+  /** 開いた直後の最新 turn 状態を確認済み。履歴を省いた制御復旧でも idle を確定できる。 */
+  readonly initialTurnStateKnown?: boolean;
   /** false は turn 履歴が未生成で購読時の履歴スナップショットが読めず、live 通知を保証できない接続。 */
   readonly liveSubscriptionReady?: boolean;
   /** liveSubscriptionReady=false の理由（診断ログ用）。 */
@@ -322,6 +324,10 @@ export interface CodexAppServerThreadRuntime {
     cwd: string;
     prompt: string;
   }): Promise<CodexThreadTitleGenerationResult>;
+}
+
+function isAppServerRequestTimeout(error: unknown): error is Error {
+  return error instanceof Error && error.message.startsWith("Codex App Server request timed out:");
 }
 
 function isDefinitiveSteerRejection(error: unknown): boolean {
@@ -550,20 +556,34 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     collaborationMode?: CodexCollaborationMode | null;
   }): Promise<string> {
     let opened: OpenThread;
+    let recovery: Pick<OpenThread, "goal" | "goalNoticeKey"> | undefined;
     try {
       opened = await this.threadFor(options.session, options.threadId, options.cwd);
+      // fallback 接続は初回 turn の後も通知を保証できず、送信前に最新 turn を確かめる。
+      // 同じ socket での有界リトライでも timeout するなら、本文を送る前に限って接続を一度交換する。
+      // 履歴表示は Hub の rollout fallback を継続し、ここでは制御に必要な状態だけを読む。
+      try {
+        await this.refreshActiveTurnBeforeSend(opened);
+      } catch (error) {
+        if (!isAppServerRequestTimeout(error)) throw error;
+        recovery = { goal: opened.goal, goalNoticeKey: opened.goalNoticeKey };
+        this.discardUnresponsiveThread(options.session, opened, error);
+        opened = await this.threadFor(options.session, options.threadId, options.cwd, "operate", 0, recovery);
+        try {
+          if (opened.thread.initialTurnStateKnown !== true) await this.refreshActiveTurnBeforeSend(opened);
+        } catch (retryError) {
+          if (isAppServerRequestTimeout(retryError)) {
+            this.discardUnresponsiveThread(options.session, opened, retryError);
+          }
+          throw retryError;
+        }
+      }
     } catch (error) {
       throw new CodexTurnNotStartedError(error instanceof Error ? error.message : String(error), { cause: error });
     }
     this.onProcessing(options.session, "active");
+    let submitted = false;
     try {
-      // 未materialize fallback 接続は、別 client の実行中 turn を初期 snapshot で
-      // 復元できない。新規 turn/start の前に rollout を読み直し、既存 turn が
-      // materialize 済みなら steer へ戻す。undefined（まだ未生成）だけは従来どおり開始する。
-      if (opened.activeTurnId === null && opened.thread.liveSubscriptionReady === false) {
-        const refreshedTurnId = await opened.thread.readActiveTurnId?.();
-        if (refreshedTurnId !== undefined) opened.activeTurnId = refreshedTurnId;
-      }
       const activeTurnId = opened.activeTurnId;
       if (activeTurnId !== null) {
         try {
@@ -572,6 +592,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
             options.text,
             options.clientUserMessageId,
           );
+          submitted = true;
           this.noteCollaborationModeNotAppliedBySteer(options.session, opened, activeTurnId, options.collaborationMode);
           this.generateThreadTitle(opened, options.session, options.text);
           return activeTurnId;
@@ -586,6 +607,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
               options.text,
               options.clientUserMessageId,
             );
+            submitted = true;
             this.noteCollaborationModeNotAppliedBySteer(options.session, opened, currentTurnId, options.collaborationMode);
             this.generateThreadTitle(opened, options.session, options.text);
             return currentTurnId;
@@ -606,13 +628,36 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
         options.approvalPolicy,
         options.collaborationMode ?? null,
       );
+      submitted = true;
       opened.activeTurnId = turnId;
       this.generateThreadTitle(opened, options.session, options.text);
       return turnId;
     } catch (error) {
+      // 書き込みは受理済みかもしれないため再送しない。応答しなかった接続だけを捨て、
+      // 明示の再送は新しい接続で現在の turn を確かめてから行う。
+      if (isAppServerRequestTimeout(error)) this.discardUnresponsiveThread(options.session, opened, error);
       this.onProcessing(options.session, "done");
       throw error;
+    } finally {
+      // 補助的な目標取得で送信 ACK を遅らせない。先に前の目標を保持して送信を完了し、後から更新する。
+      if (submitted && recovery !== undefined && this.open.get(options.session) === opened) {
+        void this.loadGoal(options.session, opened, true);
+      }
     }
+  }
+
+  private async refreshActiveTurnBeforeSend(opened: OpenThread): Promise<void> {
+    if (opened.activeTurnId !== null || opened.thread.liveSubscriptionReady !== false) return;
+    const refreshedTurnId = await opened.thread.readActiveTurnId?.();
+    if (refreshedTurnId !== undefined) opened.activeTurnId = refreshedTurnId;
+  }
+
+  private discardUnresponsiveThread(session: string, opened: OpenThread, error: Error): void {
+    if (this.open.get(session) !== opened) return;
+    this.closeSession(session);
+    // closeSession は意図した close の切断 callback を抑制する。表示側には別途知らせ、
+    // live だった会話も rollout から読み続けられるようにする。
+    this.onDisconnect(session, error);
   }
 
   /**
@@ -716,18 +761,22 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
   }
 
   /**
-   * open 直後に現在の目標を読む（失敗は無視: 旧 server / ephemeral thread は未対応）。threadFor が
-   * await するので、購読直後に購読者がいなくなっても hasActiveGoal が「未読」で false を返さない。
+   * open 直後に現在の目標を読む（失敗は無視: 旧 server / ephemeral thread は未対応）。通常の threadFor は
+   * await して未読の false を避ける。制御復旧は前の状態を引き継ぎ、本文送信後に refresh する。
    */
-  private async loadGoal(session: string, opened: OpenThread): Promise<void> {
+  private async loadGoal(session: string, opened: OpenThread, refresh = false): Promise<void> {
     if (opened.thread.goalGet === undefined) return;
+    const previousGoal = opened.goal;
+    const previousNoticeKey = opened.goalNoticeKey;
     try {
       const goal = await opened.thread.goalGet();
       if (this.open.get(session) !== opened) return;
       // 通知（thread/goal/updated）が先に届いて確定済みなら上書きしない。
-      if (opened.goalNoticeKey !== null) return;
-      // 配信は購読確立（subscribeSession）側で行う: 開き直しで既存 thread を再利用する場合も必ず 1 回届く。
-      this.applyGoal(session, opened, goal, { publishState: false, initial: true });
+      if (refresh) {
+        if (opened.goal !== previousGoal || opened.goalNoticeKey !== previousNoticeKey) return;
+      } else if (opened.goalNoticeKey !== null) return;
+      // 初回の配信は subscribeSession 側。制御復旧後の更新だけはここから Hub へ知らせる。
+      this.applyGoal(session, opened, goal, { publishState: refresh, initial: true });
     } catch (error) {
       this.log(`Codex 目標の読み取りに失敗（無視） session=${session}: ${String(error)}`);
     }
@@ -1115,6 +1164,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     cwd: string,
     intent: "subscribe" | "operate" = "operate",
     reopenAttempt = 0,
+    recovery?: Pick<OpenThread, "goal" | "goalNoticeKey">,
   ): Promise<OpenThread> {
     // 開始中（openThread → 目標読み取り → サブエージェント復元）の同じ session は完了を共有する。
     // 会話オープンでは hub の購読と iOS の目標 get がほぼ同時に届くため、共有しないと openThread が
@@ -1139,7 +1189,7 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     if (existing?.threadId === threadId) return existing;
     if (existing !== undefined) this.closeSession(session);
     this.closeRequestedWhileOpening.delete(session);
-    const task = this.openThreadFor(session, threadId, cwd).finally(() => {
+    const task = this.openThreadFor(session, threadId, cwd, recovery).finally(() => {
       if (this.opening.get(session)?.task === task) this.opening.delete(session);
     });
     this.opening.set(session, { threadId, task });
@@ -1150,18 +1200,24 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       if (reopenAttempt >= MAX_OPERATE_REOPENS) {
         throw new Error(`Codex thread の接続を開いても直後に閉じられました（${MAX_OPERATE_REOPENS} 回）。少し待って再送してください。`);
       }
-      return this.threadFor(session, threadId, cwd, intent, reopenAttempt + 1);
+      return this.threadFor(session, threadId, cwd, intent, reopenAttempt + 1, recovery);
     }
     return opened;
   }
 
-  private async openThreadFor(session: string, threadId: string, cwd: string): Promise<OpenThread> {
+  private async openThreadFor(
+    session: string,
+    threadId: string,
+    cwd: string,
+    recovery?: Pick<OpenThread, "goal" | "goalNoticeKey">,
+  ): Promise<OpenThread> {
     const items = new Map<string, Record<string, unknown>>();
     const bufferedNotifications: CodexAppServerNotification[] = [];
     let notificationTargetReady = false;
     const thread = await this.appServer.openThread({
       threadId,
       cwd,
+      ...(recovery !== undefined ? { controlOnly: true } : {}),
       onNotification: (notification) => {
         if (!notificationTargetReady) {
           bufferedNotifications.push(notification);
@@ -1204,8 +1260,8 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
       planSeq: 0,
       subagents: new CodexSubagentTracker(threadId),
       subagentSeq: 0,
-      goal: null,
-      goalNoticeKey: null,
+      goal: recovery?.goal ?? null,
+      goalNoticeKey: recovery?.goalNoticeKey ?? null,
       budgetLimitedTurnIds: new Set<string>(),
     };
     this.open.set(session, opened);
@@ -1218,10 +1274,10 @@ export class CodexNativeTurnController implements CodexTurnControllerRuntime {
     }
     if (opened.activeTurnId !== null) this.onProcessing(session, "active");
     // 目標は rollout に現在値が無い（SQLite 保存）ため、開くたびに App Server から読む（失敗無視）。
-    // Hub の close 判定（hasActiveGoal）が open 直後から正しい値を返すよう、ここで待つ。
+    // Hub の close 判定（hasActiveGoal）のため通常はここで待つ。制御復旧は前の状態を保ち、送信後に読む。
     // 実行中 turn の未回答の非同期質問は、待ち（目標の読み取り）の間に届く live の質問より先に並べる。
     this.restoreAsyncQuestions(session, opened, thread.initialItems ?? []);
-    await this.loadGoal(session, opened);
+    if (recovery === undefined) await this.loadGoal(session, opened);
     if (this.open.get(session) !== opened) return opened;
     const restoredSubagents = [];
     for (const item of thread.initialItems ?? []) {
